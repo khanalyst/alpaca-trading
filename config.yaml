@@ -1,0 +1,48 @@
+# ============================================================
+# OKX AI Trading Agent - configuration
+# Edit this file, then restart the agent for changes to apply.
+# ============================================================
+
+mode: demo            # demo | live
+                      # demo uses OKX Demo Trading (paper money). You must create
+                      # SEPARATE demo API keys inside OKX's Demo Trading section.
+
+llm:
+  provider: anthropic          # anthropic | openai
+  model: claude-sonnet-4-6     # e.g. claude-sonnet-4-6, claude-opus-4-8,
+                               #      gpt-4.1, gpt-4o, o4-mini
+  temperature: 0.2
+  max_tokens: 2000
+
+universe:
+  top_n: 10                          # trade only the N highest-volume USDT perpetuals
+  min_24h_quote_volume_usd: 50000000 # $50m floor - filters thin and newly listed coins
+  denylist: []                       # e.g. ["DOGE/USDT:USDT"]
+  refresh_minutes: 60                # how often the volume ranking is rebuilt
+
+cycle:
+  interval_seconds: 300              # decision cycle (300 = one LLM call every 5 min)
+  timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model
+  candles: 120                       # candles per timeframe (also excludes brand-new
+                                     # listings that lack 4h history)
+
+risk:
+  # --- sizing (everything is a % of live account equity) ---
+  max_leverage: 3                # per position; hard ceiling of 10 enforced in code
+  risk_per_trade_pct: 1.5        # % of equity lost if a stop-loss is hit
+  max_position_notional_pct: 40  # per-position notional cap, % of equity
+  max_gross_exposure_pct: 150    # total notional across all positions, % of equity
+  max_concurrent_positions: 3
+  min_confidence: 0.65           # model decisions below this are discarded
+  max_hold_hours: 24             # day-trading discipline: no stale positions
+
+  # --- circuit breakers ---
+  daily_loss_limit_pct: 5        # down this much on the day -> no new entries until next UTC day
+  flatten_on_daily_stop: false   # true = also close open positions when the daily stop trips
+  max_drawdown_pct: 15           # from the high-water mark -> flatten everything and self-kill
+  max_margin_usage_pct: 60       # if exceeded (e.g. after a withdrawal) reduce positions
+  cooldown_minutes_after_loss: 45  # per-symbol timeout after a losing close
+
+execution:
+  slippage_guard_pct: 0.5        # abort an entry if price moved more than this
+                                 # between analysis and execution
