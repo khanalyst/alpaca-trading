@@ -11,8 +11,15 @@ llm:
   provider: anthropic          # anthropic | openai
   model: claude-sonnet-4-6     # e.g. claude-sonnet-4-6, claude-opus-4-8,
                                #      gpt-4.1, gpt-4o, o4-mini
-  temperature: 0.2
+  temperature: 0.2             # ignored automatically on models that reject
+                               # sampling params (Sonnet 5, Opus 4.7+)
   max_tokens: 2000
+  # Prompt caching: the static system prompt is cached on Anthropic servers
+  # (1-hour TTL, refreshed on every call) and cached automatically by OpenAI.
+  # Anthropic ignores cache blocks below a per-model minimum: 2,048 tokens on
+  # Sonnet 4.6 (this prompt qualifies), 4,096 on Opus 4.x / Haiku 4.5 (there
+  # the marker is a harmless no-op and the prompt bills at the normal rate).
+  # Check cache hits in runtime/agent.log: "tokens: ... cache_read=NNNN".
 
 universe:
   top_n: 10                          # trade only the N highest-volume USDT perpetuals

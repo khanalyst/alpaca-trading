@@ -12,6 +12,10 @@ it shrinks.
 
 ---
 
+> **New to all of this?** [SETUP.md](SETUP.md) is a step-by-step beginner
+> guide: installing, getting keys, running 24/7 on any machine or VPS, and
+> what it costs per month.
+
 ## Read this first
 
 - Leveraged perpetual futures can lose money faster than they make it, and
@@ -68,7 +72,7 @@ Requirements: Python 3.10+ and an always-on machine (VPS recommended for
 true 24/7 operation).
 
 ```bash
-cd okx-ai-trader
+cd okx-agent-crypto
 pip install -r requirements.txt
 cp .env.example .env      # then fill in your keys
 ```
@@ -94,6 +98,16 @@ Set `llm.provider` and `llm.model` in `config.yaml` and the matching key in
 `.env`. The agent makes one model call per cycle (288 calls/day at the
 default 5-minute cycle), so pick a model whose per-call cost you are happy
 with and check current pricing on the provider's site.
+
+Token costs are kept down three ways: the static system prompt is cached
+(explicitly on Anthropic with a 1-hour TTL, automatically on OpenAI), the
+per-cycle market payload is serialized compactly, and cycles where the model
+cannot act (daily loss stop with no open positions) skip the call entirely.
+Every call logs `tokens: in=... out=... cache_write=... cache_read=...` to
+`runtime/agent.log` — after the first call of a session, `cache_read` should
+be a few thousand tokens; if it stays 0, caching isn't engaging (see the
+note in `config.yaml` about per-model cache minimums). Indicative monthly
+costs per model are in [SETUP.md](SETUP.md).
 
 ---
 
@@ -140,7 +154,7 @@ between a blow-up and the next trade.
 | Command | What it does |
 | --- | --- |
 | `python main.py status` | State, equity, day PnL, drawdown, open positions |
-| `python main.py pause` | No new positions. Existing ones keep their exchange-side SL/TP; max-hold and margin guards still run. No LLM calls (saves cost). |
+| `python main.py pause` | No new positions. Existing ones keep their exchange-side SL/TP; max-hold and margin guards still run. No LLM calls (saves cost). Survives crashes and restarts until `resume`. |
 | `python main.py pause --flatten` | Pause and close everything immediately |
 | `python main.py resume` | Back to full trading |
 | `python main.py flatten` | Close all positions, cancel all orders, then pause |
@@ -149,7 +163,8 @@ between a blow-up and the next trade.
 
 Ctrl+C on a foreground loop is treated as `pause`: the process exits, state
 becomes PAUSED, and open positions remain protected by their server-side
-stops.
+stops. Unlike an explicit `pause` command, a Ctrl+C pause does not stick:
+the next `run` resumes full trading.
 
 The agent also stops itself:
 
@@ -215,6 +230,9 @@ Turning aggression up means raising `max_leverage`, `risk_per_trade_pct` and
 `max_gross_exposure_pct`. Understand the compounding of those three before
 touching them: 3 positions at 2% risk each is a 6% day if everything stops
 out at once.
+
+If a stop-loss order cannot be placed right after an entry fills, the agent
+closes that position immediately rather than let it run unprotected.
 
 ---
 

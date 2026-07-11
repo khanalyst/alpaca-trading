@@ -54,13 +54,17 @@ def _light_engine(cfg):
 
 def _flatten(cfg, reason: str) -> bool:
     try:
-        _light_engine(cfg).flatten_all(reason)
-        print("All orders cancelled and all positions closed.")
-        return True
+        ok = _light_engine(cfg).flatten_all(reason)
     except Exception as e:
         print(f"Flatten FAILED: {e}")
         print("Close positions manually in the OKX app/web if any remain.")
         return False
+    if ok:
+        print("All orders cancelled and all positions closed.")
+    else:
+        print("Some positions could not be closed; see runtime/agent.log and "
+              "close them manually in the OKX app/web.")
+    return ok
 
 
 # ------------------------------------------------------------------ commands
@@ -80,6 +84,7 @@ def cmd_run(args, cfg) -> int:
     if st["state"] == KILLED:
         st["state"] = PAUSED
         st["kill_reason"] = None
+        st["operator_pause"] = False
         state.save_state(st)
     from agent.engine import Engine
     engine = Engine(cfg)
@@ -88,10 +93,12 @@ def cmd_run(args, cfg) -> int:
 
 
 def cmd_pause(args, cfg) -> int:
-    state.set_state(PAUSED)
+    state.set_state(PAUSED, operator_pause=True)
     print("State set to PAUSED. No new positions will be opened. Open "
           "positions keep their exchange-side stop-loss and take-profit "
           "orders and the loop still enforces max-hold and margin guards.")
+    print("This pause survives crashes and restarts; use 'python main.py "
+          "resume' to re-enable trading.")
     if args.flatten:
         _flatten(cfg, "pause --flatten")
     return 0
@@ -104,7 +111,7 @@ def cmd_resume(args, cfg) -> int:
         return 1
     if st["state"] == DAY_STOPPED:
         print("Note: overriding today's daily loss stop.")
-    state.set_state(RUNNING)
+    state.set_state(RUNNING, operator_pause=False)
     pid = state.read_pid()
     if pid and state.pid_alive(pid):
         print("State set to RUNNING. The live loop will resume on its next "
@@ -129,7 +136,7 @@ def cmd_kill(args, cfg) -> int:
 
 def cmd_flatten(args, cfg) -> int:
     ok = _flatten(cfg, "manual flatten")
-    state.set_state(PAUSED)
+    state.set_state(PAUSED, operator_pause=True)
     print("State set to PAUSED.")
     return 0 if ok else 1
 

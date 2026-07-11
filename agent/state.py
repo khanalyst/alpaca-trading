@@ -29,6 +29,8 @@ DEFAULT = {
     "cooldowns": {},   # symbol -> unix ts until which no new entries are allowed
     "opened_at": {},   # symbol -> unix ts the position was opened
     "kill_reason": None,
+    "operator_pause": False,  # True = pause was an explicit CLI command and
+                              # must survive crashes and restarts
 }
 
 
@@ -54,12 +56,44 @@ def save_state(st: dict) -> None:
     os.replace(tmp, STATE_FILE)
 
 
-def set_state(name: str, reason: str | None = None) -> dict:
+def set_state(name: str, reason: str | None = None, **extra) -> dict:
     st = load_state()
     st["state"] = name
     if reason is not None:
         st["kill_reason"] = reason
+    st.update(extra)
     save_state(st)
+    return st
+
+
+# Keys the trading loop owns. commit() persists these without clobbering a
+# state change (pause/kill) the CLI may have written while a cycle was running.
+LOOP_KEYS = ("high_water_mark", "day", "day_start_equity", "last_ledger_ts",
+             "cooldowns", "opened_at")
+
+
+def commit(st: dict, transition: tuple[str, str] | None = None,
+           kill: str | None = None) -> dict:
+    """Merge the loop's bookkeeping into the state file.
+
+    The file is reloaded first because the CLI may have set PAUSED or KILLED
+    mid-cycle; a plain save_state(st) with the loop's stale copy would erase
+    that command. A state change is applied only as a compare-and-set
+    `transition=(from, to)` or an unconditional `kill=reason`. `st` is
+    updated in place to the merged result so the caller sees CLI changes.
+    """
+    cur = load_state()
+    for k in LOOP_KEYS:
+        if k in st:
+            cur[k] = st[k]
+    if kill is not None:
+        cur["state"] = KILLED
+        cur["kill_reason"] = kill
+    elif transition and cur["state"] == transition[0]:
+        cur["state"] = transition[1]
+    save_state(cur)
+    st.clear()
+    st.update(cur)
     return st
 
 

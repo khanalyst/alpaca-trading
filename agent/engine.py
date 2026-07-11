@@ -43,8 +43,11 @@ class Engine:
     def run(self) -> None:
         state.write_pid()
         st = state.load_state()
-        if st["state"] == state.PAUSED:
+        if st["state"] == state.PAUSED and not st.get("operator_pause"):
             st = state.set_state(state.RUNNING)
+        elif st["state"] == state.PAUSED:
+            log.info("Operator pause is in effect; housekeeping only until "
+                     "'python main.py resume'.")
         log.info("Agent loop started | mode=%s | state=%s | llm=%s/%s",
                  self.cfg["mode"].upper(), st["state"],
                  self.cfg["llm"]["provider"], self.cfg["llm"]["model"])
@@ -64,10 +67,13 @@ class Engine:
                     state.log_event("error", str(e))
                 time.sleep(int(self.cfg["cycle"]["interval_seconds"]))
         except KeyboardInterrupt:
-            log.warning("Interrupted. State set to PAUSED. Open positions "
-                        "keep their exchange-side stop-loss/take-profit "
-                        "orders on OKX.")
-            state.set_state(state.PAUSED)
+            if state.load_state()["state"] == state.KILLED:
+                log.warning("Interrupted during a kill; state stays KILLED.")
+            else:
+                log.warning("Interrupted. State set to PAUSED. Open positions "
+                            "keep their exchange-side stop-loss/take-profit "
+                            "orders on OKX.")
+                state.set_state(state.PAUSED)
         finally:
             state.clear_pid()
 
@@ -80,9 +86,13 @@ class Engine:
             log.warning("Equity reads as 0; skipping cycle")
             return
 
+        # --- drop expired per-symbol cooldowns
+        st["cooldowns"] = {s: t for s, t in (st.get("cooldowns") or {}).items()
+                           if float(t) > now}
+
         # --- deposits / withdrawals: rebase benchmarks, never trade on them
         since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
-        net_transfer, latest_ts = self.ex.transfers_since(since)
+        net_transfer, next_since = self.ex.transfers_since(since)
         if abs(net_transfer) > 0.01:
             log.info("Net transfer detected: %+.2f USDT; rebasing benchmarks",
                      net_transfer)
@@ -93,7 +103,7 @@ class Engine:
                 st["day_start_equity"] = max(
                     1e-9, st["day_start_equity"] + net_transfer)
             state.log_event("transfer", json.dumps({"net_usdt": net_transfer}))
-        st["last_ledger_ts"] = max(latest_ts, since)
+        st["last_ledger_ts"] = next_since
 
         # --- UTC day rollover
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -101,7 +111,7 @@ class Engine:
             st["day"] = today
             st["day_start_equity"] = equity
             if st["state"] == state.DAY_STOPPED:
-                st["state"] = state.RUNNING
+                state.commit(st, transition=(state.DAY_STOPPED, state.RUNNING))
                 log.info("New UTC day; trading re-enabled")
 
         if not st.get("high_water_mark"):
@@ -116,9 +126,7 @@ class Engine:
             log.error("MAX DRAWDOWN breached (%.1f%% from high-water mark). "
                       "Flattening everything and self-killing.", drawdown_pct)
             self.flatten_all("max drawdown breached")
-            st["state"] = state.KILLED
-            st["kill_reason"] = f"max drawdown {drawdown_pct:.1f}%"
-            state.save_state(st)
+            state.commit(st, kill=f"max drawdown {drawdown_pct:.1f}%")
             raise SystemExit(1)
 
         day_pnl_pct = (equity - st["day_start_equity"]) / st["day_start_equity"] * 100
@@ -126,11 +134,11 @@ class Engine:
                 and st["state"] == state.RUNNING):
             log.warning("Daily loss limit hit (%.1f%%). No new entries until "
                         "the next UTC day.", day_pnl_pct)
-            st["state"] = state.DAY_STOPPED
+            state.commit(st, transition=(state.RUNNING, state.DAY_STOPPED))
             state.log_event("daily_stop", f"{day_pnl_pct:.2f}%")
             if r.get("flatten_on_daily_stop"):
                 self.flatten_all("daily loss limit")
-        state.save_state(st)
+        state.commit(st)
 
         # --- universe refresh
         refresh_s = float(self.cfg["universe"]["refresh_minutes"]) * 60
@@ -145,6 +153,8 @@ class Engine:
 
         if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
             return  # PAUSED: no LLM calls, no new trades
+        if st["state"] == state.DAY_STOPPED and not positions:
+            return  # opens blocked and nothing held: an LLM call cannot act
 
         # --- build snapshot and ask the brain
         symbols = list(dict.fromkeys(
@@ -164,13 +174,16 @@ class Engine:
             return
         if decisions:
             state.log_event("decisions", json.dumps(decisions))
+        # Pick up any pause/kill the CLI issued while the LLM call was running.
+        state.commit(st)
 
         # --- closes first
         for d in [d for d in decisions if d["action"] == "close"]:
             pos = next((p for p in positions
                         if p.get("symbol") == d.get("symbol")), None)
-            if pos:
-                self._close(pos, "model close: " + d.get("reasoning", ""), st)
+            if pos and self._close(pos,
+                                   "model close: " + d.get("reasoning", ""),
+                                   st):
                 positions.remove(pos)
 
         # --- opens (blocked while DAY_STOPPED)
@@ -192,7 +205,7 @@ class Engine:
                 gross += plan["notional"]
                 positions.append({"symbol": plan["symbol"],
                                   "notional": plan["notional"]})
-        state.save_state(st)
+        state.commit(st)
 
     # ------------------------------------------------------------ execution
 
@@ -240,13 +253,13 @@ class Engine:
                  plan["confidence"], plan["reason"])
         return True
 
-    def _close(self, pos: dict, reason: str, st: dict) -> None:
+    def _close(self, pos: dict, reason: str, st: dict) -> bool:
         symbol = pos["symbol"]
         try:
             self.ex.close_position(pos)
         except Exception as e:
             log.error("Close failed for %s: %s", symbol, e)
-            return
+            return False
         try:
             price = self.ex.price(symbol)
         except Exception:
@@ -261,9 +274,10 @@ class Engine:
             cooldown = float(self.cfg["risk"]["cooldown_minutes_after_loss"])
             st.setdefault("cooldowns", {})[symbol] = time.time() + cooldown * 60
         st.get("opened_at", {}).pop(symbol, None)
-        state.save_state(st)
+        state.commit(st)
         log.info("CLOSED %s (%s, %.2f%% uPnL at close): %s",
                  symbol, pos.get("side"), upnl_pct, reason)
+        return True
 
     # --------------------------------------------------------- housekeeping
 
@@ -274,8 +288,8 @@ class Engine:
         kept = []
         for p in positions:
             opened = st.get("opened_at", {}).get(p["symbol"])
-            if opened and now - opened > float(r["max_hold_hours"]) * 3600:
-                self._close(p, "max hold time reached", st)
+            if (opened and now - opened > float(r["max_hold_hours"]) * 3600
+                    and self._close(p, "max hold time reached", st)):
                 continue
             kept.append(p)
 
@@ -287,7 +301,10 @@ class Engine:
             log.warning("Margin usage %.0f%% above %.0f%% cap; closing "
                         "largest position %s", usage,
                         float(r["max_margin_usage_pct"]), biggest["symbol"])
-            self._close(biggest, "margin usage guard", st)
+            if not self._close(biggest, "margin usage guard", st):
+                kept.insert(0, biggest)
+                break
+            time.sleep(2)  # let the close settle before re-reading margin
             usage = self.ex.margin_usage_pct()
         return kept
 
@@ -337,7 +354,7 @@ class Engine:
 
     # ------------------------------------------------------------- flatten
 
-    def flatten_all(self, reason: str) -> None:
+    def flatten_all(self, reason: str) -> bool:
         log.warning("FLATTEN ALL (cancel every order, close every position): %s",
                     reason)
         try:
@@ -345,6 +362,12 @@ class Engine:
         except Exception as e:
             log.error("cancel_everything: %s", e)
         st = state.load_state()
+        failed = []
         for p in self.ex.positions():
-            self._close(p, f"flatten: {reason}", st)
+            if not self._close(p, f"flatten: {reason}", st):
+                failed.append(str(p.get("symbol")))
+        if failed:
+            log.error("FLATTEN INCOMPLETE; still open: %s. Close them "
+                      "manually on OKX.", ", ".join(failed))
         state.log_event("flatten", reason)
+        return not failed

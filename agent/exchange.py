@@ -91,16 +91,24 @@ class Exchange:
 
         Used to rebase the drawdown and daily-loss benchmarks so a deposit is
         not counted as profit and a withdrawal is not counted as a crash.
+
+        Returns (net_usdt, next_since_ms). fetch_ledger treats `since` as
+        inclusive, so the cursor advances one past the newest entry counted --
+        otherwise the same transfer is re-counted every cycle until a newer
+        ledger entry appears. On error the cursor stays put so transfers that
+        happened during an outage are picked up on recovery.
         """
-        latest = since_ms
-        net = 0.0
         try:
             entries = self.retry(self.x.fetch_ledger, "USDT", since_ms, 100)
         except Exception as e:
             log.debug("fetch_ledger unavailable: %s", e)
-            return 0.0, int(time.time() * 1000)
+            return 0.0, since_ms
+        net = 0.0
+        latest = since_ms - 1
         for e in entries or []:
-            ts = e.get("timestamp") or 0
+            ts = int(e.get("timestamp") or 0)
+            if ts < since_ms:
+                continue
             latest = max(latest, ts)
             okx_type = str((e.get("info") or {}).get("type", ""))
             is_transfer = e.get("type") == "transfer" or okx_type == "1"
@@ -112,7 +120,7 @@ class Exchange:
                 net += amt
             elif direction == "out":
                 net -= amt
-        return net, latest
+        return net, latest + 1
 
     def positions(self) -> list[dict]:
         out = []
@@ -170,7 +178,20 @@ class Exchange:
                        {"tdMode": "cross", "reduceOnly": True,
                         "stopLossPrice": sl})
         except Exception as e:
-            log.error("stop-loss placement failed for %s: %s", symbol, e)
+            # A leveraged position must never run without a stop-loss: the
+            # entry already filled, so close it rather than leave it naked.
+            log.error("stop-loss placement failed for %s: %s; closing the "
+                      "unprotected position", symbol, e)
+            try:
+                self.retry(self.x.create_order, symbol, "market", opposite,
+                           contracts, None,
+                           {"tdMode": "cross", "reduceOnly": True})
+            except Exception as e2:
+                log.critical("EMERGENCY CLOSE FAILED for %s: %s. Position is "
+                             "open with NO stop-loss.", symbol, e2)
+            raise RuntimeError(
+                f"{symbol}: entry filled but stop-loss could not be placed; "
+                "position closed") from e
         try:
             self.retry(self.x.create_order, symbol, "market", opposite,
                        contracts, None,
