@@ -196,43 +196,169 @@ only sees (and trades with) the Trading account balance.
 
 ---
 
-## Strategy and the risk engine
+## How the agent thinks
 
-The model is prompted as an aggressive, disciplined momentum day trader:
-multi-timeframe trend alignment (15m impulse with the 1h/4h trend), long and
-short, funding-rate aware, ATR-aware stops, at least 2R take-profits, no
-averaging down, and "flat is a position". It sees a compact snapshot per
-symbol (price, 24h change, volume, funding, RSI, ATR%, trend per timeframe,
-momentum, range position) plus the live portfolio in percentage terms.
+Every cycle (default: every 5 minutes) the agent runs the same loop:
 
-The universe is rebuilt hourly: top `top_n` USDT perpetuals by 24h quote
-volume above `min_24h_quote_volume_usd` (default $50m). Thin and newly listed
-coins never qualify; the indicator history requirement filters fresh listings
-a second time.
+1. **Sync equity and money movements.** It reads live Trading-account equity
+   and checks the OKX ledger for deposits/withdrawals, rebasing its
+   benchmarks so a transfer is never mistaken for profit or a crash.
+2. **Check the circuit breakers first.** If the account is down past the
+   daily loss limit, no new positions open until the next UTC day. If it's
+   down past the max drawdown from its high-water mark, it flattens
+   everything and self-kills (see Caveats).
+3. **Refresh the tradable universe (hourly).** The top `top_n` USDT
+   perpetuals by 24h volume above `min_24h_quote_volume_usd` (default $50m).
+   Thin and newly listed coins never qualify; the indicator-history
+   requirement filters fresh listings a second time.
+4. **Housekeep open positions.** Force-close anything past `max_hold_hours`,
+   and if margin usage exceeds `max_margin_usage_pct`, close the largest
+   position(s) until it's healthy.
+5. **Ask the brain.** It builds a compact snapshot per symbol — price, 24h
+   change, volume, funding rate, RSI, ATR%, trend on 15m/1h/4h, 1h momentum,
+   position within the 24h range — plus the live portfolio (equity, day PnL,
+   drawdown, each open position's unrealised PnL and age). The LLM is
+   prompted as an **aggressive but disciplined momentum day trader**:
+   multi-timeframe trend alignment (a 15m impulse in the direction of the
+   1h/4h trend is the A+ setup), long and short with equal comfort,
+   funding-rate aware, ATR-sized stops, take-profits of at least 2x the stop
+   distance, never averaging down, and "flat is a position" — returning zero
+   trades is normal and often correct. It replies as strict JSON.
+6. **The risk engine disposes.** The model only *proposes*. A deterministic
+   engine ([agent/risk.py](agent/risk.py)) then vets every proposal:
+   discards anything below the confidence floor, rejects symbols already held
+   or in post-loss cooldown, clamps leverage, and **sizes each position from
+   your stop distance so that being stopped out loses exactly
+   `risk_per_trade_pct` of equity** — then caps that by the per-position and
+   whole-book exposure limits. Closes execute first, then the surviving opens
+   (highest confidence first).
+7. **Execute with protection.** Orders go to OKX with **exchange-side
+   stop-loss and take-profit attached**, so positions stay protected even if
+   this process dies. If a stop-loss can't be placed after an entry fills,
+   the agent immediately closes that position rather than run it naked.
 
-The risk engine then clamps every proposal. All values live in `config.yaml`:
+The LLM never touches the exchange, never sizes a position, and never
+overrides a cap. It is an idea generator inside hard, code-enforced rails.
 
-| Parameter | Default | Meaning |
+### How many positions can it hold at once?
+
+- **At most `max_concurrent_positions` open positions simultaneously**
+  (default **3**).
+- **One position per symbol.** It never adds to or averages into a symbol it
+  already holds — a second proposal on the same symbol is rejected.
+- **Each new cycle it may open at most `max_concurrent_positions` minus what
+  it already holds.** If 3 are open, it can only close or hold until a slot
+  frees up.
+- **Total size is capped two ways regardless of count:** each position is at
+  most `max_position_notional_pct` of equity (default 40%), and the whole
+  book is at most `max_gross_exposure_pct` of equity (default 150%).
+
+So the maximum book is 3 positions, each on a different symbol, each ≤40% of
+equity, summing to ≤150% of equity in notional.
+
+---
+
+## Configuration reference — where to change what
+
+Everything lives in [`config.yaml`](config.yaml). Edit it, then restart the
+agent. Grouped by what you're trying to change:
+
+**Switch demo ↔ live** — `mode` (`demo` | `live`). Demo and live use separate
+API keys; the mode must match the keys in `.env`.
+
+**Change the brain (`llm:` block)**
+
+| Parameter | Default | What it does |
 | --- | --- | --- |
-| `max_leverage` | 3 | Per position. Hard ceiling of 10 in code regardless of config. |
-| `risk_per_trade_pct` | 1.5 | % of equity lost if a stop is hit; position size is derived from this and the stop distance |
+| `provider` | `anthropic` | `anthropic` or `openai` |
+| `model` | `claude-sonnet-4-6` | Any model from that provider (e.g. `claude-opus-4-8`, `gpt-4.1`) |
+| `temperature` | 0.2 | Creativity; auto-ignored on models that reject it |
+| `max_tokens` | 2000 | Cap on the model's reply length |
+
+**Change what it watches (`universe:` block)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `top_n` | 10 | Trade only the N highest-volume USDT perps |
+| `min_24h_quote_volume_usd` | 50000000 | Liquidity floor; filters thin/new coins |
+| `denylist` | `[]` | Symbols to ban, e.g. `["DOGE/USDT:USDT"]` |
+| `refresh_minutes` | 60 | How often the volume ranking is rebuilt |
+
+**Change how often it thinks (`cycle:` block)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `interval_seconds` | 300 | Seconds between decisions. **Biggest cost lever** — raising it cuts the AI bill proportionally |
+| `timeframes` | `[15m,1h,4h]` | Candle timeframes fed to the model |
+| `candles` | 120 | Candles per timeframe; also excludes coins lacking history |
+
+**Change how aggressive it is (`risk:` sizing)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `max_leverage` | 3 | Per-position leverage cap. **Hard ceiling of 10 in code** regardless of config |
+| `risk_per_trade_pct` | 1.5 | % of equity lost if a stop is hit; position size is derived from this |
 | `max_position_notional_pct` | 40 | Per-position notional cap, % of equity |
 | `max_gross_exposure_pct` | 150 | Whole-book notional cap, % of equity |
-| `max_concurrent_positions` | 3 | |
-| `min_confidence` | 0.65 | Model decisions below this are discarded |
+| `max_concurrent_positions` | 3 | Max simultaneous open positions |
+| `min_confidence` | 0.65 | Proposals below this are discarded |
 | `max_hold_hours` | 24 | Stale positions are force-closed |
-| `daily_loss_limit_pct` | 5 | Daily circuit breaker |
-| `max_drawdown_pct` | 15 | Account circuit breaker: flatten and self-kill |
-| `max_margin_usage_pct` | 60 | Margin guard threshold |
+
+**Change the safety brakes (`risk:` circuit breakers)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `daily_loss_limit_pct` | 5 | Down this much on the day → no new entries until next UTC day |
+| `flatten_on_daily_stop` | false | `true` also closes open positions when the daily stop trips |
+| `max_drawdown_pct` | 15 | Down this much from the high-water mark → flatten everything and self-kill |
+| `max_margin_usage_pct` | 60 | Above this, close the largest position(s) to reduce margin |
 | `cooldown_minutes_after_loss` | 45 | Per-symbol timeout after a losing close |
 
-Turning aggression up means raising `max_leverage`, `risk_per_trade_pct` and
-`max_gross_exposure_pct`. Understand the compounding of those three before
-touching them: 3 positions at 2% risk each is a 6% day if everything stops
-out at once.
+**Change execution (`execution:` block)** — `slippage_guard_pct` (default 0.5):
+abort an entry if price moved more than this between analysis and execution.
 
-If a stop-loss order cannot be placed right after an entry fills, the agent
-closes that position immediately rather than let it run unprotected.
+> **To turn aggression up**, raise `max_leverage`, `risk_per_trade_pct`, and
+> `max_gross_exposure_pct` — but understand how they compound: 3 positions at
+> 2% risk each is a 6% day if everything stops out at once. A few limits are
+> hard-coded in [agent/risk.py](agent/risk.py) and cannot be raised via
+> config: leverage is capped at 10, stop distances must be between 0.2% and
+> 15%, and positions below ~$10 notional are skipped.
+
+---
+
+## Caveats and limitations
+
+Read these before running anything with real money.
+
+- **Leverage can lose money faster than it makes it, and liquidation is
+  real.** No strategy — human or model-driven — guarantees profit or a "10x".
+  The caps and breakers here enforce discipline; they do not promise gains.
+- **The brain is a probabilistic model, not an oracle.** It can propose bad
+  trades, misread a regime, or produce malformed output. The risk engine
+  bounds the damage (sizing, caps, cooldowns) but cannot make a losing
+  strategy win.
+- **No alerting exists.** If the agent self-kills or an error stops it at 3am,
+  it goes silent — nothing texts or emails you. Check `status` daily, or wire
+  the log into your own notifier.
+- **The drawdown self-kill halts the agent until a human intervenes.** After a
+  15% drawdown it flattens and refuses to trade again until you run
+  `--acknowledge-kill`. This is intentional (a human should review a blow-up),
+  but it means the agent can sit dead through a recovery.
+- **It needs an always-on machine and network.** If the process dies, no new
+  decisions happen. Open positions remain protected by their exchange-side
+  stop-losses on OKX, but nothing new is managed until it's back up.
+- **Demo results ≠ live results.** Demo fills are idealized. Live trading adds
+  real slippage, trading fees, funding payments, and occasional partial
+  fills. Expect live to underperform demo.
+- **It costs money even in demo.** The LLM calls are real (~$50–95/month at
+  the default cycle). Only the trading is simulated in demo mode.
+- **One OKX account per running instance,** and it only sees the **Trading**
+  account balance (not Funding). For multiple strategies, use OKX
+  sub-accounts (see below).
+- **The daily reset is UTC,** not your local midnight. The daily loss limit
+  and PnL are measured against the start of the UTC day.
+- **This is software, not investment advice.** You own every parameter in
+  `config.yaml` and every trade the account takes.
 
 ---
 
