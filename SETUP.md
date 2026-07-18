@@ -393,6 +393,15 @@ and a SQLite journal. All commands run from inside the repo folder.
   sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, reason FROM trades ORDER BY ts DESC LIMIT 10;"
   ```
 
+- The performance report (after it has traded for a while):
+
+  ```bash
+  python3 report.py
+  ```
+
+  Shows the equity curve, win rate, expectancy, per-symbol results, and
+  whether the model's confidence numbers actually predict outcomes.
+
 **There is no built-in alerting.** If the agent self-kills at 3am it stays
 down silently. Check `status` daily, or pipe `runtime/agent.log` into
 whatever notification tool you already use.

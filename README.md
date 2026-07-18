@@ -216,7 +216,9 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    position(s) until it's healthy.
 5. **Ask the brain.** It builds a compact snapshot per symbol — price, 24h
    change, volume, funding rate, RSI, ATR%, trend on 15m/1h/4h, 1h momentum,
-   position within the 24h range — plus the live portfolio (equity, day PnL,
+   position within the 24h range, distance to the recent swing high/low and
+   to the 1h EMA20 (structure anchors for stop placement) — plus the live
+   portfolio (equity, day PnL,
    drawdown, each open position's unrealised PnL and age). The LLM is
    prompted as an **aggressive but disciplined momentum day trader**:
    multi-timeframe trend alignment (a 15m impulse in the direction of the
@@ -229,9 +231,11 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    discards anything below the confidence floor, rejects symbols already held
    or in post-loss cooldown, clamps leverage, and **sizes each position from
    your stop distance so that being stopped out loses exactly
-   `risk_per_trade_pct` of equity** — then caps that by the per-position and
-   whole-book exposure limits. Closes execute first, then the surviving opens
-   (highest confidence first).
+   `risk_per_trade_pct` of equity** — then caps that by the per-position,
+   whole-book, and net-direction exposure limits (the last one stops several
+   same-direction positions in correlated coins from acting as one oversized
+   macro bet). Closes execute first, then the surviving opens (highest
+   confidence first).
 7. **Execute with protection.** Orders go to OKX with **exchange-side
    stop-loss and take-profit attached**, so positions stay protected even if
    this process dies. If a stop-loss can't be placed after an entry fills,
@@ -249,12 +253,15 @@ overrides a cap. It is an idea generator inside hard, code-enforced rails.
 - **Each new cycle it may open at most `max_concurrent_positions` minus what
   it already holds.** If 3 are open, it can only close or hold until a slot
   frees up.
-- **Total size is capped two ways regardless of count:** each position is at
-  most `max_position_notional_pct` of equity (default 40%), and the whole
-  book is at most `max_gross_exposure_pct` of equity (default 150%).
+- **Total size is capped three ways regardless of count:** each position is
+  at most `max_position_notional_pct` of equity (default 40%), the whole book
+  is at most `max_gross_exposure_pct` of equity (default 150%), and the *net
+  direction* (long notional minus short notional) is at most
+  `max_net_direction_pct` of equity (default 100%) — because three correlated
+  longs are really one big long.
 
 So the maximum book is 3 positions, each on a different symbol, each ≤40% of
-equity, summing to ≤150% of equity in notional.
+equity, ≤150% total notional, and ≤100% net in one direction.
 
 ---
 
@@ -300,6 +307,7 @@ API keys; the mode must match the keys in `.env`.
 | `risk_per_trade_pct` | 1.5 | % of equity lost if a stop is hit; position size is derived from this |
 | `max_position_notional_pct` | 40 | Per-position notional cap, % of equity |
 | `max_gross_exposure_pct` | 150 | Whole-book notional cap, % of equity |
+| `max_net_direction_pct` | 100 | Cap on net long-minus-short notional, % of equity (correlation guard) |
 | `max_concurrent_positions` | 3 | Max simultaneous open positions |
 | `min_confidence` | 0.65 | Proposals below this are discarded |
 | `max_hold_hours` | 24 | Stale positions are force-closed |
@@ -323,6 +331,14 @@ abort an entry if price moved more than this between analysis and execution.
 > hard-coded in [agent/risk.py](agent/risk.py) and cannot be raised via
 > config: leverage is capped at 10, stop distances must be between 0.2% and
 > 15%, and positions below ~$10 notional are skipped.
+>
+> **Know your *effective* risk per trade.** Sizing takes the *minimum* of
+> three caps, so `risk_per_trade_pct` is a ceiling, not a promise: with a
+> typical 1.5–2% stop, the 40% per-position notional cap binds first and the
+> actual loss on a stop-out is ~0.6–0.8% of equity, not 1.5%. The risk
+> target only fully binds for stops wider than ~3.75%
+> (= risk 1.5 ÷ cap 0.40). The model can also voluntarily request less via
+> `size_pct_equity`; it is prompted to do so only deliberately.
 
 ---
 
@@ -371,6 +387,18 @@ rejection, trade, transfer and an equity curve snapshot per cycle.
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), equity FROM equity ORDER BY ts DESC LIMIT 10;"
 ```
+
+Opens are journaled with the model's **confidence** and closes with the
+**realized PnL%**, so performance is measurable, not vibes:
+
+```bash
+python3 report.py    # equity curve, win rate, expectancy, per-symbol results,
+                     # confidence calibration, rejection reasons
+```
+
+The calibration table is the one to watch: if 0.9-confidence trades don't
+outperform 0.7s after a few weeks, the confidence floor is not doing what
+you think.
 
 Plain-text logs are in `runtime/agent.log`.
 

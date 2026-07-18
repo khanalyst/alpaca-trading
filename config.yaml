@@ -29,7 +29,12 @@ universe:
 
 cycle:
   interval_seconds: 300              # decision cycle (300 = one LLM call every 5 min)
-  timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model
+  timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model.
+                                     # NOTE: the model's field reference in
+                                     # agent/brain.py describes these defaults
+                                     # (trend_15m/1h/4h etc.); if you change
+                                     # them, update SYSTEM there too or the
+                                     # model will misread the snapshot.
   candles: 120                       # candles per timeframe (also excludes brand-new
                                      # listings that lack 4h history)
 
@@ -39,6 +44,9 @@ risk:
   risk_per_trade_pct: 1.5        # % of equity lost if a stop-loss is hit
   max_position_notional_pct: 40  # per-position notional cap, % of equity
   max_gross_exposure_pct: 150    # total notional across all positions, % of equity
+  max_net_direction_pct: 100     # cap on |long minus short| notional, % of equity.
+                                 # Correlation guard: most alts follow BTC, so
+                                 # 3 same-direction positions act as one big bet.
   max_concurrent_positions: 3
   min_confidence: 0.65           # model decisions below this are discarded
   max_hold_hours: 24             # day-trading discipline: no stale positions

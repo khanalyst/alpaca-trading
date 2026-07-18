@@ -137,8 +137,14 @@ def _db() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades ("
         "ts REAL, symbol TEXT, side TEXT, action TEXT, qty REAL, price REAL, "
-        "notional REAL, leverage REAL, reason TEXT)"
+        "notional REAL, leverage REAL, reason TEXT, confidence REAL, "
+        "pnl_pct REAL)"
     )
+    # Migrate journals created before confidence/pnl_pct existed.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+    for col in ("confidence", "pnl_pct"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS equity (ts REAL, equity REAL, state TEXT)"
     )
@@ -155,13 +161,19 @@ def log_event(kind: str, payload: str) -> None:
         pass
 
 
-def log_trade(symbol, side, action, qty, price, notional, leverage, reason) -> None:
+def log_trade(symbol, side, action, qty, price, notional, leverage, reason,
+              confidence=None, pnl_pct=None) -> None:
+    """Journal one trade. Opens carry the model's confidence; closes carry
+    the realized PnL percent — together they make calibration measurable
+    (does 0.8-confidence actually outperform 0.7?). See report.py."""
     try:
         with _db() as c:
             c.execute(
-                "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO trades (ts, symbol, side, action, qty, price, "
+                "notional, leverage, reason, confidence, pnl_pct) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), symbol, side, action, qty, price, notional,
-                 leverage, reason),
+                 leverage, reason, confidence, pnl_pct),
             )
     except Exception:
         pass

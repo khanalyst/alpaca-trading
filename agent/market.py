@@ -116,6 +116,16 @@ def symbol_snapshot(ex, symbol: str, cfg: dict) -> dict:
         float(df_fast["close"].pct_change(4).iloc[-1] * 100), 2
     )
 
+    # Structure anchors: recent swing extremes (last 20 fast-frame candles,
+    # ~5h on 15m) and distance from the 1h EMA20, so the model can place
+    # stops beyond real levels instead of blind ATR multiples.
+    lows = df_fast["low"].tail(20)
+    highs = df_fast["high"].tail(20)
+    snap["swing_low_pct"] = round((last - float(lows.min())) / last * 100, 2)
+    snap["swing_high_pct"] = round((float(highs.max()) - last) / last * 100, 2)
+    e20_1h = float(ema(df_1h["close"], 20).iloc[-1])
+    snap["ema20_1h_dist_pct"] = round((last - e20_1h) / e20_1h * 100, 2)
+
     hi = float(ticker.get("high") or 0)
     lo = float(ticker.get("low") or 0)
     if hi > lo > 0:

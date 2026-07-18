@@ -198,7 +198,10 @@ class Exchange:
                        {"tdMode": "cross", "reduceOnly": True,
                         "takeProfitPrice": tp})
         except Exception as e:
-            log.warning("take-profit placement failed for %s: %s", symbol, e)
+            # Not fatal (the stop-loss is in place and the model can close
+            # manually), but loud: this position will not auto-take-profit.
+            log.error("take-profit placement failed for %s: %s — position "
+                      "is protected by SL only", symbol, e)
         return order
 
     def close_position(self, pos: dict):
@@ -207,10 +210,15 @@ class Exchange:
         if contracts <= 0:
             return None
         side = "sell" if pos.get("side") == "long" else "buy"
+        # Close FIRST, cancel protection after. If the close order fails the
+        # position still has its stop-loss; and leftover reduce-only SL/TP
+        # orders on a now-flat position can never open new exposure (they
+        # simply fail if triggered), so late cancellation is harmless.
+        order = self.retry(self.x.create_order, symbol, "market", side,
+                           contracts, None,
+                           {"tdMode": "cross", "reduceOnly": True})
         self.cancel_symbol(symbol)
-        return self.retry(self.x.create_order, symbol, "market", side,
-                          contracts, None,
-                          {"tdMode": "cross", "reduceOnly": True})
+        return order
 
     # --------------------------------------------------------- cancellation
 

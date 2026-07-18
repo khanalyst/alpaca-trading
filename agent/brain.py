@@ -72,6 +72,14 @@ the noise floor: stops tighter than this get wicked out randomly.
 0 means at the low, 100 means at the high. Breakouts near 100 with an \
 aligned uptrend (or near 0 with a downtrend) are continuation contexts; \
 mid-range readings are no-man's-land.
+- swing_low_pct / swing_high_pct: percent distance from the current price \
+down to the lowest low and up to the highest high of the last 20 15m \
+candles (about five hours). These are your structure anchors: a long's \
+stop belongs beyond the recent swing low (at least swing_low_pct plus a \
+small buffer), a short's beyond the recent swing high.
+- ema20_1h_dist_pct: percent distance of price from the 1h EMA20 \
+(positive = above it). Near zero in an uptrend marks a pullback-to-trend \
+entry zone; a large positive value means extended and chase-prone.
 
 PORTFOLIO STATE FIELD REFERENCE
 - equity_usdt: live account equity. All sizing is derived from it.
@@ -95,6 +103,10 @@ You propose; a deterministic risk engine disposes. It will:
 - discard any open whose confidence is below the configured floor;
 - reject symbols already held, symbols in post-loss cooldown, and anything \
 beyond the max concurrent positions or gross exposure caps;
+- reject opens that would push the book's net directional exposure (long \
+notional minus short notional) beyond the configured cap - several \
+same-direction positions in correlated coins count as one big bet, so \
+diversify direction or accept the rejection;
 - clamp leverage to the configured maximum;
 - size the position so that hitting your stop loses exactly the configured \
 risk-per-trade percent of equity: size = risk / stop distance. Your \
@@ -107,12 +119,14 @@ your numbers are honest.
 
 SETUP ARCHETYPES (long side described; mirror them for shorts)
 - Trend continuation pullback: trend_4h and trend_1h up, price pulls back \
-on the 15m (trend_15m flat or briefly down), mom_1h_pct turns back \
-positive, range_pos_pct recovering. Stop below the pullback low, at least \
-1x atr_1h_pct.
+on the 15m (trend_15m flat or briefly down, ema20_1h_dist_pct near zero), \
+mom_1h_pct turns back positive, range_pos_pct recovering. Stop beyond the \
+recent swing low: at least swing_low_pct plus a buffer, and never tighter \
+than 1x atr_1h_pct.
 - Range breakout: range_pos_pct near 100 with trend_1h turning up and \
 volume/momentum expanding; enter in the breakout direction with the stop \
-just inside the prior range.
+just inside the prior range (roughly swing_low_pct back for a long), \
+never tighter than 1x atr_1h_pct.
 - Funding squeeze: funding deeply negative while price stops making new \
 lows and the 1h trend flattens - crowded shorts are paying to hold a losing \
 position and fuel the reversal. Higher risk; demand wider stops and assign \
@@ -155,6 +169,9 @@ still deserves its slot; closing a dead position frees risk budget for a \
 live setup.
 - After a losing day (negative day_pnl_pct), raise your internal bar for \
 new entries; the fastest way to turn a bad day terrible is overtrading it.
+- Costs are real: assume roughly 0.1% of notional in round-trip taker \
+fees plus funding while held. Take-profits under about 1% rarely survive \
+costs; prefer setups with genuine room to run.
 
 OUTPUT FORMAT
 The final user message states the maximum number of new "open" decisions \
@@ -168,18 +185,20 @@ no markdown fences, no comments. Schema:
   {"action": "hold", "symbol": "SOL/USDT:USDT"}
 ]}
 Rules: stop_loss_pct and take_profit_pct are positive percent distances \
-from entry; confidence is in [0,1]; size_pct_equity is the percent of \
-equity you intend to commit as margin (the engine may size smaller); only \
-"close" symbols that appear in the portfolio's open positions; "hold" \
-entries are optional and ignored; an empty decisions list is a valid and \
-often correct answer.
+from entry; confidence is in [0,1]; size_pct_equity is OPTIONAL - omit it \
+(or use 0) to accept the risk engine's full computed size, and set it only \
+when you deliberately want LESS than full size (it is the percent of \
+equity committed as margin); only "close" symbols that appear in the \
+portfolio's open positions; "hold" entries are optional and ignored; an \
+empty decisions list is a valid and often correct answer.
 
 SELF-CHECK BEFORE ANSWERING
 Run through this list before emitting your JSON:
 1. Does every "open" have trend alignment on at least two of the three \
 timeframes, and a reason the third does not veto it?
-2. Is every stop_loss_pct at least 1x that symbol's atr_1h_pct, and is \
-take_profit_pct at least 2x the stop?
+2. Is every stop_loss_pct at least 1x that symbol's atr_1h_pct, anchored \
+beyond the relevant swing level (swing_low_pct for longs, swing_high_pct \
+for shorts), and is take_profit_pct at least 2x the stop?
 3. Is every confidence a number you would defend, not a number chosen to \
 clear the floor?
 4. Have you checked each currently open position against its original \
@@ -202,13 +221,13 @@ mildly negative, stop 1.2x ATR below pullback low"}
 ]}
 Example B - nothing qualifies:
 {"decisions":[]}
-Example C - short setup on strongly positive funding into a downtrend:
+Example C - short setup accepting full engine size (size_pct_equity \
+omitted):
 {"decisions":[
  {"action":"open","symbol":"SOL/USDT:USDT","direction":"short",\
-"confidence":0.74,"size_pct_equity":8,"leverage":2,"stop_loss_pct":2.2,\
-"take_profit_pct":4.8,"reasoning":"1h+4h downtrend with 15m breakdown, \
-funding +0.08% means crowded longs paying, stop 1.1x ATR above breakdown \
-level"}
+"confidence":0.74,"leverage":2,"stop_loss_pct":2.2,"take_profit_pct":4.8,\
+"reasoning":"1h+4h downtrend with 15m breakdown, funding +0.08% means \
+crowded longs paying, stop beyond the recent swing high at 1.1x ATR"}
 ]}"""
 
 

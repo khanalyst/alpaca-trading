@@ -166,7 +166,10 @@ class Engine:
 
         portfolio = self._portfolio_view(equity, positions, st,
                                          day_pnl_pct, drawdown_pct)
-        max_new = int(r["max_concurrent_positions"]) - len(positions)
+        # While DAY_STOPPED the engine drops every open, so tell the model
+        # zero — otherwise it wastes output proposing entries that can't run.
+        max_new = (int(r["max_concurrent_positions"]) - len(positions)
+                   if st["state"] == state.RUNNING else 0)
         try:
             decisions = self.llm.decide(snapshot, portfolio, max_new)
         except Exception as e:
@@ -204,7 +207,8 @@ class Engine:
             if self._execute_open(plan, st):
                 gross += plan["notional"]
                 positions.append({"symbol": plan["symbol"],
-                                  "notional": plan["notional"]})
+                                  "notional": plan["notional"],
+                                  "side": plan["direction"]})
         state.commit(st)
 
     # ------------------------------------------------------------ execution
@@ -245,7 +249,8 @@ class Engine:
 
         st.setdefault("opened_at", {})[symbol] = time.time()
         state.log_trade(symbol, side, "open", contracts, live,
-                        plan["notional"], plan["leverage"], plan["reason"])
+                        plan["notional"], plan["leverage"], plan["reason"],
+                        confidence=plan["confidence"])
         log.info("OPENED %s %s | notional %.0f USDT | %.1fx | SL %.2f%% "
                  "TP %.2f%% | conf %.2f | %s",
                  plan["direction"].upper(), symbol, plan["notional"],
@@ -269,7 +274,7 @@ class Engine:
                         "sell" if pos.get("side") == "long" else "buy",
                         "close", abs(float(pos.get("contracts") or 0)), price,
                         self._notional(pos), float(pos.get("leverage") or 0),
-                        reason)
+                        reason, pnl_pct=upnl_pct)
         if upnl_pct < 0:
             cooldown = float(self.cfg["risk"]["cooldown_minutes_after_loss"])
             st.setdefault("cooldowns", {})[symbol] = time.time() + cooldown * 60
@@ -349,6 +354,8 @@ class Engine:
                 "max_leverage": r["max_leverage"],
                 "risk_per_trade_pct": r["risk_per_trade_pct"],
                 "max_concurrent_positions": r["max_concurrent_positions"],
+                "min_confidence": r["min_confidence"],
+                "max_net_direction_pct": r.get("max_net_direction_pct", 100),
             },
         }
 
