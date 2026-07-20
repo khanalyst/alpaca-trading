@@ -249,6 +249,9 @@ OKX_API_PASSPHRASE=your-demo-passphrase
 # From Step 2 — fill in ONLY the provider you chose
 ANTHROPIC_API_KEY=sk-ant-...
 # OPENAI_API_KEY=sk-...
+
+# Optional: only needed when alerts.enabled is true in config.yaml
+# ALERT_WEBHOOK_URL=https://hooks.example/...
 ```
 
 You only need the AI key for the provider set in `config.yaml`. Leave the
@@ -276,8 +279,13 @@ defaults. Here's what each block controls, so you know where to change what:
   drawdown, margin guard). See the "Configuration reference" and "How the
   agent thinks" sections in the [README](README.md) for exactly what each
   parameter does and how they interact.
-- **`execution`** — the slippage guard that aborts an entry if price moved
-  too far between the decision and the order.
+- **`execution`** — the slippage guard that aborts a stale entry and the
+  timeout used to verify actual and partial fills.
+- **`trading_costs`** — expected taker fees, stop slippage and funding holding
+  time passed to the LLM for net-reward and voluntary sizing decisions.
+- **`alerts`** — optional generic, Slack or Discord webhook alerts. Set
+  `enabled: true`, choose the format/severity, and put the URL in the named
+  `.env` variable.
 
 After any edit here, restart the agent for it to take effect.
 
@@ -399,12 +407,13 @@ and a SQLite journal. All commands run from inside the repo folder.
   python3 report.py
   ```
 
-  Shows the equity curve, win rate, expectancy, per-symbol results, and
-  whether the model's confidence numbers actually predict outcomes.
+  Shows transfer-adjusted equity, trade-ID-matched net USDT, notional- and
+  risk-weighted results, recorded costs, and confidence calibration.
 
-**There is no built-in alerting.** If the agent self-kills at 3am it stays
-down silently. Check `status` daily, or pipe `runtime/agent.log` into
-whatever notification tool you already use.
+For built-in alerts, set `alerts.enabled: true`, choose `generic`, `slack`, or
+`discord`, and set `ALERT_WEBHOOK_URL` in `.env`. Alerts cover circuit breakers,
+unprotected/reconciled positions, incomplete flattening, and cycle failures.
+Keep external uptime monitoring too: a dead machine cannot send its webhook.
 
 Confirm prompt caching is working (keeps your AI bill down): after a couple of
 cycles, `grep cache_read runtime/agent.log` — from the second call onward it

@@ -7,6 +7,7 @@ history to compute indicators.
 """
 
 import logging
+import time
 
 import numpy as np
 import pandas as pd
@@ -29,12 +30,46 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
 
 
 def atr_pct(df: pd.DataFrame, n: int = 14) -> float:
+    return float(atr_pct_series(df, n).iloc[-1])
+
+
+def atr_pct_series(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / n, adjust=False).mean()
-    return float(atr.iloc[-1] / df["close"].iloc[-1] * 100)
+    return atr / df["close"] * 100
+
+
+def _closed_ohlcv(ex, symbol: str, timeframe: str, limit: int) -> list:
+    """Fetch completed candles only; indicators should not use a live bar."""
+    raw = ex.retry(ex.x.fetch_ohlcv, symbol, timeframe, None, limit + 1) or []
+    if raw:
+        try:
+            duration_ms = int(ex.x.parse_timeframe(timeframe) * 1000)
+        except Exception:
+            duration_ms = {"15m": 900_000, "1h": 3_600_000,
+                           "4h": 14_400_000}.get(timeframe, 0)
+        if duration_ms and int(raw[-1][0]) + duration_ms > int(time.time() * 1000):
+            raw = raw[:-1]
+    return raw[-limit:]
+
+
+def classify_regime(snap: dict) -> str:
+    """Describe current conditions without deciding whether to trade them."""
+    atr_ratio = float(snap.get("atr_1h_ratio") or 0)
+    if atr_ratio >= 1.75:
+        return "high_volatility"
+    one, four = snap.get("trend_1h"), snap.get("trend_4h")
+    if one == four == "up":
+        return "trend_up"
+    if one == four == "down":
+        return "trend_down"
+    atr = max(float(snap.get("atr_1h_pct") or 0), 0.01)
+    if one == "flat" and abs(float(snap.get("mom_1h_pct") or 0)) < atr * 0.25:
+        return "choppy"
+    return "transition"
 
 
 # ------------------------------------------------------------- universe
@@ -67,14 +102,15 @@ def build_universe(ex, cfg: dict) -> list[str]:
 
 # ------------------------------------------------------------- snapshot
 
-def symbol_snapshot(ex, symbol: str, cfg: dict) -> dict:
+def symbol_snapshot(ex, symbol: str, cfg: dict,
+                    benchmark_returns: pd.Series | None = None) -> dict:
     tfs = cfg["cycle"]["timeframes"]
     n = cfg["cycle"]["candles"]
     ticker = ex.retry(ex.x.fetch_ticker, symbol)
 
     frames: dict[str, pd.DataFrame] = {}
     for tf in tfs:
-        raw = ex.retry(ex.x.fetch_ohlcv, symbol, tf, None, n)
+        raw = _closed_ohlcv(ex, symbol, tf, n)
         if not raw or len(raw) < 60:
             raise ValueError(f"insufficient {tf} history for {symbol}")
         frames[tf] = pd.DataFrame(
@@ -87,6 +123,13 @@ def symbol_snapshot(ex, symbol: str, cfg: dict) -> dict:
         "chg_24h_pct": round(float(ticker.get("percentage") or 0), 2),
         "vol_24h_musd": round(float(ticker.get("quoteVolume") or 0) / 1e6, 1),
     }
+    bid = float(ticker.get("bid") or 0)
+    ask = float(ticker.get("ask") or 0)
+    if ask >= bid > 0:
+        mid = (ask + bid) / 2
+        snap["spread_pct"] = round((ask - bid) / mid * 100, 4)
+    else:
+        snap["spread_pct"] = None
     try:
         fr = ex.retry(ex.x.fetch_funding_rate, symbol)
         snap["funding_rate_pct"] = round(
@@ -109,12 +152,36 @@ def symbol_snapshot(ex, symbol: str, cfg: dict) -> dict:
 
     df_1h = frames.get("1h", frames[tfs[-1]])
     snap["rsi_1h"] = round(float(rsi(df_1h["close"]).iloc[-1]), 1)
-    snap["atr_1h_pct"] = round(atr_pct(df_1h), 2)
+    atr_history = atr_pct_series(df_1h)
+    current_atr = float(atr_history.iloc[-1])
+    baseline_atr = float(atr_history.iloc[-51:-1].median())
+    snap["atr_1h_pct"] = round(current_atr, 2)
+    snap["atr_1h_ratio"] = round(current_atr / baseline_atr, 2) \
+        if baseline_atr > 0 else None
 
     df_fast = frames.get("15m", frames[tfs[0]])
     snap["mom_1h_pct"] = round(
         float(df_fast["close"].pct_change(4).iloc[-1] * 100), 2
     )
+    recent_volume = float(df_fast["vol"].tail(4).sum())
+    prior_windows = df_fast["vol"].iloc[:-4].rolling(4).sum().tail(20)
+    normal_volume = float(prior_windows.median())
+    snap["relative_volume_1h"] = round(recent_volume / normal_volume, 2) \
+        if normal_volume > 0 else None
+
+    if benchmark_returns is not None:
+        symbol_returns = df_1h.set_index("ts")["close"].pct_change().dropna()
+        aligned = pd.concat(
+            [symbol_returns.rename("symbol"),
+             benchmark_returns.rename("benchmark")],
+            axis=1, join="inner",
+        ).dropna().tail(30)
+        if len(aligned) >= 10:
+            corr = aligned["symbol"].corr(aligned["benchmark"])
+            snap["corr_btc_1h_30"] = round(float(corr), 2) \
+                if pd.notna(corr) else None
+        else:
+            snap["corr_btc_1h_30"] = None
 
     # Structure anchors: recent swing extremes (last 20 fast-frame candles,
     # ~5h on 15m) and distance from the 1h EMA20, so the model can place
@@ -130,14 +197,46 @@ def symbol_snapshot(ex, symbol: str, cfg: dict) -> dict:
     lo = float(ticker.get("low") or 0)
     if hi > lo > 0:
         snap["range_pos_pct"] = round((last - lo) / (hi - lo) * 100, 0)
+    snap["regime"] = classify_regime(snap)
     return snap
 
 
 def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
-    out = {}
+    benchmark = "BTC/USDT:USDT"
+    benchmark_returns = None
+    context = {"benchmark": benchmark, "regime": None}
+    try:
+        raw = _closed_ohlcv(ex, benchmark, "1h", cfg["cycle"]["candles"])
+        frame = pd.DataFrame(
+            raw, columns=["ts", "open", "high", "low", "close", "vol"]
+        )
+        benchmark_returns = frame.set_index("ts")["close"].pct_change().dropna()
+    except Exception as e:
+        log.warning("benchmark context failed: %s", e)
+
+    benchmark_snapshot = None
+    try:
+        # Broad-market context must still exist when BTC itself did not make
+        # the configured top-volume universe. Keep it out of the tradable
+        # symbol map unless it was actually selected.
+        benchmark_snapshot = symbol_snapshot(
+            ex, benchmark, cfg, benchmark_returns)
+        context.update({
+            "regime": benchmark_snapshot.get("regime"),
+            "atr_1h_ratio": benchmark_snapshot.get("atr_1h_ratio"),
+            "relative_volume_1h": benchmark_snapshot.get("relative_volume_1h"),
+            "mom_1h_pct": benchmark_snapshot.get("mom_1h_pct"),
+        })
+    except Exception as e:
+        log.warning("benchmark snapshot failed: %s", e)
+
+    out = {"_market_context": context}
     for sym in symbols:
         try:
-            out[sym] = symbol_snapshot(ex, sym, cfg)
+            if sym == benchmark and benchmark_snapshot is not None:
+                out[sym] = benchmark_snapshot
+            else:
+                out[sym] = symbol_snapshot(ex, sym, cfg, benchmark_returns)
         except Exception as e:
             log.warning("snapshot failed for %s: %s", sym, e)
-    return out
+    return out if len(out) > 1 else {}

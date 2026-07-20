@@ -63,6 +63,8 @@ it shrinks.
 | `agent/market.py` | Universe builder, indicators, market snapshot |
 | `agent/exchange.py` | All OKX calls (via ccxt), orders, kill-switch cancellation |
 | `agent/state.py` | State machine, PID file, SQLite journal |
+| `agent/config.py` | Fail-closed configuration schema and safe ranges |
+| `agent/alerts.py` | Optional generic, Slack, or Discord webhook alerts |
 
 ---
 
@@ -211,13 +213,19 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    perpetuals by 24h volume above `min_24h_quote_volume_usd` (default $50m).
    Thin and newly listed coins never qualify; the indicator-history
    requirement filters fresh listings a second time.
-4. **Housekeep open positions.** Force-close anything past `max_hold_hours`,
-   and if margin usage exceeds `max_margin_usage_pct`, close the largest
-   position(s) until it's healthy.
-5. **Ask the brain.** It builds a compact snapshot per symbol — price, 24h
-   change, volume, funding rate, RSI, ATR%, trend on 15m/1h/4h, 1h momentum,
-   position within the 24h range, distance to the recent swing high/low and
-   to the 1h EMA20 (structure anchors for stop placement) — plus the live
+4. **Reconcile and housekeep open positions.** The exchange is authoritative:
+   each cycle (including the first after a restart) matches live positions to
+   durable trade IDs, verifies stop-loss/take-profit coverage, restores known
+   protection where possible, and closes any position that cannot be verified
+   to have a stop. It then force-closes anything past `max_hold_hours`, and if
+   margin usage exceeds `max_margin_usage_pct`, closes the largest position(s)
+   until it's healthy.
+5. **Ask the brain.** It builds a compact snapshot per symbol — price, spread,
+   24h volume, completed-hour relative volume, funding rate, RSI, current
+   ATR%, ATR versus its recent history, trend on 15m/1h/4h, 1h momentum,
+   30-hour BTC correlation, an explicit regime classification, position within
+   the 24h range, distance to the recent swing high/low and to the 1h EMA20
+   (structure anchors for stop placement) — plus a BTC-wide regime context and the live
    portfolio (equity, day PnL,
    drawdown, each open position's unrealised PnL and age). The LLM is
    prompted as an **aggressive but disciplined momentum day trader**:
@@ -236,10 +244,13 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    same-direction positions in correlated coins from acting as one oversized
    macro bet). Closes execute first, then the surviving opens (highest
    confidence first).
-7. **Execute with protection.** Orders go to OKX with **exchange-side
-   stop-loss and take-profit attached**, so positions stay protected even if
-   this process dies. If a stop-loss can't be placed after an entry fills,
-   the agent immediately closes that position rather than run it naked.
+7. **Execute with protection.** Orders use client IDs and are never blindly
+   retried after an ambiguous network response. Actual terminal order status,
+   filled quantity, average fill, fees, and partial fills are verified. Orders
+   go to OKX with **exchange-side stop-loss and take-profit attached**, so
+   positions stay protected even if this process dies. If a stop-loss can't
+   be verified after an entry fills, the agent immediately closes that
+   position rather than run it naked.
 
 The LLM never touches the exchange, never sizes a position, and never
 overrides a cap. It is an idea generator inside hard, code-enforced rails.
@@ -322,8 +333,20 @@ API keys; the mode must match the keys in `.env`.
 | `max_margin_usage_pct` | 60 | Above this, close the largest position(s) to reduce margin |
 | `cooldown_minutes_after_loss` | 45 | Per-symbol timeout after a losing close |
 
-**Change execution (`execution:` block)** — `slippage_guard_pct` (default 0.5):
-abort an entry if price moved more than this between analysis and execution.
+**Change execution (`execution:` block)** — `slippage_guard_pct` (default 0.5)
+aborts an entry if price moved too far between analysis and execution;
+`fill_timeout_seconds` (default 12) bounds fill verification before the agent
+cancels the unfilled remainder.
+
+**Cost assumptions (`trading_costs:` block)** — expected taker fee per side,
+stop slippage, and funding intervals are sent to the LLM alongside live spread
+and funding. They inform net-reward and voluntary size decisions; they do not
+replace technical stop placement.
+
+**Human alerts (`alerts:` block)** — enable an optional generic JSON, Slack,
+or Discord webhook, choose the minimum severity, and put its URL in the
+environment variable named by `webhook_url_env` (default
+`ALERT_WEBHOOK_URL`).
 
 > **To turn aggression up**, raise `max_leverage`, `risk_per_trade_pct`, and
 > `max_gross_exposure_pct` — but understand how they compound: 3 positions at
@@ -353,9 +376,9 @@ Read these before running anything with real money.
   trades, misread a regime, or produce malformed output. The risk engine
   bounds the damage (sizing, caps, cooldowns) but cannot make a losing
   strategy win.
-- **No alerting exists.** If the agent self-kills or an error stops it at 3am,
-  it goes silent — nothing texts or emails you. Check `status` daily, or wire
-  the log into your own notifier.
+- **Webhook alerts are optional, not a monitoring service.** Enable and test
+  them before relying on them. A machine or network outage can prevent the
+  same webhook from being delivered, so still monitor the process externally.
 - **The drawdown self-kill halts the agent until a human intervenes.** After a
   15% drawdown it flattens and refuses to trade again until you run
   `--acknowledge-kill`. This is intentional (a human should review a blow-up),
@@ -363,9 +386,9 @@ Read these before running anything with real money.
 - **It needs an always-on machine and network.** If the process dies, no new
   decisions happen. Open positions remain protected by their exchange-side
   stop-losses on OKX, but nothing new is managed until it's back up.
-- **Demo results ≠ live results.** Demo fills are idealized. Live trading adds
-  real slippage, trading fees, funding payments, and occasional partial
-  fills. Expect live to underperform demo.
+- **Demo results ≠ live results.** Demo fills are idealized. The live executor
+  records actual fills, fees and partial fills, but real slippage and funding
+  still make live outcomes different from demo.
 - **It costs money even in demo.** The LLM calls are real (~$50–95/month at
   the default cycle). Only the trading is simulated in demo mode.
 - **One OKX account per running instance,** and it only sees the **Trading**
@@ -388,12 +411,14 @@ sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, actio
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), equity FROM equity ORDER BY ts DESC LIMIT 10;"
 ```
 
-Opens are journaled with the model's **confidence** and closes with the
-**realized PnL%**, so performance is measurable, not vibes:
+Entries and exits share a durable trade ID and record actual fill price,
+quantity, fees, slippage, planned risk, funding and net realized USDT. The
+report excludes legacy or unmatched rows rather than pairing by symbol or
+averaging unrelated percentage returns:
 
 ```bash
-python3 report.py    # equity curve, win rate, expectancy, per-symbol results,
-                     # confidence calibration, rejection reasons
+python3 report.py    # transfer-adjusted equity, net USDT, risk/notional returns,
+                     # costs, confidence calibration and rejection reasons
 ```
 
 The calibration table is the one to watch: if 0.9-confidence trades don't

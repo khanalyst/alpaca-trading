@@ -61,3 +61,20 @@ risk:
 execution:
   slippage_guard_pct: 0.5        # abort an entry if price moved more than this
                                  # between analysis and execution
+  fill_timeout_seconds: 12       # wait for market orders to reach a terminal fill state
+
+# Cost assumptions are sent to the LLM with live spread and funding data.
+# The model can then reduce size_pct_equity when total stop risk (price move
+# plus fees, spread, funding and expected stop slippage) is too high.
+trading_costs:
+  taker_fee_pct_per_side: 0.05
+  expected_stop_slippage_pct: 0.15
+  expected_funding_intervals_held: 1
+
+# Optional human alerts. The URL remains in .env, never in this file.
+alerts:
+  enabled: false
+  webhook_url_env: ALERT_WEBHOOK_URL
+  format: generic                 # generic | slack | discord
+  minimum_level: error            # warning | error | critical
+  timeout_seconds: 5

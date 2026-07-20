@@ -26,6 +26,7 @@ from dotenv import load_dotenv  # noqa: E402
 import yaml  # noqa: E402
 
 from agent import state  # noqa: E402
+from agent.config import ConfigError, validate_config  # noqa: E402
 from agent.state import DAY_STOPPED, KILLED, PAUSED, RUNNING  # noqa: E402
 
 
@@ -44,7 +45,7 @@ def setup_logging() -> None:
 
 def load_cfg(path: str) -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        return validate_config(yaml.safe_load(f))
 
 
 def _light_engine(cfg):
@@ -193,6 +194,11 @@ def cmd_check(args, cfg) -> int:
     if not os.getenv(need):
         print(f"  MISSING {need} in .env")
         ok = False
+    alert_cfg = cfg["alerts"]
+    alert_env = alert_cfg["webhook_url_env"]
+    if alert_cfg["enabled"] and not os.getenv(alert_env):
+        print(f"  MISSING {alert_env} in .env (alerts.enabled is true)")
+        ok = False
     if ok:
         try:
             from agent.exchange import Exchange
@@ -252,7 +258,11 @@ def main() -> int:
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
     setup_logging()
-    cfg = load_cfg(args.config)
+    try:
+        cfg = load_cfg(args.config)
+    except (OSError, yaml.YAMLError, ConfigError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
     return args.fn(args, cfg)
 
 
