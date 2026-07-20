@@ -34,6 +34,10 @@ class RiskEngine:
                  gross_notional: float) -> tuple[dict | None, str | None]:
         symbol = decision["symbol"]
 
+        # Snapshot keys starting with "_" are context blocks (_market_context),
+        # not tradable instruments; never let one pass the membership check.
+        if not isinstance(symbol, str) or symbol.startswith("_"):
+            return None, "not a tradable symbol"
         if symbol not in snapshot:
             return None, "symbol not in current snapshot"
         if any(p.get("symbol") == symbol for p in positions):

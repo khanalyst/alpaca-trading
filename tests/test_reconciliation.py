@@ -8,6 +8,7 @@ from tests.helpers import valid_config
 class FakeReconciliationExchange:
     def __init__(self):
         self.ensure_calls = []
+        self.cancelled = []
         self.x = Mock()
         self.x.market.return_value = {"contractSize": 1}
 
@@ -21,6 +22,9 @@ class FakeReconciliationExchange:
             "realized_pnl_usd": 9.5,
             "status": "position_history",
         }
+
+    def cancel_symbol(self, symbol):
+        self.cancelled.append(symbol)
 
     @staticmethod
     def protection_status(symbol, contracts, side, mark):
@@ -80,6 +84,48 @@ class PositionReconciliationTests(unittest.TestCase):
         self.assertEqual(log_trade.call_args.kwargs["trade_id"], "trade-1")
         self.assertEqual(log_trade.call_args.kwargs["realized_pnl_usd"], 9.5)
         log_event.assert_called_once()
+
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.log_trade")
+    def test_reconciled_exit_cancels_stale_protective_orders(
+            self, log_trade, log_event):
+        st = self.tracked_state()
+        self.engine._reconcile_positions([], st, startup=True)
+        # Separate fallback/restored SL+TP orders would otherwise survive an
+        # exchange-side exit and ambush the next entry in this symbol.
+        self.assertEqual(self.engine.ex.cancelled, ["BTC/USDT:USDT"])
+
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.log_trade")
+    def test_replaced_position_never_loses_its_own_protection(
+            self, log_trade, log_event):
+        st = self.tracked_state()
+        st["active_trades"]["BTC/USDT:USDT"]["position_id"] = "old-pos"
+        replacement = {
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 3,
+            "entryPrice": 104, "markPrice": 104, "leverage": 2,
+            "info": {"posId": "new-pos"},
+        }
+        # The replacement carries its own verified SL/TP; adoption keeps it.
+        self.engine.ex.protection_status = lambda *a: {
+            "stop_loss": True, "take_profit": True,
+            "stop_price": 99.0, "take_price": 112.0,
+        }
+        self.engine._reconcile_positions([replacement], st, startup=True)
+        # Cancelling here would strip the replacement position's own SL/TP.
+        self.assertEqual(self.engine.ex.cancelled, [])
+
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.log_trade")
+    def test_partial_close_share_is_not_double_counted(
+            self, log_trade, log_event):
+        st = self.tracked_state()
+        st["active_trades"]["BTC/USDT:USDT"][
+            "partial_realized_pnl_usd"] = 3.5
+        self.engine._reconcile_positions([], st, startup=True)
+        # 9.5 total minus the 3.5 already journaled by the partial close.
+        self.assertEqual(
+            log_trade.call_args.kwargs["realized_pnl_usd"], 6.0)
 
     def test_missing_protection_is_restored_from_durable_target(self):
         st = self.tracked_state()

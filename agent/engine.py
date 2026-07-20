@@ -100,9 +100,23 @@ class Engine:
         # Exchange state is authoritative. Reconcile fills and protection
         # before strategy decisions or account-level risk calculations.
         positions = self.ex.positions()
-        positions = self._reconcile_positions(
-            positions, st, startup=not self._startup_reconciled)
-        self._startup_reconciled = True
+        try:
+            positions = self._reconcile_positions(
+                positions, st, startup=not self._startup_reconciled)
+            self._startup_reconciled = True
+            reconciled = True
+        except Exception as exc:
+            # A reconciliation problem must not disable the account-level
+            # circuit breakers below. Trade conservatively instead: keep
+            # housekeeping, closes and breakers, but open nothing new.
+            log.error("Reconciliation failed; no new entries this cycle: %s",
+                      exc)
+            state.log_event("error", f"reconciliation: {exc}")
+            self.alerts.send(
+                "error", "reconciliation_failed",
+                "Reconciliation failed; new entries disabled this cycle",
+                {"error": str(exc)})
+            reconciled = False
         state.commit(st)
 
         # --- drop expired per-symbol cooldowns
@@ -203,8 +217,10 @@ class Engine:
                                          day_pnl_pct, drawdown_pct)
         # While DAY_STOPPED the engine drops every open, so tell the model
         # zero — otherwise it wastes output proposing entries that can't run.
+        # The same applies when reconciliation failed: closes may still make
+        # sense, but nothing new opens on top of unverified state.
         max_new = (int(r["max_concurrent_positions"]) - len(positions)
-                   if st["state"] == state.RUNNING else 0)
+                   if st["state"] == state.RUNNING and reconciled else 0)
         try:
             decisions = self.llm.decide(snapshot, portfolio, max_new)
         except Exception as e:
@@ -224,8 +240,9 @@ class Engine:
                                    st):
                 positions.remove(pos)
 
-        # --- opens (blocked while DAY_STOPPED)
-        if st["state"] != state.RUNNING:
+        # --- opens (blocked while DAY_STOPPED or after a failed reconcile,
+        # even if the model proposed one despite being told max_new = 0)
+        if st["state"] != state.RUNNING or not reconciled:
             return
         gross = sum(self._notional(p) for p in positions)
         opens = sorted([d for d in decisions if d["action"] == "open"],
@@ -289,6 +306,11 @@ class Engine:
                 realized = float(summary.get("realized_pnl_usd") or 0)
                 if summary.get("status") != "position_history":
                     realized -= float(trade.get("entry_fee_usd") or 0)
+                # Partial closes were already journaled with their own
+                # realized share (which covered their exit fee and entry-fee
+                # portion); the final close row carries only the remainder so
+                # summing a trade's rows never double-counts.
+                realized -= float(trade.get("partial_realized_pnl_usd") or 0)
                 if summary.get("status") == "fill_history_funding_unavailable":
                     self.alerts.send(
                         "warning", "funding_reconciliation_incomplete",
@@ -321,6 +343,18 @@ class Engine:
                 active.pop(symbol, None)
                 protection.pop(symbol, None)
                 opened_at.pop(symbol, None)
+                if not replaced:
+                    # The attached-OCO entry path cleans itself up, but
+                    # restored or fallback protection uses separate SL/TP
+                    # orders: cancel any survivor so a later re-entry cannot
+                    # inherit a stale trigger from this finished trade. Never
+                    # cancel when a replacement position occupies the symbol —
+                    # that would strip the replacement's own protection.
+                    try:
+                        self.ex.cancel_symbol(symbol)
+                    except Exception as cleanup_exc:
+                        log.warning("stale protective-order cleanup failed "
+                                    "for %s: %s", symbol, cleanup_exc)
             except Exception as exc:
                 log.error("Could not reconcile disappeared position %s: %s",
                           symbol, exc)
