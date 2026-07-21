@@ -21,12 +21,18 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import ccxt
+
 from . import brain, market, state
 from .alerts import AlertManager
-from .exchange import Exchange
+from .exchange import CredentialError, Exchange
 from .risk import RiskEngine
 
 log = logging.getLogger("engine")
+
+# Consecutive cycles that may fail on credentials before the loop gives up.
+# One spurious rejection should not stop a live agent; a revoked key should.
+MAX_CREDENTIAL_FAILURES = 3
 
 
 class Engine:
@@ -40,6 +46,7 @@ class Engine:
         self.universe: list[str] = []
         self.universe_ts = 0.0
         self._startup_reconciled = False
+        self._credential_failures = 0
 
     # ------------------------------------------------------------ lifecycle
 
@@ -68,8 +75,12 @@ class Engine:
                     break
                 try:
                     self.cycle(st)
+                    self._credential_failures = 0
                 except SystemExit:
                     raise
+                except (CredentialError, ccxt.AuthenticationError) as e:
+                    if self._on_credential_failure(e):
+                        break
                 except Exception as e:
                     log.exception("Cycle error (agent continues): %s", e)
                     state.log_event("error", str(e))
@@ -88,10 +99,52 @@ class Engine:
         finally:
             state.clear_pid()
 
+    def _on_credential_failure(self, exc: Exception) -> bool:
+        """Handle an auth/clock rejection. True means stop the loop.
+
+        Deliberately PAUSED, not KILLED: a kill flattens everything, and
+        flattening needs the very API access we just lost, so a kill here
+        would fail loudly and change nothing. Pausing stops the agent from
+        pretending to trade while leaving open positions under their
+        exchange-side stop-loss/take-profit, which survive this process.
+        """
+        self._credential_failures += 1
+        n = self._credential_failures
+        log.error("Credential/clock failure %d of %d: %s",
+                  n, MAX_CREDENTIAL_FAILURES, exc)
+        state.log_event("error", f"credentials: {exc}")
+        if n < MAX_CREDENTIAL_FAILURES:
+            self.alerts.send(
+                "error", "credential_failure",
+                f"OKX rejected our credentials ({n}/{MAX_CREDENTIAL_FAILURES}); "
+                "stopping the agent if this keeps up",
+                {"error": str(exc)})
+            return False
+        reason = f"OKX credentials rejected {n} cycles running: {exc}"
+        try:
+            open_symbols = [p["symbol"] for p in self.ex.positions()]
+        except Exception:
+            open_symbols = ["unknown - could not query OKX"]
+        state.set_state(state.PAUSED, reason, operator_pause=True)
+        log.critical(
+            "Agent stopped: %s. Open positions keep their exchange-side "
+            "SL/TP on OKX and are NOT being managed. Fix the credentials, "
+            "run 'python main.py check', then 'python main.py resume'. "
+            "Positions at stop time: %s", reason, open_symbols or "none")
+        self.alerts.send(
+            "critical", "credential_failure_stop",
+            "Agent STOPPED: OKX credentials rejected. Open positions are "
+            "unmanaged (exchange-side SL/TP still active).",
+            {"error": str(exc), "open_positions": open_symbols})
+        return True
+
     # ------------------------------------------------------------ the cycle
 
     def cycle(self, st: dict) -> None:
         now = time.time()
+        # A host that booted with a good clock can still drift into OKX's
+        # 30s signing window later; warn before it starts rejecting orders.
+        self.ex.recheck_clock_if_due()
         equity = self.ex.equity_usdt()
         if equity <= 0:
             log.warning("Equity reads as 0; skipping cycle")

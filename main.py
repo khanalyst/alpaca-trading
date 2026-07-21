@@ -43,6 +43,35 @@ def setup_logging() -> None:
     )
 
 
+ENV_FILE = ROOT / ".env"
+SECRET_VARS = ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE",
+               "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALERT_WEBHOOK_URL")
+# Credentials that were already in the process environment before .env was
+# read — i.e. coming from somewhere other than .env. Reported by `check`.
+SHELL_SOURCED: list[str] = []
+
+
+def load_secrets() -> None:
+    """Load every credential from .env, and only from .env.
+
+    .env is the single source of truth by design: override=True so a stale
+    `export OKX_API_KEY=...` left in a shell profile cannot silently shadow
+    the file and point a live run at the wrong account. Nothing in this repo
+    reads a credential from anywhere else, and .env is gitignored.
+    """
+    if not ENV_FILE.exists():
+        raise FileNotFoundError(
+            f"No .env file at {ENV_FILE}. Copy .env.example to .env and fill "
+            "it in; credentials are read from that file only."
+        )
+    mode = ENV_FILE.stat().st_mode
+    if mode & 0o077:
+        print(f"WARNING: {ENV_FILE} is readable by other users on this host. "
+              f"Run: chmod 600 {ENV_FILE}", file=sys.stderr)
+    SHELL_SOURCED[:] = [v for v in SECRET_VARS if os.getenv(v)]
+    load_dotenv(ENV_FILE, override=True)
+
+
 def load_cfg(path: str) -> dict:
     with open(path) as f:
         return validate_config(yaml.safe_load(f))
@@ -185,6 +214,11 @@ def cmd_check(args, cfg) -> int:
     ok = True
     print(f"Mode: {cfg['mode']}")
     print(f"LLM:  {cfg['llm']['provider']} / {cfg['llm']['model']}")
+    print(f"Secrets: {ENV_FILE}")
+    if SHELL_SOURCED:
+        print(f"  NOTE {', '.join(SHELL_SOURCED)} also set in the shell "
+              "environment; .env takes precedence. Unset the shell copies so "
+              "there is one source of truth.")
     for key in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE"):
         if not os.getenv(key):
             print(f"  MISSING {key} in .env")
@@ -203,15 +237,30 @@ def cmd_check(args, cfg) -> int:
         try:
             from agent.exchange import Exchange
             from agent import market
-            ex = Exchange(cfg)
+            ex = Exchange(cfg)          # also verifies the clock
             equity = ex.equity_usdt()
             universe = market.build_universe(ex, cfg)
             print(f"  OKX connection OK ({'DEMO' if ex.demo else 'LIVE'}). "
                   f"Equity: {equity:,.2f} USDT")
+            print(f"  Clock drift vs OKX: {ex.clock_drift_ms() / 1000:+.2f}s "
+                  "(must stay within 30s)")
             print(f"  Universe head: {', '.join(universe[:5])}")
         except Exception as e:
             print(f"  OKX check FAILED: {e}")
             ok = False
+        else:
+            # Reading balances only proves Read permission. Placing no order,
+            # confirm the key can actually trade — otherwise the first real
+            # entry is where a Read-only key gets discovered.
+            try:
+                probe = ex.verify_trade_permission()
+                print(f"  Trade permission OK (set_leverage on {probe})")
+            except Exception as e:
+                print(f"  TRADE PERMISSION FAILED: {e}")
+                print("  The key can read the account but not trade. In OKX "
+                      "API management, edit the key and enable 'Trade' "
+                      "(never enable 'Withdraw').")
+                ok = False
     print("All checks passed. You can start with: python main.py run"
           if ok else
           "Fix the issues above, then re-run: python main.py check")
@@ -256,9 +305,9 @@ def main() -> int:
     p.set_defaults(fn=cmd_check)
 
     args = parser.parse_args()
-    load_dotenv(ROOT / ".env")
     setup_logging()
     try:
+        load_secrets()
         cfg = load_cfg(args.config)
     except (OSError, yaml.YAMLError, ConfigError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)

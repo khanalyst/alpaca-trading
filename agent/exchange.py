@@ -16,6 +16,24 @@ import ccxt
 log = logging.getLogger("exchange")
 PROTECTIVE_ALGO_TYPES = ("conditional", "oco", "trigger")
 
+# OKX rejects any signed request whose OK-ACCESS-TIMESTAMP is more than 30s
+# from server time (error 50102). We refuse to start well inside that window
+# so a slow request cannot push an already-marginal clock over the edge.
+CLOCK_SKEW_FATAL_MS = 15_000
+CLOCK_SKEW_WARN_MS = 3_000
+CLOCK_RECHECK_SECONDS = 900
+
+
+class CredentialError(RuntimeError):
+    """A permanent auth/clock problem. Retrying cannot fix it.
+
+    Raised for OKX 50102 (timestamp outside the signing window) and for every
+    ccxt AuthenticationError (bad key, bad passphrase, bad signature, missing
+    Trade permission, IP not whitelisted, key expired). The engine treats this
+    differently from a transient network fault: it stops the loop instead of
+    spinning forever against credentials that will never start working.
+    """
+
 
 class Exchange:
     def __init__(self, cfg: dict, alerts=None):
@@ -49,6 +67,10 @@ class Exchange:
             headers = dict(self.x.headers or {})
             headers["x-simulated-trading"] = "1"
             self.x.headers = headers
+        # Before anything signed goes out, prove the clock can produce a valid
+        # OK-ACCESS-TIMESTAMP. A drifted clock fails every private call, so
+        # finding out here beats finding out mid-entry.
+        self.check_clock()
         self.x.load_markets()
         try:
             # One-way (net) position mode keeps order handling simple.
@@ -68,10 +90,104 @@ class Exchange:
         for i in range(3):
             try:
                 return fn(*a, **kw)
+            except ccxt.InvalidNonce as e:
+                # OKX 50102. ccxt files this under NetworkError, but a clock
+                # outside the 30s signing window will not heal itself between
+                # retries — re-measure the drift and report it plainly.
+                raise CredentialError(self._clock_error(e)) from e
+            except ccxt.AuthenticationError as e:
+                raise CredentialError(
+                    f"OKX rejected the API credentials: {e}. Check that "
+                    "OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE in .env "
+                    "are correct and unquoted-safe, that the key carries Read "
+                    "+ Trade permission, that any IP binding matches this "
+                    f"host, and that mode: {self.cfg.get('mode')} matches the "
+                    "kind of key (demo keys work only in demo mode)."
+                ) from e
             except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
                 last = e
                 time.sleep(1.5 * (i + 1))
         raise last
+
+    # --------------------------------------------------------------- clock
+
+    def clock_drift_ms(self) -> float:
+        """Local clock minus OKX server clock, in milliseconds.
+
+        Measured against GET /api/v5/public/time (unsigned), with the round
+        trip halved out so network latency is not counted as drift.
+        """
+        sent = time.time() * 1000
+        server = float(self.x.fetch_time())
+        received = time.time() * 1000
+        return (sent + received) / 2 - server
+
+    def _clock_error(self, exc: Exception | None = None) -> str:
+        try:
+            drift = self.clock_drift_ms()
+            measured = f"local clock is {drift / 1000:+.1f}s from OKX server time"
+        except Exception:
+            measured = "could not reach OKX to measure the drift"
+        detail = f" ({exc})" if exc else ""
+        return (
+            f"OKX rejected the request timestamp{detail}; {measured}. Signed "
+            "requests must be within 30s of server time. Enable NTP on this "
+            "host (macOS: System Settings > General > Date & Time > Set "
+            "automatically; Linux: `sudo timedatectl set-ntp true`) and "
+            "restart the agent."
+        )
+
+    def check_clock(self, fatal: bool = True) -> float:
+        """Verify the clock is inside OKX's signing window. Returns drift ms."""
+        try:
+            drift = self.clock_drift_ms()
+        except Exception as e:
+            # A public endpoint being unreachable is a network problem, not a
+            # clock problem; let the normal retry paths deal with it.
+            log.warning("Could not verify clock against OKX: %s", e)
+            return 0.0
+        self._clock_checked_at = time.time()
+        if abs(drift) >= CLOCK_SKEW_FATAL_MS:
+            msg = (f"Clock is {drift / 1000:+.1f}s from OKX server time, past "
+                   f"the safe limit of {CLOCK_SKEW_FATAL_MS / 1000:.0f}s. "
+                   "Every signed request will be rejected (50102). Enable NTP "
+                   "on this host and restart.")
+            self._alert("critical", "clock_drift", msg, {"drift_ms": drift})
+            if fatal:
+                raise CredentialError(msg)
+            log.error(msg)
+        elif abs(drift) >= CLOCK_SKEW_WARN_MS:
+            log.warning("Clock is %+.1fs from OKX server time (limit 30s); "
+                        "check NTP on this host.", drift / 1000)
+        else:
+            log.debug("Clock drift vs OKX: %+.0f ms", drift)
+        return drift
+
+    def recheck_clock_if_due(self) -> None:
+        """Periodic re-check for hosts that drift after a clean startup."""
+        last = getattr(self, "_clock_checked_at", 0.0)
+        if time.time() - last >= CLOCK_RECHECK_SECONDS:
+            self.check_clock(fatal=False)
+
+    # ---------------------------------------------------------- permissions
+
+    def verify_trade_permission(self) -> str:
+        """Prove the key has Trade scope, not just Read.
+
+        set_leverage is a Trade-scope POST that places no order and is exactly
+        what open_position calls first, so a Read-only key fails here during
+        `check` instead of at 3am on the first real entry.
+        """
+        symbol = "BTC/USDT:USDT"
+        if symbol not in self.x.markets:
+            swaps = [s for s, m in self.x.markets.items()
+                     if m.get("swap") and m.get("quote") == "USDT"]
+            if not swaps:
+                raise RuntimeError("No USDT swap markets available to probe")
+            symbol = sorted(swaps)[0]
+        leverage = int(self.cfg["risk"]["max_leverage"])
+        self.retry(self.x.set_leverage, leverage, symbol, {"mgnMode": "cross"})
+        return symbol
 
     @staticmethod
     def _client_order_id(prefix: str) -> str:

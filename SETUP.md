@@ -114,9 +114,25 @@ keys by mistake.
 Keep these somewhere safe for Step 5. If you lose the secret, just delete the
 key and make a new one.
 
+**Two things OKX does that will bite you later:**
+
+- **Keys without an IP binding expire after 14 days of inactivity** if they
+  have Trade permission. A running agent counts as activity, so this only
+  matters if you set up keys and then leave them unused for a fortnight.
+  If the agent suddenly can't authenticate after a long pause, this is why —
+  make a new key.
+- **Pick a passphrase without `#`, quotes, or trailing spaces.** The `.env`
+  file treats `#` as the start of a comment, so a passphrase like `my#pass`
+  silently arrives at OKX as `my` and you get a confusing "invalid
+  passphrase" error. Letters, digits, `-` and `_` are the safe set. (If you
+  already have one with symbols, wrap the whole value in single quotes in
+  `.env`: `OKX_API_PASSPHRASE='my#pass'`.)
+
 > Live keys (for real money, much later) are created the same way but
 > **outside** Demo Trading, and you should additionally bind them to your
-> server's IP address and, again, never grant Withdraw.
+> server's IP address and, again, never grant Withdraw. Note that an IP
+> binding breaks the moment your server's IP changes — if you move hosts or
+> your VPS provider reassigns you, update the binding in OKX first.
 
 ---
 
@@ -256,6 +272,32 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 You only need the AI key for the provider set in `config.yaml`. Leave the
 other one blank.
+
+**`.env` is the only place the agent reads credentials from.** Nothing is
+hardcoded, and no key is read from anywhere else. If the same variable is
+also exported in your shell, `.env` wins — but `python main.py check` will
+warn you, because having two copies is how people end up pointing a live run
+at the wrong account. Lock the file down so other users on the machine can't
+read it:
+
+```bash
+chmod 600 .env
+```
+
+### Your computer's clock matters
+
+OKX signs every request with a timestamp and **rejects anything more than 30
+seconds off its own clock**. If your machine's clock drifts, every single
+request fails. Make sure automatic time sync is on:
+
+- **macOS**: System Settings → General → Date & Time → *Set time and date
+  automatically*
+- **Linux**: `sudo timedatectl set-ntp true`
+- **Windows**: Settings → Time & language → *Set time automatically*
+
+The agent checks this for you at startup, refuses to start if the clock is
+more than 15 seconds out, and re-checks every 15 minutes while running.
+`python main.py check` prints your current drift.
 
 ---
 
@@ -491,7 +533,25 @@ else**, if you run it on a computer you already own.
 - **`check` fails with an authentication error.** The most common cause is a
   mode/key mismatch: demo keys with `mode: live`, or live keys with
   `mode: demo`. They must match. Double-check you created the keys *inside*
-  Demo Trading for demo mode.
+  Demo Trading for demo mode. After that, in order of likelihood: a
+  passphrase containing `#` or trailing spaces (see Step 1.4), an IP binding
+  that no longer matches this machine, or a key that expired after 14 days
+  unused.
+- **`TRADE PERMISSION FAILED` in `check`.** The key can read your account but
+  not place orders — OKX defaults new keys to Read-only. Edit the key in OKX
+  API management and tick **Trade**. Never tick Withdraw. This check exists
+  so you find out now instead of when the agent tries its first real entry.
+- **"timestamp expired" / error 50102, or `check` reports a large clock
+  drift.** Your machine's clock is more than 30 seconds off OKX's. Turn on
+  automatic time sync (see Step 5) and restart. Laptops that sleep and
+  cheap VPS instances are the usual offenders.
+- **"Agent STOPPED: OKX credentials rejected".** After 3 consecutive cycles
+  of auth failures the agent pauses itself rather than pretending to trade.
+  Any open positions are still protected by their stop-loss/take-profit
+  orders on OKX, but nothing is managing them — so fix this promptly. Repair
+  the credentials, run `check`, then `python3 main.py resume`. If you run
+  under systemd, note that `Restart=always` will keep restarting into the
+  same failure; fix the key rather than watching it loop.
 - **"Insufficient balance" when opening.** Margin is tied up, or the (demo)
   Trading account has too little USDT. Lower `max_gross_exposure_pct`, or add
   USDT to the Trading account. Confirm your balance is in the **Trading**
