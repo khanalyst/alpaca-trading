@@ -98,9 +98,19 @@ class TradePermissionTests(unittest.TestCase):
             "perm": perm, "posMode": pos_mode, "acctLv": "2", "ip": ip,
         }]}
 
+    @staticmethod
+    def _balance_response(usdt=10_000.0, non_usdt=0.0):
+        details = [{"ccy": "USDT", "eqUsd": str(usdt)}]
+        if non_usdt:
+            details.append({"ccy": "BTC", "eqUsd": str(non_usdt)})
+        return {"info": {"data": [{
+            "totalEq": str(usdt + non_usdt), "details": details,
+        }]}}
+
     def test_probe_is_read_only_and_checks_account_configuration(self):
         client = Mock()
         client.private_get_account_config.return_value = self._account_response()
+        client.fetch_balance.return_value = self._balance_response()
         ex = bare_exchange(client)
         result = ex.verify_trade_permission()
         self.assertEqual(result["position_mode"], "net_mode")
@@ -108,6 +118,20 @@ class TradePermissionTests(unittest.TestCase):
         client.private_get_account_config.assert_called_once()
         client.set_leverage.assert_not_called()
         client.create_order.assert_not_called()
+
+    def test_demo_reports_mixed_collateral_without_refusing_to_start(self):
+        # Live refuses; demo is where mixed collateral should be *found*, so it
+        # measures and warns instead. Silence would let paper results describe
+        # an account whose sizing the exchange would never have accepted.
+        client = Mock()
+        client.private_get_account_config.return_value = self._account_response()
+        client.fetch_balance.return_value = self._balance_response(
+            usdt=5_000.0, non_usdt=76_000.0)
+        ex = bare_exchange(client)
+        with self.assertLogs("exchange", level="WARNING") as logged:
+            result = ex.verify_trade_permission()
+        self.assertAlmostEqual(result["non_usdt_collateral_pct"], 93.83, places=1)
+        self.assertIn("non-USDT", "\n".join(logged.output))
 
     def test_read_only_key_is_rejected(self):
         client = Mock()

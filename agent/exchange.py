@@ -241,8 +241,16 @@ class Exchange:
             raise CredentialError(
                 "Live trading requires an IP-bound OKX API key")
         try:
-            collateral = (self.verify_usdt_collateral()
-                          if require_trade and live else None)
+            if not require_trade:
+                collateral = None
+            elif live:
+                collateral = self.verify_usdt_collateral()
+            else:
+                # Demo measures the same ratio and warns. Refusing to start
+                # here would block the environment that exists for finding
+                # this out, but staying silent lets mixed collateral quietly
+                # invalidate every paper result.
+                collateral = self.measure_usdt_collateral()
         except RuntimeError as exc:
             raise CredentialError(str(exc)) from exc
         result = {
@@ -423,8 +431,12 @@ class Exchange:
             raise RuntimeError("OKX total equity is not a positive finite value")
         return value
 
-    def verify_usdt_collateral(self) -> float:
-        """Require a live account whose equity is effectively all USDT."""
+    def collateral_breakdown(self) -> tuple[float, float]:
+        """Return (non-USDT equity in USD, total equity in USD).
+
+        Split out from verify_usdt_collateral so demo can measure the same
+        number without inheriting live's refusal to start.
+        """
         bal = self.retry(self.x.fetch_balance)
         rows = (bal.get("info") or {}).get("data") or []
         if not rows:
@@ -444,11 +456,44 @@ class Exchange:
             if not math.isfinite(value):
                 raise RuntimeError("OKX collateral breakdown is not finite")
             non_usdt += abs(value)
+        return non_usdt, total
+
+    @staticmethod
+    def _collateral_is_mixed(non_usdt: float, total: float) -> bool:
+        """True when enough non-USDT sits in the account to distort sizing."""
+        return non_usdt > max(1.0, total * 0.01)
+
+    def verify_usdt_collateral(self) -> float:
+        """Require a live account whose equity is effectively all USDT."""
+        non_usdt, total = self.collateral_breakdown()
         pct = non_usdt / total * 100
-        if non_usdt > max(1.0, total * 0.01):
+        if self._collateral_is_mixed(non_usdt, total):
             raise RuntimeError(
                 f"non-USDT assets are {pct:.2f}% of trading equity; move "
                 "them out or use a dedicated USDT-only sub-account")
+        return pct
+
+    def measure_usdt_collateral(self) -> float:
+        """Demo counterpart: report the same ratio, but warn instead of stop.
+
+        Sizing is a percentage of *total* equity, while OKX will only margin a
+        USDT swap from collateral it actually lends against. A demo account
+        stuffed with OKX's free BTC/ETH/OKB therefore sizes entries several
+        times larger than the exchange will accept, and every order comes back
+        rejected. Demo must not refuse to start over it -- that is the one
+        place to discover such things safely -- but it must say so loudly,
+        because a silent version of this makes two weeks of paper results
+        describe an account that never existed.
+        """
+        non_usdt, total = self.collateral_breakdown()
+        pct = non_usdt / total * 100
+        if self._collateral_is_mixed(non_usdt, total):
+            log.warning(
+                "non-USDT assets are %.1f%% of demo equity (%.0f of %.0f USD). "
+                "Position sizing is a percentage of total equity, so entries "
+                "will be sized against money OKX will not margin a USDT swap "
+                "with, and orders may be rejected. Convert them to USDT so "
+                "demo matches how live must be funded.", pct, non_usdt, total)
         return pct
 
     def margin_usage_pct(self) -> float | None:
