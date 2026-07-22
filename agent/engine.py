@@ -236,6 +236,11 @@ class Engine:
         # Exchange state is authoritative. Reconcile fills and protection
         # before strategy decisions or account-level risk calculations.
         positions = self.ex.positions()
+        for p in positions:
+            # Normalize once so the net-direction guard and portfolio view
+            # never meet a position whose side/notional ccxt left unset.
+            p["side"] = self._direction(p)
+            p["notional"] = self._notional(p)
         try:
             positions = self._reconcile_positions(
                 positions, st, startup=not self._startup_reconciled)
@@ -362,13 +367,24 @@ class Engine:
         # sense, but nothing new opens on top of unverified state.
         max_new = (int(r["max_concurrent_positions"]) - len(positions)
                    if st["state"] == state.RUNNING and reconciled else 0)
+        # The model is the one nondeterministic component in the pipeline.
+        # Journal exactly what it saw so every decision - and every silent
+        # hold - can be audited against its inputs later.
+        state.log_event("llm_input", json.dumps(
+            {"max_new": max_new, "portfolio": portfolio,
+             "snapshot": snapshot}, separators=(",", ":")))
         try:
             decisions = self.llm.decide(snapshot, portfolio, max_new)
         except Exception as e:
             log.error("LLM call failed; holding this cycle: %s", e)
+            state.log_event("error", f"llm: {e}")
+            self.alerts.send(
+                "error", "llm_call_failed",
+                "LLM call failed; holding this cycle", {"error": str(e)})
             return
-        if decisions:
-            state.log_event("decisions", json.dumps(decisions))
+        # An empty list is a real decision ("no trade"); journal it too so
+        # the audit trail distinguishes a deliberate hold from a failed call.
+        state.log_event("decisions", json.dumps(decisions))
         # Pick up any pause/kill the CLI issued while the LLM call was running.
         state.commit(st)
         if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
@@ -391,8 +407,13 @@ class Engine:
         if st["state"] != state.RUNNING or not reconciled:
             return
         gross = sum(self._notional(p) for p in positions)
-        opens = sorted([d for d in decisions if d["action"] == "open"],
-                       key=lambda d: d.get("confidence", 0), reverse=True)
+        opens, conflicted = self._sorted_opens(decisions)
+        for d in conflicted:
+            log.info("Rejected %s %s: open and close on the same symbol in "
+                     "one reply", d.get("direction"), d.get("symbol"))
+            state.log_event("rejected", json.dumps(
+                {"symbol": d.get("symbol"),
+                 "why": "open and close on the same symbol in one reply"}))
         for d in opens:
             latest = state.load_state()
             if latest["state"] != state.RUNNING:
@@ -977,6 +998,24 @@ class Engine:
         return kept
 
     # ------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _sorted_opens(decisions: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Opens by descending confidence, minus same-reply close conflicts.
+
+        SYSTEM forbids proposing an open and a close on one symbol in the
+        same answer. Enforce that deterministically: a violating reply must
+        not close a position and instantly re-enter (or reverse) it within
+        the same cycle. Returns (executable opens, conflicted opens).
+        """
+        closing = {d["symbol"] for d in decisions if d["action"] == "close"}
+        conflicted = [d for d in decisions
+                      if d["action"] == "open" and d["symbol"] in closing]
+        opens = sorted(
+            [d for d in decisions
+             if d["action"] == "open" and d["symbol"] not in closing],
+            key=lambda d: d.get("confidence", 0), reverse=True)
+        return opens, conflicted
 
     def _notional(self, pos: dict) -> float:
         n = pos.get("notional")

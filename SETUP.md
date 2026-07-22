@@ -224,7 +224,8 @@ On whichever machine you chose, open a terminal and run these one at a time.
 > and then come back here at Step 8. Everything below still applies; VS Code
 > just gives you a file tree and a built-in terminal instead of `nano`.
 
-1. Check Python is 3.11 or newer:
+1. Check Python is 3.12 or newer (the pinned library versions in
+   `requirements.lock.txt` require it):
 
    ```bash
    python3 --version

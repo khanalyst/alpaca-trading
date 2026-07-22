@@ -12,7 +12,8 @@ llm:
   model: gpt-5.6-terra     # e.g. claude-sonnet-4-6, claude-opus-4-8,
                                #      gpt-4.1, gpt-4o, o4-mini
   temperature: 0.2             # ignored automatically on models that reject
-                               # sampling params (Sonnet 5, Opus 4.7+)
+                               # sampling params (Sonnet 5, Opus 4.7+, and
+                               # GPT-5.x / o-series reasoning models)
   max_tokens: 2000
   # Prompt caching: the static system prompt is cached on Anthropic servers
   # (1-hour TTL, refreshed on every call) and cached automatically by OpenAI.

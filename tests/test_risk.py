@@ -57,6 +57,21 @@ class VetOpenSymbolTests(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertEqual(why, "invalid price")
 
+    def test_take_profit_beyond_bound_is_rejected(self):
+        # A short's TP trigger at entry*(1 - 120/100) would be negative and
+        # OKX would reject the whole attached-SL/TP entry order.
+        plan, why = self.risk.vet_open(
+            decision(direction="short", take_profit_pct=120),
+            10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "take-profit distance 120.0% out of bounds")
+
+    def test_take_profit_at_bound_is_accepted(self):
+        plan, why = self.risk.vet_open(
+            decision(take_profit_pct=50), 10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertEqual(plan["tp_pct"], 50)
+
     def test_all_in_costs_reduce_size_and_stay_inside_risk_budget(self):
         cfg = valid_config()
         cfg["risk"]["max_position_notional_pct"] = 100

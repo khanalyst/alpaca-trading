@@ -71,7 +71,7 @@ never treated as USDT capital.
 
 ## Setup
 
-Requirements: Python 3.11+ on macOS or Linux and an always-on machine (a Linux
+Requirements: Python 3.12+ on macOS or Linux and an always-on machine (a Linux
 VPS is recommended for true 24/7 operation).
 
 ```bash

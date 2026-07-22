@@ -23,6 +23,10 @@ log = logging.getLogger("risk")
 HARD_MAX_LEVERAGE = 10
 MIN_STOP_PCT = 0.2
 MAX_STOP_PCT = 15.0
+# Generous ceiling (>3R on the widest stop). Beyond it the number is noise,
+# and a short's TP trigger price entry*(1 - tp/100) would go non-positive at
+# 100%, which OKX rejects together with the whole attached-SL/TP entry.
+MAX_TP_PCT = 50.0
 MIN_NOTIONAL_USD = 10.0
 
 
@@ -63,6 +67,8 @@ class RiskEngine:
         take_pct = float(decision.get("take_profit_pct") or 0)
         if not math.isfinite(take_pct):
             return None, "take-profit distance is not finite"
+        if take_pct > MAX_TP_PCT:
+            return None, f"take-profit distance {take_pct}% out of bounds"
         if take_pct <= 0:
             take_pct = stop_pct * 2
 

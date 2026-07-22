@@ -138,7 +138,9 @@ adverse funding and stop slippage loses no more than the configured \
 risk-per-trade percent of equity. Your \
 stop_loss_pct is therefore a sizing input, not a suggestion - report the \
 stop the setup genuinely needs;
-- reject stops tighter than 0.2% or wider than 15%.
+- reject stops tighter than 0.2% or wider than 15%, and take-profit \
+distances wider than 50%;
+- drop any "open" on a symbol that also has a "close" in the same reply.
 Because every proposal is vetted, state your honest intent; never inflate \
 confidence to push a marginal trade through, because sizing and caps assume \
 your numbers are honest.
@@ -327,13 +329,21 @@ class LLM:
             ],
             response_format={"type": "json_object"},
         )
+        if not self._no_temperature:
+            kwargs["temperature"] = float(self.cfg.get("temperature", 0.2))
         try:
-            resp = self.client.chat.completions.create(
-                temperature=float(self.cfg.get("temperature", 0.2)), **kwargs
-            )
-        except Exception:
-            # Some reasoning models reject a temperature parameter.
             resp = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # Reasoning models (o-series, GPT-5.x) reject sampling params.
+            # Remember the rejection so later cycles skip the doomed first
+            # attempt; every other error propagates instead of being masked
+            # by a blind retry.
+            if "temperature" in kwargs and "temperature" in str(e):
+                self._no_temperature = True
+                kwargs.pop("temperature")
+                resp = self.client.chat.completions.create(**kwargs)
+            else:
+                raise
         u = getattr(resp, "usage", None)
         if u:
             cached = 0

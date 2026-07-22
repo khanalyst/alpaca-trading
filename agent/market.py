@@ -74,7 +74,12 @@ def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
     down = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
     rs = up / down.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+    out = 100 - 100 / (1 + rs)
+    # down == 0 makes rs undefined: a window with no down moves is maximal
+    # strength (RSI 100), and a window with no movement at all is neutral -
+    # NaN here would otherwise leak into the model's snapshot JSON.
+    out = out.mask(down == 0, 100.0)
+    return out.mask((down == 0) & (up == 0), 50.0)
 
 
 def atr_pct(df: pd.DataFrame, n: int = 14) -> float:
@@ -205,7 +210,8 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
             snap[f"trend_{tf}"] = "flat"
 
     df_1h = frames.get("1h", frames[tfs[-1]])
-    snap["rsi_1h"] = round(float(rsi(df_1h["close"]).iloc[-1]), 1)
+    rsi_1h = float(rsi(df_1h["close"]).iloc[-1])
+    snap["rsi_1h"] = round(rsi_1h, 1) if math.isfinite(rsi_1h) else None
     atr_history = atr_pct_series(df_1h)
     current_atr = float(atr_history.iloc[-1])
     baseline_atr = float(atr_history.iloc[-51:-1].median())
