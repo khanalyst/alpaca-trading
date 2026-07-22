@@ -92,8 +92,9 @@ The agent trades perpetual swaps, which live in the derivatives section.
    top-right in the trading view).
 2. Choose **Single-currency margin** or **Multi-currency margin**. Either
    works. (Do not use "Spot mode" — the agent needs derivatives.)
-3. Keep your (pretend) balance as **USDT in the Trading account**. The agent
-   reads equity from the Trading account only; the Funding account is
+3. Keep your (pretend) trading capital as **USDT in the Trading account**.
+   The agent sizes from the USDT currency equity only. Demo BTC, ETH or OKB
+   with **Set collateral** disabled are ignored; the Funding account is
    invisible to it.
 
 ### 1.4 Create DEMO API keys
@@ -474,7 +475,10 @@ and a SQLite journal. All commands run from inside the repo folder.
   ./.venv/bin/python main.py status
   ```
 
-  Shows state, equity, day PnL, drawdown, and open positions.
+  Shows state, USDT-only equity, day PnL, drawdown, and open positions. On the
+  first run after upgrading from an older account-wide equity version, the
+  loop rebases the day-start and high-water benchmarks once before evaluating
+  circuit breakers.
 
 - The full diary (every decision, rejection, trade, and the token/cache usage
   of each AI call):

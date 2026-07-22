@@ -100,9 +100,12 @@ class TradePermissionTests(unittest.TestCase):
 
     @staticmethod
     def _balance_response(usdt=10_000.0, non_usdt=0.0):
-        details = [{"ccy": "USDT", "eqUsd": str(usdt)}]
+        details = [{"ccy": "USDT", "eq": str(usdt), "eqUsd": str(usdt)}]
         if non_usdt:
-            details.append({"ccy": "BTC", "eqUsd": str(non_usdt)})
+            details.append({
+                "ccy": "BTC", "eqUsd": str(non_usdt),
+                "collateralEnabled": True,
+            })
         return {"info": {"data": [{
             "totalEq": str(usdt + non_usdt), "details": details,
         }]}}
@@ -132,6 +135,23 @@ class TradePermissionTests(unittest.TestCase):
             result = ex.verify_trade_permission()
         self.assertAlmostEqual(result["non_usdt_collateral_pct"], 93.83, places=1)
         self.assertIn("non-USDT", "\n".join(logged.output))
+
+    def test_demo_ignores_disabled_okb_collateral(self):
+        client = Mock()
+        client.private_get_account_config.return_value = self._account_response()
+        client.fetch_balance.return_value = {"info": {"data": [{
+            "totalEq": "18150",
+            "details": [
+                {"ccy": "USDT", "eq": "10000", "eqUsd": "10000"},
+                {"ccy": "OKB", "eq": "100", "eqUsd": "8150",
+                 "collateralEnabled": False},
+            ],
+        }]}}
+        ex = bare_exchange(client)
+
+        result = ex.verify_trade_permission()
+
+        self.assertEqual(result["non_usdt_collateral_pct"], 0)
 
     def test_read_only_key_is_rejected(self):
         client = Mock()
@@ -172,7 +192,8 @@ class TradePermissionTests(unittest.TestCase):
             "totalEq": "10000",
             "details": [
                 {"ccy": "USDT", "eqUsd": "9000"},
-                {"ccy": "BTC", "eqUsd": "1000"},
+                {"ccy": "BTC", "eqUsd": "1000",
+                 "collateralEnabled": True},
             ],
         }]}}
         ex = bare_exchange(client)

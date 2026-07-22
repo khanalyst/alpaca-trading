@@ -195,7 +195,9 @@ class MarginRiskTests(unittest.TestCase):
         client = Mock()
         client.fetch_balance.return_value = {
             "info": {"data": [{"adjEq": "10000", "imr": "1250",
-                                "mgnRatio": "20"}]},
+                                "mgnRatio": "20", "details": [
+                                    {"ccy": "USDT", "eq": "10000"},
+                                ]}]},
             "USDT": {"used": 9000, "total": 10000},
         }
         exchange = Exchange.__new__(Exchange)
@@ -204,10 +206,31 @@ class MarginRiskTests(unittest.TestCase):
         exchange.x = client
         self.assertEqual(exchange.margin_usage_pct(), 12.5)
 
+    def test_margin_usage_does_not_use_non_usdt_equity(self):
+        client = Mock()
+        client.fetch_balance.return_value = {
+            "info": {"data": [{"adjEq": "18000", "imr": "1000",
+                                "details": [
+                                    {"ccy": "USDT", "eq": "10000"},
+                                    {"ccy": "OKB", "eq": "100",
+                                     "eqUsd": "8000",
+                                     "collateralEnabled": True},
+                                ]}]},
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        self.assertEqual(exchange.margin_usage_pct(), 10)
+
     def test_non_finite_margin_measurement_fails_closed(self):
         client = Mock()
         client.fetch_balance.return_value = {
-            "info": {"data": [{"adjEq": "10000", "imr": "nan"}]},
+            "info": {"data": [{"adjEq": "10000", "imr": "nan",
+                                "details": [
+                                    {"ccy": "USDT", "eq": "10000"},
+                                ]}]},
         }
         exchange = Exchange.__new__(Exchange)
         exchange.cfg = valid_config()
@@ -218,16 +241,53 @@ class MarginRiskTests(unittest.TestCase):
 
 
 class AccountValueValidationTests(unittest.TestCase):
+    def test_equity_uses_only_usdt_currency_row(self):
+        client = Mock()
+        client.fetch_balance.return_value = {
+            "info": {"data": [{
+                "totalEq": "80384.99",
+                "details": [
+                    {"ccy": "USDT", "eq": "72232.06",
+                     "eqUsd": "72232.06"},
+                    {"ccy": "OKB", "eq": "100", "eqUsd": "8152.93",
+                     "collateralEnabled": False},
+                ],
+            }]},
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        self.assertEqual(exchange.equity_usdt(), 72232.06)
+
     def test_non_finite_equity_fails_closed(self):
         client = Mock()
         client.fetch_balance.return_value = {
-            "info": {"data": [{"totalEq": "nan"}]},
+            "info": {"data": [{"totalEq": "10000", "details": [
+                {"ccy": "USDT", "eq": "nan"},
+            ]}]},
         }
         exchange = Exchange.__new__(Exchange)
         exchange.cfg = valid_config()
         exchange.alerts = None
         exchange.x = client
         with self.assertRaisesRegex(RuntimeError, "positive finite"):
+            exchange.equity_usdt()
+
+    def test_missing_usdt_row_fails_closed(self):
+        client = Mock()
+        client.fetch_balance.return_value = {
+            "info": {"data": [{"totalEq": "8152.93", "details": [
+                {"ccy": "OKB", "eq": "100", "eqUsd": "8152.93"},
+            ]}]},
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        with self.assertRaisesRegex(RuntimeError, "no USDT currency equity"):
             exchange.equity_usdt()
 
 

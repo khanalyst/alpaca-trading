@@ -242,14 +242,18 @@ def cmd_status(args, cfg) -> int:
         ex = Exchange(cfg)
         equity = ex.equity_usdt()
         line = f"Equity: {equity:,.2f} USDT"
-        if st.get("day_start_equity"):
+        basis_current = st.get("equity_basis") == state.EQUITY_BASIS
+        if basis_current and st.get("day_start_equity"):
             day = (equity - st["day_start_equity"]) / st["day_start_equity"] * 100
             line += f"   Day PnL: {day:+.2f}%"
-        if st.get("high_water_mark"):
+        if basis_current and st.get("high_water_mark"):
             dd = (st["high_water_mark"] - equity) / st["high_water_mark"] * 100
             line += (f"   High-water mark: {st['high_water_mark']:,.2f}"
                      f"   Drawdown: {dd:.2f}%")
         print(line)
+        if not basis_current:
+            print("Benchmarks: pending one-time USDT-only rebase on the next "
+                  "agent cycle")
         positions = ex.positions()
         if not positions:
             print("Open positions: none")

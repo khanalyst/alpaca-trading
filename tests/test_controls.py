@@ -2,7 +2,9 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -13,6 +15,32 @@ from tests.helpers import valid_config
 
 
 class CredentialFreeControlTests(unittest.TestCase):
+    @patch("agent.exchange.Exchange")
+    @patch("main.state.pid_alive", return_value=False)
+    @patch("main.state.read_pid", return_value=None)
+    @patch("main.state.load_state")
+    def test_status_hides_legacy_benchmarks_until_rebased(
+            self, load_state, read_pid, pid_alive, exchange_cls):
+        load_state.return_value = {
+            "state": state.RUNNING,
+            "high_water_mark": 81_000.06,
+            "day_start_equity": 81_000.06,
+            "equity_basis": None,
+            "kill_reason": None,
+        }
+        exchange_cls.return_value.equity_usdt.return_value = 72_232.06
+        exchange_cls.return_value.positions.return_value = []
+        output = StringIO()
+
+        with redirect_stdout(output):
+            self.assertEqual(main.cmd_status(Mock(), valid_config()), 0)
+
+        shown = output.getvalue()
+        self.assertIn("Equity: 72,232.06 USDT", shown)
+        self.assertIn("pending one-time USDT-only rebase", shown)
+        self.assertNotIn("Day PnL", shown)
+        self.assertNotIn("Drawdown", shown)
+
     @patch("main.setup_logging")
     @patch("main.state.set_state")
     def test_pause_works_without_env_file(self, set_state, setup_logging):
@@ -82,6 +110,31 @@ class CredentialFreeControlTests(unittest.TestCase):
 
 
 class KillSemanticsTests(unittest.TestCase):
+    @patch("agent.engine.state.log_event")
+    def test_legacy_equity_benchmarks_rebase_once(self, log_event):
+        st = {
+            "state": state.RUNNING,
+            "high_water_mark": 81_000.06,
+            "day_start_equity": 81_000.06,
+            "day": "2026-07-22",
+            "last_ledger_ts": 1,
+        }
+        now = 1_753_228_800.0
+
+        changed = Engine._ensure_equity_basis(st, 72_232.06, now)
+
+        self.assertTrue(changed)
+        self.assertEqual(st["equity_basis"], state.EQUITY_BASIS)
+        self.assertEqual(st["high_water_mark"], 72_232.06)
+        self.assertEqual(st["day_start_equity"], 72_232.06)
+        self.assertEqual(st["last_ledger_ts"], int(now * 1000))
+        self.assertEqual(log_event.call_args.args[0],
+                         "equity_basis_migration")
+
+        self.assertFalse(Engine._ensure_equity_basis(st, 72_100, now + 60))
+        self.assertEqual(st["high_water_mark"], 72_232.06)
+        self.assertEqual(log_event.call_count, 1)
+
     @patch("agent.engine.state.load_state")
     def test_keep_positions_kill_exits_without_flattening(self, load_state):
         load_state.return_value = {
@@ -148,6 +201,7 @@ class KillSemanticsTests(unittest.TestCase):
             "high_water_mark": 100,
             "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "day_start_equity": 100,
+            "equity_basis": state.EQUITY_BASIS,
             "last_ledger_ts": 0,
             "cooldowns": {}, "opened_at": {}, "active_trades": {},
             "protection": {},

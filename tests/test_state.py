@@ -55,6 +55,12 @@ class StateSafetyTests(unittest.TestCase):
         loaded = state.load_state()
         self.assertEqual(loaded["state"], state.KILLED)
 
+    def test_unknown_equity_basis_fails_closed(self):
+        invalid = dict(state.DEFAULT)
+        invalid["equity_basis"] = "account_total_usd"
+        with self.assertRaisesRegex(ValueError, "equity_basis"):
+            state.save_state(invalid)
+
     def test_only_one_agent_run_lock_can_be_held(self):
         first = state.acquire_run_lock()
         self.assertIsNotNone(first)

@@ -186,6 +186,40 @@ class Engine:
 
     # ------------------------------------------------------------ the cycle
 
+    @staticmethod
+    def _ensure_equity_basis(st: dict, equity: float, now: float) -> bool:
+        """Rebase legacy account-wide benchmarks to USDT equity exactly once.
+
+        Before ``usdt_currency_equity_v1``, OKX ``totalEq`` made demo OKB and
+        other currencies look like USDT trading capital. Comparing the new
+        USDT-only value with those old benchmarks would create a false loss,
+        so the first cycle resets both references before any breaker runs.
+        """
+        if st.get("equity_basis") == state.EQUITY_BASIS:
+            return False
+        previous = {
+            "high_water_mark": st.get("high_water_mark"),
+            "day_start_equity": st.get("day_start_equity"),
+        }
+        st["equity_basis"] = state.EQUITY_BASIS
+        st["high_water_mark"] = equity
+        st["day_start_equity"] = equity
+        st["day"] = datetime.fromtimestamp(
+            now, timezone.utc).strftime("%Y-%m-%d")
+        # Current USDT equity already contains every earlier transfer. Moving
+        # the cursor prevents one of those transfers being added a second time
+        # to the freshly rebased references.
+        st["last_ledger_ts"] = int(now * 1000)
+        state.log_event("equity_basis_migration", json.dumps({
+            "basis": state.EQUITY_BASIS,
+            "previous": previous,
+            "rebased_usdt_equity": equity,
+        }))
+        log.warning(
+            "Equity basis migrated to USDT-only; benchmarks rebased to %.2f "
+            "USDT (non-USDT assets are excluded)", equity)
+        return True
+
     def cycle(self, st: dict) -> None:
         now = time.time()
         # A host that booted with a good clock can still drift into OKX's
@@ -196,6 +230,8 @@ class Engine:
         if equity <= 0:
             log.warning("Equity reads as 0; skipping cycle")
             return
+        if self._ensure_equity_basis(st, equity, now):
+            state.commit(st)
 
         # Exchange state is authoritative. Reconcile fills and protection
         # before strategy decisions or account-level risk calculations.
