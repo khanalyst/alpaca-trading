@@ -34,6 +34,7 @@ provider works (Anthropic or OpenAI).
 - [Going live (much later)](#going-live-much-later)
 - [What it costs](#what-it-costs)
 - [Troubleshooting](#troubleshooting)
+- [Appendix — Doing it all in VS Code](#appendix--doing-it-all-in-vs-code)
 
 ---
 
@@ -215,6 +216,13 @@ Oracle Cloud free tier, etc. The agent is tiny; the smallest plan is plenty
 
 On whichever machine you chose, open a terminal and run these one at a time.
 
+> **Prefer a real editor to a bare terminal?** Steps 4–7 can all be done
+> inside VS Code — installing it, cloning, the sandbox, editing `.env`, and
+> pushing config changes back to GitHub. See
+> [Appendix — Doing it all in VS Code](#appendix--doing-it-all-in-vs-code)
+> and then come back here at Step 8. Everything below still applies; VS Code
+> just gives you a file tree and a built-in terminal instead of `nano`.
+
 1. Check Python is 3.11 or newer:
 
    ```bash
@@ -296,7 +304,7 @@ other one blank.
 
 **`.env` is the only place the agent reads credentials from.** Nothing is
 hardcoded, and no key is read from anywhere else. If the same variable is
-also exported in your shell, `.env` wins — but `python main.py check` will
+also exported in your shell, `.env` wins — but `./.venv/bin/python main.py check` will
 warn you, because having two copies is how people end up pointing a live run
 at the wrong account. Lock the file down so other users on the machine can't
 read it:
@@ -317,7 +325,7 @@ request fails. Make sure automatic time sync is on:
 
 The agent checks this for you at startup, refuses to start if the clock is
 more than 15 seconds out, and re-checks every 15 minutes while running.
-`python main.py check` prints your current drift.
+`./.venv/bin/python main.py check` prints your current drift.
 
 ---
 
@@ -626,3 +634,139 @@ else**, if you run it on a computer you already own.
 - **It self-killed and won't restart.** That's the drawdown circuit breaker.
   Review `runtime/agent.log` and the journal, then restart deliberately with
   `./.venv/bin/python main.py run --acknowledge-kill`.
+
+---
+
+## Appendix — Doing it all in VS Code
+
+VS Code is a free code editor. Nothing here *requires* it — the terminal
+steps above are complete on their own — but it gives you a file tree, a
+built-in terminal, and a safe way to edit `config.yaml` and push it back to
+GitHub without touching the command line for git.
+
+This appendix replaces Steps 4 through 7. When you finish it, continue at
+[Step 8 — Keep it running 24/7](#step-8--keep-it-running-247).
+
+### A.1 Install VS Code
+
+1. Go to **code.visualstudio.com** and click **Download for Mac** (or your
+   platform — the button detects it).
+2. Open the downloaded `.zip`. It produces *Visual Studio Code.app*.
+3. **Drag that app into your Applications folder.** Don't skip this — running
+   it from `Downloads` causes confusing update behaviour later.
+4. Launch it. If macOS warns about an app downloaded from the internet, click
+   **Open**.
+
+### A.2 Install the Python extension
+
+1. Click the **Extensions** icon in the left sidebar (four small squares), or
+   press `Cmd+Shift+X` (`Ctrl+Shift+X` on Windows/Linux).
+2. Search for `Python`.
+3. Install the one published by **Microsoft** — it's the first result.
+
+That one extension provides syntax highlighting, error underlining, and the
+interpreter picker used in A.5.
+
+### A.3 Clone the code
+
+Open VS Code's built-in terminal with `` Ctrl+` `` (control plus the backtick
+key, above Tab). It opens a normal shell at the bottom of the window.
+
+```bash
+mkdir -p ~/Projects && cd ~/Projects
+git clone https://github.com/khanalyst/okx-agent-crypto.git
+cd okx-agent-crypto
+```
+
+If the repository is private, git will ask for credentials. The painless fix
+is the GitHub CLI — `brew install gh`, then `gh auth login`, then use
+`gh repo clone khanalyst/okx-agent-crypto` instead of `git clone`. It stores
+the credentials once and you never get prompted again.
+
+### A.4 Open the folder
+
+**File → Open Folder…** → navigate to `Projects` → select
+`okx-agent-crypto` → **Open**. Click **Yes, I trust the authors** if asked.
+
+The file tree now appears on the left. Reopen the terminal with `` Ctrl+` ``;
+from now on it always starts in the project folder, so you never need `cd`.
+
+### A.5 Build the sandbox and point VS Code at it
+
+In the VS Code terminal:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.lock.txt
+```
+
+Then tell the editor to use that sandbox:
+
+1. Press `Cmd+Shift+P` (`Ctrl+Shift+P` on Windows/Linux) to open the command
+   palette.
+2. Type `Python: Select Interpreter` and press Enter.
+3. Choose the entry showing `./.venv/bin/python` — it is usually labelled
+   **Recommended**.
+
+Skip this and VS Code underlines every `import ccxt` in red even though the
+code runs perfectly. The squiggles mean the editor is looking at the wrong
+Python, not that anything is broken.
+
+### A.6 Create and fill in .env
+
+```bash
+cp .env.example .env && chmod 600 .env
+```
+
+Now click `.env` in the file tree and edit it directly in the editor. Fill in
+the values exactly as described in
+[Step 5](#step-5--fill-in-your-secrets-env) — no quotes, no spaces around the
+`=` sign. Save with `Cmd+S`.
+
+### A.7 Confirm your keys can't leak to GitHub
+
+This is worth doing once, so you trust the setup rather than hoping.
+
+Click the **Source Control** icon in the left sidebar (the branching-lines
+icon). It lists every file git would commit.
+
+**`.env` must not appear in that list.** It's in `.gitignore`, so VS Code
+will not offer to commit it and cannot upload it by accident. `config.yaml`
+*will* appear whenever you edit it — that one is meant to be versioned and
+contains no secrets.
+
+To push config changes from the editor: click the **Accounts** icon at the
+bottom-left → **Sign in with GitHub** and approve in the browser. After that,
+editing `config.yaml` → typing a short message in the Source Control box →
+`Cmd+Enter` → **Sync Changes** commits and pushes it. Your `.env` stays on
+this machine permanently.
+
+> **The one rule:** never paste a key into `config.yaml`, a commit message, or
+> a GitHub issue. `.env` is the only place credentials belong, and it is the
+> only file protected from upload.
+
+### A.8 Check and run
+
+In the VS Code terminal:
+
+```bash
+./.venv/bin/python main.py check
+```
+
+That validates the config, tests your OKX keys, checks this machine's clock
+against OKX's 30-second signing window, confirms the key has Trade permission,
+and prints the coin universe — all without placing a single order. When it
+passes:
+
+```bash
+./.venv/bin/python main.py run
+```
+
+Decisions now stream into that terminal panel. To watch status at the same
+time, click the **+** in the terminal panel to open a second one and run
+`./.venv/bin/python main.py status` there — the first panel keeps running the
+agent.
+
+Continue at [Step 8 — Keep it running 24/7](#step-8--keep-it-running-247).
+Note that a laptop only trades while it's awake: closing the lid stops the
+decision loop (open positions keep their exchange-side stops either way).
