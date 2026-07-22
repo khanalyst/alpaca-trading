@@ -28,12 +28,16 @@ RUNNING = "RUNNING"          # normal operation: manage positions, open new ones
 PAUSED = "PAUSED"            # housekeeping only: no LLM calls, no new entries
 DAY_STOPPED = "DAY_STOPPED"  # daily loss limit hit: model may close, cannot open
 KILLED = "KILLED"            # terminal: flatten everything and exit
+EQUITY_BASIS = "usdt_currency_equity_v1"
 
 DEFAULT = {
     "state": PAUSED,
     "high_water_mark": None,
     "day": None,
     "day_start_equity": None,
+    # None identifies state written before USDT-only equity was introduced.
+    # The engine rebases legacy benchmarks once before evaluating breakers.
+    "equity_basis": None,
     "last_ledger_ts": 0,
     "cooldowns": {},   # symbol -> unix ts until which no new entries are allowed
     "opened_at": {},   # symbol -> unix ts the position was opened
@@ -73,6 +77,8 @@ def _validate(data: object) -> dict:
     day = merged.get("day")
     if day is not None and (not isinstance(day, str) or len(day) != 10):
         raise ValueError("state.day is invalid")
+    if merged.get("equity_basis") not in {None, EQUITY_BASIS}:
+        raise ValueError("state.equity_basis is invalid")
     for block_name in ("cooldowns", "opened_at"):
         for symbol, value in merged[block_name].items():
             if (not isinstance(symbol, str) or isinstance(value, bool)
@@ -235,8 +241,9 @@ def set_state(name: str, reason: str | None = None, **extra) -> dict:
 
 # Keys the trading loop owns. commit() persists these without clobbering a
 # state change (pause/kill) the CLI may have written while a cycle was running.
-LOOP_KEYS = ("high_water_mark", "day", "day_start_equity", "last_ledger_ts",
-             "cooldowns", "opened_at", "active_trades", "protection")
+LOOP_KEYS = ("high_water_mark", "day", "day_start_equity", "equity_basis",
+             "last_ledger_ts", "cooldowns", "opened_at", "active_trades",
+             "protection")
 
 
 def commit(st: dict, transition: tuple[str, str] | None = None,

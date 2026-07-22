@@ -420,19 +420,43 @@ class Exchange:
 
     # ------------------------------------------------------------- account
 
-    def equity_usdt(self) -> float:
-        bal = self.retry(self.x.fetch_balance)
-        data = (bal.get("info") or {}).get("data") or []
-        if data and data[0].get("totalEq") not in (None, ""):
-            value = float(data[0]["totalEq"])
+    @staticmethod
+    def _usdt_equity_from_balance(balance: dict) -> float:
+        """Return USDT-denominated equity without valuing other currencies.
+
+        OKX ``totalEq`` is an account-wide USD conversion and therefore
+        includes assets such as the 100 virtual OKB issued to demo accounts.
+        This agent trades USDT-settled swaps, so sizing and circuit breakers
+        must use the USDT currency row's ``eq`` field instead.
+        """
+        rows = ((balance.get("info") or {}).get("data") or [])
+        if rows:
+            details = rows[0].get("details") or []
+            usdt = next((detail for detail in details
+                         if str(detail.get("ccy") or "").upper() == "USDT"),
+                        None)
+            if usdt is None:
+                raise RuntimeError("OKX returned no USDT currency equity")
+            raw = usdt.get("eq")
+            if raw in (None, ""):
+                raise RuntimeError("OKX returned no USDT equity value")
+            value = float(raw)
         else:
-            value = float((bal.get("USDT") or {}).get("total") or 0)
+            # Compatibility fallback for a CCXT response without raw OKX
+            # account data. This remains currency-specific; never fall back
+            # to account-wide totalEq.
+            value = float((balance.get("USDT") or {}).get("total") or 0)
         if not math.isfinite(value) or value <= 0:
-            raise RuntimeError("OKX total equity is not a positive finite value")
+            raise RuntimeError(
+                "OKX USDT equity is not a positive finite value")
         return value
 
+    def equity_usdt(self) -> float:
+        return self._usdt_equity_from_balance(
+            self.retry(self.x.fetch_balance))
+
     def collateral_breakdown(self) -> tuple[float, float]:
-        """Return (non-USDT equity in USD, total equity in USD).
+        """Return (enabled non-USDT USD, USDT-plus-enabled USD equity).
 
         Split out from verify_usdt_collateral so demo can measure the same
         number without inheriting live's refusal to start.
@@ -442,25 +466,37 @@ class Exchange:
         if not rows:
             raise RuntimeError("OKX collateral breakdown is unavailable")
         account = rows[0]
-        total = float(account.get("totalEq") or 0)
-        if not math.isfinite(total) or total <= 0:
-            raise RuntimeError("OKX total equity is not positive")
         details = account.get("details") or []
         if not details:
             raise RuntimeError("OKX returned no collateral currency details")
         non_usdt = 0.0
+        usdt_usd = None
         for detail in details:
             if str(detail.get("ccy") or "").upper() == "USDT":
+                raw = detail.get("eqUsd")
+                if raw in (None, ""):
+                    raw = detail.get("eq")
+                usdt_usd = float(raw or 0)
+                continue
+            # Disabled assets still appear in totalEq, but cannot support or
+            # share risk with cross-margin positions. Missing flags are
+            # treated conservatively as enabled for backwards compatibility.
+            enabled = detail.get("collateralEnabled")
+            if enabled is False or str(enabled).strip().lower() in {
+                    "false", "0"}:
                 continue
             value = float(detail.get("eqUsd") or 0)
             if not math.isfinite(value):
                 raise RuntimeError("OKX collateral breakdown is not finite")
             non_usdt += abs(value)
-        return non_usdt, total
+        if (usdt_usd is None or not math.isfinite(usdt_usd)
+                or usdt_usd <= 0):
+            raise RuntimeError("OKX USDT collateral equity is not positive")
+        return non_usdt, usdt_usd + non_usdt
 
     @staticmethod
     def _collateral_is_mixed(non_usdt: float, total: float) -> bool:
-        """True when enough non-USDT sits in the account to distort sizing."""
+        """True when enabled non-USDT collateral is material to account risk."""
         return non_usdt > max(1.0, total * 0.01)
 
     def verify_usdt_collateral(self) -> float:
@@ -469,31 +505,27 @@ class Exchange:
         pct = non_usdt / total * 100
         if self._collateral_is_mixed(non_usdt, total):
             raise RuntimeError(
-                f"non-USDT assets are {pct:.2f}% of trading equity; move "
-                "them out or use a dedicated USDT-only sub-account")
+                f"enabled non-USDT collateral is {pct:.2f}% of trading "
+                "equity; disable it, move it out, or use a dedicated "
+                "USDT-only sub-account")
         return pct
 
     def measure_usdt_collateral(self) -> float:
         """Demo counterpart: report the same ratio, but warn instead of stop.
 
-        Sizing is a percentage of *total* equity, while OKX will only margin a
-        USDT swap from collateral it actually lends against. A demo account
-        stuffed with OKX's free BTC/ETH/OKB therefore sizes entries several
-        times larger than the exchange will accept, and every order comes back
-        rejected. Demo must not refuse to start over it -- that is the one
-        place to discover such things safely -- but it must say so loudly,
-        because a silent version of this makes two weeks of paper results
-        describe an account that never existed.
+        Sizing uses USDT currency equity only. Enabled non-USDT collateral is
+        still reported because it shares liquidation risk in cross margin;
+        disabled demo assets such as OKX's virtual OKB are ignored entirely.
         """
         non_usdt, total = self.collateral_breakdown()
         pct = non_usdt / total * 100
         if self._collateral_is_mixed(non_usdt, total):
             log.warning(
-                "non-USDT assets are %.1f%% of demo equity (%.0f of %.0f USD). "
-                "Position sizing is a percentage of total equity, so entries "
-                "will be sized against money OKX will not margin a USDT swap "
-                "with, and orders may be rejected. Convert them to USDT so "
-                "demo matches how live must be funded.", pct, non_usdt, total)
+                "enabled non-USDT collateral is %.1f%% of demo equity "
+                "(%.0f of %.0f USD). It is excluded from position sizing but "
+                "still shares cross-margin liquidation risk; disable it so "
+                "demo matches the agent's USDT-only risk model.",
+                pct, non_usdt, total)
         return pct
 
     def margin_usage_pct(self) -> float | None:
@@ -513,7 +545,11 @@ class Exchange:
             equity_raw = account.get("totalEq")
         imr_raw = account.get("imr")
         if equity_raw not in (None, "") and imr_raw not in (None, ""):
-            equity = float(equity_raw)
+            # Never let ignored assets make margin usage look safer. adjEq is
+            # USD-denominated, while USDT eq is in USDT and tracks USD closely;
+            # the smaller value is the conservative denominator.
+            equity = min(float(equity_raw),
+                         self._usdt_equity_from_balance(bal))
             initial_margin = float(imr_raw)
             if not math.isfinite(equity) or equity <= 0:
                 raise RuntimeError("OKX adjusted equity is not positive")

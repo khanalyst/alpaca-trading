@@ -102,7 +102,8 @@ trend_down, high_volatility, choppy, or transition. It is context, not a \
 command; decide whether the setup fits it.
 
 PORTFOLIO STATE FIELD REFERENCE
-- equity_usdt: live account equity. All sizing is derived from it.
+- equity_usdt: live USDT currency equity. Other account assets (including \
+demo OKB) are excluded. All sizing is derived from this USDT value.
 - day_pnl_pct: percent PnL since the UTC day started. If this is \
 meaningfully negative, be pickier, not more aggressive: the daily loss \
 breaker is close.

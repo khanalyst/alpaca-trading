@@ -6,9 +6,10 @@ deterministic risk engine owns sizing, leverage and circuit breakers; an
 execution layer places orders with exchange-side stop-losses so positions
 stay protected even if the process dies.
 
-Everything is measured and sized in percentages of live equity, so the agent
-compounds automatically as the account grows and scales down automatically if
-it shrinks.
+Everything is measured and sized in percentages of live **USDT currency
+equity**, so the agent compounds automatically as the trading balance grows
+and scales down as it shrinks. Account-wide USD values such as demo OKB are
+never treated as USDT capital.
 
 ---
 
@@ -83,8 +84,9 @@ cp .env.example .env      # then fill in your keys
 
 1. In OKX, make sure derivatives trading is enabled and your account mode is
    Single-currency or Multi-currency margin (Settings -> Account mode).
-2. Keep your trading capital as USDT in the Trading account (the agent reads
-   equity from there; the Funding account is invisible to it).
+2. Keep your trading capital as USDT in the Trading account. The agent sizes
+   strictly from the USDT currency equity there; disabled BTC/ETH/OKB assets
+   are ignored, and the Funding account is invisible to it.
 3. Set derivatives position mode to **one-way / net mode** in OKX while the
    account is flat. The agent never changes account settings implicitly and
    refuses to start if OKX reports hedge mode.
@@ -182,8 +184,9 @@ The agent also stops itself:
 
 You can add or remove funds at any time; the agent is designed for it.
 
-- Sizing is recomputed from live equity every cycle, so a deposit compounds
-  into larger positions on the very next cycle and a withdrawal shrinks them.
+- Sizing is recomputed from live USDT equity every cycle, so a USDT deposit
+  compounds into larger positions on the next cycle and a withdrawal shrinks
+  them. Price changes in disabled non-USDT assets do not affect the agent.
 - The agent reads the OKX ledger each cycle and rebases its benchmarks by the
   net transfer, so a deposit is not mistaken for profit and a withdrawal is
   not mistaken for a crash (neither will falsely trip the drawdown or daily
@@ -203,9 +206,10 @@ only sees (and trades with) the Trading account balance.
 
 Every cycle (default: every 5 minutes) the agent runs the same loop:
 
-1. **Sync equity and money movements.** It reads live Trading-account equity
-   and checks the OKX ledger for deposits/withdrawals, rebasing its
-   benchmarks so a transfer is never mistaken for profit or a crash.
+1. **Sync USDT equity and money movements.** It reads the Trading account's
+   USDT currency equity and checks the OKX ledger for USDT
+   deposits/withdrawals, rebasing its benchmarks so a transfer is never
+   mistaken for profit or a crash. Other currencies are excluded.
 2. **Check the circuit breakers first.** If the account is down past the
    daily loss limit, no new positions open until the next UTC day. If it's
    down past the max drawdown from its high-water mark, it flattens
