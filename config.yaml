@@ -8,8 +8,8 @@ mode: demo            # demo | live
                       # SEPARATE demo API keys inside OKX's Demo Trading section.
 
 llm:
-  provider: anthropic          # anthropic | openai
-  model: claude-sonnet-4-6     # e.g. claude-sonnet-4-6, claude-opus-4-8,
+  provider: openai          # anthropic | openai
+  model: gpt-5.6-terra     # e.g. claude-sonnet-4-6, claude-opus-4-8,
                                #      gpt-4.1, gpt-4o, o4-mini
   temperature: 0.2             # ignored automatically on models that reject
                                # sampling params (Sonnet 5, Opus 4.7+)
