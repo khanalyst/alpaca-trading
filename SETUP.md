@@ -1,4 +1,4 @@
-# Setup Guide — from zero to a running agent
+# Setup Guide — from zero to a running agent v2
 
 This is the complete, assume-nothing walkthrough. It covers **every** piece
 involved, not just the agent: the OKX exchange account, the AI provider
