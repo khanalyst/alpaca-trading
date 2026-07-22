@@ -1,3 +1,4 @@
+import json
 import time
 import unittest
 
@@ -97,6 +98,22 @@ class MarketSnapshotTests(unittest.TestCase):
         # JSON sent to the model.
         snap = symbol_snapshot(FakeExchange(), "BTC/USDT:USDT", valid_config())
         self.assertEqual(snap["rsi_1h"], 100.0)
+
+    def test_non_finite_market_values_become_json_null(self):
+        exchange = FakeExchange()
+        original_ticker = exchange.x.fetch_ticker
+
+        def malformed_ticker(symbol):
+            return {**original_ticker(symbol), "percentage": float("nan")}
+
+        exchange.x.fetch_ticker = malformed_ticker
+        snap = symbol_snapshot(
+            exchange, "BTC/USDT:USDT", valid_config())
+
+        self.assertIsNone(snap["chg_24h_pct"])
+        encoded = json.dumps(snap, allow_nan=False)
+        self.assertNotIn("NaN", encoded)
+        self.assertNotIn("Infinity", encoded)
 
     def test_okx_swap_contract_volume_is_converted_with_contract_size(self):
         market = {"swap": True, "settle": "USDT", "contractSize": 0.01}

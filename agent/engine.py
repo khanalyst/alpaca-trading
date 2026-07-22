@@ -18,6 +18,7 @@ State semantics:
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 
@@ -236,16 +237,32 @@ class Engine:
         # Exchange state is authoritative. Reconcile fills and protection
         # before strategy decisions or account-level risk calculations.
         positions = self.ex.positions()
+        invalid_position_metrics = []
         for p in positions:
             # Normalize once so the net-direction guard and portfolio view
             # never meet a position whose side/notional ccxt left unset.
             p["side"] = self._direction(p)
             p["notional"] = self._notional(p)
+            if p["side"] not in {"long", "short"} or p["notional"] <= 0:
+                p["_risk_notional_invalid"] = True
+                invalid_position_metrics.append(str(p.get("symbol") or "?"))
+        if invalid_position_metrics:
+            detail = {
+                "symbols": invalid_position_metrics,
+                "why": "non-finite or unavailable position risk metrics",
+            }
+            log.error("Position risk metrics invalid for %s; new entries "
+                      "disabled this cycle", ", ".join(invalid_position_metrics))
+            state.log_event("error", json.dumps(detail, separators=(",", ":")))
+            self.alerts.send(
+                "error", "position_metrics_invalid",
+                "New entries disabled because held-position risk metrics are "
+                "invalid", detail)
         try:
             positions = self._reconcile_positions(
                 positions, st, startup=not self._startup_reconciled)
             self._startup_reconciled = True
-            reconciled = True
+            reconciled = not invalid_position_metrics
         except Exception as exc:
             # A reconciliation problem must not disable the account-level
             # circuit breakers below. Trade conservatively instead: keep
@@ -368,20 +385,20 @@ class Engine:
         max_new = (int(r["max_concurrent_positions"]) - len(positions)
                    if st["state"] == state.RUNNING and reconciled else 0)
         # The model is the one nondeterministic component in the pipeline.
-        # Journal exactly what it saw so every decision - and every silent
-        # hold - can be audited against its inputs later.
-        state.log_event("llm_input", json.dumps(
-            {"max_new": max_new, "portfolio": portfolio,
-             "snapshot": snapshot}, separators=(",", ":")))
+        # Journal the exact provider request and the raw provider result so
+        # every parsed decision - and every silent hold - can be reconstructed.
+        self._journal_llm_input(snapshot, portfolio, max_new)
         try:
             decisions = self.llm.decide(snapshot, portfolio, max_new)
         except Exception as e:
+            self._journal_llm_output()
             log.error("LLM call failed; holding this cycle: %s", e)
             state.log_event("error", f"llm: {e}")
             self.alerts.send(
                 "error", "llm_call_failed",
                 "LLM call failed; holding this cycle", {"error": str(e)})
             return
+        self._journal_llm_output()
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
@@ -985,7 +1002,11 @@ class Engine:
                 f"cannot enforce margin-usage guard: {exc}") from exc
         while (usage is not None and usage > float(r["max_margin_usage_pct"])
                and kept):
-            kept.sort(key=self._notional, reverse=True)
+            kept.sort(
+                key=lambda p: (float("inf")
+                               if p.get("_risk_notional_invalid")
+                               else self._notional(p)),
+                reverse=True)
             biggest = kept.pop(0)
             log.warning("Margin usage %.0f%% above %.0f%% cap; closing "
                         "largest position %s", usage,
@@ -998,6 +1019,24 @@ class Engine:
         return kept
 
     # ------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _audit_json(payload: object) -> str:
+        return json.dumps(
+            payload, separators=(",", ":"), allow_nan=False)
+
+    def _journal_llm_input(self, snapshot: dict, portfolio: dict,
+                           max_new: int) -> None:
+        state.log_event(
+            "llm_input",
+            self._audit_json(
+                self.llm.audit_request(snapshot, portfolio, max_new)),
+        )
+
+    def _journal_llm_output(self) -> None:
+        payload = self.llm.call_audit()
+        if payload is not None:
+            state.log_event("llm_output", self._audit_json(payload))
 
     @staticmethod
     def _sorted_opens(decisions: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -1019,13 +1058,19 @@ class Engine:
 
     def _notional(self, pos: dict) -> float:
         n = pos.get("notional")
-        if n:
-            return abs(float(n))
+        if n not in (None, ""):
+            try:
+                value = abs(float(n))
+                if math.isfinite(value) and value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
         try:
             m = self.ex.x.market(pos["symbol"])
-            return (abs(float(pos.get("contracts") or 0))
-                    * float(m.get("contractSize") or 1)
-                    * float(pos.get("markPrice") or 0))
+            value = (abs(float(pos.get("contracts") or 0))
+                     * float(m.get("contractSize") or 1)
+                     * float(pos.get("markPrice") or 0))
+            return value if math.isfinite(value) and value > 0 else 0.0
         except Exception:
             return 0.0
 

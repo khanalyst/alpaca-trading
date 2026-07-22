@@ -57,6 +57,22 @@ class VetOpenSymbolTests(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertEqual(why, "invalid price")
 
+    def test_non_finite_gross_exposure_fails_closed(self):
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], snapshot(), {}, float("nan"))
+        self.assertIsNone(plan)
+        self.assertEqual(why, "gross exposure measurement is invalid")
+
+    def test_non_finite_held_notional_cannot_bypass_net_cap(self):
+        held = [{
+            "symbol": "ETH/USDT:USDT", "side": "long",
+            "notional": float("nan"),
+        }]
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, held, snapshot(), {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "held position notional is invalid")
+
     def test_take_profit_beyond_bound_is_rejected(self):
         # A short's TP trigger at entry*(1 - 120/100) would be negative and
         # OKX would reject the whole attached-SL/TP entry order.

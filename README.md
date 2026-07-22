@@ -423,6 +423,11 @@ rejection, trade, transfer and an equity curve snapshot per cycle. The agent
 checks that the journal is writable before starting and pauses immediately on
 any later journal write failure. Plain-text logs rotate at 10 MB.
 
+Each model cycle also records the exact provider request, every retry attempt,
+the provider response ID, raw response text and parsed decisions. This makes
+the nondeterministic LLM layer auditable after prompts or settings change;
+protect and back up the journal as trading-sensitive data.
+
 ```bash
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), equity FROM equity ORDER BY ts DESC LIMIT 10;"

@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from agent.brain import LLM, parse_decisions
+from agent.brain import LLM, SYSTEM, parse_decisions
 
 
 class LLMPreflightTests(unittest.TestCase):
@@ -82,6 +82,45 @@ class ModelOutputValidationTests(unittest.TestCase):
         )
         self.assertEqual(decisions[0]["confidence"], 0)
         self.assertEqual(decisions[0]["leverage"], 1)
+
+
+class LLMAuditTests(unittest.TestCase):
+    @staticmethod
+    def _llm():
+        llm = LLM.__new__(LLM)
+        llm.cfg = {"model": "gpt-test", "temperature": 0.2,
+                   "max_tokens": 2000}
+        llm.provider = "openai"
+        llm._no_temperature = False
+        llm._call = Mock(return_value='{"decisions":[]}')
+        llm._last_request_attempts = []
+        llm._last_response_audit = None
+        return llm
+
+    def test_audit_request_contains_exact_prompt_and_provider_parameters(self):
+        llm = self._llm()
+        audit = llm.audit_request(
+            {"BTC/USDT:USDT": {"price": 100}},
+            {"equity_usdt": 10_000}, 1)
+
+        self.assertEqual(audit["provider"], "openai")
+        request = audit["request"]
+        self.assertEqual(request["model"], "gpt-test")
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertEqual(request["messages"][0]["content"], SYSTEM)
+        self.assertIn('"equity_usdt":10000',
+                      request["messages"][1]["content"])
+
+    def test_call_audit_records_raw_and_parsed_output(self):
+        llm = self._llm()
+        llm.decide({}, {}, 0)
+        audit = llm.call_audit()
+
+        self.assertEqual(audit["request_attempts"], [])
+        self.assertEqual(audit["response"]["raw_text"],
+                         '{"decisions":[]}')
+        self.assertEqual(audit["response"]["parsed_decisions"], [])
+        self.assertEqual(audit["response"]["effective_temperature"], 0.2)
 
 
 if __name__ == "__main__":

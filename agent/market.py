@@ -69,6 +69,25 @@ def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
 
+def _json_safe(value):
+    """Replace non-finite numeric market data before it reaches the LLM.
+
+    Python's json encoder otherwise emits NaN/Infinity tokens, which are not
+    valid JSON and can make provider behavior dependent on malformed exchange
+    data. Preserve the shape of the snapshot and mark unavailable values null.
+    """
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
@@ -257,6 +276,9 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     lo = float(ticker.get("low") or 0)
     if hi > lo > 0:
         snap["range_pos_pct"] = round((last - lo) / (hi - lo) * 100, 0)
+    # Sanitize every field, not just indicators with known edge cases. Ticker,
+    # funding and OHLCV adapters can all surface non-finite numeric values.
+    snap = _json_safe(snap)
     snap["regime"] = classify_regime(snap)
     return snap
 

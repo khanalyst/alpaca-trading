@@ -190,7 +190,8 @@ Any provider works — Hetzner, DigitalOcean, Vultr, Linode, AWS Lightsail,
 Oracle Cloud free tier, etc. The agent is tiny; the smallest plan is plenty
 (**1 CPU, 1 GB RAM, ~$5–12/month**, or free on some tiers).
 
-1. Create the smallest **Ubuntu** (22.04 or 24.04) server the provider offers.
+1. Create the smallest **Ubuntu 24.04** server the provider offers. Ubuntu
+   22.04's default Python is too old for the pinned NumPy version.
 2. The provider gives you an IP address and a way to connect. From your own
    computer's terminal:
 
@@ -204,7 +205,7 @@ Oracle Cloud free tier, etc. The agent is tiny; the smallest plan is plenty
 3. Once connected, install the basics:
 
    ```bash
-   sudo apt update && sudo apt install -y python3 python3-pip git tmux sqlite3
+   sudo apt update && sudo apt install -y python3 python3-pip python3-venv git tmux sqlite3
    ```
 
 4. Now do Steps 4–8 **on the server** (in that SSH session).
@@ -231,8 +232,8 @@ On whichever machine you chose, open a terminal and run these one at a time.
    python3 --version
    ```
 
-   If it's missing: Mac → install from python.org or `xcode-select --install`;
-   Ubuntu/VPS → `sudo apt install -y python3 python3-pip`.
+   If it's missing: Mac → install Python 3.12+ from python.org or Homebrew;
+   Ubuntu 24.04/VPS → `sudo apt install -y python3 python3-pip python3-venv`.
 
 2. Download the code:
 
