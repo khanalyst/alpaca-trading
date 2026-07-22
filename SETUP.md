@@ -234,16 +234,37 @@ On whichever machine you chose, open a terminal and run these one at a time.
    (No git? Download the ZIP from the GitHub page and unzip it, then `cd`
    into the folder.)
 
-3. Install the Python libraries it needs:
+3. Create a virtual environment — a private Python sandbox for this project:
 
    ```bash
-   pip3 install -r requirements.lock.txt
+   python3 -m venv .venv
    ```
 
-4. Create your secrets file from the template:
+   This is not optional. Modern Macs (Homebrew Python) and Ubuntu 23.04+
+   **refuse** to install libraries system-wide and fail with
+   `error: externally-managed-environment`. The sandbox is also what stops
+   this agent's pinned library versions from breaking your other Python
+   projects. It creates a `.venv` folder inside the project; it is gitignored
+   and you never need to look inside it.
+
+4. Install the Python libraries into that sandbox:
 
    ```bash
-   cp .env.example .env
+   ./.venv/bin/pip install -r requirements.lock.txt
+   ```
+
+   Using `./.venv/bin/pip` rather than plain `pip3` means you never have to
+   remember whether the sandbox is "activated" — this path always installs to
+   the right place. **From here on, every command in this guide uses
+   `./.venv/bin/python` instead of `python3`** for exactly that reason. If you
+   prefer the shorter `python main.py` form, run `source .venv/bin/activate`
+   first, once per terminal window.
+
+5. Create your secrets file from the template, and lock it down so no other
+   account on the machine can read your keys:
+
+   ```bash
+   cp .env.example .env && chmod 600 .env
    ```
 
 ---
@@ -337,7 +358,7 @@ After any edit here, restart the agent for it to take effect.
 1. Validate everything is wired up correctly:
 
    ```bash
-   python3 main.py check
+   ./.venv/bin/python main.py check
    ```
 
    You should see your mode (DEMO), your equity, and a short list of coins.
@@ -346,7 +367,7 @@ After any edit here, restart the agent for it to take effect.
 2. Start the agent in the foreground (a log line prints every cycle):
 
    ```bash
-   python3 main.py run
+   ./.venv/bin/python main.py run
    ```
 
    Leave it running. Press **Ctrl+C** to stop — that counts as a pause, and
@@ -367,7 +388,7 @@ and reconnect later.
 
 ```bash
 tmux new -s trader        # opens the "room"
-python3 main.py run       # start the agent inside it
+./.venv/bin/python main.py run       # start the agent inside it
 # leave the room: press Ctrl+B, release, then press D
 # come back later:
 tmux attach -t trader
@@ -423,13 +444,13 @@ journalctl -u okx-trader -f     # watch the logs live (Ctrl+C to stop watching)
 
 Two behaviors worth knowing:
 
-- An explicit `python3 main.py pause` **survives** crashes and reboots (the
+- An explicit `./.venv/bin/python main.py pause` **survives** crashes and reboots (the
   agent comes back paused until you `resume`). Run control commands as the
   same service user; from `/opt/okx-agent`, use
   `sudo -u okx-agent .venv/bin/python main.py pause`.
 - A drawdown self-kill is **not** auto-restarted into trading: the service
   will keep trying and failing to start until a human runs
-  `python3 main.py run --acknowledge-kill`. That's deliberate — a human
+  `./.venv/bin/python main.py run --acknowledge-kill`. That's deliberate — a human
   should look at a blow-up before more money is risked.
 
 ---
@@ -442,7 +463,7 @@ and a SQLite journal. All commands run from inside the repo folder.
 - One-line health check:
 
   ```bash
-  python3 main.py status
+  ./.venv/bin/python main.py status
   ```
 
   Shows state, equity, day PnL, drawdown, and open positions.
@@ -463,7 +484,7 @@ and a SQLite journal. All commands run from inside the repo folder.
 - The performance report (after it has traded for a while):
 
   ```bash
-  python3 report.py
+  ./.venv/bin/python report.py
   ```
 
   Shows transfer-adjusted equity, trade-ID-matched net USDT, notional- and
@@ -492,8 +513,8 @@ Before changing modes, run the full local suite and the opt-in read-only OKX
 demo integration preflight:
 
 ```bash
-python3 -m unittest discover -v
-OKX_RUN_DEMO_INTEGRATION=1 python3 -m unittest \
+./.venv/bin/python -m unittest discover -v
+OKX_RUN_DEMO_INTEGRATION=1 ./.venv/bin/python -m unittest \
   tests.test_okx_demo_integration -v
 ```
 
@@ -507,7 +528,7 @@ OKX_RUN_DEMO_INTEGRATION=1 python3 -m unittest \
 4. Enable alerts, configure `ALERT_WEBHOOK_URL`, and verify external host
    monitoring. Live startup is blocked if the webhook preflight fails.
 5. Ensure `.env` is mode 600, then set `mode: live` in `config.yaml`.
-6. Run `python3 main.py check` — it should say LIVE, confirm net mode, Read +
+6. Run `./.venv/bin/python main.py check` — it should say LIVE, confirm net mode, Read +
    Trade only, IP binding, and successful alert delivery. This preflight is
    read-only and does not alter leverage or position mode.
 7. Start small. Consider lowering `risk_per_trade_pct` and
@@ -581,7 +602,7 @@ else**, if you run it on a computer you already own.
   of auth failures the agent pauses itself rather than pretending to trade.
   Any open positions are still protected by their stop-loss/take-profit
   orders on OKX, but nothing is managing them — so fix this promptly. Repair
-  the credentials, run `check`, then `python3 main.py resume`. If you run
+  the credentials, run `check`, then `./.venv/bin/python main.py resume`. If you run
   under systemd, note that `Restart=always` will keep restarting into the
   same failure; fix the key rather than watching it loop.
 - **"Insufficient balance" when opening.** Margin is tied up, or the (demo)
@@ -604,4 +625,4 @@ else**, if you run it on a computer you already own.
   system prompt below the minimum length.
 - **It self-killed and won't restart.** That's the drawdown circuit breaker.
   Review `runtime/agent.log` and the journal, then restart deliberately with
-  `python3 main.py run --acknowledge-kill`.
+  `./.venv/bin/python main.py run --acknowledge-kill`.
