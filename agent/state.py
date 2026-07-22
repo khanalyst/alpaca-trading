@@ -4,6 +4,7 @@ The state file (runtime/state.json) is the control channel between the CLI
 and the running loop. The CLI writes it; the loop reads it every cycle.
 """
 
+import fcntl
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -18,6 +20,7 @@ RUNTIME = Path(__file__).resolve().parent.parent / "runtime"
 STATE_FILE = RUNTIME / "state.json"
 PID_FILE = RUNTIME / "agent.pid"
 DB_FILE = RUNTIME / "journal.db"
+STATE_LOCK_FILE = RUNTIME / "state.lock"
 
 log = logging.getLogger("state")
 
@@ -37,6 +40,7 @@ DEFAULT = {
     "active_trades": {},  # symbol -> durable entry/fill/risk metadata
     "protection": {},     # symbol -> intended exchange-side SL/TP metadata
     "kill_reason": None,
+    "flatten_on_kill": True,  # False only for explicit kill --keep-positions
     "operator_pause": False,  # True = pause was an explicit CLI command and
                               # must survive crashes and restarts
 }
@@ -126,27 +130,63 @@ def _validate(data: object) -> dict:
                 raise ValueError(f"state.protection.{symbol}.{key} is invalid")
     if not isinstance(merged.get("operator_pause"), bool):
         raise ValueError("state.operator_pause is not boolean")
+    if not isinstance(merged.get("flatten_on_kill"), bool):
+        raise ValueError("state.flatten_on_kill is not boolean")
     reason = merged.get("kill_reason")
     if reason is not None and not isinstance(reason, str):
         raise ValueError("state.kill_reason is invalid")
     return merged
 
 
+@contextmanager
+def _state_lock():
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    lock_file = RUNTIME / STATE_LOCK_FILE.name
+    with lock_file.open("a+") as handle:
+        os.chmod(lock_file, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _write_atomic(st: dict) -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(st, indent=2))
-    os.replace(tmp, STATE_FILE)
+    tmp = STATE_FILE.with_name(
+        f"{STATE_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(st, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+        try:
+            directory = os.open(RUNTIME, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            # Some filesystems do not support directory fsync; the state file
+            # itself has still been flushed before the atomic replacement.
+            pass
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def _ensure() -> None:
+def _ensure_unlocked() -> None:
     RUNTIME.mkdir(parents=True, exist_ok=True)
     if not STATE_FILE.exists():
         _write_atomic(_default())
 
 
-def load_state() -> dict:
-    _ensure()
+def _load_state_unlocked() -> dict:
+    _ensure_unlocked()
     try:
         return _validate(json.loads(STATE_FILE.read_text()))
     except Exception as exc:
@@ -154,7 +194,8 @@ def load_state() -> dict:
         # replace it with an explicit KILLED state, and require a human
         # acknowledgement before the process can run again.
         stamp = int(time.time() * 1000)
-        backup = STATE_FILE.with_name(f"state.corrupt.{stamp}.json")
+        backup = STATE_FILE.with_name(
+            f"state.corrupt.{stamp}.{uuid.uuid4().hex[:8]}.json")
         try:
             os.replace(STATE_FILE, backup)
         except Exception:
@@ -171,18 +212,25 @@ def load_state() -> dict:
         return safe
 
 
+def load_state() -> dict:
+    with _state_lock():
+        return _load_state_unlocked()
+
+
 def save_state(st: dict) -> None:
-    _write_atomic(_validate(st))
+    with _state_lock():
+        _write_atomic(_validate(st))
 
 
 def set_state(name: str, reason: str | None = None, **extra) -> dict:
-    st = load_state()
-    st["state"] = name
-    if reason is not None:
-        st["kill_reason"] = reason
-    st.update(extra)
-    save_state(st)
-    return st
+    with _state_lock():
+        st = _load_state_unlocked()
+        st["state"] = name
+        if reason is not None:
+            st["kill_reason"] = reason
+        st.update(extra)
+        _write_atomic(_validate(st))
+        return st
 
 
 # Keys the trading loop owns. commit() persists these without clobbering a
@@ -201,26 +249,61 @@ def commit(st: dict, transition: tuple[str, str] | None = None,
     `transition=(from, to)` or an unconditional `kill=reason`. `st` is
     updated in place to the merged result so the caller sees CLI changes.
     """
-    cur = load_state()
-    for k in LOOP_KEYS:
-        if k in st:
-            cur[k] = st[k]
-    if kill is not None:
-        cur["state"] = KILLED
-        cur["kill_reason"] = kill
-    elif transition and cur["state"] == transition[0]:
-        cur["state"] = transition[1]
-    save_state(cur)
-    st.clear()
-    st.update(cur)
-    return st
+    with _state_lock():
+        cur = _load_state_unlocked()
+        for k in LOOP_KEYS:
+            if k in st:
+                cur[k] = st[k]
+        if kill is not None:
+            cur["state"] = KILLED
+            cur["kill_reason"] = kill
+            cur["flatten_on_kill"] = True
+        elif transition and cur["state"] == transition[0]:
+            cur["state"] = transition[1]
+        _write_atomic(_validate(cur))
+        st.clear()
+        st.update(cur)
+        return st
 
 
 # ---------------------------------------------------------------- PID file
 
-def write_pid() -> None:
-    _ensure()
-    PID_FILE.write_text(str(os.getpid()))
+def acquire_run_lock():
+    """Atomically acquire the single-agent lock and publish this PID."""
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    handle = PID_FILE.open("a+")
+    os.chmod(PID_FILE, 0o600)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        os.fsync(handle.fileno())
+        return handle
+    except Exception:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+        raise
+
+
+def release_run_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def read_pid() -> int | None:
@@ -228,13 +311,6 @@ def read_pid() -> int | None:
         return int(PID_FILE.read_text().strip())
     except Exception:
         return None
-
-
-def clear_pid() -> None:
-    try:
-        PID_FILE.unlink()
-    except Exception:
-        pass
 
 
 def pid_alive(pid: int) -> bool:
@@ -247,9 +323,16 @@ def pid_alive(pid: int) -> bool:
 
 # ---------------------------------------------------------------- journal
 
+
+class JournalError(RuntimeError):
+    """The durable trading audit trail could not be written."""
+
 def _db() -> sqlite3.Connection:
-    _ensure()
-    conn = sqlite3.connect(DB_FILE)
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, payload TEXT)"
     )
@@ -275,7 +358,22 @@ def _db() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS equity (ts REAL, equity REAL, state TEXT)"
     )
+    os.chmod(DB_FILE, 0o600)
     return conn
+
+
+def check_journal() -> None:
+    """Fail startup unless the SQLite audit trail is writable."""
+    try:
+        with _db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?)",
+                (time.time(), "journal_preflight", "writable"),
+            )
+            conn.rollback()
+    except Exception as exc:
+        raise JournalError(f"journal preflight failed: {exc}") from exc
 
 
 def log_event(kind: str, payload: str) -> None:
@@ -284,8 +382,9 @@ def log_event(kind: str, payload: str) -> None:
             c.execute(
                 "INSERT INTO events VALUES (?,?,?)", (time.time(), kind, payload)
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.critical("event journal write failed: %s", exc)
+        raise JournalError(f"event journal write failed: {exc}") from exc
 
 
 def new_trade_id() -> str:
@@ -311,7 +410,8 @@ def log_trade(symbol, side, action, qty, price, notional, leverage, reason,
                  fill_status, slippage_usd),
             )
     except Exception as exc:
-        log.error("trade journal write failed: %s", exc)
+        log.critical("trade journal write failed: %s", exc)
+        raise JournalError(f"trade journal write failed: {exc}") from exc
 
 
 def log_equity(equity: float, st: str) -> None:
@@ -320,5 +420,6 @@ def log_equity(equity: float, st: str) -> None:
             c.execute(
                 "INSERT INTO equity VALUES (?,?,?)", (time.time(), equity, st)
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.critical("equity journal write failed: %s", exc)
+        raise JournalError(f"equity journal write failed: {exc}") from exc

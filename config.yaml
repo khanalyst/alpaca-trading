@@ -16,8 +16,8 @@ llm:
   max_tokens: 2000
   # Prompt caching: the static system prompt is cached on Anthropic servers
   # (1-hour TTL, refreshed on every call) and cached automatically by OpenAI.
-  # Anthropic ignores cache blocks below a per-model minimum: 2,048 tokens on
-  # Sonnet 4.6 (this prompt qualifies), 4,096 on Opus 4.x / Haiku 4.5 (there
+  # Anthropic ignores cache blocks below a per-model minimum: 1,024 tokens on
+  # Sonnet 4.6 (this prompt qualifies); some other models require more (there
   # the marker is a harmless no-op and the prompt bills at the normal rate).
   # Check cache hits in runtime/agent.log: "tokens: ... cache_read=NNNN".
 
@@ -41,7 +41,7 @@ cycle:
 risk:
   # --- sizing (everything is a % of live account equity) ---
   max_leverage: 3                # per position; hard ceiling of 10 enforced in code
-  risk_per_trade_pct: 1.5        # % of equity lost if a stop-loss is hit
+  risk_per_trade_pct: 1.5        # max all-in equity loss at the stop
   max_position_notional_pct: 40  # per-position notional cap, % of equity
   max_gross_exposure_pct: 150    # total notional across all positions, % of equity
   max_net_direction_pct: 100     # cap on |long minus short| notional, % of equity.
@@ -61,15 +61,19 @@ risk:
 execution:
   slippage_guard_pct: 0.5        # abort an entry if price moved more than this
                                  # between analysis and execution
+  max_spread_pct: 0.15           # reject entries when the live bid/ask is wider
+  max_order_book_slippage_pct: 0.35  # IOC cap vs mid; reserved in risk sizing
+  max_market_data_age_seconds: 10    # reject stale exchange order books
   fill_timeout_seconds: 12       # wait for market orders to reach a terminal fill state
 
-# Cost assumptions are sent to the LLM with live spread and funding data.
-# The model can then reduce size_pct_equity when total stop risk (price move
-# plus fees, spread, funding and expected stop slippage) is too high.
+# Cost assumptions are sent to the LLM and enforced by deterministic sizing.
+# Price loss plus fees, spread, adverse funding and expected stop slippage
+# are kept inside risk_per_trade_pct instead of being added on afterward.
 trading_costs:
   taker_fee_pct_per_side: 0.05
   expected_stop_slippage_pct: 0.15
-  expected_funding_intervals_held: 1
+  expected_funding_intervals_held: 1  # floor when funding schedule is unknown
+  expected_hold_hours: 8              # live interval/next time derive charges
 
 # Optional human alerts. The URL remains in .env, never in this file.
 alerts:

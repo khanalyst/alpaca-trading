@@ -62,20 +62,20 @@ it shrinks.
 | `agent/risk.py` | Deterministic sizing and hard caps |
 | `agent/market.py` | Universe builder, indicators, market snapshot |
 | `agent/exchange.py` | All OKX calls (via ccxt), orders, kill-switch cancellation |
-| `agent/state.py` | State machine, PID file, SQLite journal |
+| `agent/state.py` | Locked state machine, single-process lock, SQLite journal |
 | `agent/config.py` | Fail-closed configuration schema and safe ranges |
-| `agent/alerts.py` | Optional generic, Slack, or Discord webhook alerts |
+| `agent/alerts.py` | Retried webhooks with a local failed-delivery queue |
 
 ---
 
 ## Setup
 
-Requirements: Python 3.10+ and an always-on machine (VPS recommended for
-true 24/7 operation).
+Requirements: Python 3.11+ on macOS or Linux and an always-on machine (a Linux
+VPS is recommended for true 24/7 operation).
 
 ```bash
 cd okx-agent-crypto
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 cp .env.example .env      # then fill in your keys
 ```
 
@@ -85,8 +85,9 @@ cp .env.example .env      # then fill in your keys
    Single-currency or Multi-currency margin (Settings -> Account mode).
 2. Keep your trading capital as USDT in the Trading account (the agent reads
    equity from there; the Funding account is invisible to it).
-3. The agent sets one-way (net) position mode on startup. If you have open
-   positions in hedge mode, close them first.
+3. Set derivatives position mode to **one-way / net mode** in OKX while the
+   account is flat. The agent never changes account settings implicitly and
+   refuses to start if OKX reports hedge mode.
 
 ### API keys
 
@@ -221,7 +222,8 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    margin usage exceeds `max_margin_usage_pct`, closes the largest position(s)
    until it's healthy.
 5. **Ask the brain.** It builds a compact snapshot per symbol — price, spread,
-   24h volume, completed-hour relative volume, funding rate, RSI, current
+   correctly contract-normalized 24h quote volume, completed-hour relative
+   volume, funding rate/interval/next settlement, RSI, current
    ATR%, ATR versus its recent history, trend on 15m/1h/4h, 1h momentum,
    30-hour BTC correlation, an explicit regime classification, position within
    the 24h range, distance to the recent swing high/low and to the 1h EMA20
@@ -238,7 +240,8 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    engine ([agent/risk.py](agent/risk.py)) then vets every proposal:
    discards anything below the confidence floor, rejects symbols already held
    or in post-loss cooldown, clamps leverage, and **sizes each position from
-   your stop distance so that being stopped out loses exactly
+   stop distance plus expected round-trip fees, live spread, adverse funding
+   and stop slippage so the all-in expected stop loss stays within
    `risk_per_trade_pct` of equity** — then caps that by the per-position,
    whole-book, and net-direction exposure limits (the last one stops several
    same-direction positions in correlated coins from acting as one oversized
@@ -250,7 +253,10 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    go to OKX with **exchange-side stop-loss and take-profit attached**, so
    positions stay protected even if this process dies. If a stop-loss can't
    be verified after an entry fills, the agent immediately closes that
-   position rather than run it naked.
+   position rather than run it naked. Entries are marketable IOC limits:
+   current spread and order-book depth must pass configured caps, and the
+   exchange-side limit prevents a sudden move from producing unlimited entry
+   slippage.
 
 The LLM never touches the exchange, never sizes a position, and never
 overrides a cap. It is an idea generator inside hard, code-enforced rails.
@@ -315,7 +321,7 @@ API keys; the mode must match the keys in `.env`.
 | Parameter | Default | What it does |
 | --- | --- | --- |
 | `max_leverage` | 3 | Per-position leverage cap. **Hard ceiling of 10 in code** regardless of config |
-| `risk_per_trade_pct` | 1.5 | % of equity lost if a stop is hit; position size is derived from this |
+| `risk_per_trade_pct` | 1.5 | Maximum expected equity loss at a stop, including configured costs |
 | `max_position_notional_pct` | 40 | Per-position notional cap, % of equity |
 | `max_gross_exposure_pct` | 150 | Whole-book notional cap, % of equity |
 | `max_net_direction_pct` | 100 | Cap on net long-minus-short notional, % of equity (correlation guard) |
@@ -334,19 +340,24 @@ API keys; the mode must match the keys in `.env`.
 | `cooldown_minutes_after_loss` | 45 | Per-symbol timeout after a losing close |
 
 **Change execution (`execution:` block)** — `slippage_guard_pct` (default 0.5)
-aborts an entry if price moved too far between analysis and execution;
-`fill_timeout_seconds` (default 12) bounds fill verification before the agent
-cancels the unfilled remainder.
+rejects stale analyses, `max_spread_pct` (0.15) rejects a wide current market,
+and `max_order_book_slippage_pct` (0.35) is the depth-test threshold, hard IOC
+entry-price boundary, and a reserved component of all-in sizing.
+`max_market_data_age_seconds` (10) rejects stale order books.
+`fill_timeout_seconds` (12) bounds fill
+verification before the agent cancels any unfilled remainder.
 
 **Cost assumptions (`trading_costs:` block)** — expected taker fee per side,
-stop slippage, and funding intervals are sent to the LLM alongside live spread
-and funding. They inform net-reward and voluntary size decisions; they do not
-replace technical stop placement.
+stop slippage, minimum funding intervals and expected holding hours are sent to
+the LLM alongside the live funding schedule. The deterministic risk engine
+derives likely settlements from that schedule and includes their adverse cost
+in position sizing; they do not replace technical stop placement.
 
-**Human alerts (`alerts:` block)** — enable an optional generic JSON, Slack,
-or Discord webhook, choose the minimum severity, and put its URL in the
-environment variable named by `webhook_url_env` (default
-`ALERT_WEBHOOK_URL`).
+**Human alerts (`alerts:` block)** — generic JSON, Slack or Discord webhooks
+are optional in demo but mandatory in live. Live startup sends a preflight
+message and refuses to trade unless it is acknowledged. Delivery is retried
+three times; exhausted messages are stored in
+`runtime/failed_alerts.jsonl`.
 
 > **To turn aggression up**, raise `max_leverage`, `risk_per_trade_pct`, and
 > `max_gross_exposure_pct` — but understand how they compound: 3 positions at
@@ -376,9 +387,9 @@ Read these before running anything with real money.
   trades, misread a regime, or produce malformed output. The risk engine
   bounds the damage (sizing, caps, cooldowns) but cannot make a losing
   strategy win.
-- **Webhook alerts are optional, not a monitoring service.** Enable and test
-  them before relying on them. A machine or network outage can prevent the
-  same webhook from being delivered, so still monitor the process externally.
+- **A webhook is mandatory in live, but it is not uptime monitoring.** A dead
+  machine cannot send its own alert. Keep external process/host monitoring as
+  a separate layer and inspect `runtime/failed_alerts.jsonl`.
 - **The drawdown self-kill halts the agent until a human intervenes.** After a
   15% drawdown it flattens and refuses to trade again until you run
   `--acknowledge-kill`. This is intentional (a human should review a blow-up),
@@ -404,7 +415,9 @@ Read these before running anything with real money.
 ## The journal
 
 Everything is recorded in `runtime/journal.db` (SQLite): every decision,
-rejection, trade, transfer and an equity curve snapshot per cycle.
+rejection, trade, transfer and an equity curve snapshot per cycle. The agent
+checks that the journal is writable before starting and pauses immediately on
+any later journal write failure. Plain-text logs rotate at 10 MB.
 
 ```bash
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"

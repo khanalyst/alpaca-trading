@@ -7,6 +7,7 @@ stay protected even if this process dies.
 """
 
 import logging
+import math
 import os
 import time
 import uuid
@@ -15,6 +16,8 @@ import ccxt
 
 log = logging.getLogger("exchange")
 PROTECTIVE_ALGO_TYPES = ("conditional", "oco", "trigger")
+ALL_ALGO_TYPES = PROTECTIVE_ALGO_TYPES + (
+    "move_order_stop", "iceberg", "twap")
 
 # OKX rejects any signed request whose OK-ACCESS-TIMESTAMP is more than 30s
 # from server time (error 50102). We refuse to start well inside that window
@@ -22,6 +25,7 @@ PROTECTIVE_ALGO_TYPES = ("conditional", "oco", "trigger")
 CLOCK_SKEW_FATAL_MS = 15_000
 CLOCK_SKEW_WARN_MS = 3_000
 CLOCK_RECHECK_SECONDS = 900
+ACCOUNT_RECHECK_SECONDS = 900
 
 
 class CredentialError(RuntimeError):
@@ -36,7 +40,8 @@ class CredentialError(RuntimeError):
 
 
 class Exchange:
-    def __init__(self, cfg: dict, alerts=None):
+    def __init__(self, cfg: dict, alerts=None,
+                 validate_account: bool = True):
         self.cfg = cfg
         self.alerts = alerts
         key = os.getenv("OKX_API_KEY")
@@ -72,11 +77,12 @@ class Exchange:
         # finding out here beats finding out mid-entry.
         self.check_clock()
         self.x.load_markets()
-        try:
-            # One-way (net) position mode keeps order handling simple.
-            self.x.set_position_mode(False)
-        except Exception as e:
-            log.debug("set_position_mode skipped: %s", e)
+        # Account settings are never changed implicitly.  Read the current
+        # configuration and refuse to operate unless the one-way position
+        # model assumed everywhere else in this engine is already active.
+        if validate_account:
+            self._account_config = self.account_config(refresh=True)
+            self.verify_account_safety(require_trade=False, refresh=False)
 
     # ------------------------------------------------------------- helpers
 
@@ -167,27 +173,97 @@ class Exchange:
         """Periodic re-check for hosts that drift after a clean startup."""
         last = getattr(self, "_clock_checked_at", 0.0)
         if time.time() - last >= CLOCK_RECHECK_SECONDS:
-            self.check_clock(fatal=False)
+            self.check_clock(fatal=True)
 
     # ---------------------------------------------------------- permissions
 
-    def verify_trade_permission(self) -> str:
-        """Prove the key has Trade scope, not just Read.
+    def account_config(self, refresh: bool = False) -> dict:
+        """Return OKX account configuration through its read-only endpoint."""
+        cached = getattr(self, "_account_config", None)
+        if cached is not None and not refresh:
+            return cached
+        getter = getattr(self.x, "private_get_account_config", None)
+        if not callable(getter):
+            raise RuntimeError(
+                "installed CCXT does not expose OKX account configuration")
+        response = self.retry(getter)
+        if str((response or {}).get("code", "0")) != "0":
+            raise RuntimeError(
+                f"OKX account configuration failed: "
+                f"{(response or {}).get('msg') or response}")
+        rows = (response or {}).get("data") or []
+        if not rows or not isinstance(rows[0], dict):
+            raise RuntimeError("OKX returned no account configuration")
+        self._account_config = rows[0]
+        return self._account_config
 
-        set_leverage is a Trade-scope POST that places no order and is exactly
-        what open_position calls first, so a Read-only key fails here during
-        `check` instead of at 3am on the first real entry.
+    @staticmethod
+    def _permissions(config: dict) -> set[str]:
+        raw = config.get("perm") or ""
+        if isinstance(raw, list):
+            values = raw
+        else:
+            values = str(raw).replace(";", ",").split(",")
+        return {str(value).strip().lower() for value in values
+                if str(value).strip()}
+
+    def verify_account_safety(self, require_trade: bool = True,
+                              refresh: bool = True) -> dict:
+        """Fail closed on incompatible or over-privileged account settings.
+
+        This is intentionally read-only. Position mode and API permissions
+        must be configured in OKX before starting the agent.
         """
-        symbol = "BTC/USDT:USDT"
-        if symbol not in self.x.markets:
-            swaps = [s for s, m in self.x.markets.items()
-                     if m.get("swap") and m.get("quote") == "USDT"]
-            if not swaps:
-                raise RuntimeError("No USDT swap markets available to probe")
-            symbol = sorted(swaps)[0]
-        leverage = int(self.cfg["risk"]["max_leverage"])
-        self.retry(self.x.set_leverage, leverage, symbol, {"mgnMode": "cross"})
-        return symbol
+        config = self.account_config(refresh=refresh)
+        pos_mode = str(config.get("posMode") or "")
+        if pos_mode != "net_mode":
+            raise CredentialError(
+                "OKX position mode must be net_mode (one-way), but the "
+                f"account reports {pos_mode or 'unknown'}. Change it in OKX "
+                "while flat, then rerun check.")
+        account_level = str(config.get("acctLv") or "")
+        if account_level and account_level not in {"2", "3", "4"}:
+            raise CredentialError(
+                f"OKX account mode {account_level} does not support this "
+                "cross-margin swap agent")
+
+        permissions = self._permissions(config)
+        if "withdraw" in permissions:
+            raise CredentialError(
+                "Refusing an API key with Withdraw permission. Create an "
+                "IP-bound key with Read + Trade only.")
+        if require_trade and "trade" not in permissions:
+            raise CredentialError(
+                "The API key is read-only; Read + Trade permission is required")
+        bound_ips = str(config.get("ip") or "").strip()
+        live = not getattr(self, "demo", self.cfg.get("mode") == "demo")
+        if require_trade and live and not bound_ips:
+            raise CredentialError(
+                "Live trading requires an IP-bound OKX API key")
+        try:
+            collateral = (self.verify_usdt_collateral()
+                          if require_trade and live else None)
+        except RuntimeError as exc:
+            raise CredentialError(str(exc)) from exc
+        result = {
+            "position_mode": pos_mode,
+            "account_level": account_level or None,
+            "permissions": sorted(permissions),
+            "ip_bound": bool(bound_ips),
+            "non_usdt_collateral_pct": collateral,
+        }
+        if require_trade:
+            self._account_checked_at = time.time()
+        return result
+
+    def verify_trade_permission(self) -> dict:
+        """Verify Trade scope without changing leverage or placing an order."""
+        return self.verify_account_safety(require_trade=True, refresh=True)
+
+    def recheck_account_safety_if_due(self) -> None:
+        last = getattr(self, "_account_checked_at", 0.0)
+        if time.time() - last >= ACCOUNT_RECHECK_SECONDS:
+            self.verify_account_safety(require_trade=True, refresh=True)
 
     @staticmethod
     def _client_order_id(prefix: str) -> str:
@@ -297,11 +373,11 @@ class Exchange:
                        or info.get("fillSz") or 0)
         average = float(current.get("average") or info.get("avgPx")
                         or info.get("fillPx") or 0)
-        if filled <= 0:
+        if not math.isfinite(filled) or filled <= 0:
             raise RuntimeError(f"order {order_id or '?'} has no verified fill")
-        if average <= 0:
+        if not math.isfinite(average) or average <= 0:
             average = float(expected_price or 0)
-        if average <= 0:
+        if not math.isfinite(average) or average <= 0:
             raise RuntimeError(f"order {order_id or '?'} has no verified fill price")
 
         contract_size = float(self.x.market(symbol).get("contractSize") or 1)
@@ -329,7 +405,10 @@ class Exchange:
 
     def price(self, symbol: str) -> float:
         t = self.retry(self.x.fetch_ticker, symbol)
-        return float(t.get("last") or t.get("close") or 0)
+        value = float(t.get("last") or t.get("close") or 0)
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError(f"OKX returned an invalid price for {symbol}")
+        return value
 
     # ------------------------------------------------------------- account
 
@@ -337,20 +416,67 @@ class Exchange:
         bal = self.retry(self.x.fetch_balance)
         data = (bal.get("info") or {}).get("data") or []
         if data and data[0].get("totalEq") not in (None, ""):
-            return float(data[0]["totalEq"])
-        return float((bal.get("USDT") or {}).get("total") or 0)
+            value = float(data[0]["totalEq"])
+        else:
+            value = float((bal.get("USDT") or {}).get("total") or 0)
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError("OKX total equity is not a positive finite value")
+        return value
+
+    def verify_usdt_collateral(self) -> float:
+        """Require a live account whose equity is effectively all USDT."""
+        bal = self.retry(self.x.fetch_balance)
+        rows = (bal.get("info") or {}).get("data") or []
+        if not rows:
+            raise RuntimeError("OKX collateral breakdown is unavailable")
+        account = rows[0]
+        total = float(account.get("totalEq") or 0)
+        if not math.isfinite(total) or total <= 0:
+            raise RuntimeError("OKX total equity is not positive")
+        details = account.get("details") or []
+        if not details:
+            raise RuntimeError("OKX returned no collateral currency details")
+        non_usdt = 0.0
+        for detail in details:
+            if str(detail.get("ccy") or "").upper() == "USDT":
+                continue
+            value = float(detail.get("eqUsd") or 0)
+            if not math.isfinite(value):
+                raise RuntimeError("OKX collateral breakdown is not finite")
+            non_usdt += abs(value)
+        pct = non_usdt / total * 100
+        if non_usdt > max(1.0, total * 0.01):
+            raise RuntimeError(
+                f"non-USDT assets are {pct:.2f}% of trading equity; move "
+                "them out or use a dedicated USDT-only sub-account")
+        return pct
 
     def margin_usage_pct(self) -> float | None:
-        try:
-            bal = self.retry(self.x.fetch_balance)
-            u = bal.get("USDT") or {}
-            used = float(u.get("used") or 0)
-            total = float(u.get("total") or 0)
-            if total <= 0:
-                return None
-            return used / total * 100
-        except Exception:
-            return None
+        """Initial-margin usage from OKX account-level risk fields.
+
+        CCXT's synthetic USDT ``used / total`` balance can be incorrect for
+        swap accounts. OKX publishes adjusted equity and initial margin
+        directly; use those values and fail closed when they are unavailable.
+        """
+        bal = self.retry(self.x.fetch_balance)
+        rows = (bal.get("info") or {}).get("data") or []
+        if not rows:
+            raise RuntimeError("OKX account risk fields are unavailable")
+        account = rows[0]
+        equity_raw = account.get("adjEq")
+        if equity_raw in (None, ""):
+            equity_raw = account.get("totalEq")
+        imr_raw = account.get("imr")
+        if equity_raw not in (None, "") and imr_raw not in (None, ""):
+            equity = float(equity_raw)
+            initial_margin = float(imr_raw)
+            if not math.isfinite(equity) or equity <= 0:
+                raise RuntimeError("OKX adjusted equity is not positive")
+            if not math.isfinite(initial_margin) or initial_margin < 0:
+                raise RuntimeError("OKX initial margin is not a finite value")
+            return initial_margin / equity * 100
+        raise RuntimeError(
+            "OKX returned no adjusted-equity/initial-margin measurement")
 
     def transfers_since(self, since_ms: int) -> tuple[float, int]:
         """Net USDT transferred in/out of the trading account since since_ms.
@@ -401,18 +527,39 @@ class Exchange:
     def positions(self) -> list[dict]:
         out = []
         for p in self.retry(self.x.fetch_positions) or []:
-            if abs(float(p.get("contracts") or 0)) > 0:
+            contracts = float(p.get("contracts") or 0)
+            if not math.isfinite(contracts):
+                raise RuntimeError(
+                    f"OKX returned a non-finite position size for "
+                    f"{p.get('symbol') or 'unknown symbol'}")
+            if abs(contracts) > 0:
                 out.append(p)
         return out
 
-    def position(self, symbol: str) -> dict | None:
-        return next((p for p in self.positions() if p.get("symbol") == symbol),
-                    None)
+    def position(self, symbol: str, side: str | None = None) -> dict | None:
+        for position in self.positions():
+            if position.get("symbol") != symbol:
+                continue
+            if side is None:
+                return position
+            position_side = str(
+                position.get("side")
+                or (position.get("info") or {}).get("posSide") or "").lower()
+            if position_side not in {"long", "short"}:
+                raw = float((position.get("info") or {}).get("pos") or 0)
+                position_side = "long" if raw >= 0 else "short"
+            if position_side == side:
+                return position
+        return None
 
     # ------------------------------------------------------------- sizing
 
     def contracts_for_notional(self, symbol: str, notional_usd: float,
                                price: float) -> float:
+        if (not math.isfinite(float(notional_usd))
+                or not math.isfinite(float(price))
+                or float(notional_usd) <= 0 or float(price) <= 0):
+            return 0.0
         m = self.x.market(symbol)
         contract_size = float(m.get("contractSize") or 1)
         raw = notional_usd / (contract_size * price)
@@ -424,6 +571,100 @@ class Exchange:
         if amt <= 0 or amt < float(min_amt or 0):
             return 0.0
         return amt
+
+    def guarded_entry_limit(self, symbol: str, side: str, contracts: float,
+                            max_spread_pct: float,
+                            max_slippage_pct: float,
+                            max_age_seconds: float) -> dict:
+        """Build a marketable IOC limit only when displayed depth is enough.
+
+        The order-book check rejects wide spreads and insufficient size. The
+        returned limit is the hard exchange-side price boundary, so a sudden
+        move after this read produces no/partial fill instead of unlimited
+        market-order slippage.
+        """
+        book = self.retry(self.x.fetch_order_book, symbol, 50)
+        timestamp = book.get("timestamp")
+        if timestamp in (None, ""):
+            raise RuntimeError(f"{symbol} order book has no exchange timestamp")
+        timestamp = float(timestamp)
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            raise RuntimeError(f"{symbol} order book timestamp is invalid")
+        age_seconds = max(0.0, (time.time() * 1000 - timestamp) / 1000)
+        if age_seconds > float(max_age_seconds):
+            raise RuntimeError(
+                f"{symbol} order book is {age_seconds:.1f}s old; limit is "
+                f"{float(max_age_seconds):.1f}s")
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            raise RuntimeError(f"{symbol} order book has no two-sided depth")
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        if (not math.isfinite(best_bid) or not math.isfinite(best_ask)
+                or best_bid <= 0 or best_ask < best_bid):
+            raise RuntimeError(f"{symbol} order book is invalid")
+        mid = (best_bid + best_ask) / 2
+        spread_pct = (best_ask - best_bid) / mid * 100
+        if spread_pct > float(max_spread_pct):
+            raise RuntimeError(
+                f"{symbol} spread {spread_pct:.4f}% exceeds "
+                f"{float(max_spread_pct):.4f}%")
+
+        buying = side == "buy"
+        if not buying and side != "sell":
+            raise ValueError(f"invalid entry side: {side}")
+        boundary = mid * (1 + float(max_slippage_pct) / 100) if buying \
+            else mid * (1 - float(max_slippage_pct) / 100)
+        levels = asks if buying else bids
+        remaining = float(contracts)
+        filled = cost = 0.0
+        for level in levels:
+            price = float(level[0])
+            amount = float(level[1])
+            if (not math.isfinite(price) or not math.isfinite(amount)
+                    or price <= 0 or amount < 0):
+                raise RuntimeError(
+                    f"{symbol} order book contains non-finite depth")
+            inside = price <= boundary if buying else price >= boundary
+            if not inside:
+                break
+            take = min(remaining, amount)
+            cost += take * price
+            filled += take
+            remaining -= take
+            if remaining <= max(1e-12, contracts * 1e-9):
+                break
+        if remaining > max(1e-12, contracts * 1e-9):
+            raise RuntimeError(
+                f"{symbol} has only {filled:g} of {contracts:g} contracts "
+                f"inside the {float(max_slippage_pct):.4f}% entry cap")
+        vwap = cost / filled
+        limit = float(self.x.price_to_precision(symbol, boundary))
+        if not math.isfinite(limit) or limit <= 0:
+            raise RuntimeError(
+                f"{symbol} price precision returned an invalid IOC limit")
+        rounded_past_cap = ((buying and limit > boundary)
+                            or (not buying and limit < boundary))
+        if rounded_past_cap:
+            market = self.x.market(symbol)
+            tick = (market.get("precision") or {}).get("price")
+            if (getattr(self.x, "precisionMode", None) == ccxt.TICK_SIZE
+                    and tick and float(tick) > 0):
+                limit += -float(tick) if buying else float(tick)
+                limit = float(self.x.price_to_precision(symbol, limit))
+            if ((buying and limit > boundary)
+                    or (not buying and limit < boundary)):
+                raise RuntimeError(
+                    f"{symbol} price precision cannot honor the slippage cap")
+        return {
+            "limit_price": limit,
+            "mid": mid,
+            "spread_pct": spread_pct,
+            "estimated_vwap": vwap,
+            "estimated_slippage_pct": abs(vwap - mid) / mid * 100,
+            "age_seconds": age_seconds,
+        }
 
     # ------------------------------------------------------------- orders
 
@@ -455,6 +696,25 @@ class Exchange:
         return abs(float(order.get("remaining") or order.get("amount")
                          or info.get("sz") or 0))
 
+    @staticmethod
+    def _protection_matches_position(order: dict, position_side: str) -> bool:
+        """Only count orders that can reduce the position being checked."""
+        info = order.get("info") or {}
+        expected_side = "sell" if position_side == "long" else "buy"
+        order_side = str(order.get("side") or info.get("side") or "").lower()
+        if order_side != expected_side:
+            return False
+        reduce_raw = order.get("reduceOnly")
+        if reduce_raw is None:
+            reduce_raw = info.get("reduceOnly")
+        reducing = (reduce_raw is True
+                    or str(reduce_raw).strip().lower() in {"1", "true"}
+                    or str(info.get("closeFraction") or "") == "1")
+        if not reducing:
+            return False
+        pos_side = str(info.get("posSide") or "net").lower()
+        return pos_side in {"", "net", position_side}
+
     def protection_status(self, symbol: str, contracts: float, side: str,
                           mark_price: float) -> dict:
         stop_size = take_size = 0.0
@@ -462,6 +722,8 @@ class Exchange:
         take_prices = []
         orders = self.protective_orders(symbol)
         for order in orders:
+            if not self._protection_matches_position(order, side):
+                continue
             info = order.get("info") or {}
             size = self._protection_size(order)
             stop_price = (order.get("stopLossPrice") or info.get("slTriggerPx"))
@@ -525,7 +787,8 @@ class Exchange:
 
     def open_position(self, symbol: str, side: str, contracts: float,
                       leverage: float, sl_price: float, tp_price: float,
-                      expected_price: float | None = None) -> dict:
+                      expected_price: float | None = None,
+                      entry_limit_price: float | None = None) -> dict:
         try:
             self.retry(self.x.set_leverage, int(leverage), symbol,
                        {"mgnMode": "cross"})
@@ -539,16 +802,20 @@ class Exchange:
             "stopLoss": {"triggerPrice": sl},
             "takeProfit": {"triggerPrice": tp},
         }
+        order_type = "limit" if entry_limit_price is not None else "market"
+        order_price = (self.x.price_to_precision(symbol, entry_limit_price)
+                       if entry_limit_price is not None else None)
+        if entry_limit_price is not None:
+            params["timeInForce"] = "IOC"
         try:
             # Preferred path: entry with SL/TP attached server-side.
-            order = self._create_order_once(symbol, "market", side, contracts,
-                                            None, params, "okxent")
-        except ccxt.ExchangeError as e:
-            log.warning("attached SL/TP rejected (%s); using separate stop "
-                        "orders", e)
             order = self._create_order_once(
-                symbol, "market", side, contracts, None,
-                {"tdMode": "cross"}, "okxent")
+                symbol, order_type, side, contracts, order_price, params,
+                "okxent")
+        except ccxt.ExchangeError as e:
+            raise RuntimeError(
+                f"{symbol} entry rejected with required attached SL/TP; "
+                "no unprotected fallback order was sent") from e
 
         fill = self.verify_fill(order, symbol, contracts, expected_price)
         position_side = "long" if side == "buy" else "short"
@@ -607,18 +874,25 @@ class Exchange:
         # position still has its stop-loss; and leftover reduce-only SL/TP
         # orders on a now-flat position can never open new exposure (they
         # simply fail if triggered), so late cancellation is harmless.
+        params = {"tdMode": "cross", "reduceOnly": True}
+        raw_pos_side = str((pos.get("info") or {}).get("posSide") or "").lower()
+        if raw_pos_side in {"long", "short"}:
+            # Emergency flatten remains available if an operator changed the
+            # account to hedge mode after startup.
+            params["posSide"] = raw_pos_side
         order = self._create_order_once(
             symbol, "market", side, contracts, None,
-            {"tdMode": "cross", "reduceOnly": True}, "okxcls")
+            params, "okxcls")
         result = self.verify_fill(
             order, symbol, contracts,
             float(pos.get("markPrice") or pos.get("last") or 0) or None)
-        remaining = self.position(symbol)
+        remaining = self.position(symbol, position_side)
         remaining_contracts = abs(float((remaining or {}).get("contracts") or 0))
         result["fully_closed"] = remaining_contracts <= max(1e-12, contracts * 1e-6)
         result["remaining_contracts"] = remaining_contracts
         if result["fully_closed"]:
-            self.cancel_symbol(symbol)
+            if not any(p.get("symbol") == symbol for p in self.positions()):
+                self.cancel_symbol(symbol)
         else:
             log.error("close for %s left %s contracts; protection retained",
                       symbol, remaining_contracts)
@@ -639,7 +913,7 @@ class Exchange:
                     log.warning("cancel %s: %s", o.get("id"), e)
         except Exception as e:
             log.debug("fetch_open_orders(%s): %s", symbol, e)
-        for order_type in PROTECTIVE_ALGO_TYPES:
+        for order_type in ALL_ALGO_TYPES:
             query = {"ordType": order_type}
             cancel_params = {"trigger": True}
             try:
@@ -654,16 +928,18 @@ class Exchange:
                 continue
 
     def cancel_everything(self) -> None:
-        """Kill-switch helper: cancel all orders across all symbols."""
+        """Cancel and then verify every regular and algo order is gone."""
+        failures = []
         try:
             for o in self.retry(self.x.fetch_open_orders) or []:
                 try:
                     self.x.cancel_order(o["id"], o.get("symbol"))
                 except Exception as e:
                     log.warning("cancel %s: %s", o.get("id"), e)
+                    failures.append(f"{o.get('id')}: {e}")
         except Exception as e:
-            log.debug("fetch_open_orders(all): %s", e)
-        for order_type in PROTECTIVE_ALGO_TYPES:
+            failures.append(f"regular-order query: {e}")
+        for order_type in ALL_ALGO_TYPES:
             query = {"ordType": order_type}
             cancel_params = {"trigger": True}
             try:
@@ -675,11 +951,31 @@ class Exchange:
                             o["id"], o.get("symbol"), cancel_params)
                     except Exception as e:
                         log.warning("cancel algo %s: %s", o.get("id"), e)
-            except Exception:
-                continue
-        # Belt and braces: clear per-symbol orders on anything still open.
-        for p in self.positions():
-            self.cancel_symbol(p["symbol"])
+                        failures.append(f"algo {o.get('id')}: {e}")
+            except Exception as exc:
+                failures.append(f"{order_type}-order query: {exc}")
+
+        time.sleep(0.5)
+        remaining = []
+        try:
+            remaining.extend(self.retry(self.x.fetch_open_orders) or [])
+        except Exception as exc:
+            failures.append(f"regular-order verification: {exc}")
+        for order_type in ALL_ALGO_TYPES:
+            try:
+                rows = self.x.fetch_open_orders(
+                    None, None, None, {"ordType": order_type}) or []
+                remaining.extend(rows)
+            except Exception as exc:
+                failures.append(f"{order_type}-order verification: {exc}")
+        remaining_ids = sorted({str(order.get("id") or "unknown")
+                                for order in remaining})
+        if failures or remaining_ids:
+            details = "; ".join(failures)
+            if remaining_ids:
+                details += ("; " if details else "") + (
+                    "still open: " + ", ".join(remaining_ids))
+            raise RuntimeError(f"order cancellation could not be verified: {details}")
 
     # ------------------------------------------------------ reconciliation
 

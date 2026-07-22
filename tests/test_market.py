@@ -1,13 +1,27 @@
 import time
 import unittest
 
-from agent.market import market_snapshot, symbol_snapshot
+from agent.market import (build_universe, market_snapshot, quote_volume_usd,
+                          symbol_snapshot)
 from tests.helpers import valid_config
 
 
 class FakeMarketClient:
     def __init__(self):
         self.frames = {}
+        self.markets = {
+            "BTC/USDT:USDT": {
+                "swap": True, "settle": "USDT", "active": True,
+                "linear": True, "contractSize": 0.01,
+            },
+            "ETH/USDT:USDT": {
+                "swap": True, "settle": "USDT", "active": True,
+                "linear": True, "contractSize": 0.1,
+            },
+        }
+
+    def market(self, symbol):
+        return self.markets[symbol]
 
     @staticmethod
     def parse_timeframe(timeframe):
@@ -37,7 +51,14 @@ class FakeMarketClient:
 
     @staticmethod
     def fetch_funding_rate(symbol):
-        return {"fundingRate": 0.0002}
+        now = int(time.time() * 1000)
+        return {
+            "fundingRate": 0.0002, "fundingTimestamp": now,
+            "nextFundingTimestamp": now + 4 * 3_600_000,
+        }
+
+    def fetch_tickers(self):
+        return {symbol: self.fetch_ticker(symbol) for symbol in self.markets}
 
 
 class FakeExchange:
@@ -54,7 +75,8 @@ class MarketSnapshotTests(unittest.TestCase):
         cfg = valid_config()
         snap = symbol_snapshot(FakeExchange(), "ETH/USDT:USDT", cfg)
         for field in ("spread_pct", "relative_volume_1h", "atr_1h_ratio",
-                      "regime"):
+                      "regime", "funding_interval_hours",
+                      "next_funding_minutes"):
             self.assertIn(field, snap)
         self.assertGreater(snap["relative_volume_1h"], 1)
 
@@ -68,6 +90,30 @@ class MarketSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(context["regime"])
         self.assertIsNotNone(context["atr_1h_ratio"])
         self.assertIsNotNone(snap["ETH/USDT:USDT"]["corr_btc_1h_30"])
+
+    def test_okx_swap_contract_volume_is_converted_with_contract_size(self):
+        market = {"swap": True, "settle": "USDT", "contractSize": 0.01}
+        ticker = {
+            "last": 100_000, "quoteVolume": None,
+            "baseVolume": 120_000,
+            "info": {"vol24h": "120000", "volCcy24h": "1200"},
+        }
+        self.assertEqual(quote_volume_usd(ticker, market), 120_000_000)
+
+    def test_universe_uses_normalized_swap_quote_volume(self):
+        cfg = valid_config()
+        cfg["universe"]["min_24h_quote_volume_usd"] = 100_000_000
+        client = FakeMarketClient()
+        client.fetch_ticker = lambda symbol: {
+            "last": 100_000, "quoteVolume": None, "baseVolume": 120_000,
+            "info": {"volCcy24h": "1200"},
+        }
+        ex = FakeExchange()
+        ex.x = client
+        self.assertEqual(
+            build_universe(ex, cfg),
+            ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+        )
 
 
 if __name__ == "__main__":

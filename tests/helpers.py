@@ -37,12 +37,16 @@ VALID_CONFIG = {
     },
     "execution": {
         "slippage_guard_pct": 0.5,
+        "max_spread_pct": 0.15,
+        "max_order_book_slippage_pct": 0.35,
+        "max_market_data_age_seconds": 10,
         "fill_timeout_seconds": 1,
     },
     "trading_costs": {
         "taker_fee_pct_per_side": 0.05,
         "expected_stop_slippage_pct": 0.15,
         "expected_funding_intervals_held": 1,
+        "expected_hold_hours": 8,
     },
     "alerts": {
         "enabled": False,

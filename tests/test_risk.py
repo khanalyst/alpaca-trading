@@ -8,7 +8,12 @@ def snapshot():
     return {
         "_market_context": {"benchmark": "BTC/USDT:USDT",
                             "regime": "trend_up"},
-        "BTC/USDT:USDT": {"price": 100.0},
+        "BTC/USDT:USDT": {
+            "price": 100.0, "spread_pct": 0.05,
+            "funding_rate_pct": 0.02,
+            "funding_interval_hours": 4,
+            "next_funding_minutes": 240,
+        },
     }
 
 
@@ -43,6 +48,32 @@ class VetOpenSymbolTests(unittest.TestCase):
             decision(), 10_000, [], snapshot(), {}, 0)
         self.assertIsNotNone(plan)
         self.assertIsNone(why)
+
+    def test_non_finite_snapshot_price_is_rejected(self):
+        malformed = snapshot()
+        malformed["BTC/USDT:USDT"]["price"] = float("nan")
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], malformed, {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "invalid price")
+
+    def test_all_in_costs_reduce_size_and_stay_inside_risk_budget(self):
+        cfg = valid_config()
+        cfg["risk"]["max_position_notional_pct"] = 100
+        cfg["risk"]["max_gross_exposure_pct"] = 300
+        cfg["risk"]["max_net_direction_pct"] = 300
+        risk = RiskEngine(cfg)
+        plan, why = risk.vet_open(
+            decision(), 10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertGreater(plan["estimated_loss_pct"], plan["sl_pct"])
+        self.assertLess(plan["notional"], 7_500)  # stop-only sizing
+        self.assertAlmostEqual(plan["risk_usd"], 150, places=6)
+        self.assertEqual(plan["estimated_funding_intervals"], 2)
+        self.assertEqual(
+            plan["entry_slippage_budget_pct"],
+            cfg["execution"]["max_order_book_slippage_pct"],
+        )
 
 
 if __name__ == "__main__":

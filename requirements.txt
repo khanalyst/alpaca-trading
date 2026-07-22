@@ -1,7 +1,7 @@
-ccxt>=4.3.0
-anthropic>=0.40.0
-openai>=1.50.0
-pandas>=2.0.0
-numpy>=1.26.0
-PyYAML>=6.0
-python-dotenv>=1.0.0
+ccxt==4.5.67
+anthropic==0.117.1
+openai==2.46.0
+pandas==3.0.3
+numpy==2.5.1
+PyYAML==6.0.3
+python-dotenv==1.2.2
