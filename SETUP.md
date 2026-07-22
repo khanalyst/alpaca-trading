@@ -215,7 +215,7 @@ Oracle Cloud free tier, etc. The agent is tiny; the smallest plan is plenty
 
 On whichever machine you chose, open a terminal and run these one at a time.
 
-1. Check Python is 3.10 or newer:
+1. Check Python is 3.11 or newer:
 
    ```bash
    python3 --version
@@ -237,7 +237,7 @@ On whichever machine you chose, open a terminal and run these one at a time.
 3. Install the Python libraries it needs:
 
    ```bash
-   pip3 install -r requirements.txt
+   pip3 install -r requirements.lock.txt
    ```
 
 4. Create your secrets file from the template:
@@ -266,7 +266,7 @@ OKX_API_PASSPHRASE=your-demo-passphrase
 ANTHROPIC_API_KEY=sk-ant-...
 # OPENAI_API_KEY=sk-...
 
-# Optional: only needed when alerts.enabled is true in config.yaml
+# Optional in demo; mandatory before mode: live
 # ALERT_WEBHOOK_URL=https://hooks.example/...
 ```
 
@@ -293,7 +293,6 @@ request fails. Make sure automatic time sync is on:
 - **macOS**: System Settings → General → Date & Time → *Set time and date
   automatically*
 - **Linux**: `sudo timedatectl set-ntp true`
-- **Windows**: Settings → Time & language → *Set time automatically*
 
 The agent checks this for you at startup, refuses to start if the clock is
 more than 15 seconds out, and re-checks every 15 minutes while running.
@@ -321,13 +320,13 @@ defaults. Here's what each block controls, so you know where to change what:
   drawdown, margin guard). See the "Configuration reference" and "How the
   agent thinks" sections in the [README](README.md) for exactly what each
   parameter does and how they interact.
-- **`execution`** — the slippage guard that aborts a stale entry and the
-  timeout used to verify actual and partial fills.
+- **`execution`** — stale-price, spread and order-book-depth caps plus the
+  timeout used to verify actual and partial IOC fills. The IOC slippage cap is
+  reserved in deterministic risk sizing.
 - **`trading_costs`** — expected taker fees, stop slippage and funding holding
-  time passed to the LLM for net-reward and voluntary sizing decisions.
-- **`alerts`** — optional generic, Slack or Discord webhook alerts. Set
-  `enabled: true`, choose the format/severity, and put the URL in the named
-  `.env` variable.
+  time used by both the LLM and deterministic all-in risk sizing.
+- **`alerts`** — generic, Slack or Discord webhooks. They are optional in demo
+  and mandatory in live; put the URL in the named `.env` variable.
 
 After any edit here, restart the agent for it to take effect.
 
@@ -379,20 +378,36 @@ systemd instead.
 
 ### 8.2 systemd (auto-start at boot, auto-restart on crash — Linux/VPS)
 
-Create the file `/etc/systemd/system/okx-trader.service` (use
-`sudo nano /etc/systemd/system/okx-trader.service`). Set `WorkingDirectory`
-to wherever you cloned the repo (`pwd` prints it):
+Do not run a live trading process as root. Put the checkout under a dedicated
+service account (the example uses `/opt/okx-agent`), make `.env` mode 600 and
+ensure that account owns only this directory. Then create
+`/etc/systemd/system/okx-trader.service`:
 
 ```ini
 [Unit]
 Description=OKX AI Trading Agent
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-WorkingDirectory=/root/okx-agent-crypto
-ExecStart=/usr/bin/python3 /root/okx-agent-crypto/main.py run
+Type=simple
+User=okx-agent
+Group=okx-agent
+WorkingDirectory=/opt/okx-agent
+ExecStart=/opt/okx-agent/.venv/bin/python /opt/okx-agent/main.py run
 Restart=on-failure
 RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/okx-agent/runtime
 
 [Install]
 WantedBy=multi-user.target
@@ -409,7 +424,9 @@ journalctl -u okx-trader -f     # watch the logs live (Ctrl+C to stop watching)
 Two behaviors worth knowing:
 
 - An explicit `python3 main.py pause` **survives** crashes and reboots (the
-  agent comes back paused until you `resume`).
+  agent comes back paused until you `resume`). Run control commands as the
+  same service user; from `/opt/okx-agent`, use
+  `sudo -u okx-agent .venv/bin/python main.py pause`.
 - A drawdown self-kill is **not** auto-restarted into trading: the service
   will keep trying and failing to start until a human runs
   `python3 main.py run --acknowledge-kill`. That's deliberate — a human
@@ -454,8 +471,10 @@ and a SQLite journal. All commands run from inside the repo folder.
 
 For built-in alerts, set `alerts.enabled: true`, choose `generic`, `slack`, or
 `discord`, and set `ALERT_WEBHOOK_URL` in `.env`. Alerts cover circuit breakers,
-unprotected/reconciled positions, incomplete flattening, and cycle failures.
-Keep external uptime monitoring too: a dead machine cannot send its webhook.
+unprotected/reconciled positions, incomplete flattening, journal failures and
+cycle failures. Failed deliveries are retried and saved to
+`runtime/failed_alerts.jsonl`. Keep external uptime monitoring too: a dead
+machine cannot send its webhook.
 
 Confirm prompt caching is working (keeps your AI bill down): after a couple of
 cycles, `grep cache_read runtime/agent.log` — from the second call onward it
@@ -469,16 +488,29 @@ should show a few thousand tokens. If it stays 0, see the note in
 Only after a demo run of at least two weeks that you're happy with, and with
 money you can afford to lose entirely:
 
+Before changing modes, run the full local suite and the opt-in read-only OKX
+demo integration preflight:
+
+```bash
+python3 -m unittest discover -v
+OKX_RUN_DEMO_INTEGRATION=1 python3 -m unittest \
+  tests.test_okx_demo_integration -v
+```
+
 1. In OKX (not in Demo Trading this time), create **live** API keys with
    **Read + Trade only, never Withdraw**, and **bind them to your server's
    IP address**.
-2. Enable derivatives and set the account mode on the live account, and move
-   real USDT into the **Trading** account.
+2. Enable derivatives, select **one-way / net position mode** while flat, and
+   move real USDT into the **Trading** account. The agent checks this setting
+   but never changes it.
 3. Put the live keys in `.env` (they replace the demo keys).
-4. Set `mode: live` in `config.yaml`.
-5. Run `python3 main.py check` — it should say LIVE and show your real
-   balance.
-6. Start small. Consider lowering `risk_per_trade_pct` and
+4. Enable alerts, configure `ALERT_WEBHOOK_URL`, and verify external host
+   monitoring. Live startup is blocked if the webhook preflight fails.
+5. Ensure `.env` is mode 600, then set `mode: live` in `config.yaml`.
+6. Run `python3 main.py check` — it should say LIVE, confirm net mode, Read +
+   Trade only, IP binding, and successful alert delivery. This preflight is
+   read-only and does not alter leverage or position mode.
+7. Start small. Consider lowering `risk_per_trade_pct` and
    `max_gross_exposure_pct` below the demo defaults for your first live days.
 
 Demo fills are idealized; live trading has real slippage, fees, funding
@@ -557,7 +589,7 @@ else**, if you run it on a computer you already own.
   USDT to the Trading account. Confirm your balance is in the **Trading**
   account, not Funding.
 - **`ModuleNotFoundError` on start.** Dependencies aren't installed in the
-  Python you're running. Re-run `pip3 install -r requirements.txt` from
+  Python you're running. Re-run `pip3 install -r requirements.lock.txt` from
   inside the repo folder.
 - **Nothing is trading.** Run `status` (state must be RUNNING), then read
   `runtime/agent.log` for rejection reasons. A quiet, choppy market plus the

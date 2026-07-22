@@ -7,8 +7,8 @@ Token-cost design:
   (cache_control below); OpenAI caches stable >=1024-token prefixes
   automatically. Any per-cycle value (like the max number of new opens)
   belongs in the user message, never in SYSTEM, or the cache breaks.
-- SYSTEM is deliberately sized above 2,048 tokens: Anthropic silently skips
-  caching below a per-model minimum (Sonnet 4.6: 2,048; Opus 4.x and
+- SYSTEM is deliberately sized above 1,024 tokens: Anthropic silently skips
+  caching below a per-model minimum (Sonnet 4.6: 1,024; some Opus and
   Haiku 4.5: 4,096 - on those models the marker is a harmless no-op).
 - The cache TTL is 1h, not the default 5m: cycles run ~6 minutes apart, so a
   5m entry would expire between calls and every call would pay the write
@@ -19,6 +19,7 @@ Token-cost design:
 
 import json
 import logging
+import math
 import os
 
 log = logging.getLogger("brain")
@@ -67,6 +68,9 @@ is elevated; below 1 means the move has weak participation.
 - funding_rate_pct: current funding rate as a percent per funding interval. \
 Positive means longs pay shorts; negative means shorts pay longs. Values \
 beyond roughly +/-0.05% per interval are strong crowd-positioning signals.
+- funding_interval_hours / next_funding_minutes: the current settlement \
+cadence and time until the next charge. Do not assume every contract always \
+uses an eight-hour interval.
 - trend_15m, trend_1h, trend_4h: "up" when price > EMA20 > EMA50 on that \
 timeframe, "down" when price < EMA20 < EMA50, otherwise "flat". Three \
 aligned values is a strong trend; mixed values mean chop.
@@ -114,7 +118,8 @@ the clock at a bad one.
 - hard_limits_fyi: the key risk-engine caps currently configured, for \
 context when choosing your intended size and leverage.
 - trading_costs_fyi: configured taker fee per side, expected stop slippage, \
-and expected number of funding intervals held. Combine these assumptions \
+expected holding hours and the minimum number of funding intervals. Combine \
+these assumptions \
 with each symbol's live spread and funding rate before sizing.
 
 HOW THE RISK ENGINE HANDLES YOUR PROPOSALS
@@ -127,8 +132,9 @@ notional minus short notional) beyond the configured cap - several \
 same-direction positions in correlated coins count as one big bet, so \
 diversify direction or accept the rejection;
 - clamp leverage to the configured maximum;
-- size the position so that hitting your stop loses exactly the configured \
-risk-per-trade percent of equity: size = risk / stop distance. Your \
+- size the position so that hitting your stop plus expected fees, live spread, \
+adverse funding and stop slippage loses no more than the configured \
+risk-per-trade percent of equity. Your \
 stop_loss_pct is therefore a sizing input, not a suggestion - report the \
 stop the setup genuinely needs;
 - reject stops tighter than 0.2% or wider than 15%.
@@ -257,6 +263,7 @@ class LLM:
     def __init__(self, cfg: dict):
         self.cfg = cfg["llm"]
         provider = self.cfg["provider"]
+        self.provider = provider
         if provider == "anthropic":
             if not os.getenv("ANTHROPIC_API_KEY"):
                 raise RuntimeError("ANTHROPIC_API_KEY missing from .env")
@@ -338,6 +345,16 @@ class LLM:
 
     # ----------------------------------------------------------- public
 
+    def preflight(self) -> str:
+        """Verify API-key access to the configured model without generating."""
+        model = self.cfg["model"]
+        if self.provider == "anthropic":
+            info = self.client.models.retrieve(model_id=model)
+        else:
+            info = self.client.models.retrieve(model=model)
+        return str(getattr(info, "id", None)
+                   or getattr(info, "display_name", None) or model)
+
     def decide(self, snapshot: dict, portfolio: dict, max_new: int) -> list[dict]:
         # Compact separators shave ~10% off the per-cycle payload; the
         # per-cycle max_new lives here so SYSTEM stays byte-identical.
@@ -355,7 +372,8 @@ class LLM:
 
 def _num(value, default=0.0) -> float:
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else default
     except (TypeError, ValueError):
         return default
 

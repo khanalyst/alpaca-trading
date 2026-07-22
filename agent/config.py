@@ -101,7 +101,7 @@ def validate_config(raw: dict) -> dict:
                  "flatten_on_daily_stop", "max_drawdown_pct",
                  "max_margin_usage_pct", "cooldown_minutes_after_loss"},
           "risk")
-    _number(risk, "max_leverage", 1, 10, "risk")
+    _integer(risk, "max_leverage", 1, 10, "risk")
     _number(risk, "risk_per_trade_pct", 0.01, 5, "risk")
     _number(risk, "max_position_notional_pct", 1, 100, "risk")
     _number(risk, "max_gross_exposure_pct", 1, 300, "risk")
@@ -118,17 +118,29 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError("risk.max_net_direction_pct cannot exceed max_gross_exposure_pct")
 
     execution = _mapping(cfg.get("execution"), "execution")
-    _keys(execution, {"slippage_guard_pct", "fill_timeout_seconds"},
+    _keys(execution, {"slippage_guard_pct", "max_spread_pct",
+                      "max_order_book_slippage_pct",
+                      "max_market_data_age_seconds", "fill_timeout_seconds"},
           "execution")
     _number(execution, "slippage_guard_pct", 0, 5, "execution")
+    _number(execution, "max_spread_pct", 0.001, 2, "execution")
+    _number(execution, "max_order_book_slippage_pct", 0.001, 5, "execution")
+    _number(execution, "max_market_data_age_seconds", 1, 60, "execution")
     _number(execution, "fill_timeout_seconds", 1, 60, "execution")
+    if (float(execution["max_spread_pct"])
+            > float(execution["max_order_book_slippage_pct"]) * 2):
+        raise ConfigError(
+            "execution.max_spread_pct cannot exceed twice "
+            "max_order_book_slippage_pct")
 
     costs = _mapping(cfg.get("trading_costs"), "trading_costs")
     _keys(costs, {"taker_fee_pct_per_side", "expected_stop_slippage_pct",
-                  "expected_funding_intervals_held"}, "trading_costs")
+                  "expected_funding_intervals_held", "expected_hold_hours"},
+          "trading_costs")
     _number(costs, "taker_fee_pct_per_side", 0, 1, "trading_costs")
     _number(costs, "expected_stop_slippage_pct", 0, 5, "trading_costs")
     _number(costs, "expected_funding_intervals_held", 0, 24, "trading_costs")
+    _number(costs, "expected_hold_hours", 0, 168, "trading_costs")
 
     alerts = _mapping(cfg.get("alerts"), "alerts")
     _keys(alerts, {"enabled", "webhook_url_env", "format", "minimum_level",

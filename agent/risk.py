@@ -4,7 +4,7 @@ The LLM never touches the exchange directly. Every "open" it proposes passes
 through vet_open(), which either rejects the trade or returns a clamped plan:
 
 - leverage capped at config max_leverage and a HARD ceiling of 10
-- notional sized so that hitting the stop costs risk_per_trade_pct of equity
+- notional sized so the all-in bounded loss costs risk_per_trade_pct of equity
 - per-position and gross exposure caps in % of equity
 - net directional exposure cap (long minus short notional) so several
   same-direction positions in correlated coins can't act as one macro bet
@@ -15,6 +15,7 @@ loop because they act on the whole account, not one trade.
 """
 
 import logging
+import math
 import time
 
 log = logging.getLogger("risk")
@@ -28,6 +29,8 @@ MIN_NOTIONAL_USD = 10.0
 class RiskEngine:
     def __init__(self, cfg: dict):
         self.r = cfg["risk"]
+        self.costs = cfg["trading_costs"]
+        self.execution = cfg["execution"]
 
     def vet_open(self, decision: dict, equity: float, positions: list[dict],
                  snapshot: dict, cooldowns: dict,
@@ -44,29 +47,94 @@ class RiskEngine:
             return None, "already holding this symbol"
         if len(positions) >= int(self.r["max_concurrent_positions"]):
             return None, "max concurrent positions reached"
-        if float(decision.get("confidence", 0)) < float(self.r["min_confidence"]):
+        confidence = float(decision.get("confidence", 0))
+        if not math.isfinite(confidence):
+            return None, "confidence is not finite"
+        if confidence < float(self.r["min_confidence"]):
             return None, "confidence below floor"
         if float(cooldowns.get(symbol, 0)) > time.time():
             return None, "symbol in post-loss cooldown"
 
         stop_pct = float(decision.get("stop_loss_pct") or 0)
+        if not math.isfinite(stop_pct):
+            return None, "stop distance is not finite"
         if not (MIN_STOP_PCT <= stop_pct <= MAX_STOP_PCT):
             return None, f"stop distance {stop_pct}% out of bounds"
         take_pct = float(decision.get("take_profit_pct") or 0)
+        if not math.isfinite(take_pct):
+            return None, "take-profit distance is not finite"
         if take_pct <= 0:
             take_pct = stop_pct * 2
 
         leverage = float(decision.get("leverage") or 1)
-        leverage = max(1.0, min(leverage, float(self.r["max_leverage"]),
-                                HARD_MAX_LEVERAGE))
+        if not math.isfinite(leverage):
+            return None, "leverage is not finite"
+        leverage = int(math.floor(max(
+            1.0, min(leverage, float(self.r["max_leverage"]),
+                     HARD_MAX_LEVERAGE))))
 
         price = float(snapshot[symbol]["price"])
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             return None, "invalid price"
 
-        # Size from risk: losing the stop costs risk_per_trade_pct of equity.
+        symbol_data = snapshot[symbol]
+        spread_raw = symbol_data.get("spread_pct")
+        if spread_raw is None:
+            return None, "live spread unavailable"
+        funding_raw = symbol_data.get("funding_rate_pct")
+        if funding_raw is None:
+            return None, "live funding rate unavailable"
+        spread_pct = max(0.0, float(spread_raw))
+        funding_pct = float(funding_raw)
+        if not math.isfinite(spread_pct) or not math.isfinite(funding_pct):
+            return None, "live cost data is not finite"
+        funding_intervals = float(
+            self.costs["expected_funding_intervals_held"])
+        interval_raw = symbol_data.get("funding_interval_hours")
+        hold_hours = float(self.costs["expected_hold_hours"])
+        if interval_raw not in (None, ""):
+            interval_hours = float(interval_raw)
+            if not math.isfinite(interval_hours):
+                return None, "funding schedule is not finite"
+        else:
+            interval_hours = 0.0
+        if interval_hours > 0:
+            next_minutes = symbol_data.get("next_funding_minutes")
+            if next_minutes in (None, ""):
+                dynamic_intervals = math.ceil(hold_hours / interval_hours)
+            else:
+                next_minutes = float(next_minutes)
+                if not math.isfinite(next_minutes):
+                    return None, "funding schedule is not finite"
+                next_hours = max(0.0, next_minutes / 60)
+                dynamic_intervals = (0 if next_hours > hold_hours else
+                                     1 + math.floor(max(
+                                         0.0, hold_hours - next_hours)
+                                         / interval_hours))
+            funding_intervals = max(funding_intervals, dynamic_intervals)
+        adverse_funding_pct = (
+            max(0.0, funding_pct)
+            if decision["direction"] == "long"
+            else max(0.0, -funding_pct)
+        ) * funding_intervals
+        fee_pct = 2 * float(self.costs["taker_fee_pct_per_side"])
+        stop_slippage_pct = float(self.costs["expected_stop_slippage_pct"])
+        # A fill can occur anywhere inside the exchange-side IOC boundary
+        # after the depth snapshot changes. Reserve the whole bounded entry
+        # move so it cannot sit outside risk_per_trade_pct.
+        entry_slippage_pct = float(
+            self.execution["max_order_book_slippage_pct"])
+        estimated_loss_pct = (stop_pct + fee_pct + spread_pct
+                              + stop_slippage_pct + entry_slippage_pct
+                              + adverse_funding_pct)
+        if estimated_loss_pct <= 0:
+            return None, "invalid estimated stop cost"
+
+        # Size from all-in adverse risk, not price distance alone. This keeps
+        # expected fees, spread, stop slippage and adverse funding inside the
+        # configured risk-per-trade budget.
         risk_usd = equity * float(self.r["risk_per_trade_pct"]) / 100.0
-        notional = risk_usd / (stop_pct / 100.0)
+        notional = risk_usd / (estimated_loss_pct / 100.0)
 
         # Per-position cap.
         notional = min(notional,
@@ -74,6 +142,8 @@ class RiskEngine:
 
         # Respect the model's own (smaller) intent if it gave one.
         intent_pct = float(decision.get("size_pct_equity") or 0)
+        if not math.isfinite(intent_pct):
+            return None, "intended size is not finite"
         if intent_pct > 0:
             notional = min(notional, equity * intent_pct / 100.0 * leverage)
 
@@ -112,6 +182,14 @@ class RiskEngine:
             "price": price,
             "sl_pct": stop_pct,
             "tp_pct": take_pct,
-            "confidence": float(decision.get("confidence", 0)),
+            "estimated_loss_pct": estimated_loss_pct,
+            "estimated_cost_pct": estimated_loss_pct - stop_pct,
+            "spread_pct": spread_pct,
+            "entry_slippage_budget_pct": entry_slippage_pct,
+            "adverse_funding_pct": adverse_funding_pct,
+            "estimated_funding_intervals": funding_intervals,
+            "risk_budget_usd": risk_usd,
+            "risk_usd": notional * estimated_loss_pct / 100.0,
+            "confidence": confidence,
             "reason": decision.get("reasoning", ""),
         }, None

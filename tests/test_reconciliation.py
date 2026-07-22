@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from agent import state
 from agent.engine import Engine
 from tests.helpers import valid_config
 
@@ -159,6 +160,7 @@ class FakeEmergencyExchange:
     def __init__(self):
         self.x = Mock()
         self.x.market.return_value = {"contractSize": 1}
+        self.close_calls = 0
 
     @staticmethod
     def price(symbol):
@@ -167,6 +169,10 @@ class FakeEmergencyExchange:
     @staticmethod
     def contracts_for_notional(symbol, notional, price):
         return 2
+
+    @staticmethod
+    def guarded_entry_limit(*args, **kwargs):
+        return {"limit_price": 100.25, "spread_pct": 0.05, "mid": 100}
 
     @staticmethod
     def open_position(*args, **kwargs):
@@ -178,8 +184,8 @@ class FakeEmergencyExchange:
             "protection": {"stop_loss": False, "take_profit": False},
         }
 
-    @staticmethod
-    def close_position(pos):
+    def close_position(self, pos):
+        self.close_calls += 1
         return {
             "order_id": "exit", "status": "closed", "filled": 2,
             "average": 99, "partial": False, "fee_usd": 0.2,
@@ -191,12 +197,39 @@ class FakeEmergencyExchange:
     def funding_since(symbol, since_ms):
         return 0
 
+    @staticmethod
+    def position(symbol, side=None):
+        return None
+
+
+class PartialEmergencyExchange(FakeEmergencyExchange):
+    def close_position(self, pos):
+        self.close_calls += 1
+        remaining = 1 if self.close_calls == 1 else 0
+        return {
+            "order_id": f"exit-{self.close_calls}", "status": "closed",
+            "filled": 1, "average": 99, "partial": bool(remaining),
+            "fee_usd": 0.1, "slippage_usd": 1,
+            "fully_closed": not remaining,
+            "remaining_contracts": remaining,
+        }
+
+    def position(self, symbol, side=None):
+        if self.close_calls < 2:
+            return {
+                "symbol": symbol, "side": side, "contracts": 1,
+                "entryPrice": 100, "markPrice": 99, "leverage": 2,
+                "info": {},
+            }
+        return None
+
 
 class EmergencyExecutionTests(unittest.TestCase):
+    @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
     @patch("agent.engine.state.commit")
     @patch("agent.engine.state.log_trade")
     def test_unprotected_fill_is_journaled_then_emergency_closed(
-            self, log_trade, commit):
+            self, log_trade, commit, load_state):
         engine = Engine.__new__(Engine)
         engine.cfg = valid_config()
         engine.ex = FakeEmergencyExchange()
@@ -218,6 +251,55 @@ class EmergencyExecutionTests(unittest.TestCase):
         self.assertEqual(first_id, second_id)
         self.assertEqual(st["active_trades"], {})
         self.assertGreaterEqual(commit.call_count, 2)
+
+    @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
+    @patch("agent.engine.state.commit", side_effect=OSError("disk full"))
+    @patch("agent.engine.state.log_trade")
+    def test_persistence_failure_cannot_block_unprotected_emergency_close(
+            self, log_trade, commit, load_state):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = FakeEmergencyExchange()
+        engine.alerts = Mock()
+        st = {"opened_at": {}, "active_trades": {}, "protection": {},
+              "cooldowns": {}}
+        plan = {
+            "symbol": "BTC/USDT:USDT", "direction": "long",
+            "notional": 200, "price": 100, "leverage": 2,
+            "sl_pct": 2, "tp_pct": 4, "confidence": 0.8,
+            "reason": "test", "estimated_loss_pct": 2.7,
+        }
+
+        with self.assertRaisesRegex(
+                state.JournalError, "post-entry persistence failed"):
+            engine._execute_open(plan, st)
+
+        self.assertEqual(engine.ex.close_calls, 1)
+        self.assertEqual(st["active_trades"], {})
+
+    @patch("agent.engine.time.sleep")
+    @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_trade")
+    def test_unprotected_partial_close_is_retried_without_waiting_a_cycle(
+            self, log_trade, commit, load_state, sleep):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = PartialEmergencyExchange()
+        engine.alerts = Mock()
+        st = {"opened_at": {}, "active_trades": {}, "protection": {},
+              "cooldowns": {}}
+        plan = {
+            "symbol": "BTC/USDT:USDT", "direction": "long",
+            "notional": 200, "price": 100, "leverage": 2,
+            "sl_pct": 2, "tp_pct": 4, "confidence": 0.8,
+            "reason": "test", "estimated_loss_pct": 2.7,
+        }
+
+        self.assertFalse(engine._execute_open(plan, st))
+
+        self.assertEqual(engine.ex.close_calls, 2)
+        self.assertEqual(st["active_trades"], {})
 
 
 if __name__ == "__main__":

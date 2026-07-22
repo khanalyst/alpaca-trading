@@ -7,12 +7,60 @@ history to compute indicators.
 """
 
 import logging
+import math
 import time
 
 import numpy as np
 import pandas as pd
 
 log = logging.getLogger("market")
+
+
+def quote_volume_usd(ticker: dict, market: dict) -> float:
+    """Return a derivative ticker's 24h quote turnover in USD.
+
+    CCXT's OKX adapter deliberately leaves ``quoteVolume`` empty for swaps
+    and exposes OKX ``vol24h`` as ``baseVolume``.  ``vol24h`` is a contract
+    count, not base-asset volume, so multiplying it by price without applying
+    ``contractSize`` can overstate liquidity by orders of magnitude.
+
+    Prefer OKX's raw ``volCcy24h`` (base-asset volume for linear USDT swaps),
+    then fall back to contracts * contract size * price.  A future adapter
+    that supplies a real quoteVolume remains the first choice.
+    """
+    last = float(ticker.get("last") or ticker.get("close") or 0)
+    direct = ticker.get("quoteVolume")
+    if direct not in (None, ""):
+        value = float(direct or 0)
+        return value if math.isfinite(value) and value >= 0 else 0.0
+
+    info = ticker.get("info") or {}
+    base_ccy_volume = info.get("volCcy24h")
+    if base_ccy_volume not in (None, "") and last > 0:
+        value = float(base_ccy_volume) * last
+        return value if math.isfinite(value) and value >= 0 else 0.0
+
+    contracts = float(ticker.get("baseVolume") or 0)
+    contract_size = float(market.get("contractSize") or 0)
+    value = contracts * contract_size * last
+    return value if math.isfinite(value) and value >= 0 else 0.0
+
+
+def _funding_interval_hours(rate: dict) -> float | None:
+    current = rate.get("fundingTimestamp")
+    next_funding = rate.get("nextFundingTimestamp")
+    if current not in (None, "") and next_funding not in (None, ""):
+        hours = (float(next_funding) - float(current)) / 3_600_000
+        if hours > 0:
+            return round(hours, 2)
+    interval = str(rate.get("interval") or "").strip().lower()
+    if interval.endswith("h"):
+        try:
+            hours = float(interval[:-1])
+            return round(hours, 2) if hours > 0 else None
+        except ValueError:
+            pass
+    return None
 
 
 # ------------------------------------------------------------- indicators
@@ -86,11 +134,7 @@ def build_universe(ex, cfg: dict) -> list[str]:
             continue
         if sym in (u.get("denylist") or []):
             continue
-        qv = t.get("quoteVolume")
-        if qv is None:
-            last = float(t.get("last") or 0)
-            qv = last * float(t.get("baseVolume") or 0)
-        qv = float(qv or 0)
+        qv = quote_volume_usd(t, m)
         if qv >= u["min_24h_quote_volume_usd"]:
             rows.append((sym, qv))
     rows.sort(key=lambda r: r[1], reverse=True)
@@ -118,10 +162,11 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
         )
 
     last = float(ticker.get("last") or frames[tfs[0]]["close"].iloc[-1])
+    market = ex.x.market(symbol)
     snap = {
         "price": last,
         "chg_24h_pct": round(float(ticker.get("percentage") or 0), 2),
-        "vol_24h_musd": round(float(ticker.get("quoteVolume") or 0) / 1e6, 1),
+        "vol_24h_musd": round(quote_volume_usd(ticker, market) / 1e6, 1),
     }
     bid = float(ticker.get("bid") or 0)
     ask = float(ticker.get("ask") or 0)
@@ -135,8 +180,17 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
         snap["funding_rate_pct"] = round(
             float(fr.get("fundingRate") or 0) * 100, 4
         )
+        snap["funding_interval_hours"] = _funding_interval_hours(fr)
+        next_funding = fr.get("nextFundingTimestamp")
+        snap["next_funding_minutes"] = (
+            round(max(0.0, (float(next_funding) - time.time() * 1000)
+                      / 60_000), 1)
+            if next_funding not in (None, "") else None
+        )
     except Exception:
         snap["funding_rate_pct"] = None
+        snap["funding_interval_hours"] = None
+        snap["next_funding_minutes"] = None
 
     for tf, df in frames.items():
         close = df["close"]

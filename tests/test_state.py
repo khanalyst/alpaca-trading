@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent import state
 
@@ -53,6 +54,37 @@ class StateSafetyTests(unittest.TestCase):
         state.STATE_FILE.write_text(json.dumps(malformed))
         loaded = state.load_state()
         self.assertEqual(loaded["state"], state.KILLED)
+
+    def test_only_one_agent_run_lock_can_be_held(self):
+        first = state.acquire_run_lock()
+        self.assertIsNotNone(first)
+        try:
+            self.assertIsNone(state.acquire_run_lock())
+        finally:
+            state.release_run_lock(first)
+        second = state.acquire_run_lock()
+        self.assertIsNotNone(second)
+        state.release_run_lock(second)
+
+    def test_keep_positions_intent_is_durable(self):
+        saved = state.set_state(
+            state.KILLED, "operator", flatten_on_kill=False,
+            operator_pause=True)
+        self.assertFalse(saved["flatten_on_kill"])
+        self.assertFalse(state.load_state()["flatten_on_kill"])
+
+    def test_journal_failure_is_never_silently_swallowed(self):
+        with patch("agent.state._db", side_effect=OSError("disk full")):
+            with self.assertRaises(state.JournalError):
+                state.log_event("test", "payload")
+
+    def test_journal_preflight_verifies_writes_without_leaving_an_event(self):
+        state.check_journal()
+        with state._db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE kind='journal_preflight'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
 
 
 if __name__ == "__main__":

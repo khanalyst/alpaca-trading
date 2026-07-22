@@ -39,9 +39,17 @@ class Engine:
     def __init__(self, cfg: dict, light: bool = False):
         self.cfg = cfg
         self.alerts = AlertManager(cfg)
-        self.ex = Exchange(cfg, self.alerts)
+        if not light:
+            state.check_journal()
+            if cfg["mode"] == "live":
+                self.alerts.require_live_ready(probe=True)
+        self.ex = Exchange(
+            cfg, self.alerts, validate_account=not light)
+        if not light:
+            self.ex.verify_account_safety(require_trade=True, refresh=True)
         if not light:
             self.llm = brain.LLM(cfg)
+            self.llm.preflight()
             self.risk = RiskEngine(cfg)
         self.universe: list[str] = []
         self.universe_ts = 0.0
@@ -50,8 +58,15 @@ class Engine:
 
     # ------------------------------------------------------------ lifecycle
 
-    def run(self) -> None:
-        state.write_pid()
+    def run(self, run_lock=None) -> None:
+        owns_lock = run_lock is None
+        if run_lock is None:
+            run_lock = state.acquire_run_lock()
+        if run_lock is None:
+            pid = state.read_pid()
+            raise RuntimeError(
+                "another agent loop already holds the run lock"
+                + (f" (pid {pid})" if pid else ""))
         st = state.load_state()
         if "state file was corrupt" in str(st.get("kill_reason") or ""):
             self.alerts.send(
@@ -70,13 +85,21 @@ class Engine:
             while True:
                 st = state.load_state()
                 if st["state"] == state.KILLED:
-                    log.warning("Kill flag detected; flattening and exiting.")
-                    self.flatten_all(st.get("kill_reason") or "kill flag")
+                    if st.get("flatten_on_kill", True):
+                        log.warning(
+                            "Kill flag detected; flattening and exiting.")
+                        self.flatten_all(st.get("kill_reason") or "kill flag")
+                    else:
+                        log.warning(
+                            "Kill flag detected with keep-positions; exiting "
+                            "without touching positions or protective orders.")
                     break
                 try:
                     self.cycle(st)
                     self._credential_failures = 0
                 except SystemExit:
+                    raise
+                except state.JournalError:
                     raise
                 except (CredentialError, ccxt.AuthenticationError) as e:
                     if self._on_credential_failure(e):
@@ -87,7 +110,20 @@ class Engine:
                     self.alerts.send(
                         "error", "cycle_error", "Trading cycle failed",
                         {"error": str(e)})
-                time.sleep(int(self.cfg["cycle"]["interval_seconds"]))
+                self._wait_for_next_cycle()
+        except state.JournalError as exc:
+            reason = f"durable journal unavailable: {exc}"
+            log.critical("Agent stopped: %s", reason)
+            try:
+                state.set_state(
+                    state.PAUSED, reason, operator_pause=True)
+            except Exception as state_exc:
+                log.critical("Could not persist journal-failure pause: %s",
+                             state_exc)
+            self.alerts.send(
+                "critical", "journal_failure_stop",
+                "Agent stopped because its durable audit journal failed",
+                {"error": str(exc)})
         except KeyboardInterrupt:
             if state.load_state()["state"] == state.KILLED:
                 log.warning("Interrupted during a kill; state stays KILLED.")
@@ -97,7 +133,17 @@ class Engine:
                             "orders on OKX.")
                 state.set_state(state.PAUSED)
         finally:
-            state.clear_pid()
+            if owns_lock:
+                state.release_run_lock(run_lock)
+
+    def _wait_for_next_cycle(self) -> None:
+        """Sleep responsively so a kill is observed within about one second."""
+        deadline = time.monotonic() + int(
+            self.cfg["cycle"]["interval_seconds"])
+        while time.monotonic() < deadline:
+            if state.load_state()["state"] == state.KILLED:
+                return
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     def _on_credential_failure(self, exc: Exception) -> bool:
         """Handle an auth/clock rejection. True means stop the loop.
@@ -145,6 +191,7 @@ class Engine:
         # A host that booted with a good clock can still drift into OKX's
         # 30s signing window later; warn before it starts rejecting orders.
         self.ex.recheck_clock_if_due()
+        self.ex.recheck_account_safety_if_due()
         equity = self.ex.equity_usdt()
         if equity <= 0:
             log.warning("Equity reads as 0; skipping cycle")
@@ -215,13 +262,18 @@ class Engine:
                 "critical", "max_drawdown_kill",
                 f"Maximum drawdown reached: {drawdown_pct:.2f}%",
                 {"equity": equity, "high_water_mark": st["high_water_mark"]})
-            self.flatten_all("max drawdown breached")
-            # flatten_all commits its own execution state. Do not merge this
-            # cycle's pre-flatten active-trade map back over those closes.
-            fresh = state.load_state()
-            st.clear()
-            st.update(fresh)
+            # Persist the terminal state before touching the exchange. If the
+            # flatten is interrupted or fails, a restart must not resume
+            # trading on the next process invocation.
             state.commit(st, kill=f"max drawdown {drawdown_pct:.1f}%")
+            try:
+                self.flatten_all("max drawdown breached")
+            finally:
+                # flatten_all commits its own execution state. Do not merge
+                # this cycle's pre-flatten active-trade map over those closes.
+                fresh = state.load_state()
+                st.clear()
+                st.update(fresh)
             raise SystemExit(1)
 
         day_pnl_pct = (equity - st["day_start_equity"]) / st["day_start_equity"] * 100
@@ -283,9 +335,14 @@ class Engine:
             state.log_event("decisions", json.dumps(decisions))
         # Pick up any pause/kill the CLI issued while the LLM call was running.
         state.commit(st)
+        if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
+            return
 
         # --- closes first
         for d in [d for d in decisions if d["action"] == "close"]:
+            if state.load_state()["state"] not in (
+                    state.RUNNING, state.DAY_STOPPED):
+                return
             pos = next((p for p in positions
                         if p.get("symbol") == d.get("symbol")), None)
             if pos and self._close(pos,
@@ -301,6 +358,9 @@ class Engine:
         opens = sorted([d for d in decisions if d["action"] == "open"],
                        key=lambda d: d.get("confidence", 0), reverse=True)
         for d in opens:
+            latest = state.load_state()
+            if latest["state"] != state.RUNNING:
+                return
             plan, why = self.risk.vet_open(d, equity, positions, snapshot,
                                            st.get("cooldowns", {}), gross)
             if not plan:
@@ -334,6 +394,10 @@ class Engine:
                              startup: bool = False) -> list[dict]:
         """Match local trades to exchange positions and verify SL/TP coverage."""
         actual = {p["symbol"]: p for p in positions}
+        if len(actual) != len(positions):
+            raise RuntimeError(
+                "OKX returned multiple positions for one symbol; net_mode "
+                "cannot be proven")
         active = st.setdefault("active_trades", {})
         protection = st.setdefault("protection", {})
         opened_at = st.setdefault("opened_at", {})
@@ -522,6 +586,9 @@ class Engine:
 
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
+        if state.load_state()["state"] != state.RUNNING:
+            log.info("Control state changed; skipping entry for %s", symbol)
+            return False
         try:
             live = self.ex.price(symbol)
         except Exception as e:
@@ -540,17 +607,65 @@ class Engine:
 
         if plan["direction"] == "long":
             side = "buy"
-            sl_price = live * (1 - plan["sl_pct"] / 100)
-            tp_price = live * (1 + plan["tp_pct"] / 100)
         else:
             side = "sell"
-            sl_price = live * (1 + plan["sl_pct"] / 100)
-            tp_price = live * (1 - plan["tp_pct"] / 100)
+
+        try:
+            entry_guard = self.ex.guarded_entry_limit(
+                symbol, side, contracts,
+                float(self.cfg["execution"]["max_spread_pct"]),
+                float(self.cfg["execution"][
+                    "max_order_book_slippage_pct"]),
+                float(self.cfg["execution"]["max_market_data_age_seconds"]),
+            )
+        except Exception as exc:
+            log.warning("Entry liquidity guard rejected %s: %s", symbol, exc)
+            return False
+
+        entry_reference = float(entry_guard["mid"])
+        book_sized_contracts = self.ex.contracts_for_notional(
+            symbol, plan["notional"], entry_reference)
+        contracts = min(contracts, book_sized_contracts)
+        if contracts <= 0:
+            log.info("Order-book-priced size below minimum for %s", symbol)
+            return False
+        if plan["direction"] == "long":
+            sl_price = entry_reference * (1 - plan["sl_pct"] / 100)
+            tp_price = entry_reference * (1 + plan["tp_pct"] / 100)
+        else:
+            sl_price = entry_reference * (1 + plan["sl_pct"] / 100)
+            tp_price = entry_reference * (1 - plan["tp_pct"] / 100)
+
+        # If the spread widened after analysis, reduce contracts again before
+        # submitting the IOC order so the all-in stop budget remains hard.
+        estimated_loss_pct = float(
+            plan.get("estimated_loss_pct") or plan["sl_pct"])
+        live_loss_pct = estimated_loss_pct + max(
+            0.0, float(entry_guard["spread_pct"])
+            - float(plan.get("spread_pct") or 0))
+        risk_budget = float(plan.get("risk_budget_usd") or 0)
+        if risk_budget > 0 and live_loss_pct > 0:
+            live_notional_cap = risk_budget / (live_loss_pct / 100)
+            if live_notional_cap < float(plan["notional"]):
+                cost_adjusted_contracts = self.ex.contracts_for_notional(
+                    symbol, live_notional_cap, entry_reference)
+                contracts = min(contracts, cost_adjusted_contracts)
+                if contracts <= 0:
+                    log.info("Live cost-adjusted size below minimum for %s",
+                             symbol)
+                    return False
+                plan["notional"] = live_notional_cap
+        plan["estimated_loss_pct"] = live_loss_pct
+
+        if state.load_state()["state"] != state.RUNNING:
+            log.info("Control state changed before order; skipping %s", symbol)
+            return False
 
         try:
             execution = self.ex.open_position(
                 symbol, side, contracts, plan["leverage"], sl_price, tp_price,
-                expected_price=live)
+                expected_price=entry_reference,
+                entry_limit_price=entry_guard["limit_price"])
         except Exception as e:
             log.error("Entry failed for %s: %s", symbol, e)
             return False
@@ -562,7 +677,8 @@ class Engine:
         actual_notional = filled * contract_size * fill_price
         trade_id = state.new_trade_id()
         opened = time.time()
-        risk_usd = actual_notional * float(plan["sl_pct"]) / 100.0
+        estimated_loss_pct = float(plan["estimated_loss_pct"])
+        risk_usd = actual_notional * estimated_loss_pct / 100.0
         st.setdefault("opened_at", {})[symbol] = opened
         st.setdefault("active_trades", {})[symbol] = {
             "trade_id": trade_id,
@@ -586,18 +702,34 @@ class Engine:
             "tp_price": tp_price,
         }
         plan["notional"] = actual_notional
-        state.log_trade(
-            symbol, side, "open", filled, fill_price, actual_notional,
-            plan["leverage"], plan["reason"], confidence=plan["confidence"],
-            trade_id=trade_id, order_id=execution.get("order_id"),
-            fee_usd=execution.get("fee_usd") or 0, risk_usd=risk_usd,
-            fill_status=("partial" if execution.get("partial") else
-                         execution.get("status")),
-            slippage_usd=execution.get("slippage_usd") or 0)
+        plan["risk_usd"] = risk_usd
+        persistence_error = None
+        try:
+            # Make the verified exchange fill durable before any journal
+            # failure can pause the loop. Startup reconciliation can recover
+            # the position from state if the audit write fails afterward.
+            state.commit(st)
+            state.log_trade(
+                symbol, side, "open", filled, fill_price, actual_notional,
+                plan["leverage"], plan["reason"],
+                confidence=plan["confidence"], trade_id=trade_id,
+                order_id=execution.get("order_id"),
+                fee_usd=execution.get("fee_usd") or 0,
+                risk_usd=risk_usd,
+                fill_status=("partial" if execution.get("partial") else
+                             execution.get("status")),
+                slippage_usd=execution.get("slippage_usd") or 0)
+        except Exception as exc:
+            persistence_error = (
+                exc if isinstance(exc, state.JournalError) else
+                state.JournalError(f"post-entry persistence failed: {exc}"))
+            log.critical("Post-entry persistence failed for %s: %s",
+                         symbol, exc)
+
         if not (execution.get("protection") or {}).get("stop_loss"):
             # Persist the verified fill before the emergency close so even a
-            # process crash leaves a durable, reconcilable trade record.
-            state.commit(st)
+            # process crash leaves a durable, reconcilable trade record. A
+            # persistence failure must never prevent this exchange close.
             emergency_position = {
                 "symbol": symbol,
                 "contracts": float(
@@ -608,20 +740,74 @@ class Engine:
                 "leverage": plan["leverage"],
                 "info": {},
             }
-            if not self._close(
-                    emergency_position,
-                    "emergency close: stop-loss verification failed", st):
+            close_error = None
+            closed = False
+            current_position = emergency_position
+            verified_flat = False
+            for attempt in range(3):
+                try:
+                    closed = self._close(
+                        current_position,
+                        "emergency close: stop-loss verification failed", st)
+                except Exception as exc:
+                    close_error = exc
+                    if persistence_error is None:
+                        persistence_error = (
+                            exc if isinstance(exc, state.JournalError) else
+                            state.JournalError(
+                                f"emergency-close persistence failed: {exc}"))
+                    log.critical(
+                        "Emergency-close bookkeeping failed for %s: %s",
+                        symbol, exc)
+                if closed:
+                    break
+                try:
+                    remaining = self.ex.position(
+                        symbol, plan["direction"])
+                except Exception as verify_exc:
+                    close_error = close_error or verify_exc
+                    log.critical(
+                        "Could not verify emergency close for %s: %s",
+                        symbol, verify_exc)
+                    break
+                if remaining is None:
+                    closed = True
+                    verified_flat = True
+                    break
+                current_position = remaining
+                if attempt < 2:
+                    time.sleep(0.25)
+            if verified_flat:
+                st.get("opened_at", {}).pop(symbol, None)
+                st.get("active_trades", {}).pop(symbol, None)
+                st.get("protection", {}).pop(symbol, None)
+                try:
+                    state.commit(st)
+                except Exception as cleanup_exc:
+                    if persistence_error is None:
+                        persistence_error = state.JournalError(
+                            f"emergency-close cleanup failed: {cleanup_exc}")
+                    log.critical(
+                        "Could not persist emergency-close cleanup for "
+                        "%s: %s", symbol, cleanup_exc)
+            if not closed:
                 self.alerts.send(
                     "critical", "emergency_close_failed",
                     f"{symbol} remains open without a verified stop-loss",
                     {"contracts": emergency_position["contracts"]})
                 raise RuntimeError(
-                    f"{symbol} emergency close failed after unprotected fill")
+                    f"{symbol} emergency close failed after unprotected fill"
+                ) from (close_error or persistence_error)
+            if persistence_error is not None:
+                raise persistence_error
             return False
+        if persistence_error is not None:
+            raise persistence_error
         log.info("OPENED %s %s | notional %.0f USDT | %.1fx | SL %.2f%% "
-                 "TP %.2f%% | conf %.2f | %s",
+                 "all-in risk %.2f%% | TP %.2f%% | conf %.2f | %s",
                  plan["direction"].upper(), symbol, actual_notional,
-                 plan["leverage"], plan["sl_pct"], plan["tp_pct"],
+                 plan["leverage"], plan["sl_pct"], estimated_loss_pct,
+                 plan["tp_pct"],
                  plan["confidence"], plan["reason"])
         return True
 
@@ -731,7 +917,15 @@ class Engine:
                 continue
             kept.append(p)
 
-        usage = self.ex.margin_usage_pct()
+        try:
+            usage = self.ex.margin_usage_pct()
+        except Exception as exc:
+            self.alerts.send(
+                "critical", "margin_risk_unavailable",
+                "New entries blocked because OKX margin risk is unavailable",
+                {"error": str(exc)})
+            raise RuntimeError(
+                f"cannot enforce margin-usage guard: {exc}") from exc
         while (usage is not None and usage > float(r["max_margin_usage_pct"])
                and kept):
             kept.sort(key=self._notional, reverse=True)
@@ -798,11 +992,50 @@ class Engine:
     def flatten_all(self, reason: str) -> bool:
         log.warning("FLATTEN ALL (close positions, then cancel orders): %s",
                     reason)
-        st = state.load_state()
+        try:
+            st = state.load_state()
+        except Exception as exc:
+            log.critical(
+                "local state unavailable during flatten; exchange remains "
+                "authoritative: %s", exc)
+            st = {"opened_at": {}, "active_trades": {}, "protection": {},
+                  "cooldowns": {}}
         failed = []
+        bookkeeping_failures = []
         for p in self.ex.positions():
-            if not self._close(p, f"flatten: {reason}", st):
+            try:
+                closed = self._close(p, f"flatten: {reason}", st)
+            except Exception as exc:
+                # The exchange close happens before journaling. Verify the
+                # exchange directly and keep flattening other symbols even if
+                # local persistence fails during an emergency.
+                log.critical("close bookkeeping failed during flatten for %s: %s",
+                             p.get("symbol"), exc)
+                bookkeeping_failures.append(str(p.get("symbol")))
+                try:
+                    remaining = self.ex.position(
+                        p["symbol"], self._direction(p))
+                except Exception:
+                    remaining = p
+                closed = remaining is None
+                if closed:
+                    st.get("opened_at", {}).pop(p["symbol"], None)
+                    st.get("active_trades", {}).pop(p["symbol"], None)
+                    st.get("protection", {}).pop(p["symbol"], None)
+                    try:
+                        state.commit(st)
+                    except Exception as state_exc:
+                        log.critical(
+                            "could not persist post-flatten state for %s: %s",
+                            p.get("symbol"), state_exc)
+            if not closed:
                 failed.append(str(p.get("symbol")))
+        if bookkeeping_failures:
+            self.alerts.send(
+                "critical", "flatten_bookkeeping_failed",
+                "One or more emergency closes lost local bookkeeping",
+                {"symbols": bookkeeping_failures, "reason": reason})
+        orders_cleared = True
         if failed:
             log.error("FLATTEN INCOMPLETE; still open: %s. Close them "
                       "manually on OKX.", ", ".join(failed))
@@ -814,10 +1047,21 @@ class Engine:
             try:
                 self.ex.cancel_everything()
             except Exception as e:
+                orders_cleared = False
                 log.error("cancel_everything after flatten: %s", e)
                 self.alerts.send(
                     "error", "order_cancel_incomplete",
                     "Positions are flat but some orders may remain",
                     {"error": str(e), "reason": reason})
-        state.log_event("flatten", reason)
-        return not failed
+        try:
+            state.log_event("flatten", reason)
+        except state.JournalError as exc:
+            # Closing risk takes precedence during an emergency. Report the
+            # lost audit write, but do not describe a successful flatten as a
+            # failed close merely because SQLite became unavailable afterward.
+            log.critical("flatten completed but journal write failed: %s", exc)
+            self.alerts.send(
+                "critical", "flatten_journal_failed",
+                "Flatten completed but could not be written to the journal",
+                {"error": str(exc), "reason": reason})
+        return not failed and orders_cleared

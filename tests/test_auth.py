@@ -91,20 +91,71 @@ class ClockCheckTests(unittest.TestCase):
 
 
 class TradePermissionTests(unittest.TestCase):
-    def test_probe_uses_set_leverage_and_places_no_order(self):
+    @staticmethod
+    def _account_response(perm="read_only,trade", pos_mode="net_mode",
+                          ip="203.0.113.10"):
+        return {"code": "0", "data": [{
+            "perm": perm, "posMode": pos_mode, "acctLv": "2", "ip": ip,
+        }]}
+
+    def test_probe_is_read_only_and_checks_account_configuration(self):
         client = Mock()
-        client.markets = {"BTC/USDT:USDT": {"swap": True, "quote": "USDT"}}
+        client.private_get_account_config.return_value = self._account_response()
         ex = bare_exchange(client)
-        self.assertEqual(ex.verify_trade_permission(), "BTC/USDT:USDT")
-        client.set_leverage.assert_called_once()
+        result = ex.verify_trade_permission()
+        self.assertEqual(result["position_mode"], "net_mode")
+        self.assertIn("trade", result["permissions"])
+        client.private_get_account_config.assert_called_once()
+        client.set_leverage.assert_not_called()
         client.create_order.assert_not_called()
 
     def test_read_only_key_is_rejected(self):
         client = Mock()
-        client.markets = {"BTC/USDT:USDT": {"swap": True, "quote": "USDT"}}
-        client.set_leverage.side_effect = ccxt.AuthenticationError("50114")
+        client.private_get_account_config.return_value = self._account_response(
+            perm="read_only")
         with self.assertRaises(CredentialError):
             bare_exchange(client).verify_trade_permission()
+
+    def test_hedge_mode_is_rejected_without_trying_to_change_it(self):
+        client = Mock()
+        client.private_get_account_config.return_value = self._account_response(
+            pos_mode="long_short_mode")
+        with self.assertRaisesRegex(RuntimeError, "net_mode"):
+            bare_exchange(client).verify_trade_permission()
+        client.set_position_mode.assert_not_called()
+
+    def test_withdraw_permission_is_rejected(self):
+        client = Mock()
+        client.private_get_account_config.return_value = self._account_response(
+            perm="read_only,trade,withdraw")
+        with self.assertRaisesRegex(CredentialError, "Withdraw"):
+            bare_exchange(client).verify_trade_permission()
+
+    def test_live_account_requires_ip_binding(self):
+        client = Mock()
+        client.private_get_account_config.return_value = self._account_response(
+            ip="")
+        ex = bare_exchange(client)
+        ex.cfg["mode"] = "live"
+        ex.demo = False
+        with self.assertRaisesRegex(CredentialError, "IP-bound"):
+            ex.verify_trade_permission()
+
+    def test_live_account_rejects_material_non_usdt_collateral(self):
+        client = Mock()
+        client.private_get_account_config.return_value = self._account_response()
+        client.fetch_balance.return_value = {"info": {"data": [{
+            "totalEq": "10000",
+            "details": [
+                {"ccy": "USDT", "eqUsd": "9000"},
+                {"ccy": "BTC", "eqUsd": "1000"},
+            ],
+        }]}}
+        ex = bare_exchange(client)
+        ex.cfg["mode"] = "live"
+        ex.demo = False
+        with self.assertRaisesRegex(RuntimeError, "non-USDT"):
+            ex.verify_trade_permission()
 
 
 class CredentialFailureHandlingTests(unittest.TestCase):

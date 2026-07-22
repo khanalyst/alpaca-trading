@@ -24,6 +24,12 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "between 1 and 10"):
             validate_config(cfg)
 
+    def test_fractional_leverage_is_rejected_before_exchange_rounding(self):
+        cfg = valid_config()
+        cfg["risk"]["max_leverage"] = 2.9
+        with self.assertRaisesRegex(ConfigError, "must be an integer"):
+            validate_config(cfg)
+
     def test_missing_new_schema_block_is_rejected(self):
         cfg = valid_config()
         del cfg["trading_costs"]
