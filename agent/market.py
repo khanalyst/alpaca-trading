@@ -69,12 +69,36 @@ def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
 
+def _json_safe(value):
+    """Replace non-finite numeric market data before it reaches the LLM.
+
+    Python's json encoder otherwise emits NaN/Infinity tokens, which are not
+    valid JSON and can make provider behavior dependent on malformed exchange
+    data. Preserve the shape of the snapshot and mark unavailable values null.
+    """
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
     down = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
     rs = up / down.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+    out = 100 - 100 / (1 + rs)
+    # down == 0 makes rs undefined: a window with no down moves is maximal
+    # strength (RSI 100), and a window with no movement at all is neutral -
+    # NaN here would otherwise leak into the model's snapshot JSON.
+    out = out.mask(down == 0, 100.0)
+    return out.mask((down == 0) & (up == 0), 50.0)
 
 
 def atr_pct(df: pd.DataFrame, n: int = 14) -> float:
@@ -205,7 +229,8 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
             snap[f"trend_{tf}"] = "flat"
 
     df_1h = frames.get("1h", frames[tfs[-1]])
-    snap["rsi_1h"] = round(float(rsi(df_1h["close"]).iloc[-1]), 1)
+    rsi_1h = float(rsi(df_1h["close"]).iloc[-1])
+    snap["rsi_1h"] = round(rsi_1h, 1) if math.isfinite(rsi_1h) else None
     atr_history = atr_pct_series(df_1h)
     current_atr = float(atr_history.iloc[-1])
     baseline_atr = float(atr_history.iloc[-51:-1].median())
@@ -251,6 +276,9 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     lo = float(ticker.get("low") or 0)
     if hi > lo > 0:
         snap["range_pos_pct"] = round((last - lo) / (hi - lo) * 100, 0)
+    # Sanitize every field, not just indicators with known edge cases. Ticker,
+    # funding and OHLCV adapters can all surface non-finite numeric values.
+    snap = _json_safe(snap)
     snap["regime"] = classify_regime(snap)
     return snap
 

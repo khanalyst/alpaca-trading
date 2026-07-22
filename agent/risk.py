@@ -23,6 +23,10 @@ log = logging.getLogger("risk")
 HARD_MAX_LEVERAGE = 10
 MIN_STOP_PCT = 0.2
 MAX_STOP_PCT = 15.0
+# Generous ceiling (>3R on the widest stop). Beyond it the number is noise,
+# and a short's TP trigger price entry*(1 - tp/100) would go non-positive at
+# 100%, which OKX rejects together with the whole attached-SL/TP entry.
+MAX_TP_PCT = 50.0
 MIN_NOTIONAL_USD = 10.0
 
 
@@ -36,6 +40,31 @@ class RiskEngine:
                  snapshot: dict, cooldowns: dict,
                  gross_notional: float) -> tuple[dict | None, str | None]:
         symbol = decision["symbol"]
+
+        try:
+            equity = float(equity)
+            gross_notional = float(gross_notional)
+        except (TypeError, ValueError):
+            return None, "account exposure measurement is invalid"
+        if not math.isfinite(equity) or equity <= 0:
+            return None, "account equity measurement is invalid"
+        if not math.isfinite(gross_notional) or gross_notional < 0:
+            return None, "gross exposure measurement is invalid"
+
+        # Validate every held position independently of the engine's normalizer.
+        # In particular, NaN must never reach arithmetic below: comparisons
+        # with NaN are false and would silently bypass both exposure caps.
+        position_notionals = []
+        for position in positions:
+            try:
+                position_notional = abs(float(position.get("notional")))
+            except (TypeError, ValueError):
+                return None, "held position notional is invalid"
+            if not math.isfinite(position_notional) or position_notional <= 0:
+                return None, "held position notional is invalid"
+            if position.get("side") not in {"long", "short"}:
+                return None, "held position direction is invalid"
+            position_notionals.append(position_notional)
 
         # Snapshot keys starting with "_" are context blocks (_market_context),
         # not tradable instruments; never let one pass the membership check.
@@ -63,6 +92,8 @@ class RiskEngine:
         take_pct = float(decision.get("take_profit_pct") or 0)
         if not math.isfinite(take_pct):
             return None, "take-profit distance is not finite"
+        if take_pct > MAX_TP_PCT:
+            return None, f"take-profit distance {take_pct}% out of bounds"
         if take_pct <= 0:
             take_pct = stop_pct * 2
 
@@ -162,8 +193,7 @@ class RiskEngine:
         # directional book (long minus short notional). Opens that REDUCE
         # the net always pass this check.
         net = 0.0
-        for p in positions:
-            pn = abs(float(p.get("notional") or 0))
+        for p, pn in zip(positions, position_notionals):
             if p.get("side") == "long":
                 net += pn
             elif p.get("side") == "short":

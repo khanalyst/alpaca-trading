@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+from copy import deepcopy
 
 log = logging.getLogger("brain")
 
@@ -138,7 +139,9 @@ adverse funding and stop slippage loses no more than the configured \
 risk-per-trade percent of equity. Your \
 stop_loss_pct is therefore a sizing input, not a suggestion - report the \
 stop the setup genuinely needs;
-- reject stops tighter than 0.2% or wider than 15%.
+- reject stops tighter than 0.2% or wider than 15%, and take-profit \
+distances wider than 50%;
+- drop any "open" on a symbol that also has a "close" in the same reply.
 Because every proposal is vetted, state your honest intent; never inflate \
 confidence to push a marginal trade through, because sizing and caps assume \
 your numbers are honest.
@@ -283,8 +286,10 @@ class LLM:
         # Newer models (Sonnet 5, Opus 4.7+) reject sampling parameters;
         # discovered once at runtime, then omitted from every later call.
         self._no_temperature = False
+        self._last_request_attempts: list[dict] = []
+        self._last_response_audit: dict | None = None
 
-    def _anthropic(self, system: str, user: str) -> str:
+    def _anthropic_params(self, system: str, user: str) -> dict:
         params = dict(
             model=self.cfg["model"],
             max_tokens=int(self.cfg.get("max_tokens", 2000)),
@@ -297,15 +302,40 @@ class LLM:
         )
         if not self._no_temperature:
             params["temperature"] = float(self.cfg.get("temperature", 0.2))
+        return params
+
+    def _openai_params(self, system: str, user: str) -> dict:
+        params = dict(
+            model=self.cfg["model"],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+        )
+        if not self._no_temperature:
+            params["temperature"] = float(self.cfg.get("temperature", 0.2))
+        return params
+
+    def _record_request_attempt(self, params: dict) -> None:
+        if not hasattr(self, "_last_request_attempts"):
+            self._last_request_attempts = []
+        self._last_request_attempts.append(deepcopy(params))
+
+    def _anthropic(self, system: str, user: str) -> str:
+        params = self._anthropic_params(system, user)
+        self._record_request_attempt(params)
         try:
             resp = self.client.messages.create(**params)
         except Exception as e:
             if "temperature" in params and "temperature" in str(e):
                 self._no_temperature = True
                 params.pop("temperature")
+                self._record_request_attempt(params)
                 resp = self.client.messages.create(**params)
             else:
                 raise
+        self._last_response_id = getattr(resp, "id", None)
         u = getattr(resp, "usage", None)
         if u:
             log.info("tokens: in=%s out=%s cache_write=%s cache_read=%s",
@@ -319,21 +349,23 @@ class LLM:
     def _openai(self, system: str, user: str) -> str:
         # OpenAI caches stable prompt prefixes >=1024 tokens automatically;
         # keeping SYSTEM byte-identical across calls is what enables it.
-        kwargs = dict(
-            model=self.cfg["model"],
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            response_format={"type": "json_object"},
-        )
+        kwargs = self._openai_params(system, user)
+        self._record_request_attempt(kwargs)
         try:
-            resp = self.client.chat.completions.create(
-                temperature=float(self.cfg.get("temperature", 0.2)), **kwargs
-            )
-        except Exception:
-            # Some reasoning models reject a temperature parameter.
             resp = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # Reasoning models (o-series, GPT-5.x) reject sampling params.
+            # Remember the rejection so later cycles skip the doomed first
+            # attempt; every other error propagates instead of being masked
+            # by a blind retry.
+            if "temperature" in kwargs and "temperature" in str(e):
+                self._no_temperature = True
+                kwargs.pop("temperature")
+                self._record_request_attempt(kwargs)
+                resp = self.client.chat.completions.create(**kwargs)
+            else:
+                raise
+        self._last_response_id = getattr(resp, "id", None)
         u = getattr(resp, "usage", None)
         if u:
             cached = 0
@@ -356,19 +388,58 @@ class LLM:
         return str(getattr(info, "id", None)
                    or getattr(info, "display_name", None) or model)
 
-    def decide(self, snapshot: dict, portfolio: dict, max_new: int) -> list[dict]:
-        # Compact separators shave ~10% off the per-cycle payload; the
-        # per-cycle max_new lives here so SYSTEM stays byte-identical.
-        user = (
+    @staticmethod
+    def _user_message(snapshot: dict, portfolio: dict, max_new: int) -> str:
+        return (
             "MARKET SNAPSHOT (liquid USDT perpetual swaps on OKX):\n"
-            + json.dumps(snapshot, separators=(",", ":"))
+            + json.dumps(snapshot, separators=(",", ":"), allow_nan=False)
             + "\n\nPORTFOLIO STATE:\n"
-            + json.dumps(portfolio, separators=(",", ":"))
+            + json.dumps(portfolio, separators=(",", ":"), allow_nan=False)
             + f"\n\nYou may propose at most {max(0, max_new)} new \"open\" "
               "decisions this cycle.\nReturn your decisions JSON now."
         )
+
+    def audit_request(self, snapshot: dict, portfolio: dict,
+                      max_new: int) -> dict:
+        """Return the exact initial provider request before it is sent."""
+        user = self._user_message(snapshot, portfolio, max_new)
+        request = (self._anthropic_params(SYSTEM, user)
+                   if self.provider == "anthropic"
+                   else self._openai_params(SYSTEM, user))
+        return {"provider": self.provider, "request": request}
+
+    def call_audit(self) -> dict | None:
+        """Return actual attempts plus raw provider output, if any."""
+        attempts = getattr(self, "_last_request_attempts", [])
+        response = getattr(self, "_last_response_audit", None)
+        if not attempts and response is None:
+            return None
+        return {
+            "provider": self.provider,
+            "model": self.cfg["model"],
+            "request_attempts": deepcopy(attempts),
+            "response": deepcopy(response),
+        }
+
+    def decide(self, snapshot: dict, portfolio: dict, max_new: int) -> list[dict]:
+        # Compact separators shave ~10% off the per-cycle payload; the
+        # per-cycle max_new lives here so SYSTEM stays byte-identical.
+        user = self._user_message(snapshot, portfolio, max_new)
+        self._last_request_attempts = []
+        self._last_response_audit = None
+        self._last_response_id = None
         text = self._call(SYSTEM, user)
-        return parse_decisions(text)
+        decisions = parse_decisions(text)
+        self._last_response_audit = {
+            "id": self._last_response_id,
+            "raw_text": text,
+            "effective_temperature": (
+                None if self._no_temperature
+                else float(self.cfg.get("temperature", 0.2))
+            ),
+            "parsed_decisions": decisions,
+        }
+        return decisions
 
 
 def _num(value, default=0.0) -> float:

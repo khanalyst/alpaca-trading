@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from agent.brain import LLM, parse_decisions
+from agent.brain import LLM, SYSTEM, parse_decisions
 
 
 class LLMPreflightTests(unittest.TestCase):
@@ -27,6 +27,51 @@ class LLMPreflightTests(unittest.TestCase):
         llm.client.chat.completions.create.assert_not_called()
 
 
+class OpenAITemperatureFallbackTests(unittest.TestCase):
+    @staticmethod
+    def _llm():
+        llm = LLM.__new__(LLM)
+        llm.cfg = {"model": "gpt-test", "temperature": 0.2,
+                   "max_tokens": 2000}
+        llm.provider = "openai"
+        llm._no_temperature = False
+        llm.client = Mock()
+        return llm
+
+    @staticmethod
+    def _response():
+        response = Mock(usage=None)
+        response.choices = [Mock(message=Mock(content='{"decisions":[]}'))]
+        return response
+
+    def test_rejected_temperature_is_remembered_across_calls(self):
+        llm = self._llm()
+        ok = self._response()
+        create = Mock(side_effect=[
+            RuntimeError("Unsupported parameter: 'temperature'"), ok, ok])
+        llm.client.chat.completions.create = create
+
+        llm._openai("sys", "user")
+        llm._openai("sys", "user")
+
+        self.assertTrue(llm._no_temperature)
+        # One doomed attempt ever, not one per cycle: 1 rejection + 1 retry
+        # for the first call, then a single clean request for the second.
+        self.assertEqual(create.call_count, 3)
+        self.assertIn("temperature", create.call_args_list[0].kwargs)
+        self.assertNotIn("temperature", create.call_args_list[1].kwargs)
+        self.assertNotIn("temperature", create.call_args_list[2].kwargs)
+
+    def test_unrelated_errors_propagate_without_a_blind_retry(self):
+        llm = self._llm()
+        create = Mock(side_effect=RuntimeError("rate limited"))
+        llm.client.chat.completions.create = create
+        with self.assertRaisesRegex(RuntimeError, "rate limited"):
+            llm._openai("sys", "user")
+        self.assertEqual(create.call_count, 1)
+        self.assertFalse(llm._no_temperature)
+
+
 class ModelOutputValidationTests(unittest.TestCase):
     def test_non_finite_model_numbers_are_replaced_with_safe_defaults(self):
         decisions = parse_decisions(
@@ -37,6 +82,45 @@ class ModelOutputValidationTests(unittest.TestCase):
         )
         self.assertEqual(decisions[0]["confidence"], 0)
         self.assertEqual(decisions[0]["leverage"], 1)
+
+
+class LLMAuditTests(unittest.TestCase):
+    @staticmethod
+    def _llm():
+        llm = LLM.__new__(LLM)
+        llm.cfg = {"model": "gpt-test", "temperature": 0.2,
+                   "max_tokens": 2000}
+        llm.provider = "openai"
+        llm._no_temperature = False
+        llm._call = Mock(return_value='{"decisions":[]}')
+        llm._last_request_attempts = []
+        llm._last_response_audit = None
+        return llm
+
+    def test_audit_request_contains_exact_prompt_and_provider_parameters(self):
+        llm = self._llm()
+        audit = llm.audit_request(
+            {"BTC/USDT:USDT": {"price": 100}},
+            {"equity_usdt": 10_000}, 1)
+
+        self.assertEqual(audit["provider"], "openai")
+        request = audit["request"]
+        self.assertEqual(request["model"], "gpt-test")
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertEqual(request["messages"][0]["content"], SYSTEM)
+        self.assertIn('"equity_usdt":10000',
+                      request["messages"][1]["content"])
+
+    def test_call_audit_records_raw_and_parsed_output(self):
+        llm = self._llm()
+        llm.decide({}, {}, 0)
+        audit = llm.call_audit()
+
+        self.assertEqual(audit["request_attempts"], [])
+        self.assertEqual(audit["response"]["raw_text"],
+                         '{"decisions":[]}')
+        self.assertEqual(audit["response"]["parsed_decisions"], [])
+        self.assertEqual(audit["response"]["effective_temperature"], 0.2)
 
 
 if __name__ == "__main__":
