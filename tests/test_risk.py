@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from agent.risk import RiskEngine
@@ -25,6 +26,18 @@ def decision(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def liquidity_feedback(**overrides):
+    base = {
+        "reason": "insufficient_depth",
+        "direction": "long",
+        "expires_at": time.time() + 1800,
+        "blocked_until": 0,
+        "max_retry_size_pct_equity": 5.0,
+    }
+    base.update(overrides)
+    return {"BTC/USDT:USDT": base}
 
 
 class VetOpenSymbolTests(unittest.TestCase):
@@ -105,6 +118,44 @@ class VetOpenSymbolTests(unittest.TestCase):
             plan["entry_slippage_budget_pct"],
             cfg["execution"]["max_order_book_slippage_pct"],
         )
+
+    def test_liquidity_retry_requires_explicit_smaller_size(self):
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], snapshot(), {}, 0,
+            liquidity_feedback())
+        self.assertIsNone(plan)
+        self.assertEqual(
+            why, "liquidity retry requires an explicit smaller size")
+
+    def test_explicit_reduced_liquidity_retry_is_allowed(self):
+        plan, why = self.risk.vet_open(
+            decision(size_pct_equity=4), 10_000, [], snapshot(), {}, 0,
+            liquidity_feedback())
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+        self.assertLessEqual(plan["margin_pct_equity"], 4)
+
+    def test_oversized_liquidity_retry_is_rejected(self):
+        plan, why = self.risk.vet_open(
+            decision(size_pct_equity=6), 10_000, [], snapshot(), {}, 0,
+            liquidity_feedback())
+        self.assertIsNone(plan)
+        self.assertEqual(
+            why, "liquidity retry size exceeds 5.00% equity limit")
+
+    def test_liquidity_backoff_blocks_same_direction(self):
+        plan, why = self.risk.vet_open(
+            decision(size_pct_equity=4), 10_000, [], snapshot(), {}, 0,
+            liquidity_feedback(blocked_until=time.time() + 900))
+        self.assertIsNone(plan)
+        self.assertEqual(why, "symbol in liquidity backoff")
+
+    def test_opposite_direction_is_not_bound_by_stale_side_depth(self):
+        plan, why = self.risk.vet_open(
+            decision(direction="short"), 10_000, [], snapshot(), {}, 0,
+            liquidity_feedback())
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
 
 
 if __name__ == "__main__":

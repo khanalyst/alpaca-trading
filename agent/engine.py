@@ -26,7 +26,7 @@ import ccxt
 
 from . import brain, market, state
 from .alerts import AlertManager
-from .exchange import CredentialError, Exchange
+from .exchange import CredentialError, EntryLiquidityRejected, Exchange
 from .risk import RiskEngine
 
 log = logging.getLogger("engine")
@@ -280,6 +280,11 @@ class Engine:
         # --- drop expired per-symbol cooldowns
         st["cooldowns"] = {s: t for s, t in (st.get("cooldowns") or {}).items()
                            if float(t) > now}
+        st["entry_feedback"] = {
+            symbol: feedback
+            for symbol, feedback in (st.get("entry_feedback") or {}).items()
+            if float(feedback.get("expires_at") or 0) > now
+        }
 
         # --- deposits / withdrawals: rebase benchmarks, never trade on them
         since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
@@ -436,12 +441,16 @@ class Engine:
             if latest["state"] != state.RUNNING:
                 return
             plan, why = self.risk.vet_open(d, equity, positions, snapshot,
-                                           st.get("cooldowns", {}), gross)
+                                           st.get("cooldowns", {}), gross,
+                                           st.get("entry_feedback", {}))
             if not plan:
                 log.info("Rejected %s %s: %s", d.get("direction"),
                          d.get("symbol"), why)
                 state.log_event("rejected", json.dumps(
                     {"symbol": d.get("symbol"), "why": why}))
+                if str(why).startswith("liquidity retry"):
+                    self._backoff_ignored_liquidity_feedback(
+                        st, d.get("symbol"), str(why))
                 continue
             if self._execute_open(plan, st):
                 gross += plan["notional"]
@@ -658,6 +667,100 @@ class Engine:
 
     # ------------------------------------------------------------ execution
 
+    def _remember_liquidity_rejection(
+            self, plan: dict, st: dict,
+            rejection: EntryLiquidityRejected) -> dict:
+        """Persist depth feedback for one model-directed smaller retry."""
+        now = time.time()
+        cfg = self.cfg["execution"]
+        details = rejection.details
+        symbol = plan["symbol"]
+        requested = float(details["requested_contracts"])
+        available = float(details["available_contracts"])
+        requested_notional = float(details["requested_notional_usdt"])
+        available_notional = float(details["available_notional_usdt"])
+        max_slippage_pct = float(details["max_slippage_pct"])
+        margin_pct = float(plan.get("margin_pct_equity") or 0)
+        values = (
+            requested, available, requested_notional, available_notional,
+            max_slippage_pct, margin_pct,
+        )
+        if (not all(math.isfinite(value) for value in values)
+                or requested <= 0 or available < 0 or available >= requested
+                or requested_notional <= 0 or available_notional < 0
+                or margin_pct <= 0):
+            raise RuntimeError(
+                f"{symbol} returned invalid structured liquidity feedback")
+
+        records = st.setdefault("entry_feedback", {})
+        previous = records.get(symbol) or {}
+        related = (
+            previous.get("direction") == plan["direction"]
+            and float(previous.get("expires_at") or 0) > now
+        )
+        count = (int(previous.get("consecutive_rejections") or 0) + 1
+                 if related else 1)
+        ratio = available / requested
+        buffer_fraction = float(
+            cfg["liquidity_depth_buffer_pct"]) / 100.0
+        max_retry_pct = min(100.0, margin_pct * ratio * buffer_fraction)
+        retries = int(cfg["liquidity_retries_before_backoff"])
+        blocked_until = (
+            now + float(cfg["liquidity_backoff_minutes"]) * 60
+            if count > retries else 0.0
+        )
+        expires_at = max(
+            now + float(cfg["liquidity_feedback_ttl_minutes"]) * 60,
+            blocked_until,
+        )
+        record = {
+            "reason": "insufficient_depth",
+            "direction": plan["direction"],
+            "last_rejected_at": now,
+            "expires_at": expires_at,
+            "blocked_until": blocked_until,
+            "consecutive_rejections": count,
+            "requested_contracts": requested,
+            "available_contracts": available,
+            "requested_notional_usdt": requested_notional,
+            "available_notional_usdt": available_notional,
+            "available_ratio": ratio,
+            "max_retry_size_pct_equity": max_retry_pct,
+            "max_slippage_pct": max_slippage_pct,
+        }
+        records[symbol] = record
+        event = {"symbol": symbol, **record}
+        state.log_event("entry_liquidity_rejected", self._audit_json(event))
+        state.commit(st)
+        if blocked_until:
+            log.info(
+                "%s entered a %.0f-minute liquidity backoff after %d "
+                "depth rejections", symbol,
+                float(cfg["liquidity_backoff_minutes"]), count)
+        return record
+
+    def _backoff_ignored_liquidity_feedback(
+            self, st: dict, symbol: str | None, reason: str) -> None:
+        """Rate-limit a model that repeats a rejected pair at full size."""
+        if not symbol:
+            return
+        record = (st.get("entry_feedback") or {}).get(symbol)
+        if not record:
+            return
+        now = time.time()
+        blocked_until = now + float(
+            self.cfg["execution"]["liquidity_backoff_minutes"]) * 60
+        record["blocked_until"] = max(
+            float(record.get("blocked_until") or 0), blocked_until)
+        record["expires_at"] = max(
+            float(record.get("expires_at") or 0), record["blocked_until"])
+        state.log_event("entry_liquidity_backoff", self._audit_json({
+            "symbol": symbol,
+            "reason": reason,
+            "blocked_until": record["blocked_until"],
+        }))
+        state.commit(st)
+
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
         if state.load_state()["state"] != state.RUNNING:
@@ -692,6 +795,10 @@ class Engine:
                     "max_order_book_slippage_pct"]),
                 float(self.cfg["execution"]["max_market_data_age_seconds"]),
             )
+        except EntryLiquidityRejected as exc:
+            self._remember_liquidity_rejection(plan, st, exc)
+            log.warning("Entry liquidity guard rejected %s: %s", symbol, exc)
+            return False
         except Exception as exc:
             log.warning("Entry liquidity guard rejected %s: %s", symbol, exc)
             return False
@@ -775,6 +882,7 @@ class Engine:
             "sl_price": sl_price,
             "tp_price": tp_price,
         }
+        st.setdefault("entry_feedback", {}).pop(symbol, None)
         plan["notional"] = actual_notional
         plan["risk_usd"] = risk_usd
         persistence_error = None
@@ -1076,6 +1184,7 @@ class Engine:
 
     def _portfolio_view(self, equity: float, positions: list[dict], st: dict,
                         day_pnl_pct: float, drawdown_pct: float) -> dict:
+        now = time.time()
         views = []
         for p in positions:
             opened = st.get("opened_at", {}).get(p["symbol"])
@@ -1087,8 +1196,40 @@ class Engine:
                 "upnl_pct": round(float(p.get("percentage") or 0), 2),
                 "leverage": p.get("leverage"),
                 "notional_usd": round(self._notional(p), 1),
-                "hours_open": round((time.time() - opened) / 3600, 1)
+                "hours_open": round((now - opened) / 3600, 1)
                 if opened else None,
+            })
+        post_loss_cooldowns = [
+            {
+                "symbol": symbol,
+                "minutes_remaining": round((float(until) - now) / 60, 1),
+            }
+            for symbol, until in sorted((st.get("cooldowns") or {}).items())
+            if float(until) > now
+        ]
+        entry_feedback = []
+        for symbol, feedback in sorted(
+                (st.get("entry_feedback") or {}).items()):
+            if float(feedback.get("expires_at") or 0) <= now:
+                continue
+            blocked_seconds = max(
+                0.0, float(feedback.get("blocked_until") or 0) - now)
+            max_retry = float(
+                feedback.get("max_retry_size_pct_equity") or 0)
+            entry_feedback.append({
+                "symbol": symbol,
+                "direction": feedback.get("direction"),
+                "reason": feedback.get("reason"),
+                "minutes_since_rejection": round(
+                    max(0.0, now - float(
+                        feedback.get("last_rejected_at") or now)) / 60, 1),
+                "consecutive_rejections": int(
+                    feedback.get("consecutive_rejections") or 0),
+                "available_pct_of_requested": round(
+                    float(feedback.get("available_ratio") or 0) * 100, 1),
+                "max_retry_size_pct_equity": round(max_retry, 2),
+                "retry_allowed": blocked_seconds <= 0 and max_retry > 0,
+                "retry_after_minutes": round(blocked_seconds / 60, 1),
             })
         r = self.cfg["risk"]
         return {
@@ -1097,6 +1238,8 @@ class Engine:
             "drawdown_from_high_pct": round(drawdown_pct, 2),
             "state": st["state"],
             "open_positions": views,
+            "post_loss_cooldowns": post_loss_cooldowns,
+            "recent_entry_feedback": entry_feedback,
             "hard_limits_fyi": {
                 "max_leverage": r["max_leverage"],
                 "risk_per_trade_pct": r["risk_per_trade_pct"],

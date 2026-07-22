@@ -38,7 +38,9 @@ class RiskEngine:
 
     def vet_open(self, decision: dict, equity: float, positions: list[dict],
                  snapshot: dict, cooldowns: dict,
-                 gross_notional: float) -> tuple[dict | None, str | None]:
+                 gross_notional: float,
+                 entry_feedback: dict | None = None
+                 ) -> tuple[dict | None, str | None]:
         symbol = decision["symbol"]
 
         try:
@@ -83,6 +85,41 @@ class RiskEngine:
             return None, "confidence below floor"
         if float(cooldowns.get(symbol, 0)) > time.time():
             return None, "symbol in post-loss cooldown"
+
+        intent_pct = float(decision.get("size_pct_equity") or 0)
+        if not math.isfinite(intent_pct) or intent_pct < 0:
+            return None, "intended size is not finite"
+
+        # A first depth rejection is execution feedback, not an immediate
+        # ban. The model may reconsider the setup and explicitly request a
+        # smaller retry. A repeated failure acquires a persisted backoff.
+        feedback = (entry_feedback or {}).get(symbol)
+        if feedback is not None:
+            if not isinstance(feedback, dict):
+                return None, "liquidity retry feedback is invalid"
+            try:
+                expires_at = float(feedback.get("expires_at") or 0)
+                blocked_until = float(feedback.get("blocked_until") or 0)
+                max_retry_pct = float(
+                    feedback.get("max_retry_size_pct_equity") or 0)
+            except (TypeError, ValueError):
+                return None, "liquidity retry feedback is invalid"
+            if not all(math.isfinite(value) for value in (
+                    expires_at, blocked_until, max_retry_pct)):
+                return None, "liquidity retry feedback is invalid"
+            same_direction = feedback.get("direction") == decision["direction"]
+            if same_direction and expires_at > time.time():
+                if blocked_until > time.time():
+                    return None, "symbol in liquidity backoff"
+                if max_retry_pct <= 0:
+                    return None, "liquidity retry has no safe executable size"
+                if intent_pct <= 0:
+                    return None, (
+                        "liquidity retry requires an explicit smaller size")
+                if intent_pct > max_retry_pct + 1e-12:
+                    return None, (
+                        "liquidity retry size exceeds "
+                        f"{max_retry_pct:.2f}% equity limit")
 
         stop_pct = float(decision.get("stop_loss_pct") or 0)
         if not math.isfinite(stop_pct):
@@ -172,9 +209,6 @@ class RiskEngine:
                        equity * float(self.r["max_position_notional_pct"]) / 100.0)
 
         # Respect the model's own (smaller) intent if it gave one.
-        intent_pct = float(decision.get("size_pct_equity") or 0)
-        if not math.isfinite(intent_pct):
-            return None, "intended size is not finite"
         if intent_pct > 0:
             notional = min(notional, equity * intent_pct / 100.0 * leverage)
 
@@ -209,6 +243,7 @@ class RiskEngine:
             "leverage": leverage,
             "notional": notional,
             "margin": notional / leverage,
+            "margin_pct_equity": notional / leverage / equity * 100.0,
             "price": price,
             "sl_pct": stop_pct,
             "tp_pct": take_pct,

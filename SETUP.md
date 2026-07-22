@@ -354,7 +354,10 @@ defaults. Here's what each block controls, so you know where to change what:
   parameter does and how they interact.
 - **`execution`** — stale-price, spread and order-book-depth caps plus the
   timeout used to verify actual and partial IOC fills. The IOC slippage cap is
-  reserved in deterministic risk sizing.
+  reserved in deterministic risk sizing. A depth rejection is shown to the
+  model on later cycles: it may select another setup, stay flat, or explicitly
+  request one smaller retry. Repeated failures create a persisted temporary
+  backoff; every retry still has to pass a fresh order-book check.
 - **`trading_costs`** — expected taker fees, stop slippage and funding holding
   time used by both the LLM and deterministic all-in risk sizing.
 - **`alerts`** — generic, Slack or Discord webhooks. They are optional in demo

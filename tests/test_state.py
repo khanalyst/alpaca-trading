@@ -61,6 +61,55 @@ class StateSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "equity_basis"):
             state.save_state(invalid)
 
+    def test_liquidity_feedback_survives_restart(self):
+        valid = dict(state.DEFAULT)
+        valid["entry_feedback"] = {
+            "KAITO/USDT:USDT": {
+                "reason": "insufficient_depth",
+                "direction": "long",
+                "last_rejected_at": 1000.0,
+                "expires_at": 2800.0,
+                "blocked_until": 1900.0,
+                "consecutive_rejections": 2,
+                "requested_contracts": 28_530.0,
+                "available_contracts": 11_015.0,
+                "requested_notional_usdt": 28_530.0,
+                "available_notional_usdt": 11_015.0,
+                "available_ratio": 11_015 / 28_530,
+                "max_retry_size_pct_equity": 4.2,
+                "max_slippage_pct": 0.35,
+            },
+        }
+
+        state.save_state(valid)
+
+        loaded = state.load_state()
+        self.assertEqual(
+            loaded["entry_feedback"]["KAITO/USDT:USDT"]
+            ["consecutive_rejections"], 2)
+
+    def test_non_finite_liquidity_feedback_is_rejected(self):
+        invalid = dict(state.DEFAULT)
+        invalid["entry_feedback"] = {
+            "KAITO/USDT:USDT": {
+                "reason": "insufficient_depth",
+                "direction": "long",
+                "last_rejected_at": 1000.0,
+                "expires_at": 2800.0,
+                "blocked_until": 0.0,
+                "consecutive_rejections": 1,
+                "requested_contracts": 100.0,
+                "available_contracts": 50.0,
+                "requested_notional_usdt": 100.0,
+                "available_notional_usdt": 50.0,
+                "available_ratio": 0.5,
+                "max_retry_size_pct_equity": float("nan"),
+                "max_slippage_pct": 0.35,
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "entry_feedback"):
+            state.save_state(invalid)
+
     def test_only_one_agent_run_lock_can_be_held(self):
         first = state.acquire_run_lock()
         self.assertIsNotNone(first)

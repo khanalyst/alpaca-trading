@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import ccxt
 
-from agent.exchange import Exchange
+from agent.exchange import EntryLiquidityRejected, Exchange
 from tests.helpers import valid_config
 
 
@@ -148,6 +148,10 @@ class DepthClient:
     def price_to_precision(symbol, price):
         return f"{price:.2f}"
 
+    @staticmethod
+    def market(symbol):
+        return {"contractSize": 0.1}
+
 
 class EntryGuardTests(unittest.TestCase):
     def setUp(self):
@@ -163,9 +167,15 @@ class EntryGuardTests(unittest.TestCase):
         self.assertLess(result["estimated_slippage_pct"], 0.35)
 
     def test_insufficient_depth_inside_cap_rejects_entry(self):
-        with self.assertRaisesRegex(RuntimeError, "only .* contracts"):
+        with self.assertRaisesRegex(
+                EntryLiquidityRejected, "only .* contracts") as raised:
             self.exchange.guarded_entry_limit(
                 "BTC/USDT:USDT", "buy", 10, 0.15, 0.35, 10)
+        details = raised.exception.details
+        self.assertEqual(details["requested_contracts"], 10)
+        self.assertEqual(details["available_contracts"], 3)
+        self.assertAlmostEqual(details["requested_notional_usdt"], 100)
+        self.assertAlmostEqual(details["available_notional_usdt"], 30.045)
 
 
 class ProtectedEntryTests(unittest.TestCase):

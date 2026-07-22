@@ -260,7 +260,9 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    position rather than run it naked. Entries are marketable IOC limits:
    current spread and order-book depth must pass configured caps, and the
    exchange-side limit prevents a sudden move from producing unlimited entry
-   slippage.
+   slippage. A depth rejection is fed into the next portfolio prompt. The
+   model may choose another setup, stay flat, or make one explicit smaller
+   retry; a repeated failure creates a persisted temporary liquidity backoff.
 
 The LLM never touches the exchange, never sizes a position, and never
 overrides a cap. It is an idea generator inside hard, code-enforced rails.
@@ -349,7 +351,13 @@ and `max_order_book_slippage_pct` (0.35) is the depth-test threshold, hard IOC
 entry-price boundary, and a reserved component of all-in sizing.
 `max_market_data_age_seconds` (10) rejects stale order books.
 `fill_timeout_seconds` (12) bounds fill
-verification before the agent cancels any unfilled remainder.
+verification before the agent cancels any unfilled remainder. Liquidity
+feedback remains visible to the model for
+`liquidity_feedback_ttl_minutes` (30). It may make
+`liquidity_retries_before_backoff` (1) smaller retry, capped to
+`liquidity_depth_buffer_pct` (70) percent of the observed safe depth; another
+failure blocks that direction in the symbol for
+`liquidity_backoff_minutes` (15). Every retry still uses a fresh order book.
 
 **Cost assumptions (`trading_costs:` block)** — expected taker fee per side,
 stop slippage, minimum funding intervals and expected holding hours are sent to
@@ -427,6 +435,9 @@ Each model cycle also records the exact provider request, every retry attempt,
 the provider response ID, raw response text and parsed decisions. This makes
 the nondeterministic LLM layer auditable after prompts or settings change;
 protect and back up the journal as trading-sensitive data.
+Structured liquidity rejections and their temporary backoffs are journaled as
+`entry_liquidity_rejected` and `entry_liquidity_backoff` events. Their active
+state lives in `runtime/state.json`, not in the provider's prompt cache.
 
 ```bash
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"

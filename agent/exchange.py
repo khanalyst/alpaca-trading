@@ -39,6 +39,18 @@ class CredentialError(RuntimeError):
     """
 
 
+class EntryLiquidityRejected(RuntimeError):
+    """A safe entry could not fit inside the configured price boundary.
+
+    Structured details let the engine give the next LLM cycle useful
+    execution feedback without parsing a human-readable log message.
+    """
+
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = details
+
+
 class Exchange:
     def __init__(self, cfg: dict, alerts=None,
                  validate_account: bool = True):
@@ -717,9 +729,23 @@ class Exchange:
             if remaining <= max(1e-12, contracts * 1e-9):
                 break
         if remaining > max(1e-12, contracts * 1e-9):
-            raise RuntimeError(
+            contract_size = float(
+                self.x.market(symbol).get("contractSize") or 1)
+            requested_notional = contracts * mid * contract_size
+            available_notional = cost * contract_size
+            raise EntryLiquidityRejected(
                 f"{symbol} has only {filled:g} of {contracts:g} contracts "
-                f"inside the {float(max_slippage_pct):.4f}% entry cap")
+                f"inside the {float(max_slippage_pct):.4f}% entry cap",
+                {
+                    "symbol": symbol,
+                    "reason": "insufficient_depth",
+                    "requested_contracts": float(contracts),
+                    "available_contracts": float(filled),
+                    "requested_notional_usdt": requested_notional,
+                    "available_notional_usdt": available_notional,
+                    "max_slippage_pct": float(max_slippage_pct),
+                },
+            )
         vwap = cost / filled
         limit = float(self.x.price_to_precision(symbol, boundary))
         if not math.isfinite(limit) or limit <= 0:

@@ -120,13 +120,23 @@ def validate_config(raw: dict) -> dict:
     execution = _mapping(cfg.get("execution"), "execution")
     _keys(execution, {"slippage_guard_pct", "max_spread_pct",
                       "max_order_book_slippage_pct",
-                      "max_market_data_age_seconds", "fill_timeout_seconds"},
+                      "max_market_data_age_seconds", "fill_timeout_seconds",
+                      "liquidity_feedback_ttl_minutes",
+                      "liquidity_retries_before_backoff",
+                      "liquidity_backoff_minutes",
+                      "liquidity_depth_buffer_pct"},
           "execution")
     _number(execution, "slippage_guard_pct", 0, 5, "execution")
     _number(execution, "max_spread_pct", 0.001, 2, "execution")
     _number(execution, "max_order_book_slippage_pct", 0.001, 5, "execution")
     _number(execution, "max_market_data_age_seconds", 1, 60, "execution")
     _number(execution, "fill_timeout_seconds", 1, 60, "execution")
+    _number(execution, "liquidity_feedback_ttl_minutes", 5, 1440,
+            "execution")
+    _integer(execution, "liquidity_retries_before_backoff", 0, 10,
+             "execution")
+    _number(execution, "liquidity_backoff_minutes", 1, 1440, "execution")
+    _number(execution, "liquidity_depth_buffer_pct", 10, 100, "execution")
     if (float(execution["max_spread_pct"])
             > float(execution["max_order_book_slippage_pct"]) * 2):
         raise ConfigError(

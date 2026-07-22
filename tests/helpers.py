@@ -41,6 +41,10 @@ VALID_CONFIG = {
         "max_order_book_slippage_pct": 0.35,
         "max_market_data_age_seconds": 10,
         "fill_timeout_seconds": 1,
+        "liquidity_feedback_ttl_minutes": 30,
+        "liquidity_retries_before_backoff": 1,
+        "liquidity_backoff_minutes": 15,
+        "liquidity_depth_buffer_pct": 70,
     },
     "trading_costs": {
         "taker_fee_pct_per_side": 0.05,

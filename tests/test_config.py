@@ -42,6 +42,18 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "unknown field.*max_leverge"):
             validate_config(cfg)
 
+    def test_liquidity_depth_buffer_cannot_exceed_visible_depth(self):
+        cfg = valid_config()
+        cfg["execution"]["liquidity_depth_buffer_pct"] = 101
+        with self.assertRaisesRegex(ConfigError, "between 10 and 100"):
+            validate_config(cfg)
+
+    def test_liquidity_retry_count_must_be_an_integer(self):
+        cfg = valid_config()
+        cfg["execution"]["liquidity_retries_before_backoff"] = 1.5
+        with self.assertRaisesRegex(ConfigError, "must be an integer"):
+            validate_config(cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,12 @@ execution:
   max_order_book_slippage_pct: 0.35  # IOC cap vs mid; reserved in risk sizing
   max_market_data_age_seconds: 10    # reject stale exchange order books
   fill_timeout_seconds: 12       # wait for market orders to reach a terminal fill state
+  # A depth rejection is fed back to the LLM instead of becoming an immediate
+  # hard ban. It may make one explicit smaller-size retry on a later cycle.
+  liquidity_feedback_ttl_minutes: 30
+  liquidity_retries_before_backoff: 1
+  liquidity_backoff_minutes: 15
+  liquidity_depth_buffer_pct: 70  # retry may use at most 70% of observed safe depth
 
 # Cost assumptions are sent to the LLM and enforced by deterministic sizing.
 # Price loss plus fees, spread, adverse funding and expected stop slippage

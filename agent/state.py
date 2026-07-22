@@ -40,6 +40,9 @@ DEFAULT = {
     "equity_basis": None,
     "last_ledger_ts": 0,
     "cooldowns": {},   # symbol -> unix ts until which no new entries are allowed
+    # Recent execution feedback. The LLM may reason about one smaller retry;
+    # repeated depth failures acquire a deterministic temporary backoff.
+    "entry_feedback": {},
     "opened_at": {},   # symbol -> unix ts the position was opened
     "active_trades": {},  # symbol -> durable entry/fill/risk metadata
     "protection": {},     # symbol -> intended exchange-side SL/TP metadata
@@ -60,7 +63,8 @@ def _validate(data: object) -> dict:
     merged = {**_default(), **data}
     if merged.get("state") not in {RUNNING, PAUSED, DAY_STOPPED, KILLED}:
         raise ValueError("invalid state transition value")
-    for key in ("cooldowns", "opened_at", "active_trades", "protection"):
+    for key in ("cooldowns", "entry_feedback", "opened_at", "active_trades",
+                "protection"):
         if not isinstance(merged.get(key), dict):
             raise ValueError(f"state.{key} is not an object")
     for key in ("high_water_mark", "day_start_equity"):
@@ -85,6 +89,46 @@ def _validate(data: object) -> dict:
                     or not isinstance(value, (int, float))
                     or not math.isfinite(float(value)) or float(value) < 0):
                 raise ValueError(f"state.{block_name} contains invalid data")
+    for symbol, feedback in merged["entry_feedback"].items():
+        if (not isinstance(symbol, str) or not symbol
+                or not isinstance(feedback, dict)):
+            raise ValueError("state.entry_feedback contains invalid data")
+        if (not isinstance(feedback.get("reason"), str)
+                or not feedback["reason"]
+                or feedback.get("direction") not in {"long", "short"}):
+            raise ValueError(f"state.entry_feedback.{symbol} is invalid")
+        count = feedback.get("consecutive_rejections")
+        if (isinstance(count, bool) or not isinstance(count, int)
+                or count < 1):
+            raise ValueError(
+                f"state.entry_feedback.{symbol}.consecutive_rejections "
+                "is invalid")
+        numeric = (
+            "last_rejected_at", "expires_at", "blocked_until",
+            "requested_contracts", "available_contracts",
+            "requested_notional_usdt", "available_notional_usdt",
+            "available_ratio", "max_retry_size_pct_equity",
+            "max_slippage_pct",
+        )
+        for key in numeric:
+            value = feedback.get(key)
+            if (isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or float(value) < 0):
+                raise ValueError(
+                    f"state.entry_feedback.{symbol}.{key} is invalid")
+        if (float(feedback["requested_contracts"]) <= 0
+                or float(feedback["requested_notional_usdt"]) <= 0
+                or float(feedback["available_contracts"])
+                >= float(feedback["requested_contracts"])
+                or float(feedback["available_ratio"]) > 1
+                or float(feedback["max_retry_size_pct_equity"]) > 100
+                or float(feedback["max_slippage_pct"]) > 5
+                or float(feedback["expires_at"])
+                < float(feedback["last_rejected_at"])
+                or float(feedback["blocked_until"])
+                > float(feedback["expires_at"])):
+            raise ValueError(f"state.entry_feedback.{symbol} is invalid")
     for symbol, trade in merged["active_trades"].items():
         if not isinstance(symbol, str) or not isinstance(trade, dict):
             raise ValueError("state.active_trades contains invalid data")
@@ -242,8 +286,8 @@ def set_state(name: str, reason: str | None = None, **extra) -> dict:
 # Keys the trading loop owns. commit() persists these without clobbering a
 # state change (pause/kill) the CLI may have written while a cycle was running.
 LOOP_KEYS = ("high_water_mark", "day", "day_start_equity", "equity_basis",
-             "last_ledger_ts", "cooldowns", "opened_at", "active_trades",
-             "protection")
+             "last_ledger_ts", "cooldowns", "entry_feedback", "opened_at",
+             "active_trades", "protection")
 
 
 def commit(st: dict, transition: tuple[str, str] | None = None,
