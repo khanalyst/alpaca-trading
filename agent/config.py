@@ -72,10 +72,12 @@ def validate_config(raw: dict) -> dict:
     _integer(llm, "max_tokens", 128, 32000, "llm")
 
     universe = _mapping(cfg.get("universe"), "universe")
-    _keys(universe, {"top_n", "min_24h_quote_volume_usd", "denylist",
+    _keys(universe, {"top_n", "min_24h_quote_volume_usd",
+                     "min_history_candles", "denylist",
                      "refresh_minutes"}, "universe")
     _integer(universe, "top_n", 1, 100, "universe")
     _number(universe, "min_24h_quote_volume_usd", 0, 1e15, "universe")
+    _integer(universe, "min_history_candles", 60, 1000, "universe")
     _number(universe, "refresh_minutes", 1, 1440, "universe")
     denylist = universe.get("denylist")
     if not isinstance(denylist, list) or not all(isinstance(x, str) for x in denylist):
@@ -92,6 +94,9 @@ def validate_config(raw: dict) -> dict:
     required = {"15m", "1h", "4h"}
     if not required.issubset(set(timeframes)):
         raise ConfigError("cycle.timeframes must include 15m, 1h, and 4h")
+    if int(universe["min_history_candles"]) > int(cycle["candles"]):
+        raise ConfigError(
+            "universe.min_history_candles cannot exceed cycle.candles")
 
     risk = _mapping(cfg.get("risk"), "risk")
     _keys(risk, {"max_leverage", "risk_per_trade_pct",
@@ -99,7 +104,9 @@ def validate_config(raw: dict) -> dict:
                  "max_net_direction_pct", "max_concurrent_positions",
                  "min_confidence", "max_hold_hours", "daily_loss_limit_pct",
                  "flatten_on_daily_stop", "max_drawdown_pct",
-                 "max_margin_usage_pct", "cooldown_minutes_after_loss"},
+                 "max_margin_usage_pct", "min_maintenance_margin_ratio",
+                 "min_stop_liquidation_buffer_pct",
+                 "cooldown_minutes_after_loss"},
           "risk")
     _integer(risk, "max_leverage", 1, 10, "risk")
     _number(risk, "risk_per_trade_pct", 0.01, 5, "risk")
@@ -113,6 +120,8 @@ def validate_config(raw: dict) -> dict:
     _boolean(risk, "flatten_on_daily_stop", "risk")
     _number(risk, "max_drawdown_pct", 1, 50, "risk")
     _number(risk, "max_margin_usage_pct", 1, 95, "risk")
+    _number(risk, "min_maintenance_margin_ratio", 1.01, 100, "risk")
+    _number(risk, "min_stop_liquidation_buffer_pct", 0.1, 50, "risk")
     _number(risk, "cooldown_minutes_after_loss", 0, 10080, "risk")
     if float(risk["max_net_direction_pct"]) > float(risk["max_gross_exposure_pct"]):
         raise ConfigError("risk.max_net_direction_pct cannot exceed max_gross_exposure_pct")
@@ -124,7 +133,10 @@ def validate_config(raw: dict) -> dict:
                       "liquidity_feedback_ttl_minutes",
                       "liquidity_retries_before_backoff",
                       "liquidity_backoff_minutes",
-                      "liquidity_depth_buffer_pct"},
+                      "liquidity_depth_buffer_pct",
+                      "entry_failure_backoff_minutes",
+                      "entry_failure_backoff_max_minutes",
+                      "entry_failure_ttl_minutes"},
           "execution")
     _number(execution, "slippage_guard_pct", 0, 5, "execution")
     _number(execution, "max_spread_pct", 0.001, 2, "execution")
@@ -137,6 +149,22 @@ def validate_config(raw: dict) -> dict:
              "execution")
     _number(execution, "liquidity_backoff_minutes", 1, 1440, "execution")
     _number(execution, "liquidity_depth_buffer_pct", 10, 100, "execution")
+    _number(execution, "entry_failure_backoff_minutes", 1, 1440,
+            "execution")
+    _number(execution, "entry_failure_backoff_max_minutes", 1, 10080,
+            "execution")
+    _number(execution, "entry_failure_ttl_minutes", 1, 10080,
+            "execution")
+    if (float(execution["entry_failure_backoff_max_minutes"])
+            < float(execution["entry_failure_backoff_minutes"])):
+        raise ConfigError(
+            "execution.entry_failure_backoff_max_minutes cannot be below "
+            "entry_failure_backoff_minutes")
+    if (float(execution["entry_failure_ttl_minutes"])
+            < float(execution["entry_failure_backoff_max_minutes"])):
+        raise ConfigError(
+            "execution.entry_failure_ttl_minutes cannot be below "
+            "entry_failure_backoff_max_minutes")
     if (float(execution["max_spread_pct"])
             > float(execution["max_order_book_slippage_pct"]) * 2):
         raise ConfigError(

@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 from agent import state
 from agent.engine import Engine
+from agent.exchange import CredentialError
 from tests.helpers import valid_config
 
 
@@ -155,6 +156,26 @@ class PositionReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "without verified protection"):
             self.engine._reconcile_positions([position], st, startup=True)
 
+    @patch("agent.engine.state.log_event")
+    def test_reconciliation_closes_position_whose_stop_is_too_near_liquidation(
+            self, log_event):
+        st = self.tracked_state()
+        position = {
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 2,
+            "entryPrice": 100, "markPrice": 100, "liquidationPrice": 94.5,
+            "leverage": 2,
+        }
+        self.engine._close = Mock(return_value=True)
+
+        positions = self.engine._reconcile_positions(
+            [position], st, startup=True)
+
+        self.assertEqual(positions, [])
+        self.engine._close.assert_called_once_with(
+            position, "reconciliation: unsafe liquidation buffer", st)
+        self.assertEqual(log_event.call_args.args[0],
+                         "liquidation_buffer_unsafe")
+
 
 class FakeEmergencyExchange:
     def __init__(self):
@@ -222,6 +243,19 @@ class PartialEmergencyExchange(FakeEmergencyExchange):
                 "info": {},
             }
         return None
+
+
+class UnsafeLiquidationExchange(FakeEmergencyExchange):
+    @staticmethod
+    def open_position(*args, **kwargs):
+        return {
+            "order_id": "entry", "status": "closed", "filled": 2,
+            "average": 100, "partial": False, "fee_usd": 0.2,
+            "slippage_usd": 0, "position_contracts": 2,
+            "position_id": "position-1", "mark_price": 100,
+            "liquidation_price": 97.5,
+            "protection": {"stop_loss": True, "take_profit": True},
+        }
 
 
 class EmergencyExecutionTests(unittest.TestCase):
@@ -300,6 +334,86 @@ class EmergencyExecutionTests(unittest.TestCase):
 
         self.assertEqual(engine.ex.close_calls, 2)
         self.assertEqual(st["active_trades"], {})
+
+    @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_trade")
+    def test_protected_fill_with_unsafe_liquidation_buffer_is_closed(
+            self, log_trade, commit, load_state):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = UnsafeLiquidationExchange()
+        engine.alerts = Mock()
+        st = {"opened_at": {}, "active_trades": {}, "protection": {},
+              "cooldowns": {}, "entry_failures": {}}
+        plan = {
+            "symbol": "BTC/USDT:USDT", "direction": "long",
+            "notional": 200, "price": 100, "leverage": 2,
+            "sl_pct": 2, "tp_pct": 4, "confidence": 0.8,
+            "reason": "test", "estimated_loss_pct": 2.7,
+        }
+
+        self.assertFalse(engine._execute_open(plan, st))
+
+        self.assertEqual(engine.ex.close_calls, 1)
+        self.assertEqual(st["active_trades"], {})
+        self.assertEqual(engine.alerts.send.call_args.args[1],
+                         "liquidation_buffer_unsafe")
+
+
+class AccountRiskGuardTests(unittest.TestCase):
+    @patch("agent.engine.time.sleep")
+    def test_largest_position_is_closed_until_imr_and_mmr_are_safe(
+            self, sleep):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.alerts = Mock()
+        engine.ex = Mock()
+        engine.ex.account_risk_metrics.side_effect = [
+            {
+                "initial_margin_usage_pct": 70,
+                "maintenance_margin_ratio": 2,
+            },
+            {
+                "initial_margin_usage_pct": 20,
+                "maintenance_margin_ratio": 10,
+            },
+        ]
+        engine._close = Mock(return_value=True)
+        large = {"symbol": "BTC/USDT:USDT", "notional": 500, "side": "long"}
+        small = {"symbol": "ETH/USDT:USDT", "notional": 200, "side": "long"}
+
+        kept = engine._manage_positions(
+            [small, large], {"opened_at": {}}, 10_000)
+
+        self.assertEqual(kept, [small])
+        engine._close.assert_called_once_with(
+            large, "account IMR/MMR guard", {"opened_at": {}})
+
+    def test_unsafe_account_metrics_with_no_position_block_new_entries(self):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.alerts = Mock()
+        engine.ex = Mock()
+        engine.ex.account_risk_metrics.return_value = {
+            "initial_margin_usage_pct": 70,
+            "maintenance_margin_ratio": 2,
+        }
+
+        with self.assertRaisesRegex(
+                RuntimeError, "account margin risk remains unsafe"):
+            engine._manage_positions([], {"opened_at": {}}, 10_000)
+
+    def test_account_risk_auth_failure_is_not_downgraded_to_generic_error(self):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.alerts = Mock()
+        engine.ex = Mock()
+        engine.ex.account_risk_metrics.side_effect = CredentialError(
+            "bad key")
+
+        with self.assertRaises(CredentialError):
+            engine._manage_positions([], {"opened_at": {}}, 10_000)
 
 
 if __name__ == "__main__":

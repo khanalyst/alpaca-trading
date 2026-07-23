@@ -3,7 +3,7 @@ import time
 import unittest
 
 from agent.market import (build_universe, market_snapshot, quote_volume_usd,
-                          symbol_snapshot)
+                          select_universe, symbol_snapshot)
 from tests.helpers import valid_config
 
 
@@ -12,10 +12,12 @@ class FakeMarketClient:
         self.frames = {}
         self.markets = {
             "BTC/USDT:USDT": {
+                "id": "BTC-USDT-SWAP",
                 "swap": True, "settle": "USDT", "active": True,
                 "linear": True, "contractSize": 0.01,
             },
             "ETH/USDT:USDT": {
+                "id": "ETH-USDT-SWAP",
                 "swap": True, "settle": "USDT", "active": True,
                 "linear": True, "contractSize": 0.1,
             },
@@ -69,6 +71,20 @@ class FakeExchange:
     @staticmethod
     def retry(fn, *args, **kwargs):
         return fn(*args, **kwargs)
+
+    def account_swap_instruments(self, refresh=False):
+        return {
+            symbol: {
+                "instId": market["id"],
+                "instType": "SWAP",
+                "settleCcy": "USDT",
+                "state": "live",
+                "instCategory": str(
+                    (market.get("info") or {}).get("instCategory", "1")),
+            }
+            for symbol, market in self.x.markets.items()
+            if (market.get("info") or {}).get("accountAvailable", True)
+        }
 
 
 class MarketSnapshotTests(unittest.TestCase):
@@ -138,6 +154,112 @@ class MarketSnapshotTests(unittest.TestCase):
             build_universe(ex, cfg),
             ["BTC/USDT:USDT", "ETH/USDT:USDT"],
         )
+
+    def test_non_crypto_and_account_unavailable_swaps_are_excluded(self):
+        cfg = valid_config()
+        cfg["universe"]["top_n"] = 2
+        cfg["universe"]["min_24h_quote_volume_usd"] = 1
+        exchange = FakeExchange()
+        exchange.x.markets = {
+            "CL/USDT:USDT": {
+                "id": "CL-USDT-SWAP", "swap": True, "settle": "USDT",
+                "active": True, "linear": True, "contractSize": 1,
+                "info": {"instCategory": "4"},
+            },
+            "XAU/USDT:USDT": {
+                "id": "XAU-USDT-SWAP", "swap": True, "settle": "USDT",
+                "active": True, "linear": True, "contractSize": 1,
+                "info": {"instCategory": "4"},
+            },
+            "BTC/USDT:USDT": {
+                "id": "BTC-USDT-SWAP", "swap": True, "settle": "USDT",
+                "active": True, "linear": True, "contractSize": 0.01,
+                "info": {"instCategory": "1"},
+            },
+            "ETH/USDT:USDT": {
+                "id": "ETH-USDT-SWAP", "swap": True, "settle": "USDT",
+                "active": True, "linear": True, "contractSize": 0.1,
+                "info": {"instCategory": "1", "accountAvailable": False},
+            },
+        }
+        volumes = {
+            "CL/USDT:USDT": 400_000_000,
+            "XAU/USDT:USDT": 300_000_000,
+            "ETH/USDT:USDT": 200_000_000,
+            "BTC/USDT:USDT": 100_000_000,
+        }
+        exchange.x.fetch_ticker = lambda symbol: {
+            "last": 100, "quoteVolume": volumes[symbol],
+            "bid": 99.9, "ask": 100.1, "high": 105, "low": 95,
+        }
+
+        selected, audit = select_universe(exchange, cfg)
+
+        self.assertEqual(selected, ["BTC/USDT:USDT"])
+        reasons = {row["symbol"]: row["reason"]
+                   for row in audit["candidates"]}
+        self.assertEqual(reasons["CL/USDT:USDT"],
+                         "non_crypto_category_4")
+        self.assertEqual(reasons["XAU/USDT:USDT"],
+                         "non_crypto_category_4")
+        self.assertEqual(reasons["ETH/USDT:USDT"],
+                         "not_available_to_account")
+
+    def test_insufficient_history_does_not_consume_a_top_n_slot(self):
+        cfg = valid_config()
+        cfg["universe"]["top_n"] = 1
+        cfg["universe"]["min_24h_quote_volume_usd"] = 1
+        exchange = FakeExchange()
+        exchange.x.markets["ORCL/USDT:USDT"] = {
+            "id": "ORCL-USDT-SWAP", "swap": True, "settle": "USDT",
+            "active": True, "linear": True, "contractSize": 1,
+            "info": {"instCategory": "3"},
+        }
+        # Model the actual failure mode while keeping ORCL marked crypto here:
+        # history, rather than category, must be what excludes this fixture.
+        exchange.x.markets["ORCL/USDT:USDT"]["info"]["instCategory"] = "1"
+        volumes = {
+            "ORCL/USDT:USDT": 300_000_000,
+            "BTC/USDT:USDT": 200_000_000,
+            "ETH/USDT:USDT": 100_000_000,
+        }
+        exchange.x.fetch_ticker = lambda symbol: {
+            "last": 100, "quoteVolume": volumes[symbol],
+            "bid": 99.9, "ask": 100.1, "high": 105, "low": 95,
+        }
+        original = exchange.x.fetch_ohlcv
+        calls = []
+
+        def history(symbol, timeframe, since, limit):
+            calls.append((symbol, timeframe))
+            rows = original(symbol, timeframe, since, limit)
+            return rows[-40:] if (
+                symbol == "ORCL/USDT:USDT" and timeframe == "4h") else rows
+
+        exchange.x.fetch_ohlcv = history
+
+        selected, audit = select_universe(exchange, cfg)
+
+        self.assertEqual(selected, ["BTC/USDT:USDT"])
+        row = next(item for item in audit["candidates"]
+                   if item["symbol"] == "ORCL/USDT:USDT")
+        self.assertEqual(row["reason"], "insufficient_4h_history")
+        self.assertEqual(calls.count(("ORCL/USDT:USDT", "4h")), 1)
+
+    def test_missing_instrument_category_fails_closed(self):
+        cfg = valid_config()
+        cfg["universe"]["min_24h_quote_volume_usd"] = 1
+        exchange = FakeExchange()
+        rows = exchange.account_swap_instruments()
+        rows["BTC/USDT:USDT"].pop("instCategory")
+        exchange.account_swap_instruments = lambda refresh=False: rows
+
+        selected, audit = select_universe(exchange, cfg)
+
+        self.assertNotIn("BTC/USDT:USDT", selected)
+        row = next(item for item in audit["candidates"]
+                   if item["symbol"] == "BTC/USDT:USDT")
+        self.assertEqual(row["reason"], "non_crypto_category_unknown")
 
 
 if __name__ == "__main__":

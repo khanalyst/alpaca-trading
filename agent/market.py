@@ -1,9 +1,9 @@
 """Universe selection and market snapshot construction.
 
-Universe rule: only USDT-settled perpetual swaps ranked by 24h quote volume,
-above a hard dollar floor. Newly listed coins are excluded twice over: they
-rarely clear the volume floor, and the snapshot requires enough 4h candle
-history to compute indicators.
+New entries are restricted to account-enabled, active, linear USDT perpetual
+swaps whose OKX private instrument metadata classifies the base asset as
+crypto.  Candidates are ranked by 24h quote volume, then history-qualified
+before they occupy one of the configured universe slots.
 """
 
 import logging
@@ -12,6 +12,8 @@ import time
 
 import numpy as np
 import pandas as pd
+
+from .exchange import OKX_CRYPTO_INSTRUMENT_CATEGORY
 
 log = logging.getLogger("market")
 
@@ -146,26 +148,106 @@ def classify_regime(snap: dict) -> str:
 
 # ------------------------------------------------------------- universe
 
-def build_universe(ex, cfg: dict) -> list[str]:
+def _history_eligibility(ex, symbol: str, cfg: dict) -> tuple[bool, str, dict]:
+    """Verify the same completed-candle minimum required by snapshots."""
+    minimum = int(cfg["universe"]["min_history_candles"])
+    counts = {}
+    for timeframe in cfg["cycle"]["timeframes"]:
+        try:
+            rows = _closed_ohlcv(ex, symbol, timeframe, minimum)
+        except Exception as exc:
+            return (
+                False,
+                f"history_unavailable_{timeframe}: "
+                f"{str(exc).replace(chr(10), ' ')[:160]}",
+                counts,
+            )
+        counts[timeframe] = len(rows)
+        if len(rows) < minimum:
+            return False, f"insufficient_{timeframe}_history", counts
+    return True, "selected", counts
+
+
+def select_universe(ex, cfg: dict) -> tuple[list[str], dict]:
+    """Build a crypto-only universe and a durable selection audit payload."""
     u = cfg["universe"]
+    account = ex.account_swap_instruments(refresh=True)
     tickers = ex.retry(ex.x.fetch_tickers)
-    rows = []
-    for sym, t in tickers.items():
-        m = ex.x.markets.get(sym)
-        if not m or not m.get("swap") or m.get("settle") != "USDT":
+    candidates = []
+    for symbol, ticker in tickers.items():
+        market = ex.x.markets.get(symbol)
+        if (not market or not market.get("swap")
+                or market.get("settle") != "USDT"):
             continue
-        if not m.get("active", True):
+        quote_volume = quote_volume_usd(ticker, market)
+        if quote_volume < float(u["min_24h_quote_volume_usd"]):
             continue
-        if sym in (u.get("denylist") or []):
-            continue
-        qv = quote_volume_usd(t, m)
-        if qv >= u["min_24h_quote_volume_usd"]:
-            rows.append((sym, qv))
-    rows.sort(key=lambda r: r[1], reverse=True)
-    universe = [s for s, _ in rows[: u["top_n"]]]
-    if not universe:
-        log.warning("Universe is empty; check min_24h_quote_volume_usd")
-    return universe
+        candidates.append((symbol, quote_volume, market))
+    candidates.sort(key=lambda row: row[1], reverse=True)
+
+    selected: list[str] = []
+    records = []
+    denylist = set(u.get("denylist") or [])
+    for rank, (symbol, quote_volume, market) in enumerate(candidates, start=1):
+        record = {
+            "rank": rank,
+            "symbol": symbol,
+            "quote_volume_usd": round(float(quote_volume), 2),
+            "selected": False,
+        }
+        instrument = account.get(symbol)
+        if not market.get("active", True):
+            reason = "public_market_inactive"
+        elif market.get("linear") is not True:
+            reason = "not_linear"
+        elif symbol in denylist:
+            reason = "denylisted"
+        elif instrument is None:
+            reason = "not_available_to_account"
+        elif str(instrument.get("instType") or "") != "SWAP":
+            reason = "account_instrument_not_swap"
+        elif str(instrument.get("settleCcy") or "") != "USDT":
+            reason = "account_instrument_not_usdt_settled"
+        elif str(instrument.get("state") or "") != "live":
+            reason = (
+                "account_instrument_"
+                + str(instrument.get("state") or "state_unknown")
+            )
+        elif str(instrument.get("instCategory") or "") \
+                != OKX_CRYPTO_INSTRUMENT_CATEGORY:
+            reason = (
+                "non_crypto_category_"
+                + str(instrument.get("instCategory") or "unknown")
+            )
+        elif len(selected) >= int(u["top_n"]):
+            reason = "ranked_below_top_n"
+        else:
+            eligible, reason, counts = _history_eligibility(
+                ex, symbol, cfg)
+            record["history_candles"] = counts
+            if eligible:
+                selected.append(symbol)
+                record["selected"] = True
+        record["reason"] = reason
+        records.append(record)
+
+    audit = {
+        "selected": selected,
+        "top_n": int(u["top_n"]),
+        "min_24h_quote_volume_usd": float(
+            u["min_24h_quote_volume_usd"]),
+        "min_history_candles": int(u["min_history_candles"]),
+        "candidates": records,
+    }
+    if not selected:
+        log.warning(
+            "Universe is empty after crypto/account/history eligibility checks")
+    return selected, audit
+
+
+def build_universe(ex, cfg: dict) -> list[str]:
+    """Compatibility wrapper returning only selected symbols."""
+    return select_universe(ex, cfg)[0]
 
 
 # ------------------------------------------------------------- snapshot
@@ -174,12 +256,13 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
                     benchmark_returns: pd.Series | None = None) -> dict:
     tfs = cfg["cycle"]["timeframes"]
     n = cfg["cycle"]["candles"]
+    minimum = int(cfg["universe"]["min_history_candles"])
     ticker = ex.retry(ex.x.fetch_ticker, symbol)
 
     frames: dict[str, pd.DataFrame] = {}
     for tf in tfs:
         raw = _closed_ohlcv(ex, symbol, tf, n)
-        if not raw or len(raw) < 60:
+        if not raw or len(raw) < minimum:
             raise ValueError(f"insufficient {tf} history for {symbol}")
         frames[tf] = pd.DataFrame(
             raw, columns=["ts", "open", "high", "low", "close", "vol"]

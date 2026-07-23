@@ -110,6 +110,49 @@ class StateSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "entry_feedback"):
             state.save_state(invalid)
 
+    def test_execution_failure_backoff_survives_restart(self):
+        valid = dict(state.DEFAULT)
+        valid["entry_failures"] = {
+            "CL/USDT:USDT": {
+                "reason": "exchange_rejected",
+                "direction": "long",
+                "stage": "attached_entry",
+                "classification": "permanent",
+                "error_code": "51001",
+                "error_message": "Instrument does not exist",
+                "last_failed_at": 1000.0,
+                "blocked_until": 4600.0,
+                "expires_at": 15400.0,
+                "consecutive_failures": 2,
+            },
+        }
+
+        state.save_state(valid)
+
+        loaded = state.load_state()
+        failure = loaded["entry_failures"]["CL/USDT:USDT"]
+        self.assertEqual(failure["classification"], "permanent")
+        self.assertEqual(failure["error_code"], "51001")
+
+    def test_invalid_execution_failure_backoff_is_rejected(self):
+        invalid = dict(state.DEFAULT)
+        invalid["entry_failures"] = {
+            "AAVE/USDT:USDT": {
+                "reason": "exchange_rejected",
+                "direction": "long",
+                "stage": "attached_entry",
+                "classification": "transient",
+                "error_code": None,
+                "error_message": "temporary",
+                "last_failed_at": 1000.0,
+                "blocked_until": float("nan"),
+                "expires_at": 2000.0,
+                "consecutive_failures": 1,
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "entry_failures"):
+            state.save_state(invalid)
+
     def test_only_one_agent_run_lock_can_be_held(self):
         first = state.acquire_run_lock()
         self.assertIsNotNone(first)

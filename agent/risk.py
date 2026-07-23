@@ -39,7 +39,8 @@ class RiskEngine:
     def vet_open(self, decision: dict, equity: float, positions: list[dict],
                  snapshot: dict, cooldowns: dict,
                  gross_notional: float,
-                 entry_feedback: dict | None = None
+                 entry_feedback: dict | None = None,
+                 entry_failures: dict | None = None,
                  ) -> tuple[dict | None, str | None]:
         symbol = decision["symbol"]
 
@@ -85,6 +86,21 @@ class RiskEngine:
             return None, "confidence below floor"
         if float(cooldowns.get(symbol, 0)) > time.time():
             return None, "symbol in post-loss cooldown"
+        failure = (entry_failures or {}).get(symbol)
+        if failure is not None:
+            if not isinstance(failure, dict):
+                return None, "execution failure feedback is invalid"
+            try:
+                blocked_until = float(failure.get("blocked_until") or 0)
+                expires_at = float(failure.get("expires_at") or 0)
+            except (TypeError, ValueError):
+                return None, "execution failure feedback is invalid"
+            if (not math.isfinite(blocked_until)
+                    or not math.isfinite(expires_at)):
+                return None, "execution failure feedback is invalid"
+            if (expires_at > time.time()
+                    and blocked_until > time.time()):
+                return None, "symbol in execution failure backoff"
 
         intent_pct = float(decision.get("size_pct_equity") or 0)
         if not math.isfinite(intent_pct) or intent_pct < 0:

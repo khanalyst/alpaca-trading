@@ -157,6 +157,18 @@ class VetOpenSymbolTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIsNotNone(plan)
 
+    def test_execution_failure_backoff_blocks_symbol(self):
+        failures = {
+            "BTC/USDT:USDT": {
+                "blocked_until": time.time() + 900,
+                "expires_at": time.time() + 3600,
+            },
+        }
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], snapshot(), {}, 0, {}, failures)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "symbol in execution failure backoff")
+
 
 if __name__ == "__main__":
     unittest.main()

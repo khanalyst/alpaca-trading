@@ -342,7 +342,11 @@ defaults. Here's what each block controls, so you know where to change what:
   (`temperature`). Default is Anthropic Sonnet 4.6, which is a good balance
   of cost and quality.
 - **`universe`** — which coins it's allowed to trade: the top `top_n` by
-  volume above a dollar floor. Add symbols to `denylist` to ban them.
+  volume above a dollar floor that also pass OKX's private account catalogue,
+  crypto-category, USDT-settlement, active-market, and completed-history
+  checks. `min_history_candles` sets the per-timeframe history minimum. An
+  excluded symbol does not consume a slot; the next eligible ranked symbol is
+  considered. Add symbols to `denylist` to ban them.
 - **`cycle`** — how often it thinks (`interval_seconds`, default 300 = every
   5 minutes) and which candle timeframes it looks at. **Raising
   `interval_seconds` is the biggest cost saver** (600 = every 10 min = half
@@ -357,7 +361,9 @@ defaults. Here's what each block controls, so you know where to change what:
   reserved in deterministic risk sizing. A depth rejection is shown to the
   model on later cycles: it may select another setup, stay flat, or explicitly
   request one smaller retry. Repeated failures create a persisted temporary
-  backoff; every retry still has to pass a fresh order-book check.
+  backoff; every retry still has to pass a fresh order-book check. Other OKX
+  entry failures preserve the safe code/message and create a separate
+  persistent exponential backoff.
 - **`trading_costs`** — expected taker fees, stop slippage and funding holding
   time used by both the LLM and deterministic all-in risk sizing.
 - **`alerts`** — generic, Slack or Discord webhooks. They are optional in demo
@@ -764,8 +770,10 @@ In the VS Code terminal:
 
 That validates the config, tests your OKX keys, checks this machine's clock
 against OKX's 30-second signing window, confirms the key has Trade permission,
-and prints the coin universe — all without placing a single order. When it
-passes:
+and prints the crypto-only account-eligible universe plus the first exclusion
+reasons — all without placing a single order. It also fetches the configured
+completed-candle minimum, so the check can take longer than a simple
+connectivity probe. When it passes:
 
 ```bash
 ./.venv/bin/python main.py run

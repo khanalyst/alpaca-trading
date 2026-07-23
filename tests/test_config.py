@@ -54,6 +54,26 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "must be an integer"):
             validate_config(cfg)
 
+    def test_history_requirement_cannot_exceed_snapshot_candles(self):
+        cfg = valid_config()
+        cfg["universe"]["min_history_candles"] = 121
+        with self.assertRaisesRegex(
+                ConfigError, "cannot exceed cycle.candles"):
+            validate_config(cfg)
+
+    def test_maintenance_margin_ratio_must_stay_above_liquidation(self):
+        cfg = valid_config()
+        cfg["risk"]["min_maintenance_margin_ratio"] = 1.0
+        with self.assertRaisesRegex(ConfigError, "between 1.01 and 100"):
+            validate_config(cfg)
+
+    def test_entry_failure_backoff_bounds_are_consistent(self):
+        cfg = valid_config()
+        cfg["execution"]["entry_failure_backoff_minutes"] = 30
+        cfg["execution"]["entry_failure_backoff_max_minutes"] = 15
+        with self.assertRaisesRegex(ConfigError, "cannot be below"):
+            validate_config(cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -214,17 +214,27 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    daily loss limit, no new positions open until the next UTC day. If it's
    down past the max drawdown from its high-water mark, it flattens
    everything and self-kills (see Caveats).
-3. **Refresh the tradable universe (hourly).** The top `top_n` USDT
-   perpetuals by 24h volume above `min_24h_quote_volume_usd` (default $50m).
-   Thin and newly listed coins never qualify; the indicator-history
-   requirement filters fresh listings a second time.
+3. **Refresh the tradable universe (hourly).** Candidates are ranked by
+   contract-normalized 24h quote volume above
+   `min_24h_quote_volume_usd` (default $50m), but a slot is filled only after
+   the instrument is confirmed by OKX's private account catalogue as
+   account-available, active, linear, USDT-settled, and category `1`
+   (**crypto**), with at least `min_history_candles` completed bars on every
+   configured timeframe. An ineligible high-volume symbol is skipped and the
+   next ranked eligible symbol fills the slot. The full inclusion/exclusion
+   audit is journaled as `universe_selection`. Even an empty result is cached
+   until the next refresh, preventing a bad/new listing from being fetched
+   again every five minutes.
 4. **Reconcile and housekeep open positions.** The exchange is authoritative:
    each cycle (including the first after a restart) matches live positions to
    durable trade IDs, verifies stop-loss/take-profit coverage, restores known
    protection where possible, and closes any position that cannot be verified
-   to have a stop. It then force-closes anything past `max_hold_hours`, and if
-   margin usage exceeds `max_margin_usage_pct`, closes the largest position(s)
-   until it's healthy.
+   to have a stop. A valid OKX liquidation estimate must also remain beyond
+   the stop by `min_stop_liquidation_buffer_pct`; otherwise the position is
+   closed. It then force-closes anything past `max_hold_hours`, and closes the
+   largest position(s) until both initial-margin use is below
+   `max_margin_usage_pct` and adjusted-equity/maintenance-margin is above
+   `min_maintenance_margin_ratio`.
 5. **Ask the brain.** It builds a compact snapshot per symbol — price, spread,
    correctly contract-normalized 24h quote volume, completed-hour relative
    volume, funding rate/interval/next settlement, RSI, current
@@ -263,6 +273,11 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    slippage. A depth rejection is fed into the next portfolio prompt. The
    model may choose another setup, stay flat, or make one explicit smaller
    retry; a repeated failure creates a persisted temporary liquidity backoff.
+   Other OKX entry failures preserve the safe exchange code/message and create
+   a separate persisted exponential backoff, so the same rejected symbol is
+   not submitted every cycle. Instrument/account incompatibilities remain
+   blocked for at least one universe refresh. No path falls back to an entry
+   without attached protection.
 
 The LLM never touches the exchange, never sizes a position, and never
 overrides a cap. It is an idea generator inside hard, code-enforced rails.
@@ -311,6 +326,7 @@ API keys; the mode must match the keys in `.env`.
 | --- | --- | --- |
 | `top_n` | 10 | Trade only the N highest-volume USDT perps |
 | `min_24h_quote_volume_usd` | 50000000 | Liquidity floor; filters thin/new coins |
+| `min_history_candles` | 60 | Completed bars required on every timeframe before a symbol can occupy a universe slot |
 | `denylist` | `[]` | Symbols to ban, e.g. `["DOGE/USDT:USDT"]` |
 | `refresh_minutes` | 60 | How often the volume ranking is rebuilt |
 
@@ -343,6 +359,8 @@ API keys; the mode must match the keys in `.env`.
 | `flatten_on_daily_stop` | false | `true` also closes open positions when the daily stop trips |
 | `max_drawdown_pct` | 15 | Down this much from the high-water mark → flatten everything and self-kill |
 | `max_margin_usage_pct` | 60 | Above this, close the largest position(s) to reduce margin |
+| `min_maintenance_margin_ratio` | 3.0 | Minimum conservative adjusted-equity/MMR ratio; OKX's liquidation boundary is 1.0 |
+| `min_stop_liquidation_buffer_pct` | 1.0 | Required distance between the stop and a valid OKX liquidation estimate, as % of mark |
 | `cooldown_minutes_after_loss` | 45 | Per-symbol timeout after a losing close |
 
 **Change execution (`execution:` block)** — `slippage_guard_pct` (default 0.5)
@@ -358,6 +376,10 @@ feedback remains visible to the model for
 `liquidity_depth_buffer_pct` (70) percent of the observed safe depth; another
 failure blocks that direction in the symbol for
 `liquidity_backoff_minutes` (15). Every retry still uses a fresh order book.
+Non-liquidity execution failures start at
+`entry_failure_backoff_minutes` (15), double on consecutive failures up to
+`entry_failure_backoff_max_minutes` (60), and remain visible for
+`entry_failure_ttl_minutes` (240). These records survive restarts.
 
 **Cost assumptions (`trading_costs:` block)** — expected taker fee per side,
 stop slippage, minimum funding intervals and expected holding hours are sent to
@@ -438,6 +460,10 @@ protect and back up the journal as trading-sensitive data.
 Structured liquidity rejections and their temporary backoffs are journaled as
 `entry_liquidity_rejected` and `entry_liquidity_backoff` events. Their active
 state lives in `runtime/state.json`, not in the provider's prompt cache.
+Universe eligibility is journaled as `universe_selection`; non-liquidity OKX
+entry failures are journaled as `entry_execution_failed` with a bounded,
+redacted exchange code/message and their active backoff also lives in
+`runtime/state.json`.
 
 ```bash
 sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"
@@ -479,6 +505,12 @@ touch another's.
   the reverse) is the most common cause; keys and mode must match.
 - "Insufficient balance" on entries: margin is tied up; lower
   `max_gross_exposure_pct` or add USDT to the Trading account.
+- A symbol is missing from the universe: run `python main.py check`; it prints
+  the first account/category/history exclusion reasons. The complete audit is
+  in the latest `universe_selection` journal event.
+- `entry_execution_failed`: the order was not opened. The symbol is in a
+  persisted execution backoff; inspect its recorded OKX code/message instead
+  of repeatedly retrying it.
 - Model output parse failures: the agent simply holds for that cycle and
   logs the event; persistent failures usually mean the chosen model ignores
   JSON instructions, so switch models.

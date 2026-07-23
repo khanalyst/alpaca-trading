@@ -4,7 +4,8 @@ from unittest.mock import Mock, patch
 
 import ccxt
 
-from agent.exchange import EntryLiquidityRejected, Exchange
+from agent.exchange import (CredentialError, EntryLiquidityRejected,
+                            EntryOrderRejected, Exchange)
 from tests.helpers import valid_config
 
 
@@ -179,6 +180,20 @@ class EntryGuardTests(unittest.TestCase):
 
 
 class ProtectedEntryTests(unittest.TestCase):
+    def test_set_leverage_auth_failure_remains_a_credential_failure(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = Mock()
+        exchange.x.set_leverage.side_effect = ccxt.AuthenticationError(
+            "bad key")
+
+        with self.assertRaises(CredentialError):
+            exchange.open_position(
+                "BTC/USDT:USDT", "buy", 2, 3, 95, 110,
+                expected_price=100, entry_limit_price=100.3,
+            )
+
     def test_rejected_attached_protection_never_retries_a_naked_entry(self):
         exchange = Exchange.__new__(Exchange)
         exchange.cfg = valid_config()
@@ -188,16 +203,35 @@ class ProtectedEntryTests(unittest.TestCase):
         exchange._create_order_once = Mock(
             side_effect=ccxt.ExchangeError("attached orders unsupported"))
 
-        with self.assertRaisesRegex(RuntimeError, "no unprotected fallback"):
+        with self.assertRaisesRegex(
+                EntryOrderRejected, "no unprotected fallback") as raised:
             exchange.open_position(
                 "BTC/USDT:USDT", "buy", 2, 3, 95, 110,
                 expected_price=100, entry_limit_price=100.3,
             )
 
         self.assertEqual(exchange._create_order_once.call_count, 1)
+        self.assertEqual(raised.exception.details["classification"],
+                         "permanent")
+        self.assertIn("attached orders unsupported",
+                      raised.exception.details["error_message"])
         params = exchange._create_order_once.call_args.args[5]
         self.assertIn("stopLoss", params)
         self.assertIn("takeProfit", params)
+
+    def test_okx_code_and_message_are_preserved_without_raw_response(self):
+        error = ccxt.ExchangeError(
+            'okx {"code":"1","msg":"","data":[{"sCode":"51001",'
+            '"sMsg":"Instrument does not exist"}]}')
+
+        rejection = Exchange._entry_order_rejection(
+            "CL/USDT:USDT", "attached_entry", error)
+
+        self.assertEqual(rejection.details["error_code"], "51001")
+        self.assertEqual(rejection.details["error_message"],
+                         "Instrument does not exist")
+        self.assertEqual(rejection.details["classification"], "permanent")
+        self.assertIn("51001", str(rejection))
 
 
 class MarginRiskTests(unittest.TestCase):
@@ -205,7 +239,7 @@ class MarginRiskTests(unittest.TestCase):
         client = Mock()
         client.fetch_balance.return_value = {
             "info": {"data": [{"adjEq": "10000", "imr": "1250",
-                                "mgnRatio": "20", "details": [
+                                "mmr": "250", "mgnRatio": "40", "details": [
                                     {"ccy": "USDT", "eq": "10000"},
                                 ]}]},
             "USDT": {"used": 9000, "total": 10000},
@@ -215,11 +249,14 @@ class MarginRiskTests(unittest.TestCase):
         exchange.alerts = None
         exchange.x = client
         self.assertEqual(exchange.margin_usage_pct(), 12.5)
+        metrics = exchange.account_risk_metrics()
+        self.assertEqual(metrics["maintenance_margin_ratio"], 40)
 
     def test_margin_usage_does_not_use_non_usdt_equity(self):
         client = Mock()
         client.fetch_balance.return_value = {
             "info": {"data": [{"adjEq": "18000", "imr": "1000",
+                                "mmr": "200", "mgnRatio": "90",
                                 "details": [
                                     {"ccy": "USDT", "eq": "10000"},
                                     {"ccy": "OKB", "eq": "100",
@@ -233,6 +270,34 @@ class MarginRiskTests(unittest.TestCase):
         exchange.x = client
 
         self.assertEqual(exchange.margin_usage_pct(), 10)
+
+    def test_single_currency_mode_uses_usdt_detail_imr_and_mmr(self):
+        client = Mock()
+        client.fetch_balance.return_value = {
+            "info": {"data": [{
+                "totalEq": "10000",
+                "imr": "",
+                "mmr": "",
+                "mgnRatio": "",
+                "details": [{
+                    "ccy": "USDT",
+                    "eq": "10000",
+                    "imr": "1000",
+                    "mmr": "250",
+                    "mgnRatio": "40",
+                }],
+            }]},
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        metrics = exchange.account_risk_metrics()
+
+        self.assertEqual(metrics["initial_margin_usage_pct"], 10)
+        self.assertEqual(metrics["maintenance_margin_ratio"], 40)
+        self.assertEqual(metrics["risk_scope"], "usdt_currency")
 
     def test_non_finite_margin_measurement_fails_closed(self):
         client = Mock()
@@ -248,6 +313,58 @@ class MarginRiskTests(unittest.TestCase):
         exchange.x = client
         with self.assertRaisesRegex(RuntimeError, "not a finite value"):
             exchange.margin_usage_pct()
+
+    def test_missing_mmr_with_open_margin_fails_closed(self):
+        client = Mock()
+        client.fetch_balance.return_value = {
+            "info": {"data": [{"adjEq": "10000", "imr": "1000",
+                                "details": [
+                                    {"ccy": "USDT", "eq": "10000"},
+                                ]}]},
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        with self.assertRaisesRegex(
+                RuntimeError, "no maintenance-margin measurement"):
+            exchange.account_risk_metrics()
+
+
+class AccountInstrumentTests(unittest.TestCase):
+    def test_private_account_instruments_are_mapped_to_ccxt_symbols(self):
+        client = Mock()
+        client.markets = {
+            "BTC/USDT:USDT": {
+                "id": "BTC-USDT-SWAP", "swap": True,
+            },
+            "CL/USDT:USDT": {
+                "id": "CL-USDT-SWAP", "swap": True,
+            },
+        }
+        client.private_get_account_instruments.return_value = {
+            "code": "0",
+            "data": [
+                {"instId": "BTC-USDT-SWAP", "instType": "SWAP",
+                 "settleCcy": "USDT", "state": "live",
+                 "instCategory": "1"},
+                {"instId": "CL-USDT-SWAP", "instType": "SWAP",
+                 "settleCcy": "USDT", "state": "live",
+                 "instCategory": "4"},
+            ],
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        rows = exchange.account_swap_instruments(refresh=True)
+
+        self.assertEqual(rows["BTC/USDT:USDT"]["instCategory"], "1")
+        self.assertEqual(rows["CL/USDT:USDT"]["instCategory"], "4")
+        client.private_get_account_instruments.assert_called_once_with(
+            {"instType": "SWAP"})
 
 
 class AccountValueValidationTests(unittest.TestCase):

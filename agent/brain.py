@@ -125,6 +125,11 @@ setup with every other candidate. If retry_allowed is true, you may retry \
 only by setting an explicit size_pct_equity no larger than \
 max_retry_size_pct_equity. If false, choose another setup or stay flat until \
 retry_after_minutes expires. Never repeat the original full size.
+- recent_entry_failures: non-liquidity exchange failures, including the \
+failed stage, safe OKX code/message, classification and retry delay. Do not \
+propose the symbol again while retry_after_minutes is positive. A permanent \
+classification means the instrument/account combination should be avoided \
+until the universe is refreshed.
 - hard_limits_fyi: the key risk-engine caps currently configured, for \
 context when choosing your intended size and leverage.
 - trading_costs_fyi: configured taker fee per side, expected stop slippage, \
@@ -140,6 +145,7 @@ beyond the max concurrent positions or gross exposure caps;
 - reject a repeated liquidity-constrained proposal unless you explicitly \
 reduce size_pct_equity to the safe retry ceiling supplied in the portfolio; \
 after repeated depth failures, enforce the temporary liquidity backoff;
+- reject a symbol while a non-liquidity execution-failure backoff is active;
 - reject opens that would push the book's net directional exposure (long \
 notional minus short notional) beyond the configured cap - several \
 same-direction positions in correlated coins count as one big bet, so \
@@ -250,9 +256,9 @@ thesis and closed the ones that no longer qualify?
 close on the same symbol in the same answer?
 6. If the honest answer this cycle is "no trade", is your decisions list \
 empty rather than padded with a marginal idea?
-7. If recent_entry_feedback exists, did you deliberately choose between a \
-smaller retry, a stronger alternative, and staying flat instead of blindly \
-repeating the rejected size?
+7. If recent_entry_feedback or recent_entry_failures exists, did you \
+deliberately choose between a permitted retry, a stronger alternative, and \
+staying flat instead of blindly repeating the rejected symbol or size?
 8. Is the output a single JSON object with no prose around it?
 
 WORKED EXAMPLES

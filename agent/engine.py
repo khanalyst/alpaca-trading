@@ -26,7 +26,8 @@ import ccxt
 
 from . import brain, market, state
 from .alerts import AlertManager
-from .exchange import CredentialError, EntryLiquidityRejected, Exchange
+from .exchange import (CredentialError, EntryLiquidityRejected,
+                       EntryOrderRejected, Exchange)
 from .risk import RiskEngine
 
 log = logging.getLogger("engine")
@@ -285,6 +286,11 @@ class Engine:
             for symbol, feedback in (st.get("entry_feedback") or {}).items()
             if float(feedback.get("expires_at") or 0) > now
         }
+        st["entry_failures"] = {
+            symbol: failure
+            for symbol, failure in (st.get("entry_failures") or {}).items()
+            if float(failure.get("expires_at") or 0) > now
+        }
 
         # --- deposits / withdrawals: rebase benchmarks, never trade on them
         since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
@@ -359,9 +365,12 @@ class Engine:
 
         # --- universe refresh
         refresh_s = float(self.cfg["universe"]["refresh_minutes"]) * 60
-        if not self.universe or now - self.universe_ts > refresh_s:
-            self.universe = market.build_universe(self.ex, self.cfg)
+        if self.universe_ts <= 0 or now - self.universe_ts > refresh_s:
+            self.universe, universe_audit = market.select_universe(
+                self.ex, self.cfg)
             self.universe_ts = now
+            state.log_event(
+                "universe_selection", self._audit_json(universe_audit))
             log.info("Universe (%d): %s", len(self.universe),
                      ", ".join(self.universe))
 
@@ -442,7 +451,8 @@ class Engine:
                 return
             plan, why = self.risk.vet_open(d, equity, positions, snapshot,
                                            st.get("cooldowns", {}), gross,
-                                           st.get("entry_feedback", {}))
+                                           st.get("entry_feedback", {}),
+                                           st.get("entry_failures", {}))
             if not plan:
                 log.info("Rejected %s %s: %s", d.get("direction"),
                          d.get("symbol"), why)
@@ -468,6 +478,59 @@ class Engine:
             return side
         raw = float((pos.get("info") or {}).get("pos") or 0)
         return "long" if raw >= 0 else "short"
+
+    def _liquidation_stop_check(
+            self, direction: str, mark_price: object, stop_price: object,
+            liquidation_price: object) -> dict:
+        """Verify a valid OKX liquidation estimate remains beyond the stop."""
+        if liquidation_price in (None, "", "0", 0):
+            return {
+                "available": False,
+                "safe": True,
+                "buffer_pct": None,
+                "reason": "liquidation price unavailable",
+            }
+        try:
+            mark = float(mark_price)
+            stop = float(stop_price)
+            liquidation = float(liquidation_price)
+        except (TypeError, ValueError):
+            return {
+                "available": True,
+                "safe": False,
+                "buffer_pct": None,
+                "reason": "liquidation measurement is invalid",
+            }
+        if (direction not in {"long", "short"}
+                or not all(math.isfinite(value) and value > 0
+                           for value in (mark, stop, liquidation))):
+            return {
+                "available": True,
+                "safe": False,
+                "buffer_pct": None,
+                "reason": "liquidation measurement is invalid",
+            }
+        if direction == "long":
+            geometrically_valid = liquidation < stop < mark
+            buffer_pct = (stop - liquidation) / mark * 100
+        else:
+            geometrically_valid = liquidation > stop > mark
+            buffer_pct = (liquidation - stop) / mark * 100
+        minimum = float(
+            self.cfg["risk"]["min_stop_liquidation_buffer_pct"])
+        safe = geometrically_valid and buffer_pct >= minimum
+        return {
+            "available": True,
+            "safe": safe,
+            "buffer_pct": buffer_pct,
+            "minimum_buffer_pct": minimum,
+            "reason": (
+                "stop precedes liquidation"
+                if safe else
+                "stop is not safely between mark and liquidation "
+                f"(buffer {buffer_pct:.2f}%, minimum {minimum:.2f}%)"
+            ),
+        }
 
     @staticmethod
     def _position_id(pos: dict):
@@ -649,6 +712,38 @@ class Engine:
                         "error", "startup_take_profit_missing",
                         f"{symbol} has a stop-loss but no verified take-profit",
                         {"startup": startup})
+            liquidation = (
+                pos.get("liquidationPrice")
+                or (pos.get("info") or {}).get("liqPx")
+            )
+            liquidation_check = self._liquidation_stop_check(
+                direction,
+                mark,
+                status.get("stop_price") or target.get("sl_price"),
+                liquidation,
+            )
+            if (liquidation_check["available"]
+                    and not liquidation_check["safe"]):
+                detail = {
+                    "symbol": symbol,
+                    "liquidation_price": liquidation,
+                    "mark_price": mark,
+                    **liquidation_check,
+                }
+                self.alerts.send(
+                    "critical", "liquidation_buffer_unsafe",
+                    f"{symbol} stop is too close to liquidation; closing it",
+                    detail)
+                if self._close(
+                        pos, "reconciliation: unsafe liquidation buffer", st):
+                    actual.pop(symbol, None)
+                    state.log_event(
+                        "liquidation_buffer_unsafe",
+                        self._audit_json(detail),
+                    )
+                    continue
+                raise RuntimeError(
+                    f"{symbol} remains open with unsafe liquidation buffer")
             target.update({
                 "side": direction, "contracts": contracts,
                 "sl_price": target.get("sl_price") or status.get("stop_price"),
@@ -761,6 +856,74 @@ class Engine:
         }))
         state.commit(st)
 
+    def _remember_entry_failure(
+            self, plan: dict, st: dict, exc: Exception,
+            stage: str) -> dict:
+        """Persist non-liquidity entry failure with bounded backoff."""
+        now = time.time()
+        symbol = plan["symbol"]
+        details = (
+            dict(exc.details)
+            if isinstance(exc, EntryOrderRejected)
+            else {
+                "stage": stage,
+                "classification": "transient",
+                "error_code": None,
+                "error_message": Exchange._safe_exchange_error_text(exc),
+            }
+        )
+        classification = str(
+            details.get("classification") or "transient")
+        if classification not in {"transient", "permanent"}:
+            classification = "transient"
+        records = st.setdefault("entry_failures", {})
+        previous = records.get(symbol) or {}
+        related = (
+            previous.get("direction") == plan["direction"]
+            and previous.get("stage") == details.get("stage", stage)
+            and float(previous.get("expires_at") or 0) > now
+        )
+        count = (int(previous.get("consecutive_failures") or 0) + 1
+                 if related else 1)
+        execution = self.cfg["execution"]
+        base = float(execution["entry_failure_backoff_minutes"])
+        maximum = float(execution["entry_failure_backoff_max_minutes"])
+        delay = min(maximum, base * (2 ** min(count - 1, 10)))
+        if classification == "permanent":
+            delay = max(
+                delay, float(self.cfg["universe"]["refresh_minutes"]))
+        blocked_until = now + delay * 60
+        expires_at = max(
+            blocked_until,
+            now + float(execution["entry_failure_ttl_minutes"]) * 60,
+        )
+        record = {
+            "reason": "exchange_rejected",
+            "direction": plan["direction"],
+            "stage": str(details.get("stage") or stage),
+            "classification": classification,
+            "error_code": (
+                str(details["error_code"])
+                if details.get("error_code") not in (None, "") else None
+            ),
+            "error_message": Exchange._safe_exchange_error_text(
+                details.get("error_message")),
+            "last_failed_at": now,
+            "blocked_until": blocked_until,
+            "expires_at": expires_at,
+            "consecutive_failures": count,
+        }
+        records[symbol] = record
+        state.log_event(
+            "entry_execution_failed",
+            self._audit_json({"symbol": symbol, **record}),
+        )
+        state.commit(st)
+        log.warning(
+            "%s entered a %.0f-minute %s entry backoff after %d failure(s)",
+            symbol, delay, classification, count)
+        return record
+
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
         if state.load_state()["state"] != state.RUNNING:
@@ -768,7 +931,10 @@ class Engine:
             return False
         try:
             live = self.ex.price(symbol)
+        except CredentialError:
+            raise
         except Exception as e:
+            self._remember_entry_failure(plan, st, e, "price_check")
             log.warning("Price check failed for %s: %s", symbol, e)
             return False
         guard = float(self.cfg["execution"]["slippage_guard_pct"])
@@ -799,7 +965,11 @@ class Engine:
             self._remember_liquidity_rejection(plan, st, exc)
             log.warning("Entry liquidity guard rejected %s: %s", symbol, exc)
             return False
+        except CredentialError:
+            raise
         except Exception as exc:
+            self._remember_entry_failure(
+                plan, st, exc, "order_book_guard")
             log.warning("Entry liquidity guard rejected %s: %s", symbol, exc)
             return False
 
@@ -847,7 +1017,11 @@ class Engine:
                 symbol, side, contracts, plan["leverage"], sl_price, tp_price,
                 expected_price=entry_reference,
                 entry_limit_price=entry_guard["limit_price"])
+        except CredentialError:
+            raise
         except Exception as e:
+            self._remember_entry_failure(
+                plan, st, e, "attached_entry")
             log.error("Entry failed for %s: %s", symbol, e)
             return False
 
@@ -860,6 +1034,22 @@ class Engine:
         opened = time.time()
         estimated_loss_pct = float(plan["estimated_loss_pct"])
         risk_usd = actual_notional * estimated_loss_pct / 100.0
+        liquidation_check = self._liquidation_stop_check(
+            plan["direction"],
+            execution.get("mark_price") or fill_price,
+            sl_price,
+            execution.get("liquidation_price"),
+        )
+        stop_verified = bool(
+            (execution.get("protection") or {}).get("stop_loss"))
+        liquidation_unsafe = (
+            liquidation_check["available"]
+            and not liquidation_check["safe"]
+        )
+        if not liquidation_check["available"]:
+            log.warning(
+                "OKX returned no liquidation price for %s; relying on "
+                "attached stop and account-level IMR/MMR guards", symbol)
         st.setdefault("opened_at", {})[symbol] = opened
         st.setdefault("active_trades", {})[symbol] = {
             "trade_id": trade_id,
@@ -883,6 +1073,7 @@ class Engine:
             "tp_price": tp_price,
         }
         st.setdefault("entry_feedback", {}).pop(symbol, None)
+        st.setdefault("entry_failures", {}).pop(symbol, None)
         plan["notional"] = actual_notional
         plan["risk_usd"] = risk_usd
         persistence_error = None
@@ -908,10 +1099,25 @@ class Engine:
             log.critical("Post-entry persistence failed for %s: %s",
                          symbol, exc)
 
-        if not (execution.get("protection") or {}).get("stop_loss"):
+        if not stop_verified or liquidation_unsafe:
             # Persist the verified fill before the emergency close so even a
             # process crash leaves a durable, reconcilable trade record. A
             # persistence failure must never prevent this exchange close.
+            if not stop_verified:
+                emergency_reason = "stop-loss verification failed"
+            else:
+                emergency_reason = "liquidation buffer is unsafe"
+                self.alerts.send(
+                    "critical", "liquidation_buffer_unsafe",
+                    f"{symbol} entry filled with an unsafe liquidation "
+                    "buffer; closing it",
+                    {
+                        "liquidation_price": execution.get(
+                            "liquidation_price"),
+                        "mark_price": execution.get("mark_price") or fill_price,
+                        **liquidation_check,
+                    },
+                )
             emergency_position = {
                 "symbol": symbol,
                 "contracts": float(
@@ -930,7 +1136,7 @@ class Engine:
                 try:
                     closed = self._close(
                         current_position,
-                        "emergency close: stop-loss verification failed", st)
+                        f"emergency close: {emergency_reason}", st)
                 except Exception as exc:
                     close_error = exc
                     if persistence_error is None:
@@ -975,10 +1181,12 @@ class Engine:
             if not closed:
                 self.alerts.send(
                     "critical", "emergency_close_failed",
-                    f"{symbol} remains open without a verified stop-loss",
-                    {"contracts": emergency_position["contracts"]})
+                    f"{symbol} remains open without verified liquidation "
+                    "safety",
+                    {"contracts": emergency_position["contracts"],
+                     "reason": emergency_reason})
                 raise RuntimeError(
-                    f"{symbol} emergency close failed after unprotected fill"
+                    f"{symbol} emergency close failed after unsafe fill"
                 ) from (close_error or persistence_error)
             if persistence_error is not None:
                 raise persistence_error
@@ -1099,31 +1307,67 @@ class Engine:
                 continue
             kept.append(p)
 
-        try:
-            usage = self.ex.margin_usage_pct()
-        except Exception as exc:
-            self.alerts.send(
-                "critical", "margin_risk_unavailable",
-                "New entries blocked because OKX margin risk is unavailable",
-                {"error": str(exc)})
-            raise RuntimeError(
-                f"cannot enforce margin-usage guard: {exc}") from exc
-        while (usage is not None and usage > float(r["max_margin_usage_pct"])
-               and kept):
+        def read_account_risk() -> dict:
+            try:
+                return self.ex.account_risk_metrics()
+            except CredentialError:
+                raise
+            except Exception as exc:
+                self.alerts.send(
+                    "critical", "margin_risk_unavailable",
+                    "New entries blocked because OKX account risk is "
+                    "unavailable",
+                    {"error": str(exc)})
+                raise RuntimeError(
+                    f"cannot enforce IMR/MMR guards: {exc}") from exc
+
+        def breaches(metrics: dict) -> list[str]:
+            reasons = []
+            usage = float(metrics["initial_margin_usage_pct"])
+            if usage > float(r["max_margin_usage_pct"]):
+                reasons.append(
+                    f"initial-margin usage {usage:.1f}% exceeds "
+                    f"{float(r['max_margin_usage_pct']):.1f}%")
+            ratio = metrics.get("maintenance_margin_ratio")
+            if (ratio is not None
+                    and float(ratio)
+                    < float(r["min_maintenance_margin_ratio"])):
+                reasons.append(
+                    f"maintenance-margin ratio {float(ratio):.2f} is below "
+                    f"{float(r['min_maintenance_margin_ratio']):.2f}")
+            return reasons
+
+        metrics = read_account_risk()
+        reasons = breaches(metrics)
+        while reasons and kept:
             kept.sort(
                 key=lambda p: (float("inf")
                                if p.get("_risk_notional_invalid")
                                else self._notional(p)),
                 reverse=True)
             biggest = kept.pop(0)
-            log.warning("Margin usage %.0f%% above %.0f%% cap; closing "
-                        "largest position %s", usage,
-                        float(r["max_margin_usage_pct"]), biggest["symbol"])
-            if not self._close(biggest, "margin usage guard", st):
+            log.warning(
+                "Account risk guard (%s); closing largest position %s",
+                "; ".join(reasons), biggest["symbol"])
+            if not self._close(biggest, "account IMR/MMR guard", st):
                 kept.insert(0, biggest)
                 break
             time.sleep(2)  # let the close settle before re-reading margin
-            usage = self.ex.margin_usage_pct()
+            metrics = read_account_risk()
+            reasons = breaches(metrics)
+        if reasons:
+            detail = {
+                "reasons": reasons,
+                "metrics": metrics,
+                "open_positions": [p.get("symbol") for p in kept],
+            }
+            self.alerts.send(
+                "critical", "margin_risk_unsafe",
+                "New entries blocked because account margin risk remains "
+                "outside configured limits",
+                detail)
+            raise RuntimeError(
+                "account margin risk remains unsafe: " + "; ".join(reasons))
         return kept
 
     # ------------------------------------------------------------- helpers
@@ -1231,6 +1475,24 @@ class Engine:
                 "retry_allowed": blocked_seconds <= 0 and max_retry > 0,
                 "retry_after_minutes": round(blocked_seconds / 60, 1),
             })
+        entry_failures = []
+        for symbol, failure in sorted(
+                (st.get("entry_failures") or {}).items()):
+            if float(failure.get("expires_at") or 0) <= now:
+                continue
+            blocked_seconds = max(
+                0.0, float(failure.get("blocked_until") or 0) - now)
+            entry_failures.append({
+                "symbol": symbol,
+                "direction": failure.get("direction"),
+                "stage": failure.get("stage"),
+                "classification": failure.get("classification"),
+                "error_code": failure.get("error_code"),
+                "error_message": failure.get("error_message"),
+                "consecutive_failures": int(
+                    failure.get("consecutive_failures") or 0),
+                "retry_after_minutes": round(blocked_seconds / 60, 1),
+            })
         r = self.cfg["risk"]
         return {
             "equity_usdt": round(equity, 2),
@@ -1240,6 +1502,7 @@ class Engine:
             "open_positions": views,
             "post_loss_cooldowns": post_loss_cooldowns,
             "recent_entry_feedback": entry_feedback,
+            "recent_entry_failures": entry_failures,
             "hard_limits_fyi": {
                 "max_leverage": r["max_leverage"],
                 "risk_per_trade_pct": r["risk_per_trade_pct"],

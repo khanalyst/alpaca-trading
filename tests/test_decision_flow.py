@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from agent import state
 from agent.engine import Engine
-from agent.exchange import EntryLiquidityRejected
+from agent.exchange import (EntryLiquidityRejected, EntryOrderRejected)
 from tests.helpers import valid_config
 
 
@@ -86,7 +86,7 @@ class SequentialOpenValidationTests(unittest.TestCase):
         seen = []
 
         def vet(decision, equity, positions, snapshot, cooldowns, gross,
-                entry_feedback):
+                entry_feedback, entry_failures):
             seen.append((
                 decision["symbol"],
                 [position["symbol"] for position in positions],
@@ -106,6 +106,7 @@ class SequentialOpenValidationTests(unittest.TestCase):
             "last_ledger_ts": 1,
             "cooldowns": {},
             "entry_feedback": {},
+            "entry_failures": {},
             "opened_at": {},
             "active_trades": {},
             "protection": {},
@@ -118,6 +119,62 @@ class SequentialOpenValidationTests(unittest.TestCase):
             ("ETH/USDT:USDT", ["BTC/USDT:USDT"], 100),
         ])
         self.assertEqual(engine._execute_open.call_count, 2)
+
+
+class UniverseRefreshTests(unittest.TestCase):
+    @patch("agent.engine.market.market_snapshot", return_value={})
+    @patch("agent.engine.market.select_universe")
+    @patch("agent.engine.state.log_equity")
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.commit")
+    def test_empty_universe_waits_for_refresh_instead_of_retrying_each_cycle(
+            self, commit, log_event, log_equity, select_universe,
+            market_snapshot):
+        select_universe.return_value = (
+            [],
+            {"selected": [], "candidates": [
+                {"symbol": "ORCL/USDT:USDT",
+                 "reason": "insufficient_4h_history"},
+            ]},
+        )
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.alerts = Mock()
+        engine.ex = Mock()
+        engine.ex.equity_usdt.return_value = 10_000
+        engine.ex.positions.return_value = []
+        engine.ex.transfers_since.return_value = (0, 2)
+        engine._reconcile_positions = Mock(return_value=[])
+        engine._startup_reconciled = True
+        engine._manage_positions = Mock(return_value=[])
+        engine.universe = []
+        engine.universe_ts = 0
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        st = {
+            "state": state.RUNNING,
+            "equity_basis": state.EQUITY_BASIS,
+            "high_water_mark": 10_000,
+            "day_start_equity": 10_000,
+            "day": today,
+            "last_ledger_ts": 1,
+            "cooldowns": {},
+            "entry_feedback": {},
+            "entry_failures": {},
+            "opened_at": {},
+            "active_trades": {},
+            "protection": {},
+        }
+
+        engine.cycle(st)
+        engine.cycle(st)
+
+        select_universe.assert_called_once_with(engine.ex, engine.cfg)
+        universe_events = [
+            call for call in log_event.call_args_list
+            if call.args and call.args[0] == "universe_selection"
+        ]
+        self.assertEqual(len(universe_events), 1)
+        self.assertEqual(market_snapshot.call_count, 2)
 
 
 class PositionMetricTests(unittest.TestCase):
@@ -222,6 +279,7 @@ class LiquidityFeedbackTests(unittest.TestCase):
                          "entry_liquidity_rejected")
         commit.assert_called_once_with(st)
 
+
     @patch("agent.engine.state.commit")
     @patch("agent.engine.state.log_event")
     def test_second_depth_rejection_creates_backoff(
@@ -311,6 +369,134 @@ class LiquidityFeedbackTests(unittest.TestCase):
         self.assertEqual(record["blocked_until"], now + 900)
         self.assertEqual(log_event.call_args.args[0],
                          "entry_liquidity_backoff")
+        commit.assert_called_once_with(st)
+
+
+class EntryFailureBackoffTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = Engine.__new__(Engine)
+        self.engine.cfg = valid_config()
+        self.plan = {
+            "symbol": "CL/USDT:USDT",
+            "direction": "long",
+        }
+
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    def test_permanent_rejection_is_blocked_until_universe_refresh(
+            self, log_event, commit):
+        rejection = EntryOrderRejected(
+            "rejected",
+            {
+                "symbol": "CL/USDT:USDT",
+                "stage": "attached_entry",
+                "classification": "permanent",
+                "error_code": "51001",
+                "error_message": "Instrument does not exist",
+            },
+        )
+        st = {"entry_failures": {}}
+
+        with patch("agent.engine.time.time", return_value=1_000.0):
+            record = self.engine._remember_entry_failure(
+                self.plan, st, rejection, "attached_entry")
+
+        self.assertEqual(record["classification"], "permanent")
+        self.assertEqual(record["blocked_until"], 4_600.0)
+        self.assertEqual(record["error_code"], "51001")
+        self.assertEqual(log_event.call_args.args[0],
+                         "entry_execution_failed")
+        commit.assert_called_once_with(st)
+
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    def test_transient_failures_use_bounded_exponential_backoff(
+            self, log_event, commit):
+        st = {"entry_failures": {}}
+        with patch("agent.engine.time.time", return_value=1_000.0):
+            first = self.engine._remember_entry_failure(
+                self.plan, st, RuntimeError("temporary"), "price_check")
+        with patch("agent.engine.time.time", return_value=1_100.0):
+            second = self.engine._remember_entry_failure(
+                self.plan, st, RuntimeError("temporary"), "price_check")
+
+        self.assertEqual(first["blocked_until"], 1_900.0)
+        self.assertEqual(second["blocked_until"], 2_900.0)
+        self.assertEqual(second["consecutive_failures"], 2)
+
+    def test_portfolio_exposes_safe_failure_details_to_llm(self):
+        now = time.time()
+        st = {
+            "state": "RUNNING",
+            "cooldowns": {},
+            "opened_at": {},
+            "entry_feedback": {},
+            "entry_failures": {
+                "CL/USDT:USDT": {
+                    "reason": "exchange_rejected",
+                    "direction": "long",
+                    "stage": "attached_entry",
+                    "classification": "permanent",
+                    "error_code": "51001",
+                    "error_message": "Instrument does not exist",
+                    "last_failed_at": now - 60,
+                    "blocked_until": now + 600,
+                    "expires_at": now + 3600,
+                    "consecutive_failures": 2,
+                },
+            },
+        }
+
+        with patch("agent.engine.time.time", return_value=now):
+            view = self.engine._portfolio_view(10_000, [], st, 0, 0)
+
+        failure = view["recent_entry_failures"][0]
+        self.assertEqual(failure["symbol"], "CL/USDT:USDT")
+        self.assertEqual(failure["error_code"], "51001")
+        self.assertEqual(failure["retry_after_minutes"], 10.0)
+
+    @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    def test_attached_entry_rejection_is_persisted_before_next_cycle(
+            self, log_event, commit, load_state):
+        rejection = EntryOrderRejected(
+            "rejected",
+            {
+                "symbol": "CL/USDT:USDT",
+                "stage": "attached_entry",
+                "classification": "permanent",
+                "error_code": "51001",
+                "error_message": "Instrument does not exist",
+            },
+        )
+        self.engine.ex = Mock()
+        self.engine.ex.price.return_value = 100
+        self.engine.ex.contracts_for_notional.return_value = 2
+        self.engine.ex.guarded_entry_limit.return_value = {
+            "limit_price": 100.25,
+            "spread_pct": 0.05,
+            "mid": 100,
+        }
+        self.engine.ex.open_position.side_effect = rejection
+        st = {"entry_failures": {}}
+        plan = {
+            **self.plan,
+            "notional": 200,
+            "price": 100,
+            "leverage": 2,
+            "sl_pct": 2,
+            "tp_pct": 4,
+        }
+
+        self.assertFalse(self.engine._execute_open(plan, st))
+
+        failure = st["entry_failures"]["CL/USDT:USDT"]
+        self.assertEqual(failure["classification"], "permanent")
+        self.assertEqual(failure["error_code"], "51001")
+        self.assertGreater(failure["blocked_until"], failure["last_failed_at"])
+        self.assertEqual(log_event.call_args.args[0],
+                         "entry_execution_failed")
         commit.assert_called_once_with(st)
 
 

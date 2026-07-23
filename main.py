@@ -303,12 +303,21 @@ def cmd_check(args, cfg) -> int:
             from agent import market
             ex = Exchange(cfg)          # also verifies the clock
             equity = ex.equity_usdt()
-            universe = market.build_universe(ex, cfg)
+            universe, universe_audit = market.select_universe(ex, cfg)
             print(f"  OKX connection OK ({'DEMO' if ex.demo else 'LIVE'}). "
                   f"Equity: {equity:,.2f} USDT")
             print(f"  Clock drift vs OKX: {ex.clock_drift_ms() / 1000:+.2f}s "
                   "(must stay within 30s)")
-            print(f"  Universe head: {', '.join(universe[:5])}")
+            print(f"  Eligible crypto universe: {len(universe)} "
+                  f"instrument(s)")
+            print(f"  Universe head: {', '.join(universe[:5]) or 'none'}")
+            skipped = [
+                row for row in universe_audit["candidates"]
+                if (not row["selected"]
+                    and row["reason"] != "ranked_below_top_n")
+            ][:5]
+            for row in skipped:
+                print(f"    skipped {row['symbol']}: {row['reason']}")
         except Exception as e:
             print(f"  OKX check FAILED: {e}")
             ok = False

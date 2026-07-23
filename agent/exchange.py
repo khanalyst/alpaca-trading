@@ -6,9 +6,11 @@ Stop-loss and take-profit orders are placed ON THE EXCHANGE, so positions
 stay protected even if this process dies.
 """
 
+import json
 import logging
 import math
 import os
+import re
 import time
 import uuid
 
@@ -26,6 +28,7 @@ CLOCK_SKEW_FATAL_MS = 15_000
 CLOCK_SKEW_WARN_MS = 3_000
 CLOCK_RECHECK_SECONDS = 900
 ACCOUNT_RECHECK_SECONDS = 900
+OKX_CRYPTO_INSTRUMENT_CATEGORY = "1"
 
 
 class CredentialError(RuntimeError):
@@ -44,6 +47,19 @@ class EntryLiquidityRejected(RuntimeError):
 
     Structured details let the engine give the next LLM cycle useful
     execution feedback without parsing a human-readable log message.
+    """
+
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = details
+
+
+class EntryOrderRejected(RuntimeError):
+    """OKX refused an entry before a verified position was opened.
+
+    The structured fields are safe to persist and let the engine distinguish
+    a temporary exchange failure from an instrument/account incompatibility.
+    They deliberately omit request headers, credentials and full responses.
     """
 
     def __init__(self, message: str, details: dict):
@@ -127,6 +143,88 @@ class Exchange:
                 time.sleep(1.5 * (i + 1))
         raise last
 
+    @staticmethod
+    def _safe_exchange_error_text(value: object) -> str:
+        """Return a bounded error string with configured secrets removed."""
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        for name in ("OKX_API_KEY", "OKX_API_SECRET",
+                     "OKX_API_PASSPHRASE"):
+            secret = os.getenv(name)
+            if secret:
+                text = text.replace(secret, "<redacted>")
+        return text[:500] or "OKX rejected the request"
+
+    @classmethod
+    def _okx_error_details(cls, exc: Exception) -> dict:
+        """Extract OKX's code/message without persisting a raw HTTP response."""
+        raw = str(exc or "")
+        text = cls._safe_exchange_error_text(raw)
+        payload = None
+        start, end = raw.find("{"), raw.rfind("}")
+        if 0 <= start < end:
+            try:
+                candidate = json.loads(raw[start:end + 1])
+                if isinstance(candidate, dict):
+                    payload = candidate
+            except json.JSONDecodeError:
+                pass
+
+        code = None
+        message = None
+        if payload:
+            rows = payload.get("data") or []
+            row = rows[0] if rows and isinstance(rows[0], dict) else {}
+            code = row.get("sCode") or payload.get("code")
+            message = row.get("sMsg") or payload.get("msg")
+        if code in (None, ""):
+            match = re.search(
+                r"(?:sCode|code)[\"'=:\s]+([A-Za-z0-9_-]+)", text)
+            code = match.group(1) if match else None
+        message = cls._safe_exchange_error_text(message or text)
+        lowered = message.lower()
+        permanent_hints = (
+            "instrument does not exist",
+            "instrument is not available",
+            "instrument not available",
+            "invalid instid",
+            "invalid instrument",
+            "not available for trading",
+            "not supported",
+            "unsupported",
+            "has been suspended",
+            "is suspended",
+            "has been delisted",
+            "is delisted",
+        )
+        classification = (
+            "permanent"
+            if any(hint in lowered for hint in permanent_hints)
+            else "transient"
+        )
+        return {
+            "error_code": str(code) if code not in (None, "") else None,
+            "error_message": message,
+            "classification": classification,
+        }
+
+    @classmethod
+    def _entry_order_rejection(
+            cls, symbol: str, stage: str,
+            exc: Exception) -> EntryOrderRejected:
+        details = {
+            "symbol": symbol,
+            "stage": stage,
+            **cls._okx_error_details(exc),
+        }
+        code = (f" code {details['error_code']}"
+                if details["error_code"] else "")
+        return EntryOrderRejected(
+            f"{symbol} entry rejected during {stage}; OKX{code}: "
+            f"{details['error_message']}; no unprotected fallback order "
+            "was sent",
+            details,
+        )
+
     # --------------------------------------------------------------- clock
 
     def clock_drift_ms(self) -> float:
@@ -208,6 +306,51 @@ class Exchange:
             raise RuntimeError("OKX returned no account configuration")
         self._account_config = rows[0]
         return self._account_config
+
+    def account_swap_instruments(self, refresh: bool = False) -> dict[str, dict]:
+        """Return SWAP instruments enabled for this exact OKX account.
+
+        Public market metadata includes products that can be unavailable in a
+        user's region or demo environment.  The private, read-only account
+        endpoint is authoritative and also carries ``instCategory``:
+        ``1`` is crypto; stocks, commodities, forex and bonds use other values.
+        """
+        cached = getattr(self, "_account_swap_instruments", None)
+        if cached is not None and not refresh:
+            return cached
+        getter = getattr(self.x, "private_get_account_instruments", None)
+        if not callable(getter):
+            raise RuntimeError(
+                "installed CCXT does not expose OKX account instruments")
+        response = self.retry(getter, {"instType": "SWAP"})
+        if str((response or {}).get("code", "0")) != "0":
+            raise RuntimeError(
+                "OKX account instruments failed: "
+                f"{(response or {}).get('msg') or response}")
+        rows = (response or {}).get("data") or []
+        if not rows:
+            raise RuntimeError(
+                "OKX returned no SWAP instruments for this account")
+        by_id = {
+            str(market.get("id") or ""): (symbol, market)
+            for symbol, market in self.x.markets.items()
+            if market.get("swap")
+        }
+        mapped: dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            inst_id = str(row.get("instId") or "")
+            item = by_id.get(inst_id)
+            if not item:
+                continue
+            symbol, _ = item
+            mapped[symbol] = dict(row)
+        if not mapped:
+            raise RuntimeError(
+                "OKX account SWAP instruments did not match loaded markets")
+        self._account_swap_instruments = mapped
+        return mapped
 
     @staticmethod
     def _permissions(config: dict) -> set[str]:
@@ -331,6 +474,13 @@ class Exchange:
         try:
             return self.x.create_order(symbol, order_type, side, amount,
                                        price, request)
+        except ccxt.InvalidNonce as exc:
+            raise CredentialError(self._clock_error(exc)) from exc
+        except ccxt.AuthenticationError as exc:
+            raise CredentialError(
+                "OKX rejected the API credentials while placing an order; "
+                "stop the agent and re-run `python main.py check`"
+            ) from exc
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             recovered = self._recover_order(symbol, client_id)
             if recovered:
@@ -540,36 +690,91 @@ class Exchange:
                 pct, non_usdt, total)
         return pct
 
-    def margin_usage_pct(self) -> float | None:
-        """Initial-margin usage from OKX account-level risk fields.
+    def account_risk_metrics(self) -> dict:
+        """Return conservative account-level IMR and MMR measurements.
 
-        CCXT's synthetic USDT ``used / total`` balance can be incorrect for
-        swap accounts. OKX publishes adjusted equity and initial margin
-        directly; use those values and fail closed when they are unavailable.
+        OKX defines ``mgnRatio`` as adjusted equity divided by maintenance
+        margin, with forced liquidation beginning at 1.0.  This agent excludes
+        non-USDT collateral from sizing, so use the smaller of adjusted equity
+        and USDT currency equity for both ratios.  That can only make the guard
+        more conservative than OKX's account-wide calculation.
         """
         bal = self.retry(self.x.fetch_balance)
         rows = (bal.get("info") or {}).get("data") or []
         if not rows:
             raise RuntimeError("OKX account risk fields are unavailable")
         account = rows[0]
+        details = account.get("details") or []
+        usdt_detail = next(
+            (detail for detail in details
+             if str(detail.get("ccy") or "").upper() == "USDT"),
+            None,
+        )
+        usdt_equity = self._usdt_equity_from_balance(bal)
         equity_raw = account.get("adjEq")
         if equity_raw in (None, ""):
             equity_raw = account.get("totalEq")
         imr_raw = account.get("imr")
         if equity_raw not in (None, "") and imr_raw not in (None, ""):
-            # Never let ignored assets make margin usage look safer. adjEq is
-            # USD-denominated, while USDT eq is in USDT and tracks USD closely;
-            # the smaller value is the conservative denominator.
-            equity = min(float(equity_raw),
-                         self._usdt_equity_from_balance(bal))
-            initial_margin = float(imr_raw)
-            if not math.isfinite(equity) or equity <= 0:
-                raise RuntimeError("OKX adjusted equity is not positive")
-            if not math.isfinite(initial_margin) or initial_margin < 0:
-                raise RuntimeError("OKX initial margin is not a finite value")
-            return initial_margin / equity * 100
-        raise RuntimeError(
-            "OKX returned no adjusted-equity/initial-margin measurement")
+            # Multi-currency and portfolio modes expose account-level USD risk.
+            # Never let ignored collateral make the denominator look safer.
+            equity = min(float(equity_raw), usdt_equity)
+            mmr_raw = account.get("mmr")
+            raw_ratio = account.get("mgnRatio")
+            scope = "account_usdt_capped"
+        elif usdt_detail is not None and usdt_detail.get("imr") not in (
+                None, ""):
+            # Single-currency/Futures mode exposes the same fields inside the
+            # USDT detail row rather than at account level.
+            equity = usdt_equity
+            imr_raw = usdt_detail.get("imr")
+            mmr_raw = usdt_detail.get("mmr")
+            raw_ratio = usdt_detail.get("mgnRatio")
+            scope = "usdt_currency"
+        else:
+            raise RuntimeError(
+                "OKX returned no adjusted-equity/initial-margin measurement")
+        initial_margin = float(imr_raw)
+        if not math.isfinite(equity) or equity <= 0:
+            raise RuntimeError("OKX adjusted equity is not positive")
+        if not math.isfinite(initial_margin) or initial_margin < 0:
+            raise RuntimeError("OKX initial margin is not a finite value")
+
+        if mmr_raw in (None, ""):
+            if initial_margin > 0:
+                raise RuntimeError(
+                    "OKX returned no maintenance-margin measurement")
+            maintenance_margin = 0.0
+        else:
+            maintenance_margin = float(mmr_raw)
+        if (not math.isfinite(maintenance_margin)
+                or maintenance_margin < 0):
+            raise RuntimeError(
+                "OKX maintenance margin is not a finite value")
+        maintenance_ratio = (
+            equity / maintenance_margin if maintenance_margin > 0 else None
+        )
+        if raw_ratio in (None, ""):
+            okx_ratio = None
+        else:
+            okx_ratio = float(raw_ratio)
+            if not math.isfinite(okx_ratio) or okx_ratio < 0:
+                raise RuntimeError(
+                    "OKX margin ratio is not a finite value")
+        return {
+            "equity_usdt_basis": equity,
+            "initial_margin_usd": initial_margin,
+            "maintenance_margin_usd": maintenance_margin,
+            "initial_margin_usage_pct": initial_margin / equity * 100,
+            "maintenance_margin_ratio": maintenance_ratio,
+            "okx_margin_ratio": okx_ratio,
+            "risk_scope": scope,
+        }
+
+    def margin_usage_pct(self) -> float:
+        """Compatibility wrapper for callers needing only initial-margin use."""
+        return float(
+            self.account_risk_metrics()["initial_margin_usage_pct"])
 
     def transfers_since(self, since_ms: int) -> tuple[float, int]:
         """Net USDT transferred in/out of the trading account since since_ms.
@@ -899,6 +1104,11 @@ class Exchange:
         try:
             self.retry(self.x.set_leverage, int(leverage), symbol,
                        {"mgnMode": "cross"})
+        except CredentialError:
+            raise
+        except ccxt.ExchangeError as e:
+            raise self._entry_order_rejection(
+                symbol, "set_leverage", e) from e
         except Exception as e:
             raise RuntimeError(f"set_leverage failed for {symbol}: {e}") from e
 
@@ -920,9 +1130,8 @@ class Exchange:
                 symbol, order_type, side, contracts, order_price, params,
                 "okxent")
         except ccxt.ExchangeError as e:
-            raise RuntimeError(
-                f"{symbol} entry rejected with required attached SL/TP; "
-                "no unprotected fallback order was sent") from e
+            raise self._entry_order_rejection(
+                symbol, "attached_entry", e) from e
 
         fill = self.verify_fill(order, symbol, contracts, expected_price)
         position_side = "long" if side == "buy" else "short"
@@ -965,6 +1174,22 @@ class Exchange:
         fill["position_id"] = ((live_position or {}).get("id")
                                or ((live_position or {}).get("info") or {}).get(
                                    "posId"))
+        liquidation_raw = (
+            (live_position or {}).get("liquidationPrice")
+            or ((live_position or {}).get("info") or {}).get("liqPx")
+        )
+        if liquidation_raw in (None, "", "0", 0):
+            liquidation_price = None
+        else:
+            try:
+                liquidation_price = float(liquidation_raw)
+            except (TypeError, ValueError):
+                # The engine treats an invalid available measurement as unsafe
+                # and emergency-closes the already-filled position. Never raise
+                # here and accidentally make a real fill look like no fill.
+                liquidation_price = liquidation_raw
+        fill["liquidation_price"] = liquidation_price
+        fill["mark_price"] = mark
         return fill
 
     def close_position(self, pos: dict) -> dict:
