@@ -102,13 +102,15 @@ class RiskEngine:
                     and blocked_until > time.time()):
                 return None, "symbol in execution failure backoff"
 
-        intent_pct = float(decision.get("size_pct_equity") or 0)
-        if not math.isfinite(intent_pct) or intent_pct < 0:
-            return None, "intended size is not finite"
+        execution_choice = str(
+            decision.get("execution_choice") or "normal")
+        if execution_choice not in {"normal", "retry_smaller"}:
+            return None, "execution choice is invalid"
+        retry_margin_pct = None
 
-        # A first depth rejection is execution feedback, not an immediate
-        # ban. The model may reconsider the setup and explicitly request a
-        # smaller retry. A repeated failure acquires a persisted backoff.
+        # A first depth rejection is execution feedback, not an immediate ban.
+        # The model chooses whether the setup still deserves a smaller retry;
+        # deterministic code chooses the safe retry size.
         feedback = (entry_feedback or {}).get(symbol)
         if feedback is not None:
             if not isinstance(feedback, dict):
@@ -129,13 +131,12 @@ class RiskEngine:
                     return None, "symbol in liquidity backoff"
                 if max_retry_pct <= 0:
                     return None, "liquidity retry has no safe executable size"
-                if intent_pct <= 0:
+                if execution_choice != "retry_smaller":
                     return None, (
-                        "liquidity retry requires an explicit smaller size")
-                if intent_pct > max_retry_pct + 1e-12:
-                    return None, (
-                        "liquidity retry size exceeds "
-                        f"{max_retry_pct:.2f}% equity limit")
+                        "liquidity retry requires retry_smaller approval")
+                retry_margin_pct = max_retry_pct
+        elif execution_choice == "retry_smaller":
+            return None, "no current liquidity rejection supports a retry"
 
         stop_pct = float(decision.get("stop_loss_pct") or 0)
         if not math.isfinite(stop_pct):
@@ -150,12 +151,10 @@ class RiskEngine:
         if take_pct <= 0:
             take_pct = stop_pct * 2
 
-        leverage = float(decision.get("leverage") or 1)
-        if not math.isfinite(leverage):
-            return None, "leverage is not finite"
-        leverage = int(math.floor(max(
-            1.0, min(leverage, float(self.r["max_leverage"]),
-                     HARD_MAX_LEVERAGE))))
+        # Leverage is configured policy, never a model-selected number.
+        leverage = int(min(
+            int(self.r["entry_leverage"]), int(self.r["max_leverage"]),
+            HARD_MAX_LEVERAGE))
 
         price = float(snapshot[symbol]["price"])
         if not math.isfinite(price) or price <= 0:
@@ -201,7 +200,14 @@ class RiskEngine:
             if decision["direction"] == "long"
             else max(0.0, -funding_pct)
         ) * funding_intervals
-        fee_pct = 2 * float(self.costs["taker_fee_pct_per_side"])
+        fee_rate_raw = symbol_data.get("taker_fee_pct_per_side")
+        fee_rate = (
+            float(fee_rate_raw) if fee_rate_raw is not None
+            else float(self.costs["taker_fee_pct_per_side"])
+        )
+        if not math.isfinite(fee_rate) or fee_rate < 0 or fee_rate > 1:
+            return None, "account fee rate is invalid"
+        fee_pct = 2 * fee_rate
         stop_slippage_pct = float(self.costs["expected_stop_slippage_pct"])
         # A fill can occur anywhere inside the exchange-side IOC boundary
         # after the depth snapshot changes. Reserve the whole bounded entry
@@ -224,9 +230,11 @@ class RiskEngine:
         notional = min(notional,
                        equity * float(self.r["max_position_notional_pct"]) / 100.0)
 
-        # Respect the model's own (smaller) intent if it gave one.
-        if intent_pct > 0:
-            notional = min(notional, equity * intent_pct / 100.0 * leverage)
+        if retry_margin_pct is not None:
+            notional = min(
+                notional,
+                equity * retry_margin_pct / 100.0 * leverage,
+            )
 
         # Gross exposure cap across the whole book.
         room = equity * float(self.r["max_gross_exposure_pct"]) / 100.0
@@ -269,8 +277,20 @@ class RiskEngine:
             "entry_slippage_budget_pct": entry_slippage_pct,
             "adverse_funding_pct": adverse_funding_pct,
             "estimated_funding_intervals": funding_intervals,
+            "taker_fee_pct_per_side": fee_rate,
+            "fee_rate_source": symbol_data.get(
+                "fee_rate_source", "configured_fallback"),
             "risk_budget_usd": risk_usd,
             "risk_usd": notional * estimated_loss_pct / 100.0,
             "confidence": confidence,
             "reason": decision.get("reasoning", ""),
+            "strategy_id": decision.get("strategy_id"),
+            "strategy_version": decision.get("strategy_version"),
+            "setup_id": decision.get("setup_id"),
+            "setup_key": decision.get("setup_key"),
+            "setup_type": decision.get("setup_type"),
+            "signal_ts": decision.get("signal_ts"),
+            "exit_policy": decision.get("exit_policy"),
+            "invalidation_anchor": decision.get("invalidation_anchor"),
+            "execution_choice": execution_choice,
         }, None

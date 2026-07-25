@@ -13,6 +13,7 @@ import time
 import numpy as np
 import pandas as pd
 
+from . import strategy
 from .exchange import OKX_CRYPTO_INSTRUMENT_CATEGORY
 
 log = logging.getLogger("market")
@@ -63,6 +64,79 @@ def _funding_interval_hours(rate: dict) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _funding_history_context(ex, symbol: str,
+                             current_rate_pct: float | None) -> dict:
+    """Summarize recent funding without sending raw history to the model."""
+    fetcher = getattr(ex.x, "fetch_funding_rate_history", None)
+    if not callable(fetcher) or current_rate_pct is None:
+        return {
+            "funding_samples_30": 0,
+            "funding_mean_30_pct": None,
+            "funding_percentile_30": None,
+            "funding_change_pct": None,
+        }
+    try:
+        rows = ex.retry(fetcher, symbol, None, 30) or []
+    except Exception:
+        rows = []
+    rates = []
+    for row in rows[-30:]:
+        value = row.get("fundingRate")
+        if value in (None, ""):
+            value = (row.get("info") or {}).get("fundingRate")
+        try:
+            number = float(value) * 100
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            rates.append(number)
+    if not rates:
+        return {
+            "funding_samples_30": 0,
+            "funding_mean_30_pct": None,
+            "funding_percentile_30": None,
+            "funding_change_pct": None,
+        }
+    percentile = (
+        sum(rate <= current_rate_pct for rate in rates) / len(rates) * 100)
+    return {
+        "funding_samples_30": len(rates),
+        "funding_mean_30_pct": round(float(np.mean(rates)), 4),
+        "funding_percentile_30": round(percentile, 1),
+        "funding_change_pct": round(current_rate_pct - rates[-1], 4),
+    }
+
+
+def _open_interest_usd(ex, symbol: str, last: float) -> float | None:
+    fetcher = getattr(ex.x, "fetch_open_interest", None)
+    if not callable(fetcher):
+        return None
+    try:
+        row = ex.retry(fetcher, symbol) or {}
+    except Exception:
+        return None
+    info = row.get("info") or {}
+    for key in ("openInterestValue", "openInterestUsd", "oiUsd"):
+        value = row.get(key)
+        if value in (None, ""):
+            value = info.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number >= 0:
+            return number
+    try:
+        amount = float(row.get("openInterestAmount")
+                       or info.get("oi") or 0)
+        contract_size = float(
+            ex.x.market(symbol).get("contractSize") or 1)
+        value = amount * contract_size * last
+    except (TypeError, ValueError, KeyError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 # ------------------------------------------------------------- indicators
@@ -284,9 +358,13 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
         snap["spread_pct"] = None
     try:
         fr = ex.retry(ex.x.fetch_funding_rate, symbol)
-        snap["funding_rate_pct"] = round(
-            float(fr.get("fundingRate") or 0) * 100, 4
-        )
+        funding_raw = fr.get("fundingRate")
+        if funding_raw in (None, ""):
+            raise ValueError("funding rate unavailable")
+        current_funding = float(funding_raw) * 100
+        if not math.isfinite(current_funding):
+            raise ValueError("funding rate is not finite")
+        snap["funding_rate_pct"] = round(current_funding, 4)
         snap["funding_interval_hours"] = _funding_interval_hours(fr)
         next_funding = fr.get("nextFundingTimestamp")
         snap["next_funding_minutes"] = (
@@ -294,10 +372,41 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
                       / 60_000), 1)
             if next_funding not in (None, "") else None
         )
+        mark = fr.get("markPrice") or (fr.get("info") or {}).get("markPx")
+        index = fr.get("indexPrice") or (fr.get("info") or {}).get("idxPx")
+        mark = float(mark) if mark not in (None, "") else None
+        index = float(index) if index not in (None, "") else None
+        snap["perp_index_basis_pct"] = (
+            round((mark - index) / index * 100, 4)
+            if mark is not None and index is not None and index > 0 else None
+        )
+        snap.update(_funding_history_context(
+            ex, symbol, snap["funding_rate_pct"]))
     except Exception:
         snap["funding_rate_pct"] = None
         snap["funding_interval_hours"] = None
         snap["next_funding_minutes"] = None
+        snap["perp_index_basis_pct"] = None
+        snap.update(_funding_history_context(ex, symbol, None))
+
+    fee_reader = getattr(ex, "taker_fee_pct", None)
+    try:
+        fee_pct = (
+            float(fee_reader(symbol)) if callable(fee_reader)
+            else float(cfg["trading_costs"]["taker_fee_pct_per_side"])
+        )
+        if not math.isfinite(fee_pct) or fee_pct < 0 or fee_pct > 1:
+            raise ValueError("invalid fee rate")
+        snap["taker_fee_pct_per_side"] = round(fee_pct, 6)
+        snap["fee_rate_source"] = (
+            "okx_account" if callable(fee_reader) else "configured_fallback")
+    except Exception:
+        snap["taker_fee_pct_per_side"] = float(
+            cfg["trading_costs"]["taker_fee_pct_per_side"])
+        snap["fee_rate_source"] = "configured_fallback"
+    open_interest = _open_interest_usd(ex, symbol, last)
+    snap["open_interest_musd"] = (
+        round(open_interest / 1e6, 2) if open_interest is not None else None)
 
     for tf, df in frames.items():
         close = df["close"]
@@ -322,6 +431,7 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
         if baseline_atr > 0 else None
 
     df_fast = frames.get("15m", frames[tfs[0]])
+    snap["signal_ts"] = int(df_fast["ts"].iloc[-1])
     snap["mom_1h_pct"] = round(
         float(df_fast["close"].pct_change(4).iloc[-1] * 100), 2
     )
@@ -331,19 +441,49 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     snap["relative_volume_1h"] = round(recent_volume / normal_volume, 2) \
         if normal_volume > 0 else None
 
+    snap.update({
+        "corr_btc_1h_30": None,
+        "corr_btc_1h_72_shrunk": None,
+        "beta_btc_1h_72": None,
+        "corr_btc_downside_1h_72": None,
+        "corr_btc_samples": 0,
+    })
     if benchmark_returns is not None:
         symbol_returns = df_1h.set_index("ts")["close"].pct_change().dropna()
         aligned = pd.concat(
             [symbol_returns.rename("symbol"),
              benchmark_returns.rename("benchmark")],
             axis=1, join="inner",
-        ).dropna().tail(30)
-        if len(aligned) >= 10:
-            corr = aligned["symbol"].corr(aligned["benchmark"])
+        ).dropna()
+        short = aligned.tail(30)
+        if len(short) >= 10:
+            corr = short["symbol"].corr(short["benchmark"])
             snap["corr_btc_1h_30"] = round(float(corr), 2) \
                 if pd.notna(corr) else None
+        robust = aligned.tail(72)
+        if len(robust) >= 24:
+            raw_corr = robust["symbol"].corr(robust["benchmark"])
+            variance = float(robust["benchmark"].var())
+            covariance = float(
+                robust["symbol"].cov(robust["benchmark"]))
+            downside = robust[robust["benchmark"] < 0]
+            downside_corr = (
+                downside["symbol"].corr(downside["benchmark"])
+                if len(downside) >= 10 else None
+            )
+            shrink = len(robust) / (len(robust) + 20)
+            snap["corr_btc_1h_72_shrunk"] = (
+                round(float(raw_corr) * shrink, 2)
+                if pd.notna(raw_corr) else None)
+            snap["beta_btc_1h_72"] = (
+                round(covariance / variance, 2) if variance > 0 else None)
+            snap["corr_btc_downside_1h_72"] = (
+                round(float(downside_corr), 2)
+                if downside_corr is not None and pd.notna(downside_corr)
+                else None)
+            snap["corr_btc_samples"] = len(robust)
         else:
-            snap["corr_btc_1h_30"] = None
+            snap["corr_btc_samples"] = len(robust)
 
     # Structure anchors: recent swing extremes (last 20 fast-frame candles,
     # ~5h on 15m) and distance from the 1h EMA20, so the model can place
@@ -363,6 +503,7 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     # funding and OHLCV adapters can all surface non-finite numeric values.
     snap = _json_safe(snap)
     snap["regime"] = classify_regime(snap)
+    strategy.enrich_snapshot(snap, cfg)
     return snap
 
 

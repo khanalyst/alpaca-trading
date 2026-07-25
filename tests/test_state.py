@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,8 @@ class StateSafetyTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.originals = (
             state.RUNTIME, state.STATE_FILE, state.PID_FILE, state.DB_FILE)
+        self.original_context = state.journal_context()
+        state._JOURNAL_CONTEXT.clear()
         runtime = Path(self.temp.name)
         state.RUNTIME = runtime
         state.STATE_FILE = runtime / "state.json"
@@ -21,6 +24,8 @@ class StateSafetyTests(unittest.TestCase):
     def tearDown(self):
         (state.RUNTIME, state.STATE_FILE, state.PID_FILE,
          state.DB_FILE) = self.originals
+        state._JOURNAL_CONTEXT.clear()
+        state._JOURNAL_CONTEXT.update(self.original_context)
         self.temp.cleanup()
 
     def test_corrupt_state_is_preserved_and_forces_killed(self):
@@ -183,6 +188,99 @@ class StateSafetyTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM events WHERE kind='journal_preflight'"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_legacy_journal_is_migrated_in_place_without_losing_rows(self):
+        state.RUNTIME.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(state.DB_FILE)
+        db.execute(
+            "CREATE TABLE events (ts REAL, kind TEXT, payload TEXT)")
+        db.execute(
+            "CREATE TABLE trades ("
+            "ts REAL, symbol TEXT, side TEXT, action TEXT, qty REAL, "
+            "price REAL, notional REAL, leverage REAL, reason TEXT)")
+        db.execute(
+            "CREATE TABLE equity (ts REAL, equity REAL, state TEXT)")
+        db.execute(
+            "INSERT INTO events VALUES (1, 'legacy', 'kept')")
+        db.execute(
+            "INSERT INTO trades VALUES "
+            "(1, 'BTC/USDT:USDT', 'buy', 'open', 1, 100, 100, 2, 'kept')")
+        db.execute(
+            "INSERT INTO equity VALUES (1, 1000, 'RUNNING')")
+        db.commit()
+        db.close()
+
+        with state._db() as migrated:
+            trade_columns = {
+                row[1] for row in migrated.execute(
+                    "PRAGMA table_info(trades)")}
+            equity_columns = {
+                row[1] for row in migrated.execute(
+                    "PRAGMA table_info(equity)")}
+            self.assertIn("strategy_id", trade_columns)
+            self.assertIn("pnl_semantics", trade_columns)
+            self.assertIn("basis_id", equity_columns)
+            self.assertEqual(
+                migrated.execute(
+                    "SELECT payload FROM events WHERE kind='legacy'"
+                ).fetchone()[0],
+                "kept",
+            )
+            self.assertEqual(
+                migrated.execute(
+                    "SELECT reason FROM trades"
+                ).fetchone()[0],
+                "kept",
+            )
+            self.assertEqual(
+                migrated.execute(
+                    "SELECT value FROM schema_meta "
+                    "WHERE key='journal_schema_version'"
+                ).fetchone()[0],
+                str(state.JOURNAL_SCHEMA_VERSION),
+            )
+
+    def test_journal_context_tags_trade_and_equity_rows(self):
+        state.set_journal_context(
+            run_id="run-a", cycle_id="cycle-a",
+            strategy_id="momentum", strategy_version="v1",
+            prompt_version="p1", config_version="cfg1",
+            code_version="code1", equity_basis_id="basis-a")
+        state.log_trade(
+            "BTC/USDT:USDT", "buy", "open", 1, 100, 100, 2,
+            "test", trade_id="trade-a")
+        state.log_equity(1_000, state.RUNNING)
+
+        with state._db() as db:
+            trade = db.execute(
+                "SELECT run_id, cycle_id, strategy_id, equity_basis_id "
+                "FROM trades").fetchone()
+            equity = db.execute(
+                "SELECT run_id, cycle_id, basis_id FROM equity").fetchone()
+        self.assertEqual(
+            trade, ("run-a", "cycle-a", "momentum", "basis-a"))
+        self.assertEqual(equity, ("run-a", "cycle-a", "basis-a"))
+
+    def test_non_finite_setup_memory_is_rejected(self):
+        invalid = dict(state.DEFAULT)
+        invalid["recent_setups"] = {
+            "setup-a": {
+                "strategy_id": "momentum",
+                "strategy_version": "v1",
+                "setup_key": "key-a",
+                "setup_type": "trend_continuation",
+                "symbol": "BTC/USDT:USDT",
+                "direction": "long",
+                "signal_ts": float("nan"),
+                "first_seen_at": 1.0,
+                "last_seen_at": 1.0,
+                "blocked_until": 0.0,
+                "expires_at": 2.0,
+                "status": "proposed",
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "recent_setups"):
+            state.save_state(invalid)
 
 
 if __name__ == "__main__":

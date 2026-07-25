@@ -55,8 +55,8 @@ def _boolean(block: dict, key: str, path: str) -> bool:
 def validate_config(raw: dict) -> dict:
     """Return a validated defensive copy of *raw* or raise ``ConfigError``."""
     cfg = deepcopy(_mapping(raw, "config"))
-    _keys(cfg, {"mode", "llm", "universe", "cycle", "risk", "execution",
-                "trading_costs", "alerts"}, "config")
+    _keys(cfg, {"mode", "llm", "strategy", "universe", "cycle", "risk",
+                "execution", "trading_costs", "alerts"}, "config")
 
     mode = cfg.get("mode")
     if mode not in {"demo", "live"}:
@@ -70,6 +70,47 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError("llm.model must be a non-empty string")
     _number(llm, "temperature", 0, 2, "llm")
     _integer(llm, "max_tokens", 128, 32000, "llm")
+
+    strategy = _mapping(cfg.get("strategy"), "strategy")
+    _keys(strategy, {
+        "id", "version", "signal_timeframe",
+        "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
+        "setup_memory_hours", "min_stop_atr_multiple",
+        "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
+        "breakout_range_threshold_pct", "breakout_min_relative_volume",
+        "funding_extreme_pct", "fixed_reward_risk",
+        "extended_reward_risk",
+    }, "strategy")
+    for key in ("id", "version", "signal_timeframe"):
+        if (not isinstance(strategy.get(key), str)
+                or not strategy[key].strip()):
+            raise ConfigError(f"strategy.{key} must be a non-empty string")
+    if strategy["id"] != "momentum":
+        raise ConfigError(
+            "strategy.id must be 'momentum' until another isolated strategy "
+            "implementation exists")
+    _boolean(
+        strategy, "allow_experimental_setups_in_demo", "strategy")
+    _number(strategy, "setup_cooldown_minutes", 0, 1440, "strategy")
+    _number(strategy, "setup_memory_hours", 1, 720, "strategy")
+    _number(strategy, "min_stop_atr_multiple", 0.5, 5, "strategy")
+    _number(strategy, "structure_buffer_atr_multiple", 0, 2, "strategy")
+    _number(strategy, "hard_max_entry_extension_atr", 0.5, 10, "strategy")
+    _number(strategy, "breakout_range_threshold_pct", 50, 99, "strategy")
+    _number(strategy, "breakout_min_relative_volume", 0.5, 10, "strategy")
+    _number(strategy, "funding_extreme_pct", 0, 1, "strategy")
+    fixed_rr = _number(
+        strategy, "fixed_reward_risk", 1, 10, "strategy")
+    extended_rr = _number(
+        strategy, "extended_reward_risk", 1, 15, "strategy")
+    if extended_rr < fixed_rr:
+        raise ConfigError(
+            "strategy.extended_reward_risk cannot be below "
+            "fixed_reward_risk")
+    if (float(strategy["setup_memory_hours"]) * 60
+            < float(strategy["setup_cooldown_minutes"])):
+        raise ConfigError(
+            "strategy.setup_memory_hours must cover setup_cooldown_minutes")
 
     universe = _mapping(cfg.get("universe"), "universe")
     _keys(universe, {"top_n", "min_24h_quote_volume_usd",
@@ -97,9 +138,16 @@ def validate_config(raw: dict) -> dict:
     if int(universe["min_history_candles"]) > int(cycle["candles"]):
         raise ConfigError(
             "universe.min_history_candles cannot exceed cycle.candles")
+    if strategy["signal_timeframe"] != "15m":
+        raise ConfigError(
+            "strategy.signal_timeframe must be exactly '15m' for the "
+            "current momentum strategy version")
+    if strategy["signal_timeframe"] not in timeframes:
+        raise ConfigError(
+            "strategy.signal_timeframe must appear in cycle.timeframes")
 
     risk = _mapping(cfg.get("risk"), "risk")
-    _keys(risk, {"max_leverage", "risk_per_trade_pct",
+    _keys(risk, {"max_leverage", "entry_leverage", "risk_per_trade_pct",
                  "max_position_notional_pct", "max_gross_exposure_pct",
                  "max_net_direction_pct", "max_concurrent_positions",
                  "min_confidence", "max_hold_hours", "daily_loss_limit_pct",
@@ -109,6 +157,10 @@ def validate_config(raw: dict) -> dict:
                  "cooldown_minutes_after_loss"},
           "risk")
     _integer(risk, "max_leverage", 1, 10, "risk")
+    _integer(risk, "entry_leverage", 1, 10, "risk")
+    if int(risk["entry_leverage"]) > int(risk["max_leverage"]):
+        raise ConfigError(
+            "risk.entry_leverage cannot exceed risk.max_leverage")
     _number(risk, "risk_per_trade_pct", 0.01, 5, "risk")
     _number(risk, "max_position_notional_pct", 1, 100, "risk")
     _number(risk, "max_gross_exposure_pct", 1, 300, "risk")

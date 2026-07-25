@@ -13,8 +13,30 @@ from tests.helpers import valid_config
 def open_decision(symbol, confidence):
     return {
         "action": "open", "symbol": symbol, "direction": "long",
-        "confidence": confidence, "size_pct_equity": 0, "leverage": 2,
-        "stop_loss_pct": 1.0, "take_profit_pct": 2.0, "reasoning": "",
+        "confidence": confidence,
+        "setup_type": "trend_continuation",
+        "invalidation_anchor": "structure",
+        "exit_policy": "fixed_rr",
+        "execution_choice": "normal",
+        "reasoning": "",
+    }
+
+
+def setup_snapshot(signal_ts):
+    return {
+        "price": 100,
+        "trend_15m": "up",
+        "trend_1h": "up",
+        "trend_4h": "up",
+        "atr_1h_pct": 1.0,
+        "ema20_1h_dist_pct": 0.5,
+        "swing_low_pct": 1.2,
+        "swing_high_pct": 2.5,
+        "range_pos_pct": 70,
+        "relative_volume_1h": 1.2,
+        "mom_1h_pct": 0.5,
+        "funding_rate_pct": 0.0,
+        "signal_ts": signal_ts,
     }
 
 
@@ -41,6 +63,68 @@ class SortedOpensTests(unittest.TestCase):
         self.assertEqual(conflicted, [conflict])
 
 
+class SetupIdempotencyTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = Engine.__new__(Engine)
+        self.engine.cfg = valid_config()
+        self.st = {"recent_setups": {}}
+
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    def test_same_setup_on_same_signal_candle_is_rejected(
+            self, log_event, commit):
+        snapshot = {
+            "BTC/USDT:USDT": setup_snapshot(1_000),
+        }
+        first, why = self.engine._prepare_setup_decision(
+            open_decision("BTC/USDT:USDT", 0.8), snapshot, self.st)
+        duplicate, duplicate_why = self.engine._prepare_setup_decision(
+            open_decision("BTC/USDT:USDT", 0.8), snapshot, self.st)
+
+        self.assertIsNone(why)
+        self.assertIsNotNone(first)
+        self.assertIsNone(duplicate)
+        self.assertEqual(
+            duplicate_why,
+            "symbol already evaluated for this completed signal candle")
+
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    def test_new_candle_is_allowed_until_semantic_cooldown_is_applied(
+            self, log_event, commit):
+        decision = open_decision("BTC/USDT:USDT", 0.8)
+        first, _ = self.engine._prepare_setup_decision(
+            decision, {"BTC/USDT:USDT": setup_snapshot(1_000)}, self.st)
+        second, why = self.engine._prepare_setup_decision(
+            decision, {"BTC/USDT:USDT": setup_snapshot(2_000)}, self.st)
+
+        self.assertIsNone(why)
+        self.assertNotEqual(first["setup_id"], second["setup_id"])
+
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    def test_contract_rejection_is_also_remembered_for_the_signal_candle(
+            self, log_event, commit):
+        snapshot = {"BTC/USDT:USDT": setup_snapshot(1_000)}
+        invalid = open_decision("BTC/USDT:USDT", 0.8)
+        invalid["setup_type"] = "range_breakout"
+
+        first, first_why = self.engine._prepare_setup_decision(
+            invalid, snapshot, self.st)
+        second, second_why = self.engine._prepare_setup_decision(
+            open_decision("BTC/USDT:USDT", 0.8), snapshot, self.st)
+
+        self.assertIsNone(first)
+        self.assertEqual(
+            first_why, "range_breakout evidence contract is not met")
+        self.assertIsNone(second)
+        self.assertEqual(
+            second_why,
+            "symbol already evaluated for this completed signal candle")
+        record = next(iter(self.st["recent_setups"].values()))
+        self.assertEqual(record["status"], "risk_rejected")
+
+
 class SequentialOpenValidationTests(unittest.TestCase):
     @patch("agent.engine.market.market_snapshot")
     @patch("agent.engine.state.log_equity")
@@ -65,8 +149,8 @@ class SequentialOpenValidationTests(unittest.TestCase):
         engine.universe = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
         engine.universe_ts = time.time()
         market_snapshot.return_value = {
-            "BTC/USDT:USDT": {"price": 100},
-            "ETH/USDT:USDT": {"price": 100},
+            "BTC/USDT:USDT": setup_snapshot(1_000),
+            "ETH/USDT:USDT": setup_snapshot(1_000),
         }
         engine.llm = Mock()
         engine.llm.decide.return_value = [
@@ -92,7 +176,16 @@ class SequentialOpenValidationTests(unittest.TestCase):
                 [position["symbol"] for position in positions],
                 gross,
             ))
-            return plans[decision["symbol"]], None
+            return {
+                **plans[decision["symbol"]],
+                **{
+                    key: decision[key] for key in (
+                        "strategy_id", "strategy_version", "setup_id",
+                        "setup_key", "setup_type", "signal_ts", "exit_policy",
+                        "invalidation_anchor",
+                    )
+                },
+            }, None
 
         engine.risk = Mock()
         engine.risk.vet_open.side_effect = vet
@@ -110,6 +203,7 @@ class SequentialOpenValidationTests(unittest.TestCase):
             "opened_at": {},
             "active_trades": {},
             "protection": {},
+            "recent_setups": {},
         }
 
         engine.cycle(st)

@@ -58,7 +58,19 @@ class FakeMarketClient:
         return {
             "fundingRate": 0.0002, "fundingTimestamp": now,
             "nextFundingTimestamp": now + 4 * 3_600_000,
+            "markPrice": 100.1, "indexPrice": 100,
         }
+
+    @staticmethod
+    def fetch_funding_rate_history(symbol, since, limit):
+        return [
+            {"fundingRate": 0.00005 + index * 0.000001}
+            for index in range(limit)
+        ]
+
+    @staticmethod
+    def fetch_open_interest(symbol):
+        return {"openInterestValue": 250_000_000}
 
     def fetch_tickers(self):
         return {symbol: self.fetch_ticker(symbol) for symbol in self.markets}
@@ -86,6 +98,10 @@ class FakeExchange:
             if (market.get("info") or {}).get("accountAvailable", True)
         }
 
+    @staticmethod
+    def taker_fee_pct(symbol):
+        return 0.07
+
 
 class MarketSnapshotTests(unittest.TestCase):
     def test_symbol_snapshot_has_relative_and_regime_context(self):
@@ -93,9 +109,23 @@ class MarketSnapshotTests(unittest.TestCase):
         snap = symbol_snapshot(FakeExchange(), "ETH/USDT:USDT", cfg)
         for field in ("spread_pct", "relative_volume_1h", "atr_1h_ratio",
                       "regime", "funding_interval_hours",
-                      "next_funding_minutes"):
+                      "next_funding_minutes", "funding_percentile_30",
+                      "perp_index_basis_pct", "open_interest_musd",
+                      "taker_fee_pct_per_side", "signal_ts",
+                      "setup_evidence"):
             self.assertIn(field, snap)
         self.assertGreater(snap["relative_volume_1h"], 1)
+        self.assertEqual(snap["fee_rate_source"], "okx_account")
+
+    def test_missing_funding_is_unavailable_instead_of_fabricated_zero(self):
+        exchange = FakeExchange()
+        exchange.x.fetch_funding_rate = lambda symbol: {}
+
+        snap = symbol_snapshot(
+            exchange, "ETH/USDT:USDT", valid_config())
+
+        self.assertIsNone(snap["funding_rate_pct"])
+        self.assertEqual(snap["funding_samples_30"], 0)
 
     def test_btc_context_exists_even_when_btc_is_not_tradable(self):
         cfg = valid_config()
@@ -107,6 +137,10 @@ class MarketSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(context["regime"])
         self.assertIsNotNone(context["atr_1h_ratio"])
         self.assertIsNotNone(snap["ETH/USDT:USDT"]["corr_btc_1h_30"])
+        self.assertIsNotNone(
+            snap["ETH/USDT:USDT"]["corr_btc_1h_72_shrunk"])
+        self.assertGreaterEqual(
+            snap["ETH/USDT:USDT"]["corr_btc_samples"], 24)
 
     def test_all_up_history_reads_rsi_100_not_nan(self):
         # The fake client's closes rise monotonically: no down moves at all.

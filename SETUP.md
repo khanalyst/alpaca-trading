@@ -341,6 +341,10 @@ defaults. Here's what each block controls, so you know where to change what:
 - **`llm`** — which AI provider and model, and how creative it is
   (`temperature`). Default is Anthropic Sonnet 4.6, which is a good balance
   of cost and quality.
+- **`strategy`** — the isolated, versioned momentum contract. The LLM chooses
+  whether a setup exists, its direction, label, invalidation anchor and exit
+  policy. Code derives the numeric stop/target, enforces the no-chase limit,
+  and remembers each evaluated 15-minute signal candle across restarts.
 - **`universe`** — which coins it's allowed to trade: the top `top_n` by
   volume above a dollar floor that also pass OKX's private account catalogue,
   crypto-category, USDT-settlement, active-market, and completed-history
@@ -351,11 +355,12 @@ defaults. Here's what each block controls, so you know where to change what:
   5 minutes) and which candle timeframes it looks at. **Raising
   `interval_seconds` is the biggest cost saver** (600 = every 10 min = half
   the AI bill).
-- **`risk`** — how aggressive it is (leverage, risk per trade, how many
-  positions, exposure caps) and its safety brakes (daily loss limit, max
-  drawdown, margin guard). See the "Configuration reference" and "How the
-  agent thinks" sections in the [README](README.md) for exactly what each
-  parameter does and how they interact.
+- **`risk`** — how aggressive it is (`entry_leverage`, risk per trade, how
+  many positions, exposure caps) and its safety brakes (daily loss limit, max
+  drawdown, margin guard). The LLM cannot choose leverage or position size.
+  See the "Configuration reference" and "How the agent thinks" sections in
+  the [README](README.md) for exactly what each parameter does and how they
+  interact.
 - **`execution`** — stale-price, spread and order-book-depth caps plus the
   timeout used to verify actual and partial IOC fills. The IOC slippage cap is
   reserved in deterministic risk sizing. A depth rejection is shown to the
@@ -364,8 +369,8 @@ defaults. Here's what each block controls, so you know where to change what:
   backoff; every retry still has to pass a fresh order-book check. Other OKX
   entry failures preserve the safe code/message and create a separate
   persistent exponential backoff.
-- **`trading_costs`** — expected taker fees, stop slippage and funding holding
-  time used by both the LLM and deterministic all-in risk sizing.
+- **`trading_costs`** — fallback taker fee, stop slippage and funding holding
+  time. The authenticated OKX account taker fee is used when available.
 - **`alerts`** — generic, Slack or Discord webhooks. They are optional in demo
   and mandatory in live; put the URL in the named `.env` variable.
 
@@ -510,8 +515,12 @@ and a SQLite journal. All commands run from inside the repo folder.
   ./.venv/bin/python report.py
   ```
 
-  Shows transfer-adjusted equity, trade-ID-matched net USDT, notional- and
-  risk-weighted results, recorded costs, and confidence calibration.
+  Shows transfer-adjusted equity separately for each valuation-basis segment,
+  trade-ID-matched net USDT, expectancy, profit factor, R-multiples, fees,
+  funding, signed/adverse slippage and synthetic drawdown by strategy/setup.
+  It also separates prompt/config/code variants and shows universe exclusions
+  and underlying OKX rejection codes. Open and unmatched trades stay out of
+  realized performance.
 
 For built-in alerts, set `alerts.enabled: true`, choose `generic`, `slack`, or
 `discord`, and set `ALERT_WEBHOOK_URL` in `.env`. Alerts cover circuit breakers,

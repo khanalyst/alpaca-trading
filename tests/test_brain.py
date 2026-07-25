@@ -73,15 +73,21 @@ class OpenAITemperatureFallbackTests(unittest.TestCase):
 
 
 class ModelOutputValidationTests(unittest.TestCase):
-    def test_non_finite_model_numbers_are_replaced_with_safe_defaults(self):
+    def test_non_finite_confidence_is_safe_and_numeric_risk_fields_are_ignored(self):
         decisions = parse_decisions(
             '{"decisions":[{"action":"open",'
             '"symbol":"BTC/USDT:USDT","direction":"long",'
             '"confidence":NaN,"leverage":Infinity,'
-            '"stop_loss_pct":2,"take_profit_pct":4}]}'
+            '"stop_loss_pct":2,"take_profit_pct":4,'
+            '"setup_type":"trend_continuation",'
+            '"invalidation_anchor":"structure",'
+            '"exit_policy":"fixed_rr","execution_choice":"normal"}]}'
         )
         self.assertEqual(decisions[0]["confidence"], 0)
-        self.assertEqual(decisions[0]["leverage"], 1)
+        self.assertNotIn("leverage", decisions[0])
+        self.assertNotIn("stop_loss_pct", decisions[0])
+        self.assertEqual(
+            decisions[0]["setup_type"], "trend_continuation")
 
 
 class LLMAuditTests(unittest.TestCase):

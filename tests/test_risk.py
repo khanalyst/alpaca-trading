@@ -119,33 +119,35 @@ class VetOpenSymbolTests(unittest.TestCase):
             cfg["execution"]["max_order_book_slippage_pct"],
         )
 
-    def test_liquidity_retry_requires_explicit_smaller_size(self):
+    def test_liquidity_retry_requires_model_approval(self):
         plan, why = self.risk.vet_open(
             decision(), 10_000, [], snapshot(), {}, 0,
             liquidity_feedback())
         self.assertIsNone(plan)
         self.assertEqual(
-            why, "liquidity retry requires an explicit smaller size")
+            why, "liquidity retry requires retry_smaller approval")
 
-    def test_explicit_reduced_liquidity_retry_is_allowed(self):
+    def test_approved_liquidity_retry_is_sized_by_code(self):
         plan, why = self.risk.vet_open(
-            decision(size_pct_equity=4), 10_000, [], snapshot(), {}, 0,
+            decision(execution_choice="retry_smaller"),
+            10_000, [], snapshot(), {}, 0,
             liquidity_feedback())
         self.assertIsNone(why)
         self.assertIsNotNone(plan)
-        self.assertLessEqual(plan["margin_pct_equity"], 4)
+        self.assertLessEqual(plan["margin_pct_equity"], 5)
 
-    def test_oversized_liquidity_retry_is_rejected(self):
+    def test_retry_choice_without_current_feedback_is_rejected(self):
         plan, why = self.risk.vet_open(
-            decision(size_pct_equity=6), 10_000, [], snapshot(), {}, 0,
-            liquidity_feedback())
+            decision(execution_choice="retry_smaller"),
+            10_000, [], snapshot(), {}, 0)
         self.assertIsNone(plan)
         self.assertEqual(
-            why, "liquidity retry size exceeds 5.00% equity limit")
+            why, "no current liquidity rejection supports a retry")
 
     def test_liquidity_backoff_blocks_same_direction(self):
         plan, why = self.risk.vet_open(
-            decision(size_pct_equity=4), 10_000, [], snapshot(), {}, 0,
+            decision(execution_choice="retry_smaller"),
+            10_000, [], snapshot(), {}, 0,
             liquidity_feedback(blocked_until=time.time() + 900))
         self.assertIsNone(plan)
         self.assertEqual(why, "symbol in liquidity backoff")
@@ -168,6 +170,20 @@ class VetOpenSymbolTests(unittest.TestCase):
             decision(), 10_000, [], snapshot(), {}, 0, {}, failures)
         self.assertIsNone(plan)
         self.assertEqual(why, "symbol in execution failure backoff")
+
+    def test_model_cannot_change_configured_leverage(self):
+        plan, why = self.risk.vet_open(
+            decision(leverage=10_000), 10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertEqual(plan["leverage"], 2)
+
+    def test_account_fee_rate_overrides_configured_fallback(self):
+        market = snapshot()
+        market["BTC/USDT:USDT"]["taker_fee_pct_per_side"] = 0.08
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], market, {}, 0)
+        self.assertIsNone(why)
+        self.assertEqual(plan["taker_fee_pct_per_side"], 0.08)
 
 
 if __name__ == "__main__":

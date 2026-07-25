@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from . import brain, market, state
+from . import brain, market, state, strategy
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
                        EntryOrderRejected, Exchange)
@@ -40,6 +40,19 @@ MAX_CREDENTIAL_FAILURES = 3
 class Engine:
     def __init__(self, cfg: dict, light: bool = False):
         self.cfg = cfg
+        self.run_id = state.new_run_id()
+        self.config_version = state.stable_fingerprint(cfg)
+        self.code_version = state.code_fingerprint()
+        self.prompt_version = brain.PROMPT_VERSION
+        self.strategy_id, self.strategy_version = strategy.identity(cfg)
+        state.set_journal_context(
+            run_id=self.run_id,
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            prompt_version=self.prompt_version,
+            config_version=self.config_version,
+            code_version=self.code_version,
+        )
         self.alerts = AlertManager(cfg)
         if not light:
             state.check_journal()
@@ -69,7 +82,36 @@ class Engine:
             raise RuntimeError(
                 "another agent loop already holds the run lock"
                 + (f" (pid {pid})" if pid else ""))
+        if not hasattr(self, "run_id"):
+            self.run_id = state.new_run_id()
+        if not hasattr(self, "strategy_id"):
+            self.strategy_id, self.strategy_version = strategy.identity(
+                self.cfg)
+        if not hasattr(self, "prompt_version"):
+            self.prompt_version = brain.PROMPT_VERSION
+        if not hasattr(self, "config_version"):
+            self.config_version = state.stable_fingerprint(self.cfg)
+        if not hasattr(self, "code_version"):
+            self.code_version = state.code_fingerprint()
+        state.set_journal_context(
+            run_id=self.run_id,
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            prompt_version=self.prompt_version,
+            config_version=self.config_version,
+            code_version=self.code_version,
+        )
         st = state.load_state()
+        state.log_run(
+            self.run_id,
+            mode=self.cfg["mode"],
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            model=self.cfg["llm"]["model"],
+            prompt_version=self.prompt_version,
+            config_version=self.config_version,
+            code_version=self.code_version,
+        )
         if "state file was corrupt" in str(st.get("kill_reason") or ""):
             self.alerts.send(
                 "critical", "corrupt_state_kill",
@@ -198,12 +240,27 @@ class Engine:
         so the first cycle resets both references before any breaker runs.
         """
         if st.get("equity_basis") == state.EQUITY_BASIS:
-            return False
+            if st.get("equity_basis_id"):
+                state.set_journal_context(
+                    equity_basis_id=st["equity_basis_id"])
+                return False
+            st["equity_basis_id"] = state.new_equity_basis_id()
+            state.set_journal_context(
+                equity_basis_id=st["equity_basis_id"])
+            state.log_event("equity_basis_segment_started", json.dumps({
+                "basis": state.EQUITY_BASIS,
+                "basis_id": st["equity_basis_id"],
+                "reason": "existing USDT basis assigned a segment ID",
+            }))
+            return True
         previous = {
             "high_water_mark": st.get("high_water_mark"),
             "day_start_equity": st.get("day_start_equity"),
         }
         st["equity_basis"] = state.EQUITY_BASIS
+        st["equity_basis_id"] = state.new_equity_basis_id()
+        state.set_journal_context(
+            equity_basis_id=st["equity_basis_id"])
         st["high_water_mark"] = equity
         st["day_start_equity"] = equity
         st["day"] = datetime.fromtimestamp(
@@ -214,6 +271,7 @@ class Engine:
         st["last_ledger_ts"] = int(now * 1000)
         state.log_event("equity_basis_migration", json.dumps({
             "basis": state.EQUITY_BASIS,
+            "basis_id": st["equity_basis_id"],
             "previous": previous,
             "rebased_usdt_equity": equity,
         }))
@@ -224,6 +282,10 @@ class Engine:
 
     def cycle(self, st: dict) -> None:
         now = time.time()
+        state.set_journal_context(
+            cycle_id=state.new_cycle_id(),
+            equity_basis_id=st.get("equity_basis_id"),
+        )
         # A host that booted with a good clock can still drift into OKX's
         # 30s signing window later; warn before it starts rejecting orders.
         self.ex.recheck_clock_if_due()
@@ -291,6 +353,8 @@ class Engine:
             for symbol, failure in (st.get("entry_failures") or {}).items()
             if float(failure.get("expires_at") or 0) > now
         }
+        st["recent_setups"] = strategy.prune_records(
+            st.get("recent_setups") or {}, now)
 
         # --- deposits / withdrawals: rebase benchmarks, never trade on them
         since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
@@ -319,7 +383,8 @@ class Engine:
         if not st.get("high_water_mark"):
             st["high_water_mark"] = equity
         st["high_water_mark"] = max(st["high_water_mark"], equity)
-        state.log_equity(equity, st["state"])
+        state.log_equity(
+            equity, st["state"], st.get("equity_basis_id"))
 
         # --- circuit breakers
         r = self.cfg["risk"]
@@ -449,24 +514,48 @@ class Engine:
             latest = state.load_state()
             if latest["state"] != state.RUNNING:
                 return
-            plan, why = self.risk.vet_open(d, equity, positions, snapshot,
-                                           st.get("cooldowns", {}), gross,
-                                           st.get("entry_feedback", {}),
-                                           st.get("entry_failures", {}))
-            if not plan:
+            prepared, why = self._prepare_setup_decision(
+                d, snapshot, st)
+            if not prepared:
                 log.info("Rejected %s %s: %s", d.get("direction"),
                          d.get("symbol"), why)
                 state.log_event("rejected", json.dumps(
                     {"symbol": d.get("symbol"), "why": why}))
+                continue
+            plan, why = self.risk.vet_open(
+                prepared, equity, positions, snapshot,
+                                           st.get("cooldowns", {}), gross,
+                                           st.get("entry_feedback", {}),
+                                           st.get("entry_failures", {}))
+            if not plan:
+                self._mark_setup_status(
+                    st, prepared["setup_id"], "risk_rejected")
+                log.info("Rejected %s %s: %s", prepared.get("direction"),
+                         prepared.get("symbol"), why)
+                state.log_event("rejected", json.dumps(
+                    {"symbol": prepared.get("symbol"), "why": why,
+                     "setup_id": prepared["setup_id"]}),
+                    setup_id=prepared["setup_id"])
                 if str(why).startswith("liquidity retry"):
                     self._backoff_ignored_liquidity_feedback(
-                        st, d.get("symbol"), str(why))
+                        st, prepared.get("symbol"), str(why))
                 continue
+            plan["entry_equity_usd"] = equity
+            self._mark_setup_status(
+                st, plan["setup_id"], "attempted")
             if self._execute_open(plan, st):
+                self._mark_setup_status(
+                    st, plan["setup_id"], "opened")
                 gross += plan["notional"]
                 positions.append({"symbol": plan["symbol"],
                                   "notional": plan["notional"],
                                   "side": plan["direction"]})
+            else:
+                setup_record = (st.get("recent_setups") or {}).get(
+                    plan["setup_id"]) or {}
+                if setup_record.get("status") != "closed":
+                    self._mark_setup_status(
+                        st, plan["setup_id"], "execution_rejected")
         state.commit(st)
 
     # ------------------------------------------------------ reconciliation
@@ -573,14 +662,19 @@ class Engine:
                 # realized share (which covered their exit fee and entry-fee
                 # portion); the final close row carries only the remainder so
                 # summing a trade's rows never double-counts.
-                realized -= float(trade.get("partial_realized_pnl_usd") or 0)
+                partial_realized = float(
+                    trade.get("partial_realized_pnl_usd") or 0)
+                realized -= partial_realized
+                total_realized = partial_realized + realized
                 if summary.get("status") == "fill_history_funding_unavailable":
                     self.alerts.send(
                         "warning", "funding_reconciliation_incomplete",
                         f"Funding could not be recovered for {symbol}",
                         {"trade_id": trade.get("trade_id")})
                 entry_notional = float(trade.get("entry_notional") or 0)
-                pnl_pct = realized / entry_notional * 100 if entry_notional else None
+                pnl_pct = (
+                    total_realized / entry_notional * 100
+                    if entry_notional else None)
                 state.log_trade(
                     symbol,
                     "sell" if trade["direction"] == "long" else "buy",
@@ -594,15 +688,32 @@ class Engine:
                     realized_pnl_usd=realized,
                     risk_usd=trade.get("risk_usd"),
                     fill_status=summary.get("status"),
+                    funding_status=(
+                        "unavailable"
+                        if summary.get("status")
+                        == "fill_history_funding_unavailable"
+                        else "available"),
+                    strategy_id=trade.get("strategy_id"),
+                    strategy_version=trade.get("strategy_version"),
+                    setup_id=trade.get("setup_id"),
+                    setup_key=trade.get("setup_key"),
+                    setup_type=trade.get("setup_type"),
+                    signal_ts=trade.get("signal_ts"),
+                    exit_policy=trade.get("exit_policy"),
+                    invalidation_anchor=trade.get("invalidation_anchor"),
                 )
-                if realized < 0:
+                if total_realized < 0:
                     cooldown = float(
                         self.cfg["risk"]["cooldown_minutes_after_loss"])
                     cooldowns[symbol] = time.time() + cooldown * 60
                 state.log_event("reconciled_close", json.dumps({
                     "symbol": symbol, "trade_id": trade.get("trade_id"),
-                    "realized_pnl_usd": realized,
-                }))
+                    "incremental_realized_pnl_usd": realized,
+                    "total_realized_pnl_usd": total_realized,
+                    "setup_id": trade.get("setup_id"),
+                }), setup_id=trade.get("setup_id"))
+                self._mark_setup_status(
+                    st, trade.get("setup_id"), "closed", cooldown=True)
                 active.pop(symbol, None)
                 protection.pop(symbol, None)
                 opened_at.pop(symbol, None)
@@ -662,13 +773,25 @@ class Engine:
                     "partial_realized_pnl_usd": 0.0,
                     "risk_usd": None,
                     "adopted": True,
+                    "strategy_id": "external",
+                    "strategy_version": "adopted-v1",
+                    "setup_type": "adopted",
+                    "run_id": getattr(
+                        self, "run_id", state.journal_context().get("run_id")
+                        or "unknown-run"),
+                    "cycle_id": state.journal_context().get("cycle_id"),
                 }
                 opened_at[symbol] = active[symbol]["opened_at"]
                 state.log_trade(
                     symbol, "buy" if direction == "long" else "sell", "open",
                     contracts, entry, notional, pos.get("leverage") or 0,
                     "position adopted during startup reconciliation",
-                    trade_id=trade_id, fill_status="adopted")
+                    trade_id=trade_id, fill_status="adopted",
+                    funding_status="unknown",
+                    strategy_id="external",
+                    strategy_version="adopted-v1",
+                    setup_type="adopted",
+                    entry_equity_usd=None)
                 protection[symbol] = {
                     "side": direction, "contracts": contracts,
                     "sl_price": status.get("stop_price"),
@@ -870,6 +993,9 @@ class Engine:
                 "classification": "transient",
                 "error_code": None,
                 "error_message": Exchange._safe_exchange_error_text(exc),
+                "http_status": None,
+                "result_rows": [],
+                "order_audit": getattr(exc, "_order_audit", None),
             }
         )
         classification = str(
@@ -916,7 +1042,17 @@ class Engine:
         records[symbol] = record
         state.log_event(
             "entry_execution_failed",
-            self._audit_json({"symbol": symbol, **record}),
+            self._audit_json({
+                "symbol": symbol,
+                **record,
+                "diagnostics": {
+                    "http_status": details.get("http_status"),
+                    "result_rows": details.get("result_rows") or [],
+                    "order_audit": details.get("order_audit"),
+                },
+                "setup_id": plan.get("setup_id"),
+            }),
+            setup_id=plan.get("setup_id"),
         )
         state.commit(st)
         log.warning(
@@ -1065,6 +1201,18 @@ class Engine:
             "entry_fee_remaining_usd": float(execution.get("fee_usd") or 0),
             "partial_realized_pnl_usd": 0.0,
             "risk_usd": risk_usd,
+            "strategy_id": plan.get("strategy_id"),
+            "strategy_version": plan.get("strategy_version"),
+            "setup_id": plan.get("setup_id"),
+            "setup_key": plan.get("setup_key"),
+            "setup_type": plan.get("setup_type"),
+            "signal_ts": plan.get("signal_ts"),
+            "exit_policy": plan.get("exit_policy"),
+            "invalidation_anchor": plan.get("invalidation_anchor"),
+            "run_id": getattr(
+                self, "run_id", state.journal_context().get("run_id")
+                or "unknown-run"),
+            "cycle_id": state.journal_context().get("cycle_id"),
         }
         st.setdefault("protection", {})[symbol] = {
             "side": plan["direction"],
@@ -1091,7 +1239,41 @@ class Engine:
                 risk_usd=risk_usd,
                 fill_status=("partial" if execution.get("partial") else
                              execution.get("status")),
-                slippage_usd=execution.get("slippage_usd") or 0)
+                slippage_usd=execution.get("slippage_usd") or 0,
+                adverse_slippage_usd=execution.get(
+                    "adverse_slippage_usd") or 0,
+                funding_status="not_applicable",
+                strategy_id=plan.get("strategy_id"),
+                strategy_version=plan.get("strategy_version"),
+                setup_id=plan.get("setup_id"),
+                setup_key=plan.get("setup_key"),
+                setup_type=plan.get("setup_type"),
+                signal_ts=plan.get("signal_ts"),
+                exit_policy=plan.get("exit_policy"),
+                invalidation_anchor=plan.get("invalidation_anchor"),
+                entry_equity_usd=plan.get("entry_equity_usd"))
+            state.log_event(
+                "order_execution",
+                self._audit_json({
+                    "symbol": symbol,
+                    "stage": "entry",
+                    "trade_id": trade_id,
+                    "setup_id": plan.get("setup_id"),
+                    "order_id": execution.get("order_id"),
+                    "client_order_id": execution.get("client_order_id"),
+                    "status": execution.get("status"),
+                    "requested": execution.get("requested"),
+                    "filled": execution.get("filled"),
+                    "average": execution.get("average"),
+                    "fee_usd": execution.get("fee_usd"),
+                    "implementation_shortfall_usd": execution.get(
+                        "slippage_usd"),
+                    "adverse_slippage_usd": execution.get(
+                        "adverse_slippage_usd"),
+                    "submission_audit": execution.get("submission_audit"),
+                }),
+                setup_id=plan.get("setup_id"),
+            )
         except Exception as exc:
             persistence_error = (
                 exc if isinstance(exc, state.JournalError) else
@@ -1249,7 +1431,20 @@ class Engine:
                 fee_usd=exit_fee, realized_pnl_usd=partial_realized,
                 risk_usd=trade.get("risk_usd"),
                 fill_status="partial",
-                slippage_usd=execution.get("slippage_usd") or 0)
+                slippage_usd=execution.get("slippage_usd") or 0,
+                adverse_slippage_usd=execution.get(
+                    "adverse_slippage_usd") or 0,
+                funding_status="deferred",
+                strategy_id=trade.get("strategy_id"),
+                strategy_version=trade.get("strategy_version"),
+                setup_id=trade.get("setup_id"),
+                setup_key=trade.get("setup_key"),
+                setup_type=trade.get("setup_type"),
+                signal_ts=trade.get("signal_ts"),
+                exit_policy=trade.get("exit_policy"),
+                invalidation_anchor=trade.get("invalidation_anchor"))
+            self._log_order_execution(
+                symbol, "partial_close", execution, trade)
             state.commit(st)
             return False
 
@@ -1261,36 +1456,73 @@ class Engine:
             "entry_fee_remaining_usd", trade.get("entry_fee_usd") or 0))
         exit_fee = float(execution.get("fee_usd") or 0)
         funding_raw = (pos.get("info") or {}).get("fundingFee")
+        funding_status = "available"
         if funding_raw in (None, "") and trade.get("opened_at"):
             funding_raw = self.ex.funding_since(
                 symbol, int(float(trade["opened_at"]) * 1000))
-        funding = float(funding_raw or 0)
+        if funding_raw is None:
+            funding_status = "unavailable"
+            funding = 0.0
+            state.log_event(
+                "funding_reconciliation_incomplete",
+                self._audit_json({
+                    "symbol": symbol,
+                    "trade_id": trade.get("trade_id"),
+                    "setup_id": trade.get("setup_id"),
+                }),
+                setup_id=trade.get("setup_id"),
+            )
+            self.alerts.send(
+                "warning", "funding_reconciliation_incomplete",
+                f"Funding could not be recovered for {symbol}",
+                {"trade_id": trade.get("trade_id")})
+        else:
+            funding = float(funding_raw)
         contract_size = float(
             self.ex.x.market(symbol).get("contractSize") or 1)
         move = price - entry_price
         gross_pnl = move * qty * contract_size * (
             1 if direction == "long" else -1)
-        realized = (float(trade.get("partial_realized_pnl_usd") or 0)
-                    + gross_pnl - entry_fee - exit_fee + funding)
-        pnl_pct = realized / entry_notional * 100 if entry_notional else None
+        final_realized = gross_pnl - entry_fee - exit_fee + funding
+        total_realized = (
+            float(trade.get("partial_realized_pnl_usd") or 0)
+            + final_realized
+        )
+        pnl_pct = (
+            total_realized / entry_notional * 100
+            if entry_notional else None)
         state.log_trade(
             symbol, "sell" if direction == "long" else "buy", "close", qty,
             price, entry_notional, float(pos.get("leverage") or 0), reason,
             pnl_pct=pnl_pct, trade_id=trade.get("trade_id"),
             order_id=execution.get("order_id"), fee_usd=exit_fee,
-            funding_usd=funding, realized_pnl_usd=realized,
+            funding_usd=funding, realized_pnl_usd=final_realized,
             risk_usd=trade.get("risk_usd"),
             fill_status=execution.get("status"),
-            slippage_usd=execution.get("slippage_usd") or 0)
-        if realized < 0:
+            slippage_usd=execution.get("slippage_usd") or 0,
+            adverse_slippage_usd=execution.get(
+                "adverse_slippage_usd") or 0,
+            funding_status=funding_status,
+            strategy_id=trade.get("strategy_id"),
+            strategy_version=trade.get("strategy_version"),
+            setup_id=trade.get("setup_id"),
+            setup_key=trade.get("setup_key"),
+            setup_type=trade.get("setup_type"),
+            signal_ts=trade.get("signal_ts"),
+            exit_policy=trade.get("exit_policy"),
+            invalidation_anchor=trade.get("invalidation_anchor"))
+        self._log_order_execution(symbol, "close", execution, trade)
+        if total_realized < 0:
             cooldown = float(self.cfg["risk"]["cooldown_minutes_after_loss"])
             st.setdefault("cooldowns", {})[symbol] = time.time() + cooldown * 60
+        self._mark_setup_status(
+            st, trade.get("setup_id"), "closed", cooldown=True)
         st.get("opened_at", {}).pop(symbol, None)
         st.get("active_trades", {}).pop(symbol, None)
         st.get("protection", {}).pop(symbol, None)
         state.commit(st)
         log.info("CLOSED %s (%s, %+.2f USDT realized): %s",
-                 symbol, direction, realized, reason)
+                 symbol, direction, total_realized, reason)
         return True
 
     # --------------------------------------------------------- housekeeping
@@ -1389,6 +1621,118 @@ class Engine:
         payload = self.llm.call_audit()
         if payload is not None:
             state.log_event("llm_output", self._audit_json(payload))
+
+    def _log_order_execution(
+            self, symbol: str, stage: str,
+            execution: dict, trade: dict) -> None:
+        state.log_event(
+            "order_execution",
+            self._audit_json({
+                "symbol": symbol,
+                "stage": stage,
+                "trade_id": trade.get("trade_id"),
+                "setup_id": trade.get("setup_id"),
+                "order_id": execution.get("order_id"),
+                "client_order_id": execution.get("client_order_id"),
+                "status": execution.get("status"),
+                "requested": execution.get("requested"),
+                "filled": execution.get("filled"),
+                "average": execution.get("average"),
+                "fee_usd": execution.get("fee_usd"),
+                "implementation_shortfall_usd": execution.get(
+                    "slippage_usd"),
+                "adverse_slippage_usd": execution.get(
+                    "adverse_slippage_usd"),
+                "submission_audit": execution.get("submission_audit"),
+            }),
+            setup_id=trade.get("setup_id"),
+        )
+
+    def _prepare_setup_decision(
+            self, decision: dict, snapshot: dict,
+            st: dict) -> tuple[dict | None, str | None]:
+        symbol = decision.get("symbol")
+        symbol_snapshot = snapshot.get(symbol)
+        if not isinstance(symbol_snapshot, dict):
+            return None, "symbol not in current snapshot"
+        records = st.setdefault("recent_setups", {})
+        probe = strategy.signal_probe(
+            decision, symbol_snapshot, self.cfg)
+        if (probe is not None
+                and strategy.evaluated_signal(records, probe) is not None):
+            return None, (
+                "symbol already evaluated for this completed signal candle")
+        prepared, why = strategy.build_setup_plan(
+            decision, symbol_snapshot, self.cfg)
+        if prepared is None:
+            if probe is not None:
+                record = strategy.new_setup_record(
+                    probe, self.cfg)
+                strategy.mark_setup(
+                    record, "risk_rejected", self.cfg)
+                records[probe["setup_id"]] = record
+                state.log_event(
+                    "setup_status",
+                    self._audit_json({
+                        "setup_id": probe["setup_id"],
+                        "status": "risk_rejected",
+                        "symbol": symbol,
+                        "signal_ts": probe["signal_ts"],
+                        "why": why,
+                    }),
+                    setup_id=probe["setup_id"],
+                )
+                state.commit(st)
+            return None, why
+        setup_id = prepared["setup_id"]
+        blocked = strategy.semantic_block(
+            records, prepared["setup_key"])
+        if blocked is not None:
+            remaining = max(
+                0.0, float(blocked["blocked_until"]) - time.time()) / 60
+            return None, (
+                "semantically identical setup is cooling down for "
+                f"{remaining:.1f} more minute(s)")
+        records[setup_id] = strategy.new_setup_record(
+            prepared, self.cfg)
+        state.log_event(
+            "setup_proposed",
+            self._audit_json({
+                "setup_id": setup_id,
+                "setup_key": prepared["setup_key"],
+                "symbol": symbol,
+                "direction": prepared["direction"],
+                "setup_type": prepared["setup_type"],
+                "signal_ts": prepared["signal_ts"],
+                "invalidation_anchor": prepared["invalidation_anchor"],
+                "exit_policy": prepared["exit_policy"],
+                "execution_choice": prepared["execution_choice"],
+            }),
+            setup_id=setup_id,
+        )
+        state.commit(st)
+        return prepared, None
+
+    def _mark_setup_status(
+            self, st: dict, setup_id: str | None, status: str,
+            *, cooldown: bool = False) -> None:
+        if not setup_id:
+            return
+        record = (st.setdefault("recent_setups", {}).get(setup_id))
+        if not isinstance(record, dict):
+            return
+        strategy.mark_setup(
+            record, status, self.cfg, apply_cooldown=cooldown)
+        state.log_event(
+            "setup_status",
+            self._audit_json({
+                "setup_id": setup_id,
+                "status": status,
+                "blocked_until": record.get("blocked_until"),
+            }),
+            setup_id=setup_id,
+        )
+        state.commit(st)
 
     @staticmethod
     def _sorted_opens(decisions: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -1503,8 +1847,17 @@ class Engine:
             "post_loss_cooldowns": post_loss_cooldowns,
             "recent_entry_feedback": entry_feedback,
             "recent_entry_failures": entry_failures,
+            "recent_setup_memory": strategy.recent_setup_view(
+                st.get("recent_setups") or {}, now),
+            "strategy": {
+                "id": getattr(
+                    self, "strategy_id", strategy.identity(self.cfg)[0]),
+                "version": getattr(
+                    self, "strategy_version", strategy.identity(self.cfg)[1]),
+            },
             "hard_limits_fyi": {
                 "max_leverage": r["max_leverage"],
+                "entry_leverage": r["entry_leverage"],
                 "risk_per_trade_pct": r["risk_per_trade_pct"],
                 "max_concurrent_positions": r["max_concurrent_positions"],
                 "min_confidence": r["min_confidence"],

@@ -48,12 +48,20 @@ class FillVerificationTests(unittest.TestCase):
     def test_actual_partial_fill_fee_and_slippage_are_recorded(self):
         result = self.exchange.verify_fill(
             {"id": "order-1", "status": "open"},
-            "BTC/USDT:USDT", requested=5, expected_price=100)
+            "BTC/USDT:USDT", requested=5, expected_price=100, side="buy")
         self.assertTrue(result["partial"])
         self.assertEqual(result["filled"], 3)
         self.assertEqual(result["average"], 101)
         self.assertEqual(result["fee_usd"], 0.5)
         self.assertEqual(result["slippage_usd"], 3)
+        self.assertEqual(result["adverse_slippage_usd"], 3)
+
+    def test_favorable_fill_is_negative_shortfall_not_a_cost(self):
+        result = self.exchange.verify_fill(
+            {"id": "order-1", "status": "open"},
+            "BTC/USDT:USDT", requested=5, expected_price=102, side="buy")
+        self.assertEqual(result["slippage_usd"], -3)
+        self.assertEqual(result["adverse_slippage_usd"], 0)
 
     def test_ambiguous_create_is_recovered_without_resubmission(self):
         result = self.exchange._create_order_once(
@@ -65,6 +73,35 @@ class FillVerificationTests(unittest.TestCase):
         fee = {"currency": "USDT", "cost": 0.5}
         self.assertEqual(
             self.exchange._fee_usd({"fee": fee, "fees": [fee]}), 0.5)
+
+    def test_unverified_fill_error_keeps_client_submission_audit(self):
+        with patch.object(
+                self.exchange.x, "fetch_order",
+                return_value={
+                    "id": "order-2", "status": "canceled", "filled": 0,
+                    "average": None, "info": {},
+                }):
+            with self.assertRaisesRegex(
+                    RuntimeError, "no verified fill") as raised:
+                self.exchange.verify_fill(
+                    {
+                        "id": "order-2",
+                        "status": "open",
+                        "_submission_audit": {
+                            "client_order_id": "client-2",
+                            "submission_count": 1,
+                        },
+                    },
+                    "BTC/USDT:USDT",
+                    requested=1,
+                    expected_price=100,
+                    side="buy",
+                )
+
+        self.assertEqual(
+            raised.exception._order_audit["client_order_id"], "client-2")
+        self.assertEqual(
+            raised.exception._order_audit["outcome"], "fill_unverified")
 
 
 class ProtectionClient:
@@ -222,7 +259,8 @@ class ProtectedEntryTests(unittest.TestCase):
     def test_okx_code_and_message_are_preserved_without_raw_response(self):
         error = ccxt.ExchangeError(
             'okx {"code":"1","msg":"","data":[{"sCode":"51001",'
-            '"sMsg":"Instrument does not exist"}]}')
+            '"subCode":"51001A","sMsg":"Instrument does not exist",'
+            '"clOrdId":"client-a","inTime":"1","outTime":"2"}]}')
 
         rejection = Exchange._entry_order_rejection(
             "CL/USDT:USDT", "attached_entry", error)
@@ -231,6 +269,10 @@ class ProtectedEntryTests(unittest.TestCase):
         self.assertEqual(rejection.details["error_message"],
                          "Instrument does not exist")
         self.assertEqual(rejection.details["classification"], "permanent")
+        self.assertEqual(
+            rejection.details["result_rows"][0]["sub_code"], "51001A")
+        self.assertEqual(
+            rejection.details["result_rows"][0]["client_order_id"], "client-a")
         self.assertIn("51001", str(rejection))
 
 
@@ -365,6 +407,28 @@ class AccountInstrumentTests(unittest.TestCase):
         self.assertEqual(rows["CL/USDT:USDT"]["instCategory"], "4")
         client.private_get_account_instruments.assert_called_once_with(
             {"instType": "SWAP"})
+
+    def test_account_taker_fee_is_read_and_cached(self):
+        client = Mock()
+        client.market.return_value = {"id": "BTC-USDT-SWAP"}
+        client.private_get_account_trade_fee.return_value = {
+            "code": "0",
+            "data": [{"taker": "-0.0007"}],
+        }
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        first = exchange.taker_fee_pct("BTC/USDT:USDT")
+        second = exchange.taker_fee_pct("BTC/USDT:USDT")
+
+        self.assertAlmostEqual(first, 0.07)
+        self.assertEqual(second, first)
+        client.private_get_account_trade_fee.assert_called_once_with({
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+        })
 
 
 class AccountValueValidationTests(unittest.TestCase):

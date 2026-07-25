@@ -171,11 +171,31 @@ class Exchange:
 
         code = None
         message = None
+        result_rows = []
         if payload:
             rows = payload.get("data") or []
             row = rows[0] if rows and isinstance(rows[0], dict) else {}
             code = row.get("sCode") or payload.get("code")
             message = row.get("sMsg") or payload.get("msg")
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                result_rows.append({
+                    "code": str(item.get("sCode"))
+                    if item.get("sCode") not in (None, "") else None,
+                    "sub_code": str(item.get("subCode"))
+                    if item.get("subCode") not in (None, "") else None,
+                    "message": cls._safe_exchange_error_text(
+                        item.get("sMsg") or item.get("msg")),
+                    "order_id": str(item.get("ordId"))
+                    if item.get("ordId") not in (None, "") else None,
+                    "client_order_id": str(item.get("clOrdId"))
+                    if item.get("clOrdId") not in (None, "") else None,
+                    "in_time": str(item.get("inTime"))
+                    if item.get("inTime") not in (None, "") else None,
+                    "out_time": str(item.get("outTime"))
+                    if item.get("outTime") not in (None, "") else None,
+                })
         if code in (None, ""):
             match = re.search(
                 r"(?:sCode|code)[\"'=:\s]+([A-Za-z0-9_-]+)", text)
@@ -201,11 +221,24 @@ class Exchange:
             if any(hint in lowered for hint in permanent_hints)
             else "transient"
         )
-        return {
+        response = getattr(exc, "response", None)
+        http_status = (
+            getattr(response, "status_code", None)
+            or getattr(exc, "status_code", None)
+        )
+        details = {
             "error_code": str(code) if code not in (None, "") else None,
             "error_message": message,
             "classification": classification,
+            "http_status": int(http_status)
+            if (isinstance(http_status, (int, float))
+                and math.isfinite(float(http_status))) else None,
+            "result_rows": result_rows,
         }
+        order_audit = getattr(exc, "_order_audit", None)
+        if isinstance(order_audit, dict):
+            details["order_audit"] = order_audit
+        return details
 
     @classmethod
     def _entry_order_rejection(
@@ -352,6 +385,48 @@ class Exchange:
         self._account_swap_instruments = mapped
         return mapped
 
+    def taker_fee_pct(self, symbol: str, refresh: bool = False) -> float:
+        """Return this account's actual taker fee rate as a positive percent."""
+        cache = getattr(self, "_taker_fee_pct_cache", {})
+        if symbol in cache and not refresh:
+            return float(cache[symbol])
+        market = self.x.market(symbol)
+        rate = None
+        getter = getattr(self.x, "private_get_account_trade_fee", None)
+        if callable(getter):
+            response = self.retry(getter, {
+                "instType": "SWAP",
+                "instId": market.get("id"),
+            })
+            if str((response or {}).get("code", "0")) != "0":
+                raise RuntimeError(
+                    "OKX trade-fee query failed: "
+                    f"{(response or {}).get('msg') or response}")
+            rows = (response or {}).get("data") or []
+            row = rows[0] if rows and isinstance(rows[0], dict) else {}
+            for key in ("taker", "takerU", "takerUSDC"):
+                if row.get(key) not in (None, ""):
+                    rate = float(row[key])
+                    break
+        if rate is None:
+            fetcher = getattr(self.x, "fetch_trading_fee", None)
+            if not callable(fetcher):
+                raise RuntimeError(
+                    "installed CCXT cannot read the account taker fee")
+            row = self.retry(fetcher, symbol) or {}
+            if row.get("taker") not in (None, ""):
+                rate = float(row["taker"])
+        if rate is None or not math.isfinite(rate):
+            raise RuntimeError(f"OKX returned no taker fee for {symbol}")
+        percent = abs(rate) * 100
+        if percent < 0 or percent > 1:
+            raise RuntimeError(
+                f"OKX returned an implausible taker fee for {symbol}")
+        cache = dict(cache)
+        cache[symbol] = percent
+        self._taker_fee_pct_cache = cache
+        return percent
+
     @staticmethod
     def _permissions(config: dict) -> set[str]:
         raw = config.get("perm") or ""
@@ -471,25 +546,71 @@ class Exchange:
         request = dict(params)
         client_id = self._client_order_id(prefix)
         request["clientOrderId"] = client_id
+        started = time.monotonic()
+        audit = {
+            "client_order_id": client_id,
+            "symbol": symbol,
+            "order_type": order_type,
+            "side": side,
+            "amount": float(amount),
+            "price": price,
+            "params": {
+                key: value for key, value in request.items()
+                if key not in {"apiKey", "secret", "password"}
+            },
+            "submission_count": 1,
+            "recovery_attempted": False,
+        }
         try:
-            return self.x.create_order(symbol, order_type, side, amount,
-                                       price, request)
+            order = self.x.create_order(
+                symbol, order_type, side, amount, price, request)
+            audit["latency_ms"] = round(
+                (time.monotonic() - started) * 1000, 1)
+            audit["outcome"] = "acknowledged"
+            if isinstance(order, dict):
+                order["_submission_audit"] = audit
+            return order
         except ccxt.InvalidNonce as exc:
+            audit["latency_ms"] = round(
+                (time.monotonic() - started) * 1000, 1)
+            audit["outcome"] = "clock_rejected"
+            setattr(exc, "_order_audit", audit)
             raise CredentialError(self._clock_error(exc)) from exc
         except ccxt.AuthenticationError as exc:
+            audit["latency_ms"] = round(
+                (time.monotonic() - started) * 1000, 1)
+            audit["outcome"] = "authentication_rejected"
+            setattr(exc, "_order_audit", audit)
             raise CredentialError(
                 "OKX rejected the API credentials while placing an order; "
                 "stop the agent and re-run `python main.py check`"
             ) from exc
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
+            audit["recovery_attempted"] = True
             recovered = self._recover_order(symbol, client_id)
             if recovered:
+                audit["latency_ms"] = round(
+                    (time.monotonic() - started) * 1000, 1)
+                audit["outcome"] = "recovered_after_ambiguous_response"
+                if isinstance(recovered, dict):
+                    recovered["_submission_audit"] = audit
                 log.warning("Recovered %s after ambiguous network response",
                             client_id)
                 return recovered
-            raise RuntimeError(
+            audit["latency_ms"] = round(
+                (time.monotonic() - started) * 1000, 1)
+            audit["outcome"] = "ambiguous_unrecovered"
+            error = RuntimeError(
                 f"ambiguous order result for {client_id}; order was not retried"
-            ) from exc
+            )
+            setattr(error, "_order_audit", audit)
+            raise error from exc
+        except Exception as exc:
+            audit["latency_ms"] = round(
+                (time.monotonic() - started) * 1000, 1)
+            audit["outcome"] = "rejected"
+            setattr(exc, "_order_audit", audit)
+            raise
 
     @staticmethod
     def _fee_usd(order: dict) -> float:
@@ -511,7 +632,8 @@ class Exchange:
         return total
 
     def verify_fill(self, order: dict, symbol: str, requested: float,
-                    expected_price: float | None = None) -> dict:
+                    expected_price: float | None = None,
+                    side: str | None = None) -> dict:
         """Wait for a terminal order state and return actual execution data."""
         current = order or {}
         order_id = current.get("id")
@@ -543,17 +665,42 @@ class Exchange:
                        or info.get("fillSz") or 0)
         average = float(current.get("average") or info.get("avgPx")
                         or info.get("fillPx") or 0)
+        submission_audit = dict(
+            current.get("_submission_audit")
+            or (order or {}).get("_submission_audit")
+            or {}
+        )
+        submission_audit.update({
+            "order_id": order_id,
+            "last_fill_status": status,
+        })
         if not math.isfinite(filled) or filled <= 0:
-            raise RuntimeError(f"order {order_id or '?'} has no verified fill")
+            submission_audit["outcome"] = "fill_unverified"
+            error = RuntimeError(
+                f"order {order_id or '?'} has no verified fill")
+            setattr(error, "_order_audit", submission_audit)
+            raise error
         if not math.isfinite(average) or average <= 0:
             average = float(expected_price or 0)
         if not math.isfinite(average) or average <= 0:
-            raise RuntimeError(f"order {order_id or '?'} has no verified fill price")
+            submission_audit["outcome"] = "fill_price_unverified"
+            error = RuntimeError(
+                f"order {order_id or '?'} has no verified fill price")
+            setattr(error, "_order_audit", submission_audit)
+            raise error
 
         contract_size = float(self.x.market(symbol).get("contractSize") or 1)
         slippage = 0.0
         if expected_price and expected_price > 0:
-            slippage = abs(average - expected_price) * filled * contract_size
+            execution_side = str(
+                side or current.get("side") or info.get("side") or "").lower()
+            if execution_side == "buy":
+                price_shortfall = average - expected_price
+            elif execution_side == "sell":
+                price_shortfall = expected_price - average
+            else:
+                price_shortfall = abs(average - expected_price)
+            slippage = price_shortfall * filled * contract_size
         realized_includes_costs = info.get("realizedPnl") not in (None, "")
         realized_raw = info.get("realizedPnl")
         if realized_raw in (None, ""):
@@ -570,6 +717,14 @@ class Exchange:
                                  if realized_raw not in (None, "") else None),
             "realized_includes_costs": realized_includes_costs,
             "slippage_usd": slippage,
+            "adverse_slippage_usd": max(0.0, slippage),
+            "client_order_id": (
+                current.get("clientOrderId") or info.get("clOrdId")
+                or (order or {}).get("clientOrderId")
+                or ((order or {}).get("_submission_audit") or {}).get(
+                    "client_order_id")),
+            "submission_audit": (
+                submission_audit or None),
             "order": current,
         }
 
@@ -1133,7 +1288,8 @@ class Exchange:
             raise self._entry_order_rejection(
                 symbol, "attached_entry", e) from e
 
-        fill = self.verify_fill(order, symbol, contracts, expected_price)
+        fill = self.verify_fill(
+            order, symbol, contracts, expected_price, side=side)
         position_side = "long" if side == "buy" else "short"
         try:
             live_position = self.position(symbol)
@@ -1217,7 +1373,8 @@ class Exchange:
             params, "okxcls")
         result = self.verify_fill(
             order, symbol, contracts,
-            float(pos.get("markPrice") or pos.get("last") or 0) or None)
+            float(pos.get("markPrice") or pos.get("last") or 0) or None,
+            side=side)
         remaining = self.position(symbol, position_side)
         remaining_contracts = abs(float((remaining or {}).get("contracts") or 0))
         result["fully_closed"] = remaining_contracts <= max(1e-12, contracts * 1e-6)

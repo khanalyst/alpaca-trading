@@ -22,6 +22,25 @@ llm:
   # the marker is a harmless no-op and the prompt bills at the normal rate).
   # Check cache hits in runtime/agent.log: "tokens: ... cache_read=NNNN".
 
+# Momentum is one isolated, versioned strategy. Future strategies such as
+# scalping must get their own ID, prompt, risk budget and report rather than
+# changing these rules in place.
+strategy:
+  id: momentum
+  version: phase1-v1
+  signal_timeframe: 15m          # fixed for this version; one evaluation/bar
+  allow_experimental_setups_in_demo: true  # "other" ideas are demo-only
+  setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
+  setup_memory_hours: 72        # bounded operational idempotency history
+  min_stop_atr_multiple: 1.0
+  structure_buffer_atr_multiple: 0.15
+  hard_max_entry_extension_atr: 2.5  # extreme no-chase safety boundary
+  breakout_range_threshold_pct: 85
+  breakout_min_relative_volume: 1.0
+  funding_extreme_pct: 0.03
+  fixed_reward_risk: 2.0
+  extended_reward_risk: 3.0
+
 universe:
   top_n: 10                          # trade only the N highest-volume USDT perpetuals
   min_24h_quote_volume_usd: 50000000 # $50m floor before account/category/history checks
@@ -43,6 +62,7 @@ cycle:
 risk:
   # --- sizing (everything is a % of live account equity) ---
   max_leverage: 3                # per position; hard ceiling of 10 enforced in code
+  entry_leverage: 2              # deterministic; the LLM cannot choose leverage
   risk_per_trade_pct: 1.5        # max all-in equity loss at the stop
   max_position_notional_pct: 40  # per-position notional cap, % of equity
   max_gross_exposure_pct: 150    # total notional across all positions, % of equity

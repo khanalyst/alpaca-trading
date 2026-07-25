@@ -129,6 +129,50 @@ class PositionReconciliationTests(unittest.TestCase):
         self.assertEqual(
             log_trade.call_args.kwargs["realized_pnl_usd"], 6.0)
 
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.log_trade")
+    def test_direct_final_close_journals_only_the_unrealized_remainder(
+            self, log_trade, log_event, commit):
+        st = self.tracked_state()
+        trade = st["active_trades"]["BTC/USDT:USDT"]
+        trade.update({
+            "qty": 1,
+            "initial_qty": 2,
+            "entry_fee_remaining_usd": 0.1,
+            "partial_realized_pnl_usd": 3.0,
+        })
+        self.engine.ex.close_position = Mock(return_value={
+            "fully_closed": True,
+            "filled": 1,
+            "average": 105,
+            "fee_usd": 0.2,
+            "order_id": "close-1",
+            "status": "closed",
+            "slippage_usd": -0.05,
+            "adverse_slippage_usd": 0.0,
+        })
+        self.engine._log_order_execution = Mock()
+        self.engine._mark_setup_status = Mock()
+        position = {
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 1,
+            "entryPrice": 100,
+            "markPrice": 105,
+            "leverage": 2,
+            "info": {"fundingFee": "0"},
+        }
+
+        self.assertTrue(self.engine._close(position, "test close", st))
+
+        # Final remainder: +5 gross -0.10 remaining entry fee -0.20 exit fee.
+        # The prior +3.00 partial row is used only for cumulative PnL/cooldown.
+        self.assertAlmostEqual(
+            log_trade.call_args.kwargs["realized_pnl_usd"], 4.7)
+        self.assertAlmostEqual(log_trade.call_args.kwargs["pnl_pct"], 3.85)
+        self.assertNotIn("BTC/USDT:USDT", st["active_trades"])
+
     def test_missing_protection_is_restored_from_durable_target(self):
         st = self.tracked_state()
         position = {

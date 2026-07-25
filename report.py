@@ -26,7 +26,12 @@ TRADE_FIELDS = (
     "ts", "symbol", "side", "action", "qty", "price", "notional",
     "leverage", "reason", "confidence", "pnl_pct", "trade_id", "order_id",
     "fee_usd", "funding_usd", "realized_pnl_usd", "risk_usd",
-    "fill_status", "slippage_usd",
+    "fill_status", "slippage_usd", "adverse_slippage_usd",
+    "funding_status", "pnl_semantics", "strategy_id", "strategy_version",
+    "setup_id", "setup_key", "setup_type", "signal_ts", "exit_policy",
+    "invalidation_anchor", "run_id", "cycle_id", "prompt_version",
+    "config_version", "code_version", "equity_basis_id",
+    "entry_equity_usd",
 )
 
 
@@ -97,13 +102,24 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
             unmatchable_closes += 1
             continue
         closed_ids.add(str(trade_id))
+        close_rows = partials.get(str(trade_id), []) + [close]
         if close.get("realized_pnl_usd") is None:
             unscored_closes += 1
             continue
         opened = opens[str(trade_id)]
         notional = _number(opened.get("notional"))
         risk = _number(opened.get("risk_usd"), _number(close.get("risk_usd")))
-        pnl = _number(close.get("realized_pnl_usd"))
+        incremental = close.get("pnl_semantics") == "incremental_v1"
+        if incremental:
+            if any(row.get("realized_pnl_usd") is None for row in close_rows):
+                unscored_closes += 1
+                continue
+            pnl = sum(_number(row.get("realized_pnl_usd"))
+                      for row in close_rows)
+        else:
+            # Pre-migration close rows historically stored cumulative PnL in
+            # most paths. Do not add partial rows and double-count them.
+            pnl = _number(close.get("realized_pnl_usd"))
         entry_fee = _number(opened.get("fee_usd"))
         exit_fee = _number(close.get("fee_usd"))
         entry_slippage = _number(opened.get("slippage_usd"))
@@ -114,12 +130,32 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
                               for row in partials.get(str(trade_id), []))
         partial_slippage = sum(_number(row.get("slippage_usd"))
                                for row in partials.get(str(trade_id), []))
+        partial_adverse_slippage = sum(
+            _number(row.get("adverse_slippage_usd"))
+            for row in partials.get(str(trade_id), []))
         matched.append({
             "trade_id": str(trade_id),
             "symbol": opened.get("symbol"),
             "open_ts": _number(opened.get("ts")),
             "close_ts": _number(close.get("ts")),
             "confidence": opened.get("confidence"),
+            "strategy_id": (
+                opened.get("strategy_id") or "legacy_unattributed"),
+            "strategy_version": (
+                opened.get("strategy_version") or "legacy"),
+            "setup_id": opened.get("setup_id"),
+            "setup_type": opened.get("setup_type") or "legacy",
+            "exit_policy": opened.get("exit_policy"),
+            "prompt_version": (
+                opened.get("prompt_version") or "legacy"),
+            "config_version": (
+                opened.get("config_version") or "legacy"),
+            "code_version": (
+                opened.get("code_version") or "legacy"),
+            "entry_equity_usd": _number(
+                opened.get("entry_equity_usd"), 0.0),
+            "pnl_semantics": (
+                "incremental_v1" if incremental else "legacy_cumulative"),
             "notional_usd": notional,
             "risk_usd": risk,
             "net_pnl_usd": pnl,
@@ -129,6 +165,17 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
             "funding_usd": partial_funding + _number(close.get("funding_usd")),
             "slippage_usd": (entry_slippage + partial_slippage
                              + exit_slippage),
+            "adverse_slippage_usd": (
+                _number(opened.get("adverse_slippage_usd"))
+                + partial_adverse_slippage
+                + _number(close.get("adverse_slippage_usd"))
+            ),
+            # New close rows explicitly prove whether funding was recovered.
+            # A missing legacy tag is unknown, not evidence of zero funding.
+            "funding_status": (
+                close.get("funding_status") or "legacy_unknown"),
+            "funding_complete": (
+                close.get("funding_status") == "available"),
             "open_fill_status": opened.get("fill_status"),
             "close_fill_status": close.get("fill_status"),
         })
@@ -144,6 +191,11 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
         "unmatchable_closes": unmatchable_closes,
         "unscored_closes": unscored_closes,
         "duplicate_trade_ids": len(duplicates),
+        "legacy_pnl_semantics": sum(
+            trade["pnl_semantics"] == "legacy_cumulative"
+            for trade in matched),
+        "funding_incomplete": sum(
+            not trade["funding_complete"] for trade in matched),
     }
     return matched, diagnostics
 
@@ -204,27 +256,49 @@ def curve_stats(curve: list[tuple[float, float]]) -> dict | None:
 
 
 def print_equity(db: sqlite3.Connection, transfers: list[tuple[float, float]]) -> None:
-    section("EQUITY (TRANSFER ADJUSTED)")
+    section("EQUITY BY VALUATION BASIS (TRANSFER ADJUSTED)")
     if not _columns(db, "equity"):
         print("  no equity table yet")
         return
-    equity = [(float(ts), float(value)) for ts, value in db.execute(
-        "SELECT ts, equity FROM equity ORDER BY ts").fetchall()]
-    if not equity:
+    columns = _columns(db, "equity")
+    basis_expr = (
+        "basis_id" if "basis_id" in columns else "NULL AS basis_id")
+    rows = db.execute(
+        f"SELECT ts, equity, {basis_expr} FROM equity ORDER BY ts"
+    ).fetchall()
+    if not rows:
         print("  no equity snapshots yet")
         return
-    adjusted, net_flow = adjusted_equity_curve(equity, transfers)
-    raw = curve_stats(equity)
-    clean = curve_stats(adjusted)
-    print(f"  {fmt_ts(equity[0][0])} -> {fmt_ts(equity[-1][0])} UTC "
-          f"({len(equity)} snapshots)")
-    print(f"  raw account:      {raw['first']:,.2f} -> {raw['last']:,.2f} USDT "
-          f"({raw['return_pct']:+.2f}%)")
-    print(f"  external net flow:{net_flow:>+13,.2f} USDT")
-    print(f"  adjusted equity:  {clean['first']:,.2f} -> {clean['last']:,.2f} USDT "
-          f"({clean['return_pct']:+.2f}%)")
-    print(f"  adjusted peak {clean['peak']:,.2f}   "
-          f"max drawdown {clean['max_drawdown_pct']:.2f}%")
+    segments: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for ts, value, basis_id in rows:
+        key = str(basis_id) if basis_id else "legacy_unsegmented"
+        segments[key].append((float(ts), float(value)))
+    ordered = sorted(segments.items(), key=lambda item: item[1][0][0])
+    if len(ordered) > 1:
+        print("  Returns are intentionally not chained across valuation bases.")
+    for basis_id, equity in ordered:
+        first_ts, last_ts = equity[0][0], equity[-1][0]
+        segment_transfers = [
+            (ts, net) for ts, net in transfers
+            if first_ts < ts <= last_ts
+        ]
+        adjusted, net_flow = adjusted_equity_curve(
+            equity, segment_transfers)
+        raw = curve_stats(equity)
+        clean = curve_stats(adjusted)
+        print(f"\n  basis {basis_id}")
+        if basis_id == "legacy_unsegmented":
+            print("    warning: valuation basis is unknown; do not compare this "
+                  "segment with later USDT-only equity")
+        print(f"    {fmt_ts(first_ts)} -> {fmt_ts(last_ts)} UTC "
+              f"({len(equity)} snapshots)")
+        print(f"    raw account:      {raw['first']:,.2f} -> "
+              f"{raw['last']:,.2f} USDT ({raw['return_pct']:+.2f}%)")
+        print(f"    external net flow:{net_flow:>+13,.2f} USDT")
+        print(f"    adjusted equity:  {clean['first']:,.2f} -> "
+              f"{clean['last']:,.2f} USDT ({clean['return_pct']:+.2f}%)")
+        print(f"    adjusted peak {clean['peak']:,.2f}   "
+              f"max drawdown {clean['max_drawdown_pct']:.2f}%")
 
 
 def print_trades(trades: list[dict], diagnostics: dict) -> None:
@@ -242,6 +316,12 @@ def print_trades(trades: list[dict], diagnostics: dict) -> None:
               f"{diagnostics['unmatchable_closes']} unmatchable closes, "
               f"{diagnostics['unscored_closes']} closes without net USDT PnL, "
               f"{diagnostics['duplicate_trade_ids']} duplicate trade IDs")
+    if diagnostics.get("legacy_pnl_semantics"):
+        print(f"  warning: {diagnostics['legacy_pnl_semantics']} matched trade(s) "
+              "use legacy cumulative-PnL semantics")
+    if diagnostics.get("funding_incomplete"):
+        print(f"  warning: funding was unavailable or unverified for "
+              f"{diagnostics['funding_incomplete']} matched trade(s)")
     if not trades:
         print("  no verified trade-ID-matched round trips yet")
         return
@@ -270,7 +350,10 @@ def print_trades(trades: list[dict], diagnostics: dict) -> None:
               f"average {sum(t['r_multiple'] for t in risk_trades) / len(risk_trades):+.2f}R/trade")
     print(f"  recorded costs: fees {sum(t['fees_usd'] for t in trades):,.2f}   "
           f"funding {sum(t['funding_usd'] for t in trades):+,.2f}   "
-          f"execution slippage {sum(t['slippage_usd'] for t in trades):,.2f} USDT")
+          f"implementation shortfall "
+          f"{sum(t['slippage_usd'] for t in trades):+,.2f}   "
+          f"adverse slippage "
+          f"{sum(t['adverse_slippage_usd'] for t in trades):,.2f} USDT")
 
 
 def print_per_symbol(trades: list[dict]) -> None:
@@ -292,6 +375,92 @@ def print_per_symbol(trades: list[dict]) -> None:
         print(f"  {str(symbol):<20} trades {len(rows):>3}   win {wins}/{len(rows)}   "
               f"PnL {pnl:+,.2f}   notional return "
               f"{(pnl / notional * 100 if notional else 0):+.3f}%   {r_text}")
+
+
+def _synthetic_strategy_drawdown(rows: list[dict]) -> tuple[float, float | None]:
+    """Return max drawdown in USDT and percent for a virtual strategy ledger."""
+    ordered = sorted(rows, key=lambda row: row["close_ts"])
+    starts = [
+        row["entry_equity_usd"] for row in ordered
+        if row.get("entry_equity_usd", 0) > 0
+    ]
+    capital = starts[0] if starts else 0.0
+    cumulative = 0.0
+    peak = capital
+    max_drawdown = 0.0
+    max_drawdown_pct = 0.0
+    for row in ordered:
+        cumulative += row["net_pnl_usd"]
+        value = capital + cumulative
+        peak = max(peak, value)
+        drawdown = peak - value
+        max_drawdown = max(max_drawdown, drawdown)
+        if peak > 0:
+            max_drawdown_pct = max(
+                max_drawdown_pct, drawdown / peak * 100)
+    return max_drawdown, max_drawdown_pct if starts else None
+
+
+def print_per_strategy(trades: list[dict]) -> None:
+    section("PER STRATEGY (ISOLATED ATTRIBUTION)")
+    if not trades:
+        print("  no verified strategy-attributed round trips yet")
+        return
+    grouped = defaultdict(list)
+    for trade in trades:
+        grouped[(
+            trade["strategy_id"],
+            trade["strategy_version"],
+            trade["prompt_version"],
+            trade["config_version"],
+            trade["code_version"],
+        )].append(trade)
+    for (
+            strategy_id, version, prompt_version, config_version, code_version
+    ), rows in sorted(grouped.items()):
+        pnl = sum(row["net_pnl_usd"] for row in rows)
+        wins = [row for row in rows if row["net_pnl_usd"] > 0]
+        losses = [row for row in rows if row["net_pnl_usd"] <= 0]
+        gross_profit = sum(row["net_pnl_usd"] for row in wins)
+        gross_loss = abs(sum(row["net_pnl_usd"] for row in losses))
+        factor = gross_profit / gross_loss if gross_loss else None
+        risk_rows = [row for row in rows if row["r_multiple"] is not None]
+        drawdown_usd, drawdown_pct = _synthetic_strategy_drawdown(rows)
+        factor_text = f"{factor:.2f}" if factor is not None else "n/a"
+        drawdown_text = (
+            f"{drawdown_pct:.2f}%" if drawdown_pct is not None
+            else "n/a (legacy entries lack entry equity)")
+        avg_r_text = (
+            f"{sum(row['r_multiple'] for row in risk_rows) / len(risk_rows):+.2f}"
+            if risk_rows else "n/a")
+        print(f"\n  {strategy_id} / {version}")
+        print(f"    variant prompt={prompt_version} config={config_version} "
+              f"code={code_version}")
+        print(f"    trades {len(rows)}   win rate "
+              f"{len(wins) / len(rows) * 100:.1f}%   "
+              f"net realized {pnl:+,.2f} USDT")
+        print(f"    expectancy {pnl / len(rows):+,.2f} USDT/trade   "
+              f"profit factor {factor_text}   avg R {avg_r_text}")
+        print(f"    synthetic drawdown {drawdown_usd:,.2f} USDT / "
+              f"{drawdown_text}")
+        print(f"    fees {sum(row['fees_usd'] for row in rows):,.2f}   "
+              f"funding {sum(row['funding_usd'] for row in rows):+,.2f}   "
+              f"signed shortfall "
+              f"{sum(row['slippage_usd'] for row in rows):+,.2f}   "
+              f"adverse slippage "
+              f"{sum(row['adverse_slippage_usd'] for row in rows):,.2f} USDT")
+        incomplete_funding = sum(
+            not row["funding_complete"] for row in rows)
+        if incomplete_funding:
+            print(f"    warning: funding unavailable/unverified for "
+                  f"{incomplete_funding} trade(s)")
+        setups = defaultdict(list)
+        for row in rows:
+            setups[row["setup_type"]].append(row)
+        for setup_type, setup_rows in sorted(setups.items()):
+            setup_pnl = sum(row["net_pnl_usd"] for row in setup_rows)
+            print(f"      setup {setup_type:<22} trades "
+                  f"{len(setup_rows):>3}   PnL {setup_pnl:+,.2f}")
 
 
 def print_calibration(trades: list[dict]) -> None:
@@ -317,24 +486,79 @@ def print_calibration(trades: list[dict]) -> None:
 
 
 def print_rejections(db: sqlite3.Connection) -> None:
-    section("REJECTIONS (WHY PROPOSALS WERE VETOED)")
+    section("UNIVERSE EXCLUSIONS AND REJECTIONS")
     if not _columns(db, "events"):
         print("  none recorded")
         return
     rows = db.execute(
-        "SELECT payload FROM events WHERE kind='rejected'").fetchall()
-    counts = defaultdict(int)
-    for (payload,) in rows:
+        "SELECT ts, kind, payload FROM events WHERE kind IN "
+        "('rejected','entry_execution_failed','entry_liquidity_rejected',"
+        "'universe_selection') ORDER BY ts").fetchall()
+    rejection_counts = defaultdict(int)
+    exchange_counts = defaultdict(int)
+    liquidity_counts = defaultdict(int)
+    latest_universe = None
+    for ts, kind, payload in rows:
         try:
-            reason = json.loads(payload).get("why", "?")
+            record = json.loads(payload)
         except (TypeError, json.JSONDecodeError, AttributeError):
-            reason = "?"
-        counts[str(reason)] += 1
-    if not counts:
+            record = {}
+        if kind == "rejected":
+            rejection_counts[str(record.get("why", "?"))] += 1
+        elif kind == "entry_liquidity_rejected":
+            liquidity_counts[str(record.get("reason", "insufficient_depth"))] += 1
+        elif kind == "entry_execution_failed":
+            diagnostics = record.get("diagnostics") or {}
+            result_rows = diagnostics.get("result_rows") or []
+            codes = sorted({
+                str(item.get("code"))
+                for item in result_rows
+                if isinstance(item, dict) and item.get("code")
+            })
+            code = record.get("error_code") or (
+                ",".join(codes) if codes else "no-code")
+            key = (
+                str(record.get("stage") or "?"),
+                str(code),
+                str(record.get("classification") or "?"),
+                str(record.get("error_message") or "?")[:120],
+            )
+            exchange_counts[key] += 1
+        elif kind == "universe_selection":
+            latest_universe = (float(ts), record)
+
+    if latest_universe is not None:
+        ts, audit = latest_universe
+        selected = audit.get("selected") or []
+        print(f"  latest universe {fmt_ts(ts)} UTC: "
+              f"{', '.join(selected) if selected else 'empty'}")
+        exclusions = defaultdict(int)
+        for candidate in audit.get("candidates") or []:
+            if isinstance(candidate, dict) and not candidate.get("selected"):
+                exclusions[str(candidate.get("reason") or "?")] += 1
+        for reason, count in sorted(
+                exclusions.items(), key=lambda item: (-item[1], item[0])):
+            print(f"    excluded {count:>4}  {reason}")
+
+    if rejection_counts:
+        print("  deterministic proposal vetoes:")
+        for reason, count in sorted(
+                rejection_counts.items(), key=lambda item: -item[1]):
+            print(f"    {count:>4}  {reason}")
+    if liquidity_counts:
+        print("  liquidity rejections:")
+        for reason, count in sorted(
+                liquidity_counts.items(), key=lambda item: -item[1]):
+            print(f"    {count:>4}  {reason}")
+    if exchange_counts:
+        print("  exchange execution failures:")
+        for (stage, code, classification, message), count in sorted(
+                exchange_counts.items(), key=lambda item: -item[1]):
+            print(f"    {count:>4}  stage={stage} code={code} "
+                  f"class={classification}  {message}")
+    if not (latest_universe or rejection_counts
+            or liquidity_counts or exchange_counts):
         print("  none recorded")
-        return
-    for reason, count in sorted(counts.items(), key=lambda item: -item[1]):
-        print(f"  {count:>4}  {reason}")
 
 
 def print_transfers(transfers: list[tuple[float, float]]) -> None:
@@ -357,6 +581,7 @@ def main(path: Path | None = None) -> int:
         trades, diagnostics = match_round_trips(events)
         print_equity(db, transfers)
         print_trades(trades, diagnostics)
+        print_per_strategy(trades)
         print_per_symbol(trades)
         print_calibration(trades)
         print_rejections(db)

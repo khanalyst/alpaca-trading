@@ -1,173 +1,234 @@
 # Trading decision examples
 
-These examples are reconstructed from the agent's own journal on
-2026-07-23. They show the difference between universe selection, LLM
-reasoning, deterministic risk checks, exchange execution, and account-level
-circuit breakers.
+These examples explain the current `momentum / phase1-v1` decision contract.
+The KAITO, CL and AAVE observations come from the agent's July 23, 2026
+journal. Those trades were originally evaluated by an older interface in
+which the model supplied numeric leverage, size, stop and target. Phase 1 no
+longer accepts that numeric authority; the examples below show how the same
+market observations flow through the current code.
 
-The percentages below are price distances unless explicitly described as a
-percentage of account equity. A proposed take-profit is not guaranteed to
-fill, and actual net P&L also includes fees, funding, spread, and slippage.
+Percentages are price distances unless explicitly described as a percentage
+of account equity. Targets are planned exits, not guaranteed fills. Net PnL
+also includes actual fees, funding and execution shortfall.
 
-## Decision pipeline
+## Current decision pipeline
 
-Every new position follows this sequence:
+Every proposed entry follows this sequence:
 
-1. Rank eligible instruments by normalized 24-hour quote turnover.
-2. Build a completed-candle snapshot for every selected instrument.
-3. Ask the LLM for zero or more `open`, `close`, or `hold` decisions.
-4. Process closes first and sort opens by descending confidence.
-5. Validate each open against current positions, costs, cooldowns, and
-   exposure limits.
-6. Check the live order book and submit an IOC entry with attached
-   exchange-side stop-loss and take-profit.
-7. Verify the actual fill and protective orders.
+1. Rank active USDT-settled perpetual swaps by normalized 24-hour quote
+   turnover.
+2. Admit only account-available OKX category-1 crypto instruments with enough
+   completed 15m, 1h and 4h history.
+3. Build a snapshot containing trend, momentum, relative volume, ATR history,
+   range/structure, funding history, perp/index basis, account fee, open
+   interest, BTC regime and robust BTC correlation measurements.
+4. Ask the LLM for zero or more semantic decisions. For an open, it chooses
+   `setup_type`, direction, confidence, `invalidation_anchor`, `exit_policy`
+   and `execution_choice`.
+5. Check that the label has broad deterministic evidence and that the entry
+   is not beyond the hard no-chase boundary.
+6. Derive stop, target and leverage in code. Model-supplied numeric size,
+   leverage, stop or target fields are ignored.
+7. Size from the all-in stop risk, then apply per-position, portfolio,
+   net-direction, margin and liquidation constraints.
+8. Validate proposed pairs sequentially in confidence order. A fill from the
+   first pair immediately reduces the exposure available to the second.
+9. Check a fresh order book, submit an IOC entry with required attached
+   exchange-side SL/TP, verify actual fills and record the complete outcome.
 
-## Example 1: KAITO long opened successfully
+The current model-side open schema is:
 
-At the decision time, the KAITO snapshot contained:
+```json
+{
+  "action": "open",
+  "symbol": "BTC/USDT:USDT",
+  "direction": "long",
+  "setup_type": "trend_continuation",
+  "invalidation_anchor": "structure",
+  "exit_policy": "fixed_rr",
+  "execution_choice": "normal",
+  "confidence": 0.8,
+  "reasoning": "one concise setup-specific sentence"
+}
+```
+
+## Example 1: KAITO trend-continuation long
+
+The historical KAITO snapshot contained:
 
 - Price: 0.9976 USDT.
 - 24-hour change: +3.74%.
 - 24-hour quote turnover: 1,772.8 million USDT.
-- 15m, 1h, and 4h trends: all up.
+- 15m, 1h and 4h trends: all up.
 - 1h RSI: 55.6.
 - 1h ATR: 1.96% of price.
 - Current ATR versus its recent median: 0.90.
 - One-hour momentum: +0.89%.
 - Relative one-hour volume: 1.16.
-- 30-hour correlation with BTC returns: -0.26.
+- 30-hour BTC-return correlation: -0.26.
 - Recent swing low: 1.88% below price.
 - Position in the 24-hour range: 81%.
-- BTC market context: transition regime with -0.54% one-hour momentum.
+- BTC context: transition regime with -0.54% one-hour momentum.
 
-The LLM proposed:
+A current semantic proposal could be:
 
 ```json
 {
   "action": "open",
   "symbol": "KAITO/USDT:USDT",
   "direction": "long",
+  "setup_type": "trend_continuation",
+  "invalidation_anchor": "structure",
+  "exit_policy": "fixed_rr",
+  "execution_choice": "normal",
   "confidence": 0.82,
-  "size_pct_equity": 0.0,
-  "leverage": 3.0,
-  "stop_loss_pct": 2.15,
-  "take_profit_pct": 4.6,
-  "reasoning": "All three timeframes trend up with positive momentum and above-average participation, while its low BTC correlation supports an independent continuation long; stop sits beyond the 20-period swing low and ATR."
+  "reasoning": "All three timeframes trend up with positive momentum and participation while the recent swing low provides a clear invalidation."
 }
 ```
 
-Why it passed:
+With the current default contract, code would derive:
 
-- The proposed stop was wider than ATR and beyond the recent swing low.
-- The take-profit was approximately 2.14 times the stop distance.
-- Confidence exceeded the configured 0.65 floor.
-- The deterministic cost, exposure, spread, and order-book checks passed.
-- The exchange verified the fill and protective orders.
-
-The actual opened notional was approximately 28,910 USDT. The estimated
-all-in loss at the stop was approximately 2.78% of that notional after
-including the price stop, round-trip fees, spread, expected stop slippage,
-the reserved entry-price boundary, and adverse funding.
-
-That corresponds to approximately 803 USDT, or 1.11% of the then-current
-72,232 USDT account equity. The configured per-trade ceiling was 1.5%, but
-the 40%-of-equity notional cap reduced the actual planned risk.
-
-If the 4.60% target were filled exactly, gross price P&L would be
-approximately 1,330 USDT, or 1.84% of account equity before exit fees,
-funding, and execution effects.
-
-## Example 2: CL long proposed but rejected by OKX
-
-The CL snapshot contained:
-
-- 15m, 1h, and 4h trends: all up.
-- 1h RSI: approximately 72, indicating an extended market.
-- One-hour momentum: +0.77%.
-- Relative one-hour volume: 10.5.
-- Negative funding, which favored a long position.
-- Price approximately 1.85% above the 1h EMA20.
-
-The LLM proposed:
-
-```json
-{
-  "action": "open",
-  "symbol": "CL/USDT:USDT",
-  "direction": "long",
-  "confidence": 0.75,
-  "size_pct_equity": 12.0,
-  "leverage": 2.0,
-  "stop_loss_pct": 2.05,
-  "take_profit_pct": 4.4,
-  "reasoning": "Strong three-timeframe uptrend, exceptional relative volume, positive momentum and negative funding support continuation, though the extended RSI and EMA distance warrant reduced size."
-}
+```text
+ATR floor       = 1.96% × 1.00                         = 1.96%
+structure stop  = 1.88% + (1.96% × 0.15 ATR buffer)  = 2.174%
+chosen stop     = max(1.96%, 2.174%)                  ≈ 2.17%
+fixed-R target  = 2.174% × 2R                         ≈ 4.35%
+entry leverage  = risk.entry_leverage                 = 2x
 ```
 
-The LLM deliberately requested less than the risk engine's full computed
-size because the instrument was extended. Its take-profit was approximately
-2.15 times its stop distance.
+The LLM still makes the important discretionary call: whether this is a
+quality continuation at all, which direction is justified, whether structure
+is the real invalidation, whether a fixed or extended target fits the regime,
+and how confident it is. It cannot move the stop inside structure, choose 10x
+leverage or inflate size.
 
-OKX rejected the entry with its required attached stop-loss and take-profit.
-The agent correctly did not send an unprotected fallback order, so no CL
-position was opened.
+The historical revision actually opened about 28,910 USDT at 3x with a 2.15%
+stop and 4.60% target. That fill is useful historical evidence, but it is not
+a promise of what the current version would size or execute.
 
-This example also exposed two issues addressed by Phase 1:
+## Example 2: CL never reaches the LLM
 
-- CL is a commodity instrument and should never have entered a crypto-only
-  universe.
-- The old error wrapper hid the underlying OKX rejection code and did not
-  create persistent backoff, allowing CL to be proposed again later.
+CL previously appeared because its volume and trend data looked eligible:
 
-## Example 3: AAVE pullback proposed but not opened
+- 15m, 1h and 4h trends were up.
+- 1h RSI was about 72.
+- One-hour momentum was +0.77%.
+- Relative one-hour volume was 10.5.
+- Funding was negative.
 
-The LLM identified:
+CL is a commodity instrument, not crypto. The current universe requires OKX
+private catalogue category `1`, active linear USDT settlement and sufficient
+history. CL is therefore excluded during universe construction and cannot
+consume a top-10 slot or reach the model.
 
-- Aligned 1h and 4h uptrends.
-- A flat 15m pullback near the 1h EMA20.
-- Positive one-hour momentum.
-- Elevated relative volume.
+The latest universe audit stores the selected list and every exclusion reason.
+If an exchange order is rejected for a valid crypto instrument, the journal
+also preserves its stage, classification, OKX code/sub-code, safe message,
+client order ID and submission/recovery audit. `python report.py` displays
+those reasons and codes.
 
-It proposed:
+## Example 3: AAVE pullback
+
+The historical AAVE observation had aligned 1h/4h uptrends, a flat 15m
+pullback near the 1h EMA20, positive one-hour momentum and elevated relative
+volume. A current proposal would describe intent rather than invent numeric
+risk:
 
 ```json
 {
   "action": "open",
   "symbol": "AAVE/USDT:USDT",
   "direction": "long",
+  "setup_type": "trend_continuation",
+  "invalidation_anchor": "structure",
+  "exit_policy": "extended_rr",
+  "execution_choice": "normal",
   "confidence": 0.76,
-  "size_pct_equity": 0.0,
-  "leverage": 3.0,
-  "stop_loss_pct": 1.1,
-  "take_profit_pct": 2.4,
-  "reasoning": "1h and 4h uptrends align with a flat 15m pullback at the 1h EMA20, positive momentum and elevated volume; stop clears ATR and recent swing low."
+  "reasoning": "The higher-timeframe uptrend remains intact and the 15m pullback is near the 1h EMA with positive participation."
 }
 ```
 
-The proposed gross price reward was approximately 2.18 times the stop
-distance. OKX rejected the required attached entry, so no position was
-opened. As with CL, the old visible error did not retain enough information
-to identify the exact exchange cause.
+The broad evidence contract requires at least two of the 15m/1h/4h trends to
+be up. The LLM must still decide whether the pullback is genuinely attractive.
+Code then places a long stop beyond the recent swing low plus the configured
+ATR buffer, never tighter than the ATR floor. An `extended_rr` target uses the
+configured 3R multiple. If the snapshot lacks finite ATR or structure, the
+proposal is rejected rather than guessed.
 
-## Example 4: daily-loss and drawdown protection
+## Example 4: insufficient order-book depth
 
-The strategy has no fixed daily profit target. It instead sizes each trade
-from current equity and applies account-level loss controls:
+Suppose the strategy approves a KAITO setup and deterministic sizing requests
+28,806 contracts, but only 12,672 contracts are visible before the configured
+0.35% entry-price boundary. No order is sent.
 
-- Maximum planned all-in loss per trade: 1.5% of current USDT equity.
-- Daily loss limit: 5% from the UTC-day starting equity.
-- Maximum drawdown: 15% from the high-water mark.
+The rejection is stored as execution feedback. The same symbol cannot be
+re-evaluated repeatedly on the same completed 15-minute candle, even if the
+model changes direction or relabels the setup. On a later completed candle the
+LLM may:
 
-If live equity falls 5% from the UTC-day benchmark, the agent enters
-`DAY_STOPPED` and opens no new positions until the next UTC day. Existing
-positions continue to be protected and managed. With the current
-`flatten_on_daily_stop: false` setting, they are not automatically closed
-solely because the daily stop was reached.
+- choose a better pair;
+- stay flat; or
+- deliberately set `"execution_choice": "retry_smaller"`.
 
-If equity falls 15% from the high-water mark, the agent durably enters
-`KILLED`, closes positions, cancels remaining orders, and stops.
+For `retry_smaller`, code—not the model—caps size to the configured fraction
+of freshly measured safe depth. Every retry gets a new order book. A repeated
+depth failure creates a persisted backoff, so restarting the process does not
+erase the safety memory.
 
-These thresholds limit loss; they do not guarantee that a gap, exchange
-outage, liquidation event, or severe slippage cannot exceed the planned
-amount.
+## Example 5: partial fill and realized performance
+
+Assume one trade closes in two pieces:
+
+```text
+partial-close net realized PnL: +3.00 USDT
+final remainder net realized:   +4.70 USDT
+matched trade total:            +7.70 USDT
+```
+
+The final journal row stores only its incremental +4.70 USDT remainder. The
+report sums the two rows once; it does not add a cumulative final value and
+double-count the partial. Open/unmatched trades remain outside realized
+performance.
+
+Entry and exit records also keep actual fees, funding status, signed
+implementation shortfall and adverse-only slippage. A favorable fill is
+negative signed shortfall and zero adverse slippage; it is not mislabeled as
+an execution cost.
+
+## Setup memory and strategy attribution
+
+Each evaluated idea receives:
+
+- a `setup_key` for strategy version + symbol + direction + setup type;
+- a `setup_id` that also includes the completed signal-candle timestamp;
+- run, cycle, prompt, config, code and equity-basis identifiers.
+
+A symbol gets one evaluation per completed 15-minute candle. After a setup
+finishes, the same semantic setup is blocked for
+`strategy.setup_cooldown_minutes`; records remain available for
+`strategy.setup_memory_hours`. This is bounded operational memory and
+idempotency, not self-modifying trading logic.
+
+`python report.py` separates results by strategy/version,
+prompt/config/code variant and setup type and shows net realized PnL,
+expectancy, profit factor, R-multiples, fees, funding, signed/adverse slippage
+and synthetic strategy drawdown. Equity curves are segmented by
+valuation-basis ID, so removing demo OKB from the equity basis cannot appear as
+a trading loss.
+
+## Account-level loss protection
+
+The strategy has no fixed daily profit target. With the current defaults:
+
+- maximum planned all-in loss per trade: 1.5% of current USDT equity;
+- daily loss limit: 5% from the UTC-day starting equity;
+- maximum drawdown: 15% from the high-water mark;
+- deterministic entry leverage: 2x;
+- maximum three concurrent positions, subject to exposure and margin caps.
+
+At the daily loss limit, the agent enters `DAY_STOPPED` and opens no new
+positions until the next UTC day. At maximum drawdown it durably enters
+`KILLED`, flattens and requires explicit human acknowledgement to restart.
+Exchange-side stops, liquidation-distance checks and account IMR/MMR guards
+reduce risk, but cannot guarantee a gap, outage or severe slippage will stay
+inside the planned amount.

@@ -74,6 +74,24 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "cannot be below"):
             validate_config(cfg)
 
+    def test_unimplemented_strategy_id_is_rejected(self):
+        cfg = valid_config()
+        cfg["strategy"]["id"] = "scalping"
+        with self.assertRaisesRegex(ConfigError, "must be 'momentum'"):
+            validate_config(cfg)
+
+    def test_deterministic_entry_leverage_cannot_exceed_cap(self):
+        cfg = valid_config()
+        cfg["risk"]["entry_leverage"] = 4
+        with self.assertRaisesRegex(ConfigError, "cannot exceed"):
+            validate_config(cfg)
+
+    def test_strategy_signal_timeframe_must_be_available(self):
+        cfg = valid_config()
+        cfg["strategy"]["signal_timeframe"] = "5m"
+        with self.assertRaisesRegex(ConfigError, "must be exactly '15m'"):
+            validate_config(cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

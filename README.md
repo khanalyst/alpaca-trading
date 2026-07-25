@@ -42,12 +42,12 @@ never treated as USDT capital.
  │       (top-volume USDT perps only)             │                │
  │                                                ▼                │
  │                            LLM analyst (Claude or OpenAI)       │
- │                              proposes open/close as JSON        │
+ │                       labels setup/anchor/exit as JSON          │
  │                                                │                │
  │                                                ▼                │
- │                     deterministic RISK ENGINE (the boss)        │
- │       sizing from risk-per-trade, leverage clamp, exposure      │
- │       caps, confidence floor, cooldowns, circuit breakers       │
+ │              versioned STRATEGY + RISK ENGINE (the boss)        │
+ │     evidence contract, stops/targets, leverage, risk sizing,    │
+ │        exposure caps, cooldowns and circuit breakers            │
  │                                                │                │
  │                                                ▼                │
  │        executor ──► OKX orders with attached SL/TP (server-side)│
@@ -60,6 +60,7 @@ never treated as USDT capital.
 | `main.py` | CLI: run, pause, resume, kill, flatten, status, check |
 | `agent/engine.py` | The loop: circuit breakers, transfer detection, execution |
 | `agent/brain.py` | LLM providers, trader persona prompt, JSON decision parsing |
+| `agent/strategy.py` | Versioned setup contracts, deterministic stop/target derivation, setup memory |
 | `agent/risk.py` | Deterministic sizing and hard caps |
 | `agent/market.py` | Universe builder, indicators, market snapshot |
 | `agent/exchange.py` | All OKX calls (via ccxt), orders, kill-switch cancellation |
@@ -237,30 +238,32 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    `min_maintenance_margin_ratio`.
 5. **Ask the brain.** It builds a compact snapshot per symbol — price, spread,
    correctly contract-normalized 24h quote volume, completed-hour relative
-   volume, funding rate/interval/next settlement, RSI, current
-   ATR%, ATR versus its recent history, trend on 15m/1h/4h, 1h momentum,
-   30-hour BTC correlation, an explicit regime classification, position within
-   the 24h range, distance to the recent swing high/low and to the 1h EMA20
-   (structure anchors for stop placement) — plus a BTC-wide regime context and the live
-   portfolio (equity, day PnL,
-   drawdown, each open position's unrealised PnL and age). The LLM is
-   prompted as an **aggressive but disciplined momentum day trader**:
-   multi-timeframe trend alignment (a 15m impulse in the direction of the
-   1h/4h trend is the A+ setup), long and short with equal comfort,
-   funding-rate aware, ATR-sized stops, take-profits of at least 2x the stop
-   distance, never averaging down, and "flat is a position" — returning zero
-   trades is normal and often correct. It replies as strict JSON.
-6. **The risk engine disposes.** The model only *proposes*. A deterministic
-   engine ([agent/risk.py](agent/risk.py)) then vets every proposal:
-   discards anything below the confidence floor, rejects symbols already held
-   or in post-loss cooldown, clamps leverage, and **sizes each position from
-   stop distance plus expected round-trip fees, live spread, adverse funding
-   and stop slippage so the all-in expected stop loss stays within
-   `risk_per_trade_pct` of equity** — then caps that by the per-position,
-   whole-book, and net-direction exposure limits (the last one stops several
-   same-direction positions in correlated coins from acting as one oversized
-   macro bet). Closes execute first, then the surviving opens (highest
-   confidence first).
+   volume, current and historical funding, perp/index basis, authenticated
+   account taker fee, open interest, RSI, current ATR%, ATR versus recent
+   history, trend on 15m/1h/4h, 1h momentum, short and shrinkage-adjusted BTC
+   correlation/beta/downside correlation, an explicit regime classification,
+   range position, recent swing distances and 1h EMA20 distance — plus the
+   BTC-wide regime and live portfolio. The LLM remains the discretionary
+   analyst: it can return no trade or label an idea as `trend_continuation`,
+   `range_breakout`, `funding_squeeze`, or (in demo only) `other`; it chooses
+   direction, confidence, invalidation anchor, exit policy and whether a prior
+   liquidity failure merits one smaller retry. It does **not** choose numeric
+   size, leverage, stop or target.
+6. **The strategy and risk layers dispose.** The versioned momentum contract
+   ([agent/strategy.py](agent/strategy.py)) checks that a recognised label has
+   broad supporting evidence, enforces an extreme no-chase boundary, and
+   converts the chosen anchor/exit policy into reproducible stop and target
+   distances. Structure stops sit beyond the recent swing plus an ATR buffer
+   and can never be tighter than the configured ATR floor. Leverage comes from
+   `risk.entry_leverage`. The risk engine then discards low-confidence,
+   duplicate, held or cooling-down ideas and **sizes from the derived stop plus
+   actual/fallback fees, live spread, adverse funding and expected stop
+   slippage so the all-in stop loss stays within `risk_per_trade_pct` of
+   equity**. Per-position, whole-book and net-direction caps still apply.
+   Every symbol is evaluated at most once for each completed 15-minute signal
+   candle; completed setups also receive semantic cooldown. Closes execute
+   first, then surviving opens are validated sequentially in confidence order
+   against the exposure created by earlier fills.
 7. **Execute with protection.** Orders use client IDs and are never blindly
    retried after an ambiguous network response. Actual terminal order status,
    filled quantity, average fill, fees, and partial fills are verified. Orders
@@ -338,11 +341,25 @@ API keys; the mode must match the keys in `.env`.
 | `timeframes` | `[15m,1h,4h]` | Candle timeframes fed to the model |
 | `candles` | 120 | Candles per timeframe; also excludes coins lacking history |
 
+**Change the momentum contract (`strategy:` block)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `id` / `version` | `momentum` / `phase1-v1` | Immutable attribution identity stored with runs, setups and trades |
+| `signal_timeframe` | `15m` | Fixed for this strategy version; one symbol evaluation per completed bar |
+| `setup_cooldown_minutes` | 45 | Blocks a completed semantic setup before it can be reused |
+| `setup_memory_hours` | 72 | Persists bounded setup/idempotency history across restarts |
+| `min_stop_atr_multiple` | 1.0 | Minimum deterministic stop width |
+| `structure_buffer_atr_multiple` | 0.15 | Buffer added beyond the selected swing invalidation |
+| `hard_max_entry_extension_atr` | 2.5 | Absolute no-chase boundary from the 1h EMA20 |
+| `fixed_reward_risk` / `extended_reward_risk` | 2.0 / 3.0 | Code-derived target multiples selected through the model's exit policy |
+
 **Change how aggressive it is (`risk:` sizing)**
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `max_leverage` | 3 | Per-position leverage cap. **Hard ceiling of 10 in code** regardless of config |
+| `max_leverage` | 3 | Validation ceiling. **Hard ceiling of 10 in code** regardless of config |
+| `entry_leverage` | 2 | Actual deterministic entry leverage; the model cannot change it |
 | `risk_per_trade_pct` | 1.5 | Maximum expected equity loss at a stop, including configured costs |
 | `max_position_notional_pct` | 40 | Per-position notional cap, % of equity |
 | `max_gross_exposure_pct` | 150 | Whole-book notional cap, % of equity |
@@ -381,11 +398,12 @@ Non-liquidity execution failures start at
 `entry_failure_backoff_max_minutes` (60), and remain visible for
 `entry_failure_ttl_minutes` (240). These records survive restarts.
 
-**Cost assumptions (`trading_costs:` block)** — expected taker fee per side,
-stop slippage, minimum funding intervals and expected holding hours are sent to
-the LLM alongside the live funding schedule. The deterministic risk engine
-derives likely settlements from that schedule and includes their adverse cost
-in position sizing; they do not replace technical stop placement.
+**Cost assumptions (`trading_costs:` block)** — the configured taker fee is a
+fallback when the authenticated OKX account fee cannot be read. Expected stop
+slippage, minimum funding intervals and expected holding hours are sent to the
+LLM alongside live funding history and basis. Deterministic sizing uses the
+actual/fallback fee and derives likely adverse funding settlements; costs do
+not replace technical stop placement.
 
 **Human alerts (`alerts:` block)** — generic JSON, Slack or Discord webhooks
 are optional in demo but mandatory in live. Live startup sends a preflight
@@ -393,8 +411,9 @@ message and refuses to trade unless it is acknowledged. Delivery is retried
 three times; exhausted messages are stored in
 `runtime/failed_alerts.jsonl`.
 
-> **To turn aggression up**, raise `max_leverage`, `risk_per_trade_pct`, and
-> `max_gross_exposure_pct` — but understand how they compound: 3 positions at
+> **To turn aggression up**, raise `entry_leverage` (without exceeding
+> `max_leverage`), `risk_per_trade_pct`, and `max_gross_exposure_pct` — but
+> understand how they compound: 3 positions at
 > 2% risk each is a 6% day if everything stops out at once. A few limits are
 > hard-coded in [agent/risk.py](agent/risk.py) and cannot be raised via
 > config: leverage is capped at 10, stop distances must be between 0.2% and
@@ -405,8 +424,8 @@ three times; exhausted messages are stored in
 > typical 1.5–2% stop, the 40% per-position notional cap binds first and the
 > actual loss on a stop-out is ~0.6–0.8% of equity, not 1.5%. The risk
 > target only fully binds for stops wider than ~3.75%
-> (= risk 1.5 ÷ cap 0.40). The model can also voluntarily request less via
-> `size_pct_equity`; it is prompted to do so only deliberately.
+> (= risk 1.5 ÷ cap 0.40). After an order-book rejection, the model may choose
+> `retry_smaller`; code—not the model—calculates the permitted reduced size.
 
 ---
 
@@ -449,9 +468,12 @@ Read these before running anything with real money.
 ## The journal
 
 Everything is recorded in `runtime/journal.db` (SQLite): every decision,
-rejection, trade, transfer and an equity curve snapshot per cycle. The agent
+rejection, setup lifecycle, order submission/recovery result, trade, transfer
+and equity snapshot. Runs and records carry run/cycle IDs, strategy and prompt
+versions, config/code fingerprints and the equity-basis segment ID. The agent
 checks that the journal is writable before starting and pauses immediately on
-any later journal write failure. Plain-text logs rotate at 10 MB.
+any later journal write failure. Existing journals migrate in place;
+plain-text logs rotate at 10 MB.
 
 Each model cycle also records the exact provider request, every retry attempt,
 the provider response ID, raw response text and parsed decisions. This makes
@@ -471,13 +493,16 @@ sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), equity FROM equity 
 ```
 
 Entries and exits share a durable trade ID and record actual fill price,
-quantity, fees, slippage, planned risk, funding and net realized USDT. The
-report excludes legacy or unmatched rows rather than pairing by symbol or
-averaging unrelated percentage returns:
+quantity, fees, signed implementation shortfall, adverse slippage, planned
+risk, funding status and incremental net realized USDT. The report excludes
+unmatched/open rows, never chains equity across valuation-basis migrations,
+and reports momentum independently by strategy/version, prompt/config/code
+variant and setup:
 
 ```bash
-python3 report.py    # transfer-adjusted equity, net USDT, risk/notional returns,
-                     # costs, confidence calibration and rejection reasons
+python3 report.py    # basis-segmented equity; matched net USDT, expectancy,
+                     # profit factor, R, costs/drawdown by strategy/setup;
+                     # universe exclusions and underlying OKX rejection codes
 ```
 
 The calibration table is the one to watch: if 0.9-confidence trades don't
