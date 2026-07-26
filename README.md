@@ -548,6 +548,26 @@ Plain-text logs are in `runtime/demo/agent.log` or `runtime/live/agent.log`.
 
 ---
 
+## Historical backtest
+
+`research/phase1_v2_backtest.py` performs an offline, look-ahead-safe replay
+of the deterministic phase1-v2 setup contracts and `RiskEngine`. It enters at
+the next completed-bar open, handles ambiguous same-bar SL/TP touches
+conservatively, includes fees/funding/slippage scenarios, and never calls the
+LLM or exchange order endpoints.
+
+The committed January 2025–June 2026 six-instrument result found no reliable
+deterministic edge: the combined fixed-RR event study was approximately flat
+before costs and negative after ordinary costs. See
+`research/results/phase1-v2-backtest-2025-2026/REPORT.md` and
+`research/README.md` for methodology, limitations and reproduction.
+
+This result does not measure the LLM selector's incremental contribution.
+That requires a frozen forward demo test; replaying a current model over old
+history can leak knowledge from model training.
+
+---
+
 ## Running multiple agents
 
 One process with specialised modules beats several chatty agents fighting
