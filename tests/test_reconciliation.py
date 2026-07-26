@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from agent import state
-from agent.engine import Engine
+from agent.engine import Engine, PositionAgeUnknown
 from agent.exchange import CredentialError
 from tests.helpers import valid_config
 
@@ -45,6 +45,10 @@ class FakeReconciliationExchange:
             "stop_price": sl,
             "take_price": tp,
         }
+
+    @staticmethod
+    def position_opened_at(pos):
+        return 900.0
 
 
 class PositionReconciliationTests(unittest.TestCase):
@@ -164,13 +168,22 @@ class PositionReconciliationTests(unittest.TestCase):
             "info": {"fundingFee": "0"},
         }
 
-        self.assertTrue(self.engine._close(position, "test close", st))
+        self.assertTrue(self.engine._close(
+            position, "test close", st,
+            close_trigger="thesis_invalidated",
+            close_evidence="entry trend was up; current trend is down"))
 
         # Final remainder: +5 gross -0.10 remaining entry fee -0.20 exit fee.
         # The prior +3.00 partial row is used only for cumulative PnL/cooldown.
         self.assertAlmostEqual(
             log_trade.call_args.kwargs["realized_pnl_usd"], 4.7)
         self.assertAlmostEqual(log_trade.call_args.kwargs["pnl_pct"], 3.85)
+        self.assertEqual(
+            log_trade.call_args.kwargs["close_trigger"],
+            "thesis_invalidated")
+        self.assertIn(
+            "current trend is down",
+            log_trade.call_args.kwargs["close_evidence"])
         self.assertNotIn("BTC/USDT:USDT", st["active_trades"])
 
     def test_missing_protection_is_restored_from_durable_target(self):
@@ -199,6 +212,31 @@ class PositionReconciliationTests(unittest.TestCase):
         self.engine._close = Mock(return_value=False)
         with self.assertRaisesRegex(RuntimeError, "without verified protection"):
             self.engine._reconcile_positions([position], st, startup=True)
+
+    @patch("agent.engine.state.log_trade")
+    def test_unknown_adopted_position_age_pauses_instead_of_resetting_clock(
+            self, log_trade):
+        self.engine.ex.position_opened_at = Mock(return_value=None)
+        self.engine.ex.protection_status = Mock(return_value={
+            "stop_loss": True, "take_profit": True,
+            "stop_price": 95, "take_price": 110,
+        })
+        st = {
+            "opened_at": {}, "cooldowns": {}, "active_trades": {},
+            "protection": {},
+        }
+        position = {
+            "symbol": "ETH/USDT:USDT", "side": "long", "contracts": 2,
+            "entryPrice": 100, "markPrice": 101, "leverage": 2,
+        }
+
+        with self.assertRaises(PositionAgeUnknown):
+            self.engine._reconcile_positions([position], st, startup=True)
+
+        adopted = st["active_trades"]["ETH/USDT:USDT"]
+        self.assertFalse(adopted["age_known"])
+        self.assertEqual(adopted["opened_at"], 0)
+        self.assertNotIn("ETH/USDT:USDT", st["opened_at"])
 
     @patch("agent.engine.state.log_event")
     def test_reconciliation_closes_position_whose_stop_is_too_near_liquidation(

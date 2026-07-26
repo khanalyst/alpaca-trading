@@ -108,7 +108,16 @@ is more independent; negative means it has recently moved opposite BTC.
 corr_btc_downside_1h_72: longer, shrinkage-adjusted co-movement, BTC beta and \
 down-market correlation. Check corr_btc_samples before trusting them.
 - signal_ts: timestamp of the completed 15m candle that identifies this setup.
-- setup_evidence: broad deterministic evidence contracts for recognised setup \
+- signal_1h_ts: timestamp of the latest completed 1h candle. Failed-thesis \
+re-entry requires a genuinely newer 1h bar.
+- mom_15m_pct / signal_candle_return_pct: the latest completed 15m impulse.
+- fresh_breakout_long / fresh_breakout_short and breakout_distance_pct: true \
+only when the latest completed signal candle closes beyond the preceding \
+20-candle range; unlike 24h range position, this proves the break is fresh.
+- price_stabilized_long / price_stabilized_short: completed-candle evidence \
+that price stopped extending the adverse extreme and closed back in the \
+potential squeeze direction.
+- setup_evidence: minimum deterministic evidence contracts for recognised setup \
 types, plus directional EMA extension in ATR and the hard no-chase boundary.
 - regime: deterministic description of the current data: trend_up, \
 trend_down, high_volatility, choppy, or transition. It is context, not a \
@@ -126,7 +135,10 @@ account self-kills at the configured max drawdown; protect it.
 loss limit tripped and you may only close.
 - open_positions: for each held position: symbol, side, entry, mark, \
 upnl_pct (unrealised PnL percent on margin), leverage, notional_usd, \
-hours_open. Positions are force-closed at the max hold age, so tired \
+hours_open, age_verified, planned_risk_usd and original_thesis. The original \
+thesis contains the entry reason, setup/invalidation/exit policy and compact \
+entry evidence. Compare it field-by-field with the current symbol snapshot \
+before proposing a close. Positions are force-closed at the max hold age, so tired \
 positions going nowhere are better closed by you at a good price than by \
 the clock at a bad one.
 - post_loss_cooldowns: symbols temporarily barred after a realized losing \
@@ -146,7 +158,9 @@ until the universe is refreshed.
 - recent_setup_memory: setup IDs already evaluated or traded. A symbol is \
 evaluated only once per completed signal candle, even if you would relabel the \
 setup or flip direction. A positive retry_after_minutes also blocks a \
-semantically identical setup on a newer candle.
+semantically identical setup on a newer candle. A prior loss additionally \
+requires elapsed time, a fresh completed 1h candle, changed objective evidence \
+and your explicit what_changed_since_last_loss explanation.
 - hard_limits_fyi: key deterministic risk caps. You do not choose size or \
 leverage.
 - trading_costs_fyi: fallback taker fee per side, expected stop slippage, \
@@ -167,6 +181,9 @@ execution_choice to retry_smaller; code calculates the safe reduced size;
 notional minus short notional) beyond the configured cap - several \
 same-direction positions in correlated coins count as one big bet, so \
 diversify direction or accept the rejection;
+- cap the sum of planned all-in stop risk across every open position, and cap \
+signed BTC-beta-weighted exposure using measured beta (or conservative beta=1 \
+when history is insufficient);
 - set leverage from configuration and size the position so that the \
 deterministic structure/ATR stop plus expected fees, live spread, adverse \
 funding and slippage remains inside the risk budget;
@@ -180,18 +197,21 @@ confidence to push a marginal trade through. Confidence is a decision gate \
 and later calibration input, not a way to force size.
 
 SETUP ARCHETYPES (long side described; mirror them for shorts)
-- Trend continuation pullback: trend_4h and trend_1h up, price pulls back \
-on the 15m (trend_15m flat or briefly down, ema20_1h_dist_pct near zero), \
-mom_1h_pct turns back positive, range_pos_pct recovering. Stop beyond the \
+- Trend continuation pullback: trend_4h and trend_1h up, then the latest \
+completed 15m impulse resumes upward after a pullback (trend_15m flat or up, \
+mom_15m_pct and mom_1h_pct positive, ema20_1h_dist_pct near zero), and \
+range_pos_pct is recovering. Stop beyond the \
 recent swing low: at least swing_low_pct plus a buffer, and never tighter \
 than 1x atr_1h_pct.
-- Range breakout: range_pos_pct near 100 with trend_1h turning up and \
-volume/momentum expanding; enter in the breakout direction with the stop \
+- Range breakout: the latest completed 15m candle must freshly close beyond \
+the preceding 20-candle range, with range_pos_pct near 100, trend_1h not \
+opposed and volume/momentum expanding; enter in the breakout direction with the stop \
 just inside the prior range (roughly swing_low_pct back for a long), \
 never tighter than 1x atr_1h_pct.
-- Funding squeeze: funding deeply negative while price stops making new \
-lows and the 1h trend flattens - crowded shorts are paying to hold a losing \
-position and fuel the reversal. Higher risk; demand a clear structure/ATR \
+- Funding squeeze: funding deeply negative and extreme versus its own history \
+while price stops making new lows, closes back up, the perp trades at a \
+discount and open interest is measurable - crowded shorts are paying to hold \
+a losing position and fuel the reversal. Higher risk; demand a clear structure/ATR \
 invalidation, enough net room for the chosen exit policy, and assign lower \
 confidence.
 - Avoid: mid-range entries with mixed trends; chasing a move already \
@@ -246,8 +266,11 @@ no markdown fences, no comments. Schema:
    "setup_type": "trend_continuation",
    "invalidation_anchor": "structure", "exit_policy": "fixed_rr",
    "execution_choice": "normal", "confidence": 0.0,
+   "what_changed_since_last_loss": "", "reasoning": "one sentence"},
+  {"action": "close", "symbol": "ETH/USDT:USDT",
+   "close_trigger": "thesis_invalidated",
+   "evidence_change": "entry trend_1h up; current trend_1h down",
    "reasoning": "one sentence"},
-  {"action": "close", "symbol": "ETH/USDT:USDT", "reasoning": "one sentence"},
   {"action": "hold", "symbol": "SOL/USDT:USDT"}
 ]}
 Rules: setup_type must be trend_continuation, range_breakout, funding_squeeze \
@@ -255,7 +278,11 @@ or other; other is experimental and demo-only. invalidation_anchor must be \
 structure or atr; trend_continuation and range_breakout require structure. \
 exit_policy must be fixed_rr, extended_rr or structure_target. \
 execution_choice is normal unless current liquidity feedback justifies \
-retry_smaller. Confidence is in [0,1]. You have no size, leverage, numeric \
+retry_smaller. what_changed_since_last_loss is required only when retrying \
+the same direction/setup after a recorded loss. Confidence is in [0,1]. \
+For close, close_trigger must be thesis_invalidated, risk_reduction, \
+stale_position or profit_protection, and evidence_change must state the \
+specific original-versus-current evidence change. You have no size, leverage, numeric \
 stop or numeric target field. Only close symbols in open_positions; hold \
 entries are optional and ignored; an empty decisions list is valid.
 
@@ -268,7 +295,8 @@ point, and does the exit policy leave enough net room after costs?
 3. Is every confidence a number you would defend, not a number chosen to \
 clear the floor?
 4. Have you checked each currently open position against its original \
-thesis and closed the ones that no longer qualify?
+thesis, and does every close name a valid trigger plus the exact evidence \
+that changed?
 5. Are you within the stated maximum number of new opens, with no open and \
 close on the same symbol in the same answer?
 6. If the honest answer this cycle is "no trade", is your decisions list \
@@ -282,8 +310,11 @@ staying flat instead of blindly repeating the rejected symbol or size?
 WORKED EXAMPLES
 Example A - one tired holding, one aligned setup:
 {"decisions":[
- {"action":"close","symbol":"ETH/USDT:USDT","reasoning":"held 14h, trend_1h \
-flipped down and momentum negative - thesis broken"},
+ {"action":"close","symbol":"ETH/USDT:USDT",\
+"close_trigger":"thesis_invalidated",\
+"evidence_change":"entry trend_1h was up; current trend_1h is down and \
+mom_1h_pct is negative",\
+"reasoning":"held 14h and the recorded continuation thesis has broken"},
  {"action":"open","symbol":"BTC/USDT:USDT","direction":"long",\
 "setup_type":"trend_continuation","invalidation_anchor":"structure",\
 "exit_policy":"extended_rr","execution_choice":"normal","confidence":0.82,\
@@ -304,6 +335,11 @@ PROMPT_VERSION = hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest()[:16]
 
 
 class LLM:
+    @staticmethod
+    def _sampling_unsupported(model: str) -> bool:
+        name = str(model).lower()
+        return name.startswith(("gpt-5", "o1", "o3", "o4"))
+
     def __init__(self, cfg: dict):
         self.cfg = cfg["llm"]
         provider = self.cfg["provider"]
@@ -325,9 +361,11 @@ class LLM:
                              "(use anthropic or openai)")
         # Newer models (Sonnet 5, Opus 4.7+) reject sampling parameters;
         # discovered once at runtime, then omitted from every later call.
-        self._no_temperature = False
+        self._no_temperature = self._sampling_unsupported(
+            self.cfg["model"])
         self._last_request_attempts: list[dict] = []
         self._last_response_audit: dict | None = None
+        self._last_usage_audit: dict | None = None
 
     def _anthropic_params(self, system: str, user: str) -> dict:
         params = dict(
@@ -353,6 +391,9 @@ class LLM:
                 {"role": "user", "content": user},
             ],
             response_format={"type": "json_object"},
+            # Stable routing key for the byte-identical system-prefix cache.
+            # Dynamic market/portfolio data remains after that prefix.
+            prompt_cache_key=f"okx-agent-{PROMPT_VERSION}",
         )
         if not self._no_temperature:
             params["temperature"] = float(self.cfg.get("temperature", 0.2))
@@ -379,10 +420,26 @@ class LLM:
         self._last_response_id = getattr(resp, "id", None)
         u = getattr(resp, "usage", None)
         if u:
-            log.info("tokens: in=%s out=%s cache_write=%s cache_read=%s",
-                     u.input_tokens, u.output_tokens,
-                     getattr(u, "cache_creation_input_tokens", 0) or 0,
-                     getattr(u, "cache_read_input_tokens", 0) or 0)
+            total = int(getattr(u, "input_tokens", 0) or 0)
+            written = int(
+                getattr(u, "cache_creation_input_tokens", 0) or 0)
+            cached = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+            fresh = max(0, total - cached)
+            hit_rate = (cached / total * 100) if total else 0.0
+            self._last_usage_audit = {
+                "input_tokens_total": total,
+                "input_tokens_fresh": fresh,
+                "output_tokens": int(
+                    getattr(u, "output_tokens", 0) or 0),
+                "cache_write_tokens": written,
+                "cache_read_tokens": cached,
+                "cache_hit_pct": round(hit_rate, 1),
+            }
+            log.info(
+                "tokens: in_total=%s in_fresh=%s out=%s cache_write=%s "
+                "cache_read=%s cache_hit=%.1f%%",
+                total, fresh, self._last_usage_audit["output_tokens"],
+                written, cached, hit_rate)
         return "".join(
             b.text for b in resp.content if getattr(b, "type", "") == "text"
         )
@@ -413,8 +470,22 @@ class LLM:
             details = getattr(u, "prompt_tokens_details", None)
             if details:
                 cached = getattr(details, "cached_tokens", 0) or 0
-            log.info("tokens: in=%s out=%s cache_read=%s",
-                     u.prompt_tokens, u.completion_tokens, cached)
+            total = int(getattr(u, "prompt_tokens", 0) or 0)
+            output = int(getattr(u, "completion_tokens", 0) or 0)
+            fresh = max(0, total - int(cached))
+            hit_rate = (int(cached) / total * 100) if total else 0.0
+            self._last_usage_audit = {
+                "input_tokens_total": total,
+                "input_tokens_fresh": fresh,
+                "output_tokens": output,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": int(cached),
+                "cache_hit_pct": round(hit_rate, 1),
+            }
+            log.info(
+                "tokens: in_total=%s in_fresh=%s out=%s cache_read=%s "
+                "cache_hit=%.1f%%",
+                total, fresh, output, cached, hit_rate)
         return resp.choices[0].message.content or ""
 
     # ----------------------------------------------------------- public
@@ -460,6 +531,7 @@ class LLM:
             "model": self.cfg["model"],
             "request_attempts": deepcopy(attempts),
             "response": deepcopy(response),
+            "usage": deepcopy(getattr(self, "_last_usage_audit", None)),
         }
 
     def decide(self, snapshot: dict, portfolio: dict, max_new: int) -> list[dict]:
@@ -468,6 +540,7 @@ class LLM:
         user = self._user_message(snapshot, portfolio, max_new)
         self._last_request_attempts = []
         self._last_response_audit = None
+        self._last_usage_audit = None
         self._last_response_id = None
         text = self._call(SYSTEM, user)
         decisions = parse_decisions(text)
@@ -533,6 +606,22 @@ def parse_decisions(text: str) -> list[dict]:
                 "exit_policy": str(d.get("exit_policy") or "").lower(),
                 "execution_choice": str(
                     d.get("execution_choice") or "normal").lower(),
+                "what_changed_since_last_loss": str(
+                    d.get("what_changed_since_last_loss") or "")[:300],
+            })
+        elif action == "close":
+            trigger = str(d.get("close_trigger") or "").lower()
+            evidence_change = str(
+                d.get("evidence_change") or "").strip()[:500]
+            if trigger not in {
+                    "thesis_invalidated", "risk_reduction",
+                    "stale_position", "profit_protection"}:
+                continue
+            if len(evidence_change) < 12:
+                continue
+            item.update({
+                "close_trigger": trigger,
+                "evidence_change": evidence_change,
             })
         out.append(item)
     return out

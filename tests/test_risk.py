@@ -185,6 +185,63 @@ class VetOpenSymbolTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertEqual(plan["taker_fee_pct_per_side"], 0.08)
 
+    def test_held_position_without_durable_planned_risk_blocks_new_entries(self):
+        market = snapshot()
+        market["ETH/USDT:USDT"] = {
+            "price": 100, "beta_btc_1h_72": 1,
+            "corr_btc_samples": 72,
+        }
+        held = [{
+            "symbol": "ETH/USDT:USDT", "side": "long",
+            "notional": 1_000,
+        }]
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, held, market, {}, 1_000,
+            active_trades={})
+        self.assertIsNone(plan)
+        self.assertEqual(
+            why, "held position planned risk is unavailable")
+
+    def test_total_planned_open_risk_cap_blocks_another_stop_budget(self):
+        market = snapshot()
+        market["ETH/USDT:USDT"] = {
+            "price": 100, "beta_btc_1h_72": 0.2,
+            "corr_btc_samples": 72,
+        }
+        held = [{
+            "symbol": "ETH/USDT:USDT", "side": "short",
+            "notional": 1_000,
+        }]
+        active = {"ETH/USDT:USDT": {"risk_usd": 300}}
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, held, market, {}, 1_000,
+            active_trades=active)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "total planned open-risk cap reached")
+
+    def test_btc_beta_weighted_cap_uses_measured_candidate_beta(self):
+        cfg = valid_config()
+        cfg["risk"]["max_btc_beta_exposure_pct"] = 20
+        risk = RiskEngine(cfg)
+        market = snapshot()
+        market["BTC/USDT:USDT"].update({
+            "beta_btc_1h_72": 1.0,
+            "corr_btc_samples": 72,
+        })
+        plan, why = risk.vet_open(
+            decision(), 10_000, [], market, {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(
+            why, "BTC-beta-weighted exposure cap reached")
+
+    def test_experimental_lane_uses_smaller_risk_budget(self):
+        plan, why = self.risk.vet_open(
+            decision(setup_type="other"),
+            10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertEqual(plan["risk_budget_pct"], 0.5)
+        self.assertAlmostEqual(plan["risk_usd"], 50)
+
 
 if __name__ == "__main__":
     unittest.main()

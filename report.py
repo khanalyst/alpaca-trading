@@ -20,8 +20,26 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
 
-DEFAULT_DB = Path(__file__).resolve().parent / "runtime" / "journal.db"
+
+ROOT = Path(__file__).resolve().parent
+
+
+def configured_default_db() -> Path:
+    """Use the same demo/live runtime scope selected by config.yaml."""
+    try:
+        mode = str(
+            (yaml.safe_load((ROOT / "config.yaml").read_text()) or {})
+            .get("mode"))
+    except Exception:
+        mode = "_unconfigured"
+    if mode not in {"demo", "live"}:
+        mode = "_unconfigured"
+    return ROOT / "runtime" / mode / "journal.db"
+
+
+DEFAULT_DB = configured_default_db()
 TRADE_FIELDS = (
     "ts", "symbol", "side", "action", "qty", "price", "notional",
     "leverage", "reason", "confidence", "pnl_pct", "trade_id", "order_id",
@@ -31,7 +49,8 @@ TRADE_FIELDS = (
     "setup_id", "setup_key", "setup_type", "signal_ts", "exit_policy",
     "invalidation_anchor", "run_id", "cycle_id", "prompt_version",
     "config_version", "code_version", "equity_basis_id",
-    "entry_equity_usd",
+    "entry_equity_usd", "close_trigger", "close_evidence",
+    "runtime_mode", "account_fingerprint",
 )
 
 
@@ -152,6 +171,12 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
                 opened.get("config_version") or "legacy"),
             "code_version": (
                 opened.get("code_version") or "legacy"),
+            "runtime_mode": (
+                opened.get("runtime_mode") or "legacy_unknown"),
+            "account_fingerprint": (
+                opened.get("account_fingerprint") or "legacy_unknown"),
+            "close_trigger": close.get("close_trigger"),
+            "close_evidence": close.get("close_evidence"),
             "entry_equity_usd": _number(
                 opened.get("entry_equity_usd"), 0.0),
             "pnl_semantics": (
@@ -409,6 +434,8 @@ def print_per_strategy(trades: list[dict]) -> None:
     grouped = defaultdict(list)
     for trade in trades:
         grouped[(
+            trade["runtime_mode"],
+            trade["account_fingerprint"],
             trade["strategy_id"],
             trade["strategy_version"],
             trade["prompt_version"],
@@ -416,7 +443,8 @@ def print_per_strategy(trades: list[dict]) -> None:
             trade["code_version"],
         )].append(trade)
     for (
-            strategy_id, version, prompt_version, config_version, code_version
+            runtime_mode, account_fingerprint, strategy_id, version,
+            prompt_version, config_version, code_version
     ), rows in sorted(grouped.items()):
         pnl = sum(row["net_pnl_usd"] for row in rows)
         wins = [row for row in rows if row["net_pnl_usd"] > 0]
@@ -434,6 +462,7 @@ def print_per_strategy(trades: list[dict]) -> None:
             f"{sum(row['r_multiple'] for row in risk_rows) / len(risk_rows):+.2f}"
             if risk_rows else "n/a")
         print(f"\n  {strategy_id} / {version}")
+        print(f"    runtime {runtime_mode} / {account_fingerprint}")
         print(f"    variant prompt={prompt_version} config={config_version} "
               f"code={code_version}")
         print(f"    trades {len(rows)}   win rate "

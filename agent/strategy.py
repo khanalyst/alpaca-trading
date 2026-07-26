@@ -63,6 +63,9 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
         return None
     strategy_id, strategy_version = identity(cfg)
     setup_type = str(decision.get("setup_type") or "invalid")[:80]
+    if setup_type == "other":
+        strategy_id = f"{strategy_id}-experimental"
+        strategy_version = f"{strategy_version}-experimental-v1"
     setup_key = _hash({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
@@ -90,24 +93,26 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
 
 
 def setup_evidence(snapshot: dict, cfg: dict) -> dict:
-    """Return compact, broad evidence for each recognised setup archetype."""
+    """Return auditable minimum evidence for each recognised setup archetype."""
     block = cfg["strategy"]
     atr = max(_finite(snapshot.get("atr_1h_pct"), 0.0) or 0.0, 0.0)
     ema_distance = _finite(snapshot.get("ema20_1h_dist_pct"), 0.0) or 0.0
     long_extension = max(0.0, ema_distance / atr) if atr > 0 else None
     short_extension = max(0.0, -ema_distance / atr) if atr > 0 else None
 
-    trends = [
-        snapshot.get("trend_15m"),
-        snapshot.get("trend_1h"),
-        snapshot.get("trend_4h"),
-    ]
-    up = sum(value == "up" for value in trends)
-    down = sum(value == "down" for value in trends)
+    trend_15m = snapshot.get("trend_15m")
+    trend_1h = snapshot.get("trend_1h")
+    trend_4h = snapshot.get("trend_4h")
     range_position = _finite(snapshot.get("range_pos_pct"))
     relative_volume = _finite(snapshot.get("relative_volume_1h"))
     momentum = _finite(snapshot.get("mom_1h_pct"), 0.0) or 0.0
+    fast_momentum = _finite(snapshot.get("mom_15m_pct"), 0.0) or 0.0
     funding = _finite(snapshot.get("funding_rate_pct"))
+    funding_percentile = _finite(snapshot.get("funding_percentile_30"))
+    funding_samples = int(
+        max(0.0, _finite(snapshot.get("funding_samples_30"), 0.0) or 0.0))
+    basis = _finite(snapshot.get("perp_index_basis_pct"))
+    open_interest = _finite(snapshot.get("open_interest_musd"))
     range_threshold = float(block["breakout_range_threshold_pct"])
     min_relative_volume = float(block["breakout_min_relative_volume"])
     funding_extreme = float(block["funding_extreme_pct"])
@@ -118,6 +123,9 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
         and range_position >= range_threshold
         and relative_volume >= min_relative_volume
         and momentum > 0
+        and fast_momentum > 0
+        and snapshot.get("fresh_breakout_long") is True
+        and trend_1h != "down"
     )
     breakout_short = (
         range_position is not None
@@ -125,16 +133,63 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
         and range_position <= 100 - range_threshold
         and relative_volume >= min_relative_volume
         and momentum < 0
+        and fast_momentum < 0
+        and snapshot.get("fresh_breakout_short") is True
+        and trend_1h != "up"
+    )
+    continuation_long = (
+        trend_1h == "up"
+        and trend_4h == "up"
+        and trend_15m != "down"
+        and momentum > 0
+        and fast_momentum > 0
+    )
+    continuation_short = (
+        trend_1h == "down"
+        and trend_4h == "down"
+        and trend_15m != "up"
+        and momentum < 0
+        and fast_momentum < 0
+    )
+    squeeze_context_available = (
+        funding_samples >= 10
+        and funding_percentile is not None
+        and basis is not None
+        and open_interest is not None
+        and open_interest > 0
+    )
+    squeeze_long = (
+        funding is not None
+        and funding <= -funding_extreme
+        and squeeze_context_available
+        and funding_percentile <= 25
+        and basis <= 0
+        and trend_1h != "down"
+        and snapshot.get("price_stabilized_long") is True
+        and fast_momentum > 0
+    )
+    squeeze_short = (
+        funding is not None
+        and funding >= funding_extreme
+        and squeeze_context_available
+        and funding_percentile >= 75
+        and basis >= 0
+        and trend_1h != "up"
+        and snapshot.get("price_stabilized_short") is True
+        and fast_momentum < 0
     )
     return {
-        "trend_continuation": {"long": up >= 2, "short": down >= 2},
+        "trend_continuation": {
+            "long": continuation_long,
+            "short": continuation_short,
+        },
         "range_breakout": {
             "long": breakout_long,
             "short": breakout_short,
         },
         "funding_squeeze": {
-            "long": funding is not None and funding <= -funding_extreme,
-            "short": funding is not None and funding >= funding_extreme,
+            "long": squeeze_long,
+            "short": squeeze_short,
         },
         "extension_atr": {
             "long": round(long_extension, 2)
@@ -149,6 +204,72 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
 def enrich_snapshot(snapshot: dict, cfg: dict) -> dict:
     snapshot["setup_evidence"] = setup_evidence(snapshot, cfg)
     return snapshot
+
+
+def _bucket(value: object, thresholds: tuple[float, ...]) -> int | None:
+    number = _finite(value)
+    if number is None:
+        return None
+    return sum(number >= threshold for threshold in thresholds)
+
+
+def evidence_fingerprint(snapshot: dict) -> str:
+    """Fingerprint meaningful evidence buckets, not every market tick."""
+    return _hash({
+        "trends": [
+            snapshot.get("trend_15m"),
+            snapshot.get("trend_1h"),
+            snapshot.get("trend_4h"),
+        ],
+        "regime": snapshot.get("regime"),
+        "momentum_15m": _bucket(
+            snapshot.get("mom_15m_pct"), (-0.5, 0.0, 0.5)),
+        "momentum_1h": _bucket(
+            snapshot.get("mom_1h_pct"), (-1.0, 0.0, 1.0)),
+        "relative_volume": _bucket(
+            snapshot.get("relative_volume_1h"), (0.75, 1.0, 1.5, 2.0)),
+        "range_position": _bucket(
+            snapshot.get("range_pos_pct"), (20, 40, 60, 80)),
+        "funding": _bucket(
+            snapshot.get("funding_rate_pct"), (-0.05, -0.02, 0, 0.02, 0.05)),
+        "fresh_breakout_long": snapshot.get("fresh_breakout_long") is True,
+        "fresh_breakout_short": snapshot.get("fresh_breakout_short") is True,
+        "price_stabilized_long": (
+            snapshot.get("price_stabilized_long") is True),
+        "price_stabilized_short": (
+            snapshot.get("price_stabilized_short") is True),
+    })
+
+
+def compact_entry_evidence(
+        snapshot: dict, market_context: dict | None = None) -> dict:
+    """Persist enough original evidence for a later close comparison."""
+    fields = (
+        "signal_ts", "signal_1h_ts", "trend_15m", "trend_1h", "trend_4h",
+        "regime", "mom_15m_pct", "mom_1h_pct", "relative_volume_1h",
+        "range_pos_pct", "atr_1h_pct", "atr_1h_ratio",
+        "ema20_1h_dist_pct", "funding_rate_pct", "funding_percentile_30",
+        "perp_index_basis_pct", "open_interest_musd",
+        "corr_btc_1h_72_shrunk", "beta_btc_1h_72",
+        "corr_btc_downside_1h_72", "corr_btc_samples",
+        "fresh_breakout_long", "fresh_breakout_short",
+        "price_stabilized_long", "price_stabilized_short",
+    )
+    evidence = {
+        key: snapshot.get(key) for key in fields if key in snapshot
+    }
+    evidence["evidence_fingerprint"] = evidence_fingerprint(snapshot)
+    if isinstance(snapshot.get("setup_evidence"), dict):
+        evidence["setup_evidence"] = snapshot["setup_evidence"]
+    if isinstance(market_context, dict):
+        evidence["btc_market_context"] = {
+            key: market_context.get(key)
+            for key in (
+                "regime", "atr_1h_ratio", "relative_volume_1h",
+                "mom_1h_pct")
+            if key in market_context
+        }
+    return evidence
 
 
 def build_setup_plan(decision: dict, symbol_snapshot: dict,
@@ -232,6 +353,9 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
         take_pct = stop_pct * fixed_rr
 
     strategy_id, strategy_version = identity(cfg)
+    if setup_type == "other":
+        strategy_id = f"{strategy_id}-experimental"
+        strategy_version = f"{strategy_version}-experimental-v1"
     setup_key = _hash({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
@@ -254,6 +378,11 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
         "invalidation_anchor": anchor,
         "exit_policy": exit_policy,
         "execution_choice": execution_choice,
+        "what_changed_since_last_loss": str(
+            decision.get("what_changed_since_last_loss") or "")[:300],
+        "entry_evidence_fingerprint": evidence_fingerprint(symbol_snapshot),
+        "entry_signal_1h_ts": _finite(
+            symbol_snapshot.get("signal_1h_ts")),
         "stop_loss_pct": round(stop_pct, 6),
         "take_profit_pct": round(take_pct, 6),
         # Risk and leverage are deterministic. Explicitly discard any numeric
@@ -281,17 +410,31 @@ def new_setup_record(plan: dict, cfg: dict,
         "expires_at": (
             current + float(cfg["strategy"]["setup_memory_hours"]) * 3600),
         "status": "proposed",
+        "entry_evidence_fingerprint": plan.get(
+            "entry_evidence_fingerprint"),
+        "entry_signal_1h_ts": plan.get("entry_signal_1h_ts"),
+        "outcome": None,
     }
 
 
 def mark_setup(record: dict, status: str, cfg: dict,
                *, now: float | None = None,
-               apply_cooldown: bool = False) -> None:
+               apply_cooldown: bool = False,
+               realized_pnl_usd: float | None = None) -> None:
     if status not in SETUP_STATUSES:
         raise ValueError(f"invalid setup status: {status}")
     current = float(now if now is not None else time.time())
     record["status"] = status
     record["last_seen_at"] = current
+    if status == "closed":
+        record["closed_at"] = current
+        if realized_pnl_usd is None:
+            record["outcome"] = "unknown"
+        else:
+            pnl = float(realized_pnl_usd)
+            record["realized_pnl_usd"] = pnl
+            record["outcome"] = (
+                "win" if pnl > 0 else "loss" if pnl < 0 else "flat")
     if apply_cooldown:
         record["blocked_until"] = max(
             float(record.get("blocked_until") or 0),
@@ -317,6 +460,48 @@ def semantic_block(records: dict, setup_key: str,
         if matches else None
 
 
+def failed_thesis_reentry_reason(
+        records: dict, plan: dict, cfg: dict,
+        now: float | None = None) -> str | None:
+    """Require time, a fresh completed 1h bar and changed objective evidence."""
+    current = float(now if now is not None else time.time())
+    losses = [
+        record for record in records.values()
+        if isinstance(record, dict)
+        and record.get("setup_key") == plan.get("setup_key")
+        and record.get("outcome") == "loss"
+    ]
+    if not losses:
+        return None
+    previous = max(
+        losses,
+        key=lambda record: float(
+            record.get("closed_at") or record.get("last_seen_at") or 0))
+    closed_at = float(
+        previous.get("closed_at") or previous.get("last_seen_at") or 0)
+    wait_seconds = float(
+        cfg["strategy"]["loss_reentry_min_minutes"]) * 60
+    if current < closed_at + wait_seconds:
+        remaining = (closed_at + wait_seconds - current) / 60
+        return (
+            f"failed-thesis re-entry requires {remaining:.1f} more "
+            "minute(s)")
+    old_hour = _finite(previous.get("entry_signal_1h_ts"))
+    new_hour = _finite(plan.get("entry_signal_1h_ts"))
+    if old_hour is None or new_hour is None or new_hour <= old_hour:
+        return "failed-thesis re-entry requires a fresh completed 1h candle"
+    old_evidence = previous.get("entry_evidence_fingerprint")
+    new_evidence = plan.get("entry_evidence_fingerprint")
+    if not old_evidence or not new_evidence or old_evidence == new_evidence:
+        return "failed-thesis re-entry requires changed objective evidence"
+    explanation = str(
+        plan.get("what_changed_since_last_loss") or "").strip()
+    if len(explanation) < 12:
+        return (
+            "failed-thesis re-entry requires what_changed_since_last_loss")
+    return None
+
+
 def evaluated_signal(records: dict, plan: dict) -> dict | None:
     """Find an earlier evaluation of this symbol's completed signal bar.
 
@@ -329,9 +514,7 @@ def evaluated_signal(records: dict, plan: dict) -> dict | None:
         if not isinstance(record, dict):
             continue
         if (
-            record.get("strategy_id") == plan.get("strategy_id")
-            and record.get("strategy_version") == plan.get("strategy_version")
-            and record.get("symbol") == plan.get("symbol")
+            record.get("symbol") == plan.get("symbol")
             and float(record.get("signal_ts") or -1) == signal_ts
         ):
             return record
@@ -365,6 +548,8 @@ def recent_setup_view(records: dict, now: float | None = None) -> list[dict]:
             "setup_type": record.get("setup_type"),
             "status": record.get("status"),
             "signal_ts": record.get("signal_ts"),
+            "outcome": record.get("outcome"),
+            "closed_at": record.get("closed_at"),
             "retry_after_minutes": round(
                 max(0.0, blocked_until - current) / 60, 1),
             "_last_seen_at": float(record.get("last_seen_at") or 0),

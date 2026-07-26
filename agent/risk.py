@@ -6,8 +6,11 @@ through vet_open(), which either rejects the trade or returns a clamped plan:
 - leverage capped at config max_leverage and a HARD ceiling of 10
 - notional sized so the all-in bounded loss costs risk_per_trade_pct of equity
 - per-position and gross exposure caps in % of equity
+- total planned stop-risk cap across all open positions
 - net directional exposure cap (long minus short notional) so several
   same-direction positions in correlated coins can't act as one macro bet
+- signed BTC-beta-weighted exposure cap using measured beta or a conservative
+  beta of one when history is insufficient
 - confidence floor, per-symbol cooldowns, stop-distance sanity bounds
 
 Circuit breakers (daily loss, max drawdown, margin usage) live in the engine
@@ -41,6 +44,7 @@ class RiskEngine:
                  gross_notional: float,
                  entry_feedback: dict | None = None,
                  entry_failures: dict | None = None,
+                 active_trades: dict | None = None,
                  ) -> tuple[dict | None, str | None]:
         symbol = decision["symbol"]
 
@@ -68,6 +72,21 @@ class RiskEngine:
             if position.get("side") not in {"long", "short"}:
                 return None, "held position direction is invalid"
             position_notionals.append(position_notional)
+
+        active_trades = active_trades or {}
+        current_open_risk = 0.0
+        for position in positions:
+            symbol_key = position.get("symbol")
+            trade = active_trades.get(symbol_key)
+            if not isinstance(trade, dict):
+                return None, "held position planned risk is unavailable"
+            try:
+                held_risk = float(trade.get("risk_usd"))
+            except (TypeError, ValueError):
+                return None, "held position planned risk is unavailable"
+            if not math.isfinite(held_risk) or held_risk < 0:
+                return None, "held position planned risk is unavailable"
+            current_open_risk += held_risk
 
         # Snapshot keys starting with "_" are context blocks (_market_context),
         # not tradable instruments; never let one pass the membership check.
@@ -223,7 +242,12 @@ class RiskEngine:
         # Size from all-in adverse risk, not price distance alone. This keeps
         # expected fees, spread, stop slippage and adverse funding inside the
         # configured risk-per-trade budget.
-        risk_usd = equity * float(self.r["risk_per_trade_pct"]) / 100.0
+        risk_pct = (
+            float(self.r["experimental_risk_per_trade_pct"])
+            if decision.get("setup_type") == "other"
+            else float(self.r["risk_per_trade_pct"])
+        )
+        risk_usd = equity * risk_pct / 100.0
         notional = risk_usd / (estimated_loss_pct / 100.0)
 
         # Per-position cap.
@@ -246,6 +270,21 @@ class RiskEngine:
         if notional < MIN_NOTIONAL_USD:
             return None, "resulting size too small"
 
+        # The daily stop is an account outcome, while per-trade risk is only a
+        # plan. Cap the sum of those plans so three simultaneous stops cannot
+        # consume essentially the whole daily loss allowance.
+        total_risk_cap = (
+            equity * float(self.r["max_total_open_risk_pct"]) / 100.0)
+        risk_room = total_risk_cap - current_open_risk
+        if risk_room <= 0:
+            return None, "total planned open-risk cap reached"
+        candidate_risk = notional * estimated_loss_pct / 100.0
+        if candidate_risk > risk_room:
+            notional = risk_room / (estimated_loss_pct / 100.0)
+            candidate_risk = notional * estimated_loss_pct / 100.0
+        if notional < MIN_NOTIONAL_USD:
+            return None, "total planned open-risk room is too small"
+
         # Correlation guard: most alts move with BTC, so N same-direction
         # positions behave like one position N times the size. Cap the net
         # directional book (long minus short notional). Opens that REDUCE
@@ -260,6 +299,38 @@ class RiskEngine:
         net_cap = equity * float(self.r.get("max_net_direction_pct", 100)) / 100.0
         if abs(net + candidate) > net_cap:
             return None, "net directional exposure cap reached"
+
+        def beta_for(position_symbol: str) -> float:
+            if position_symbol == "BTC/USDT:USDT":
+                return 1.0
+            data = snapshot.get(position_symbol)
+            if not isinstance(data, dict):
+                return 1.0
+            try:
+                samples = int(data.get("corr_btc_samples") or 0)
+                beta = float(data.get("beta_btc_1h_72"))
+            except (TypeError, ValueError):
+                return 1.0
+            if (samples < int(self.r["min_btc_beta_samples"])
+                    or not math.isfinite(beta)):
+                return 1.0
+            return max(-3.0, min(3.0, beta))
+
+        beta_exposure = 0.0
+        for position, held_notional in zip(positions, position_notionals):
+            sign = 1.0 if position["side"] == "long" else -1.0
+            beta_exposure += (
+                sign * held_notional * beta_for(position["symbol"]))
+        candidate_beta = beta_for(symbol)
+        candidate_beta_exposure = (
+            notional * candidate_beta
+            * (1.0 if decision["direction"] == "long" else -1.0))
+        beta_cap = (
+            equity * float(self.r["max_btc_beta_exposure_pct"]) / 100.0)
+        beta_after = beta_exposure + candidate_beta_exposure
+        if (abs(beta_after) > beta_cap
+                and abs(beta_after) > abs(beta_exposure)):
+            return None, "BTC-beta-weighted exposure cap reached"
 
         return {
             "symbol": symbol,
@@ -280,8 +351,16 @@ class RiskEngine:
             "taker_fee_pct_per_side": fee_rate,
             "fee_rate_source": symbol_data.get(
                 "fee_rate_source", "configured_fallback"),
-            "risk_budget_usd": risk_usd,
-            "risk_usd": notional * estimated_loss_pct / 100.0,
+            "risk_budget_usd": candidate_risk,
+            "per_trade_risk_budget_usd": risk_usd,
+            "risk_usd": candidate_risk,
+            "risk_budget_pct": risk_pct,
+            "portfolio_open_risk_usd_before": current_open_risk,
+            "portfolio_open_risk_usd_after": (
+                current_open_risk + candidate_risk),
+            "btc_beta": candidate_beta,
+            "btc_beta_exposure_usd_before": beta_exposure,
+            "btc_beta_exposure_usd_after": beta_after,
             "confidence": confidence,
             "reason": decision.get("reasoning", ""),
             "strategy_id": decision.get("strategy_id"),

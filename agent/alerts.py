@@ -9,13 +9,15 @@ import time
 import urllib.request
 from pathlib import Path
 
+from . import state
+
 log = logging.getLogger("alerts")
 
 LEVELS = {"warning": 1, "error": 2, "critical": 3}
 DELIVERY_ATTEMPTS = 3
-FAILED_ALERTS_FILE = (
-    Path(__file__).resolve().parent.parent / "runtime" / "failed_alerts.jsonl"
-)
+# Tests may override this path. Normal operation resolves it dynamically after
+# main.py has selected the demo/live runtime scope.
+FAILED_ALERTS_FILE: Path | None = None
 
 
 class AlertManager:
@@ -50,11 +52,13 @@ class AlertManager:
         record = dict(body)
         record["delivery_error"] = str(error)
         record["failed_at"] = int(time.time())
+        failed_file = FAILED_ALERTS_FILE or (
+            state.RUNTIME / "failed_alerts.jsonl")
         try:
-            FAILED_ALERTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with FAILED_ALERTS_FILE.open("a", encoding="utf-8") as handle:
+            failed_file.parent.mkdir(parents=True, exist_ok=True)
+            with failed_file.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
-            os.chmod(FAILED_ALERTS_FILE, 0o600)
+            os.chmod(failed_file, 0o600)
         except Exception as exc:
             log.critical("could not persist failed alert %s: %s",
                          body.get("event"), exc)

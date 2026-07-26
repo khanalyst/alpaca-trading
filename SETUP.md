@@ -484,6 +484,9 @@ Two behaviors worth knowing:
 
 There's no dashboard or GUI — monitoring is the terminal, a `status` command,
 and a SQLite journal. All commands run from inside the repo folder.
+The examples below use the default `mode: demo`; replace `runtime/demo` with
+`runtime/live` after deliberately switching to live. The two modes have
+separate state, PID, log, alert queue and journal files.
 
 - One-line health check:
 
@@ -500,13 +503,13 @@ and a SQLite journal. All commands run from inside the repo folder.
   of each AI call):
 
   ```bash
-  tail -f runtime/agent.log
+  tail -f runtime/demo/agent.log
   ```
 
 - The last trades from the journal:
 
   ```bash
-  sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, reason FROM trades ORDER BY ts DESC LIMIT 10;"
+  sqlite3 runtime/demo/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, reason FROM trades ORDER BY ts DESC LIMIT 10;"
   ```
 
 - The performance report (after it has traded for a while):
@@ -526,12 +529,13 @@ For built-in alerts, set `alerts.enabled: true`, choose `generic`, `slack`, or
 `discord`, and set `ALERT_WEBHOOK_URL` in `.env`. Alerts cover circuit breakers,
 unprotected/reconciled positions, incomplete flattening, journal failures and
 cycle failures. Failed deliveries are retried and saved to
-`runtime/failed_alerts.jsonl`. Keep external uptime monitoring too: a dead
+`runtime/<mode>/failed_alerts.jsonl`. Keep external uptime monitoring too: a dead
 machine cannot send its webhook.
 
 Confirm prompt caching is working (keeps your AI bill down): after a couple of
-cycles, `grep cache_read runtime/agent.log` — from the second call onward it
-should show a few thousand tokens. If it stays 0, see the note in
+cycles, `grep cache_read runtime/demo/agent.log` — from the second call onward
+it should show total input, fresh input, cache reads and cache-hit percentage.
+Total input includes cached tokens. If cache reads stay 0, see the note in
 `config.yaml` about per-model cache minimums.
 
 ---
@@ -645,7 +649,7 @@ else**, if you run it on a computer you already own.
   Python you're running. Re-run `pip3 install -r requirements.lock.txt` from
   inside the repo folder.
 - **Nothing is trading.** Run `status` (state must be RUNNING), then read
-  `runtime/agent.log` for rejection reasons. A quiet, choppy market plus the
+  `runtime/<mode>/agent.log` for rejection reasons. A quiet, choppy market plus the
   0.65 confidence floor legitimately produces long flat stretches — that's
   the agent being disciplined, not broken.
 - **Model output parse failures in the log.** The agent just holds for that
@@ -656,7 +660,7 @@ else**, if you run it on a computer you already own.
   bills normally). On Sonnet it should cache; if not, you may have edited the
   system prompt below the minimum length.
 - **It self-killed and won't restart.** That's the drawdown circuit breaker.
-  Review `runtime/agent.log` and the journal, then restart deliberately with
+  Review `runtime/<mode>/agent.log` and the journal, then restart deliberately with
   `./.venv/bin/python main.py run --acknowledge-kill`.
 
 ---

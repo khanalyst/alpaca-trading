@@ -1,6 +1,6 @@
 # Trading decision examples
 
-These examples explain the current `momentum / phase1-v1` decision contract.
+These examples explain the current `momentum / phase1-v2` decision contract.
 The KAITO, CL and AAVE observations come from the agent's July 23, 2026
 journal. Those trades were originally evaluated by an older interface in
 which the model supplied numeric leverage, size, stop and target. Phase 1 no
@@ -25,12 +25,13 @@ Every proposed entry follows this sequence:
 4. Ask the LLM for zero or more semantic decisions. For an open, it chooses
    `setup_type`, direction, confidence, `invalidation_anchor`, `exit_policy`
    and `execution_choice`.
-5. Check that the label has broad deterministic evidence and that the entry
+5. Check that the label has its minimum deterministic evidence and that the entry
    is not beyond the hard no-chase boundary.
 6. Derive stop, target and leverage in code. Model-supplied numeric size,
    leverage, stop or target fields are ignored.
 7. Size from the all-in stop risk, then apply per-position, portfolio,
-   net-direction, margin and liquidation constraints.
+   total planned stop-risk, net-direction, BTC-beta, margin and liquidation
+   constraints.
 8. Validate proposed pairs sequentially in confidence order. A fill from the
    first pair immediately reduces the exposure available to the second.
 9. Check a fresh order book, submit an IOC entry with required attached
@@ -47,6 +48,7 @@ The current model-side open schema is:
   "invalidation_anchor": "structure",
   "exit_policy": "fixed_rr",
   "execution_choice": "normal",
+  "what_changed_since_last_loss": "",
   "confidence": 0.8,
   "reasoning": "one concise setup-specific sentence"
 }
@@ -148,8 +150,9 @@ risk:
 }
 ```
 
-The broad evidence contract requires at least two of the 15m/1h/4h trends to
-be up. The LLM must still decide whether the pullback is genuinely attractive.
+The evidence contract requires aligned 1h and 4h uptrends plus a positive
+completed 15m resumption that is not itself in a downtrend. The LLM must still
+decide whether the pullback is genuinely attractive.
 Code then places a long stop beyond the recent swing low plus the configured
 ATR buffer, never tighter than the ATR floor. An `extended_rr` target uses the
 configured 3R multiple. If the snapshot lacks finite ATR or structure, the
@@ -208,6 +211,16 @@ finishes, the same semantic setup is blocked for
 `strategy.setup_cooldown_minutes`; records remain available for
 `strategy.setup_memory_hours`. This is bounded operational memory and
 idempotency, not self-modifying trading logic.
+
+After a realized loss, elapsed cooldown alone is not enough. The same
+symbol/direction/setup also needs a newer completed 1h candle, a changed
+objective evidence fingerprint and a non-empty
+`what_changed_since_last_loss` explanation. Code verifies the time/bar/data
+conditions; the explanation preserves the model's discretionary reasoning.
+
+Demo-only `other` proposals are not mixed into the primary attribution. They
+run as `momentum-experimental`, use the smaller
+`experimental_risk_per_trade_pct` budget and report separately.
 
 `python report.py` separates results by strategy/version,
 prompt/config/code variant and setup type and shows net realized PnL,

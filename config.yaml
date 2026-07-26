@@ -27,11 +27,12 @@ llm:
 # changing these rules in place.
 strategy:
   id: momentum
-  version: phase1-v1
+  version: phase1-v2
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
   allow_experimental_setups_in_demo: true  # "other" ideas are demo-only
   setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
   setup_memory_hours: 72        # bounded operational idempotency history
+  loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence
   min_stop_atr_multiple: 1.0
   structure_buffer_atr_multiple: 0.15
   hard_max_entry_extension_atr: 2.5  # extreme no-chase safety boundary
@@ -64,11 +65,14 @@ risk:
   max_leverage: 3                # per position; hard ceiling of 10 enforced in code
   entry_leverage: 2              # deterministic; the LLM cannot choose leverage
   risk_per_trade_pct: 1.5        # max all-in equity loss at the stop
+  experimental_risk_per_trade_pct: 0.5  # demo-only "other" setup budget
+  max_total_open_risk_pct: 3.0   # sum of planned stop losses across the book
   max_position_notional_pct: 40  # per-position notional cap, % of equity
   max_gross_exposure_pct: 150    # total notional across all positions, % of equity
   max_net_direction_pct: 100     # cap on |long minus short| notional, % of equity.
-                                 # Correlation guard: most alts follow BTC, so
-                                 # 3 same-direction positions act as one big bet.
+                                 # Kept separately from measured BTC beta.
+  max_btc_beta_exposure_pct: 100 # cap signed BTC-beta-weighted notional
+  min_btc_beta_samples: 24       # otherwise assume conservative beta=1
   max_concurrent_positions: 3
   min_confidence: 0.65           # model decisions below this are discarded
   max_hold_hours: 24             # day-trading discipline: no stale positions

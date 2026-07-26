@@ -52,7 +52,7 @@ never treated as USDT capital.
  │                                                ▼                │
  │        executor ──► OKX orders with attached SL/TP (server-side)│
  └─────────────────────────────────────────────────────────────────┘
-        control: runtime/state.json + CLI      journal: SQLite
+ control: runtime/{demo|live}/state.json + CLI   journal: scoped SQLite
 ```
 
 | File | Role |
@@ -106,12 +106,15 @@ default 5-minute cycle), so pick a model whose per-call cost you are happy
 with and check current pricing on the provider's site.
 
 Token costs are kept down three ways: the static system prompt is cached
-(explicitly on Anthropic with a 1-hour TTL, automatically on OpenAI), the
+(explicitly on Anthropic with a 1-hour TTL; automatically on OpenAI with a
+stable prompt-cache routing key), the
 per-cycle market payload is serialized compactly, and cycles where the model
 cannot act (daily loss stop with no open positions) skip the call entirely.
-Every call logs `tokens: in=... out=... cache_write=... cache_read=...` to
-`runtime/agent.log` — after the first call of a session, `cache_read` should
-be a few thousand tokens; if it stays 0, caching isn't engaging (see the
+Every call logs total input, fresh (uncached) input, output, cache reads and
+cache-hit percentage to `runtime/<mode>/agent.log`. Total input includes
+cached tokens, so a 5,000-token total does not mean 5,000 freshly billed
+tokens. After the first call, `cache_read` should be a few thousand tokens;
+if it stays 0, caching isn't engaging (see the
 note in `config.yaml` about per-model cache minimums). Indicative monthly
 costs per model are in [SETUP.md](SETUP.md).
 
@@ -232,7 +235,11 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    protection where possible, and closes any position that cannot be verified
    to have a stop. A valid OKX liquidation estimate must also remain beyond
    the stop by `min_stop_liquidation_buffer_pct`; otherwise the position is
-   closed. It then force-closes anything past `max_hold_hours`, and closes the
+   closed. For an adopted/restarted position, opening time is recovered from
+   OKX's position creation time or fill history. If age cannot be proven, the
+   agent pauses for operator review instead of pretending it opened "now" and
+   silently resetting the max-hold clock. It then force-closes anything past
+   `max_hold_hours`, and closes the
    largest position(s) until both initial-margin use is below
    `max_margin_usage_pct` and adjusted-equity/maintenance-margin is above
    `min_maintenance_margin_ratio`.
@@ -240,18 +247,26 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    correctly contract-normalized 24h quote volume, completed-hour relative
    volume, current and historical funding, perp/index basis, authenticated
    account taker fee, open interest, RSI, current ATR%, ATR versus recent
-   history, trend on 15m/1h/4h, 1h momentum, short and shrinkage-adjusted BTC
+   history, trend on 15m/1h/4h, completed 15m/1h signal timestamps, 15m/1h
+   momentum, a fresh break of the prior completed 20-candle range,
+   stabilization evidence, short and shrinkage-adjusted BTC
    correlation/beta/downside correlation, an explicit regime classification,
    range position, recent swing distances and 1h EMA20 distance — plus the
    BTC-wide regime and live portfolio. The LLM remains the discretionary
    analyst: it can return no trade or label an idea as `trend_continuation`,
    `range_breakout`, `funding_squeeze`, or (in demo only) `other`; it chooses
    direction, confidence, invalidation anchor, exit policy and whether a prior
-   liquidity failure merits one smaller retry. It does **not** choose numeric
-   size, leverage, stop or target.
+   liquidity failure merits one smaller retry. Open positions include their
+   original entry thesis/evidence; a model close must name a structured close
+   trigger and the specific original-versus-current evidence change. It does
+   **not** choose numeric size, leverage, stop or target.
 6. **The strategy and risk layers dispose.** The versioned momentum contract
    ([agent/strategy.py](agent/strategy.py)) checks that a recognised label has
-   broad supporting evidence, enforces an extreme no-chase boundary, and
+   minimum supporting evidence: continuations require aligned 1h/4h direction
+   plus a completed 15m resumption; breakouts require a fresh completed-candle
+   range break plus volume/momentum; funding squeezes require extreme
+   historical funding, basis/open-interest context and price stabilization.
+   It enforces an extreme no-chase boundary, and
    converts the chosen anchor/exit policy into reproducible stop and target
    distances. Structure stops sit beyond the recent swing plus an ATR buffer
    and can never be tighter than the configured ATR floor. Leverage comes from
@@ -259,9 +274,15 @@ Every cycle (default: every 5 minutes) the agent runs the same loop:
    duplicate, held or cooling-down ideas and **sizes from the derived stop plus
    actual/fallback fees, live spread, adverse funding and expected stop
    slippage so the all-in stop loss stays within `risk_per_trade_pct` of
-   equity**. Per-position, whole-book and net-direction caps still apply.
+   equity**. Per-position, whole-book, total planned stop-risk, net-direction
+   and BTC-beta-weighted caps still apply. Demo-only `other` ideas retain an
+   agentic experimental lane but receive a separate strategy identity and a
+   smaller risk budget.
    Every symbol is evaluated at most once for each completed 15-minute signal
-   candle; completed setups also receive semantic cooldown. Closes execute
+   candle; completed setups also receive semantic cooldown. After a losing
+   thesis, re-entry additionally needs the configured delay, a fresh completed
+   1h bar, changed objective evidence and an explicit model explanation.
+   Closes execute
    first, then surviving opens are validated sequentially in confidence order
    against the exposure created by earlier fills.
 7. **Execute with protection.** Orders use client IDs and are never blindly
@@ -294,15 +315,17 @@ overrides a cap. It is an idea generator inside hard, code-enforced rails.
 - **Each new cycle it may open at most `max_concurrent_positions` minus what
   it already holds.** If 3 are open, it can only close or hold until a slot
   frees up.
-- **Total size is capped three ways regardless of count:** each position is
+- **Total risk/size is capped five ways regardless of count:** each position is
   at most `max_position_notional_pct` of equity (default 40%), the whole book
   is at most `max_gross_exposure_pct` of equity (default 150%), and the *net
   direction* (long notional minus short notional) is at most
-  `max_net_direction_pct` of equity (default 100%) — because three correlated
-  longs are really one big long.
+  `max_net_direction_pct` of equity (default 100%), planned all-in stop risk
+  is at most `max_total_open_risk_pct` (default 3%), and signed BTC-beta
+  exposure is capped at `max_btc_beta_exposure_pct` (default 100%).
 
 So the maximum book is 3 positions, each on a different symbol, each ≤40% of
-equity, ≤150% total notional, and ≤100% net in one direction.
+equity, ≤150% total notional, ≤3% planned stop risk, ≤100% net direction and
+≤100% BTC-beta-weighted exposure.
 
 ---
 
@@ -345,10 +368,11 @@ API keys; the mode must match the keys in `.env`.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `id` / `version` | `momentum` / `phase1-v1` | Immutable attribution identity stored with runs, setups and trades |
+| `id` / `version` | `momentum` / `phase1-v2` | Immutable attribution identity stored with runs, setups and trades |
 | `signal_timeframe` | `15m` | Fixed for this strategy version; one symbol evaluation per completed bar |
 | `setup_cooldown_minutes` | 45 | Blocks a completed semantic setup before it can be reused |
 | `setup_memory_hours` | 72 | Persists bounded setup/idempotency history across restarts |
+| `loss_reentry_min_minutes` | 60 | After a loss, also require a fresh completed 1h bar, changed objective evidence and an explicit model explanation |
 | `min_stop_atr_multiple` | 1.0 | Minimum deterministic stop width |
 | `structure_buffer_atr_multiple` | 0.15 | Buffer added beyond the selected swing invalidation |
 | `hard_max_entry_extension_atr` | 2.5 | Absolute no-chase boundary from the 1h EMA20 |
@@ -361,9 +385,13 @@ API keys; the mode must match the keys in `.env`.
 | `max_leverage` | 3 | Validation ceiling. **Hard ceiling of 10 in code** regardless of config |
 | `entry_leverage` | 2 | Actual deterministic entry leverage; the model cannot change it |
 | `risk_per_trade_pct` | 1.5 | Maximum expected equity loss at a stop, including configured costs |
+| `experimental_risk_per_trade_pct` | 0.5 | Smaller budget for demo-only `other` setups, attributed as `momentum-experimental` |
+| `max_total_open_risk_pct` | 3.0 | Cap on the sum of planned all-in stop losses across held positions |
 | `max_position_notional_pct` | 40 | Per-position notional cap, % of equity |
 | `max_gross_exposure_pct` | 150 | Whole-book notional cap, % of equity |
-| `max_net_direction_pct` | 100 | Cap on net long-minus-short notional, % of equity (correlation guard) |
+| `max_net_direction_pct` | 100 | Cap on net long-minus-short notional, % of equity |
+| `max_btc_beta_exposure_pct` | 100 | Cap on signed BTC-beta-weighted notional; insufficient histories conservatively use beta 1 |
+| `min_btc_beta_samples` | 24 | Minimum observations before measured BTC beta is trusted |
 | `max_concurrent_positions` | 3 | Max simultaneous open positions |
 | `min_confidence` | 0.65 | Proposals below this are discarded |
 | `max_hold_hours` | 24 | Stale positions are force-closed |
@@ -409,7 +437,7 @@ not replace technical stop placement.
 are optional in demo but mandatory in live. Live startup sends a preflight
 message and refuses to trade unless it is acknowledged. Delivery is retried
 three times; exhausted messages are stored in
-`runtime/failed_alerts.jsonl`.
+`runtime/<mode>/failed_alerts.jsonl`.
 
 > **To turn aggression up**, raise `entry_leverage` (without exceeding
 > `max_leverage`), `risk_per_trade_pct`, and `max_gross_exposure_pct` — but
@@ -442,7 +470,7 @@ Read these before running anything with real money.
   strategy win.
 - **A webhook is mandatory in live, but it is not uptime monitoring.** A dead
   machine cannot send its own alert. Keep external process/host monitoring as
-  a separate layer and inspect `runtime/failed_alerts.jsonl`.
+  a separate layer and inspect `runtime/<mode>/failed_alerts.jsonl`.
 - **The drawdown self-kill halts the agent until a human intervenes.** After a
   15% drawdown it flattens and refuses to trade again until you run
   `--acknowledge-kill`. This is intentional (a human should review a blow-up),
@@ -467,7 +495,7 @@ Read these before running anything with real money.
 
 ## The journal
 
-Everything is recorded in `runtime/journal.db` (SQLite): every decision,
+Everything is recorded in `runtime/<mode>/journal.db` (SQLite): every decision,
 rejection, setup lifecycle, order submission/recovery result, trade, transfer
 and equity snapshot. Runs and records carry run/cycle IDs, strategy and prompt
 versions, config/code fingerprints and the equity-basis segment ID. The agent
@@ -481,15 +509,22 @@ the nondeterministic LLM layer auditable after prompts or settings change;
 protect and back up the journal as trading-sensitive data.
 Structured liquidity rejections and their temporary backoffs are journaled as
 `entry_liquidity_rejected` and `entry_liquidity_backoff` events. Their active
-state lives in `runtime/state.json`, not in the provider's prompt cache.
+state lives in `runtime/<mode>/state.json`, not in the provider's prompt cache.
 Universe eligibility is journaled as `universe_selection`; non-liquidity OKX
 entry failures are journaled as `entry_execution_failed` with a bounded,
 redacted exchange code/message and their active backoff also lives in
-`runtime/state.json`.
+`runtime/<mode>/state.json`.
+
+Demo and live have separate state, PID, log, failed-alert and journal files.
+Each state is also bound to a one-way hash of the configured OKX API key; a
+different key cannot silently inherit positions, cooldowns or performance.
+Legacy runtime files are copied only when the journal proves their recorded
+mode matches the selected mode. Tests use a temporary runtime and cannot
+append synthetic records to either operational journal.
 
 ```bash
-sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"
-sqlite3 runtime/journal.db "SELECT datetime(ts,'unixepoch'), equity FROM equity ORDER BY ts DESC LIMIT 10;"
+sqlite3 runtime/demo/journal.db "SELECT datetime(ts,'unixepoch'), symbol, side, action, notional, reason FROM trades ORDER BY ts DESC LIMIT 20;"
+sqlite3 runtime/demo/journal.db "SELECT datetime(ts,'unixepoch'), equity FROM equity ORDER BY ts DESC LIMIT 10;"
 ```
 
 Entries and exits share a durable trade ID and record actual fill price,
@@ -509,7 +544,7 @@ The calibration table is the one to watch: if 0.9-confidence trades don't
 outperform 0.7s after a few weeks, the confidence floor is not doing what
 you think.
 
-Plain-text logs are in `runtime/agent.log`.
+Plain-text logs are in `runtime/demo/agent.log` or `runtime/live/agent.log`.
 
 ---
 
@@ -540,5 +575,5 @@ touch another's.
   logs the event; persistent failures usually mean the chosen model ignores
   JSON instructions, so switch models.
 - Nothing is trading: check `status` (state must be RUNNING), then
-  `runtime/agent.log` for rejection reasons; a quiet, choppy market plus a
+  `runtime/<mode>/agent.log` for rejection reasons; a quiet, choppy market plus a
   0.65 confidence floor legitimately produces long flat stretches.

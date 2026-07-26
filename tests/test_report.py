@@ -231,6 +231,38 @@ class PerformanceReportTests(unittest.TestCase):
         self.assertIn("config=config-b", rendered)
         self.assertIn("signed shortfall", rendered)
 
+    def test_strategy_report_never_mixes_runtime_accounts(self):
+        events = [
+            event(
+                ts=1, action="open", trade_id="demo", notional=1_000,
+                risk_usd=20, strategy_id="momentum",
+                strategy_version="phase1-v2", setup_type="range_breakout",
+                entry_equity_usd=10_000, runtime_mode="demo",
+                account_fingerprint="okx-demo-a"),
+            event(
+                ts=2, action="close", trade_id="demo",
+                realized_pnl_usd=5, pnl_semantics="incremental_v1"),
+            event(
+                ts=3, action="open", trade_id="live", notional=1_000,
+                risk_usd=20, strategy_id="momentum",
+                strategy_version="phase1-v2", setup_type="range_breakout",
+                entry_equity_usd=10_000, runtime_mode="live",
+                account_fingerprint="okx-live-b"),
+            event(
+                ts=4, action="close", trade_id="live",
+                realized_pnl_usd=-2, pnl_semantics="incremental_v1"),
+        ]
+        trades, _ = match_round_trips(events)
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            print_per_strategy(trades)
+
+        rendered = output.getvalue()
+        self.assertIn("runtime demo / okx-demo-a", rendered)
+        self.assertIn("runtime live / okx-live-b", rendered)
+        self.assertEqual(rendered.count("momentum / phase1-v2"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -977,6 +977,84 @@ class Exchange:
             return None
         return sum(float(row.get("amount") or 0) for row in rows)
 
+    @staticmethod
+    def _seconds_timestamp(value: object) -> float | None:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        now = time.time()
+        if timestamp < 1_230_768_000 or timestamp > now + 60:
+            return None
+        return timestamp
+
+    def position_opened_at(self, pos: dict) -> float | None:
+        """Recover the start of the current continuous net position.
+
+        OKX normally returns ``cTime`` on a position. If an adapter omits it,
+        reverse the account's fills until the current net position crosses
+        flat. Returning ``None`` is intentional: the engine pauses rather
+        than inventing a fresh timestamp and silently defeating max-hold.
+        """
+        info = pos.get("info") or {}
+        for value in (
+                info.get("cTime"), info.get("createdTime"),
+                info.get("openTime"), info.get("openTimestamp"),
+                pos.get("created"), pos.get("datetime")):
+            if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+                continue
+            recovered = self._seconds_timestamp(value)
+            if recovered is not None:
+                return recovered
+
+        symbol = pos.get("symbol")
+        contracts = abs(float(pos.get("contracts") or 0))
+        if not symbol or not math.isfinite(contracts) or contracts <= 0:
+            return None
+        side = str(pos.get("side") or info.get("posSide") or "").lower()
+        if side not in {"long", "short"}:
+            raw = float(info.get("pos") or 0)
+            side = "long" if raw >= 0 else "short"
+        current = contracts if side == "long" else -contracts
+        lookback_hours = max(
+            24.0 * 30,
+            float(self.cfg.get("risk", {}).get("max_hold_hours") or 24) * 2,
+        )
+        since_ms = int((time.time() - lookback_hours * 3600) * 1000)
+        try:
+            fills = self.retry(
+                self.x.fetch_my_trades, symbol, since_ms, 100) or []
+        except Exception as exc:
+            log.warning("position age fill history unavailable for %s: %s",
+                        symbol, exc)
+            return None
+        for fill in sorted(
+                fills,
+                key=lambda row: int(row.get("timestamp") or 0),
+                reverse=True):
+            fill_side = str(fill.get("side") or "").lower()
+            try:
+                amount = abs(float(fill.get("amount") or 0))
+            except (TypeError, ValueError):
+                continue
+            if fill_side not in {"buy", "sell"} \
+                    or not math.isfinite(amount) or amount <= 0:
+                continue
+            signed = amount if fill_side == "buy" else -amount
+            previous = current - signed
+            if current != 0 and (
+                    abs(previous) <= max(1e-12, contracts * 1e-9)
+                    or previous * current < 0):
+                recovered = self._seconds_timestamp(fill.get("timestamp"))
+                if recovered is not None:
+                    return recovered
+            current = previous
+        return None
+
     def positions(self) -> list[dict]:
         out = []
         for p in self.retry(self.x.fetch_positions) or []:

@@ -75,7 +75,8 @@ def validate_config(raw: dict) -> dict:
     _keys(strategy, {
         "id", "version", "signal_timeframe",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
-        "setup_memory_hours", "min_stop_atr_multiple",
+        "setup_memory_hours", "loss_reentry_min_minutes",
+        "min_stop_atr_multiple",
         "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
         "breakout_range_threshold_pct", "breakout_min_relative_volume",
         "funding_extreme_pct", "fixed_reward_risk",
@@ -93,6 +94,7 @@ def validate_config(raw: dict) -> dict:
         strategy, "allow_experimental_setups_in_demo", "strategy")
     _number(strategy, "setup_cooldown_minutes", 0, 1440, "strategy")
     _number(strategy, "setup_memory_hours", 1, 720, "strategy")
+    _number(strategy, "loss_reentry_min_minutes", 0, 10080, "strategy")
     _number(strategy, "min_stop_atr_multiple", 0.5, 5, "strategy")
     _number(strategy, "structure_buffer_atr_multiple", 0, 2, "strategy")
     _number(strategy, "hard_max_entry_extension_atr", 0.5, 10, "strategy")
@@ -148,8 +150,11 @@ def validate_config(raw: dict) -> dict:
 
     risk = _mapping(cfg.get("risk"), "risk")
     _keys(risk, {"max_leverage", "entry_leverage", "risk_per_trade_pct",
+                 "experimental_risk_per_trade_pct",
+                 "max_total_open_risk_pct",
                  "max_position_notional_pct", "max_gross_exposure_pct",
-                 "max_net_direction_pct", "max_concurrent_positions",
+                 "max_net_direction_pct", "max_btc_beta_exposure_pct",
+                 "min_btc_beta_samples", "max_concurrent_positions",
                  "min_confidence", "max_hold_hours", "daily_loss_limit_pct",
                  "flatten_on_daily_stop", "max_drawdown_pct",
                  "max_margin_usage_pct", "min_maintenance_margin_ratio",
@@ -162,9 +167,18 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError(
             "risk.entry_leverage cannot exceed risk.max_leverage")
     _number(risk, "risk_per_trade_pct", 0.01, 5, "risk")
+    _number(risk, "experimental_risk_per_trade_pct", 0.01, 5, "risk")
+    if (float(risk["experimental_risk_per_trade_pct"])
+            > float(risk["risk_per_trade_pct"])):
+        raise ConfigError(
+            "risk.experimental_risk_per_trade_pct cannot exceed "
+            "risk_per_trade_pct")
+    _number(risk, "max_total_open_risk_pct", 0.1, 20, "risk")
     _number(risk, "max_position_notional_pct", 1, 100, "risk")
     _number(risk, "max_gross_exposure_pct", 1, 300, "risk")
     _number(risk, "max_net_direction_pct", 1, 300, "risk")
+    _number(risk, "max_btc_beta_exposure_pct", 1, 300, "risk")
+    _integer(risk, "min_btc_beta_samples", 0, 200, "risk")
     _integer(risk, "max_concurrent_positions", 1, 20, "risk")
     _number(risk, "min_confidence", 0, 1, "risk")
     _number(risk, "max_hold_hours", 0.25, 168, "risk")
@@ -175,6 +189,11 @@ def validate_config(raw: dict) -> dict:
     _number(risk, "min_maintenance_margin_ratio", 1.01, 100, "risk")
     _number(risk, "min_stop_liquidation_buffer_pct", 0.1, 50, "risk")
     _number(risk, "cooldown_minutes_after_loss", 0, 10080, "risk")
+    if (float(risk["max_total_open_risk_pct"])
+            > float(risk["daily_loss_limit_pct"])):
+        raise ConfigError(
+            "risk.max_total_open_risk_pct cannot exceed "
+            "daily_loss_limit_pct")
     if float(risk["max_net_direction_pct"]) > float(risk["max_gross_exposure_pct"]):
         raise ConfigError("risk.max_net_direction_pct cannot exceed max_gross_exposure_pct")
 

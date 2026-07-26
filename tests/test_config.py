@@ -92,6 +92,19 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "must be exactly '15m'"):
             validate_config(cfg)
 
+    def test_experimental_risk_budget_cannot_exceed_primary_budget(self):
+        cfg = valid_config()
+        cfg["risk"]["experimental_risk_per_trade_pct"] = 2
+        with self.assertRaisesRegex(ConfigError, "cannot exceed"):
+            validate_config(cfg)
+
+    def test_total_open_risk_cannot_exceed_daily_loss_stop(self):
+        cfg = valid_config()
+        cfg["risk"]["max_total_open_risk_pct"] = 6
+        with self.assertRaisesRegex(
+                ConfigError, "cannot exceed daily_loss_limit_pct"):
+            validate_config(cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

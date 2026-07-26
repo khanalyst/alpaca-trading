@@ -35,8 +35,14 @@ def setup_snapshot(signal_ts):
         "range_pos_pct": 70,
         "relative_volume_1h": 1.2,
         "mom_1h_pct": 0.5,
+        "mom_15m_pct": 0.2,
         "funding_rate_pct": 0.0,
         "signal_ts": signal_ts,
+        "signal_1h_ts": signal_ts - 100,
+        "fresh_breakout_long": False,
+        "fresh_breakout_short": False,
+        "price_stabilized_long": True,
+        "price_stabilized_short": False,
     }
 
 
@@ -170,7 +176,7 @@ class SequentialOpenValidationTests(unittest.TestCase):
         seen = []
 
         def vet(decision, equity, positions, snapshot, cooldowns, gross,
-                entry_feedback, entry_failures):
+                entry_feedback, entry_failures, active_trades):
             seen.append((
                 decision["symbol"],
                 [position["symbol"] for position in positions],
@@ -291,6 +297,52 @@ class PositionMetricTests(unittest.TestCase):
             "contracts": float("nan"), "markPrice": 100,
         }
         self.assertEqual(engine._notional(position), 0)
+
+
+class OriginalThesisViewTests(unittest.TestCase):
+    def test_portfolio_exposes_durable_entry_thesis_for_close_reasoning(self):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = Mock()
+        now = time.time()
+        st = {
+            "state": state.RUNNING,
+            "cooldowns": {}, "entry_feedback": {}, "entry_failures": {},
+            "recent_setups": {},
+            "opened_at": {"BTC/USDT:USDT": now - 3600},
+            "active_trades": {
+                "BTC/USDT:USDT": {
+                    "age_known": True,
+                    "risk_usd": 150,
+                    "entry_reason": "1h and 4h continuation aligned",
+                    "setup_type": "trend_continuation",
+                    "invalidation_anchor": "structure",
+                    "exit_policy": "fixed_rr",
+                    "stop_loss_pct": 2,
+                    "take_profit_pct": 4,
+                    "signal_ts": 1_000,
+                    "entry_evidence": {
+                        "trend_1h": "up", "trend_4h": "up",
+                        "evidence_fingerprint": "abc",
+                    },
+                },
+            },
+        }
+        positions = [{
+            "symbol": "BTC/USDT:USDT", "side": "long",
+            "entryPrice": 100, "markPrice": 101, "percentage": 1,
+            "leverage": 2, "notional": 1_000,
+        }]
+
+        with patch("agent.engine.time.time", return_value=now):
+            view = engine._portfolio_view(
+                10_000, positions, st, 0, 0)
+
+        held = view["open_positions"][0]
+        self.assertTrue(held["age_verified"])
+        self.assertEqual(
+            held["original_thesis"]["entry_evidence"]["trend_1h"], "up")
+        self.assertEqual(held["planned_risk_usd"], 150)
 
 
 class LLMAuditEventTests(unittest.TestCase):

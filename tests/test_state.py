@@ -12,18 +12,21 @@ class StateSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.originals = (
-            state.RUNTIME, state.STATE_FILE, state.PID_FILE, state.DB_FILE)
+            state.RUNTIME_SCOPE, state.RUNTIME, state.STATE_FILE,
+            state.PID_FILE, state.DB_FILE, state.STATE_LOCK_FILE)
         self.original_context = state.journal_context()
         state._JOURNAL_CONTEXT.clear()
         runtime = Path(self.temp.name)
+        state.RUNTIME_SCOPE = "test"
         state.RUNTIME = runtime
         state.STATE_FILE = runtime / "state.json"
         state.PID_FILE = runtime / "agent.pid"
         state.DB_FILE = runtime / "journal.db"
+        state.STATE_LOCK_FILE = runtime / "state.lock"
 
     def tearDown(self):
-        (state.RUNTIME, state.STATE_FILE, state.PID_FILE,
-         state.DB_FILE) = self.originals
+        (state.RUNTIME_SCOPE, state.RUNTIME, state.STATE_FILE, state.PID_FILE,
+         state.DB_FILE, state.STATE_LOCK_FILE) = self.originals
         state._JOURNAL_CONTEXT.clear()
         state._JOURNAL_CONTEXT.update(self.original_context)
         self.temp.cleanup()
@@ -42,6 +45,26 @@ class StateSafetyTests(unittest.TestCase):
         self.assertEqual(backups[0].read_text(), "{not-json")
         persisted = json.loads(state.STATE_FILE.read_text())
         self.assertEqual(persisted["state"], state.KILLED)
+
+    def test_runtime_identity_is_bound_once_and_mismatch_fails_closed(self):
+        state.RUNTIME_SCOPE = "demo"
+        first = state.bind_runtime_identity("demo", "demo-key-a")
+        self.assertEqual(
+            state.load_state()["account_fingerprint"], first)
+
+        with self.assertRaisesRegex(
+                state.RuntimeIdentityError, "another OKX key"):
+            state.bind_runtime_identity("demo", "demo-key-b")
+
+        persisted = state.load_state()
+        self.assertEqual(persisted["runtime_mode"], "demo")
+        self.assertEqual(persisted["account_fingerprint"], first)
+
+    def test_runtime_scope_must_match_configured_mode(self):
+        state.RUNTIME_SCOPE = "live"
+        with self.assertRaisesRegex(
+                state.RuntimeIdentityError, "not demo"):
+            state.bind_runtime_identity("demo", "demo-key")
 
     def test_invalid_state_cannot_be_saved(self):
         invalid = dict(state.DEFAULT)
@@ -245,7 +268,8 @@ class StateSafetyTests(unittest.TestCase):
             run_id="run-a", cycle_id="cycle-a",
             strategy_id="momentum", strategy_version="v1",
             prompt_version="p1", config_version="cfg1",
-            code_version="code1", equity_basis_id="basis-a")
+            code_version="code1", equity_basis_id="basis-a",
+            runtime_mode="demo", account_fingerprint="okx-demo-test")
         state.log_trade(
             "BTC/USDT:USDT", "buy", "open", 1, 100, 100, 2,
             "test", trade_id="trade-a")
@@ -253,13 +277,18 @@ class StateSafetyTests(unittest.TestCase):
 
         with state._db() as db:
             trade = db.execute(
-                "SELECT run_id, cycle_id, strategy_id, equity_basis_id "
+                "SELECT run_id, cycle_id, strategy_id, equity_basis_id, "
+                "runtime_mode, account_fingerprint "
                 "FROM trades").fetchone()
             equity = db.execute(
-                "SELECT run_id, cycle_id, basis_id FROM equity").fetchone()
+                "SELECT run_id, cycle_id, basis_id, runtime_mode, "
+                "account_fingerprint FROM equity").fetchone()
         self.assertEqual(
-            trade, ("run-a", "cycle-a", "momentum", "basis-a"))
-        self.assertEqual(equity, ("run-a", "cycle-a", "basis-a"))
+            trade, ("run-a", "cycle-a", "momentum", "basis-a",
+                    "demo", "okx-demo-test"))
+        self.assertEqual(
+            equity, ("run-a", "cycle-a", "basis-a",
+                     "demo", "okx-demo-test"))
 
     def test_non_finite_setup_memory_is_rejected(self):
         invalid = dict(state.DEFAULT)

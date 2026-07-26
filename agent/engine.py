@@ -19,6 +19,7 @@ State semantics:
 import json
 import logging
 import math
+import os
 import time
 from datetime import datetime, timezone
 
@@ -37,9 +38,24 @@ log = logging.getLogger("engine")
 MAX_CREDENTIAL_FAILURES = 3
 
 
+class PositionAgeUnknown(RuntimeError):
+    """A held position cannot be proven to be inside max-hold policy."""
+
+    def __init__(self, symbols: list[str]):
+        self.symbols = sorted(set(symbols))
+        super().__init__(
+            "cannot recover opening time for held position(s): "
+            + ", ".join(self.symbols))
+
+
 class Engine:
     def __init__(self, cfg: dict, light: bool = False):
         self.cfg = cfg
+        # Protect library/direct callers as well as main.py: state and journal
+        # access must already be scoped to, and bound to, this exact key/mode.
+        state.configure_runtime(cfg["mode"])
+        state.bind_runtime_identity(
+            cfg["mode"], os.environ.get("OKX_API_KEY", ""))
         self.run_id = state.new_run_id()
         self.config_version = state.stable_fingerprint(cfg)
         self.code_version = state.code_fingerprint()
@@ -326,6 +342,30 @@ class Engine:
                 positions, st, startup=not self._startup_reconciled)
             self._startup_reconciled = True
             reconciled = not invalid_position_metrics
+        except PositionAgeUnknown as exc:
+            # Keep verified exchange-side protection in place, preserve the
+            # adopted trade metadata, and require an operator decision. A
+            # guessed "opened now" timestamp would silently reset max-hold.
+            state.commit(st)
+            paused = state.set_state(
+                state.PAUSED,
+                "position age is unknown; inspect OKX and flatten or resume "
+                "only after resolving: " + ", ".join(exc.symbols),
+                operator_pause=True,
+            )
+            st.clear()
+            st.update(paused)
+            detail = {"symbols": exc.symbols}
+            log.critical(
+                "Position age unavailable for %s; agent PAUSED",
+                ", ".join(exc.symbols))
+            state.log_event(
+                "position_age_unknown", self._audit_json(detail))
+            self.alerts.send(
+                "critical", "position_age_unknown",
+                "Agent paused because max-hold age cannot be verified",
+                detail)
+            reconciled = False
         except Exception as exc:
             # A reconciliation problem must not disable the account-level
             # circuit breakers below. Trade conservatively instead: keep
@@ -493,9 +533,34 @@ class Engine:
                 return
             pos = next((p for p in positions
                         if p.get("symbol") == d.get("symbol")), None)
-            if pos and self._close(pos,
-                                   "model close: " + d.get("reasoning", ""),
-                                   st):
+            if pos:
+                trade = (st.get("active_trades") or {}).get(
+                    d.get("symbol")) or {}
+                state.log_event(
+                    "model_close_audit",
+                    self._audit_json({
+                        "symbol": d.get("symbol"),
+                        "trade_id": trade.get("trade_id"),
+                        "setup_id": trade.get("setup_id"),
+                        "close_trigger": d.get("close_trigger"),
+                        "evidence_change": d.get("evidence_change"),
+                        "reasoning": d.get("reasoning"),
+                        "original_thesis": {
+                            "reason": trade.get("entry_reason"),
+                            "entry_evidence": trade.get("entry_evidence"),
+                            "invalidation_anchor": trade.get(
+                                "invalidation_anchor"),
+                            "exit_policy": trade.get("exit_policy"),
+                        },
+                    }),
+                    setup_id=trade.get("setup_id"),
+                )
+            if pos and self._close(
+                    pos,
+                    "model close: " + d.get("reasoning", ""),
+                    st,
+                    close_trigger=d.get("close_trigger"),
+                    close_evidence=d.get("evidence_change")):
                 positions.remove(pos)
 
         # --- opens (blocked while DAY_STOPPED or after a failed reconcile,
@@ -526,7 +591,8 @@ class Engine:
                 prepared, equity, positions, snapshot,
                                            st.get("cooldowns", {}), gross,
                                            st.get("entry_feedback", {}),
-                                           st.get("entry_failures", {}))
+                                           st.get("entry_failures", {}),
+                                           st.get("active_trades", {}))
             if not plan:
                 self._mark_setup_status(
                     st, prepared["setup_id"], "risk_rejected")
@@ -637,6 +703,7 @@ class Engine:
         protection = st.setdefault("protection", {})
         opened_at = st.setdefault("opened_at", {})
         cooldowns = st.setdefault("cooldowns", {})
+        unknown_age: list[str] = []
 
         # A tracked trade that disappeared was closed by exchange-side SL/TP
         # or another operator. Recover actual fills before allowing a re-entry.
@@ -648,6 +715,24 @@ class Engine:
             same_id = (not live_id or not trade.get("position_id")
                        or str(live_id) == str(trade.get("position_id")))
             if live is not None and same_direction and same_id:
+                opened = float(
+                    trade.get("opened_at")
+                    or opened_at.get(symbol) or 0)
+                if opened > 0:
+                    trade["opened_at"] = opened
+                    trade["age_known"] = True
+                    opened_at[symbol] = opened
+                if not trade.get("age_known", opened > 0) or opened <= 0:
+                    recovered = self.ex.position_opened_at(live)
+                    if recovered is None:
+                        trade["opened_at"] = 0.0
+                        trade["age_known"] = False
+                        opened_at.pop(symbol, None)
+                        unknown_age.append(symbol)
+                    else:
+                        trade["opened_at"] = float(recovered)
+                        trade["age_known"] = True
+                        opened_at[symbol] = float(recovered)
                 continue
             replaced = live is not None
             try:
@@ -701,6 +786,10 @@ class Engine:
                     signal_ts=trade.get("signal_ts"),
                     exit_policy=trade.get("exit_policy"),
                     invalidation_anchor=trade.get("invalidation_anchor"),
+                    close_trigger="exchange_protection",
+                    close_evidence=(
+                        "position disappeared from OKX and actual exit "
+                        "fills were reconciled"),
                 )
                 if total_realized < 0:
                     cooldown = float(
@@ -713,7 +802,8 @@ class Engine:
                     "setup_id": trade.get("setup_id"),
                 }), setup_id=trade.get("setup_id"))
                 self._mark_setup_status(
-                    st, trade.get("setup_id"), "closed", cooldown=True)
+                    st, trade.get("setup_id"), "closed", cooldown=True,
+                    realized_pnl_usd=total_realized)
                 active.pop(symbol, None)
                 protection.pop(symbol, None)
                 opened_at.pop(symbol, None)
@@ -758,10 +848,15 @@ class Engine:
                 trade_id = state.new_trade_id()
                 entry = float(pos.get("entryPrice") or mark)
                 notional = self._notional(pos)
+                recovered_opened_at = opened_at.get(symbol)
+                if not recovered_opened_at:
+                    recovered_opened_at = self.ex.position_opened_at(pos)
+                age_known = bool(recovered_opened_at)
                 active[symbol] = {
                     "trade_id": trade_id,
                     "direction": direction,
-                    "opened_at": float(opened_at.get(symbol) or time.time()),
+                    "opened_at": float(recovered_opened_at or 0),
+                    "age_known": age_known,
                     "entry_price": entry,
                     "entry_notional": notional,
                     "qty": contracts,
@@ -781,7 +876,11 @@ class Engine:
                         or "unknown-run"),
                     "cycle_id": state.journal_context().get("cycle_id"),
                 }
-                opened_at[symbol] = active[symbol]["opened_at"]
+                if age_known:
+                    opened_at[symbol] = active[symbol]["opened_at"]
+                else:
+                    opened_at.pop(symbol, None)
+                    unknown_age.append(symbol)
                 state.log_trade(
                     symbol, "buy" if direction == "long" else "sell", "open",
                     contracts, entry, notional, pos.get("leverage") or 0,
@@ -881,6 +980,8 @@ class Engine:
         if startup:
             log.info("Startup reconciliation complete: %d open position(s)",
                      len(actual))
+        if unknown_age:
+            raise PositionAgeUnknown(unknown_age)
         return list(actual.values())
 
     # ------------------------------------------------------------ execution
@@ -1191,6 +1292,7 @@ class Engine:
             "trade_id": trade_id,
             "direction": plan["direction"],
             "opened_at": opened,
+            "age_known": True,
             "entry_price": fill_price,
             "entry_notional": actual_notional,
             "qty": filled,
@@ -1209,6 +1311,11 @@ class Engine:
             "signal_ts": plan.get("signal_ts"),
             "exit_policy": plan.get("exit_policy"),
             "invalidation_anchor": plan.get("invalidation_anchor"),
+            "entry_reason": (
+                plan.get("reason") or "model supplied no entry thesis"),
+            "entry_evidence": plan.get("entry_evidence") or {},
+            "stop_loss_pct": plan.get("sl_pct"),
+            "take_profit_pct": plan.get("tp_pct"),
             "run_id": getattr(
                 self, "run_id", state.journal_context().get("run_id")
                 or "unknown-run"),
@@ -1383,7 +1490,9 @@ class Engine:
                  plan["confidence"], plan["reason"])
         return True
 
-    def _close(self, pos: dict, reason: str, st: dict) -> bool:
+    def _close(self, pos: dict, reason: str, st: dict,
+               *, close_trigger: str | None = None,
+               close_evidence: str | None = None) -> bool:
         symbol = pos["symbol"]
         try:
             execution = self.ex.close_position(pos)
@@ -1392,6 +1501,10 @@ class Engine:
             return False
         trade = (st.get("active_trades") or {}).get(symbol) or {}
         direction = trade.get("direction") or self._direction(pos)
+        if close_trigger is None:
+            close_trigger = "engine_safety"
+        if close_evidence is None:
+            close_evidence = reason
         if not execution.get("fully_closed"):
             remaining = float(execution.get("remaining_contracts") or 0)
             filled = float(execution.get("filled") or 0)
@@ -1442,7 +1555,9 @@ class Engine:
                 setup_type=trade.get("setup_type"),
                 signal_ts=trade.get("signal_ts"),
                 exit_policy=trade.get("exit_policy"),
-                invalidation_anchor=trade.get("invalidation_anchor"))
+                invalidation_anchor=trade.get("invalidation_anchor"),
+                close_trigger=close_trigger,
+                close_evidence=close_evidence)
             self._log_order_execution(
                 symbol, "partial_close", execution, trade)
             state.commit(st)
@@ -1510,13 +1625,16 @@ class Engine:
             setup_type=trade.get("setup_type"),
             signal_ts=trade.get("signal_ts"),
             exit_policy=trade.get("exit_policy"),
-            invalidation_anchor=trade.get("invalidation_anchor"))
+            invalidation_anchor=trade.get("invalidation_anchor"),
+            close_trigger=close_trigger,
+            close_evidence=close_evidence)
         self._log_order_execution(symbol, "close", execution, trade)
         if total_realized < 0:
             cooldown = float(self.cfg["risk"]["cooldown_minutes_after_loss"])
             st.setdefault("cooldowns", {})[symbol] = time.time() + cooldown * 60
         self._mark_setup_status(
-            st, trade.get("setup_id"), "closed", cooldown=True)
+            st, trade.get("setup_id"), "closed", cooldown=True,
+            realized_pnl_usd=total_realized)
         st.get("opened_at", {}).pop(symbol, None)
         st.get("active_trades", {}).pop(symbol, None)
         st.get("protection", {}).pop(symbol, None)
@@ -1684,6 +1802,8 @@ class Engine:
                 )
                 state.commit(st)
             return None, why
+        prepared["entry_evidence"] = strategy.compact_entry_evidence(
+            symbol_snapshot, snapshot.get("_market_context"))
         setup_id = prepared["setup_id"]
         blocked = strategy.semantic_block(
             records, prepared["setup_key"])
@@ -1693,6 +1813,10 @@ class Engine:
             return None, (
                 "semantically identical setup is cooling down for "
                 f"{remaining:.1f} more minute(s)")
+        failed_reentry = strategy.failed_thesis_reentry_reason(
+            records, prepared, self.cfg)
+        if failed_reentry is not None:
+            return None, failed_reentry
         records[setup_id] = strategy.new_setup_record(
             prepared, self.cfg)
         state.log_event(
@@ -1707,6 +1831,10 @@ class Engine:
                 "invalidation_anchor": prepared["invalidation_anchor"],
                 "exit_policy": prepared["exit_policy"],
                 "execution_choice": prepared["execution_choice"],
+                "entry_evidence_fingerprint": prepared.get(
+                    "entry_evidence_fingerprint"),
+                "what_changed_since_last_loss": prepared.get(
+                    "what_changed_since_last_loss") or None,
             }),
             setup_id=setup_id,
         )
@@ -1715,20 +1843,24 @@ class Engine:
 
     def _mark_setup_status(
             self, st: dict, setup_id: str | None, status: str,
-            *, cooldown: bool = False) -> None:
+            *, cooldown: bool = False,
+            realized_pnl_usd: float | None = None) -> None:
         if not setup_id:
             return
         record = (st.setdefault("recent_setups", {}).get(setup_id))
         if not isinstance(record, dict):
             return
         strategy.mark_setup(
-            record, status, self.cfg, apply_cooldown=cooldown)
+            record, status, self.cfg, apply_cooldown=cooldown,
+            realized_pnl_usd=realized_pnl_usd)
         state.log_event(
             "setup_status",
             self._audit_json({
                 "setup_id": setup_id,
                 "status": status,
                 "blocked_until": record.get("blocked_until"),
+                "outcome": record.get("outcome"),
+                "realized_pnl_usd": record.get("realized_pnl_usd"),
             }),
             setup_id=setup_id,
         )
@@ -1776,6 +1908,7 @@ class Engine:
         views = []
         for p in positions:
             opened = st.get("opened_at", {}).get(p["symbol"])
+            trade = (st.get("active_trades") or {}).get(p["symbol"]) or {}
             views.append({
                 "symbol": p["symbol"],
                 "side": p.get("side"),
@@ -1786,6 +1919,20 @@ class Engine:
                 "notional_usd": round(self._notional(p), 1),
                 "hours_open": round((now - opened) / 3600, 1)
                 if opened else None,
+                "age_verified": bool(
+                    trade.get("age_known", bool(opened))),
+                "planned_risk_usd": trade.get("risk_usd"),
+                "original_thesis": {
+                    "reason": trade.get("entry_reason"),
+                    "setup_type": trade.get("setup_type"),
+                    "invalidation_anchor": trade.get(
+                        "invalidation_anchor"),
+                    "exit_policy": trade.get("exit_policy"),
+                    "stop_loss_pct": trade.get("stop_loss_pct"),
+                    "take_profit_pct": trade.get("take_profit_pct"),
+                    "signal_ts": trade.get("signal_ts"),
+                    "entry_evidence": trade.get("entry_evidence"),
+                },
             })
         post_loss_cooldowns = [
             {
@@ -1859,9 +2006,15 @@ class Engine:
                 "max_leverage": r["max_leverage"],
                 "entry_leverage": r["entry_leverage"],
                 "risk_per_trade_pct": r["risk_per_trade_pct"],
+                "experimental_risk_per_trade_pct": r[
+                    "experimental_risk_per_trade_pct"],
+                "max_total_open_risk_pct": r[
+                    "max_total_open_risk_pct"],
                 "max_concurrent_positions": r["max_concurrent_positions"],
                 "min_confidence": r["min_confidence"],
                 "max_net_direction_pct": r.get("max_net_direction_pct", 100),
+                "max_btc_beta_exposure_pct": r[
+                    "max_btc_beta_exposure_pct"],
             },
             "trading_costs_fyi": self.cfg["trading_costs"],
         }

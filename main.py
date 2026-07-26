@@ -87,7 +87,10 @@ def load_cfg(path: str) -> dict:
 
 def load_exchange_cfg(path: str) -> dict:
     cfg = load_cfg(path)
+    state.configure_runtime(cfg["mode"])
     load_secrets(cfg["mode"])
+    state.bind_runtime_identity(
+        cfg["mode"], os.getenv("OKX_API_KEY") or "")
     return cfg
 
 
@@ -121,7 +124,7 @@ def _flatten(cfg, reason: str) -> bool:
         print("All orders cancelled and all positions closed.")
     else:
         print("Flatten was incomplete: positions or orders remain unverified. "
-              "See runtime/agent.log and inspect OKX manually.")
+              f"See {state.RUNTIME / 'agent.log'} and inspect OKX manually.")
     return ok
 
 
@@ -138,7 +141,8 @@ def cmd_run(args, cfg) -> int:
         st = state.load_state()
         if st["state"] == KILLED and not args.acknowledge_kill:
             print(f"Agent is KILLED (reason: {st.get('kill_reason')}).")
-            print("Review runtime/agent.log and the journal, then restart with:")
+            print(f"Review {state.RUNTIME / 'agent.log'} and the journal, "
+                  "then restart with:")
             print("  python main.py run --acknowledge-kill")
             return 1
         if st["state"] == KILLED:
@@ -400,24 +404,35 @@ def main() -> int:
     p.set_defaults(fn=cmd_check)
 
     args = parser.parse_args()
+    # Runtime selection must happen before logging, state, PID or journal
+    # access. Demo and live therefore cannot share operational files.
     try:
-        setup_logging()
-    except OSError as exc:
-        if args.command not in {"pause", "resume", "kill"}:
-            print(f"Logging startup failed: {exc}", file=sys.stderr)
-            return 2
-        print(f"WARNING: logging is unavailable: {exc}", file=sys.stderr)
+        cfg = load_cfg(args.config)
+        state.configure_runtime(cfg["mode"])
+    except (OSError, yaml.YAMLError, ConfigError,
+            state.RuntimeIdentityError) as exc:
+        _print_configuration_error(exc)
+        return 2
     # These controls write only local durable state. They must remain usable
     # during credential loss, .env rotation or an exchange outage. Commands
     # that also flatten load credentials only after PAUSED/KILLED is saved.
-    if args.command in {"pause", "resume", "kill"}:
-        return _dispatch(args, None)
+    credential_free = args.command in {"pause", "resume", "kill"}
     try:
-        cfg = load_cfg(args.config)
-        load_secrets(cfg["mode"])
-    except (OSError, yaml.YAMLError, ConfigError) as exc:
+        if not credential_free:
+            load_secrets(cfg["mode"])
+            state.bind_runtime_identity(
+                cfg["mode"], os.getenv("OKX_API_KEY") or "")
+        setup_logging()
+    except OSError as exc:
+        if not credential_free:
+            print(f"Logging startup failed: {exc}", file=sys.stderr)
+            return 2
+        print(f"WARNING: logging is unavailable: {exc}", file=sys.stderr)
+    except (state.RuntimeIdentityError, KeyError) as exc:
         _print_configuration_error(exc)
         return 2
+    if credential_free:
+        return _dispatch(args, None)
     return _dispatch(args, cfg)
 
 

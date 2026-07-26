@@ -8,6 +8,7 @@ def snapshot(**overrides):
     base = {
         "price": 100,
         "signal_ts": 1_000,
+        "signal_1h_ts": 900,
         "trend_15m": "up",
         "trend_1h": "up",
         "trend_4h": "up",
@@ -18,7 +19,16 @@ def snapshot(**overrides):
         "range_pos_pct": 70,
         "relative_volume_1h": 1.4,
         "mom_1h_pct": 0.5,
+        "mom_15m_pct": 0.2,
+        "fresh_breakout_long": False,
+        "fresh_breakout_short": False,
+        "price_stabilized_long": True,
+        "price_stabilized_short": False,
         "funding_rate_pct": 0.0,
+        "funding_samples_30": 20,
+        "funding_percentile_30": 50,
+        "perp_index_basis_pct": 0.0,
+        "open_interest_musd": 100,
     }
     base.update(overrides)
     return base
@@ -91,6 +101,62 @@ class StrategyContractTests(unittest.TestCase):
         self.assertEqual(
             why, "trend_continuation evidence contract is not met")
 
+    def test_continuation_requires_one_hour_and_four_hour_alignment(self):
+        plan, why = strategy.build_setup_plan(
+            decision(),
+            snapshot(trend_4h="flat"),
+            valid_config(),
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(
+            why, "trend_continuation evidence contract is not met")
+
+    def test_range_position_alone_is_not_a_fresh_breakout(self):
+        plan, why = strategy.build_setup_plan(
+            decision(setup_type="range_breakout"),
+            snapshot(range_pos_pct=95, fresh_breakout_long=False),
+            valid_config(),
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(why, "range_breakout evidence contract is not met")
+
+        plan, why = strategy.build_setup_plan(
+            decision(setup_type="range_breakout"),
+            snapshot(range_pos_pct=95, fresh_breakout_long=True),
+            valid_config(),
+        )
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+
+    def test_funding_squeeze_requires_crowding_and_price_stabilization(self):
+        plan, why = strategy.build_setup_plan(
+            decision(
+                setup_type="funding_squeeze",
+                invalidation_anchor="atr"),
+            snapshot(
+                funding_rate_pct=-0.05,
+                funding_percentile_30=10,
+                perp_index_basis_pct=-0.1,
+                price_stabilized_long=False),
+            valid_config(),
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(why, "funding_squeeze evidence contract is not met")
+
+        plan, why = strategy.build_setup_plan(
+            decision(
+                setup_type="funding_squeeze",
+                invalidation_anchor="atr"),
+            snapshot(
+                funding_rate_pct=-0.05,
+                funding_percentile_30=10,
+                perp_index_basis_pct=-0.1,
+                price_stabilized_long=True),
+            valid_config(),
+        )
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+
     def test_experimental_setup_is_demo_only(self):
         cfg = valid_config()
         cfg["mode"] = "live"
@@ -100,6 +166,14 @@ class StrategyContractTests(unittest.TestCase):
         self.assertIsNone(plan)
         self.assertEqual(
             why, "experimental setups are allowed only in demo mode")
+
+    def test_experimental_setup_has_separate_attribution_identity(self):
+        plan, why = strategy.build_setup_plan(
+            decision(setup_type="other", invalidation_anchor="atr"),
+            snapshot(), valid_config())
+        self.assertIsNone(why)
+        self.assertEqual(plan["strategy_id"], "momentum-experimental")
+        self.assertIn("experimental", plan["strategy_version"])
 
     def test_semantic_cooldown_blocks_new_candle_without_erasing_history(self):
         cfg = valid_config()
@@ -141,6 +215,45 @@ class StrategyContractTests(unittest.TestCase):
             cfg,
         )
         self.assertIsNone(strategy.evaluated_signal(records, next_bar))
+
+    def test_failed_thesis_reentry_requires_time_new_hour_and_changed_evidence(self):
+        cfg = valid_config()
+        first, _ = strategy.build_setup_plan(
+            decision(), snapshot(), cfg)
+        record = strategy.new_setup_record(first, cfg, now=100)
+        strategy.mark_setup(
+            record, "closed", cfg, now=200,
+            realized_pnl_usd=-10)
+        records = {first["setup_id"]: record}
+
+        retry, _ = strategy.build_setup_plan(
+            decision(
+                what_changed_since_last_loss=(
+                    "relative volume expanded into a new impulse")),
+            snapshot(
+                signal_ts=2_000, signal_1h_ts=1_800,
+                relative_volume_1h=2.2),
+            cfg,
+        )
+        self.assertIn(
+            "more minute",
+            strategy.failed_thesis_reentry_reason(
+                records, retry, cfg, now=201))
+        self.assertIsNone(
+            strategy.failed_thesis_reentry_reason(
+                records, retry, cfg, now=4_000))
+
+        unchanged, _ = strategy.build_setup_plan(
+            decision(
+                what_changed_since_last_loss=(
+                    "I want to try the same setup again")),
+            snapshot(signal_ts=2_000, signal_1h_ts=1_800),
+            cfg,
+        )
+        self.assertIn(
+            "changed objective evidence",
+            strategy.failed_thesis_reentry_reason(
+                records, unchanged, cfg, now=4_000))
 
 
 if __name__ == "__main__":

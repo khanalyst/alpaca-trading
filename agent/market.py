@@ -432,9 +432,48 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
 
     df_fast = frames.get("15m", frames[tfs[0]])
     snap["signal_ts"] = int(df_fast["ts"].iloc[-1])
+    snap["signal_1h_ts"] = int(df_1h["ts"].iloc[-1])
     snap["mom_1h_pct"] = round(
         float(df_fast["close"].pct_change(4).iloc[-1] * 100), 2
     )
+    signal_open = float(df_fast["open"].iloc[-1])
+    signal_close = float(df_fast["close"].iloc[-1])
+    previous_close = float(df_fast["close"].iloc[-2])
+    signal_low = float(df_fast["low"].iloc[-1])
+    previous_low = float(df_fast["low"].iloc[-2])
+    signal_high = float(df_fast["high"].iloc[-1])
+    previous_high = float(df_fast["high"].iloc[-2])
+    snap["mom_15m_pct"] = round(
+        (signal_close - previous_close) / previous_close * 100, 3
+    ) if previous_close > 0 else None
+    snap["signal_candle_return_pct"] = round(
+        (signal_close - signal_open) / signal_open * 100, 3
+    ) if signal_open > 0 else None
+    # A breakout must occur on the latest completed signal candle, beyond a
+    # prior range that excludes that candle. A 24h range-position reading by
+    # itself can describe an old move and is not proof of a fresh break.
+    prior_fast = df_fast.iloc[-21:-1]
+    prior_high = float(prior_fast["high"].max())
+    prior_low = float(prior_fast["low"].min())
+    snap["prior_range_high_20"] = round(prior_high, 10)
+    snap["prior_range_low_20"] = round(prior_low, 10)
+    snap["fresh_breakout_long"] = bool(
+        prior_high > 0 and signal_close > prior_high)
+    snap["fresh_breakout_short"] = bool(
+        prior_low > 0 and signal_close < prior_low)
+    snap["breakout_distance_pct"] = (
+        round((signal_close - prior_high) / prior_high * 100, 3)
+        if snap["fresh_breakout_long"] else
+        round((prior_low - signal_close) / prior_low * 100, 3)
+        if snap["fresh_breakout_short"] else 0.0
+    )
+    # Directional stabilization is deliberately modest evidence, not a buy
+    # signal: price must stop extending the adverse extreme and close back in
+    # the squeeze direction on the completed candle.
+    snap["price_stabilized_long"] = bool(
+        signal_low >= previous_low and signal_close > signal_open)
+    snap["price_stabilized_short"] = bool(
+        signal_high <= previous_high and signal_close < signal_open)
     recent_volume = float(df_fast["vol"].tail(4).sum())
     prior_windows = df_fast["vol"].iloc[:-4].rolling(4).sum().tail(20)
     normal_volume = float(prior_windows.median())

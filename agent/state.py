@@ -1,7 +1,8 @@
 """Agent state file, PID management and SQLite journal.
 
-The state file (runtime/state.json) is the control channel between the CLI
-and the running loop. The CLI writes it; the loop reads it every cycle.
+The mode-scoped state file (runtime/demo/state.json or runtime/live/state.json)
+is the control channel between the CLI and running loop. The CLI writes it;
+the loop reads it every cycle.
 """
 
 import fcntl
@@ -10,6 +11,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -17,7 +19,12 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-RUNTIME = Path(__file__).resolve().parent.parent / "runtime"
+RUNTIME_BASE = Path(
+    os.getenv("OKX_AGENT_RUNTIME_ROOT")
+    or Path(__file__).resolve().parent.parent / "runtime"
+)
+RUNTIME_SCOPE = "_unconfigured"
+RUNTIME = RUNTIME_BASE / RUNTIME_SCOPE
 STATE_FILE = RUNTIME / "state.json"
 PID_FILE = RUNTIME / "agent.pid"
 DB_FILE = RUNTIME / "journal.db"
@@ -30,12 +37,114 @@ PAUSED = "PAUSED"            # housekeeping only: no LLM calls, no new entries
 DAY_STOPPED = "DAY_STOPPED"  # daily loss limit hit: model may close, cannot open
 KILLED = "KILLED"            # terminal: flatten everything and exit
 EQUITY_BASIS = "usdt_currency_equity_v1"
-JOURNAL_SCHEMA_VERSION = 2
+JOURNAL_SCHEMA_VERSION = 3
 
 _JOURNAL_CONTEXT: dict[str, object] = {}
 
+
+class RuntimeIdentityError(RuntimeError):
+    """Runtime files belong to a different mode or API-key identity."""
+
+
+def _set_runtime_paths(runtime: Path, scope: str) -> Path:
+    global RUNTIME_SCOPE, RUNTIME, STATE_FILE, PID_FILE, DB_FILE
+    global STATE_LOCK_FILE
+    RUNTIME_SCOPE = scope
+    RUNTIME = runtime
+    STATE_FILE = runtime / "state.json"
+    PID_FILE = runtime / "agent.pid"
+    DB_FILE = runtime / "journal.db"
+    STATE_LOCK_FILE = runtime / "state.lock"
+    _JOURNAL_CONTEXT.clear()
+    return runtime
+
+
+def _legacy_runtime_mode(base: Path) -> str | None:
+    """Read the most recent recorded mode from the pre-isolation journal."""
+    legacy_db = base / "journal.db"
+    if not legacy_db.exists():
+        return None
+    try:
+        with sqlite3.connect(legacy_db) as conn:
+            row = conn.execute(
+                "SELECT mode FROM runs WHERE mode IN ('demo','live') "
+                "ORDER BY started_ts DESC LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row else None
+
+
+def _migrate_legacy_runtime(base: Path, target: Path, mode: str) -> None:
+    """Copy one provably matching legacy runtime into its mode directory.
+
+    Journals from releases before runtime isolation lived directly under
+    ``runtime/``. A matching ``runs.mode`` is required before any copy, so a
+    demo journal can never be guessed to be live (or vice versa). The source
+    remains as a read-only rollback artifact.
+    """
+    if ((target / "state.json").exists()
+            or (target / "journal.db").exists()
+            or _legacy_runtime_mode(base) != mode):
+        return
+    legacy_state = base / "state.json"
+    legacy_db = base / "journal.db"
+    if not legacy_state.exists() and not legacy_db.exists():
+        return
+    legacy_pid = base / "agent.pid"
+    try:
+        pid = int(legacy_pid.read_text().strip())
+    except Exception:
+        pid = None
+    if pid and pid_alive(pid):
+        raise RuntimeIdentityError(
+            "the legacy agent loop is still running; stop it before "
+            "migrating runtime files")
+    target.mkdir(parents=True, exist_ok=True)
+    if legacy_state.exists():
+        shutil.copy2(legacy_state, target / "state.json")
+    if legacy_db.exists():
+        source = sqlite3.connect(
+            f"file:{legacy_db}?mode=ro", uri=True)
+        destination = sqlite3.connect(target / "journal.db")
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+    legacy_log = base / "agent.log"
+    if legacy_log.exists():
+        shutil.copy2(legacy_log, target / "agent.log")
+
+
+def configure_runtime(mode: str, base: Path | None = None) -> Path:
+    """Select an isolated runtime before any state, PID or journal access."""
+    if mode not in {"demo", "live", "test", "_unconfigured"}:
+        raise ValueError("runtime mode must be demo, live, or test")
+    root = Path(base) if base is not None else RUNTIME_BASE
+    target = root / mode
+    if mode in {"demo", "live"}:
+        _migrate_legacy_runtime(root, target, mode)
+    return _set_runtime_paths(target, mode)
+
+
+def account_fingerprint(mode: str, api_key: str) -> str:
+    """Return a non-secret stable identity for one key/mode combination."""
+    if mode not in {"demo", "live"} or not isinstance(api_key, str) \
+            or not api_key:
+        raise RuntimeIdentityError(
+            "cannot identify runtime without a valid mode and OKX API key")
+    digest = hashlib.sha256(
+        f"okx-agent\0{mode}\0{api_key}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"okx-{mode}-{digest}"
+
 DEFAULT = {
     "state": PAUSED,
+    # Bound on first credentialed access. These fields prevent a state file
+    # from being reused with another API key or across demo/live.
+    "runtime_mode": None,
+    "account_fingerprint": None,
     "high_water_mark": None,
     "day": None,
     "day_start_equity": None,
@@ -77,6 +186,18 @@ def _validate(data: object) -> dict:
     merged = {**_default(), **data}
     if merged.get("state") not in {RUNNING, PAUSED, DAY_STOPPED, KILLED}:
         raise ValueError("invalid state transition value")
+    runtime_mode = merged.get("runtime_mode")
+    if runtime_mode not in {None, "demo", "live"}:
+        raise ValueError("state.runtime_mode is invalid")
+    account_id = merged.get("account_fingerprint")
+    if account_id is not None and (
+            not isinstance(account_id, str)
+            or not account_id.startswith("okx-")
+            or len(account_id) > 80):
+        raise ValueError("state.account_fingerprint is invalid")
+    if (runtime_mode is None) != (account_id is None):
+        raise ValueError(
+            "state runtime mode and account fingerprint must be bound together")
     for key in ("cooldowns", "entry_feedback", "entry_failures", "opened_at",
                 "active_trades", "protection", "recent_setups"):
         if not isinstance(merged.get(key), dict):
@@ -199,6 +320,13 @@ def _validate(data: object) -> dict:
                     f"state.active_trades.{symbol}.{key} is invalid")
         if float(trade["qty"]) <= 0:
             raise ValueError(f"state.active_trades.{symbol}.qty is invalid")
+        age_known = trade.get("age_known", True)
+        if not isinstance(age_known, bool):
+            raise ValueError(
+                f"state.active_trades.{symbol}.age_known is invalid")
+        if age_known and float(trade["opened_at"]) <= 0:
+            raise ValueError(
+                f"state.active_trades.{symbol}.opened_at is invalid")
         for key in ("initial_qty", "leverage", "entry_fee_usd",
                     "entry_fee_remaining_usd", "risk_usd"):
             value = trade.get(key)
@@ -219,7 +347,7 @@ def _validate(data: object) -> dict:
         for key in (
                 "strategy_id", "strategy_version", "setup_id", "setup_key",
                 "setup_type", "run_id", "cycle_id", "exit_policy",
-                "invalidation_anchor"):
+                "invalidation_anchor", "entry_reason"):
             value = trade.get(key)
             if value is not None and (
                     not isinstance(value, str) or not value.strip()
@@ -234,6 +362,29 @@ def _validate(data: object) -> dict:
                 or float(signal_ts) < 0):
             raise ValueError(
                 f"state.active_trades.{symbol}.signal_ts is invalid")
+        for key in ("stop_loss_pct", "take_profit_pct"):
+            value = trade.get(key)
+            if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0):
+                raise ValueError(
+                    f"state.active_trades.{symbol}.{key} is invalid")
+        evidence = trade.get("entry_evidence")
+        if evidence is not None:
+            if not isinstance(evidence, dict):
+                raise ValueError(
+                    f"state.active_trades.{symbol}.entry_evidence is invalid")
+            try:
+                encoded_evidence = json.dumps(
+                    evidence, allow_nan=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"state.active_trades.{symbol}.entry_evidence is invalid")
+            if len(encoded_evidence) > 6000:
+                raise ValueError(
+                    f"state.active_trades.{symbol}.entry_evidence is too large")
     for symbol, target in merged["protection"].items():
         if (not isinstance(symbol, str) or not isinstance(target, dict)
                 or target.get("side") not in {"long", "short"}):
@@ -284,6 +435,24 @@ def _validate(data: object) -> dict:
         if (float(record["last_seen_at"]) < float(record["first_seen_at"])
                 or float(record["blocked_until"]) > float(record["expires_at"])):
             raise ValueError(f"state.recent_setups.{setup_id} is invalid")
+        outcome = record.get("outcome")
+        if outcome not in {None, "win", "loss", "flat", "unknown"}:
+            raise ValueError(
+                f"state.recent_setups.{setup_id}.outcome is invalid")
+        for key in ("closed_at", "realized_pnl_usd", "entry_signal_1h_ts"):
+            value = record.get(key)
+            if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))):
+                raise ValueError(
+                    f"state.recent_setups.{setup_id}.{key} is invalid")
+        evidence_id = record.get("entry_evidence_fingerprint")
+        if evidence_id is not None and (
+                not isinstance(evidence_id, str)
+                or not evidence_id or len(evidence_id) > 80):
+            raise ValueError(
+                f"state.recent_setups.{setup_id} evidence is invalid")
     if not isinstance(merged.get("operator_pause"), bool):
         raise ValueError("state.operator_pause is not boolean")
     if not isinstance(merged.get("flatten_on_kill"), bool):
@@ -387,6 +556,31 @@ def set_state(name: str, reason: str | None = None, **extra) -> dict:
         st.update(extra)
         _write_atomic(_validate(st))
         return st
+
+
+def bind_runtime_identity(mode: str, api_key: str) -> str:
+    """Bind this mode's files to one hashed key identity, or fail closed."""
+    if RUNTIME_SCOPE != mode:
+        raise RuntimeIdentityError(
+            f"runtime is scoped to {RUNTIME_SCOPE}, not {mode}")
+    fingerprint = account_fingerprint(mode, api_key)
+    with _state_lock():
+        st = _load_state_unlocked()
+        existing_mode = st.get("runtime_mode")
+        existing_fingerprint = st.get("account_fingerprint")
+        if existing_mode is None and existing_fingerprint is None:
+            st["runtime_mode"] = mode
+            st["account_fingerprint"] = fingerprint
+            _write_atomic(_validate(st))
+        elif (existing_mode != mode
+              or existing_fingerprint != fingerprint):
+            raise RuntimeIdentityError(
+                f"{RUNTIME} belongs to {existing_mode or 'unknown mode'} / "
+                f"{existing_fingerprint or 'unknown account'}; refusing to "
+                "reuse it with another OKX key")
+    set_journal_context(
+        runtime_mode=mode, account_fingerprint=fingerprint)
+    return fingerprint
 
 
 # Keys the trading loop owns. commit() persists these without clobbering a
@@ -536,7 +730,7 @@ def set_journal_context(**context: object) -> dict:
     allowed = {
         "run_id", "cycle_id", "strategy_id", "strategy_version",
         "prompt_version", "config_version", "code_version",
-        "equity_basis_id",
+        "equity_basis_id", "runtime_mode", "account_fingerprint",
     }
     unknown = set(context) - allowed
     if unknown:
@@ -579,13 +773,15 @@ def _db() -> sqlite3.Connection:
         "ts REAL, kind TEXT, payload TEXT, run_id TEXT, cycle_id TEXT, "
         "strategy_id TEXT, strategy_version TEXT, setup_id TEXT, "
         "prompt_version TEXT, config_version TEXT, code_version TEXT, "
-        "equity_basis_id TEXT)"
+        "equity_basis_id TEXT, runtime_mode TEXT, "
+        "account_fingerprint TEXT)"
     )
     _ensure_columns(conn, "events", {
         "run_id": "TEXT", "cycle_id": "TEXT", "strategy_id": "TEXT",
         "strategy_version": "TEXT", "setup_id": "TEXT",
         "prompt_version": "TEXT", "config_version": "TEXT",
         "code_version": "TEXT", "equity_basis_id": "TEXT",
+        "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
     })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades ("
@@ -599,7 +795,8 @@ def _db() -> sqlite3.Connection:
         "signal_ts REAL, exit_policy TEXT, invalidation_anchor TEXT, "
         "run_id TEXT, cycle_id TEXT, prompt_version TEXT, "
         "config_version TEXT, code_version TEXT, equity_basis_id TEXT, "
-        "entry_equity_usd REAL)"
+        "entry_equity_usd REAL, close_trigger TEXT, close_evidence TEXT, "
+        "runtime_mode TEXT, account_fingerprint TEXT)"
     )
     # Migrate journals created by earlier releases in place.
     _ensure_columns(conn, "trades", {
@@ -614,22 +811,29 @@ def _db() -> sqlite3.Connection:
         "invalidation_anchor": "TEXT", "run_id": "TEXT", "cycle_id": "TEXT",
         "prompt_version": "TEXT", "config_version": "TEXT",
         "code_version": "TEXT", "equity_basis_id": "TEXT",
-        "entry_equity_usd": "REAL",
+        "entry_equity_usd": "REAL", "close_trigger": "TEXT",
+        "close_evidence": "TEXT", "runtime_mode": "TEXT",
+        "account_fingerprint": "TEXT",
     })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS equity ("
         "ts REAL, equity REAL, state TEXT, basis_id TEXT, run_id TEXT, "
-        "cycle_id TEXT)"
+        "cycle_id TEXT, runtime_mode TEXT, account_fingerprint TEXT)"
     )
     _ensure_columns(conn, "equity", {
         "basis_id": "TEXT", "run_id": "TEXT", "cycle_id": "TEXT",
+        "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
     })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runs ("
         "run_id TEXT PRIMARY KEY, started_ts REAL, mode TEXT, "
         "strategy_id TEXT, strategy_version TEXT, model TEXT, "
-        "prompt_version TEXT, config_version TEXT, code_version TEXT)"
+        "prompt_version TEXT, config_version TEXT, code_version TEXT, "
+        "account_fingerprint TEXT)"
     )
+    _ensure_columns(conn, "runs", {
+        "account_fingerprint": "TEXT",
+    })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_meta ("
         "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -670,15 +874,17 @@ def check_journal() -> None:
 def log_run(run_id: str, *, mode: str, strategy_id: str,
             strategy_version: str, model: str, prompt_version: str,
             config_version: str, code_version: str) -> None:
+    context = journal_context()
     try:
         with _db() as c:
             c.execute(
                 "INSERT OR IGNORE INTO runs ("
                 "run_id, started_ts, mode, strategy_id, strategy_version, "
-                "model, prompt_version, config_version, code_version) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "model, prompt_version, config_version, code_version, "
+                "account_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (run_id, time.time(), mode, strategy_id, strategy_version,
-                 model, prompt_version, config_version, code_version),
+                 model, prompt_version, config_version, code_version,
+                 context.get("account_fingerprint")),
             )
     except Exception as exc:
         log.critical("run journal write failed: %s", exc)
@@ -695,8 +901,8 @@ def log_event(kind: str, payload: str, *, setup_id: str | None = None,
                 "INSERT INTO events ("
                 "ts, kind, payload, run_id, cycle_id, strategy_id, "
                 "strategy_version, setup_id, prompt_version, config_version, "
-                "code_version, equity_basis_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "code_version, equity_basis_id, runtime_mode, "
+                "account_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     time.time(), kind, payload, context.get("run_id"),
                     context.get("cycle_id"),
@@ -705,6 +911,8 @@ def log_event(kind: str, payload: str, *, setup_id: str | None = None,
                     setup_id, context.get("prompt_version"),
                     context.get("config_version"), context.get("code_version"),
                     context.get("equity_basis_id"),
+                    context.get("runtime_mode"),
+                    context.get("account_fingerprint"),
                 ),
             )
     except Exception as exc:
@@ -726,7 +934,9 @@ def log_trade(symbol, side, action, qty, price, notional, leverage, reason,
               exit_policy=None, invalidation_anchor=None, run_id=None,
               cycle_id=None, prompt_version=None, config_version=None,
               code_version=None, equity_basis_id=None,
-              entry_equity_usd=None) -> None:
+              entry_equity_usd=None, close_trigger=None,
+              close_evidence=None, runtime_mode=None,
+              account_fingerprint=None) -> None:
     """Journal an execution event with a durable round-trip identifier."""
     context = journal_context()
     if (pnl_semantics is None and action in {"partial_close", "close"}
@@ -734,33 +944,42 @@ def log_trade(symbol, side, action, qty, price, notional, leverage, reason,
         pnl_semantics = "incremental_v1"
     try:
         with _db() as c:
+            columns = (
+                "ts", "symbol", "side", "action", "qty", "price",
+                "notional", "leverage", "reason", "confidence", "pnl_pct",
+                "trade_id", "order_id", "fee_usd", "funding_usd",
+                "realized_pnl_usd", "risk_usd", "fill_status",
+                "slippage_usd", "adverse_slippage_usd", "funding_status",
+                "pnl_semantics", "strategy_id", "strategy_version",
+                "setup_id", "setup_key", "setup_type", "signal_ts",
+                "exit_policy", "invalidation_anchor", "run_id", "cycle_id",
+                "prompt_version", "config_version", "code_version",
+                "equity_basis_id", "entry_equity_usd", "close_trigger",
+                "close_evidence", "runtime_mode", "account_fingerprint",
+            )
+            values = (
+                time.time(), symbol, side, action, qty, price, notional,
+                leverage, reason, confidence, pnl_pct, trade_id, order_id,
+                fee_usd, funding_usd, realized_pnl_usd, risk_usd,
+                fill_status, slippage_usd, adverse_slippage_usd,
+                funding_status, pnl_semantics,
+                strategy_id or context.get("strategy_id"),
+                strategy_version or context.get("strategy_version"),
+                setup_id, setup_key, setup_type, signal_ts, exit_policy,
+                invalidation_anchor, run_id or context.get("run_id"),
+                cycle_id or context.get("cycle_id"),
+                prompt_version or context.get("prompt_version"),
+                config_version or context.get("config_version"),
+                code_version or context.get("code_version"),
+                equity_basis_id or context.get("equity_basis_id"),
+                entry_equity_usd, close_trigger, close_evidence,
+                runtime_mode or context.get("runtime_mode"),
+                account_fingerprint or context.get("account_fingerprint"),
+            )
             c.execute(
-                "INSERT INTO trades (ts, symbol, side, action, qty, price, "
-                "notional, leverage, reason, confidence, pnl_pct, trade_id, "
-                "order_id, fee_usd, funding_usd, realized_pnl_usd, risk_usd, "
-                "fill_status, slippage_usd, adverse_slippage_usd, "
-                "funding_status, pnl_semantics, strategy_id, strategy_version, "
-                "setup_id, setup_key, setup_type, signal_ts, exit_policy, "
-                "invalidation_anchor, run_id, cycle_id, prompt_version, "
-                "config_version, code_version, equity_basis_id, "
-                "entry_equity_usd) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                "?,?,?,?,?,?,?,?,?,?,?)",
-                (time.time(), symbol, side, action, qty, price, notional,
-                 leverage, reason, confidence, pnl_pct, trade_id, order_id,
-                 fee_usd, funding_usd, realized_pnl_usd, risk_usd,
-                 fill_status, slippage_usd, adverse_slippage_usd,
-                 funding_status, pnl_semantics,
-                 strategy_id or context.get("strategy_id"),
-                 strategy_version or context.get("strategy_version"),
-                 setup_id, setup_key, setup_type, signal_ts, exit_policy,
-                 invalidation_anchor, run_id or context.get("run_id"),
-                 cycle_id or context.get("cycle_id"),
-                 prompt_version or context.get("prompt_version"),
-                 config_version or context.get("config_version"),
-                 code_version or context.get("code_version"),
-                 equity_basis_id or context.get("equity_basis_id"),
-                 entry_equity_usd),
+                f"INSERT INTO trades ({','.join(columns)}) VALUES "
+                f"({','.join('?' for _ in values)})",
+                values,
             )
     except Exception as exc:
         log.critical("trade journal write failed: %s", exc)
@@ -773,12 +992,23 @@ def log_equity(equity: float, st: str, basis_id: str | None = None) -> None:
         with _db() as c:
             c.execute(
                 "INSERT INTO equity ("
-                "ts, equity, state, basis_id, run_id, cycle_id) "
-                "VALUES (?,?,?,?,?,?)",
+                "ts, equity, state, basis_id, run_id, cycle_id, "
+                "runtime_mode, account_fingerprint) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (time.time(), equity, st,
                  basis_id or context.get("equity_basis_id"),
-                 context.get("run_id"), context.get("cycle_id")),
+                 context.get("run_id"), context.get("cycle_id"),
+                 context.get("runtime_mode"),
+                 context.get("account_fingerprint")),
             )
     except Exception as exc:
         log.critical("equity journal write failed: %s", exc)
         raise JournalError(f"equity journal write failed: {exc}") from exc
+
+
+# Test runners can select an isolated root before importing agent modules.
+# Normal application code deliberately starts in _unconfigured and main.py
+# selects demo/live only after validating config.
+_requested_runtime_scope = os.getenv("OKX_AGENT_RUNTIME_SCOPE")
+if _requested_runtime_scope:
+    configure_runtime(_requested_runtime_scope)
