@@ -52,6 +52,21 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(
             validate_config(cfg)["risk"]["max_margin_usage_pct"], 75)
 
+    def test_multi_day_holds_are_not_reachable(self):
+        # A day-trading system may run a position into a second session but
+        # not for days: weekend gaps, accumulated funding and overnight news
+        # are a different risk profile than the one this strategy was tested
+        # against.
+        cfg = valid_config()
+        cfg["risk"]["max_hold_hours"] = 72
+        with self.assertRaisesRegex(ConfigError, "between 0.25 and 48"):
+            validate_config(cfg)
+
+    def test_forty_eight_hour_hold_is_allowed(self):
+        cfg = valid_config()
+        cfg["risk"]["max_hold_hours"] = 48
+        self.assertEqual(validate_config(cfg)["risk"]["max_hold_hours"], 48)
+
     def test_renamed_funding_threshold_rejects_the_stale_key(self):
         # The threshold changed meaning from a raw per-interval rate to an
         # 8h-equivalent one. A stale key must fail loudly rather than be

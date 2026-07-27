@@ -387,7 +387,7 @@ API keys; the mode must match the keys in `.env`.
 | `hard_max_entry_extension_atr` | 2.5 | Absolute no-chase boundary from the 1h EMA20 |
 | `breakout_range_threshold_pct` / `breakout_min_relative_volume` | 85 / 1.0 | Minimum 24h range position and participation for a `range_breakout` |
 | `funding_extreme_pct_per_8h` | 0.01 | Absolute funding floor for `funding_squeeze`, as an **8h-equivalent** rate: a 4h contract's rate is doubled before comparison. Whether funding is extreme *for that instrument* is decided by `funding_percentile_30`; this only screens out near-zero funding |
-| `fixed_reward_risk` / `extended_reward_risk` | 2.0 / 3.0 | Code-derived target multiples selected through the model's exit policy |
+| `fixed_reward_risk` / `extended_reward_risk` | 3.0 / 4.0 | Code-derived target multiples selected through the model's exit policy. 3R beat 2R in all four matched comparisons at the 48h hold; beyond 3R the gain reverses out-of-sample |
 
 **Change how aggressive it is (`risk:` sizing)**
 
@@ -405,7 +405,7 @@ API keys; the mode must match the keys in `.env`.
 | `min_btc_beta_samples` | 24 | Minimum observations before measured BTC beta is trusted |
 | `max_concurrent_positions` | 3 | Max simultaneous open positions |
 | `min_confidence` | 0.65 | Proposals below this are discarded |
-| `max_hold_hours` | 24 | Stale positions are force-closed |
+| `max_hold_hours` | 48 | Stale positions are force-closed. **Hard-capped at 48 in code**: this is a day-trading strategy, so a multi-day hold is not reachable by config. 48 beat 24 in 8/8 matched walk-forward cells |
 
 **Change the safety brakes (`risk:` circuit breakers)**
 

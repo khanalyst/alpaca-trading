@@ -184,7 +184,11 @@ def validate_config(raw: dict) -> dict:
     _integer(risk, "min_btc_beta_samples", 0, 200, "risk")
     _integer(risk, "max_concurrent_positions", 1, 20, "risk")
     _number(risk, "min_confidence", 0, 1, "risk")
-    _number(risk, "max_hold_hours", 0.25, 168, "risk")
+    # This is a day-trading strategy. A position may run into a second
+    # session, but a multi-day hold is a different strategy with different
+    # risk (weekend gaps, funding accumulation, overnight news) and must not
+    # be reachable by nudging one number.
+    _number(risk, "max_hold_hours", 0.25, 48, "risk")
     _number(risk, "daily_loss_limit_pct", 0.1, 20, "risk")
     _boolean(risk, "flatten_on_daily_stop", "risk")
     _number(risk, "max_drawdown_pct", 1, 50, "risk")

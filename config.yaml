@@ -48,8 +48,13 @@ strategy:
   # per-interval threshold was never reached on BTC, ETH, XRP or DOGE in 97
   # days of settlements, which made the setup unreachable on liquid symbols.
   funding_extreme_pct_per_8h: 0.01
-  fixed_reward_risk: 2.0
-  extended_reward_risk: 3.0
+  # A 3R default target beat a 2R one in all four matched comparisons at the
+  # 48h hold (both cost scenarios, both walk-forward halves). With the longer
+  # hold the extra distance has time to be reached, so the wider target stops
+  # giving away winners to the clock. Beyond 3R the gain reverses
+  # out-of-sample, so this is a measured optimum rather than "wider is better".
+  fixed_reward_risk: 3.0
+  extended_reward_risk: 4.0
 
 universe:
   top_n: 10                          # trade only the N highest-volume USDT perpetuals
@@ -90,7 +95,14 @@ risk:
   min_btc_beta_samples: 24       # otherwise assume conservative beta=1
   max_concurrent_positions: 3
   min_confidence: 0.65           # model decisions below this are discarded
-  max_hold_hours: 24             # day-trading discipline: no stale positions
+  # Day-trading discipline: no multi-day positions. 48h rather than 24h is
+  # measured, not preference. Across 8 matched (reward:risk x cost) cells the
+  # 48h cap beat the 24h cap in 8/8 in-sample, 8/8 out-of-sample and 8/8
+  # full-sample, worth about +0.11% per trade on average. The 24h clock was
+  # closing trades that had not yet resolved: timeouts fall from ~29% of
+  # exits to ~20%. It reduces the loss rate; it does not make the strategy
+  # profitable. See research/results/edge-search-2024-2026/REPORT.md.
+  max_hold_hours: 48
 
   # --- circuit breakers ---
   daily_loss_limit_pct: 5        # down this much on the day -> no new entries until next UTC day
@@ -127,7 +139,10 @@ trading_costs:
   taker_fee_pct_per_side: 0.05
   expected_stop_slippage_pct: 0.15
   expected_funding_intervals_held: 1  # floor when funding schedule is unknown
-  expected_hold_hours: 8              # live interval/next time derive charges
+  # Measured average hold at the 48h cap and a 3R target is ~21h, so an 8h
+  # assumption understated the number of funding settlements a position pays
+  # and therefore undersized the cost baked into risk sizing.
+  expected_hold_hours: 20
 
 # Optional human alerts. The URL remains in .env, never in this file.
 alerts:

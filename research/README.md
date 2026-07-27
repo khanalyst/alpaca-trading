@@ -12,6 +12,11 @@ calling an LLM.
 | `edge_report.py` | The full edge investigation: nulls, conditionals, walk-forward sweep, selector headroom, power |
 | `portfolio_sim.py` | Whole-account simulation through the real `RiskEngine` and circuit breakers |
 | `phase1_v2_backtest.py` | The original event-study + portfolio proxy backtest |
+| `signal_lab.py` | Point-in-time panel builder and a library of candidate predictors |
+| `find_edge.py` | Pass 1: linear quantile spreads across every feature and horizon, FDR-controlled |
+| `deep_edge.py` | Passes 2-4: extreme tails, regime/session conditioning, implementable top-N |
+| `validate_candidate.py` | Adversarial tests on a surviving candidate, including a placebo control |
+| `unbiased_recheck.py` | Timestamp-paired re-test that removes pooled-threshold time-selection bias |
 | `make_legacy_dataset.py` | Adapt an `edge_lab` dataset into the layout `phase1_v2_backtest.py` expects |
 
 ## Getting data
@@ -95,6 +100,24 @@ whole-account simulation self-kills on drawdown 50 days in; with the breaker
 disabled it returns -58% frictionless and -95% at ordinary costs.
 
 Read `results/edge-audit-2024-2026/REPORT.md` first.
+
+### `results/edge-search-2024-2026/` — the search for a replacement signal
+
+~2,250 hypotheses across eight signal families at 15m-48h horizons.
+**No edge found.** One candidate survived FDR control and out-of-sample
+confirmation, then failed its own placebo: a randomly shuffled signal scored
++0.455% at 48h with t=2.37, about 41% of the "real" result, because decile
+thresholds pooled across time were selecting bullish moments for the long leg
+and bearish ones for the short leg. Re-tested with per-timestamp ranking, the
+placebo beats the real signal in most cells and reaches t=2.60 on pure noise.
+
+That last number is the most useful output here: on this data, at these
+sample sizes and with overlapping windows, **t>2 arises routinely from
+nothing**. Any future candidate must clear that bar.
+
+What did survive is a parameter result: a 48h maximum hold beat 24h in 8/8
+matched walk-forward cells, and a 3R target beat 2R in 4/4 at that hold.
+Both are applied in `config.yaml`.
 
 ### `results/phase1-v2-backtest-2025-2026/` — the earlier result
 

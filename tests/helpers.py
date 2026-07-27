@@ -51,7 +51,7 @@ VALID_CONFIG = {
         "min_btc_beta_samples": 24,
         "max_concurrent_positions": 3,
         "min_confidence": 0.65,
-        "max_hold_hours": 24,
+        "max_hold_hours": 48,
         "daily_loss_limit_pct": 5,
         "flatten_on_daily_stop": False,
         "max_drawdown_pct": 15,
