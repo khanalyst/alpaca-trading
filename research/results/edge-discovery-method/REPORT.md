@@ -93,6 +93,10 @@ out-of-sample confirmation, and a mechanism — or treat it as noise.**
 
 ### 1. Execution cost (highest probability, lowest glamour)
 
+> **Measured in Part C2 and substantially downgraded.** The saving is real but
+> capped near +0.10% and is destroyed by adverse selection unless fills are
+> very good. Read Part C2 before acting on this section.
+
 Every result in this project pays 0.05% per side plus spread. Maker execution
 is 0.02% per side: **0.06% of round-trip saving**, against measured gross
 spreads of 0.05-0.3%. That single change flips several point estimates from
@@ -128,6 +132,10 @@ What exists but is not being collected:
 Every hour this is not being recorded is evidence that cannot be bought back.
 
 ### 3. Breadth
+
+> **Measured in Part C2 and refuted for the live strategy.** Widening the
+> universe made expectancy monotonically worse. The argument survives only
+> for offline cross-sectional research.
 
 Cross-sectional strategies need instruments to rank against. The universe is
 10 names; after a regime filter, 3-5 remain. This is why pooled statistics
@@ -224,6 +232,68 @@ account. Capacity limits matter later, not now.
 
 ---
 
+## Part C2 — Both Part B recommendations, tested
+
+Part B ranked execution cost first and universe breadth third. Both were
+arguments, not measurements. Tested, one is conditional and the other is
+simply wrong.
+
+### Maker execution: the fee saving is real, the net is not free
+
+Resting an order buys 0.06% of round-trip fee saving and sells two things:
+fills you never get, and adverse selection on the fills you do get. Bar data
+cannot see queue position, so fill quality is parameterised as how far price
+must trade *through* the resting limit before it counts as filled — a crude
+stand-in for "enough volume traded here to clear the queue ahead of you".
+
+| Penetration required | Fill rate | Selection effect | Price+fee effect | **Net vs today** |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 bps (touch = fill) | 99.5% | -0.007% | +0.106% | **+0.099%** |
+| 5 bps | 94.3% | -0.072% | +0.106% | **+0.034%** |
+| 15 bps | 84.3% | -0.186% | +0.105% | **-0.081%** |
+| 30 bps | 69.2% | -0.365% | +0.104% | **-0.261%** |
+| 60 bps | 45.4% | -0.717% | +0.103% | **-0.615%** |
+
+The price+fee benefit is constant at ~+0.105% because it is arithmetic:
+0.06% of fee plus ~0.05% of avoided entry slippage. Everything else is
+adverse selection, and it grows fast enough to swamp the saving.
+
+**The crossover sits between 5 and 15 bps.** Below it, maker execution wins;
+above it, resting orders lose more to selection than they save in fees. That
+is the actual engineering question — not "is 0.06% worth having" but "can we
+fill inside ~10 bps of penetration". Against the measured spreads (BTC 0.015
+bps, DOGE 1.39 bps) that is plausible on the majors and doubtful on the thin
+names, which argues for a maker redesign scoped to tight-spread instruments
+only, if at all.
+
+And the decisive caveat: **even the most optimistic case leaves expectancy at
+-0.128%**. Maker execution closes at most 44% of the gap to break-even on a
+strategy that is -0.227%. It is necessary but nowhere near sufficient, so it
+should not be built for this strategy's sake. It becomes worth doing once
+something is close enough to zero for 0.10% to matter.
+
+### Universe breadth: refuted
+
+The argument was that ranking among 3-5 names is not selection. The
+measurement says widening the universe makes things monotonically worse:
+
+| `top_n` | Trades | Expectancy (frictionless) | Expectancy (base) | Monthly t |
+| ---: | ---: | ---: | ---: | ---: |
+| **10** | 6,695 | **+0.107%** | **-0.145%** | -1.88 |
+| 15 | 8,762 | +0.107% | -0.164% | -2.06 |
+| 20 | 9,142 | +0.069% | -0.194% | -2.29 |
+| 30 | 9,145 | +0.068% | -0.195% | -2.30 |
+
+Worse before costs as well as after, so this is not an execution story: the
+instruments added by widening are simply worse to trade. `universe.top_n`
+stays at 10.
+
+The breadth argument was about *cross-sectional research* — having enough
+names to rank against — and that remains true for offline panel studies,
+which can use a wider symbol set without touching live configuration. It does
+not transfer to the directional strategy, and applying it on the strength of
+the argument would have made the agent worse.
+
 ## Part D — What to do
 
 **Start recording.** `research/record_flow.py` captures order-book depth and
@@ -238,13 +308,15 @@ The data does not exist until it is collected, and it cannot be backfilled at
 any price. In three months there is enough to test the long/short hypothesis
 properly; in a year, enough to test order-book imbalance the way it deserves.
 
-**Widen the universe** — `universe.top_n` from 10 to 20-30. Costs API calls,
-materially improves every cross-sectional test.
+**Do not widen the universe.** Tested in Part C2 and refuted: `top_n` 10 to
+30 makes expectancy monotonically worse, before costs as well as after.
+Keeping it at 10.
 
-**Cost the maker redesign** before building it. The question is not whether
-0.06% helps — it obviously does — but whether adverse selection on resting
-orders costs more than the fee saved, and whether an unprotected fill window
-is acceptable. That is a design study, not a code change.
+**Do not build the maker redesign for this strategy.** Also tested in Part
+C2. The fee saving is real but bounded at ~+0.10%, it turns negative if fills
+require more than ~10 bps of penetration, and even the most optimistic case
+leaves expectancy at -0.128%. Revisit it when something is close enough to
+break-even that 0.10% decides the outcome.
 
 **Do not trade any of this yet.** The long/short result is one month of data
 in a market where t=2.6 has already been shown to arise from nothing.

@@ -21,6 +21,7 @@ calling an LLM.
 | `fetch_flow_data.py` | Pull OKX taker-volume and long/short-ratio history (~30 day retention) |
 | `analyse_flow.py` | Screen that data for predictive content, starting with a sign-convention check |
 | `record_flow.py` | **Long-running recorder** for order-book depth and the short-retention series |
+| `maker_study.py` | Costs the maker-execution redesign and tests the universe-breadth recommendation |
 
 ## Getting data
 
@@ -147,6 +148,13 @@ Also records two findings from screening OKX's flow data: taker-volume is
 not measure aggressor direction), while retail long/short ratio is a live
 hypothesis (+1.11% at 48h, t=2.72, per-instrument demeaned) that needs
 forward data before it means anything.
+
+Both of that report's own recommendations were then tested rather than
+applied, and both were downgraded. Maker execution saves a real but bounded
+~+0.10%, turns negative once fills require more than ~10 bps of penetration,
+and even at its most optimistic leaves expectancy at -0.128%. Widening
+`universe.top_n` from 10 to 30 made expectancy monotonically *worse*, before
+costs as well as after, so it was not applied.
 
 ### `results/phase1-v2-backtest-2025-2026/` — the earlier result
 
