@@ -355,8 +355,11 @@ def cmd_check(args, cfg) -> int:
             if ok:
                 try:
                     from agent.brain import LLM
-                    model = LLM(cfg).preflight()
-                    print(f"  LLM access OK ({model})")
+                    llm = LLM(cfg)
+                    model = llm.preflight()
+                    # Showing the endpoint makes a mis-set OPENAI_BASE_URL
+                    # obvious instead of silently routing to the wrong host.
+                    print(f"  LLM access OK ({model}) via {llm.endpoint()}")
                 except Exception as e:
                     print(f"  LLM CHECK FAILED: {e}")
                     ok = False

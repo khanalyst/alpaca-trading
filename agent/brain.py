@@ -56,6 +56,14 @@ MARKET SNAPSHOT FIELD REFERENCE
 The special _market_context object summarizes BTC as the market benchmark: \
 its explicit regime, ATR ratio, relative volume and one-hour momentum. Use \
 that context to distinguish a market-wide move from an isolated symbol move.
+It also reports instruments_scanned, instruments_with_a_valid_setup and \
+setup_breadth_pct: how many instruments satisfy a setup contract this cycle. \
+Breadth is a warning, not an opportunity. When most of the universe qualifies \
+at once, those setups are one correlated market move wearing many hats, and \
+measured over two years they performed markedly worse than setups that \
+appeared while the rest of the universe was quiet. High breadth means demand \
+more from each candidate and prefer taking fewer, or none; low breadth means \
+the setup is genuinely idiosyncratic.
 Each symbol in the snapshot carries these fields:
 - price: last traded price in USDT.
 - chg_24h_pct: percent price change over the last 24 hours.
@@ -497,14 +505,43 @@ class LLM:
     # ----------------------------------------------------------- public
 
     def preflight(self) -> str:
-        """Verify API-key access to the configured model without generating."""
+        """Verify API-key access to the configured model.
+
+        Prefer the metadata endpoint because it costs nothing. Gateways that
+        serve an OpenAI-compatible surface without implementing `/models`
+        (Azure AI Foundry among them) would otherwise fail this check while
+        being perfectly able to run the agent, so fall back to the smallest
+        possible generation. A wrong key or an unavailable deployment still
+        fails - it just fails on the call that actually matters.
+        """
         model = self.cfg["model"]
-        if self.provider == "anthropic":
-            info = self.client.models.retrieve(model_id=model)
-        else:
-            info = self.client.models.retrieve(model=model)
-        return str(getattr(info, "id", None)
-                   or getattr(info, "display_name", None) or model)
+        try:
+            if self.provider == "anthropic":
+                info = self.client.models.retrieve(model_id=model)
+            else:
+                info = self.client.models.retrieve(model=model)
+            return str(getattr(info, "id", None)
+                       or getattr(info, "display_name", None) or model)
+        except Exception as metadata_error:
+            try:
+                if self.provider == "anthropic":
+                    self.client.messages.create(
+                        model=model, max_tokens=1,
+                        messages=[{"role": "user", "content": "ping"}])
+                else:
+                    self.client.chat.completions.create(
+                        model=model, max_completion_tokens=1,
+                        messages=[{"role": "user", "content": "ping"}])
+            except Exception as generate_error:
+                raise RuntimeError(
+                    f"{model} is not reachable. Metadata lookup said: "
+                    f"{metadata_error}. A minimal generation said: "
+                    f"{generate_error}") from generate_error
+            return f"{model} (generation probe; /models not served)"
+
+    def endpoint(self) -> str:
+        """The base URL actually in use, so `check` can show it."""
+        return str(getattr(self.client, "base_url", "provider default"))
 
     @staticmethod
     def _user_message(snapshot: dict, portfolio: dict, max_new: int) -> str:

@@ -22,6 +22,7 @@ calling an LLM.
 | `analyse_flow.py` | Screen that data for predictive content, starting with a sign-convention check |
 | `record_flow.py` | **Long-running recorder** for order-book depth and the short-retention series |
 | `maker_study.py` | Costs the maker-execution redesign and tests the universe-breadth recommendation |
+| `selection_study.py` | Trade-management overlays, candidate-selection rules and skip filters |
 
 ## Getting data
 
@@ -155,6 +156,22 @@ applied, and both were downgraded. Maker execution saves a real but bounded
 and even at its most optimistic leaves expectancy at -0.128%. Widening
 `universe.top_n` from 10 to 30 made expectancy monotonically *worse*, before
 costs as well as after, so it was not applied.
+
+### `results/selection-and-management/` — which trades to take, and how to run them
+
+Given no directional edge, the remaining levers are *which* candidate to take
+when several fire and *how* to manage the position. Trade-management overlays
+were all neutral or harmful — a 2-ATR trailing stop raises the stop-out rate
+from 65% to 91%, and taking half off at +1.5R lifts the win rate from 30% to
+37% while making expectancy worse. The shipped selection ordering (breakout
+first, then relative volume) beat all seven alternatives tested and beats
+no-selection by +0.099% per trade.
+
+The one new finding: **signal breadth**. When 5+ instruments qualify at once
+they are one market-wide move wearing many hats, and those trades are 0.185%
+per trade worse than setups appearing while the rest of the universe is quiet
+— confirmed with the same sign in both walk-forward halves. `_market_context`
+now reports it as information for the analyst layer.
 
 ### `results/phase1-v2-backtest-2025-2026/` — the earlier result
 

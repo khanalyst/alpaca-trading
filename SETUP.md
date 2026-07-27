@@ -166,6 +166,67 @@ This costs real money **even in demo mode** — the AI calls are real. See
 4. In `config.yaml`, set `llm.provider: openai` and `llm.model` to a model
    you have access to (e.g. `gpt-4.1`).
 
+### 2.3 Option C — Azure AI Foundry (for `gpt-5.6-terra`)
+
+Azure serves OpenAI models through your own Azure subscription instead of
+through OpenAI directly. The agent talks to it with the same OpenAI client —
+you point that client at Azure's address and give it Azure's key. This is the
+option to use if `config.yaml` says `model: gpt-5.6-terra`.
+
+You need an Azure subscription with billing enabled before you start.
+
+1. Go to **https://ai.azure.com** and sign in with your Azure account.
+2. Create a project if you don't have one: **+ Create** → give it any name →
+   pick a region → **Create**. Azure makes a "resource" behind the project;
+   that resource's name becomes part of your address in step 6.
+3. In the left sidebar click **Model catalog**.
+4. Search for **`gpt-5.6-terra`**. Click it, then click **Deploy**.
+5. On the deploy dialog, note the **Deployment name**. Keep it exactly
+   `gpt-5.6-terra` — the agent sends this name as the model, so if you rename
+   it here you must use the new name in `config.yaml`. Click **Deploy** and
+   wait for the status to reach *Succeeded* (usually under a minute).
+6. Open the deployment and find the **Endpoint** panel. Copy two things:
+   - the **API key** (a long string of letters and numbers — *not* an
+     `sk-...` key);
+   - the **endpoint URL**, which looks like
+     `https://YOUR-RESOURCE.services.ai.azure.com/`.
+7. In Step 5 you will put these in `.env`:
+
+   ```
+   OPENAI_API_KEY=<the Azure API key from step 6>
+   OPENAI_BASE_URL=https://YOUR-RESOURCE.services.ai.azure.com/openai/v1
+   ```
+
+   Note the **`/openai/v1`** on the end. Azure's page shows the address
+   without it; the agent needs the OpenAI-compatible path, so add it
+   yourself. No trailing slash after `v1`.
+8. In `config.yaml`, make sure:
+
+   ```yaml
+   llm:
+     provider: openai          # Azure speaks the OpenAI protocol
+     model: gpt-5.6-terra      # must match the deployment name from step 5
+   ```
+
+   Leave `temperature` as it is — the agent detects that GPT-5.x models
+   reject it and stops sending it automatically.
+
+**Check it worked.** After Step 5, `python main.py check` prints the address
+it actually used:
+
+```
+LLM access OK (gpt-5.6-terra) via https://your-resource.services.ai.azure.com/openai/v1/
+```
+
+If that line shows `https://api.openai.com/v1/`, your `OPENAI_BASE_URL` isn't
+being read — it's misspelled, or still commented out with a `#`.
+
+> **Billing lives in Azure, not OpenAI.** Costs appear on your Azure bill
+> under the resource from step 2. Set a budget alert in the Azure portal
+> (**Cost Management → Budgets**) before leaving the agent running; a
+> 5-minute cycle is 288 calls a day and it does not pause itself when the
+> bill grows.
+
 ---
 
 ## Step 3 — Choose the machine it runs on
@@ -245,6 +306,33 @@ On whichever machine you chose, open a terminal and run these one at a time.
    (No git? Download the ZIP from the GitHub page and unzip it, then `cd`
    into the folder.)
 
+2b. **Switch to the branch you actually want to run.** A fresh clone gives you
+   the repository's default branch, which is not necessarily where the latest
+   work is. The current development branch is **`codex/main-hardening-v2`**:
+
+   ```bash
+   git fetch origin
+   git checkout codex/main-hardening-v2
+   ```
+
+   Confirm you are on it, and that nothing local is half-edited:
+
+   ```bash
+   git status
+   ```
+
+   The first line should read `On branch codex/main-hardening-v2` and the
+   rest should say the tree is clean. To see every branch available:
+
+   ```bash
+   git branch -r
+   ```
+
+   Any of them can be checked out the same way — replace the branch name in
+   the `git checkout` line above. Whenever you switch branches, re-run the
+   install in the next step: a branch can pin different library versions, and
+   `config.yaml` can differ between branches too.
+
 3. Create a virtual environment — a private Python sandbox for this project:
 
    ```bash
@@ -297,6 +385,11 @@ OKX_API_PASSPHRASE=your-demo-passphrase
 # From Step 2 — fill in ONLY the provider you chose
 ANTHROPIC_API_KEY=sk-ant-...
 # OPENAI_API_KEY=sk-...
+
+# Only if you chose Azure AI Foundry (Step 2.3): the Azure key goes in
+# OPENAI_API_KEY above, and this line points the client at Azure.
+# Must end in /openai/v1 with no trailing slash.
+# OPENAI_BASE_URL=https://YOUR-RESOURCE.services.ai.azure.com/openai/v1
 
 # Optional in demo; mandatory before mode: live
 # ALERT_WEBHOOK_URL=https://hooks.example/...
@@ -800,3 +893,117 @@ agent.
 Continue at [Step 8 — Keep it running 24/7](#step-8--keep-it-running-247).
 Note that a laptop only trades while it's awake: closing the lid stops the
 decision loop (open positions keep their exchange-side stops either way).
+
+### A.9 Picking a branch in VS Code
+
+VS Code shows the current branch in the **bottom-left corner of the status
+bar** — it looks like `⑂ main`. That indicator is the fastest way to know
+what you are about to run.
+
+To switch:
+
+1. Click the branch name in the status bar.
+2. A list drops down from the top. Pick the branch you want — for the current
+   development work, **`origin/codex/main-hardening-v2`**.
+3. VS Code checks it out and the status bar updates.
+
+If the branch you want isn't listed, VS Code hasn't seen it yet. Click the
+**⟳ refresh** icon in the Source Control panel (or run `git fetch origin` in
+the terminal), then try again.
+
+> After switching branches, always re-run
+> `./.venv/bin/pip install -r requirements.lock.txt`. Different branches can
+> pin different library versions, and running new code against old libraries
+> produces confusing errors that look like bugs.
+
+### A.10 Re-running the agent after anything changes in git
+
+**The agent reads its code and `config.yaml` once, at startup.** Editing a
+file, pulling a change, or switching branches while it runs changes nothing —
+the running process keeps using what it loaded when it started. You have to
+stop it and start it again.
+
+This is deliberate: a trading loop that silently swapped its own rules
+mid-flight would make its own journal impossible to trust.
+
+**The safe restart, every time:**
+
+1. **Click into the terminal panel running the agent and press `Ctrl+C`.**
+
+   Ctrl+C is treated as a pause, not a crash: the process exits cleanly, the
+   state becomes `PAUSED`, and any open positions keep their stop-loss and
+   take-profit orders on OKX's servers. It is safe to do this at any moment.
+
+2. **Get the new code.**
+
+   ```bash
+   git pull origin codex/main-hardening-v2
+   ```
+
+   Or, if you edited files yourself and want to keep those edits, commit them
+   first via the Source Control panel, then pull.
+
+   If git refuses with *"Your local changes would be overwritten"*, you have
+   uncommitted edits in a file the update also touches. Either commit them, or
+   discard them by clicking the **↩ Discard Changes** arrow next to the file in
+   the Source Control panel.
+
+3. **Re-install libraries if `requirements.lock.txt` changed.** Cheap to run
+   regardless — it does nothing when nothing changed:
+
+   ```bash
+   ./.venv/bin/pip install -r requirements.lock.txt
+   ```
+
+4. **Re-run the check.** This is the step people skip and regret. A pulled
+   change can rename a config field, and the agent refuses to start on an
+   unknown one rather than guessing:
+
+   ```bash
+   ./.venv/bin/python main.py check
+   ```
+
+5. **Start it again.**
+
+   ```bash
+   ./.venv/bin/python main.py run
+   ```
+
+   It picks up its own state file, so it knows what it already holds and
+   which symbols are in cooldown. You are not starting from scratch.
+
+**If `check` fails after a pull**, read the message before changing anything.
+`config.yaml has unknown field(s): X` means a setting was renamed — the new
+name is in `config.yaml` in the repository and in this guide. Copy your
+values across rather than reverting the pull.
+
+**One extra step if you were paused deliberately.** `Ctrl+C` pauses do not
+stick — the next `run` resumes trading. But if you had run
+`main.py pause` yourself, that *does* survive a restart, and you must run
+`./.venv/bin/python main.py resume` before it will open anything new.
+
+**If the agent had self-killed** on max drawdown, a plain `run` refuses to
+start. That is the safety catch working. Review what happened first, then:
+
+```bash
+./.venv/bin/python main.py run --acknowledge-kill
+```
+
+**Running under systemd instead of a terminal?** Steps 2–4 are the same, then
+restart the service rather than typing `run`:
+
+```bash
+sudo systemctl restart okx-trader
+sudo journalctl -u okx-trader -f      # watch it come back up
+```
+
+**A quick habit worth forming.** Before every restart, run:
+
+```bash
+git log --oneline -5
+```
+
+Five lines telling you what changed since last time. If a commit message
+mentions `config.yaml`, risk limits, or the strategy contract, read the diff
+in the Source Control panel before you let it trade — those are the changes
+that alter what the agent does with your money.
