@@ -18,6 +18,9 @@ calling an LLM.
 | `validate_candidate.py` | Adversarial tests on a surviving candidate, including a placebo control |
 | `unbiased_recheck.py` | Timestamp-paired re-test that removes pooled-threshold time-selection bias |
 | `make_legacy_dataset.py` | Adapt an `edge_lab` dataset into the layout `phase1_v2_backtest.py` expects |
+| `fetch_flow_data.py` | Pull OKX taker-volume and long/short-ratio history (~30 day retention) |
+| `analyse_flow.py` | Screen that data for predictive content, starting with a sign-convention check |
+| `record_flow.py` | **Long-running recorder** for order-book depth and the short-retention series |
 
 ## Getting data
 
@@ -81,6 +84,19 @@ Stages: `forward` (raw directional information, no exit overlay), `baseline`
 `oracle` (selector headroom), `power` (how long a demo must run to prove
 anything), `portfolio`.
 
+## Recording data that OKX deletes
+
+The candle search failed structurally: 15m OHLCV cannot contain order-book
+state or aggressor direction. Those series are either never served
+historically (order book) or deleted within 30-97 days. Start the recorder and
+the constraint stops getting worse:
+
+```bash
+nohup python research/record_flow.py --out runtime/research/recorded &
+```
+
+Roughly 20 MB/month, day-partitioned, deduplicated, restart-safe.
+
 Generated CSV/JSON goes under `runtime/research/` and stays ignored by Git.
 Only deliberately reviewed compact reports belong under `research/results/`.
 
@@ -118,6 +134,19 @@ nothing**. Any future candidate must clear that bar.
 What did survive is a parameter result: a 48h maximum hold beat 24h in 8/8
 matched walk-forward cells, and a 3R target beat 2R in 4/4 at that hold.
 Both are applied in `config.yaml`.
+
+### `results/edge-discovery-method/` — how to recognise an edge, and where to look
+
+The methodology write-up. Six tests any candidate must pass, the measured
+noise floor (**t>2 arises routinely from nothing on this data**), and a ranked
+list of where an edge could plausibly live: execution cost first, then data
+that OHLCV cannot contain, then breadth, then the LLM.
+
+Also records two findings from screening OKX's flow data: taker-volume is
+**rejected** (correlation with the same hour's return is +0.006, so it does
+not measure aggressor direction), while retail long/short ratio is a live
+hypothesis (+1.11% at 48h, t=2.72, per-instrument demeaned) that needs
+forward data before it means anything.
 
 ### `results/phase1-v2-backtest-2025-2026/` — the earlier result
 
