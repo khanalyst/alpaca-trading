@@ -38,7 +38,16 @@ strategy:
   hard_max_entry_extension_atr: 2.5  # extreme no-chase safety boundary
   breakout_range_threshold_pct: 85
   breakout_min_relative_volume: 1.0
-  funding_extreme_pct: 0.03
+  # Absolute funding floor for the funding_squeeze setup, expressed as an
+  # 8h-EQUIVALENT rate: a 4h contract's rate is doubled before comparison so
+  # instruments on different settlement cadences face the same economic bar.
+  # 0.01 is where OKX routinely clamps funding on liquid instruments, so it
+  # marks "funding is pinned at its practical limit". The relative test
+  # (funding_percentile_30) is what decides "extreme for THIS instrument";
+  # this value only filters out near-zero funding. The previous 0.03 raw
+  # per-interval threshold was never reached on BTC, ETH, XRP or DOGE in 97
+  # days of settlements, which made the setup unreachable on liquid symbols.
+  funding_extreme_pct_per_8h: 0.01
   fixed_reward_risk: 2.0
   extended_reward_risk: 3.0
 
@@ -67,7 +76,13 @@ risk:
   risk_per_trade_pct: 1.5        # max all-in equity loss at the stop
   experimental_risk_per_trade_pct: 0.5  # demo-only "other" setup budget
   max_total_open_risk_pct: 3.0   # sum of planned stop losses across the book
-  max_position_notional_pct: 40  # per-position notional cap, % of equity
+  # Per-position notional cap, % of equity. This also sets margin usage at a
+  # full book: max_concurrent_positions x this / entry_leverage must stay at
+  # or below 80% of max_margin_usage_pct, or any unrealized loss on a full
+  # book trips the margin guard and force-closes the largest position.
+  # Here: 3 x 30 / 2 = 45%, against a 60% guard, so the book can lose ~25%
+  # before the guard engages. Config validation enforces this.
+  max_position_notional_pct: 30
   max_gross_exposure_pct: 150    # total notional across all positions, % of equity
   max_net_direction_pct: 100     # cap on |long minus short| notional, % of equity.
                                  # Kept separately from measured BTC beta.

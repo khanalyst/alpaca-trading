@@ -372,7 +372,10 @@ class Contract:
     """Tunable copy of the phase1-v2 evidence contract and stop/target rules."""
     breakout_range_threshold_pct: float = 85.0
     breakout_min_relative_volume: float = 1.0
-    funding_extreme_pct: float = 0.03
+    # 8h-equivalent, matching agent/strategy.py after the interval-
+    # normalization fix. Kept in sync deliberately: validate_features.py
+    # compares these masks against the authoritative implementation.
+    funding_extreme_pct_per_8h: float = 0.01
     hard_max_entry_extension_atr: float = 2.5
     min_stop_atr_multiple: float = 1.0
     structure_buffer_atr_multiple: float = 0.15
@@ -436,15 +439,23 @@ def evidence_masks(df: pd.DataFrame, c: Contract) -> dict[str, np.ndarray]:
         (t1h == "down") & (t4h == "down") & (t15 != "up")
         & (mom < 0) & (fast_mom < 0))
 
+    # Normalize funding to an 8h equivalent before the absolute test, so a 4h
+    # contract is not held to a bar twice as strict in economic terms.
+    interval = df["funding_interval_hours"].to_numpy(float)
+    interval = np.where(np.isnan(interval) | (interval <= 0), 8.0, interval)
+    funding_8h = funding * (8.0 / interval)
+
     squeeze_ctx = (
         (f_samples >= 10) & ~np.isnan(f_pct) & ~np.isnan(basis)
         & ~np.isnan(oi) & (oi > 0))
     squeeze_long = (
-        ~np.isnan(funding) & (funding <= -c.funding_extreme_pct) & squeeze_ctx
+        ~np.isnan(funding_8h)
+        & (funding_8h <= -c.funding_extreme_pct_per_8h) & squeeze_ctx
         & (f_pct <= 25) & (basis <= 0) & (t1h != "down")
         & df["price_stabilized_long"].to_numpy(bool) & (fast_mom > 0))
     squeeze_short = (
-        ~np.isnan(funding) & (funding >= c.funding_extreme_pct) & squeeze_ctx
+        ~np.isnan(funding_8h)
+        & (funding_8h >= c.funding_extreme_pct_per_8h) & squeeze_ctx
         & (f_pct >= 75) & (basis >= 0) & (t1h != "up")
         & df["price_stabilized_short"].to_numpy(bool) & (fast_mom < 0))
 

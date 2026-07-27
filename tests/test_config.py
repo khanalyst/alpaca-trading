@@ -18,6 +18,50 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "exactly 'demo' or 'live'"):
             validate_config(cfg)
 
+    def test_full_book_may_not_sit_on_top_of_the_margin_guard(self):
+        # 3 positions x 40% notional / 2x leverage = 60% initial margin, which
+        # is exactly max_margin_usage_pct. Any unrealized loss then trips the
+        # guard and force-closes the largest position for configuration
+        # reasons rather than strategy ones.
+        cfg = valid_config()
+        cfg["risk"]["max_position_notional_pct"] = 40
+        with self.assertRaisesRegex(ConfigError, "no safe headroom"):
+            validate_config(cfg)
+
+    def test_shipped_full_book_margin_keeps_headroom(self):
+        cfg = validate_config(valid_config())
+        risk = cfg["risk"]
+        full_book = (risk["max_concurrent_positions"]
+                     * risk["max_position_notional_pct"]
+                     / risk["entry_leverage"])
+        self.assertLessEqual(full_book, risk["max_margin_usage_pct"] * 0.8)
+
+    def test_margin_headroom_can_be_bought_with_fewer_positions(self):
+        # The same 40% notional is safe with a smaller book, so the rule
+        # constrains the product and not one parameter in isolation.
+        cfg = valid_config()
+        cfg["risk"]["max_position_notional_pct"] = 40
+        cfg["risk"]["max_concurrent_positions"] = 2
+        self.assertEqual(
+            validate_config(cfg)["risk"]["max_concurrent_positions"], 2)
+
+    def test_margin_headroom_can_be_bought_with_a_higher_guard(self):
+        cfg = valid_config()
+        cfg["risk"]["max_position_notional_pct"] = 40
+        cfg["risk"]["max_margin_usage_pct"] = 75
+        self.assertEqual(
+            validate_config(cfg)["risk"]["max_margin_usage_pct"], 75)
+
+    def test_renamed_funding_threshold_rejects_the_stale_key(self):
+        # The threshold changed meaning from a raw per-interval rate to an
+        # 8h-equivalent one. A stale key must fail loudly rather than be
+        # silently reinterpreted as a much stricter bar.
+        cfg = valid_config()
+        del cfg["strategy"]["funding_extreme_pct_per_8h"]
+        cfg["strategy"]["funding_extreme_pct"] = 0.03
+        with self.assertRaisesRegex(ConfigError, "unknown field"):
+            validate_config(cfg)
+
     def test_unsafe_leverage_is_rejected(self):
         cfg = valid_config()
         cfg["risk"]["max_leverage"] = 11

@@ -316,16 +316,25 @@ overrides a cap. It is an idea generator inside hard, code-enforced rails.
   it already holds.** If 3 are open, it can only close or hold until a slot
   frees up.
 - **Total risk/size is capped five ways regardless of count:** each position is
-  at most `max_position_notional_pct` of equity (default 40%), the whole book
+  at most `max_position_notional_pct` of equity (default 30%), the whole book
   is at most `max_gross_exposure_pct` of equity (default 150%), and the *net
   direction* (long notional minus short notional) is at most
   `max_net_direction_pct` of equity (default 100%), planned all-in stop risk
   is at most `max_total_open_risk_pct` (default 3%), and signed BTC-beta
   exposure is capped at `max_btc_beta_exposure_pct` (default 100%).
 
-So the maximum book is 3 positions, each on a different symbol, each ≤40% of
+So the maximum book is 3 positions, each on a different symbol, each ≤30% of
 equity, ≤150% total notional, ≤3% planned stop risk, ≤100% net direction and
 ≤100% BTC-beta-weighted exposure.
+
+That 30% is not arbitrary. Per-position initial margin is
+`max_position_notional_pct / entry_leverage`, so a full book uses
+`max_concurrent_positions ×` that much. At 3 × 30% ÷ 2 = 45% against a 60%
+`max_margin_usage_pct`, the book can lose about a quarter of its value before
+the margin guard starts force-closing positions. Config validation rejects any
+combination that leaves less than 20% headroom, because without it any
+unrealized loss on a full book would trip the guard and close the largest
+position for arithmetic reasons rather than strategy ones.
 
 ---
 
@@ -376,6 +385,8 @@ API keys; the mode must match the keys in `.env`.
 | `min_stop_atr_multiple` | 1.0 | Minimum deterministic stop width |
 | `structure_buffer_atr_multiple` | 0.15 | Buffer added beyond the selected swing invalidation |
 | `hard_max_entry_extension_atr` | 2.5 | Absolute no-chase boundary from the 1h EMA20 |
+| `breakout_range_threshold_pct` / `breakout_min_relative_volume` | 85 / 1.0 | Minimum 24h range position and participation for a `range_breakout` |
+| `funding_extreme_pct_per_8h` | 0.01 | Absolute funding floor for `funding_squeeze`, as an **8h-equivalent** rate: a 4h contract's rate is doubled before comparison. Whether funding is extreme *for that instrument* is decided by `funding_percentile_30`; this only screens out near-zero funding |
 | `fixed_reward_risk` / `extended_reward_risk` | 2.0 / 3.0 | Code-derived target multiples selected through the model's exit policy |
 
 **Change how aggressive it is (`risk:` sizing)**
@@ -387,7 +398,7 @@ API keys; the mode must match the keys in `.env`.
 | `risk_per_trade_pct` | 1.5 | Maximum expected equity loss at a stop, including configured costs |
 | `experimental_risk_per_trade_pct` | 0.5 | Smaller budget for demo-only `other` setups, attributed as `momentum-experimental` |
 | `max_total_open_risk_pct` | 3.0 | Cap on the sum of planned all-in stop losses across held positions |
-| `max_position_notional_pct` | 40 | Per-position notional cap, % of equity |
+| `max_position_notional_pct` | 30 | Per-position notional cap, % of equity. With `entry_leverage` and `max_concurrent_positions` it also sets full-book margin usage, which validation keeps ≤80% of `max_margin_usage_pct` |
 | `max_gross_exposure_pct` | 150 | Whole-book notional cap, % of equity |
 | `max_net_direction_pct` | 100 | Cap on net long-minus-short notional, % of equity |
 | `max_btc_beta_exposure_pct` | 100 | Cap on signed BTC-beta-weighted notional; insufficient histories conservatively use beta 1 |
@@ -448,11 +459,16 @@ three times; exhausted messages are stored in
 > 15%, and positions below ~$10 notional are skipped.
 >
 > **Know your *effective* risk per trade.** Sizing takes the *minimum* of
-> three caps, so `risk_per_trade_pct` is a ceiling, not a promise: with a
-> typical 1.5–2% stop, the 40% per-position notional cap binds first and the
-> actual loss on a stop-out is ~0.6–0.8% of equity, not 1.5%. The risk
-> target only fully binds for stops wider than ~3.75%
-> (= risk 1.5 ÷ cap 0.40). After an order-book rejection, the model may choose
+> several caps, so `risk_per_trade_pct` is a ceiling, not a promise: with a
+> typical 1–2% stop, the 30% per-position notional cap binds first and the
+> actual loss on a stop-out is ~0.5–0.8% of equity, not 1.5%. The risk
+> target only fully binds for stops wider than ~5%
+> (= risk 1.5 ÷ cap 0.30). You do not have to work this out yourself — every
+> entry records `sizing_constraint` (which cap actually decided the size) and
+> `effective_risk_pct_equity` (what the trade really risks), and both appear
+> in the `OPENED` log line and the journal. If `sizing_constraint` is not
+> `risk_per_trade_budget`, raising `risk_per_trade_pct` alone will change
+> nothing. After an order-book rejection, the model may choose
 > `retry_smaller`; code—not the model—calculates the permitted reduced size.
 
 ---

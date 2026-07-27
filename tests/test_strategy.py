@@ -157,6 +157,70 @@ class StrategyContractTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIsNotNone(plan)
 
+    def test_funding_threshold_is_normalized_to_an_eight_hour_equivalent(self):
+        """A 4h contract charges the same rate twice as often as an 8h one.
+
+        Comparing raw per-interval rates would hold the 4h contract to a bar
+        twice as strict in economic terms, which is what made the setup
+        unreachable on liquid instruments.
+        """
+        cfg = valid_config()
+        threshold = cfg["strategy"]["funding_extreme_pct_per_8h"]
+        half = -threshold / 2
+
+        # Half the threshold on a 4h contract is exactly the threshold per 8h.
+        evidence = strategy.setup_evidence(
+            snapshot(funding_rate_pct=half,
+                     funding_interval_hours=4,
+                     funding_percentile_30=10,
+                     perp_index_basis_pct=-0.1,
+                     mom_15m_pct=0.2,
+                     price_stabilized_long=True),
+            cfg)
+        self.assertTrue(evidence["funding_squeeze"]["long"])
+        self.assertAlmostEqual(
+            evidence["funding_8h_equivalent_pct"], -threshold, places=6)
+
+        # The identical raw rate on an 8h contract is only half as extreme.
+        evidence = strategy.setup_evidence(
+            snapshot(funding_rate_pct=half,
+                     funding_interval_hours=8,
+                     funding_percentile_30=10,
+                     perp_index_basis_pct=-0.1,
+                     mom_15m_pct=0.2,
+                     price_stabilized_long=True),
+            cfg)
+        self.assertFalse(evidence["funding_squeeze"]["long"])
+
+    def test_unknown_funding_interval_is_treated_as_eight_hours(self):
+        cfg = valid_config()
+        threshold = cfg["strategy"]["funding_extreme_pct_per_8h"]
+        for interval in (None, 0, -4):
+            evidence = strategy.setup_evidence(
+                snapshot(funding_rate_pct=-threshold,
+                         funding_interval_hours=interval,
+                         funding_percentile_30=10,
+                         perp_index_basis_pct=-0.1,
+                         mom_15m_pct=0.2,
+                         price_stabilized_long=True),
+                cfg)
+            self.assertTrue(
+                evidence["funding_squeeze"]["long"],
+                f"interval {interval!r} should fall back to 8h, not scale")
+
+    def test_funding_threshold_is_reachable_on_liquid_instruments(self):
+        """Guard the regression this fix was made for.
+
+        OKX clamps funding on liquid perpetuals at about 0.01% per 8h. A
+        threshold above that makes funding_squeeze dead code on every major,
+        which is what the shipped 0.03 raw value did.
+        """
+        threshold = valid_config()["strategy"]["funding_extreme_pct_per_8h"]
+        self.assertLessEqual(
+            threshold, 0.01,
+            "threshold exceeds the rate OKX clamps liquid perps at, so the "
+            "funding_squeeze setup could never fire on BTC/ETH/XRP/DOGE")
+
     def test_experimental_setup_is_demo_only(self):
         cfg = valid_config()
         cfg["mode"] = "live"

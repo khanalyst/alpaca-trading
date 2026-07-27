@@ -67,8 +67,12 @@ Treat it as an immediate execution cost; a wide spread lowers net reward.
 median one-hour volume of the preceding sample. Above 1 means participation \
 is elevated; below 1 means the move has weak participation.
 - funding_rate_pct: current funding rate as a percent per funding interval. \
-Positive means longs pay shorts; negative means shorts pay longs. Values \
-beyond roughly +/-0.05% per interval are strong crowd-positioning signals.
+Positive means longs pay shorts; negative means shorts pay longs. Compare \
+rates across symbols only after scaling to a common cadence: a 4h contract \
+charges the same rate twice as often as an 8h one. OKX clamps funding on \
+liquid perpetuals near 0.01% per 8h, so on majors a rate pinned at that \
+level already is the extreme; percent-level readings appear only on thin or \
+newly listed instruments.
 - funding_interval_hours / next_funding_minutes: the current settlement \
 cadence and time until the next charge. Do not assume every contract always \
 uses an eight-hour interval.
@@ -118,7 +122,9 @@ only when the latest completed signal candle closes beyond the preceding \
 that price stopped extending the adverse extreme and closed back in the \
 potential squeeze direction.
 - setup_evidence: minimum deterministic evidence contracts for recognised setup \
-types, plus directional EMA extension in ATR and the hard no-chase boundary.
+types, plus directional EMA extension in ATR, the hard no-chase boundary, and \
+the 8h-equivalent funding rate the squeeze contract actually compared against \
+its threshold.
 - regime: deterministic description of the current data: trend_up, \
 trend_down, high_volatility, choppy, or transition. It is context, not a \
 command; decide whether the setup fits it.

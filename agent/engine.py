@@ -1483,9 +1483,13 @@ class Engine:
         if persistence_error is not None:
             raise persistence_error
         log.info("OPENED %s %s | notional %.0f USDT | %.1fx | SL %.2f%% "
-                 "all-in risk %.2f%% | TP %.2f%% | conf %.2f | %s",
+                 "all-in risk %.2f%% | equity at risk %.2f%% (sized by %s) | "
+                 "TP %.2f%% | conf %.2f | %s",
                  plan["direction"].upper(), symbol, actual_notional,
                  plan["leverage"], plan["sl_pct"], estimated_loss_pct,
+                 risk_usd / plan["entry_equity_usd"] * 100.0
+                 if plan.get("entry_equity_usd") else float("nan"),
+                 plan.get("sizing_constraint", "unknown"),
                  plan["tp_pct"],
                  plan["confidence"], plan["reason"])
         return True

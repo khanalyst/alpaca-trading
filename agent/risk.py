@@ -250,22 +250,35 @@ class RiskEngine:
         risk_usd = equity * risk_pct / 100.0
         notional = risk_usd / (estimated_loss_pct / 100.0)
 
+        # Track which limit actually decides the size. risk_per_trade_pct is a
+        # ceiling, not a promise: for any stop narrower than
+        # risk_per_trade_pct / max_position_notional_pct the notional cap binds
+        # first and the real loss at the stop is smaller than the configured
+        # budget. Recording the binding constraint keeps that visible in the
+        # journal instead of leaving operators to infer it from the numbers.
+        sizing_constraint = "risk_per_trade_budget"
+
         # Per-position cap.
-        notional = min(notional,
-                       equity * float(self.r["max_position_notional_pct"]) / 100.0)
+        notional_cap = (
+            equity * float(self.r["max_position_notional_pct"]) / 100.0)
+        if notional_cap < notional:
+            sizing_constraint = "max_position_notional_pct"
+            notional = notional_cap
 
         if retry_margin_pct is not None:
-            notional = min(
-                notional,
-                equity * retry_margin_pct / 100.0 * leverage,
-            )
+            retry_cap = equity * retry_margin_pct / 100.0 * leverage
+            if retry_cap < notional:
+                sizing_constraint = "liquidity_retry_cap"
+                notional = retry_cap
 
         # Gross exposure cap across the whole book.
         room = equity * float(self.r["max_gross_exposure_pct"]) / 100.0
         room -= gross_notional
         if room <= 0:
             return None, "gross exposure cap reached"
-        notional = min(notional, room)
+        if room < notional:
+            sizing_constraint = "max_gross_exposure_pct"
+            notional = room
 
         if notional < MIN_NOTIONAL_USD:
             return None, "resulting size too small"
@@ -280,6 +293,7 @@ class RiskEngine:
             return None, "total planned open-risk cap reached"
         candidate_risk = notional * estimated_loss_pct / 100.0
         if candidate_risk > risk_room:
+            sizing_constraint = "max_total_open_risk_pct"
             notional = risk_room / (estimated_loss_pct / 100.0)
             candidate_risk = notional * estimated_loss_pct / 100.0
         if notional < MIN_NOTIONAL_USD:
@@ -355,6 +369,13 @@ class RiskEngine:
             "per_trade_risk_budget_usd": risk_usd,
             "risk_usd": candidate_risk,
             "risk_budget_pct": risk_pct,
+            # Which cap decided the size, and what the trade actually risks as
+            # a percentage of equity. When sizing_constraint is not
+            # "risk_per_trade_budget", effective_risk_pct_equity is below the
+            # configured risk_budget_pct and raising that number alone will
+            # not change the size.
+            "sizing_constraint": sizing_constraint,
+            "effective_risk_pct_equity": candidate_risk / equity * 100.0,
             "portfolio_open_risk_usd_before": current_open_risk,
             "portfolio_open_risk_usd_after": (
                 current_open_risk + candidate_risk),

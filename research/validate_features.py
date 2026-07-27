@@ -152,6 +152,11 @@ EXACT_FIELDS = [
     "signal_1h_ts", "fresh_breakout_long", "fresh_breakout_short",
     "price_stabilized_long", "price_stabilized_short",
 ]
+# agent.market computes all of these inside one try block around the funding
+# fetch, so any funding failure nulls the whole group together.
+FUNDING_DEPENDENT_FIELDS = {
+    "funding_rate_pct", "funding_percentile_30", "perp_index_basis_pct",
+}
 
 
 def compare(symbol: str, frames: dict, data_root: Path, samples: int,
@@ -190,7 +195,20 @@ def compare(symbol: str, frames: dict, data_root: Path, samples: int,
     mismatches = []
     checked = 0
     warmup_skipped = 0
+    no_funding_skipped = 0
+    covered_from = getattr(frame, "funding_covered_from", None)
     for index in sorted(picks):
+        # OKX serves only ~97 days of funding history, so bars older than the
+        # fixture's coverage make the fake exchange raise on fetch_funding_rate.
+        # agent.market then nulls the whole funding block - including
+        # perp_index_basis_pct, which is computed inside the same try. That is
+        # correct fail-closed behaviour against a live exchange (the squeeze
+        # contract needs funding anyway), but against this fixture it would
+        # measure missing test data. Compare every other field on those bars
+        # instead of discarding 87% of the history.
+        funded = covered_from is not None and int(frame.ts[index]) >= covered_from
+        if not funded:
+            no_funding_skipped += 1
         # The live agent computes EMAs from min(available, 120) completed
         # bars once a timeframe has >= min_history_candles; the research
         # engine requires a full 120-bar window and reports None below it.
@@ -235,8 +253,9 @@ def compare(symbol: str, frames: dict, data_root: Path, samples: int,
             return False
 
         row_issues = {}
+        skip = set() if funded else FUNDING_DEPENDENT_FIELDS
         for field in EXACT_FIELDS:
-            if field not in live or field not in mine.index:
+            if field in skip or field not in live or field not in mine.index:
                 continue
             a, b = live[field], mine[field]
             if missing(a) and missing(b):
@@ -255,7 +274,7 @@ def compare(symbol: str, frames: dict, data_root: Path, samples: int,
             if a != b:
                 row_issues[field] = [a, b]
         for field in NUMERIC_FIELDS:
-            if field not in live or field not in mine.index:
+            if field in skip or field not in live or field not in mine.index:
                 continue
             a, b = live[field], mine[field]
             if missing(a) and missing(b):
@@ -273,6 +292,7 @@ def compare(symbol: str, frames: dict, data_root: Path, samples: int,
 
     return {"symbol": symbol, "checked": checked,
             "warmup_bars_skipped": warmup_skipped,
+            "outside_funding_coverage_skipped": no_funding_skipped,
             "mismatched_bars": len(mismatches),
             "examples": mismatches[:5]}
 

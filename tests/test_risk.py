@@ -242,6 +242,52 @@ class VetOpenSymbolTests(unittest.TestCase):
         self.assertEqual(plan["risk_budget_pct"], 0.5)
         self.assertAlmostEqual(plan["risk_usd"], 50)
 
+    def test_plan_reports_which_cap_actually_decided_the_size(self):
+        """risk_per_trade_pct is a ceiling, not a promise.
+
+        For any stop narrow enough, the per-position notional cap binds first
+        and the real loss at the stop is well below the configured budget.
+        The plan must say so rather than leave an operator to infer it.
+        """
+        # A tight stop wants far more notional than the position cap allows.
+        plan, why = self.risk.vet_open(
+            decision(stop_loss_pct=0.5), 10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertEqual(plan["sizing_constraint"], "max_position_notional_pct")
+        cap_pct = float(self.risk.r["max_position_notional_pct"])
+        self.assertAlmostEqual(plan["notional"], 10_000 * cap_pct / 100)
+        # Real risk is materially below the configured 1.5% budget.
+        self.assertLess(plan["effective_risk_pct_equity"],
+                        plan["risk_budget_pct"])
+        self.assertAlmostEqual(
+            plan["effective_risk_pct_equity"],
+            plan["risk_usd"] / 10_000 * 100)
+
+    def test_wide_stop_lets_the_risk_budget_bind(self):
+        # Once the stop is wide enough, risk_per_trade_pct is the real limit
+        # and the effective risk matches the configured budget.
+        plan, why = self.risk.vet_open(
+            decision(stop_loss_pct=8.0, take_profit_pct=16.0),
+            10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertEqual(plan["sizing_constraint"], "risk_per_trade_budget")
+        self.assertAlmostEqual(
+            plan["effective_risk_pct_equity"], plan["risk_budget_pct"],
+            places=6)
+
+    def test_portfolio_risk_cap_is_reported_when_it_trims_the_size(self):
+        held = [{"symbol": "ETH/USDT:USDT", "side": "long", "notional": 1_000}]
+        market = snapshot()
+        market["ETH/USDT:USDT"] = dict(market["BTC/USDT:USDT"])
+        # Leave only a sliver of the 3% portfolio risk budget unused.
+        active = {"ETH/USDT:USDT": {"risk_usd": 280.0}}
+        plan, why = self.risk.vet_open(
+            decision(stop_loss_pct=8.0, take_profit_pct=16.0),
+            10_000, held, market, {}, 1_000, active_trades=active)
+        self.assertIsNone(why)
+        self.assertEqual(plan["sizing_constraint"], "max_total_open_risk_pct")
+        self.assertAlmostEqual(plan["risk_usd"], 20.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

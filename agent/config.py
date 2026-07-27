@@ -79,7 +79,7 @@ def validate_config(raw: dict) -> dict:
         "min_stop_atr_multiple",
         "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
         "breakout_range_threshold_pct", "breakout_min_relative_volume",
-        "funding_extreme_pct", "fixed_reward_risk",
+        "funding_extreme_pct_per_8h", "fixed_reward_risk",
         "extended_reward_risk",
     }, "strategy")
     for key in ("id", "version", "signal_timeframe"):
@@ -100,7 +100,10 @@ def validate_config(raw: dict) -> dict:
     _number(strategy, "hard_max_entry_extension_atr", 0.5, 10, "strategy")
     _number(strategy, "breakout_range_threshold_pct", 50, 99, "strategy")
     _number(strategy, "breakout_min_relative_volume", 0.5, 10, "strategy")
-    _number(strategy, "funding_extreme_pct", 0, 1, "strategy")
+    # Compared against a funding rate normalized to an 8h equivalent, so an
+    # instrument settling every 4h is not held to a bar twice as strict in
+    # economic terms as one settling every 8h.
+    _number(strategy, "funding_extreme_pct_per_8h", 0, 1, "strategy")
     fixed_rr = _number(
         strategy, "fixed_reward_risk", 1, 10, "strategy")
     extended_rr = _number(
@@ -196,6 +199,37 @@ def validate_config(raw: dict) -> dict:
             "daily_loss_limit_pct")
     if float(risk["max_net_direction_pct"]) > float(risk["max_gross_exposure_pct"]):
         raise ConfigError("risk.max_net_direction_pct cannot exceed max_gross_exposure_pct")
+
+    # A fully loaded book must not sit on top of the margin guard.
+    #
+    # Initial margin per position is max_position_notional_pct / entry_leverage
+    # of equity, and the guard compares total initial margin against
+    # mark-to-market equity. If a full book already uses the whole allowance,
+    # any unrealized loss pushes usage past the threshold and the engine
+    # force-closes its largest position for margin reasons rather than
+    # strategy ones - a realized loss plus a taker round trip caused purely by
+    # configuration arithmetic.
+    #
+    # Requiring 20% headroom means the book can lose about a fifth of its
+    # value before the guard engages, because usage grows as M / (1 - loss).
+    full_book_margin_pct = (
+        int(risk["max_concurrent_positions"])
+        * float(risk["max_position_notional_pct"])
+        / int(risk["entry_leverage"])
+    )
+    margin_ceiling_pct = float(risk["max_margin_usage_pct"]) * 0.8
+    if full_book_margin_pct > margin_ceiling_pct:
+        raise ConfigError(
+            "a full book would use "
+            f"{full_book_margin_pct:.1f}% initial margin "
+            f"({risk['max_concurrent_positions']} positions x "
+            f"{float(risk['max_position_notional_pct']):g}% notional / "
+            f"{risk['entry_leverage']}x leverage), which leaves no safe "
+            f"headroom under risk.max_margin_usage_pct="
+            f"{float(risk['max_margin_usage_pct']):g}%. Keep it at or below "
+            f"{margin_ceiling_pct:.1f}% by lowering "
+            "risk.max_position_notional_pct or risk.max_concurrent_positions, "
+            "or by raising risk.max_margin_usage_pct")
 
     execution = _mapping(cfg.get("execution"), "execution")
     _keys(execution, {"slippage_guard_pct", "max_spread_pct",

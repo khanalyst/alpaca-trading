@@ -108,6 +108,16 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
     momentum = _finite(snapshot.get("mom_1h_pct"), 0.0) or 0.0
     fast_momentum = _finite(snapshot.get("mom_15m_pct"), 0.0) or 0.0
     funding = _finite(snapshot.get("funding_rate_pct"))
+    # Funding intervals differ per instrument (OKX runs 8h and 4h contracts
+    # side by side), so a raw per-interval rate is not comparable across
+    # symbols: a 4h contract charges the same rate twice as often. Normalize
+    # to an 8h equivalent before applying an absolute threshold. An unknown
+    # or nonsensical interval falls back to treating the rate as already 8h.
+    funding_interval = _finite(snapshot.get("funding_interval_hours"))
+    if funding_interval is None or funding_interval <= 0:
+        funding_interval = 8.0
+    funding_8h = (
+        funding * (8.0 / funding_interval) if funding is not None else None)
     funding_percentile = _finite(snapshot.get("funding_percentile_30"))
     funding_samples = int(
         max(0.0, _finite(snapshot.get("funding_samples_30"), 0.0) or 0.0))
@@ -115,7 +125,7 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
     open_interest = _finite(snapshot.get("open_interest_musd"))
     range_threshold = float(block["breakout_range_threshold_pct"])
     min_relative_volume = float(block["breakout_min_relative_volume"])
-    funding_extreme = float(block["funding_extreme_pct"])
+    funding_extreme = float(block["funding_extreme_pct_per_8h"])
 
     breakout_long = (
         range_position is not None
@@ -159,8 +169,8 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
         and open_interest > 0
     )
     squeeze_long = (
-        funding is not None
-        and funding <= -funding_extreme
+        funding_8h is not None
+        and funding_8h <= -funding_extreme
         and squeeze_context_available
         and funding_percentile <= 25
         and basis <= 0
@@ -169,8 +179,8 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
         and fast_momentum > 0
     )
     squeeze_short = (
-        funding is not None
-        and funding >= funding_extreme
+        funding_8h is not None
+        and funding_8h >= funding_extreme
         and squeeze_context_available
         and funding_percentile >= 75
         and basis >= 0
@@ -198,6 +208,11 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
             if short_extension is not None else None,
         },
         "hard_no_chase_atr": float(block["hard_max_entry_extension_atr"]),
+        # Surfaced so a squeeze decision can be audited against the value the
+        # contract actually compared, not the raw per-interval rate.
+        "funding_8h_equivalent_pct": (
+            round(funding_8h, 4) if funding_8h is not None else None),
+        "funding_extreme_threshold_per_8h": funding_extreme,
     }
 
 

@@ -263,12 +263,27 @@ and planned-risk caps, cooldowns, failed-thesis re-entry rules, the daily
 loss stop and the drawdown self-kill — on the point-in-time universe, from
 $10,000.
 
+Run at the configuration audited (`max_position_notional_pct: 40`):
+
 | Costs | Drawdown kill | Return % | Max DD % | Sharpe | Trades | Killed on | Fees $ |
 | --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
 | frictionless | **ON** (real behaviour) | +0.79 | 15.17 | 0.09 | 204 | **2024-09-15** | 0 |
 | base | **ON** (real behaviour) | -3.07 | 15.26 | -0.12 | 195 | **2024-09-15** | 603 |
 | frictionless | off (diagnostic) | **-58.17** | 72.90 | -0.80 | 3,336 | — | 0 |
 | base | off (diagnostic) | **-95.10** | 96.01 | -3.32 | 3,360 | — | 3,270 |
+
+Re-run after the section 8 fixes landed (`max_position_notional_pct: 30`), to
+confirm they change safety and not the conclusion:
+
+| Costs | Drawdown kill | Return % | Max DD % | Sharpe | Trades | Killed on | Fees $ |
+| --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| frictionless | ON | -1.49 | 15.01 | -0.04 | 195 | 2024-09-13 | 0 |
+| base | ON | -4.39 | 15.13 | -0.21 | 152 | 2024-09-04 | 383 |
+| frictionless | off | -48.04 | 71.42 | -0.56 | 3,489 | — | 0 |
+| base | off | **-95.21** | 95.94 | -3.38 | 3,499 | — | 3,094 |
+
+Smaller positions lose money slightly more slowly and still self-kill inside
+two months. Sizing was never the problem.
 
 The headline "+0.79%" is an illusion. **The agent breached its 15% drawdown
 limit and self-killed 50 days into a 730-day test.** The remaining 680 days
@@ -356,8 +371,10 @@ so sizing lands on exactly 20% margin every time.
   4.00      4.622        32.45      16.23         no
 ```
 
-Fix: lower `max_position_notional_pct` to ~30 (45% at full book), or raise
-`max_margin_usage_pct` to ~75, or reduce `max_concurrent_positions` to 2.
+**Status: fixed.** `max_position_notional_pct` is now 30 (45% at a full book,
+25% of book value can be lost before the guard engages), and `agent/config.py`
+now rejects any combination whose full-book margin exceeds 80% of
+`max_margin_usage_pct`, naming the three knobs that can restore headroom.
 
 ### 8.2 `risk_per_trade_pct` is not the binding constraint
 
@@ -365,6 +382,21 @@ Same table: with typical 0.6-2% stops the notional cap binds first, so real
 risk per trade is **0.49-1.05% of equity, not the configured 1.5%**. The README
 does document this, but the parameter does not do what its name implies —
 turning it up changes nothing until stops exceed ~3.7%.
+
+**Status: fixed (made visible, not made to bind).** Forcing the risk budget to
+bind would mean raising exposure, which is the wrong trade: at 2x leverage a
+1% stop needs 150% notional to risk 1.5% of equity. So the fix is honesty
+rather than arithmetic. Every vetted plan now carries `sizing_constraint`
+(which cap actually decided the size) and `effective_risk_pct_equity` (what
+the trade really risks), both surfaced in the `OPENED` log line and the
+journal:
+
+```
+ stop%  notional%eq  effective risk%    binding constraint
+   0.6        30.00            0.367    max_position_notional_pct
+   2.0        30.00            0.787    max_position_notional_pct
+   5.0        26.68            1.500    risk_per_trade_budget
+```
 
 ### 8.3 `funding_squeeze` is unreachable on every liquid instrument
 
@@ -382,6 +414,18 @@ The setup can therefore only ever trigger on thin, newly listed alts — exactly
 where spreads are widest and a "fade the crowded position" trade is most
 dangerous. As shipped it is either dead code or a thin-alt-only strategy;
 neither is what the prompt describes.
+
+**Status: fixed.** Two changes. First, the rate is normalized to an
+**8h-equivalent** before comparison, because OKX runs 4h and 8h contracts side
+by side and a raw per-interval threshold held 4h contracts to a bar twice as
+strict in economic terms. Second, the threshold moved to a new key,
+`funding_extreme_pct_per_8h: 0.01` — a rename, so a stale config fails loudly
+instead of being silently reinterpreted. 0.01% per 8h is where OKX clamps
+funding on liquid perpetuals, so the gate now means "funding is pinned at its
+practical limit", and BTC at its clamp qualifies. Deciding whether funding is
+extreme *for that instrument* is left to `funding_percentile_30`, which is
+what the prompt actually describes; the absolute floor only screens out
+near-zero funding.
 
 ### 8.4 Live snapshot mixes a live price with completed-bar structure
 
