@@ -160,6 +160,23 @@ between a blow-up and the next trade.
 
 ---
 
+## Running the tests
+
+The suite is plain `unittest`, so it needs nothing beyond the production
+dependencies:
+
+```bash
+python -m unittest discover -s tests -t . -q     # 304 tests
+```
+
+Two alarming-looking lines in the output — `event journal write failed: disk
+full` and `Corrupt state detected ...` — are tests proving those guards fire,
+not failures. The verdict is the final `OK`.
+
+`pip install -r requirements-dev.txt` adds pytest if you prefer its output;
+it is deliberately absent from `requirements.lock.txt`, because a trading
+host should not carry a test runner.
+
 ## Controls
 
 | Command | What it does |
