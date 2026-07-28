@@ -59,7 +59,11 @@ class Engine:
         self.run_id = state.new_run_id()
         self.config_version = state.stable_fingerprint(cfg)
         self.code_version = state.code_fingerprint()
-        self.prompt_version = brain.PROMPT_VERSION
+        # Derived from the assembled per-strategy prompt. There is no module
+        # -level PROMPT_VERSION any more: each strategy gets its own prompt,
+        # so the version is a property of the configuration rather than of
+        # the module.
+        self.prompt_version = brain.prompt_version(brain.build_system(cfg))
         self.strategy_id, self.strategy_version = strategy.identity(cfg)
         state.set_journal_context(
             run_id=self.run_id,
