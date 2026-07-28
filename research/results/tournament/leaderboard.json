@@ -10,10 +10,149 @@
   "cost_scenario": "base",
   "data_root": "runtime/research/data",
   "exit_policy": "fixed_rr",
-  "generated_utc": "2026-07-28 11:30:01Z",
+  "generated_utc": "2026-07-28 11:48:03Z",
   "instruments": 8,
   "min_bars": 19200,
   "strategies": [
+    {
+      "falsification": "Extending the existing features to 4-14 day horizons leaves expectancy negative net of costs, or positive only in the in-sample half.",
+      "forward": {
+        "status": "no forward evidence recorded yet"
+      },
+      "gates": [
+        {
+          "gate": "has_mechanism",
+          "numbers": {
+            "falsification_chars": 133,
+            "mechanism_chars": 235
+          },
+          "passed": true,
+          "summary": "mechanism and falsification criterion are both stated"
+        },
+        {
+          "gate": "beat_nulls",
+          "numbers": {
+            "beaten_by": [],
+            "expectancy_pct": {
+              "inverted": {
+                "expectancy_pct": -0.7591513427629702,
+                "trades": 739
+              },
+              "null_random_direction": {
+                "expectancy_pct": -0.39992335221780395,
+                "trades": 712
+              },
+              "null_random_timing": {
+                "expectancy_pct": 0.07497876599038718,
+                "trades": 774
+              },
+              "signal": {
+                "expectancy_pct": 0.08763724980628529,
+                "trades": 628
+              }
+            }
+          },
+          "passed": true,
+          "summary": "signal +0.0876% beats every null"
+        },
+        {
+          "gate": "survive_oos",
+          "numbers": {
+            "in_sample_pct": -0.30909125232005435,
+            "in_sample_trades": 373,
+            "out_of_sample_pct": 0.6053302980803948,
+            "out_of_sample_trades": 243,
+            "purge_days": 3,
+            "split": 0.6
+          },
+          "passed": true,
+          "summary": "in-sample -0.3091%, out-of-sample +0.6053%"
+        },
+        {
+          "gate": "survive_costs",
+          "numbers": {
+            "base_round_trip_cost_pct": 0.2,
+            "breakeven_cost_pct": 0.3407556612453523,
+            "expectancy_pct_by_scenario": {
+              "base": 0.08763724980628529,
+              "frictionless": 0.3407556612453523,
+              "optimistic": 0.2609876683417287,
+              "realistic_alt": -0.07531882837215775,
+              "stress": -0.4449171087630015
+            },
+            "required_headroom_x": 2.0
+          },
+          "passed": false,
+          "summary": "net +0.0876% at base costs, breakeven cost 0.3408% vs 0.20% charged"
+        },
+        {
+          "gate": "survive_placebo",
+          "numbers": {
+            "candidate_pct": 0.08763724980628529,
+            "fail_at_or_above": 0.5,
+            "pass_below": 0.25,
+            "placebo_draws": [
+              0.11112966376232257,
+              0.03827451331749685,
+              -0.03955473326998319,
+              -0.16745776777642296,
+              -0.1556014922824274
+            ],
+            "placebo_mean_pct": -0.04264196324980282,
+            "ratio": -0.48657349864423255
+          },
+          "passed": true,
+          "summary": "placebo -0.0426% is -49% of candidate +0.0876%"
+        },
+        {
+          "gate": "mechanism_is_the_source",
+          "numbers": {},
+          "passed": true,
+          "summary": "no isolable return source declared; not checked"
+        },
+        {
+          "gate": "is_detectable",
+          "numbers": {
+            "effect_r": -0.025149900233281616,
+            "sd_r": 1.559975821816949
+          },
+          "passed": false,
+          "summary": "effect -0.0251 R is not positive; nothing to size for"
+        }
+      ],
+      "headline": {
+        "avg_hold_h": 28.477707006369428,
+        "expectancy_pct": 0.08763724980628529,
+        "expectancy_r": -0.025149900233281616,
+        "expectancy_r_ci95": [
+          -0.21899502998254217,
+          0.23099918677689313
+        ],
+        "label": "base",
+        "median_pct": -1.8058479337195505,
+        "monthly_mean_r": 0.12719815139036514,
+        "monthly_t_stat": 0.5301612358651472,
+        "months": 7,
+        "positive_months_pct": 42.857142857142854,
+        "profit_factor": 1.0401747388706513,
+        "significant": false,
+        "stop_rate_pct": 72.29299363057325,
+        "timeout_rate_pct": 1.1146496815286624,
+        "total_r": -15.794137346500854,
+        "tp_rate_pct": 26.59235668789809,
+        "trades": 628,
+        "win_rate_pct": 27.229299363057326
+      },
+      "hypotheses_tested": 1,
+      "measured_tier": "T2_CANDIDATE",
+      "mechanism": "Slow adoption flows and reflexive positioning make crypto trend persist at multi-week horizons. Cost falls from roughly 15% of a typical intraday move to about 1% of a multi-day one. The payer is the mean-reversion seller who is early.",
+      "registered_tier": "T1_HYPOTHESIS",
+      "scored": true,
+      "strategy_id": "trend-multiday",
+      "tier_changed": true,
+      "tier_reason": "net +0.0876% at base costs, breakeven cost 0.3408% vs 0.20% charged",
+      "version": "v1"
+    },
     {
       "falsification": "Already falsified: directional hit rate 45.6-47.3% at every horizon from 15m to 24h, -0.096 R at ordinary costs (t=-4.60), 0 of 79 walk-forward variants positive out-of-sample, and at zero cost both random entry timing and the inverted signal beat it.",
       "forward": {
@@ -105,6 +244,12 @@
           "summary": "candidate expectancy is not positive; placebo not decisive"
         },
         {
+          "gate": "mechanism_is_the_source",
+          "numbers": {},
+          "passed": true,
+          "summary": "no isolable return source declared; not checked"
+        },
+        {
           "gate": "is_detectable",
           "numbers": {
             "effect_r": -0.07411520196952376,
@@ -146,6 +291,156 @@
       "tier_changed": true,
       "tier_reason": "net -0.0553% at base costs, breakeven cost 0.2140% vs 0.20% charged",
       "version": "phase1-v2"
+    },
+    {
+      "falsification": "Holding the funding-receiving side through settlements does not produce positive net expectancy once price risk over the same window is charged against it.",
+      "forward": {
+        "status": "no forward evidence recorded yet"
+      },
+      "gates": [
+        {
+          "gate": "has_mechanism",
+          "numbers": {
+            "falsification_chars": 155,
+            "mechanism_chars": 251
+          },
+          "passed": true,
+          "summary": "mechanism and falsification criterion are both stated"
+        },
+        {
+          "gate": "beat_nulls",
+          "numbers": {
+            "beaten_by": [],
+            "expectancy_pct": {
+              "inverted": {
+                "expectancy_pct": -1.52564127089088,
+                "trades": 142
+              },
+              "null_random_direction": {
+                "expectancy_pct": -0.7587549423586948,
+                "trades": 135
+              },
+              "null_random_timing": {
+                "expectancy_pct": 0.27361812143636394,
+                "trades": 476
+              },
+              "signal": {
+                "expectancy_pct": 2.007923769683454,
+                "trades": 116
+              }
+            }
+          },
+          "passed": true,
+          "summary": "signal +2.0079% beats every null"
+        },
+        {
+          "gate": "survive_oos",
+          "numbers": {
+            "in_sample_pct": 1.4668138793878391,
+            "in_sample_trades": 70,
+            "out_of_sample_pct": 3.724710588738951,
+            "out_of_sample_trades": 41,
+            "purge_days": 3,
+            "split": 0.6
+          },
+          "passed": true,
+          "summary": "in-sample +1.4668%, out-of-sample +3.7247%"
+        },
+        {
+          "gate": "survive_costs",
+          "numbers": {
+            "base_round_trip_cost_pct": 0.2,
+            "breakeven_cost_pct": 2.3186259244025904,
+            "expectancy_pct_by_scenario": {
+              "base": 2.007923769683454,
+              "frictionless": 2.3186259244025904,
+              "optimistic": 2.2895982064446323,
+              "realistic_alt": 1.8158681333441928,
+              "stress": 1.850251108169337
+            },
+            "required_headroom_x": 2.0
+          },
+          "passed": true,
+          "summary": "net +2.0079% at base costs, breakeven cost 2.3186% vs 0.20% charged"
+        },
+        {
+          "gate": "survive_placebo",
+          "numbers": {
+            "candidate_pct": 2.007923769683454,
+            "fail_at_or_above": 0.5,
+            "pass_below": 0.25,
+            "placebo_draws": [
+              -0.23420011755444442,
+              0.2569062225068944,
+              -0.2467977441142618,
+              0.3455416490035633,
+              -0.5049926522230899
+            ],
+            "placebo_mean_pct": -0.07670852847626768,
+            "ratio": -0.03820290871319315
+          },
+          "passed": true,
+          "summary": "placebo -0.0767% is -4% of candidate +2.0079%"
+        },
+        {
+          "gate": "mechanism_is_the_source",
+          "numbers": {
+            "declared_source": "funding",
+            "pass_at_or_above": 0.5,
+            "residual_pct": 1.968853906211808,
+            "source_contribution_pct": 0.039069863471646205,
+            "source_share": 0.01945784200652473,
+            "total_pct": 2.007923769683454
+          },
+          "passed": false,
+          "summary": "funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result"
+        },
+        {
+          "gate": "is_detectable",
+          "numbers": {
+            "days_needed": 26.666666666666668,
+            "effect_r": 0.42675958483285137,
+            "max_acceptable": 3000,
+            "observed_trades": 116,
+            "sd_r": 1.3588135603203921,
+            "trades_needed": 80
+          },
+          "passed": true,
+          "summary": "+0.4268 R needs 80 trades (~0.9 months at 3/day)"
+        }
+      ],
+      "headline": {
+        "avg_hold_h": 58.025862068965516,
+        "expectancy_pct": 2.007923769683454,
+        "expectancy_r": 0.42675958483285137,
+        "expectancy_r_ci95": [
+          0.386076174224356,
+          0.5313997464013878
+        ],
+        "label": "base",
+        "median_pct": 1.4755833268023533,
+        "monthly_mean_r": 0.4363485178824904,
+        "monthly_t_stat": 9.17622654631692,
+        "months": 3,
+        "positive_months_pct": 100.0,
+        "profit_factor": 1.9832335455447274,
+        "significant": true,
+        "stop_rate_pct": 46.55172413793103,
+        "timeout_rate_pct": 4.310344827586207,
+        "total_r": 49.50411184061076,
+        "tp_rate_pct": 49.137931034482754,
+        "trades": 116,
+        "win_rate_pct": 52.58620689655172
+      },
+      "hypotheses_tested": 1,
+      "measured_tier": "T0_REJECTED",
+      "mechanism": "Funding is the price of leverage. When positioning is crowded the crowd pays continuously to hold, and the payer is the leveraged long in a persistently positive-funding regime. The return source is the carry itself rather than a directional forecast.",
+      "registered_tier": "T0_REJECTED",
+      "scored": true,
+      "strategy_id": "funding-carry",
+      "tier_changed": false,
+      "tier_reason": "funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result",
+      "version": "v1"
     },
     {
       "falsification": "Among the largest adverse moves, bars with open interest falling show no more 4-24h reversion than bars with open interest rising. If both subsets behave alike, OI adds nothing and the move is noise.",
@@ -240,6 +535,12 @@
           "summary": "candidate expectancy is not positive; placebo not decisive"
         },
         {
+          "gate": "mechanism_is_the_source",
+          "numbers": {},
+          "passed": true,
+          "summary": "no isolable return source declared; not checked"
+        },
+        {
           "gate": "is_detectable",
           "numbers": {
             "effect_r": -0.1572489031181213,
@@ -283,14 +584,8 @@
       "version": "v1"
     },
     {
-      "reason": "no pre-registration at research/hypotheses/funding-carry.yaml; write the mechanism, parameters and hypothesis count before running the test",
-      "registered_tier": "T1_HYPOTHESIS",
-      "scored": false,
-      "strategy_id": "funding-carry",
-      "version": "v1"
-    },
-    {
-      "reason": "no pre-registration at research/hypotheses/ls-ratio-fade.yaml; write the mechanism, parameters and hypothesis count before running the test",
+      "notes": "+1.114% at 48h (t=2.72) on ~210 observations. On this data a placebo reached t=2.60 from pure noise, so this is a reason to collect data, not to trade.",
+      "reason": "registered but no research contract implements it yet; see the register's notes for what blocks it",
       "registered_tier": "T1_HYPOTHESIS",
       "scored": false,
       "strategy_id": "ls-ratio-fade",
@@ -301,13 +596,6 @@
       "registered_tier": "T1_HYPOTHESIS",
       "scored": false,
       "strategy_id": "scalp-maker",
-      "version": "v1"
-    },
-    {
-      "reason": "no pre-registration at research/hypotheses/trend-multiday.yaml; write the mechanism, parameters and hypothesis count before running the test",
-      "registered_tier": "T1_HYPOTHESIS",
-      "scored": false,
-      "strategy_id": "trend-multiday",
       "version": "v1"
     }
   ],

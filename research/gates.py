@@ -32,8 +32,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from edge_lab import (COST_SCENARIOS, build_trades, non_overlapping,
-                      summarize)
+from edge_lab import (COST_SCENARIOS, Costs, build_trades,
+                      non_overlapping, summarize)
 
 
 # Discover on the first 60%, confirm on the last 40%. The purge gap drops
@@ -269,6 +269,77 @@ def survive_placebo(frames, membership, contract,
     )
 
 
+def mechanism_is_the_source(frames, membership, contract, prereg,
+                            cost_name: str = "base",
+                            exit_policy: str = "fixed_rr") -> GateResult:
+    """Does the money come from where the mechanism says it comes from?
+
+    Gate 5 asks whether a mechanism was STATED. This asks whether it is
+    TRUE - and the two come apart in practice. A strategy can post a large,
+    null-beating, placebo-surviving result while its claimed return source
+    contributes nothing, because the entry rule happens to select for
+    something else entirely.
+
+    That is not hypothetical. funding-carry posted +2.008% per trade on this
+    data and passed every other gate. Decomposed: funding contributed
+    +0.039% and price movement contributed +1.969%. It was a directional
+    strategy wearing a carry label, and every number about it was true.
+
+    Why this is disqualifying rather than a curiosity: a result whose source
+    is not understood cannot be distinguished from overfitting, and you will
+    not know when it stops working, because you never knew why it worked.
+    That is the whole content of the "have a mechanism" requirement, and
+    stating a mechanism that turns out to be the wrong one fails it.
+
+    Declared per hypothesis via ``return_source`` in the pre-registration.
+    Only sources that can be isolated are checked; anything else is reported
+    as unchecked rather than silently passed.
+    """
+    source = (prereg or {}).get("return_source")
+    if not source:
+        return GateResult(
+            "mechanism_is_the_source", True,
+            "no isolable return source declared; not checked", {})
+
+    if source != "funding":
+        return GateResult(
+            "mechanism_is_the_source", True,
+            f"return source {source!r} cannot be isolated by this harness; "
+            f"not checked", {"declared_source": source})
+
+    base = COST_SCENARIOS[cost_name]
+    stripped = Costs(f"{base.name}_no_funding", base.fee_per_side,
+                     base.entry_slippage, base.exit_slippage,
+                     base.stop_slippage, False)
+    with_source = _expectancy(non_overlapping(
+        build_trades(frames, membership, contract, base,
+                     exit_policy=exit_policy)))
+    without_source = _expectancy(non_overlapping(
+        build_trades(frames, membership, contract, stripped,
+                     exit_policy=exit_policy)))
+    if not _finite(with_source) or with_source == 0:
+        return GateResult(
+            "mechanism_is_the_source", False,
+            "candidate has no measurable result to attribute",
+            {"declared_source": source})
+    contribution = with_source - without_source
+    share = contribution / with_source
+    passed = share >= 0.5
+    return GateResult(
+        "mechanism_is_the_source", passed,
+        (f"{source} contributes {contribution:+.4f}% of {with_source:+.4f}% "
+         f"({share:.0%}); the rest is price movement"
+         + ("" if passed else
+            " - the stated mechanism is not the source of the result")),
+        {"declared_source": source,
+         "total_pct": with_source,
+         "source_contribution_pct": contribution,
+         "residual_pct": without_source,
+         "source_share": share,
+         "pass_at_or_above": 0.5},
+    )
+
+
 def is_detectable(frames, membership, contract,
                   cost_name: str = "base",
                   exit_policy: str = "fixed_rr",
@@ -335,6 +406,11 @@ def tier_from_gates(results: list[GateResult]) -> tuple[str, str]:
         if ratio is not None and _finite(ratio) and ratio >= PLACEBO_FAIL_RATIO:
             return "T0_REJECTED", placebo.summary
         return "T2_CANDIDATE", placebo.summary if placebo else "placebo unrun"
+    if not ok("mechanism_is_the_source"):
+        # A result whose source is not what was claimed is a result nobody
+        # understands. Gate 5's requirement is not "state something", it is
+        # "know why this pays", and a falsified attribution fails it.
+        return "T0_REJECTED", by_name["mechanism_is_the_source"].summary
     if not ok("is_detectable"):
         return "T2_CANDIDATE", by_name["is_detectable"].summary
 
@@ -364,7 +440,8 @@ def tier_from_gates(results: list[GateResult]) -> tuple[str, str]:
 
 def run_all(spec, frames, membership, contract,
             cost_name: str = "base",
-            exit_policy: str = "fixed_rr") -> list[GateResult]:
+            exit_policy: str = "fixed_rr",
+            prereg: dict | None = None) -> list[GateResult]:
     """Run the battery cheapest-disqualifier first."""
     results = [has_mechanism(spec)]
     if not results[0].passed:
@@ -376,6 +453,8 @@ def run_all(spec, frames, membership, contract,
     results.append(survive_costs(frames, membership, contract, exit_policy))
     results.append(survive_placebo(frames, membership, contract, cost_name,
                                    exit_policy))
+    results.append(mechanism_is_the_source(frames, membership, contract,
+                                           prereg, cost_name, exit_policy))
     results.append(is_detectable(frames, membership, contract, cost_name,
                                  exit_policy))
     return results

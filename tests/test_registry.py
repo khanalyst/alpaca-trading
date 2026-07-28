@@ -80,8 +80,16 @@ class RegisterContentTests(unittest.TestCase):
         self.assertTrue(momentum.implemented)
         self.assertFalse(momentum.meets(LIVE_MIN_TIER))
 
-    def test_only_momentum_is_implemented_so_far(self):
-        self.assertEqual(implemented_ids(), ("momentum",))
+    def test_every_implemented_strategy_declares_shadow_parameters(self):
+        # A strategy shadowed with whatever the live config happens to hold
+        # produces forward evidence attributable to nothing.
+        for strategy_id in implemented_ids():
+            with self.subTest(strategy=strategy_id):
+                self.assertTrue(spec_for(strategy_id).contract_params)
+
+    def test_scalp_maker_stays_unimplemented(self):
+        # Blocked on recorded order-book data, not on development effort.
+        self.assertNotIn("scalp-maker", implemented_ids())
 
     def test_nothing_is_live_eligible_yet(self):
         # If this ever fails, a strategy has been promoted to T3 and the

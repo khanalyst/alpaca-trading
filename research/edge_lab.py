@@ -527,6 +527,107 @@ class FlushFadeContract:
         return np.round(stop, 6), np.round(stop * self.reward_risk, 6)
 
 
+@dataclass(frozen=True)
+class TrendMultidayContract:
+    """Multi-day trend continuation, mirroring agent/contracts/trend_multiday.
+
+    The reason to test trend at this horizon rather than the 15m one is
+    arithmetic: round-trip cost is roughly 15% of a typical intraday move and
+    roughly 1% of a multi-day one. The same effect can survive at one
+    timescale and cannot at the other.
+    """
+
+    min_range_pos_pct: float = 55.0
+    max_atr_ratio: float = 2.0
+    stop_atr_multiple: float = 2.0
+    reward_risk: float = 3.0
+    max_hold_bars: int = 1344              # 14 days of 15m bars
+    min_stop_pct: float = 0.2
+    max_stop_pct: float = 15.0
+    hard_max_entry_extension_atr: float = 1e9
+    default_setups: tuple[str, ...] = ("trend_follow",)
+
+    def masks(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
+        trend_1h = df["trend_1h"].to_numpy(object)
+        trend_4h = df["trend_4h"].to_numpy(object)
+        momentum = np.nan_to_num(df["mom_1h_pct"].to_numpy(float))
+        ratio = df["atr_1h_ratio"].to_numpy(float)
+        range_pos = df["range_pos_pct"].to_numpy(float)
+        calm = ~np.isnan(ratio) & (ratio <= self.max_atr_ratio)
+        long_ = ((trend_1h == "up") & (trend_4h == "up") & (momentum > 0)
+                 & calm & ~np.isnan(range_pos)
+                 & (range_pos >= self.min_range_pos_pct))
+        short_ = ((trend_1h == "down") & (trend_4h == "down")
+                  & (momentum < 0) & calm & ~np.isnan(range_pos)
+                  & (range_pos <= 100 - self.min_range_pos_pct))
+        zero = np.zeros(len(df), dtype=float)
+        return {"trend_follow_long": long_, "trend_follow_short": short_,
+                "extension_long": zero, "extension_short": zero}
+
+    def gate(self, df: pd.DataFrame, direction: str) -> np.ndarray:
+        return np.ones(len(df), dtype=bool)
+
+    def levels(self, df: pd.DataFrame, direction: str,
+               exit_policy: str) -> tuple[np.ndarray, np.ndarray]:
+        stop = df["atr_1h_pct"].to_numpy(float) * self.stop_atr_multiple
+        return np.round(stop, 6), np.round(stop * self.reward_risk, 6)
+
+
+@dataclass(frozen=True)
+class FundingCarryContract:
+    """Hold the funding-receiving side while positioning stays crowded.
+
+    Mirrors agent/contracts/funding_carry. The return source is the carry,
+    not a directional forecast, so the entry asks about funding relative to
+    the instrument's own history rather than about price.
+
+    Note what the simulator does and does not capture: it charges funding
+    through Costs.include_funding, so the carry is priced. What it cannot do
+    is model the position being held purely for carry with no price target,
+    which is why the reward:risk here is wide rather than tight.
+    """
+
+    funding_extreme_pct_per_8h: float = 0.01
+    percentile: float = 80.0
+    min_samples: int = 20
+    stop_atr_multiple: float = 3.0
+    reward_risk: float = 2.0
+    max_hold_bars: int = 960               # 10 days
+    min_stop_pct: float = 0.2
+    max_stop_pct: float = 15.0
+    hard_max_entry_extension_atr: float = 1e9
+    default_setups: tuple[str, ...] = ("carry",)
+
+    def masks(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
+        funding = df["funding_rate_pct"].to_numpy(float)
+        interval = df["funding_interval_hours"].to_numpy(float)
+        interval = np.where((interval > 0) & ~np.isnan(interval), interval, 8.0)
+        funding_8h = funding * (8.0 / interval)
+        percentile = df["funding_percentile_30"].to_numpy(float)
+        samples = np.nan_to_num(df["funding_samples_30"].to_numpy(float))
+        trend_1h = df["trend_1h"].to_numpy(object)
+        trend_4h = df["trend_4h"].to_numpy(object)
+        context = (samples >= self.min_samples) & ~np.isnan(percentile) \
+            & ~np.isnan(funding_8h)
+        both_up = (trend_1h == "up") & (trend_4h == "up")
+        both_down = (trend_1h == "down") & (trend_4h == "down")
+        short_ = (context & (funding_8h >= self.funding_extreme_pct_per_8h)
+                  & (percentile >= self.percentile) & ~both_up)
+        long_ = (context & (funding_8h <= -self.funding_extreme_pct_per_8h)
+                 & (percentile <= 100 - self.percentile) & ~both_down)
+        zero = np.zeros(len(df), dtype=float)
+        return {"carry_long": long_, "carry_short": short_,
+                "extension_long": zero, "extension_short": zero}
+
+    def gate(self, df: pd.DataFrame, direction: str) -> np.ndarray:
+        return np.ones(len(df), dtype=bool)
+
+    def levels(self, df: pd.DataFrame, direction: str,
+               exit_policy: str) -> tuple[np.ndarray, np.ndarray]:
+        stop = df["atr_1h_pct"].to_numpy(float) * self.stop_atr_multiple
+        return np.round(stop, 6), np.round(stop * self.reward_risk, 6)
+
+
 def evidence_masks(df: pd.DataFrame, c: Contract) -> dict[str, np.ndarray]:
     """Vectorized agent.strategy.setup_evidence (+ optional research gates)."""
     atr = np.maximum(np.nan_to_num(df["atr_1h_pct"].to_numpy(float)), 0.0)

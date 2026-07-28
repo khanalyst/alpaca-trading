@@ -109,6 +109,123 @@ def _funding_history_context(ex, symbol: str,
     }
 
 
+# Hourly series fetched per symbol per cycle would be wasteful and would
+# multiply rate-limit pressure: the underlying data only changes once an
+# hour, while the decision cycle runs every five minutes. Cached in-process
+# with a TTL well under the update interval.
+_SERIES_TTL_SECONDS = 900
+_series_cache: dict[tuple[str, str], tuple[float, object]] = {}
+
+
+def _cached_series(key: str, symbol: str, loader):
+    """Fetch an hourly series at most once per TTL, per symbol.
+
+    A failure is cached as None for the same TTL. Retrying a dead endpoint on
+    every symbol of every cycle turns one outage into a cycle-time problem,
+    and these series are enrichment: no trade depends on them being present.
+    """
+    entry = _series_cache.get((key, symbol))
+    now = time.time()
+    if entry is not None and now - entry[0] < _SERIES_TTL_SECONDS:
+        return entry[1]
+    try:
+        value = loader()
+    except Exception:
+        value = None
+    _series_cache[(key, symbol)] = (now, value)
+    return value
+
+
+def _open_interest_change(ex, symbol: str) -> dict:
+    """Percent change in open interest over the last 1h and 4h.
+
+    Sourced from the same per-instrument endpoint the research downloader
+    uses, so the live field and the backtest field mean the same thing. That
+    equivalence is the whole reason shadow results can be compared with
+    backtest results at all.
+
+    Open interest FALLING while price moves is existing positions closing -
+    often forcibly. Open interest RISING is new money taking a side. The two
+    are indistinguishable on price alone, which is what makes this worth an
+    API call.
+    """
+    empty = {"oi_change_1h_pct": None, "oi_change_4h_pct": None}
+    rows = _cached_series("oi_history", symbol, lambda: _okx_oi_history(
+        ex, symbol))
+    if not rows or len(rows) < 5:
+        return empty
+    # Newest first from OKX; index 0 is now, index 4 is four hours ago.
+    def change(offset: int) -> float | None:
+        if len(rows) <= offset or rows[offset] <= 0:
+            return None
+        return round((rows[0] / rows[offset] - 1) * 100, 3)
+    return {"oi_change_1h_pct": change(1), "oi_change_4h_pct": change(4)}
+
+
+def _okx_oi_history(ex, symbol: str) -> list[float]:
+    inst_id = _inst_id(ex, symbol)
+    if not inst_id:
+        return []
+    raw = ex.public_get(
+        "/api/v5/rubik/stat/contracts/open-interest-history",
+        {"instId": inst_id, "period": "1H", "limit": "24"})
+    out = []
+    for row in raw or []:
+        try:
+            out.append(float(row[3]))       # oiUsd
+        except (TypeError, ValueError, IndexError):
+            out.append(0.0)
+    return out
+
+
+def _long_short_ratio(ex, symbol: str) -> dict:
+    """Retail long/short account ratio, and where it sits in its own recent range.
+
+    CAVEAT, and it is load-bearing: OKX serves this per CURRENCY, not per
+    instrument, so it aggregates across every contract for that coin. The
+    same aggregation is why taker-volume was rejected outright during edge
+    discovery (its correlation with the same hour's return was +0.006, i.e.
+    it did not measure what it claimed to). This series survived that check
+    where taker volume did not, but it is still a coin-level signal being
+    applied to an instrument, and the percentile - not the level - is what
+    the hypothesis rests on, because a coin's average ratio is a fixed
+    effect that correlates NEGATIVELY with its return.
+    """
+    empty = {"long_short_ratio": None, "long_short_percentile_30": None}
+    rows = _cached_series("ls_ratio", symbol,
+                          lambda: _okx_long_short(ex, symbol))
+    if not rows:
+        return empty
+    current = rows[0]
+    window = rows[:720]
+    percentile = sum(value <= current for value in window) / len(window) * 100
+    return {"long_short_ratio": round(current, 4),
+            "long_short_percentile_30": round(percentile, 1)}
+
+
+def _okx_long_short(ex, symbol: str) -> list[float]:
+    currency = symbol.split("/")[0]
+    raw = ex.public_get(
+        "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+        {"ccy": currency, "period": "1H", "limit": "100"})
+    out = []
+    for row in raw or []:
+        try:
+            out.append(float(row[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _inst_id(ex, symbol: str) -> str | None:
+    try:
+        market = ex.x.market(symbol)
+    except Exception:
+        return None
+    inst = (market.get("info") or {}).get("instId")
+    return str(inst) if inst else None
+
+
 def _open_interest_usd(ex, symbol: str, last: float) -> float | None:
     fetcher = getattr(ex.x, "fetch_open_interest", None)
     if not callable(fetcher):
@@ -407,6 +524,11 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     open_interest = _open_interest_usd(ex, symbol, last)
     snap["open_interest_musd"] = (
         round(open_interest / 1e6, 2) if open_interest is not None else None)
+    # Enrichment for the positioning-based contracts. Both are cached hourly
+    # series and both degrade to None rather than raising: no order depends
+    # on them, so a statistics outage must not be able to stop trading.
+    snap.update(_open_interest_change(ex, symbol))
+    snap.update(_long_short_ratio(ex, symbol))
 
     for tf, df in frames.items():
         close = df["close"]

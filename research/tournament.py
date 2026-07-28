@@ -36,8 +36,9 @@ import yaml  # noqa: E402
 
 import gates as gate_mod  # noqa: E402
 from agent.registry import REGISTRY, TIERS  # noqa: E402
-from edge_lab import (Contract, FlushFadeContract, load_dataset,  # noqa: E402
-                      universe_membership)
+from edge_lab import (Contract, FlushFadeContract,  # noqa: E402
+                      FundingCarryContract, TrendMultidayContract,
+                      load_dataset, universe_membership)
 
 
 HYPOTHESES = REPO / "research" / "hypotheses"
@@ -48,6 +49,13 @@ HYPOTHESES = REPO / "research" / "hypotheses"
 CONTRACTS = {
     "momentum": lambda cfg: Contract.from_config(cfg) if cfg else Contract(),
     "flush-fade": lambda cfg: FlushFadeContract(),
+    "trend-multiday": lambda cfg: TrendMultidayContract(),
+    "funding-carry": lambda cfg: FundingCarryContract(),
+    # ls-ratio-fade is deliberately absent. Its input series is served for
+    # ~30 days and is not in the research dataset, so it cannot be
+    # backtested honestly - it accumulates forward evidence through shadow
+    # evaluation only, and the report says so rather than scoring it on
+    # data that does not exist.
 }
 
 # The benchmark's known values, from research/results/edge-audit-2024-2026.
@@ -92,7 +100,8 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
 
     contract = factory(cfg)
     results = gate_mod.run_all(spec, frames, membership, contract,
-                              cost_name=cost_name, exit_policy=exit_policy)
+                              cost_name=cost_name, exit_policy=exit_policy,
+                              prereg=prereg)
     tier, why = gate_mod.tier_from_gates(results)
     stats = gate_mod.headline(frames, membership, contract, cost_name,
                               exit_policy)

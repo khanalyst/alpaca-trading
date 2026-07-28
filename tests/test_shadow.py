@@ -96,11 +96,22 @@ class ShadowRecordingTests(unittest.TestCase):
 
     @patch("agent.engine.state.log_event")
     def test_records_carry_their_own_strategy_attribution(self, log_event):
+        # Every registered contract is evaluated, and each record must be
+        # attributed to the strategy that produced it rather than to the one
+        # that happens to be trading. Without this the forward evidence for
+        # every strategy collapses into one indistinguishable pile.
         self.engine._record_shadow_decisions(
             {"BTC/USDT:USDT": symbol_snapshot()})
+        seen = set()
         for _, _, kwargs in self._events(log_event):
-            self.assertEqual(kwargs.get("strategy_id"), "momentum")
-            self.assertEqual(kwargs.get("strategy_version"), "phase1-v2")
+            self.assertIsNotNone(kwargs.get("strategy_id"))
+            self.assertIsNotNone(kwargs.get("strategy_version"))
+            seen.add(kwargs["strategy_id"])
+        self.assertIn("momentum", seen)
+        self.assertGreater(len(seen), 1,
+                           "more than one contract should be shadowed")
+        for strategy_id in seen:
+            self.assertIn(strategy_id, registry.REGISTRY)
 
     @patch("agent.engine.state.log_event")
     def test_summary_is_written_even_when_nothing_fires(self, log_event):
@@ -109,10 +120,13 @@ class ShadowRecordingTests(unittest.TestCase):
                                 mom_1h_pct=0.0, mom_15m_pct=0.0)
         self.engine._record_shadow_decisions({"BTC/USDT:USDT": quiet})
         events = self._events(log_event)
-        summaries = [p for kind, p, _ in events if kind == "shadow_summary"]
-        self.assertEqual(len(summaries), 1)
-        self.assertEqual(summaries[0]["instruments_scanned"], 1)
-        self.assertEqual(summaries[0]["signals"], 0)
+        summaries = [(k, p) for k, p, _ in events if k == "shadow_summary"]
+        # One per implemented contract, always - the denominator is what
+        # turns a count of firings into a rate.
+        self.assertEqual(len(summaries),
+                         len(registry.implemented_ids()))
+        for _, payload in summaries:
+            self.assertEqual(payload["instruments_scanned"], 1)
 
     @patch("agent.engine.state.log_event")
     def test_context_blocks_are_not_treated_as_instruments(self, log_event):
@@ -126,12 +140,13 @@ class ShadowRecordingTests(unittest.TestCase):
         self.assertEqual(summaries[0]["instruments_scanned"], 1)
 
     @patch("agent.engine.state.log_event")
-    def test_the_active_strategy_is_flagged(self, log_event):
+    def test_exactly_one_strategy_is_flagged_active(self, log_event):
         self.engine._record_shadow_decisions(
             {"BTC/USDT:USDT": symbol_snapshot()})
-        summaries = [p for kind, p, _ in self._events(log_event)
-                     if kind == "shadow_summary"]
-        self.assertTrue(summaries[0]["is_active"])
+        active = [kwargs["strategy_id"]
+                  for kind, payload, kwargs in self._events(log_event)
+                  if kind == "shadow_summary" and payload["is_active"]]
+        self.assertEqual(active, ["momentum"])
 
     @patch("agent.engine.log")
     @patch("agent.engine.state.log_event")
@@ -166,7 +181,9 @@ class ShadowRecordingTests(unittest.TestCase):
         self.engine._record_shadow_decisions(snapshot)
         summaries = [p for kind, p, _ in self._events(log_event)
                      if kind == "shadow_summary"]
-        self.assertEqual(summaries[0]["instruments_scanned"], 0)
+        self.assertTrue(summaries)
+        for payload in summaries:
+            self.assertEqual(payload["instruments_scanned"], 0)
 
 
 if __name__ == "__main__":

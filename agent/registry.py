@@ -198,7 +198,18 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=24.0,
             execution_style="taker",
             setup_types=("flush_reversion",),
+            implemented=True,
+            contract_params={
+                "flush_min_move_atr": 1.5,
+                "flush_min_oi_drop_pct": 1.0,
+                "flush_min_relative_volume": 1.2,
+                "hard_max_entry_extension_atr": 5.0,
+            },
             notes=(
+                "Shadowed deliberately as a NEGATIVE CONTROL: a strategy "
+                "measured negative should keep losing, and if it starts "
+                "winning that is evidence about the pipeline rather than "
+                "the market. The tier gate keeps it away from capital. "
                 "Tested and rejected on first contact with data. 337 "
                 "non-overlapping trades, 8 instruments, 60 days of "
                 "open-interest coverage: -0.288% per trade at base costs and "
@@ -228,16 +239,34 @@ REGISTRY: dict[str, StrategySpec] = {
                 "Holding the funding-receiving side through settlements does "
                 "not produce positive net expectancy once price risk over "
                 "the same window is charged against it."),
-            tier="T1_HYPOTHESIS",
+            tier="T0_REJECTED",
             signal_timeframe="1h",
             required_timeframes=("1h", "4h"),
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("carry",),
+            implemented=True,
+            contract_params={
+                "funding_extreme_pct_per_8h": 0.01,
+                "carry_percentile": 80.0,
+                "carry_min_samples": 20,
+                "hard_max_entry_extension_atr": 3.0,
+            },
             notes=(
-                "Needs multi-day holds, which the momentum-era 48h ceiling "
-                "forbade. Measured rates are ~0.002%/8h on majors, so the "
-                "interesting cells are where funding is pinned at its clamp."),
+                "MECHANISM FALSIFIED, and instructively so: it posted "
+                "+2.008% per trade over 116 trades, beat every null, "
+                "survived the placebo (-4%), was better out-of-sample than "
+                "in, and did NOT disappear on liquid majors. Decomposed, "
+                "funding contributed +0.039% and price movement +1.969% - "
+                "so it is a directional strategy wearing a carry label. "
+                "Rejected because a result whose source is not understood "
+                "cannot be told apart from overfitting and gives no warning "
+                "when it stops. The residual directional result is a "
+                "separate hypothesis needing its own pre-registration; "
+                "folding it in here would be the retro-fitting this "
+                "framework exists to prevent."),
+            evidence=("research/results/tournament/REPORT.md",
+                      "research/hypotheses/funding-carry.yaml"),
         ),
         StrategySpec(
             id="trend-multiday",
@@ -258,6 +287,12 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=336.0,
             execution_style="taker",
             setup_types=("trend_follow",),
+            implemented=True,
+            contract_params={
+                "trend_min_range_pos_pct": 55.0,
+                "trend_max_atr_ratio": 2.0,
+                "hard_max_entry_extension_atr": 2.0,
+            },
             notes=(
                 "Cheapest test available: no new features, one horizon "
                 "constant changed in research/signal_lab.py."),
@@ -281,6 +316,12 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=72.0,
             execution_style="taker",
             setup_types=("positioning_fade",),
+            implemented=True,
+            contract_params={
+                "ls_high_percentile": 80.0,
+                "ls_low_percentile": 20.0,
+                "hard_max_entry_extension_atr": 3.0,
+            },
             notes=(
                 "+1.114% at 48h (t=2.72) on ~210 observations. On this data "
                 "a placebo reached t=2.60 from pure noise, so this is a "

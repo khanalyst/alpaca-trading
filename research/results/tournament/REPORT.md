@@ -1,6 +1,6 @@
 # Strategy tournament
 
-Generated 2026-07-28 11:30:01Z from `runtime/research/data`.
+Generated 2026-07-28 11:48:03Z from `runtime/research/data`.
 
 - instruments: 8
 - bars per instrument (min): 19200
@@ -17,12 +17,34 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 
 | Strategy | Tier | Trades | Expectancy % | Expectancy R | Hypotheses | Recommendation |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
+| `trend-multiday/v1` | T2_CANDIDATE | 628 | +0.0876 | -0.0251 | 1 | HOLD - promising but not clear of the placebo/cost gates |
 | `momentum/phase1-v2` | T2_CANDIDATE | 906 | -0.0553 | -0.0741 | 79 | HOLD - promising but not clear of the placebo/cost gates |
+| `funding-carry/v1` | T0_REJECTED | 116 | +2.0079 | +0.4268 | 1 | REJECT - archive with the finding; do not retest without a new mechanism |
 | `flush-fade/v1` | T0_REJECTED | 337 | -0.2876 | -0.1572 | 1 | REJECT - archive with the finding; do not retest without a new mechanism |
-| `funding-carry` | T1_HYPOTHESIS (registered) | - | - | - | - | no pre-registration at research/hypotheses/funding-carry.yaml; write the mechanism, parameters and hypothesis count before running the test |
-| `ls-ratio-fade` | T1_HYPOTHESIS (registered) | - | - | - | - | no pre-registration at research/hypotheses/ls-ratio-fade.yaml; write the mechanism, parameters and hypothesis count before running the test |
+| `ls-ratio-fade` | T1_HYPOTHESIS (registered) | - | - | - | - | registered but no research contract implements it yet; see the register's notes for what blocks it |
 | `scalp-maker` | T1_HYPOTHESIS (registered) | - | - | - | - | no pre-registration at research/hypotheses/scalp-maker.yaml; write the mechanism, parameters and hypothesis count before running the test |
-| `trend-multiday` | T1_HYPOTHESIS (registered) | - | - | - | - | no pre-registration at research/hypotheses/trend-multiday.yaml; write the mechanism, parameters and hypothesis count before running the test |
+
+## trend-multiday/v1
+
+**Measured tier: T2_CANDIDATE** - net +0.0876% at base costs, breakeven cost 0.3408% vs 0.20% charged
+
+> Measured T2_CANDIDATE is ABOVE the registered T1_HYPOTHESIS. Do not promote on this alone: check that this run's window and instrument count are not thinner than the evidence behind the registered tier. A promotion needs more data than a demotion, not less.
+
+**Mechanism.** Slow adoption flows and reflexive positioning make crypto trend persist at multi-week horizons. Cost falls from roughly 15% of a typical intraday move to about 1% of a multi-day one. The payer is the mean-reversion seller who is early.
+
+**Falsified by.** Extending the existing features to 4-14 day horizons leaves expectancy negative net of costs, or positive only in the in-sample half.
+
+| Gate | Result | Detail |
+| --- | --- | --- |
+| `has_mechanism` | pass | mechanism and falsification criterion are both stated |
+| `beat_nulls` | pass | signal +0.0876% beats every null |
+| `survive_oos` | pass | in-sample -0.3091%, out-of-sample +0.6053% |
+| `survive_costs` | FAIL | net +0.0876% at base costs, breakeven cost 0.3408% vs 0.20% charged |
+| `survive_placebo` | pass | placebo -0.0426% is -49% of candidate +0.0876% |
+| `mechanism_is_the_source` | pass | no isolable return source declared; not checked |
+| `is_detectable` | FAIL | effect -0.0251 R is not positive; nothing to size for |
+
+*Forward evidence: no forward evidence recorded yet.*
 
 ## momentum/phase1-v2
 
@@ -41,7 +63,28 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 | `survive_oos` | pass | in-sample -0.2455%, out-of-sample +0.1937% |
 | `survive_costs` | FAIL | net -0.0553% at base costs, breakeven cost 0.2140% vs 0.20% charged |
 | `survive_placebo` | FAIL | candidate expectancy is not positive; placebo not decisive |
+| `mechanism_is_the_source` | pass | no isolable return source declared; not checked |
 | `is_detectable` | FAIL | effect -0.0741 R is not positive; nothing to size for |
+
+*Forward evidence: no forward evidence recorded yet.*
+
+## funding-carry/v1
+
+**Measured tier: T0_REJECTED** - funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result
+
+**Mechanism.** Funding is the price of leverage. When positioning is crowded the crowd pays continuously to hold, and the payer is the leveraged long in a persistently positive-funding regime. The return source is the carry itself rather than a directional forecast.
+
+**Falsified by.** Holding the funding-receiving side through settlements does not produce positive net expectancy once price risk over the same window is charged against it.
+
+| Gate | Result | Detail |
+| --- | --- | --- |
+| `has_mechanism` | pass | mechanism and falsification criterion are both stated |
+| `beat_nulls` | pass | signal +2.0079% beats every null |
+| `survive_oos` | pass | in-sample +1.4668%, out-of-sample +3.7247% |
+| `survive_costs` | pass | net +2.0079% at base costs, breakeven cost 2.3186% vs 0.20% charged |
+| `survive_placebo` | pass | placebo -0.0767% is -4% of candidate +2.0079% |
+| `mechanism_is_the_source` | FAIL | funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result |
+| `is_detectable` | pass | +0.4268 R needs 80 trades (~0.9 months at 3/day) |
 
 *Forward evidence: no forward evidence recorded yet.*
 
@@ -60,6 +103,7 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 | `survive_oos` | FAIL | in-sample -0.1954%, out-of-sample -0.6100% |
 | `survive_costs` | FAIL | net -0.2876% at base costs, breakeven cost -0.0431% vs 0.20% charged |
 | `survive_placebo` | FAIL | candidate expectancy is not positive; placebo not decisive |
+| `mechanism_is_the_source` | pass | no isolable return source declared; not checked |
 | `is_detectable` | FAIL | effect -0.1572 R is not positive; nothing to size for |
 
 *Forward evidence: no forward evidence recorded yet.*

@@ -30,6 +30,7 @@ def all_passing():
         result("survive_oos", True),
         result("survive_costs", True),
         result("survive_placebo", True, ratio=0.05),
+        result("mechanism_is_the_source", True, source_share=0.9),
         result("is_detectable", True, trades_needed=100, observed_trades=500),
     ]
 
@@ -77,8 +78,20 @@ class TierLogicTests(unittest.TestCase):
 
     def test_undetectable_effect_stalls_at_candidate(self):
         gates_list = all_passing()
-        gates_list[5] = result("is_detectable", False)
+        gates_list[6] = result("is_detectable", False)
         self.assertEqual(tier_from_gates(gates_list)[0], "T2_CANDIDATE")
+
+    def test_a_false_mechanism_is_rejected_however_good_the_number(self):
+        # Observed on real data: funding-carry posted +2.008% per trade,
+        # beat every null, survived the placebo at -4%, and was better
+        # out-of-sample than in. Funding contributed 2% of that result and
+        # price movement 98%. Every number was true and the claim was not.
+        gates_list = all_passing()
+        gates_list[5] = result("mechanism_is_the_source", False,
+                               source_share=0.02)
+        tier, why = tier_from_gates(gates_list)
+        self.assertEqual(tier, "T0_REJECTED")
+        self.assertIn("mechanism_is_the_source", why)
 
     def test_an_empty_battery_is_rejected(self):
         self.assertEqual(tier_from_gates([])[0], "T0_REJECTED")
@@ -88,7 +101,7 @@ class TierLogicTests(unittest.TestCase):
         # real data: the momentum benchmark beat its nulls on a 200-day,
         # 8-instrument window and failed the same test over 24 months.
         gates_list = all_passing()
-        gates_list[5] = result("is_detectable", True,
+        gates_list[6] = result("is_detectable", True,
                                trades_needed=900, observed_trades=337)
         tier, why = tier_from_gates(gates_list)
         self.assertEqual(tier, "T2_CANDIDATE")
@@ -97,7 +110,7 @@ class TierLogicTests(unittest.TestCase):
 
     def test_sufficient_sample_still_validates(self):
         gates_list = all_passing()
-        gates_list[5] = result("is_detectable", True,
+        gates_list[6] = result("is_detectable", True,
                                trades_needed=900, observed_trades=1200)
         self.assertEqual(tier_from_gates(gates_list)[0], "T3_VALIDATED")
 

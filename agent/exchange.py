@@ -143,6 +143,26 @@ class Exchange:
                 time.sleep(1.5 * (i + 1))
         raise last
 
+    def public_get(self, path: str, params: dict) -> list:
+        """Call a public OKX v5 endpoint ccxt does not wrap, and return `data`.
+
+        Used for the statistics endpoints (open-interest history, long/short
+        ratio) that back enrichment fields. Public and unsigned, so it cannot
+        touch the account. Returns an empty list on any failure: these fields
+        are context for the analyst layer, and no order depends on them, so a
+        statistics outage must never be able to stop trading.
+        """
+        try:
+            response = self.retry(
+                self.x.fetch, self.x.urls["api"]["rest"] + path
+                + "?" + self.x.urlencode(params), "GET")
+        except Exception:
+            return []
+        if not isinstance(response, dict) or str(response.get("code")) != "0":
+            return []
+        data = response.get("data")
+        return data if isinstance(data, list) else []
+
     @staticmethod
     def _safe_exchange_error_text(value: object) -> str:
         """Return a bounded error string with configured secrets removed."""

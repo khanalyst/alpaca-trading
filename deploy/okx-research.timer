@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the OKX research cycle nightly
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+# Survive downtime: run on boot if the window was missed.
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
