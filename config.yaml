@@ -193,3 +193,19 @@ alerts:
   format: generic                 # generic | slack | discord
   minimum_level: error            # warning | error | critical
   timeout_seconds: 5
+
+# Shadow evaluation. Absent or disabled is a complete no-op.
+#
+# Deterministic variants only by default. Each LLM variant would cost a full
+# extra model call every cycle - roughly 288 a day - so shadow_llm_variants
+# is capped at 2 by config validation and starts empty. Every parameter axis
+# worth testing is deterministic and costs approximately nothing.
+#
+# shadow_variants names entries in research/variants.yaml. Nothing here can
+# place an order: the evaluator is constructed from configuration alone and
+# has no exchange to reach.
+research:
+  shadow_enabled: false
+  shadow_variants: []
+  shadow_budget_ms: 500
+  shadow_llm_variants: []

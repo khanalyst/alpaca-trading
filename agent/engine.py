@@ -25,7 +25,8 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from . import brain, contracts, market, registry, state, strategy, variants
+from . import (brain, contracts, market, registry, shadow, state,
+               strategy, variants)
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
                        EntryOrderRejected, Exchange)
@@ -95,10 +96,26 @@ class Engine:
             self.llm = brain.LLM(cfg)
             self.llm.preflight()
             self.risk = RiskEngine(cfg)
+        # Built once from the research block. None when shadow evaluation
+        # is off, which makes the whole feature a no-op rather than a
+        # default-on cost.
+        self.shadow = self._build_shadow(cfg)
         self.universe: list[str] = []
         self.universe_ts = 0.0
         self._startup_reconciled = False
         self._credential_failures = 0
+
+    @staticmethod
+    def _build_shadow(cfg: dict):
+        """Never fatal. A bad research block disables shadow, not trading."""
+        try:
+            from pathlib import Path
+            registry_path = (Path(__file__).resolve().parent.parent
+                             / "research" / "variants.yaml")
+            return shadow.build(cfg, variants.load_registry(registry_path))
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Shadow evaluation disabled: %s", exc)
+            return None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -657,6 +674,55 @@ class Engine:
                     self._mark_setup_status(
                         st, plan["setup_id"], "execution_rejected")
         state.commit(st)
+
+        # After every trading decision is committed, so it cannot influence
+        # one. Wrapped, budgeted, and writing only shadow_decision events.
+        self._run_shadow_variants(snapshot, equity, positions, st, gross)
+
+    def _run_shadow_variants(self, snapshot: dict, equity: float,
+                             positions: list, st: dict,
+                             gross_notional: float) -> None:
+        """Evaluate registered parameter variants against this snapshot.
+
+        Three properties, each individually tested. It runs after
+        ``state.commit``, so it can never affect a decision. It is wrapped in
+        try/except, so a failure is journalled and swallowed. And it writes
+        only ``shadow_decision`` events, never a key in ``state.LOOP_KEYS``,
+        so it cannot corrupt trading state even if it is wrong.
+
+        A research feature that could interrupt a trading cycle would be a
+        safety regression however good its output.
+        """
+        evaluator = getattr(self, "shadow", None)
+        if evaluator is None:
+            return
+        try:
+            portfolio = {
+                "equity_usdt": equity,
+                "positions": positions,
+                "cooldowns": dict(st.get("cooldowns") or {}),
+                "active_trades": dict(st.get("active_trades") or {}),
+                "gross_notional": gross_notional,
+            }
+            records = evaluator.evaluate(snapshot, portfolio, time.time())
+            for record in records:
+                state.log_event(
+                    "shadow_decision", self._audit_json(record.as_event()),
+                    variant_id=record.variant_id)
+            budget = getattr(evaluator, "last_budget", None)
+            if budget is not None and budget.overran:
+                state.log_event("shadow_budget_overrun", self._audit_json({
+                    "limit_ms": budget.limit_ms,
+                    "spent_ms": round(budget.spent_ms(), 2),
+                    "records": len(records),
+                }))
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Shadow variant evaluation failed: %s", exc)
+            try:
+                state.log_event("shadow_failed", self._audit_json(
+                    {"error": f"{type(exc).__name__}: {exc}"}))
+            except Exception:                              # noqa: BLE001
+                pass
 
     # ------------------------------------------------------ reconciliation
 

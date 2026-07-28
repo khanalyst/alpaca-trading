@@ -59,7 +59,7 @@ def validate_config(raw: dict) -> dict:
     """Return a validated defensive copy of *raw* or raise ``ConfigError``."""
     cfg = deepcopy(_mapping(raw, "config"))
     _keys(cfg, {"mode", "llm", "strategy", "universe", "cycle", "risk",
-                "execution", "trading_costs", "alerts"}, "config")
+                "execution", "trading_costs", "alerts", "research"}, "config")
 
     mode = cfg.get("mode")
     if mode not in {"demo", "live"}:
@@ -355,5 +355,35 @@ def validate_config(raw: dict) -> dict:
     if alerts.get("minimum_level") not in {"warning", "error", "critical"}:
         raise ConfigError("alerts.minimum_level must be warning, error, or critical")
     _number(alerts, "timeout_seconds", 1, 30, "alerts")
+
+    # Optional. Absent means shadow evaluation is off, which is a complete
+    # no-op rather than a default-on feature - a research block that had to
+    # be explicitly disabled would eventually be left on by accident.
+    research = cfg.get("research")
+    if research is not None:
+        research = _mapping(research, "research")
+        _keys(research, {"shadow_enabled", "shadow_variants",
+                         "shadow_budget_ms", "shadow_llm_variants"},
+              "research")
+        _boolean(research, "shadow_enabled", "research")
+        _number(research, "shadow_budget_ms", 1, 60_000, "research")
+        for key in ("shadow_variants", "shadow_llm_variants"):
+            names = research.get(key)
+            if names is None:
+                research[key] = []
+                continue
+            if not isinstance(names, list) or not all(
+                    isinstance(n, str) and n.strip() for n in names):
+                raise ConfigError(
+                    f"research.{key} must be a list of variant id strings")
+        # Each LLM variant costs a full extra model call every cycle - about
+        # 288 a day. Ten of them is an order of magnitude more than the
+        # agent's entire current spend, so the ceiling is deliberately low
+        # and has to be raised on purpose.
+        if len(research["shadow_llm_variants"]) > 2:
+            raise ConfigError(
+                "research.shadow_llm_variants is capped at 2: each entry "
+                "costs a full extra LLM call per cycle")
+        cfg["research"] = research
 
     return cfg
