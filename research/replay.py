@@ -70,6 +70,10 @@ class ReplayDecision:
     take_pct: float | None = None
     notional: float | None = None
     outcome: dict | None = None
+    # The B0.5 enrichment for this symbol-cycle, carried alongside the
+    # decision so a conditioning axis can partition on it without a second
+    # pass over the corpus. Recorded, never shown to the model.
+    enrichment: dict = field(default_factory=dict)
 
     def key(self) -> tuple:
         return (self.cycle_id, self.symbol, self.direction, self.setup_type)
@@ -285,7 +289,8 @@ class Replay:
                         _confidence(decision),
                         stop_pct=sized.get("sl_pct"),
                         take_pct=sized.get("tp_pct"),
-                        notional=sized.get("notional"))
+                        notional=sized.get("notional"),
+                        enrichment=_enrichment_of(row, cycle))
                     record.outcome = self._resolve(
                         symbol, row, sized, decision, max_hold)
                     result.decisions.append(record)
@@ -368,6 +373,19 @@ class Replay:
             "mfe_pct": outcome.mfe_pct, "bars_held": outcome.bars_held,
             "tie_broken": outcome.tie_broken, "exit_ts": outcome.exit_ts,
         }
+
+
+def _enrichment_of(row: dict, cycle) -> dict:
+    """Merge the symbol and market enrichment blocks for this observation."""
+    from agent.brain import ENRICHMENT_KEY
+
+    out = {}
+    context = (cycle.snapshot.get("_market_context") or {})
+    if isinstance(context.get(ENRICHMENT_KEY), dict):
+        out.update(context[ENRICHMENT_KEY])
+    if isinstance(row.get(ENRICHMENT_KEY), dict):
+        out.update(row[ENRICHMENT_KEY])
+    return out
 
 
 def _confidence(decision: dict) -> float | None:

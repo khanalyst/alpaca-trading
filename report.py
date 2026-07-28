@@ -26,6 +26,13 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 
 
+# One scorer, not two. The round-trip matcher lives in research/score.py so
+# the live report and the replay harness compute expectancy the same way; two
+# implementations would produce two sets of numbers that cannot be compared,
+# and comparing them is the job.
+from research.score import match_round_trips  # noqa: E402,F401
+
+
 def configured_default_db() -> Path:
     """Use the same demo/live runtime scope selected by config.yaml."""
     try:
@@ -88,141 +95,6 @@ def load_trade_events(db: sqlite3.Connection) -> list[dict]:
         f"SELECT {', '.join(selected)} FROM trades ORDER BY ts"
     ).fetchall()
     return [dict(row) for row in rows]
-
-
-def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
-    """Match one open and its final close using only a durable trade ID."""
-    opens: dict[str, dict] = {}
-    partials: dict[str, list[dict]] = defaultdict(list)
-    duplicates: set[str] = set()
-    for event in events:
-        trade_id = event.get("trade_id")
-        if event.get("action") == "partial_close" and trade_id:
-            partials[str(trade_id)].append(event)
-        if event.get("action") != "open" or not trade_id:
-            continue
-        if trade_id in opens:
-            duplicates.add(str(trade_id))
-        else:
-            opens[str(trade_id)] = event
-
-    matched = []
-    matched_ids = set()
-    closed_ids = set()
-    unmatchable_closes = 0
-    unscored_closes = 0
-    for close in events:
-        if close.get("action") != "close":
-            continue
-        trade_id = close.get("trade_id")
-        if (not trade_id or str(trade_id) not in opens
-                or str(trade_id) in duplicates
-                or str(trade_id) in matched_ids):
-            unmatchable_closes += 1
-            continue
-        closed_ids.add(str(trade_id))
-        close_rows = partials.get(str(trade_id), []) + [close]
-        if close.get("realized_pnl_usd") is None:
-            unscored_closes += 1
-            continue
-        opened = opens[str(trade_id)]
-        notional = _number(opened.get("notional"))
-        risk = _number(opened.get("risk_usd"), _number(close.get("risk_usd")))
-        incremental = close.get("pnl_semantics") == "incremental_v1"
-        if incremental:
-            if any(row.get("realized_pnl_usd") is None for row in close_rows):
-                unscored_closes += 1
-                continue
-            pnl = sum(_number(row.get("realized_pnl_usd"))
-                      for row in close_rows)
-        else:
-            # Pre-migration close rows historically stored cumulative PnL in
-            # most paths. Do not add partial rows and double-count them.
-            pnl = _number(close.get("realized_pnl_usd"))
-        entry_fee = _number(opened.get("fee_usd"))
-        exit_fee = _number(close.get("fee_usd"))
-        entry_slippage = _number(opened.get("slippage_usd"))
-        exit_slippage = _number(close.get("slippage_usd"))
-        partial_fees = sum(_number(row.get("fee_usd"))
-                           for row in partials.get(str(trade_id), []))
-        partial_funding = sum(_number(row.get("funding_usd"))
-                              for row in partials.get(str(trade_id), []))
-        partial_slippage = sum(_number(row.get("slippage_usd"))
-                               for row in partials.get(str(trade_id), []))
-        partial_adverse_slippage = sum(
-            _number(row.get("adverse_slippage_usd"))
-            for row in partials.get(str(trade_id), []))
-        matched.append({
-            "trade_id": str(trade_id),
-            "symbol": opened.get("symbol"),
-            "open_ts": _number(opened.get("ts")),
-            "close_ts": _number(close.get("ts")),
-            "confidence": opened.get("confidence"),
-            "strategy_id": (
-                opened.get("strategy_id") or "legacy_unattributed"),
-            "strategy_version": (
-                opened.get("strategy_version") or "legacy"),
-            "setup_id": opened.get("setup_id"),
-            "setup_type": opened.get("setup_type") or "legacy",
-            "exit_policy": opened.get("exit_policy"),
-            "prompt_version": (
-                opened.get("prompt_version") or "legacy"),
-            "config_version": (
-                opened.get("config_version") or "legacy"),
-            "code_version": (
-                opened.get("code_version") or "legacy"),
-            "runtime_mode": (
-                opened.get("runtime_mode") or "legacy_unknown"),
-            "account_fingerprint": (
-                opened.get("account_fingerprint") or "legacy_unknown"),
-            "close_trigger": close.get("close_trigger"),
-            "close_evidence": close.get("close_evidence"),
-            "entry_equity_usd": _number(
-                opened.get("entry_equity_usd"), 0.0),
-            "pnl_semantics": (
-                "incremental_v1" if incremental else "legacy_cumulative"),
-            "notional_usd": notional,
-            "risk_usd": risk,
-            "net_pnl_usd": pnl,
-            "return_on_notional_pct": pnl / notional * 100 if notional else None,
-            "r_multiple": pnl / risk if risk else None,
-            "fees_usd": entry_fee + partial_fees + exit_fee,
-            "funding_usd": partial_funding + _number(close.get("funding_usd")),
-            "slippage_usd": (entry_slippage + partial_slippage
-                             + exit_slippage),
-            "adverse_slippage_usd": (
-                _number(opened.get("adverse_slippage_usd"))
-                + partial_adverse_slippage
-                + _number(close.get("adverse_slippage_usd"))
-            ),
-            # New close rows explicitly prove whether funding was recovered.
-            # A missing legacy tag is unknown, not evidence of zero funding.
-            "funding_status": (
-                close.get("funding_status") or "legacy_unknown"),
-            "funding_complete": (
-                close.get("funding_status") == "available"),
-            "open_fill_status": opened.get("fill_status"),
-            "close_fill_status": close.get("fill_status"),
-        })
-        matched_ids.add(str(trade_id))
-
-    open_ids = set(opens) - duplicates
-    diagnostics = {
-        "opens": sum(1 for event in events if event.get("action") == "open"),
-        "closes": sum(1 for event in events if event.get("action") == "close"),
-        "partial_closes": sum(
-            1 for event in events if event.get("action") == "partial_close"),
-        "unmatched_opens": len(open_ids - closed_ids),
-        "unmatchable_closes": unmatchable_closes,
-        "unscored_closes": unscored_closes,
-        "duplicate_trade_ids": len(duplicates),
-        "legacy_pnl_semantics": sum(
-            trade["pnl_semantics"] == "legacy_cumulative"
-            for trade in matched),
-        "funding_incomplete": sum(
-            not trade["funding_complete"] for trade in matched),
-    }
-    return matched, diagnostics
 
 
 def load_transfers(db: sqlite3.Connection) -> list[tuple[float, float]]:

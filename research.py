@@ -20,7 +20,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from research import (corpus, prices as prices_mod,             # noqa: E402
-                      replay as replay_mod, stats)
+                      replay as replay_mod, score, stats, sweep)
 
 
 def default_db(mode: str = "demo") -> Path:
@@ -165,6 +165,105 @@ def cmd_three_arm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_funnel(args: argparse.Namespace) -> int:
+    """Publish the veto distribution. Gate G4, and it runs before any sweep.
+
+    If the binding veto sits downstream of the strategy contract, then no
+    setting of any contract parameter can increase the trade count, and a
+    sweep would consume weeks to discover that the funnel narrows somewhere
+    else. Measuring first is the cheapest week in the programme.
+    """
+    db = Path(args.db) if args.db else default_db(args.mode)
+    if not db.exists():
+        print(f"no journal at {db}", file=sys.stderr)
+        return 1
+    cfg = _load_config()
+    cycles, outputs = _corpus_for(db)
+    result = replay_mod.Replay(
+        cfg, mode=args.replay_mode, price_cache=_price_cache(args)).run(
+            cycles, outputs)
+    funnel = score.funnel_from_replay(result)
+
+    print(f"funnel over {result.cycles:,} cycles, mode {result.mode}\n")
+    print(score.format_funnel(funnel))
+
+    reason, share = score.dominant_veto(funnel)
+    if reason:
+        print(f"\ndominant veto: {reason} ({share:.1f}% of all vetoes)")
+        if share > 30.0:
+            print(
+                "\nGate G4: one veto accounts for more than 30% of "
+                "rejections.\nIf it sits downstream of the strategy "
+                "contract, no contract parameter can\nincrease the trade "
+                "count. Sweeping them would be wasted calendar time -\n"
+                "fix the funnel first.")
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    spec = sweep.load_spec(args.spec)
+    db = Path(args.db) if args.db else default_db(args.mode)
+    if not db.exists():
+        print(f"no journal at {db}", file=sys.stderr)
+        return 1
+
+    trips = corpus.stats(db)["matched_round_trips"]
+    outlook = sweep.forecast(spec, trips)
+    print(f"sweep: {spec.name}")
+    print(f"hypothesis: {spec.hypothesis}\n")
+    print(f"  {outlook['reason']}")
+    if not outlook["should_run"] and not args.force:
+        print("\nRefusing to run. Reporting the shortfall once is cheaper "
+              "than reporting\nINSUFFICIENT_SAMPLE at every grid point, and "
+              "each repetition of that\nverdict makes relaxing the rule "
+              "more tempting.\n\nPrefer a conditioning axis, which reuses "
+              "every trade instead of dividing\nthem. Use --force only if "
+              "you intend to record a null result.", file=sys.stderr)
+        return 3
+
+    cfg = _load_config()
+    cache = _price_cache(args)
+    cycles, outputs = _corpus_for(db)
+
+    if spec.is_conditioning():
+        axis = spec.condition_axis
+        result = replay_mod.Replay(cfg, mode=args.replay_mode,
+                                   price_cache=cache).run(cycles, outputs)
+
+        def value_of(decision):
+            return (decision.enrichment or {}).get(axis.variable)
+
+        buckets = sweep.partition(result.executed(), axis, value_of)
+        scored = sweep.score_partition(buckets)
+        print(f"\nconditioning on {axis.variable}, "
+              f"pre-registered buckets:\n")
+        for name in [b.get("name") for b in axis.buckets]:
+            row = scored.get(name) or {"n": 0, "expectancy_r": 0.0,
+                                       "verdict": stats.INSUFFICIENT_SAMPLE,
+                                       "mde_r": float("inf")}
+            print(f"  {name:<20} n={row['n']:<5} "
+                  f"expectancy {row['expectancy_r']:+.4f}R  "
+                  f"MDE {row['mde_r']:.4f}R  {row['verdict']}")
+        print("\nEvery bucket is reported, including the empty ones. A "
+              "programme that\nrecords only positives records only noise.")
+        return 0
+
+    from agent import variants as variant_mod
+    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    print()
+    for variant in sweep.expand(spec, registry):
+        variant_cfg = variant_mod.apply(variant, cfg)
+        result = replay_mod.Replay(
+            variant_cfg, variant_id=variant.variant_id,
+            mode=args.replay_mode, price_cache=cache).run(cycles, outputs)
+        returns = [d.outcome["r_multiple"] for d in result.executed()
+                   if d.outcome]
+        row = score.score_returns(returns, label=variant.variant_id)
+        print(f"  {variant.variant_id:<40} n={row['n']:<5} "
+              f"expectancy {row['expectancy_r']:+.4f}R  {row['verdict']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -213,6 +312,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--prices", default=None,
         help="path to a 1m price cache; required to score any arm")
     three.set_defaults(func=cmd_three_arm)
+
+    funnel = sub.add_parser(
+        "funnel",
+        help="publish the veto distribution (gate G4; run before any sweep)")
+    funnel.add_argument("--db", default=None)
+    funnel.add_argument("--mode", default="demo", choices=["demo", "live"])
+    funnel.add_argument("--prices", default=None)
+    funnel.add_argument("--replay-mode", default="recorded_llm",
+                        choices=replay_mod.MODES)
+    funnel.set_defaults(func=cmd_funnel)
+
+    sweep_parser = sub.add_parser(
+        "sweep", help="run a registered parameter or conditioning axis")
+    sweep_parser.add_argument("spec", help="path to a research/sweeps/*.yaml")
+    sweep_parser.add_argument("--db", default=None)
+    sweep_parser.add_argument("--mode", default="demo",
+                              choices=["demo", "live"])
+    sweep_parser.add_argument("--prices", default=None)
+    sweep_parser.add_argument("--replay-mode", default="recorded_llm",
+                              choices=replay_mod.MODES)
+    sweep_parser.add_argument(
+        "--force", action="store_true",
+        help="run an underpowered grid anyway, to record a null result")
+    sweep_parser.set_defaults(func=cmd_sweep)
 
     return parser
 
