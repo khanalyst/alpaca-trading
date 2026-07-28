@@ -269,10 +269,18 @@ def download_symbol(inst_id: str, out: Path, start_ms: int, end_ms: int,
         if covered(spot_path, start_ms, end_ms, 4 * BAR_MS["15m"]):
             spot = pd.read_csv(spot_path)
         else:
-            spot = api.candles(
-                inst_id.replace("-SWAP", ""), "15m", start_ms, end_ms)
-            spot_path.parent.mkdir(parents=True, exist_ok=True)
-            spot.to_csv(spot_path, index=False)
+            # Only the perp/index basis needs spot, and not every swap has a
+            # listed spot pair (OKX answers 51001). Losing basis for one
+            # instrument is a missing column; aborting is a missing dataset.
+            try:
+                spot = api.candles(
+                    inst_id.replace("-SWAP", ""), "15m", start_ms, end_ms)
+                spot_path.parent.mkdir(parents=True, exist_ok=True)
+                spot.to_csv(spot_path, index=False)
+            except Exception as exc:                       # noqa: BLE001
+                print(f"[warn] {inst_id}: no spot history ({str(exc)[:80]}); "
+                      f"perp/index basis unavailable for it", flush=True)
+                spot = pd.DataFrame()
         result["spot_bars"] = len(spot)
 
     if want_oi:
@@ -365,13 +373,32 @@ def main() -> int:
         f"{datetime.fromtimestamp(end_ms/1000, timezone.utc)}", flush=True)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        results = list(pool.map(
-            lambda inst_id: download_symbol(
+    def safe_download(inst_id: str) -> dict:
+        """Never let one instrument abort the download.
+
+        pool.map() propagates the first exception and discards every other
+        result, so a single delisted pair or transient 51001 used to cost the
+        entire dataset - and the caller would then score whatever stale data
+        was already on disk, silently, believing it had refreshed.
+        """
+        try:
+            return download_symbol(
                 inst_id, args.out, start_ms, end_ms,
-                not args.no_spot, not args.no_oi),
-            inst_ids,
-        ))
+                not args.no_spot, not args.no_oi)
+        except Exception as exc:                           # noqa: BLE001
+            print(f"[FAILED] {inst_id}: {str(exc)[:160]}", flush=True)
+            return {"symbol": inst_id, "inst_id": inst_id,
+                    "error": str(exc)[:300]}
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        results = list(pool.map(safe_download, inst_ids))
+
+    failed = [r for r in results if r.get("error")]
+    if failed:
+        print(f"\n{len(failed)} of {len(results)} instruments failed:",
+              flush=True)
+        for row in failed:
+            print(f"  {row['inst_id']}: {row['error'][:120]}", flush=True)
 
     usable = [r for r in results if r.get("swap_bars", 0) > 5000]
     manifest = {
