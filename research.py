@@ -19,8 +19,9 @@ REPO = Path(__file__).resolve().parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from research import (corpus, prices as prices_mod,             # noqa: E402
-                      replay as replay_mod, score, stats, sweep)
+from research import (corpus, findings as findings_mod,         # noqa: E402
+                      prices as prices_mod, replay as replay_mod,
+                      score, stats, sweep)
 
 
 def default_db(mode: str = "demo") -> Path:
@@ -264,6 +265,27 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    """Regenerate every scorecard from the store, deterministically."""
+    from agent import variants as variant_mod
+
+    store = findings_mod.FindingsStore(
+        args.store or findings_mod.DEFAULT_STORE)
+    # Registered-but-unrun variants still get a card: "no sample yet" is a
+    # state worth being able to see.
+    for variant in variant_mod.load_registry(
+            REPO / "research" / "variants.yaml").values():
+        store.register(variant)
+
+    written = findings_mod.write_scorecards(
+        store, args.out or (REPO / "findings"))
+    print(f"regenerated {len(written)} files under "
+          f"{args.out or (REPO / 'findings')}")
+    for path in written:
+        print(f"  {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -336,6 +358,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="run an underpowered grid anyway, to record a null result")
     sweep_parser.set_defaults(func=cmd_sweep)
+
+    report_parser = sub.add_parser(
+        "report", help="regenerate the committed scorecards")
+    report_parser.add_argument("--store", default=None)
+    report_parser.add_argument("--out", default=None)
+    report_parser.set_defaults(func=cmd_report)
 
     return parser
 

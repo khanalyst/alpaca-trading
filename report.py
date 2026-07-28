@@ -470,12 +470,55 @@ def print_transfers(transfers: list[tuple[float, float]]) -> None:
         print(f"  {fmt_ts(ts)} UTC   {net:+,.2f} USDT")
 
 
-def main(path: Path | None = None) -> int:
-    db_path = path or (Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_DB)
+def json_report(db: sqlite3.Connection) -> dict:
+    """The same numbers the text output shows, machine-readable.
+
+    Added because intention #5 needs results that survive the terminal
+    scrollback, and because a human reading a table cannot be diffed against
+    last week's table. Everything here is derived from the same
+    match_round_trips call the printed report uses, so the two cannot drift.
+    """
+    from research.score import score_returns
+
+    transfers = load_transfers(db)
+    events = load_trade_events(db)
+    trades, diagnostics = match_round_trips(events)
+    r_values = [t["r_multiple"] for t in trades
+                if t.get("r_multiple") is not None]
+    per_strategy: dict = {}
+    for trade in trades:
+        per_strategy.setdefault(
+            trade.get("strategy_id") or "unknown", []).append(trade)
+
+    return {
+        "schema": 1,
+        "round_trips": len(trades),
+        "diagnostics": diagnostics,
+        "overall": score_returns(r_values, label="all"),
+        "per_strategy": {
+            name: score_returns(
+                [t["r_multiple"] for t in rows
+                 if t.get("r_multiple") is not None], label=name)
+            for name, rows in sorted(per_strategy.items())
+        },
+        "transfers": len(transfers),
+    }
+
+
+def main(path: Path | None = None, as_json: bool = False) -> int:
+    argv = [a for a in sys.argv[1:] if a != "--json"]
+    as_json = as_json or "--json" in sys.argv
+    db_path = path or (Path(argv[0]) if argv else DEFAULT_DB)
     if not db_path.exists():
         print(f"No journal at {db_path} - run the agent first.")
         return 1
     db = sqlite3.connect(db_path)
+    if as_json:
+        try:
+            print(json.dumps(json_report(db), indent=2, default=str))
+        finally:
+            db.close()
+        return 0
     try:
         transfers = load_transfers(db)
         events = load_trade_events(db)
