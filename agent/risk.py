@@ -45,7 +45,13 @@ class RiskEngine:
                  entry_feedback: dict | None = None,
                  entry_failures: dict | None = None,
                  active_trades: dict | None = None,
+                 now: float | None = None,
                  ) -> tuple[dict | None, str | None]:
+        # Injectable clock, defaulting to the real one. Replay must be able
+        # to evaluate a cooldown as of the moment the decision was actually
+        # made; using wall-clock time there would expire every cooldown in
+        # the corpus and silently admit trades the live agent refused.
+        now = time.time() if now is None else float(now)
         symbol = decision["symbol"]
 
         try:
@@ -140,7 +146,7 @@ class RiskEngine:
             return None, "confidence is not finite"
         if confidence < float(self.r["min_confidence"]):
             return None, "confidence below floor"
-        if float(cooldowns.get(symbol, 0)) > time.time():
+        if float(cooldowns.get(symbol, 0)) > now:
             return None, "symbol in post-loss cooldown"
         failure = (entry_failures or {}).get(symbol)
         if failure is not None:
@@ -154,8 +160,8 @@ class RiskEngine:
             if (not math.isfinite(blocked_until)
                     or not math.isfinite(expires_at)):
                 return None, "execution failure feedback is invalid"
-            if (expires_at > time.time()
-                    and blocked_until > time.time()):
+            if (expires_at > now
+                    and blocked_until > now):
                 return None, "symbol in execution failure backoff"
 
         execution_choice = str(
@@ -182,8 +188,8 @@ class RiskEngine:
                     expires_at, blocked_until, max_retry_pct)):
                 return None, "liquidity retry feedback is invalid"
             same_direction = feedback.get("direction") == decision["direction"]
-            if same_direction and expires_at > time.time():
-                if blocked_until > time.time():
+            if same_direction and expires_at > now:
+                if blocked_until > now:
                     return None, "symbol in liquidity backoff"
                 if max_retry_pct <= 0:
                     return None, "liquidity retry has no safe executable size"
