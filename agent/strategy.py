@@ -32,6 +32,7 @@ SETUP_TYPES = {
     "carry",
     "trend_follow",
     "positioning_fade",
+    "positioning_unwind",
     "spread_capture",
 }
 INVALIDATION_ANCHORS = {"structure", "atr"}

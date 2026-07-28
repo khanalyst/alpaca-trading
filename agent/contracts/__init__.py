@@ -44,5 +44,6 @@ def register(strategy_id: str, builder) -> None:
     EVIDENCE_BUILDERS[strategy_id] = builder
 
 
-from . import (flush_fade, funding_carry, ls_ratio_fade,  # noqa: E402,F401
+from . import (flush_fade, funding_carry,  # noqa: E402,F401
+               funding_unwind, ls_ratio_fade,
                momentum_phase1v2, trend_multiday)         # (register on import)

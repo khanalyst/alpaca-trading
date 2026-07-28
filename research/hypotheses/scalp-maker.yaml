@@ -1,0 +1,52 @@
+# Pre-registration: scalp-maker / v1
+#
+# Registered so the tournament reports WHY it is unscored rather than
+# silently skipping it. It is blocked on data that does not exist yet, not
+# on development effort, and that distinction should be visible.
+
+strategy_id: scalp-maker
+version: v1
+status: registered_blocked_on_data
+
+mechanism: |
+  A maker is paid the spread for supplying liquidity; the payer is the
+  impatient taker who crosses it. This does not require predicting
+  direction, which is why it is the one scalping design that is not
+  arithmetically dead: round-trip taker cost alone (~0.10%) exceeds a
+  typical 1-minute move on a major.
+
+prediction: |
+  Resting limit orders on tight-spread majors, filled inside ~10 bps of
+  price penetration, earn the fee differential plus avoided entry slippage
+  (~+0.105%) net of adverse selection.
+
+falsification: |
+  Recorded book state shows resting orders require more than ~10-15 bps of
+  penetration to fill, at which point adverse selection exceeds the fee
+  saving and the strategy is negative by construction. The existing maker
+  study puts the crossover between 5 and 15 bps.
+
+backtestable: false
+why_not_backtestable: |
+  Maker profitability is decided by fill quality, fill quality is decided by
+  queue position, and queue position depends on order-book state that OKX
+  has NEVER served historically. No amount of candle data recovers it.
+
+  research/record_flow.py has been capturing 1-25 bps depth bands and
+  book_span_bps since it was started. The first honest result is roughly
+  three months after that point. Any number produced before then is a guess
+  wearing a backtest's clothes.
+
+hypotheses_tested: 0
+multiple_testing_note: |
+  Zero, because nothing has been tested. The count starts when the data
+  does.
+
+design_constraints_already_measured: |
+  - Spread varies ~90x across the tradable universe (BTC 0.015 bps, DOGE
+    1.39 bps), so this is a tight-spread majors-only design.
+  - Depth is not the binding constraint at retail size: even thin names
+    offer ~$20k within 25 bps against a ~$3k position from a $10k account.
+  - execution.max_spread_pct is 15 bps, which is permissive enough that it
+    never binds on majors - so it is not currently protecting anything and
+    would need tightening for a maker design.

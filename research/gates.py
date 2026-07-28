@@ -301,7 +301,7 @@ def mechanism_is_the_source(frames, membership, contract, prereg,
             "mechanism_is_the_source", True,
             "no isolable return source declared; not checked", {})
 
-    if source != "funding":
+    if source not in {"funding", "price"}:
         return GateResult(
             "mechanism_is_the_source", True,
             f"return source {source!r} cannot be isolated by this harness; "
@@ -322,19 +322,25 @@ def mechanism_is_the_source(frames, membership, contract, prereg,
             "mechanism_is_the_source", False,
             "candidate has no measurable result to attribute",
             {"declared_source": source})
-    contribution = with_source - without_source
-    share = contribution / with_source
+    funding_contribution = with_source - without_source
+    funding_share = funding_contribution / with_source
+    # A strategy claiming PRICE as its source must not turn out to be a
+    # carry trade any more than the reverse. The check is symmetric because
+    # the failure is symmetric: in both directions it means the result comes
+    # from somewhere other than where the claim says.
+    share = funding_share if source == "funding" else 1.0 - funding_share
     passed = share >= 0.5
     return GateResult(
         "mechanism_is_the_source", passed,
-        (f"{source} contributes {contribution:+.4f}% of {with_source:+.4f}% "
-         f"({share:.0%}); the rest is price movement"
+        (f"declared source {source!r} accounts for {share:.0%} of "
+         f"{with_source:+.4f}% (funding {funding_contribution:+.4f}%, "
+         f"price {without_source:+.4f}%)"
          + ("" if passed else
             " - the stated mechanism is not the source of the result")),
         {"declared_source": source,
          "total_pct": with_source,
-         "source_contribution_pct": contribution,
-         "residual_pct": without_source,
+         "funding_contribution_pct": funding_contribution,
+         "price_contribution_pct": without_source,
          "source_share": share,
          "pass_at_or_above": 0.5},
     )

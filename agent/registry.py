@@ -269,6 +269,50 @@ REGISTRY: dict[str, StrategySpec] = {
                       "research/hypotheses/funding-carry.yaml"),
         ),
         StrategySpec(
+            id="funding-unwind",
+            version="v1",
+            mechanism=(
+                "Extreme funding is a POSITIONING indicator, not a yield "
+                "opportunity. When funding sits at the top of its own recent "
+                "range, leveraged longs are crowded and paying to stay in. "
+                "Crowded leveraged positions are unstable: they are held by "
+                "traders who need the move to continue in order to keep "
+                "affording the position, and who are forced out when it does "
+                "not. The payer is the crowded leveraged trader squeezed out "
+                "of a position they could not finance. This is the opposite "
+                "economics to funding-carry, whose carry claim was falsified "
+                "at 2% attribution; here the carry is incidental and the "
+                "return is the unwind."),
+            falsification=(
+                "Funding contributes 50% or more of the result, which would "
+                "make it the carry trade already rejected; or the effect "
+                "fails outside 2026-05..2026-07, the window that generated "
+                "it; or the placebo reaches 25% of the candidate; or it "
+                "fails to beat the random-timing and random-direction "
+                "nulls."),
+            tier="T1_HYPOTHESIS",
+            signal_timeframe="1h",
+            required_timeframes=("1h", "4h"),
+            max_hold_hours_ceiling=240.0,
+            execution_style="taker",
+            setup_types=("positioning_unwind",),
+            implemented=True,
+            contract_params={
+                "funding_extreme_pct_per_8h": 0.01,
+                "unwind_percentile": 80.0,
+                "unwind_min_samples": 20,
+                "hard_max_entry_extension_atr": 3.0,
+            },
+            notes=(
+                "GENERATED from funding-carry's decomposition on this same "
+                "window, so any result here is in-sample by construction and "
+                "cannot confirm it. Stays T1 until out-of-sample funding "
+                "history or enough forward shadow evidence exists; the "
+                "tournament's sample-size cap enforces that independently of "
+                "how large the in-sample number looks."),
+            evidence=("research/hypotheses/funding-unwind.yaml",),
+        ),
+        StrategySpec(
             id="trend-multiday",
             version="v1",
             mechanism=(

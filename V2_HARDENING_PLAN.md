@@ -1,5 +1,26 @@
 # v2-hardening — development plan
 
+> **Status: batches 0-4 delivered.** See `research/results/tournament/REPORT.md`
+> for the current leaderboard. Three things the plan did not anticipate, all
+> discovered by running the harness rather than by reasoning about it:
+>
+> - **Null baselines were unreproducible.** `build_trades` seeded them with
+>   Python's per-process-randomised `str.hash()`, so identical commands gave
+>   different verdicts. A tier flipped between consecutive runs. Fixed with
+>   crc32.
+> - **A seventh gate was needed.** `funding-carry` posted +2.008%/trade and
+>   passed all six. Decomposed: funding contributed 2% of the result and
+>   price movement 98%. `mechanism_is_the_source` now checks that the money
+>   comes from where the mechanism says.
+> - **Provenance needed enforcing.** The replacement hypothesis generated
+>   from that decomposition clears every gate on the window that suggested
+>   it. Pre-registrations now declare `in_sample_by_construction`, and the
+>   tournament caps such hypotheses at T1 regardless of the numbers.
+>
+> Batch 5 is largely absorbed into batch 4. What remains is `scalp-maker`,
+> which is blocked on ~3 months of recorded order-book data, and whatever
+> the shadow evidence says once the loop has been running.
+
 A batch-ordered plan to convert this repository from *one strategy that has
 been measured and failed* into *a tournament that continuously evaluates many
 strategies, reports a confidence tier for each, and lets one line of config

@@ -1,6 +1,6 @@
 # Strategy tournament
 
-Generated 2026-07-28 11:48:03Z from `runtime/research/data`.
+Generated 2026-07-28 12:12:46Z from `runtime/research/data`.
 
 - instruments: 8
 - bars per instrument (min): 19200
@@ -19,10 +19,11 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | `trend-multiday/v1` | T2_CANDIDATE | 628 | +0.0876 | -0.0251 | 1 | HOLD - promising but not clear of the placebo/cost gates |
 | `momentum/phase1-v2` | T2_CANDIDATE | 906 | -0.0553 | -0.0741 | 79 | HOLD - promising but not clear of the placebo/cost gates |
+| `funding-unwind/v1` | T1_HYPOTHESIS | 116 | +2.0079 | +0.4268 | 2 | HOLD - keep collecting data; nothing testable has passed yet |
 | `funding-carry/v1` | T0_REJECTED | 116 | +2.0079 | +0.4268 | 1 | REJECT - archive with the finding; do not retest without a new mechanism |
 | `flush-fade/v1` | T0_REJECTED | 337 | -0.2876 | -0.1572 | 1 | REJECT - archive with the finding; do not retest without a new mechanism |
 | `ls-ratio-fade` | T1_HYPOTHESIS (registered) | - | - | - | - | registered but no research contract implements it yet; see the register's notes for what blocks it |
-| `scalp-maker` | T1_HYPOTHESIS (registered) | - | - | - | - | no pre-registration at research/hypotheses/scalp-maker.yaml; write the mechanism, parameters and hypothesis count before running the test |
+| `scalp-maker` | T1_HYPOTHESIS (registered) | - | - | - | - | registered but no research contract implements it yet; see the register's notes for what blocks it |
 
 ## trend-multiday/v1
 
@@ -68,9 +69,29 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 
 *Forward evidence: no forward evidence recorded yet.*
 
+## funding-unwind/v1
+
+**Measured tier: T1_HYPOTHESIS** - gates return T3_VALIDATED, but this hypothesis was generated from the data it is scored on, so the result is in-sample by construction. Needs data that did not suggest it: Out-of-sample data. Specifically: funding history from a period outside 2026-05..2026-07, or enough forward shadow evidence to reach the trade count the detectability gate computes. Until one of those
+
+**Mechanism.** Extreme funding is a POSITIONING indicator, not a yield opportunity. When funding sits at the top of its own recent range, leveraged longs are crowded and paying to stay in. Crowded leveraged positions are unstable: they are held by traders who need the move to continue in order to keep affording the position, and who are forced out when it does not. The payer is the crowded leveraged trader squeezed out of a position they could not finance. This is the opposite economics to funding-carry, whose carry claim was falsified at 2% attribution; here the carry is incidental and the return is the unwind.
+
+**Falsified by.** Funding contributes 50% or more of the result, which would make it the carry trade already rejected; or the effect fails outside 2026-05..2026-07, the window that generated it; or the placebo reaches 25% of the candidate; or it fails to beat the random-timing and random-direction nulls.
+
+| Gate | Result | Detail |
+| --- | --- | --- |
+| `has_mechanism` | pass | mechanism and falsification criterion are both stated |
+| `beat_nulls` | pass | signal +2.0079% beats every null |
+| `survive_oos` | pass | in-sample +1.4668%, out-of-sample +3.7247% |
+| `survive_costs` | pass | net +2.0079% at base costs, breakeven cost 2.3186% vs 0.20% charged |
+| `survive_placebo` | pass | placebo -0.0767% is -4% of candidate +2.0079% |
+| `mechanism_is_the_source` | pass | declared source 'price' accounts for 98% of +2.0079% (funding +0.0391%, price +1.9689%) |
+| `is_detectable` | pass | +0.4268 R needs 80 trades (~0.9 months at 3/day) |
+
+*Forward evidence: no forward evidence recorded yet.*
+
 ## funding-carry/v1
 
-**Measured tier: T0_REJECTED** - funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result
+**Measured tier: T0_REJECTED** - declared source 'funding' accounts for 2% of +2.0079% (funding +0.0391%, price +1.9689%) - the stated mechanism is not the source of the result
 
 **Mechanism.** Funding is the price of leverage. When positioning is crowded the crowd pays continuously to hold, and the payer is the leveraged long in a persistently positive-funding regime. The return source is the carry itself rather than a directional forecast.
 
@@ -83,7 +104,7 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 | `survive_oos` | pass | in-sample +1.4668%, out-of-sample +3.7247% |
 | `survive_costs` | pass | net +2.0079% at base costs, breakeven cost 2.3186% vs 0.20% charged |
 | `survive_placebo` | pass | placebo -0.0767% is -4% of candidate +2.0079% |
-| `mechanism_is_the_source` | FAIL | funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result |
+| `mechanism_is_the_source` | FAIL | declared source 'funding' accounts for 2% of +2.0079% (funding +0.0391%, price +1.9689%) - the stated mechanism is not the source of the result |
 | `is_detectable` | pass | +0.4268 R needs 80 trades (~0.9 months at 3/day) |
 
 *Forward evidence: no forward evidence recorded yet.*

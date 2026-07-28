@@ -10,7 +10,7 @@
   "cost_scenario": "base",
   "data_root": "runtime/research/data",
   "exit_policy": "fixed_rr",
-  "generated_utc": "2026-07-28 11:48:03Z",
+  "generated_utc": "2026-07-28 12:12:46Z",
   "instruments": 8,
   "min_bars": 19200,
   "strategies": [
@@ -293,6 +293,156 @@
       "version": "phase1-v2"
     },
     {
+      "falsification": "Funding contributes 50% or more of the result, which would make it the carry trade already rejected; or the effect fails outside 2026-05..2026-07, the window that generated it; or the placebo reaches 25% of the candidate; or it fails to beat the random-timing and random-direction nulls.",
+      "forward": {
+        "status": "no forward evidence recorded yet"
+      },
+      "gates": [
+        {
+          "gate": "has_mechanism",
+          "numbers": {
+            "falsification_chars": 287,
+            "mechanism_chars": 604
+          },
+          "passed": true,
+          "summary": "mechanism and falsification criterion are both stated"
+        },
+        {
+          "gate": "beat_nulls",
+          "numbers": {
+            "beaten_by": [],
+            "expectancy_pct": {
+              "inverted": {
+                "expectancy_pct": -1.52564127089088,
+                "trades": 142
+              },
+              "null_random_direction": {
+                "expectancy_pct": -0.7587549423586948,
+                "trades": 135
+              },
+              "null_random_timing": {
+                "expectancy_pct": 0.27361812143636394,
+                "trades": 476
+              },
+              "signal": {
+                "expectancy_pct": 2.007923769683454,
+                "trades": 116
+              }
+            }
+          },
+          "passed": true,
+          "summary": "signal +2.0079% beats every null"
+        },
+        {
+          "gate": "survive_oos",
+          "numbers": {
+            "in_sample_pct": 1.4668138793878391,
+            "in_sample_trades": 70,
+            "out_of_sample_pct": 3.724710588738951,
+            "out_of_sample_trades": 41,
+            "purge_days": 3,
+            "split": 0.6
+          },
+          "passed": true,
+          "summary": "in-sample +1.4668%, out-of-sample +3.7247%"
+        },
+        {
+          "gate": "survive_costs",
+          "numbers": {
+            "base_round_trip_cost_pct": 0.2,
+            "breakeven_cost_pct": 2.3186259244025904,
+            "expectancy_pct_by_scenario": {
+              "base": 2.007923769683454,
+              "frictionless": 2.3186259244025904,
+              "optimistic": 2.2895982064446323,
+              "realistic_alt": 1.8158681333441928,
+              "stress": 1.850251108169337
+            },
+            "required_headroom_x": 2.0
+          },
+          "passed": true,
+          "summary": "net +2.0079% at base costs, breakeven cost 2.3186% vs 0.20% charged"
+        },
+        {
+          "gate": "survive_placebo",
+          "numbers": {
+            "candidate_pct": 2.007923769683454,
+            "fail_at_or_above": 0.5,
+            "pass_below": 0.25,
+            "placebo_draws": [
+              -0.23420011755444442,
+              0.2569062225068944,
+              -0.2467977441142618,
+              0.3455416490035633,
+              -0.5049926522230899
+            ],
+            "placebo_mean_pct": -0.07670852847626768,
+            "ratio": -0.03820290871319315
+          },
+          "passed": true,
+          "summary": "placebo -0.0767% is -4% of candidate +2.0079%"
+        },
+        {
+          "gate": "mechanism_is_the_source",
+          "numbers": {
+            "declared_source": "price",
+            "funding_contribution_pct": 0.039069863471646205,
+            "pass_at_or_above": 0.5,
+            "price_contribution_pct": 1.968853906211808,
+            "source_share": 0.9805421579934752,
+            "total_pct": 2.007923769683454
+          },
+          "passed": true,
+          "summary": "declared source 'price' accounts for 98% of +2.0079% (funding +0.0391%, price +1.9689%)"
+        },
+        {
+          "gate": "is_detectable",
+          "numbers": {
+            "days_needed": 26.666666666666668,
+            "effect_r": 0.42675958483285137,
+            "max_acceptable": 3000,
+            "observed_trades": 116,
+            "sd_r": 1.3588135603203921,
+            "trades_needed": 80
+          },
+          "passed": true,
+          "summary": "+0.4268 R needs 80 trades (~0.9 months at 3/day)"
+        }
+      ],
+      "headline": {
+        "avg_hold_h": 58.025862068965516,
+        "expectancy_pct": 2.007923769683454,
+        "expectancy_r": 0.42675958483285137,
+        "expectancy_r_ci95": [
+          0.386076174224356,
+          0.5313997464013878
+        ],
+        "label": "base",
+        "median_pct": 1.4755833268023533,
+        "monthly_mean_r": 0.4363485178824904,
+        "monthly_t_stat": 9.17622654631692,
+        "months": 3,
+        "positive_months_pct": 100.0,
+        "profit_factor": 1.9832335455447274,
+        "significant": true,
+        "stop_rate_pct": 46.55172413793103,
+        "timeout_rate_pct": 4.310344827586207,
+        "total_r": 49.50411184061076,
+        "tp_rate_pct": 49.137931034482754,
+        "trades": 116,
+        "win_rate_pct": 52.58620689655172
+      },
+      "hypotheses_tested": 2,
+      "measured_tier": "T1_HYPOTHESIS",
+      "mechanism": "Extreme funding is a POSITIONING indicator, not a yield opportunity. When funding sits at the top of its own recent range, leveraged longs are crowded and paying to stay in. Crowded leveraged positions are unstable: they are held by traders who need the move to continue in order to keep affording the position, and who are forced out when it does not. The payer is the crowded leveraged trader squeezed out of a position they could not finance. This is the opposite economics to funding-carry, whose carry claim was falsified at 2% attribution; here the carry is incidental and the return is the unwind.",
+      "registered_tier": "T1_HYPOTHESIS",
+      "scored": true,
+      "strategy_id": "funding-unwind",
+      "tier_changed": false,
+      "tier_reason": "gates return T3_VALIDATED, but this hypothesis was generated from the data it is scored on, so the result is in-sample by construction. Needs data that did not suggest it: Out-of-sample data. Specifically: funding history from a period outside 2026-05..2026-07, or enough forward shadow evidence to reach the trade count the detectability gate computes. Until one of those",
+      "version": "v1"
+    },
+    {
       "falsification": "Holding the funding-receiving side through settlements does not produce positive net expectancy once price risk over the same window is charged against it.",
       "forward": {
         "status": "no forward evidence recorded yet"
@@ -386,14 +536,14 @@
           "gate": "mechanism_is_the_source",
           "numbers": {
             "declared_source": "funding",
+            "funding_contribution_pct": 0.039069863471646205,
             "pass_at_or_above": 0.5,
-            "residual_pct": 1.968853906211808,
-            "source_contribution_pct": 0.039069863471646205,
+            "price_contribution_pct": 1.968853906211808,
             "source_share": 0.01945784200652473,
             "total_pct": 2.007923769683454
           },
           "passed": false,
-          "summary": "funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result"
+          "summary": "declared source 'funding' accounts for 2% of +2.0079% (funding +0.0391%, price +1.9689%) - the stated mechanism is not the source of the result"
         },
         {
           "gate": "is_detectable",
@@ -439,7 +589,7 @@
       "scored": true,
       "strategy_id": "funding-carry",
       "tier_changed": false,
-      "tier_reason": "funding contributes +0.0391% of +2.0079% (2%); the rest is price movement - the stated mechanism is not the source of the result",
+      "tier_reason": "declared source 'funding' accounts for 2% of +2.0079% (funding +0.0391%, price +1.9689%) - the stated mechanism is not the source of the result",
       "version": "v1"
     },
     {
@@ -592,7 +742,8 @@
       "version": "v1"
     },
     {
-      "reason": "no pre-registration at research/hypotheses/scalp-maker.yaml; write the mechanism, parameters and hypothesis count before running the test",
+      "notes": "Hard-blocked on data, not on development. OKX never serves historical order books, so fill quality cannot be simulated until research/record_flow.py has collected it. First honest result is roughly three months after recording starts. Spread varies ~90x across the universe (BTC 0.015 bps, DOGE 1.39 bps), so this is a tight-spread majors-only design.",
+      "reason": "registered but no research contract implements it yet; see the register's notes for what blocks it",
       "registered_tier": "T1_HYPOTHESIS",
       "scored": false,
       "strategy_id": "scalp-maker",
