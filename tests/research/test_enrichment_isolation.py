@@ -166,12 +166,19 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         cfg = valid_config()
         system = brain.build_system(cfg)
 
-        # Pinned by hand at the B0.5 boundary. A value derived from
-        # build_system() would agree with itself no matter what the prompt
-        # said, which is the one thing this assertion must not do.
+        # Pinned by hand. A value derived from build_system() would agree
+        # with itself no matter what the prompt said, which is the one thing
+        # this assertion must not do.
+        #
+        # b9a09a9dc3bc59ec -> 8d99182f0dcea1c4 in batch 6.1, which removed
+        # structure_target from the model's option set and tightened the
+        # invalidation-anchor rule. That is a deliberate attribution fork:
+        # pre-6.1 and post-6.1 observations describe different decision
+        # spaces and must never be pooled. The constant moves only in a batch
+        # that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "b9a09a9dc3bc59ec",
+            "8d99182f0dcea1c4",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

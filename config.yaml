@@ -29,7 +29,17 @@ strategy:
   id: momentum
   version: phase1-v2
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
-  allow_experimental_setups_in_demo: true  # "other" ideas are demo-only
+  # Batch 6.3, interim. "other" bypasses the evidence contract entirely and
+  # pools every distinct experimental idea under one label, so report.py
+  # groups them into a single row and nothing can be learned from any of
+  # them. It is also demo-only, which means demo statistics are contaminated
+  # by a population of trades live will silently refuse.
+  #
+  # The replacement is a registered hypothesis id chosen from an explicit
+  # versioned list, each with its own contract and its own attribution. That
+  # changes the prompt, so it belongs with the 6.5 version bump rather than
+  # here. Until then this is false, so demo statistics mean something.
+  allow_experimental_setups_in_demo: false
   setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
   setup_memory_hours: 72        # bounded operational idempotency history
   loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence

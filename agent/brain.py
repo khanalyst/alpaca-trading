@@ -290,8 +290,8 @@ no markdown fences, no comments. Schema:
 ]}
 Rules: setup_type must be trend_continuation, range_breakout, funding_squeeze \
 or other; other is experimental and demo-only. invalidation_anchor must be \
-structure or atr; trend_continuation and range_breakout require structure. \
-exit_policy must be fixed_rr, extended_rr or structure_target. \
+structure or atr; every contracted setup requires structure. \
+exit_policy must be fixed_rr or extended_rr. \
 execution_choice is normal unless current liquidity feedback justifies \
 retry_smaller. what_changed_since_last_loss is required only when retrying \
 the same direction/setup after a recorded loss. Confidence is in [0,1]. \

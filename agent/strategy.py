@@ -36,7 +36,16 @@ SETUP_TYPES = {
     "spread_capture",
 }
 INVALIDATION_ANCHORS = {"structure", "atr"}
-EXIT_POLICIES = {"fixed_rr", "extended_rr", "structure_target"}
+# structure_target was removed in batch 6.1. It computed
+# max(stop_pct * fixed_rr, distance_to_recent_extreme), and in both setups it
+# was designed for the first term always won: a range_breakout fires at
+# range_pos_pct >= 85, so price is already at the highs and the remaining
+# distance is ~0, and a trend_continuation pullback sits 1-2% from the swing
+# while stop_pct * fixed_rr is ~4%. The policy was therefore identical to
+# fixed_rr precisely where it was meant to differ. An inert choice is worse
+# than no choice: it makes the decision space look richer than it is, and
+# attributes outcomes to a policy that never applied.
+EXIT_POLICIES = {"fixed_rr", "extended_rr"}
 EXECUTION_CHOICES = {"normal", "retry_smaller"}
 SETUP_STATUSES = {
     "proposed", "risk_rejected", "attempted", "execution_rejected",
@@ -208,8 +217,13 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     anchor = str(decision.get("invalidation_anchor") or "")
     if anchor not in INVALIDATION_ANCHORS:
         return None, "invalidation anchor is not recognised"
-    if setup_type in {"trend_continuation", "range_breakout"} \
-            and anchor != "structure":
+    # Every contracted setup requires a structure invalidation, funding_squeeze
+    # included. It was previously the one setup permitted the ATR anchor, which
+    # yields exactly min_stop_atr_multiple - the narrowest stop the system can
+    # produce - for a counter-trend, mean-reversion entry into a crowded book.
+    # That is backwards: fading a crowd needs more room than following one.
+    if setup_type in {"trend_continuation", "range_breakout",
+                      "funding_squeeze"} and anchor != "structure":
         return None, f"{setup_type} requires a structure invalidation"
 
     exit_policy = str(decision.get("exit_policy") or "")
@@ -263,11 +277,6 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     fixed_rr = float(block["fixed_reward_risk"])
     if exit_policy == "extended_rr":
         take_pct = stop_pct * float(block["extended_reward_risk"])
-    elif exit_policy == "structure_target":
-        target_field = (
-            "swing_high_pct" if direction == "long" else "swing_low_pct")
-        structure_target = _finite(symbol_snapshot.get(target_field), 0.0) or 0.0
-        take_pct = max(stop_pct * fixed_rr, structure_target)
     else:
         take_pct = stop_pct * fixed_rr
 

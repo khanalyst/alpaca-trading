@@ -128,11 +128,34 @@ class StrategyContractTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIsNotNone(plan)
 
-    def test_funding_squeeze_requires_crowding_and_price_stabilization(self):
+    def test_funding_squeeze_requires_a_structure_invalidation(self):
+        """Batch 6.2 / defect D3.
+
+        funding_squeeze was the only setup permitted the ATR anchor, which
+        yields exactly min_stop_atr_multiple - the narrowest stop the system
+        can produce - for a counter-trend entry into a crowded book. Fading a
+        crowd needs more room than following one, not less.
+        """
         plan, why = strategy.build_setup_plan(
             decision(
                 setup_type="funding_squeeze",
                 invalidation_anchor="atr"),
+            snapshot(
+                funding_rate_pct=-0.05,
+                funding_percentile_30=10,
+                perp_index_basis_pct=-0.1,
+                price_stabilized_long=True),
+            valid_config(),
+        )
+        self.assertIsNone(plan)
+        self.assertEqual(why, "funding_squeeze requires a structure "
+                              "invalidation")
+
+    def test_funding_squeeze_requires_crowding_and_price_stabilization(self):
+        plan, why = strategy.build_setup_plan(
+            decision(
+                setup_type="funding_squeeze",
+                invalidation_anchor="structure"),
             snapshot(
                 funding_rate_pct=-0.05,
                 funding_percentile_30=10,
@@ -146,7 +169,7 @@ class StrategyContractTests(unittest.TestCase):
         plan, why = strategy.build_setup_plan(
             decision(
                 setup_type="funding_squeeze",
-                invalidation_anchor="atr"),
+                invalidation_anchor="structure"),
             snapshot(
                 funding_rate_pct=-0.05,
                 funding_percentile_30=10,
