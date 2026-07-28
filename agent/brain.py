@@ -2,11 +2,17 @@
 trades as strict JSON. It has NO authority over risk: everything it returns
 is vetted and clamped by the deterministic risk engine before execution.
 
+The prompt is assembled once per process from the shared SYSTEM text plus the
+active strategy's ``prompt_fragment`` (see agent/registry.py), so the model is
+never told about setup archetypes belonging to a strategy it is not running.
+
 Token-cost design:
-- SYSTEM is byte-identical on every call. Anthropic caches it explicitly
-  (cache_control below); OpenAI caches stable >=1024-token prefixes
-  automatically. Any per-cycle value (like the max number of new opens)
-  belongs in the user message, never in SYSTEM, or the cache breaks.
+- The assembled system prompt is byte-identical on every call. Anthropic
+  caches it explicitly (cache_control below); OpenAI caches stable
+  >=1024-token prefixes automatically. Any per-cycle value (like the max
+  number of new opens) belongs in the user message, never in the system
+  prompt, or the cache breaks. Each strategy gets its own cache entry because
+  the cache key is derived from the assembled text.
 - SYSTEM is deliberately sized above 1,024 tokens: Anthropic silently skips
   caching below a per-model minimum (Sonnet 4.6: 1,024; some Opus and
   Haiku 4.5: 4,096 - on those models the marker is a harmless no-op).
@@ -23,6 +29,8 @@ import logging
 import math
 import os
 from copy import deepcopy
+
+from .registry import spec_for
 
 log = logging.getLogger("brain")
 
@@ -216,27 +224,7 @@ Because every proposal is vetted, state your honest intent; never inflate \
 confidence to push a marginal trade through. Confidence is a decision gate \
 and later calibration input, not a way to force size.
 
-SETUP ARCHETYPES (long side described; mirror them for shorts)
-- Trend continuation pullback: trend_4h and trend_1h up, then the latest \
-completed 15m impulse resumes upward after a pullback (trend_15m flat or up, \
-mom_15m_pct and mom_1h_pct positive, ema20_1h_dist_pct near zero), and \
-range_pos_pct is recovering. Stop beyond the \
-recent swing low: at least swing_low_pct plus a buffer, and never tighter \
-than 1x atr_1h_pct.
-- Range breakout: the latest completed 15m candle must freshly close beyond \
-the preceding 20-candle range, with range_pos_pct near 100, trend_1h not \
-opposed and volume/momentum expanding; enter in the breakout direction with the stop \
-just inside the prior range (roughly swing_low_pct back for a long), \
-never tighter than 1x atr_1h_pct.
-- Funding squeeze: funding deeply negative and extreme versus its own history \
-while price stops making new lows, closes back up, the perp trades at a \
-discount and open interest is measurable - crowded shorts are paying to hold \
-a losing position and fuel the reversal. Higher risk; demand a clear structure/ATR \
-invalidation, enough net room for the chosen exit policy, and assign lower \
-confidence.
-- Avoid: mid-range entries with mixed trends; chasing a move already \
-several ATRs extended; fading a strong aligned trend just because RSI is \
-stretched.
+__SETUP_ARCHETYPES__
 
 MARKET REGIME AWARENESS
 - Trending regime (BTC and the majors showing aligned trends): trade \
@@ -358,7 +346,28 @@ Example C - short setup:
 "reasoning":"1h and 4h downtrend with a high-volume break near the range low"}
 ]}"""
 
-PROMPT_VERSION = hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest()[:16]
+_ARCHETYPE_MARKER = "__SETUP_ARCHETYPES__"
+
+
+def build_system(cfg: dict) -> str:
+    """Assemble the system prompt for the configured strategy.
+
+    The shared text covers the parts that are true of any strategy this agent
+    runs - the risk contract, the snapshot field reference, the output schema.
+    The setup archetypes are strategy-specific and come from the register, so
+    the model is never told about setups belonging to a strategy it is not
+    running.
+
+    Substitution happens once at startup rather than per call: the invariant
+    that makes prompt caching work is byte-identical text on every call for a
+    given strategy, not one global constant.
+    """
+    fragment = spec_for(str(cfg["strategy"]["id"])).prompt_fragment.strip()
+    return SYSTEM.replace(_ARCHETYPE_MARKER, fragment)
+
+
+def prompt_version(system: str) -> str:
+    return hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
 
 
 class LLM:
@@ -369,6 +378,10 @@ class LLM:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg["llm"]
+        # Resolved once, then byte-identical for the life of the process,
+        # which is what both providers' prompt caches require.
+        self.system = build_system(cfg)
+        self.prompt_version = prompt_version(self.system)
         provider = self.cfg["provider"]
         self.provider = provider
         if provider == "anthropic":
@@ -420,7 +433,7 @@ class LLM:
             response_format={"type": "json_object"},
             # Stable routing key for the byte-identical system-prefix cache.
             # Dynamic market/portfolio data remains after that prefix.
-            prompt_cache_key=f"okx-agent-{PROMPT_VERSION}",
+            prompt_cache_key=f"okx-agent-{self.prompt_version}",
         )
         if not self._no_temperature:
             params["temperature"] = float(self.cfg.get("temperature", 0.2))
@@ -571,9 +584,9 @@ class LLM:
                       max_new: int) -> dict:
         """Return the exact initial provider request before it is sent."""
         user = self._user_message(snapshot, portfolio, max_new)
-        request = (self._anthropic_params(SYSTEM, user)
+        request = (self._anthropic_params(self.system, user)
                    if self.provider == "anthropic"
-                   else self._openai_params(SYSTEM, user))
+                   else self._openai_params(self.system, user))
         return {"provider": self.provider, "request": request}
 
     def call_audit(self) -> dict | None:
@@ -598,7 +611,7 @@ class LLM:
         self._last_response_audit = None
         self._last_usage_audit = None
         self._last_response_id = None
-        text = self._call(SYSTEM, user)
+        text = self._call(self.system, user)
         decisions = parse_decisions(text)
         self._last_response_audit = {
             "id": self._last_response_id,

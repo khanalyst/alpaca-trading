@@ -133,10 +133,28 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "cannot be below"):
             validate_config(cfg)
 
-    def test_unimplemented_strategy_id_is_rejected(self):
+    def test_unregistered_strategy_id_is_rejected(self):
         cfg = valid_config()
-        cfg["strategy"]["id"] = "scalping"
-        with self.assertRaisesRegex(ConfigError, "must be 'momentum'"):
+        cfg["strategy"]["id"] = "does-not-exist"
+        with self.assertRaisesRegex(ConfigError, "is not registered"):
+            validate_config(cfg)
+
+    def test_registered_but_unimplemented_strategy_is_rejected(self):
+        # Registered for research is not the same as runnable. Every entry
+        # in the register carries a mechanism and a tier; only some carry a
+        # live contract.
+        cfg = valid_config()
+        cfg["strategy"]["id"] = "scalp-maker"
+        cfg["strategy"]["version"] = "v1"
+        with self.assertRaisesRegex(
+                ConfigError, "no live contract implementation"):
+            validate_config(cfg)
+
+    def test_strategy_version_must_match_the_registered_spec(self):
+        cfg = valid_config()
+        cfg["strategy"]["version"] = "phase1-v3"
+        with self.assertRaisesRegex(
+                ConfigError, "needs its own registry entry"):
             validate_config(cfg)
 
     def test_deterministic_entry_leverage_cannot_exceed_cap(self):
@@ -187,6 +205,59 @@ class ConfigValidationTests(unittest.TestCase):
         cfg["strategy"]["min_hold_minutes"] = 90
         self.assertEqual(
             validate_config(cfg)["strategy"]["min_hold_minutes"], 90)
+
+
+class LiveTierGateTests(unittest.TestCase):
+    """A measured-negative strategy must not reach live capital.
+
+    The register records that momentum/phase1-v2 is T0_REJECTED. Demo may
+    still run it - paper trading is a legitimate operations rehearsal - but
+    switching mode to live has to fail, loudly and with the reason.
+    """
+
+    def test_rejected_strategy_cannot_run_live(self):
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        with self.assertRaisesRegex(
+                ConfigError, "tier T0_REJECTED and mode is live"):
+            validate_config(cfg)
+
+    def test_the_refusal_states_the_evidence(self):
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        with self.assertRaises(ConfigError) as caught:
+            validate_config(cfg)
+        self.assertIn("45.6-47.3%", str(caught.exception))
+
+    def test_same_strategy_is_allowed_on_demo(self):
+        cfg = valid_config()
+        cfg["mode"] = "demo"
+        self.assertEqual(validate_config(cfg)["mode"], "demo")
+
+
+class PerStrategyBoundsTests(unittest.TestCase):
+    """Timeframe and holding period come from the spec, not from constants."""
+
+    def test_hold_ceiling_comes_from_the_registered_spec(self):
+        cfg = valid_config()
+        cfg["risk"]["max_hold_hours"] = 72  # above momentum's 48h ceiling
+        with self.assertRaisesRegex(
+                ConfigError, "max_hold_hours must be between"):
+            validate_config(cfg)
+
+    def test_signal_timeframe_must_match_the_spec(self):
+        cfg = valid_config()
+        cfg["cycle"]["timeframes"] = ["5m", "15m", "1h", "4h"]
+        cfg["strategy"]["signal_timeframe"] = "5m"
+        with self.assertRaisesRegex(
+                ConfigError, "must be exactly '15m' for strategy.id"):
+            validate_config(cfg)
+
+    def test_missing_required_timeframe_is_named(self):
+        cfg = valid_config()
+        cfg["cycle"]["timeframes"] = ["15m", "1h"]
+        with self.assertRaisesRegex(ConfigError, "missing: 4h"):
+            validate_config(cfg)
 
 
 if __name__ == "__main__":

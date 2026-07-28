@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from agent.brain import LLM, SYSTEM, parse_decisions
+from agent.brain import LLM, build_system, parse_decisions
+from tests.helpers import valid_config
 
 
 class LLMPreflightTests(unittest.TestCase):
@@ -35,6 +36,8 @@ class OpenAITemperatureFallbackTests(unittest.TestCase):
         llm.cfg = {"model": "gpt-test", "temperature": 0.2,
                    "max_tokens": 2000}
         llm.provider = "openai"
+        llm.system = build_system(valid_config())
+        llm.prompt_version = "test-prompt"
         llm._no_temperature = False
         llm.client = Mock()
         return llm
@@ -142,6 +145,8 @@ class LLMAuditTests(unittest.TestCase):
         llm.cfg = {"model": "gpt-test", "temperature": 0.2,
                    "max_tokens": 2000}
         llm.provider = "openai"
+        llm.system = build_system(valid_config())
+        llm.prompt_version = "test-prompt"
         llm._no_temperature = False
         llm._call = Mock(return_value='{"decisions":[]}')
         llm._last_request_attempts = []
@@ -159,7 +164,7 @@ class LLMAuditTests(unittest.TestCase):
         self.assertEqual(request["model"], "gpt-test")
         self.assertEqual(request["temperature"], 0.2)
         self.assertIn("prompt_cache_key", request)
-        self.assertEqual(request["messages"][0]["content"], SYSTEM)
+        self.assertEqual(request["messages"][0]["content"], llm.system)
         self.assertIn('"equity_usdt":10000',
                       request["messages"][1]["content"])
 

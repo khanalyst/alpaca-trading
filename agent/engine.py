@@ -104,7 +104,11 @@ class Engine:
             self.strategy_id, self.strategy_version = strategy.identity(
                 self.cfg)
         if not hasattr(self, "prompt_version"):
-            self.prompt_version = brain.PROMPT_VERSION
+            # Derived from the assembled per-strategy prompt, so the journal
+            # records which prompt actually ran rather than a global constant
+            # that no longer distinguishes strategies.
+            self.prompt_version = brain.prompt_version(
+                brain.build_system(self.cfg))
         if not hasattr(self, "config_version"):
             self.config_version = state.stable_fingerprint(self.cfg)
         if not hasattr(self, "code_version"):

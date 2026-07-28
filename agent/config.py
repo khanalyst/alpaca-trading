@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from .registry import (LIVE_MIN_TIER, UnknownStrategy, implemented_ids,
+                       live_eligible_ids, spec_for)
+
 
 class ConfigError(ValueError):
     """Raised when configuration is missing, malformed, or outside safe bounds."""
@@ -86,10 +89,36 @@ def validate_config(raw: dict) -> dict:
         if (not isinstance(strategy.get(key), str)
                 or not strategy[key].strip()):
             raise ConfigError(f"strategy.{key} must be a non-empty string")
-    if strategy["id"] != "momentum":
+    # The register is the authority on what may run. It replaces the former
+    # hard-coded 'momentum' check: adding a strategy is now a registry entry
+    # plus a contract, not an edit to this validator.
+    try:
+        spec = spec_for(strategy["id"])
+    except UnknownStrategy as exc:
+        raise ConfigError(str(exc)) from None
+    if strategy["version"] != spec.version:
         raise ConfigError(
-            "strategy.id must be 'momentum' until another isolated strategy "
-            "implementation exists")
+            f"strategy.version must be {spec.version!r} for strategy.id "
+            f"{spec.id!r}; a different version is a different strategy and "
+            "needs its own registry entry")
+    if not spec.implemented:
+        raise ConfigError(
+            f"strategy.id {spec.id!r} is registered for research but has no "
+            f"live contract implementation. Runnable strategies: "
+            f"{', '.join(implemented_ids())}")
+    # Demo is an operations rehearsal, so any implemented strategy may run
+    # there. Live capital requires a strategy that has actually cleared the
+    # evidence gates, which is what stops a measured-negative strategy from
+    # reaching real money by editing one line.
+    if cfg["mode"] == "live" and not spec.meets(LIVE_MIN_TIER):
+        eligible = live_eligible_ids()
+        raise ConfigError(
+            f"strategy.id {spec.id!r} is tier {spec.tier} and mode is live, "
+            f"which requires {LIVE_MIN_TIER} or better. "
+            + (f"Live-eligible strategies: {', '.join(eligible)}"
+               if eligible else
+               "No registered strategy currently meets that bar.")
+            + f" Reason: {spec.falsification}")
     _boolean(
         strategy, "allow_experimental_setups_in_demo", "strategy")
     _number(strategy, "setup_cooldown_minutes", 0, 1440, "strategy")
@@ -138,16 +167,18 @@ def validate_config(raw: dict) -> dict:
     if not isinstance(timeframes, list) or not all(
             isinstance(x, str) and x for x in timeframes):
         raise ConfigError("cycle.timeframes must be a non-empty list of strings")
-    required = {"15m", "1h", "4h"}
-    if not required.issubset(set(timeframes)):
-        raise ConfigError("cycle.timeframes must include 15m, 1h, and 4h")
+    missing = [tf for tf in spec.required_timeframes if tf not in timeframes]
+    if missing:
+        raise ConfigError(
+            f"cycle.timeframes must include {', '.join(spec.required_timeframes)} "
+            f"for strategy.id {spec.id!r} (missing: {', '.join(missing)})")
     if int(universe["min_history_candles"]) > int(cycle["candles"]):
         raise ConfigError(
             "universe.min_history_candles cannot exceed cycle.candles")
-    if strategy["signal_timeframe"] != "15m":
+    if strategy["signal_timeframe"] != spec.signal_timeframe:
         raise ConfigError(
-            "strategy.signal_timeframe must be exactly '15m' for the "
-            "current momentum strategy version")
+            f"strategy.signal_timeframe must be exactly "
+            f"{spec.signal_timeframe!r} for strategy.id {spec.id!r}")
     if strategy["signal_timeframe"] not in timeframes:
         raise ConfigError(
             "strategy.signal_timeframe must appear in cycle.timeframes")
@@ -197,11 +228,12 @@ def validate_config(raw: dict) -> dict:
     # which no new entry is allowed at all.
     _integer(risk, "max_setups_firing_for_entry", 1, 100, "risk")
     _number(risk, "min_confidence", 0, 1, "risk")
-    # This is a day-trading strategy. A position may run into a second
-    # session, but a multi-day hold is a different strategy with different
-    # risk (weekend gaps, funding accumulation, overnight news) and must not
-    # be reachable by nudging one number.
-    _number(risk, "max_hold_hours", 0.25, 48, "risk")
+    # Holding time is a property of the strategy, not a free parameter. The
+    # ceiling comes from the registered spec, so a day-trading contract still
+    # cannot be turned into a multi-day one by nudging a number - but a
+    # strategy that is genuinely multi-day (carry, multi-week trend) declares
+    # its own ceiling instead of being blocked by the momentum-era 48h limit.
+    _number(risk, "max_hold_hours", 0.25, spec.max_hold_hours_ceiling, "risk")
     # A discretionary-close floor above the force-close ceiling would trap
     # every position until the clock closed it at whatever price was
     # available, which is the opposite of what the floor is for.

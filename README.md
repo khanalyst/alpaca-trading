@@ -60,7 +60,9 @@ never treated as USDT capital.
 | `main.py` | CLI: run, pause, resume, kill, flatten, status, check |
 | `agent/engine.py` | The loop: circuit breakers, transfer detection, execution |
 | `agent/brain.py` | LLM providers, trader persona prompt, JSON decision parsing |
-| `agent/strategy.py` | Versioned setup contracts, deterministic stop/target derivation, setup memory |
+| `agent/registry.py` | The strategy register: every strategy's mechanism, falsification test and confidence tier. Policy reads it; research writes the tiers |
+| `agent/contracts/` | One evidence contract per strategy. `strategy.id` selects which one runs |
+| `agent/strategy.py` | Contract dispatch, deterministic stop/target derivation, setup memory |
 | `agent/risk.py` | Deterministic sizing and hard caps |
 | `agent/market.py` | Universe builder, indicators, market snapshot |
 | `agent/exchange.py` | All OKX calls (via ccxt), orders, kill-switch cancellation |
@@ -163,6 +165,7 @@ between a blow-up and the next trade.
 | Command | What it does |
 | --- | --- |
 | `python main.py status` | State, equity, day PnL, drawdown, open positions |
+| `python main.py strategies` | List the strategy register: every registered strategy, its confidence tier, whether it is runnable, and whether it may run live. Add `--verbose` for each one's mechanism and falsification test. Works without `.env`. |
 | `python main.py pause` | No new positions. Existing ones keep their exchange-side SL/TP; max-hold and margin guards still run. No LLM calls (saves cost). Survives crashes and restarts until `resume`. |
 | `python main.py pause --flatten` | Pause and close everything immediately |
 | `python main.py resume` | Back to full trading |
@@ -373,18 +376,46 @@ API keys; the mode must match the keys in `.env`.
 | `timeframes` | `[15m,1h,4h]` | Candle timeframes fed to the model |
 | `candles` | 120 | Candles per timeframe; also excludes coins lacking history |
 
+**Choosing a strategy (the register)**
+
+`strategy.id` selects which registered strategy runs. `agent/registry.py`
+holds one entry per strategy, and each entry must state a **mechanism** (who
+loses the money and why they cannot stop) and a **falsification** (what
+observation would kill it), plus a **confidence tier** set by research:
+
+| Tier | Meaning |
+| --- | --- |
+| `T0_REJECTED` | Failed a gate, or its placebo scored close to it |
+| `T1_HYPOTHESIS` | Mechanism stated, nothing tested yet |
+| `T2_CANDIDATE` | Beat the nulls and stayed positive out-of-sample |
+| `T3_VALIDATED` | Also survived the placebo and realistic costs |
+| `T4_CONFIRMED` | Forward evidence agrees, at the required sample size |
+
+Demo runs any implemented strategy — paper trading is an operations
+rehearsal and running a known-negative strategy there is legitimate. **Live
+requires `T3_VALIDATED` or better**, enforced in `agent/config.py`. The
+shipped `momentum`/`phase1-v2` is `T0_REJECTED` on the evidence in
+`research/results/edge-audit-2024-2026/`, so switching `mode: live` with it
+active fails validation and prints the reason. That is intended behaviour,
+not a bug to work around.
+
+```bash
+python main.py strategies --verbose   # the register, tiers and mechanisms
+```
+
 **Change the momentum contract (`strategy:` block)**
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `id` / `version` | `momentum` / `phase1-v2` | Immutable attribution identity stored with runs, setups and trades |
-| `signal_timeframe` | `15m` | Fixed for this strategy version; one symbol evaluation per completed bar |
+| `id` / `version` | `momentum` / `phase1-v2` | Must name an entry in the strategy register (`agent/registry.py`). Stored with every run, setup and trade. Run `python main.py strategies` to list them |
+| `signal_timeframe` | `15m` | Must equal the registered spec's timeframe; one symbol evaluation per completed bar |
 | `setup_cooldown_minutes` | 45 | Blocks a completed semantic setup before it can be reused |
 | `setup_memory_hours` | 72 | Persists bounded setup/idempotency history across restarts |
 | `loss_reentry_min_minutes` | 60 | After a loss, also require a fresh completed 1h bar, changed objective evidence and an explicit model explanation |
 | `min_stop_atr_multiple` | 1.0 | Minimum deterministic stop width |
+| `min_hold_minutes` | 90 | Floor on discretionary model closes. Exchange-side SL/TP and the max-hold timer are unaffected, and `risk_reduction` closes are exempt. Measured forward return is most negative ~30 minutes after entry, so sub-hour exits removed the payoff tail while still paying a full taker round trip |
 | `structure_buffer_atr_multiple` | 0.15 | Buffer added beyond the selected swing invalidation |
-| `hard_max_entry_extension_atr` | 2.5 | Absolute no-chase boundary from the 1h EMA20 |
+| `hard_max_entry_extension_atr` | 1.2 | Absolute no-chase boundary from the 1h EMA20. Lowered from 2.5: the model was treating the ceiling as a target and entering at maximum extension, which is where mean reversion is most likely |
 | `breakout_range_threshold_pct` / `breakout_min_relative_volume` | 85 / 1.0 | Minimum 24h range position and participation for a `range_breakout` |
 | `funding_extreme_pct_per_8h` | 0.01 | Absolute funding floor for `funding_squeeze`, as an **8h-equivalent** rate: a 4h contract's rate is doubled before comparison. Whether funding is extreme *for that instrument* is decided by `funding_percentile_30`; this only screens out near-zero funding |
 | `fixed_reward_risk` / `extended_reward_risk` | 3.0 / 4.0 | Code-derived target multiples selected through the model's exit policy. 3R beat 2R in all four matched comparisons at the 48h hold; beyond 3R the gain reverses out-of-sample |
@@ -404,8 +435,10 @@ API keys; the mode must match the keys in `.env`.
 | `max_btc_beta_exposure_pct` | 100 | Cap on signed BTC-beta-weighted notional; insufficient histories conservatively use beta 1 |
 | `min_btc_beta_samples` | 24 | Minimum observations before measured BTC beta is trusted |
 | `max_concurrent_positions` | 3 | Max simultaneous open positions |
+| `max_same_direction_positions` | 2 | Max positions on the same side at once. The notional caps do not bind here: 3 x 30% = 90% net passes a 100% net-direction cap, so a wholly one-sided book was previously legal |
+| `max_setups_firing_for_entry` | 4 | Refuse all new entries when more instruments than this satisfy a contract in one cycle. Crowded bars measured -0.3475%/trade against -0.1627% on quiet ones |
 | `min_confidence` | 0.65 | Proposals below this are discarded |
-| `max_hold_hours` | 48 | Stale positions are force-closed. **Hard-capped at 48 in code**: this is a day-trading strategy, so a multi-day hold is not reachable by config. 48 beat 24 in 8/8 matched walk-forward cells |
+| `max_hold_hours` | 48 | Stale positions are force-closed. **Capped by the registered strategy's own ceiling** (48h for `momentum`), so a day-trading contract still cannot become a multi-day one, while a genuinely multi-day strategy declares its own limit. 48 beat 24 in 8/8 matched walk-forward cells |
 
 **Change the safety brakes (`risk:` circuit breakers)**
 

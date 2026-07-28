@@ -13,15 +13,26 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import time
 
+from .contracts import EVIDENCE_BUILDERS, finite as _finite
+from .registry import spec_for
 
+
+# Every setup type any registered strategy may use. The per-strategy subset
+# lives on the spec (StrategySpec.setup_types) and is what build_setup_plan
+# actually enforces; this union exists so signal_probe can bound an untrusted
+# label before the spec is consulted.
 SETUP_TYPES = {
     "trend_continuation",
     "range_breakout",
     "funding_squeeze",
     "other",
+    "flush_reversion",
+    "carry",
+    "trend_follow",
+    "positioning_fade",
+    "spread_capture",
 }
 INVALIDATION_ANCHORS = {"structure", "atr"}
 EXIT_POLICIES = {"fixed_rr", "extended_rr", "structure_target"}
@@ -30,14 +41,6 @@ SETUP_STATUSES = {
     "proposed", "risk_rejected", "attempted", "execution_rejected",
     "opened", "closed",
 }
-
-
-def _finite(value, default: float | None = None) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    return number if math.isfinite(number) else default
 
 
 def _hash(payload: object) -> str:
@@ -93,127 +96,24 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
 
 
 def setup_evidence(snapshot: dict, cfg: dict) -> dict:
-    """Return auditable minimum evidence for each recognised setup archetype."""
-    block = cfg["strategy"]
-    atr = max(_finite(snapshot.get("atr_1h_pct"), 0.0) or 0.0, 0.0)
-    ema_distance = _finite(snapshot.get("ema20_1h_dist_pct"), 0.0) or 0.0
-    long_extension = max(0.0, ema_distance / atr) if atr > 0 else None
-    short_extension = max(0.0, -ema_distance / atr) if atr > 0 else None
+    """Return auditable minimum evidence for the active strategy's setups.
 
-    trend_15m = snapshot.get("trend_15m")
-    trend_1h = snapshot.get("trend_1h")
-    trend_4h = snapshot.get("trend_4h")
-    range_position = _finite(snapshot.get("range_pos_pct"))
-    relative_volume = _finite(snapshot.get("relative_volume_1h"))
-    momentum = _finite(snapshot.get("mom_1h_pct"), 0.0) or 0.0
-    fast_momentum = _finite(snapshot.get("mom_15m_pct"), 0.0) or 0.0
-    funding = _finite(snapshot.get("funding_rate_pct"))
-    # Funding intervals differ per instrument (OKX runs 8h and 4h contracts
-    # side by side), so a raw per-interval rate is not comparable across
-    # symbols: a 4h contract charges the same rate twice as often. Normalize
-    # to an 8h equivalent before applying an absolute threshold. An unknown
-    # or nonsensical interval falls back to treating the rate as already 8h.
-    funding_interval = _finite(snapshot.get("funding_interval_hours"))
-    if funding_interval is None or funding_interval <= 0:
-        funding_interval = 8.0
-    funding_8h = (
-        funding * (8.0 / funding_interval) if funding is not None else None)
-    funding_percentile = _finite(snapshot.get("funding_percentile_30"))
-    funding_samples = int(
-        max(0.0, _finite(snapshot.get("funding_samples_30"), 0.0) or 0.0))
-    basis = _finite(snapshot.get("perp_index_basis_pct"))
-    open_interest = _finite(snapshot.get("open_interest_musd"))
-    range_threshold = float(block["breakout_range_threshold_pct"])
-    min_relative_volume = float(block["breakout_min_relative_volume"])
-    funding_extreme = float(block["funding_extreme_pct_per_8h"])
-
-    breakout_long = (
-        range_position is not None
-        and relative_volume is not None
-        and range_position >= range_threshold
-        and relative_volume >= min_relative_volume
-        and momentum > 0
-        and fast_momentum > 0
-        and snapshot.get("fresh_breakout_long") is True
-        and trend_1h != "down"
-    )
-    breakout_short = (
-        range_position is not None
-        and relative_volume is not None
-        and range_position <= 100 - range_threshold
-        and relative_volume >= min_relative_volume
-        and momentum < 0
-        and fast_momentum < 0
-        and snapshot.get("fresh_breakout_short") is True
-        and trend_1h != "up"
-    )
-    continuation_long = (
-        trend_1h == "up"
-        and trend_4h == "up"
-        and trend_15m != "down"
-        and momentum > 0
-        and fast_momentum > 0
-    )
-    continuation_short = (
-        trend_1h == "down"
-        and trend_4h == "down"
-        and trend_15m != "up"
-        and momentum < 0
-        and fast_momentum < 0
-    )
-    squeeze_context_available = (
-        funding_samples >= 10
-        and funding_percentile is not None
-        and basis is not None
-        and open_interest is not None
-        and open_interest > 0
-    )
-    squeeze_long = (
-        funding_8h is not None
-        and funding_8h <= -funding_extreme
-        and squeeze_context_available
-        and funding_percentile <= 25
-        and basis <= 0
-        and trend_1h != "down"
-        and snapshot.get("price_stabilized_long") is True
-        and fast_momentum > 0
-    )
-    squeeze_short = (
-        funding_8h is not None
-        and funding_8h >= funding_extreme
-        and squeeze_context_available
-        and funding_percentile >= 75
-        and basis >= 0
-        and trend_1h != "up"
-        and snapshot.get("price_stabilized_short") is True
-        and fast_momentum < 0
-    )
-    return {
-        "trend_continuation": {
-            "long": continuation_long,
-            "short": continuation_short,
-        },
-        "range_breakout": {
-            "long": breakout_long,
-            "short": breakout_short,
-        },
-        "funding_squeeze": {
-            "long": squeeze_long,
-            "short": squeeze_short,
-        },
-        "extension_atr": {
-            "long": round(long_extension, 2)
-            if long_extension is not None else None,
-            "short": round(short_extension, 2)
-            if short_extension is not None else None,
-        },
-        "hard_no_chase_atr": float(block["hard_max_entry_extension_atr"]),
-        # Surfaced so a squeeze decision can be audited against the value the
-        # contract actually compared, not the raw per-interval rate.
-        "funding_8h_equivalent_pct": (
-            round(funding_8h, 4) if funding_8h is not None else None),
-        "funding_extreme_threshold_per_8h": funding_extreme,
-    }
+    Dispatches to the contract registered for ``strategy.id``. The contract
+    is deterministic and authoritative: the model may only choose among the
+    setups it declares valid, never invent one. Configuration validation has
+    already proved the id is registered and implemented, so an unknown id
+    here means the register and the contract modules have drifted apart,
+    which is a bug rather than a runtime condition to absorb.
+    """
+    strategy_id = str(cfg["strategy"]["id"])
+    try:
+        builder = EVIDENCE_BUILDERS[strategy_id]
+    except KeyError:
+        raise KeyError(
+            f"no evidence contract is registered for strategy.id "
+            f"{strategy_id!r}; registered: "
+            f"{', '.join(sorted(EVIDENCE_BUILDERS))}") from None
+    return builder(snapshot, cfg)
 
 
 def enrich_snapshot(snapshot: dict, cfg: dict) -> dict:
@@ -294,7 +194,10 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     if direction not in {"long", "short"}:
         return None, "setup direction is invalid"
     setup_type = str(decision.get("setup_type") or "")
-    if setup_type not in SETUP_TYPES:
+    # A setup type belongs to a strategy. Checking against the registered
+    # spec rather than a module-level set stops one strategy's archetypes
+    # from being labellable while a different strategy is running.
+    if setup_type not in spec_for(str(cfg["strategy"]["id"])).setup_types:
         return None, "setup type is not recognised"
     if setup_type == "other" and (
             cfg["mode"] != "demo"
