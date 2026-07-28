@@ -33,6 +33,10 @@ import requests
 
 BASE = "https://www.okx.com"
 BAR_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+# OKX's open-interest history reaches back roughly 60 days regardless of the
+# window asked for. Used to decide whether a cached file is complete for the
+# span that can actually be served.
+OI_RETENTION_MS = 60 * 86_400_000
 
 # OKX publishes per-endpoint IP rate limits. Stay comfortably inside them so a
 # long download never trips a ban: history-candles is 20 requests / 2s.
@@ -273,7 +277,15 @@ def download_symbol(inst_id: str, out: Path, start_ms: int, end_ms: int,
 
     if want_oi:
         oi_path = out / "oi" / f"{stem}.csv"
-        if oi_path.exists():
+        # Coverage check, not a bare existence check. OKX serves only about
+        # 60 days of open interest whatever window is requested, so the file
+        # can never span a long request - but it must still cover the part
+        # OKX can actually serve. Reusing any existing file regardless of its
+        # span means a short earlier download (a smoke test, an interrupted
+        # run) is silently reused forever, and open interest is precisely the
+        # series a deleveraging hypothesis cannot be tested without.
+        oi_start = max(start_ms, end_ms - OI_RETENTION_MS)
+        if covered(oi_path, oi_start, end_ms, 6 * 3_600_000):
             oi = pd.read_csv(oi_path)
         else:
             oi = api.open_interest(inst_id, start_ms, end_ms)

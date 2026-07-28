@@ -179,16 +179,28 @@ REGISTRY: dict[str, StrategySpec] = {
                 "falling show no more 4-24h reversion than bars with open "
                 "interest rising. If both subsets behave alike, OI adds "
                 "nothing and the move is noise."),
-            tier="T1_HYPOTHESIS",
+            tier="T0_REJECTED",
             signal_timeframe="15m",
             required_timeframes=("15m", "1h", "4h"),
             max_hold_hours_ceiling=24.0,
             execution_style="taker",
             setup_types=("flush_reversion",),
             notes=(
-                "Testable now but data-limited: OKX serves only ~60 days of "
-                "open-interest history, which is a first look rather than a "
-                "test."),
+                "Tested and rejected on first contact with data. 337 "
+                "non-overlapping trades, 8 instruments, 60 days of "
+                "open-interest coverage: -0.288% per trade at base costs and "
+                "-0.043% frictionless, so it is negative before costs rather "
+                "than merely cost-killed. Random entry timing (-0.231%) beat "
+                "it, out-of-sample (-0.610%) was worse than in-sample "
+                "(-0.195%), and inverting it was also negative (-0.368%), "
+                "which rules out a direction error. The mechanism remains "
+                "plausible; this parameterisation of it does not survive. "
+                "Caveat, stated at pre-registration and not after: OKX serves "
+                "only ~60 days of open interest, so this is an underpowered "
+                "test - but an underpowered test that points the wrong way "
+                "is not evidence of a hidden edge."),
+            evidence=("research/results/tournament/REPORT.md",
+                      "research/hypotheses/flush-fade.yaml"),
         ),
         StrategySpec(
             id="funding-carry",

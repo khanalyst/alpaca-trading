@@ -177,7 +177,10 @@ def main() -> int:
     panel = add_cross_sectional(panel, (
         "rev_4b", "rev_16b", "rev_96b",
         "residrev_4b", "residrev_16b", "residrev_96b",
-        "ret_16b", "vol_z", "funding_8h"))
+        "ret_16b", "vol_z", "funding_8h",
+        # Ranking within a timestamp cancels market direction, which is the
+        # exact bias that made the last candidate's placebo score 41% of it.
+        "flush_fade", "build_follow"))
 
     start, end = panel["ts"].min(), panel["ts"].max()
     cut = start + (end - start) * 0.6

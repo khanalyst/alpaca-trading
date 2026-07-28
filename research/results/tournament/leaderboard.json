@@ -1,0 +1,310 @@
+{
+  "benchmark_check": {
+    "drift_r": 0.021884798030476244,
+    "expected_expectancy_r": -0.096,
+    "measured_expectancy_r": -0.07411520196952376,
+    "ok": true,
+    "reason": "benchmark reproduces its measured failure",
+    "tolerance_r": 0.2
+  },
+  "cost_scenario": "base",
+  "data_root": "runtime/research/data",
+  "exit_policy": "fixed_rr",
+  "generated_utc": "2026-07-28 10:11:15Z",
+  "instruments": 8,
+  "min_bars": 19200,
+  "strategies": [
+    {
+      "falsification": "Already falsified: directional hit rate 45.6-47.3% at every horizon from 15m to 24h, -0.096 R at ordinary costs (t=-4.60), 0 of 79 walk-forward variants positive out-of-sample, and at zero cost both random entry timing and the inverted signal beat it.",
+      "gates": [
+        {
+          "gate": "has_mechanism",
+          "numbers": {
+            "falsification_chars": 251,
+            "mechanism_chars": 161
+          },
+          "passed": true,
+          "summary": "mechanism and falsification criterion are both stated"
+        },
+        {
+          "gate": "beat_nulls",
+          "numbers": {
+            "beaten_by": [],
+            "expectancy_pct": {
+              "inverted": {
+                "expectancy_pct": -0.41188748233896916,
+                "trades": 1050
+              },
+              "null_random_direction": {
+                "expectancy_pct": -0.22257014292010244,
+                "trades": 1024
+              },
+              "null_random_timing": {
+                "expectancy_pct": -0.20021799197582352,
+                "trades": 1428
+              },
+              "signal": {
+                "expectancy_pct": -0.055313587734801,
+                "trades": 906
+              }
+            }
+          },
+          "passed": true,
+          "summary": "signal -0.0553% beats every null"
+        },
+        {
+          "gate": "survive_oos",
+          "numbers": {
+            "in_sample_pct": -0.24547466603665347,
+            "in_sample_trades": 499,
+            "out_of_sample_pct": 0.19366147834803277,
+            "out_of_sample_trades": 393,
+            "purge_days": 3,
+            "split": 0.6
+          },
+          "passed": true,
+          "summary": "in-sample -0.2455%, out-of-sample +0.1937%"
+        },
+        {
+          "gate": "survive_costs",
+          "numbers": {
+            "base_round_trip_cost_pct": 0.2,
+            "breakeven_cost_pct": 0.2140178570596219,
+            "expectancy_pct_by_scenario": {
+              "base": -0.055313587734801,
+              "frictionless": 0.2140178570596219,
+              "optimistic": 0.13028755413649185,
+              "realistic_alt": -0.24173548253723157,
+              "stress": -0.5470466790688281
+            },
+            "required_headroom_x": 2.0
+          },
+          "passed": false,
+          "summary": "net -0.0553% at base costs, breakeven cost 0.2140% vs 0.20% charged"
+        },
+        {
+          "gate": "survive_placebo",
+          "numbers": {
+            "candidate_pct": -0.055313587734801,
+            "fail_at_or_above": 0.5,
+            "pass_below": 0.25,
+            "placebo_draws": [
+              -0.17245475776151686,
+              -0.2813753739770179,
+              -0.052556509420593825,
+              -0.3760285243806941,
+              -0.19283969680860424
+            ],
+            "placebo_mean_pct": -0.2150509724696854,
+            "ratio": NaN
+          },
+          "passed": false,
+          "summary": "candidate expectancy is not positive; placebo not decisive"
+        },
+        {
+          "gate": "is_detectable",
+          "numbers": {
+            "effect_r": -0.07411520196952376,
+            "sd_r": 1.3803928076744685
+          },
+          "passed": false,
+          "summary": "effect -0.0741 R is not positive; nothing to size for"
+        }
+      ],
+      "headline": {
+        "avg_hold_h": 15.337472406181016,
+        "expectancy_pct": -0.055313587734801,
+        "expectancy_r": -0.07411520196952376,
+        "expectancy_r_ci95": [
+          -0.1778404704279041,
+          0.028458717780688883
+        ],
+        "label": "base",
+        "median_pct": -1.1373369602227443,
+        "monthly_mean_r": -0.04592490266274411,
+        "monthly_t_stat": -0.6831317469051933,
+        "months": 7,
+        "positive_months_pct": 28.57142857142857,
+        "profit_factor": 0.9631744669444223,
+        "significant": false,
+        "stop_rate_pct": 67.21854304635761,
+        "timeout_rate_pct": 11.037527593818984,
+        "total_r": -67.14837298438853,
+        "tp_rate_pct": 21.7439293598234,
+        "trades": 906,
+        "win_rate_pct": 30.4635761589404
+      },
+      "hypotheses_tested": 79,
+      "measured_tier": "T2_CANDIDATE",
+      "mechanism": "None established. Retained as the benchmark null that any new strategy must beat, and as the only strategy here whose true expectancy has actually been measured.",
+      "registered_tier": "T0_REJECTED",
+      "scored": true,
+      "strategy_id": "momentum",
+      "tier_changed": true,
+      "tier_reason": "net -0.0553% at base costs, breakeven cost 0.2140% vs 0.20% charged",
+      "version": "phase1-v2"
+    },
+    {
+      "falsification": "Among the largest adverse moves, bars with open interest falling show no more 4-24h reversion than bars with open interest rising. If both subsets behave alike, OI adds nothing and the move is noise.",
+      "gates": [
+        {
+          "gate": "has_mechanism",
+          "numbers": {
+            "falsification_chars": 199,
+            "mechanism_chars": 389
+          },
+          "passed": true,
+          "summary": "mechanism and falsification criterion are both stated"
+        },
+        {
+          "gate": "beat_nulls",
+          "numbers": {
+            "beaten_by": [
+              "null_random_timing"
+            ],
+            "expectancy_pct": {
+              "inverted": {
+                "expectancy_pct": -0.36774894547210485,
+                "trades": 313
+              },
+              "null_random_direction": {
+                "expectancy_pct": -0.6350817379748543,
+                "trades": 327
+              },
+              "null_random_timing": {
+                "expectancy_pct": -0.22610101285599554,
+                "trades": 964
+              },
+              "signal": {
+                "expectancy_pct": -0.2875890692723249,
+                "trades": 337
+              }
+            }
+          },
+          "passed": false,
+          "summary": "signal -0.2876% does not beat: null_random_timing"
+        },
+        {
+          "gate": "survive_oos",
+          "numbers": {
+            "in_sample_pct": -0.19542148838983736,
+            "in_sample_trades": 201,
+            "out_of_sample_pct": -0.6099695768528671,
+            "out_of_sample_trades": 112,
+            "purge_days": 3,
+            "split": 0.6
+          },
+          "passed": false,
+          "summary": "in-sample -0.1954%, out-of-sample -0.6100%"
+        },
+        {
+          "gate": "survive_costs",
+          "numbers": {
+            "base_round_trip_cost_pct": 0.2,
+            "breakeven_cost_pct": -0.0431402152062049,
+            "expectancy_pct_by_scenario": {
+              "base": -0.2875890692723249,
+              "frictionless": -0.0431402152062049,
+              "optimistic": -0.13004735447173343,
+              "realistic_alt": -0.38774940020776055,
+              "stress": -0.6387679231881157
+            },
+            "required_headroom_x": 2.0
+          },
+          "passed": false,
+          "summary": "net -0.2876% at base costs, breakeven cost -0.0431% vs 0.20% charged"
+        },
+        {
+          "gate": "survive_placebo",
+          "numbers": {
+            "candidate_pct": -0.2875890692723249,
+            "fail_at_or_above": 0.5,
+            "pass_below": 0.25,
+            "placebo_draws": [
+              -0.30374630809598924,
+              -0.23827723208544468,
+              -0.2931750523231852,
+              -0.315880063151376,
+              -0.20862965200023115
+            ],
+            "placebo_mean_pct": -0.2719416615312452,
+            "ratio": NaN
+          },
+          "passed": false,
+          "summary": "candidate expectancy is not positive; placebo not decisive"
+        },
+        {
+          "gate": "is_detectable",
+          "numbers": {
+            "effect_r": -0.1572489031181213,
+            "sd_r": 1.0982396189922907
+          },
+          "passed": false,
+          "summary": "effect -0.1572 R is not positive; nothing to size for"
+        }
+      ],
+      "headline": {
+        "avg_hold_h": 10.049703264094955,
+        "expectancy_pct": -0.2875890692723249,
+        "expectancy_r": -0.1572489031181213,
+        "expectancy_r_ci95": [
+          -0.2319330203612444,
+          0.21046793935995545
+        ],
+        "label": "base",
+        "median_pct": -1.2529157537499862,
+        "monthly_mean_r": -0.04418793353953556,
+        "monthly_t_stat": -0.3347076360423064,
+        "months": 3,
+        "positive_months_pct": 33.33333333333333,
+        "profit_factor": 0.80437609212639,
+        "significant": false,
+        "stop_rate_pct": 60.23738872403561,
+        "timeout_rate_pct": 16.61721068249258,
+        "total_r": -52.99288035080688,
+        "tp_rate_pct": 23.14540059347181,
+        "trades": 337,
+        "win_rate_pct": 34.124629080118694
+      },
+      "hypotheses_tested": 1,
+      "measured_tier": "T0_REJECTED",
+      "mechanism": "Liquidation engines sell at market regardless of price. That flow is price-insensitive, mechanically finite and overshoots, and whoever absorbs it is compensated. The payer is the over-leveraged trader whose margin ran out and who has no discretion about exiting. Open interest falling during an adverse move distinguishes forced deleveraging from new positioning, which should not revert.",
+      "registered_tier": "T0_REJECTED",
+      "scored": true,
+      "strategy_id": "flush-fade",
+      "tier_changed": false,
+      "tier_reason": "signal -0.2876% does not beat: null_random_timing",
+      "version": "v1"
+    },
+    {
+      "reason": "no pre-registration at research/hypotheses/funding-carry.yaml; write the mechanism, parameters and hypothesis count before running the test",
+      "registered_tier": "T1_HYPOTHESIS",
+      "scored": false,
+      "strategy_id": "funding-carry",
+      "version": "v1"
+    },
+    {
+      "reason": "no pre-registration at research/hypotheses/ls-ratio-fade.yaml; write the mechanism, parameters and hypothesis count before running the test",
+      "registered_tier": "T1_HYPOTHESIS",
+      "scored": false,
+      "strategy_id": "ls-ratio-fade",
+      "version": "v1"
+    },
+    {
+      "reason": "no pre-registration at research/hypotheses/scalp-maker.yaml; write the mechanism, parameters and hypothesis count before running the test",
+      "registered_tier": "T1_HYPOTHESIS",
+      "scored": false,
+      "strategy_id": "scalp-maker",
+      "version": "v1"
+    },
+    {
+      "reason": "no pre-registration at research/hypotheses/trend-multiday.yaml; write the mechanism, parameters and hypothesis count before running the test",
+      "registered_tier": "T1_HYPOTHESIS",
+      "scored": false,
+      "strategy_id": "trend-multiday",
+      "version": "v1"
+    }
+  ],
+  "window_end": "2026-07-28",
+  "window_start": "2026-01-09"
+}

@@ -155,6 +155,26 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
     panel["oi_chg_4b"] = panel.groupby("symbol", observed=True)["oi_musd"] \
         .transform(lambda s: s.pct_change(4)) * 100
 
+    # --- forced deleveraging vs new positioning (the OI-price quadrant)
+    #
+    # A price move with open interest FALLING is existing positions being
+    # closed, often by a liquidation engine that sells at market regardless
+    # of price - price-insensitive, finite, and prone to overshoot. A move
+    # with open interest RISING is new money taking a side, which carries no
+    # such reason to revert. The two are identical on a price chart, which is
+    # why this pair of features is the whole flush-fade hypothesis.
+    panel["oi_chg_16b"] = panel.groupby("symbol", observed=True)["oi_musd"] \
+        .transform(lambda s: s.pct_change(16)) * 100
+    move_atr = panel["ret_16b"] / panel["atr_pct"]
+    flush = (panel["oi_chg_16b"] < -1.0) & (panel["vol_z"] > 1.0)
+    build = (panel["oi_chg_16b"] > 1.0) & (panel["vol_z"] > 1.0)
+    # NaN rather than 0.0 outside each condition. evaluate_pair drops NaN
+    # rows, so each feature is scored only on the bars it claims to describe;
+    # a zero fill would create a point mass that collapses the quantile
+    # buckets and quietly makes the feature untestable.
+    panel["flush_fade"] = np.where(flush, -move_atr, np.nan)
+    panel["build_follow"] = np.where(build, move_atr, np.nan)
+
     panel["hour"] = ((panel["ts"] // 3_600_000) % 24).astype(int)
     panel["dow"] = (((panel["ts"] // 86_400_000) + 4) % 7).astype(int)
     panel["month"] = pd.to_datetime(
@@ -186,7 +206,9 @@ FEATURES = [
     "close_loc", "bar_range_atr", "gap", "consec_bars",
     "rel_vol", "vol_z", "amihud", "atr_ratio", "range_pos",
     # carry / positioning
-    "funding_8h", "oi_chg_4b",
+    "funding_8h", "oi_chg_4b", "oi_chg_16b",
+    # forced deleveraging (flush-fade hypothesis)
+    "flush_fade", "build_follow",
     # cross-sectional
     "xs_rev_4b", "xs_rev_16b", "xs_rev_96b",
     "xs_residrev_4b", "xs_residrev_16b", "xs_residrev_96b",

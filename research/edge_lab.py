@@ -31,6 +31,7 @@ import argparse
 import json
 import math
 import sys
+import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -394,6 +395,24 @@ class Contract:
     min_stop_pct: float = 0.2
     max_stop_pct: float = 15.0
 
+    # --- StrategyContract protocol -------------------------------------
+    # build_trades talks to a contract through these three methods and the
+    # four scalars below, so a new strategy is a new class rather than an
+    # edit to the shared trade builder. Momentum delegates to the
+    # module-level functions it has always used, which keeps its behaviour
+    # byte-identical and keeps validate_features.py meaningful.
+    default_setups: tuple[str, ...] = ("trend_continuation", "range_breakout")
+
+    def masks(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
+        return evidence_masks(df, self)
+
+    def gate(self, df: pd.DataFrame, direction: str) -> np.ndarray:
+        return research_gate(df, self, direction)
+
+    def levels(self, df: pd.DataFrame, direction: str,
+               exit_policy: str) -> tuple[np.ndarray, np.ndarray]:
+        return derive_levels(df, self, direction, exit_policy)
+
     @classmethod
     def from_config(cls, cfg: dict) -> "Contract":
         """Build the research contract from a validated live config.
@@ -423,6 +442,89 @@ class Contract:
             # 15m signal bars: four per hour.
             max_hold_bars=int(round(float(risk["max_hold_hours"]) * 4)),
         )
+
+
+@dataclass(frozen=True)
+class FlushFadeContract:
+    """Fade forced deleveraging; stand aside for new positioning.
+
+    Implements the StrategyContract protocol, so build_trades drives it with
+    the same simulator, the same null machinery and the same cost scenarios
+    that measured the momentum contract. Nothing about the comparison is
+    special-cased in the candidate's favour.
+
+    The distinction the whole hypothesis rests on is open interest. An
+    adverse move while OI FALLS is existing positions being closed - often
+    forcibly, by a liquidation engine that sells at market regardless of
+    price. That flow is price-insensitive and finite, so it overshoots. An
+    adverse move while OI RISES is new money taking a side, which carries no
+    such reason to revert. Both look identical on a price chart.
+
+    Parameters are pre-registered in research/hypotheses/flush-fade.yaml
+    before any result is produced; see that file for the hypothesis count
+    that any reported number must be discounted against.
+    """
+
+    # Lookback for the flush, in 15m bars. 16 bars = 4 hours: long enough to
+    # contain a cascade, short enough that OI change still refers to it.
+    lookback_bars: int = 16
+    # How large the adverse move must be, in ATRs. Below this it is noise.
+    min_move_atr: float = 1.5
+    # How much open interest must have fallen across the same window, in
+    # percent. This is the gate that separates deleveraging from positioning.
+    min_oi_drop_pct: float = 1.0
+    # Participation floor: a flush without volume is drift, not forced flow.
+    min_relative_volume: float = 1.2
+    # Stop and target, in ATR multiples. Wide stop because the entry is
+    # deliberately inside a volatile move.
+    stop_atr_multiple: float = 1.5
+    reward_risk: float = 2.0
+    max_hold_bars: int = 96          # 24h, matching the registered ceiling
+    min_stop_pct: float = 0.2
+    max_stop_pct: float = 15.0
+    hard_max_entry_extension_atr: float = 1e9   # extension is not this
+    default_setups: tuple[str, ...] = ("flush_reversion",)
+
+    def _features(self, df: pd.DataFrame):
+        close = pd.Series(df["close"].to_numpy(float))
+        atr = df["atr_1h_pct"].to_numpy(float)
+        move_pct = close.pct_change(self.lookback_bars).to_numpy(float) * 100
+        with np.errstate(divide="ignore", invalid="ignore"):
+            move_atr = np.where(atr > 0, move_pct / atr, np.nan)
+        oi = pd.Series(df["open_interest_musd"].to_numpy(float))
+        oi_change = oi.pct_change(self.lookback_bars).to_numpy(float) * 100
+        rel_vol = df["relative_volume_1h"].to_numpy(float)
+        return move_atr, oi_change, rel_vol
+
+    def masks(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
+        move_atr, oi_change, rel_vol = self._features(df)
+        deleveraging = (
+            ~np.isnan(oi_change) & (oi_change <= -self.min_oi_drop_pct)
+            & ~np.isnan(rel_vol) & (rel_vol >= self.min_relative_volume))
+        # Fade the direction of the flush: buy the forced selling.
+        long_ = deleveraging & ~np.isnan(move_atr) & (
+            move_atr <= -self.min_move_atr)
+        short_ = deleveraging & ~np.isnan(move_atr) & (
+            move_atr >= self.min_move_atr)
+        zero = np.zeros(len(df), dtype=float)
+        return {
+            "flush_reversion_long": long_,
+            "flush_reversion_short": short_,
+            # Extension from the EMA20 is a momentum-chasing concept; this
+            # strategy is deliberately entering an extended move, so the
+            # shared extension filter must not bind. Zero always passes.
+            "extension_long": zero,
+            "extension_short": zero,
+        }
+
+    def gate(self, df: pd.DataFrame, direction: str) -> np.ndarray:
+        return np.ones(len(df), dtype=bool)
+
+    def levels(self, df: pd.DataFrame, direction: str,
+               exit_policy: str) -> tuple[np.ndarray, np.ndarray]:
+        atr = df["atr_1h_pct"].to_numpy(float)
+        stop = atr * self.stop_atr_multiple
+        return np.round(stop, 6), np.round(stop * self.reward_risk, 6)
 
 
 def evidence_masks(df: pd.DataFrame, c: Contract) -> dict[str, np.ndarray]:
@@ -835,23 +937,41 @@ def universe_membership(frames: dict[str, SymbolFrame], top_n: int = 10,
 
 # ------------------------------------------------------ candidate builder
 
+def _stable_seed(text: str) -> int:
+    """Process-independent seed offset.
+
+    Python randomizes str.__hash__ per process unless PYTHONHASHSEED is set,
+    so seeding a null baseline with hash(symbol + setup) silently produced a
+    DIFFERENT null on every run - and therefore a different verdict from the
+    same command on the same data. crc32 is stable across processes and
+    machines, which is what "reproduce with this command" requires.
+    """
+    return zlib.crc32(text.encode("utf-8")) % 10**6
+
+
 SETUPS = ("trend_continuation", "range_breakout", "funding_squeeze")
 
 
 def build_trades(frames: dict[str, SymbolFrame],
                  membership: dict[str, np.ndarray] | None,
-                 contract: Contract, costs: Costs,
+                 contract, costs: Costs,
                  exit_policy: str = "fixed_rr",
-                 setups: tuple[str, ...] = ("trend_continuation",
-                                            "range_breakout"),
+                 setups: tuple[str, ...] | None = None,
                  flip_direction: bool = False,
                  random_timing: int | None = None,
                  random_direction: int | None = None) -> pd.DataFrame:
-    """Produce one trade per qualifying (symbol, bar, setup, direction)."""
+    """Produce one trade per qualifying (symbol, bar, setup, direction).
+
+    ``contract`` is any object implementing the StrategyContract protocol
+    (masks / gate / levels plus the four sizing scalars). Passing None for
+    ``setups`` uses whatever the contract declares as its default.
+    """
+    if setups is None:
+        setups = contract.default_setups
     chunks = []
     for symbol, frame in frames.items():
         df = frame.df
-        masks = evidence_masks(df, contract)
+        masks = contract.masks(df)
         in_universe = (membership[symbol] if membership is not None
                        else np.ones(len(df), dtype=bool))
         # Every indicator must be warm. The 4h EMA window is the binding
@@ -865,8 +985,8 @@ def build_trades(frames: dict[str, SymbolFrame],
                 ext = masks[f"extension_{direction}"]
                 mask &= ~np.isnan(ext) & (
                     ext <= contract.hard_max_entry_extension_atr)
-                mask &= research_gate(df, contract, direction)
-                stop, take = derive_levels(df, contract, direction, exit_policy)
+                mask &= contract.gate(df, direction)
+                stop, take = contract.levels(df, direction, exit_policy)
                 mask &= ~np.isnan(stop) & (stop >= contract.min_stop_pct) \
                     & (stop <= contract.max_stop_pct)
                 mask &= ~np.isnan(take) & (take <= 50.0)
@@ -877,11 +997,11 @@ def build_trades(frames: dict[str, SymbolFrame],
                 if flip_direction:
                     traded_direction = (
                         "short" if direction == "long" else "long")
-                    stop, take = derive_levels(
-                        df, contract, traded_direction, exit_policy)
+                    stop, take = contract.levels(
+                        df, traded_direction, exit_policy)
                 if random_timing is not None:
                     rng = np.random.default_rng(
-                        random_timing + hash(symbol + setup + direction) % 10**6)
+                        random_timing + _stable_seed(symbol + setup + direction))
                     high = len(df) - contract.max_hold_bars - 2
                     # Draw only from bars where the SAME level derivation is
                     # well defined, so the null differs from the signal in
@@ -899,7 +1019,7 @@ def build_trades(frames: dict[str, SymbolFrame],
                     idx.sort()
                 if random_direction is not None:
                     rng = np.random.default_rng(
-                        random_direction + hash(symbol + setup) % 10**6)
+                        random_direction + _stable_seed(symbol + setup))
                     flip = rng.random(len(idx)) < 0.5
                 else:
                     flip = None
@@ -915,7 +1035,7 @@ def build_trades(frames: dict[str, SymbolFrame],
                     for want, sub in (("long", idx[~flip]), ("short", idx[flip])):
                         if len(sub) == 0:
                             continue
-                        s2, t2 = derive_levels(df, contract, want, exit_policy)
+                        s2, t2 = contract.levels(df, want, exit_policy)
                         chunk = simulate(frame, sub, want, s2[sub], t2[sub],
                                          costs, contract.max_hold_bars)
                         if not chunk.empty:
