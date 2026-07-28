@@ -37,7 +37,8 @@ PAUSED = "PAUSED"            # housekeeping only: no LLM calls, no new entries
 DAY_STOPPED = "DAY_STOPPED"  # daily loss limit hit: model may close, cannot open
 KILLED = "KILLED"            # terminal: flatten everything and exit
 EQUITY_BASIS = "usdt_currency_equity_v1"
-JOURNAL_SCHEMA_VERSION = 3
+# 4: variant_id and strategy_config_version on events and trades (B0).
+JOURNAL_SCHEMA_VERSION = 4
 
 _JOURNAL_CONTEXT: dict[str, object] = {}
 
@@ -710,6 +711,37 @@ def stable_fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+# The only configuration blocks that can change a trading decision. Anything
+# outside this set may be edited freely without splitting the corpus.
+STRATEGY_FINGERPRINT_BLOCKS = (
+    "strategy", "risk", "execution", "trading_costs",
+)
+
+
+def strategy_fingerprint(cfg: dict) -> str:
+    """Fingerprint only what changes behaviour, so attribution survives edits.
+
+    ``stable_fingerprint`` hashes the whole config, which means raising
+    ``alerts.timeout_seconds`` or ``llm.max_tokens`` forks the attribution
+    bucket and fragments a sample that is already small - silently, because
+    the resulting identifier is a 16-hex string that says nothing about what
+    differed.
+
+    This narrower hash covers the strategy, risk, execution and cost blocks
+    plus ``cycle.timeframes``, which decides what the contract can see. Two
+    runs that agree here produced decisions from the same rules and their
+    results may be pooled. Two that disagree may not.
+
+    The whole-config ``config_version`` is still written alongside it. This
+    is an addition, not a replacement: existing rows keep their meaning.
+    """
+    material = {
+        block: cfg.get(block) for block in STRATEGY_FINGERPRINT_BLOCKS
+    }
+    material["cycle.timeframes"] = (cfg.get("cycle") or {}).get("timeframes")
+    return stable_fingerprint(material)
+
+
 def code_fingerprint() -> str:
     """Hash trading-runtime sources without depending on git metadata."""
     root = Path(__file__).resolve().parent.parent
@@ -731,6 +763,9 @@ def set_journal_context(**context: object) -> dict:
         "run_id", "cycle_id", "strategy_id", "strategy_version",
         "prompt_version", "config_version", "code_version",
         "equity_basis_id", "runtime_mode", "account_fingerprint",
+        # B0: attribution keys off a readable variant name, never off an
+        # opaque whole-config hash. Live trading writes variant_id "live".
+        "variant_id", "strategy_config_version",
     }
     unknown = set(context) - allowed
     if unknown:
@@ -782,6 +817,7 @@ def _db() -> sqlite3.Connection:
         "prompt_version": "TEXT", "config_version": "TEXT",
         "code_version": "TEXT", "equity_basis_id": "TEXT",
         "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
+        "variant_id": "TEXT", "strategy_config_version": "TEXT",
     })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades ("
@@ -813,7 +849,8 @@ def _db() -> sqlite3.Connection:
         "code_version": "TEXT", "equity_basis_id": "TEXT",
         "entry_equity_usd": "REAL", "close_trigger": "TEXT",
         "close_evidence": "TEXT", "runtime_mode": "TEXT",
-        "account_fingerprint": "TEXT",
+        "account_fingerprint": "TEXT", "variant_id": "TEXT",
+        "strategy_config_version": "TEXT",
     })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS equity ("
@@ -893,7 +930,8 @@ def log_run(run_id: str, *, mode: str, strategy_id: str,
 
 def log_event(kind: str, payload: str, *, setup_id: str | None = None,
               strategy_id: str | None = None,
-              strategy_version: str | None = None) -> None:
+              strategy_version: str | None = None,
+              variant_id: str | None = None) -> None:
     context = journal_context()
     try:
         with _db() as c:
@@ -902,7 +940,8 @@ def log_event(kind: str, payload: str, *, setup_id: str | None = None,
                 "ts, kind, payload, run_id, cycle_id, strategy_id, "
                 "strategy_version, setup_id, prompt_version, config_version, "
                 "code_version, equity_basis_id, runtime_mode, "
-                "account_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "account_fingerprint, variant_id, strategy_config_version) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     time.time(), kind, payload, context.get("run_id"),
                     context.get("cycle_id"),
@@ -913,6 +952,8 @@ def log_event(kind: str, payload: str, *, setup_id: str | None = None,
                     context.get("equity_basis_id"),
                     context.get("runtime_mode"),
                     context.get("account_fingerprint"),
+                    variant_id or context.get("variant_id"),
+                    context.get("strategy_config_version"),
                 ),
             )
     except Exception as exc:
@@ -956,6 +997,7 @@ def log_trade(symbol, side, action, qty, price, notional, leverage, reason,
                 "prompt_version", "config_version", "code_version",
                 "equity_basis_id", "entry_equity_usd", "close_trigger",
                 "close_evidence", "runtime_mode", "account_fingerprint",
+                "variant_id", "strategy_config_version",
             )
             values = (
                 time.time(), symbol, side, action, qty, price, notional,
@@ -975,6 +1017,8 @@ def log_trade(symbol, side, action, qty, price, notional, leverage, reason,
                 entry_equity_usd, close_trigger, close_evidence,
                 runtime_mode or context.get("runtime_mode"),
                 account_fingerprint or context.get("account_fingerprint"),
+                context.get("variant_id"),
+                context.get("strategy_config_version"),
             )
             c.execute(
                 f"INSERT INTO trades ({','.join(columns)}) VALUES "

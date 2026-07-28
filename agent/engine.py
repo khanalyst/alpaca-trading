@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from . import brain, contracts, market, registry, state, strategy
+from . import brain, contracts, market, registry, state, strategy, variants
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
                        EntryOrderRejected, Exchange)
@@ -58,6 +58,10 @@ class Engine:
             cfg["mode"], os.environ.get("OKX_API_KEY", ""))
         self.run_id = state.new_run_id()
         self.config_version = state.stable_fingerprint(cfg)
+        # Narrower than config_version: covers only the blocks that can
+        # change a decision, so an edit to an alert timeout no longer splits
+        # the sample this run's results will be pooled into.
+        self.strategy_config_version = state.strategy_fingerprint(cfg)
         self.code_version = state.code_fingerprint()
         # Derived from the assembled per-strategy prompt. There is no module
         # -level PROMPT_VERSION any more: each strategy gets its own prompt,
@@ -72,6 +76,11 @@ class Engine:
             prompt_version=self.prompt_version,
             config_version=self.config_version,
             code_version=self.code_version,
+            strategy_config_version=self.strategy_config_version,
+            # Everything the live agent writes is attributed to "live".
+            # Replayed and shadow variants carry their own readable ids, so
+            # the two populations can never be pooled by accident.
+            variant_id=variants.LIVE_VARIANT_ID,
         )
         self.alerts = AlertManager(cfg)
         if not light:
@@ -115,6 +124,8 @@ class Engine:
                 brain.build_system(self.cfg))
         if not hasattr(self, "config_version"):
             self.config_version = state.stable_fingerprint(self.cfg)
+        if not hasattr(self, "strategy_config_version"):
+            self.strategy_config_version = state.strategy_fingerprint(self.cfg)
         if not hasattr(self, "code_version"):
             self.code_version = state.code_fingerprint()
         state.set_journal_context(
@@ -124,6 +135,8 @@ class Engine:
             prompt_version=self.prompt_version,
             config_version=self.config_version,
             code_version=self.code_version,
+            strategy_config_version=self.strategy_config_version,
+            variant_id=variants.LIVE_VARIANT_ID,
         )
         st = state.load_state()
         state.log_run(
