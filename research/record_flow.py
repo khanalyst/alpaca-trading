@@ -63,6 +63,11 @@ HOURLY_FIELDS = {
     "taker_volume": ["ts", "ccy", "sell_vol", "buy_vol"],
     "open_interest": ["ts", "inst_id", "oi_contracts", "oi_ccy", "oi_usd"],
     "funding": ["ts", "inst_id", "funding_rate", "next_funding_time"],
+    # Actual filled liquidations: the DIRECT observation of the forced-flow
+    # mechanism, rather than the open-interest proxy that flush-fade v1 used
+    # and that was falsified. OKX serves only a short recent window, so this
+    # exists only if it is recorded.
+    "liquidations": ["ts", "inst_id", "side", "pos_side", "bk_px", "sz"],
 }
 
 _running = True
@@ -266,6 +271,30 @@ class Recorder:
                 })
         written["funding"] = self.append(
             "funding", HOURLY_FIELDS["funding"], rows)
+
+        # Filled liquidation orders. flush-fade v1 inferred forced flow from
+        # open interest falling and was falsified; this is the event itself,
+        # with size, side and price. Deduplication in append() makes the
+        # short poll interval safe.
+        rows = []
+        for inst_id in instruments:
+            underlying = "-".join(inst_id.split("-")[:2])
+            data = self.get("/api/v5/public/liquidation-orders",
+                            {"instType": "SWAP", "state": "filled",
+                             "uly": underlying}) or []
+            for item in data:
+                for detail in item.get("details") or []:
+                    rows.append({
+                        "ts": int(detail.get("ts")
+                                  or detail.get("time") or 0),
+                        "inst_id": item.get("instId") or inst_id,
+                        "side": detail.get("side"),
+                        "pos_side": detail.get("posSide"),
+                        "bk_px": detail.get("bkPx"),
+                        "sz": detail.get("sz"),
+                    })
+        written["liquidations"] = self.append(
+            "liquidations", HOURLY_FIELDS["liquidations"], rows)
         return written
 
 

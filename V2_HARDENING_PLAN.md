@@ -122,14 +122,23 @@ Every strategy is a declared object with an id, a **mechanism** (who loses the
 money and why they cannot stop), a falsification criterion, and a tier. No
 strategy enters the register without all four.
 
-| ID | Mechanism — who pays, and why | Timeframe / hold | Execution | Data needed | Blocked on |
-| --- | --- | --- | --- | --- | --- |
-| `momentum-phase1-v2` | *None. Retained as the benchmark null.* | 15m / ≤48h | taker | have it | — |
-| `flush-fade-v1` | Liquidation engines sell at market regardless of price. Forced flow is price-insensitive, finite, and overshoots. The payer is the over-leveraged trader whose margin ran out and who has no choice. | 15m signal / 4–24h | taker | OI history (**~60d only**) | partially — 60d is a peek, not a test |
-| `funding-carry-v1` | Perp funding is the price of leverage. When positioning is crowded, the crowd pays continuously to hold. The payer is the leveraged long in a persistently positive-funding regime. | 1h signal / 2–10 days | taker entry, funding is the return | funding (~97d) | `max_hold_hours` cap (Batch 1) |
-| `trend-multiday-v1` | Slow adoption flows and reflexive positioning make multi-week crypto trend persist. Cost falls from ~15% of the move to ~1%. The payer is the mean-reversion seller who is early. | 4h signal / 5–20 days | taker | have it (candles) | `signal_timeframe` lock, hold cap |
-| `ls-ratio-fade-v1` | Within an instrument, retail long/short ratio rising relative to its own mean precedes outperformance. Measured +1.114% at 48h (t=2.72) on 30 days — a hypothesis, not evidence. | 1h / 16–48h | taker | L/S ratio (**~30d retention**) | recorder runtime |
-| `scalp-maker-v1` | Paid the spread for providing liquidity rather than paying it for taking. The payer is the impatient taker. | 1m signal / minutes | **maker only** | order book depth (**never served historically**) | recorder — hard-blocked, see §7 |
+| ID | Mechanism — who pays, and why | Tier now | What happened |
+| --- | --- | --- | --- |
+| `momentum` / phase1-v2 | *None. Retained as the benchmark null.* | **T0_REJECTED** | Reproduces its measured failure on every run; that reproduction is the harness's own self-check |
+| `flush-fade` / v1 | Liquidation engines sell at market regardless of price. Forced flow is price-insensitive, finite, and overshoots. The payer is the over-leveraged trader whose margin ran out. | **T0_REJECTED** | −0.288% at base costs, **−0.043% frictionless** — negative before costs. Random timing beat it; the inverted variant was also negative, ruling out a sign error. Mechanism still plausible; the open-interest proxy for it was not |
+| `funding-carry` / v1 | Funding is the price of leverage; the crowd pays continuously to hold. | **T0_REJECTED** | +2.008%/trade, beat every null, placebo −4%, better out-of-sample than in — and **funding contributed 2% of the result, price movement 98%**. A directional strategy wearing a carry label. Prompted the `mechanism_is_the_source` gate |
+| `funding-unwind` / v1 | Extreme funding marks *crowded positioning*, not yield. Crowded leveraged positions are unstable; the payer is the trader squeezed out of a position they could not finance. | **T1_HYPOTHESIS** | Clears every gate on the window that generated it, so capped by the provenance rule. **The live lead.** ~58 days of shadow reaches the 80 trades its effect size requires |
+| `trend-multiday` / v1 | Slow adoption flows and reflexive positioning make trend persist at multi-day horizons; cost falls from ~15% of the move to ~1%. | **T2_CANDIDATE** | +0.0876%/trade over 628 trades. Capped by sample size: a 14-day hold on a 200-day window cannot produce enough non-overlapping trades. Needs the full 730-day download |
+| `ls-ratio-fade` / v1 | Within an instrument, retail long/short ratio rising versus its own mean precedes outperformance. The fixed-effect objection was tested and rejected (−0.432 correlation; demeaning made it stronger). | **T1_HYPOTHESIS** | Not backtestable — the series is ~30 days and absent from the research dataset. **Shadow-only**, which is the case shadow evaluation exists for |
+| `scalp-maker` / v1 | A maker is paid the spread for supplying liquidity; the payer is the impatient taker. | **T1_HYPOTHESIS** | `hypotheses_tested: 0`. Blocked on ~3 months of recorded order-book depth, not on development |
+
+One correction the table records: `flush-fade`'s **mechanism was never
+tested** — its *proxy* was. Inferring forced liquidation from open interest
+falling is indirect, and OKX serves the liquidations themselves at
+`/api/v5/public/liquidation-orders` (price, size, side, timestamp). The
+recorder now captures them, which makes a direct test possible once enough
+has accumulated. That is a different instrument for the same mechanism, not
+a re-tune of a falsified one, and it needs its own pre-registration.
 
 Two honest notes on this table:
 
