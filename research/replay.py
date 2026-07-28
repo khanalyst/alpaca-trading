@@ -290,7 +290,7 @@ class Replay:
                         stop_pct=sized.get("sl_pct"),
                         take_pct=sized.get("tp_pct"),
                         notional=sized.get("notional"),
-                        enrichment=_enrichment_of(row, cycle))
+                        enrichment=_enrichment_of(row, cycle, symbol))
                     record.outcome = self._resolve(
                         symbol, row, sized, decision, max_hold)
                     result.decisions.append(record)
@@ -375,11 +375,25 @@ class Replay:
         }
 
 
-def _enrichment_of(row: dict, cycle) -> dict:
-    """Merge the symbol and market enrichment blocks for this observation."""
+def _enrichment_of(row: dict, cycle, symbol: str) -> dict:
+    """Merge the market and symbol enrichment blocks for this observation.
+
+    The primary source is the cycle's joined ``snapshot_enrichment`` event,
+    because B0.5 withholds these fields from the prompt and they are
+    therefore absent from the recorded snapshot by design. The in-snapshot
+    lookup is a fallback for corpora written by a build where the fields did
+    briefly travel together.
+    """
     from agent.brain import ENRICHMENT_KEY
 
     out = {}
+    joined = cycle.enrichment or {}
+    if isinstance(joined.get("market"), dict):
+        out.update(joined["market"])
+    symbols = joined.get("symbols") or {}
+    if isinstance(symbols.get(symbol), dict):
+        out.update(symbols[symbol])
+
     context = (cycle.snapshot.get("_market_context") or {})
     if isinstance(context.get(ENRICHMENT_KEY), dict):
         out.update(context[ENRICHMENT_KEY])

@@ -362,3 +362,53 @@ class RealPromptRoundTripTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnrichmentJoinTests(CorpusFixture):
+    """B0.5 withholds enrichment from the prompt, so it must be joined.
+
+    A conditioning axis that looked for these fields in the recorded snapshot
+    would find nothing - by design - and would report every bucket empty
+    while appearing to work.
+    """
+
+    def test_enrichment_is_joined_onto_the_cycle(self):
+        self.event("llm_input", anthropic_payload(snapshot(), {}),
+                   cycle_id="c1")
+        self.event("snapshot_enrichment", json.dumps({
+            "market": {"btc_ref_return_1_pct": -0.42},
+            "symbols": {"BTC/USDT:USDT": {"realised_vol_ratio_8_96": 1.47,
+                                          "utc_hour": 14}},
+        }), cycle_id="c1")
+
+        cycles, _ = corpus.load_cycles(self.db)
+
+        joined = cycles[0].enrichment
+        self.assertEqual(joined["market"]["btc_ref_return_1_pct"], -0.42)
+        self.assertEqual(
+            joined["symbols"]["BTC/USDT:USDT"]["utc_hour"], 14)
+
+    def test_a_cycle_with_no_enrichment_event_is_empty_not_missing(self):
+        self.event("llm_input", anthropic_payload(snapshot(), {}),
+                   cycle_id="c1")
+
+        cycles, _ = corpus.load_cycles(self.db)
+
+        self.assertEqual(cycles[0].enrichment, {})
+
+    def test_enrichment_reaches_a_replayed_decision(self):
+        from research.replay import _enrichment_of
+
+        self.event("llm_input", anthropic_payload(snapshot(), {}),
+                   cycle_id="c1")
+        self.event("snapshot_enrichment", json.dumps({
+            "market": {"btc_ref_return_1_pct": -0.42},
+            "symbols": {"BTC/USDT:USDT": {"utc_hour": 9}},
+        }), cycle_id="c1")
+
+        cycles, _ = corpus.load_cycles(self.db)
+        merged = _enrichment_of(
+            cycles[0].snapshot["BTC/USDT:USDT"], cycles[0], "BTC/USDT:USDT")
+
+        self.assertEqual(merged["utc_hour"], 9)
+        self.assertEqual(merged["btc_ref_return_1_pct"], -0.42)

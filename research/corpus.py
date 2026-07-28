@@ -57,6 +57,12 @@ class CycleRecord:
     provider: str
     variant_id: str | None = None
     strategy_config_version: str | None = None
+    # Joined from the separate ``snapshot_enrichment`` event, never from the
+    # snapshot above. B0.5 withholds enrichment from the prompt, so it is by
+    # construction absent from ``llm_input`` - which is the point, and which
+    # means a conditioning axis that read the snapshot would silently find
+    # nothing and report every bucket empty.
+    enrichment: dict = field(default_factory=dict)
 
     def symbols(self) -> list[str]:
         return [s for s, v in self.snapshot.items()
@@ -160,10 +166,25 @@ def parse_user_message(text: str) -> tuple[dict, dict, int] | None:
     return snapshot, portfolio, max_new
 
 
+def load_enrichment(db: str | Path) -> dict:
+    """``cycle_id -> {"market": {...}, "symbols": {symbol: {...}}}``."""
+    out: dict = {}
+    for event in load_events(db, "snapshot_enrichment"):
+        cycle_id = event.get("cycle_id")
+        if not cycle_id:
+            continue
+        out[cycle_id] = {
+            "market": event.get("market") or {},
+            "symbols": event.get("symbols") or {},
+        }
+    return out
+
+
 def load_cycles(db: str | Path) -> tuple[list[CycleRecord], LoadReport]:
-    """Every recorded model input, oldest first."""
+    """Every recorded model input, oldest first, with enrichment joined on."""
     report = LoadReport()
     out: list[CycleRecord] = []
+    enrichment = load_enrichment(db)
     with _connect(db) as conn:
         available = _columns(conn, "events")
         optional = [c for c in ("variant_id", "strategy_config_version")
@@ -199,6 +220,7 @@ def load_cycles(db: str | Path) -> tuple[list[CycleRecord], LoadReport]:
                 strategy_config_version=(
                     row["strategy_config_version"]
                     if "strategy_config_version" in optional else None),
+                enrichment=enrichment.get(row["cycle_id"]) or {},
             ))
     return out, report
 
