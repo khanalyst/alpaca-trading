@@ -533,6 +533,8 @@ class Engine:
                 return
             pos = next((p for p in positions
                         if p.get("symbol") == d.get("symbol")), None)
+            if pos and self._too_young_to_close(pos, d, st):
+                continue
             if pos:
                 trade = (st.get("active_trades") or {}).get(
                     d.get("symbol")) or {}
@@ -1645,6 +1647,53 @@ class Engine:
         state.commit(st)
         log.info("CLOSED %s (%s, %+.2f USDT realized): %s",
                  symbol, direction, total_realized, reason)
+        return True
+
+    def _too_young_to_close(self, pos: dict, decision: dict,
+                            st: dict) -> bool:
+        """Block a discretionary close inside strategy.min_hold_minutes.
+
+        Exchange-side stops and targets are untouched, the max-hold timer
+        still fires, and the engine's own safety closes do not pass through
+        here - this only constrains the model's judgement calls.
+
+        A ``risk_reduction`` close is always allowed: that trigger means the
+        model is de-risking rather than second-guessing the entry, and a
+        floor that blocks de-risking would be a safety regression.
+
+        When the position's age is unknown the close is ALLOWED. Refusing to
+        close a position we cannot age would trap it until the max-hold
+        timer, which is the more dangerous failure.
+        """
+        floor_minutes = float(self.cfg["strategy"].get("min_hold_minutes", 0))
+        if floor_minutes <= 0:
+            return False
+        if str(decision.get("close_trigger") or "") == "risk_reduction":
+            return False
+        symbol = pos.get("symbol")
+        opened = (st.get("opened_at") or {}).get(symbol)
+        try:
+            opened = float(opened or 0)
+        except (TypeError, ValueError):
+            opened = 0.0
+        if opened <= 0:
+            return False
+        held_minutes = (time.time() - opened) / 60.0
+        if held_minutes >= floor_minutes:
+            return False
+        log.info(
+            "Rejected model close %s: held %.0f min, minimum is %.0f min "
+            "(trigger=%s)",
+            symbol, held_minutes, floor_minutes,
+            decision.get("close_trigger"))
+        state.log_event("rejected", json.dumps({
+            "symbol": symbol,
+            "action": "close",
+            "why": "inside strategy.min_hold_minutes",
+            "held_minutes": round(held_minutes, 1),
+            "min_hold_minutes": floor_minutes,
+            "close_trigger": decision.get("close_trigger"),
+        }))
         return True
 
     # --------------------------------------------------------- housekeeping

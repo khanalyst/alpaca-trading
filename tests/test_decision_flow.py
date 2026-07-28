@@ -646,5 +646,73 @@ class EntryFailureBackoffTests(unittest.TestCase):
         commit.assert_called_once_with(st)
 
 
+class MinimumHoldTests(unittest.TestCase):
+    """The model may not close inside strategy.min_hold_minutes.
+
+    Measured forward return after a qualifying entry is at its worst around
+    30 minutes in, and the shipped payoff depends on the minority of trades
+    that reach a distant target. Sub-hour discretionary exits removed that
+    tail while still paying a full taker round trip.
+    """
+
+    def setUp(self):
+        self.engine = Engine.__new__(Engine)
+        self.engine.cfg = valid_config()
+        self.pos = {"symbol": "BTC/USDT:USDT", "side": "short"}
+
+    def _state(self, minutes_ago):
+        return {"opened_at": {
+            "BTC/USDT:USDT": time.time() - minutes_ago * 60}}
+
+    def _close(self, trigger="thesis_invalidated"):
+        return {"action": "close", "symbol": "BTC/USDT:USDT",
+                "close_trigger": trigger, "reasoning": "impulse reversed"}
+
+    @patch("agent.engine.state.log_event")
+    def test_close_inside_the_floor_is_blocked(self, log_event):
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(17)))
+        self.assertEqual(log_event.call_args.args[0], "rejected")
+
+    @patch("agent.engine.state.log_event")
+    def test_close_after_the_floor_is_allowed(self, log_event):
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(120)))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_risk_reduction_is_never_blocked(self, log_event):
+        # De-risking is not second-guessing the entry, so the floor must not
+        # stand between the model and a position it wants to shrink.
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close("risk_reduction"), self._state(5)))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_unknown_age_allows_the_close(self, log_event):
+        # Trapping a position we cannot age until the max-hold timer is the
+        # more dangerous failure, so this direction fails open.
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), {"opened_at": {}}))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_zero_floor_disables_the_guard(self, log_event):
+        self.engine.cfg["strategy"]["min_hold_minutes"] = 0
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(1)))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_the_observed_live_exits_would_all_have_been_blocked(
+            self, log_event):
+        # LTC 17 min, ETC 55 min, DOGE 75 min - every discretionary exit in
+        # the losing window, none of them a risk reduction.
+        for held_minutes in (17, 55, 75):
+            with self.subTest(held_minutes=held_minutes):
+                self.assertTrue(self.engine._too_young_to_close(
+                    self.pos, self._close(), self._state(held_minutes)))
+
+
 if __name__ == "__main__":
     unittest.main()

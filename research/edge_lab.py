@@ -394,6 +394,36 @@ class Contract:
     min_stop_pct: float = 0.2
     max_stop_pct: float = 15.0
 
+    @classmethod
+    def from_config(cls, cfg: dict) -> "Contract":
+        """Build the research contract from a validated live config.
+
+        The defaults above are a snapshot, and snapshots drift: config.yaml
+        moved to a 3R target while these defaults still read 2.0, so anything
+        comparing the two was comparing different strategies. Sourcing the
+        tunables from the config is what makes validate_features.py a check
+        on the shipped configuration rather than on a stale copy of it.
+        """
+        strategy = cfg["strategy"]
+        risk = cfg["risk"]
+        return cls(
+            breakout_range_threshold_pct=float(
+                strategy["breakout_range_threshold_pct"]),
+            breakout_min_relative_volume=float(
+                strategy["breakout_min_relative_volume"]),
+            funding_extreme_pct_per_8h=float(
+                strategy["funding_extreme_pct_per_8h"]),
+            hard_max_entry_extension_atr=float(
+                strategy["hard_max_entry_extension_atr"]),
+            min_stop_atr_multiple=float(strategy["min_stop_atr_multiple"]),
+            structure_buffer_atr_multiple=float(
+                strategy["structure_buffer_atr_multiple"]),
+            fixed_reward_risk=float(strategy["fixed_reward_risk"]),
+            extended_reward_risk=float(strategy["extended_reward_risk"]),
+            # 15m signal bars: four per hour.
+            max_hold_bars=int(round(float(risk["max_hold_hours"]) * 4)),
+        )
+
 
 def evidence_masks(df: pd.DataFrame, c: Contract) -> dict[str, np.ndarray]:
     """Vectorized agent.strategy.setup_evidence (+ optional research gates)."""

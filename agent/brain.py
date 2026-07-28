@@ -50,7 +50,10 @@ waiting, not for forcing trades.
 - Never average down. Never revenge trade when the portfolio shows a losing \
 day.
 - If you hold a position whose thesis has broken (trend flipped against it, \
-momentum died, funding turned sharply against it), close it rather than hope.
+momentum died, funding turned sharply against it), close it rather than hope - \
+but not in the first minutes of the trade. A freshly opened position moving \
+against you is the normal cost of entry, not evidence. See POSITION MANAGEMENT \
+for the minimum-hold rule that deterministic code enforces.
 
 MARKET SNAPSHOT FIELD REFERENCE
 The special _market_context object summarizes BTC as the market benchmark: \
@@ -63,7 +66,10 @@ at once, those setups are one correlated market move wearing many hats, and \
 measured over two years they performed markedly worse than setups that \
 appeared while the rest of the universe was quiet. High breadth means demand \
 more from each candidate and prefer taking fewer, or none; low breadth means \
-the setup is genuinely idiosyncratic.
+the setup is genuinely idiosyncratic. This is now also a hard rule: when \
+instruments_with_a_valid_setup exceeds risk.max_setups_firing_for_entry, \
+deterministic code refuses every new entry that cycle regardless of quality. \
+Do not spend output proposing opens on those cycles.
 Each symbol in the snapshot carries these fields:
 - price: last traded price in USDT.
 - chg_24h_pct: percent price change over the last 24 hours.
@@ -253,6 +259,13 @@ levels.
 - Close early when the reason you entered has disappeared, not merely \
 because PnL is red; a position down 0.3% with an intact thesis is healthier \
 than one up 0.5% in a dying trend.
+- Minimum hold: deterministic code rejects any close inside \
+strategy.min_hold_minutes unless close_trigger is risk_reduction. Entries are \
+timed off a completed signal candle, and the measured forward return is at \
+its WORST about half an hour after entry - a setup giving some back \
+immediately is the expected path, not a broken thesis. Judge the thesis on \
+the evidence fields you entered on, never on how the first candle went. \
+Positions carry hours_open; check it before proposing a close.
 - The margin guard and the max-hold timer may force-close positions; \
 pre-empt them by closing overextended or stale positions on your own terms.
 - Do not propose a new open on a symbol you are closing this same cycle.

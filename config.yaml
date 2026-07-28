@@ -35,7 +35,25 @@ strategy:
   loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence
   min_stop_atr_multiple: 1.0
   structure_buffer_atr_multiple: 0.15
-  hard_max_entry_extension_atr: 2.5  # extreme no-chase safety boundary
+  # No-chase boundary, in ATRs from the 1h EMA20. Lowered from 2.5 because
+  # the model was treating the ceiling as a target: live entries arrived
+  # "just inside the no-chase extension limit", i.e. selling ~2.5 ATR BELOW
+  # the mean, which is the point of maximum mean-reversion risk. The best
+  # of 64 tested selector rules was extension_atr >= 1.977, and it scored
+  # -0.0999 R out-of-sample. 1.2 keeps the entry near the mean instead.
+  hard_max_entry_extension_atr: 1.2
+  # Floor on how long a position must be held before the model may close it
+  # on its own judgement. Exchange-side stops and targets are unaffected, and
+  # a risk_reduction close is always allowed.
+  #
+  # Measured forward return after a qualifying signal is most negative ~30
+  # minutes after entry (-0.0072%, t=-1.69) and the configuration's whole
+  # payoff depends on the ~20% of trades that reach a 3R target at a ~21h
+  # average hold. Discretionary closes at 17-75 minutes therefore removed
+  # the entire right tail while paying a full taker round trip. 90 minutes
+  # clears the worst of the adverse window without approaching the 8h point
+  # where an early-exit overlay was measured to start helping.
+  min_hold_minutes: 90
   breakout_range_threshold_pct: 85
   breakout_min_relative_volume: 1.0
   # Absolute funding floor for the funding_squeeze setup, expressed as an
@@ -94,6 +112,20 @@ risk:
   max_btc_beta_exposure_pct: 100 # cap signed BTC-beta-weighted notional
   min_btc_beta_samples: 24       # otherwise assume conservative beta=1
   max_concurrent_positions: 3
+  # Cap on positions held in the SAME direction at once. The notional caps
+  # above do not constrain correlated concentration in practice: 3 shorts x
+  # 30% notional = 90% net, which passes max_net_direction_pct=100 and the
+  # BTC-beta cap with room to spare. Every live entry in the observed losing
+  # window was a short, opened while every other cap still had headroom.
+  max_same_direction_positions: 2
+  # Refuse new entries when more than this many instruments satisfy a setup
+  # contract in the same cycle. Simultaneous setups are not independent -
+  # they are one market-wide move expressed many ways, and taking three of
+  # them is one correlated bet at triple size. Measured: bars where 5+ fired
+  # scored -0.3475% per trade against -0.1627% when only 1-2 fired, the
+  # largest effect in the project and the same sign in both walk-forward
+  # halves. Previously this count was reported to the model as advice only.
+  max_setups_firing_for_entry: 4
   min_confidence: 0.65           # model decisions below this are discarded
   # Day-trading discipline: no multi-day positions. 48h rather than 24h is
   # measured, not preference. Across 8 matched (reward:risk x cost) cells the

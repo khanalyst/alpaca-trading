@@ -164,6 +164,30 @@ class ConfigValidationTests(unittest.TestCase):
                 ConfigError, "cannot exceed daily_loss_limit_pct"):
             validate_config(cfg)
 
+    def test_same_direction_cap_cannot_exceed_concurrent_cap(self):
+        cfg = valid_config()
+        cfg["risk"]["max_same_direction_positions"] = 4
+        with self.assertRaisesRegex(
+                ConfigError, "cannot exceed max_concurrent_positions"):
+            validate_config(cfg)
+
+    def test_minimum_hold_cannot_outlast_the_max_hold_timer(self):
+        # A close floor above the force-close ceiling would mean no model
+        # close is ever permitted and every position exits on the clock.
+        cfg = valid_config()
+        cfg["risk"]["max_hold_hours"] = 1
+        cfg["strategy"]["min_hold_minutes"] = 90
+        with self.assertRaisesRegex(
+                ConfigError, "min_hold_minutes must be below"):
+            validate_config(cfg)
+
+    def test_minimum_hold_below_the_timer_is_accepted(self):
+        cfg = valid_config()
+        cfg["risk"]["max_hold_hours"] = 2
+        cfg["strategy"]["min_hold_minutes"] = 90
+        self.assertEqual(
+            validate_config(cfg)["strategy"]["min_hold_minutes"], 90)
+
 
 if __name__ == "__main__":
     unittest.main()

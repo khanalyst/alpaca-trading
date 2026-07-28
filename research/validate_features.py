@@ -305,7 +305,10 @@ def contract_agreement(frames: dict, samples: int, seed: int) -> dict:
 
     repo = Path(__file__).resolve().parents[1]
     cfg = validate_config(yaml.safe_load((repo / "config.yaml").read_text()))
-    contract = Contract()
+    # Built from the same config that drives the authoritative code path, so
+    # a parameter change in config.yaml cannot silently make this comparison
+    # test two different strategies against each other.
+    contract = Contract.from_config(cfg)
     rng = np.random.default_rng(seed)
     issues = []
     checked = 0

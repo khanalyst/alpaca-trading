@@ -76,7 +76,7 @@ def validate_config(raw: dict) -> dict:
         "id", "version", "signal_timeframe",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
         "setup_memory_hours", "loss_reentry_min_minutes",
-        "min_stop_atr_multiple",
+        "min_stop_atr_multiple", "min_hold_minutes",
         "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
         "breakout_range_threshold_pct", "breakout_min_relative_volume",
         "funding_extreme_pct_per_8h", "fixed_reward_risk",
@@ -96,6 +96,7 @@ def validate_config(raw: dict) -> dict:
     _number(strategy, "setup_memory_hours", 1, 720, "strategy")
     _number(strategy, "loss_reentry_min_minutes", 0, 10080, "strategy")
     _number(strategy, "min_stop_atr_multiple", 0.5, 5, "strategy")
+    _number(strategy, "min_hold_minutes", 0, 1440, "strategy")
     _number(strategy, "structure_buffer_atr_multiple", 0, 2, "strategy")
     _number(strategy, "hard_max_entry_extension_atr", 0.5, 10, "strategy")
     _number(strategy, "breakout_range_threshold_pct", 50, 99, "strategy")
@@ -158,6 +159,8 @@ def validate_config(raw: dict) -> dict:
                  "max_position_notional_pct", "max_gross_exposure_pct",
                  "max_net_direction_pct", "max_btc_beta_exposure_pct",
                  "min_btc_beta_samples", "max_concurrent_positions",
+                 "max_same_direction_positions",
+                 "max_setups_firing_for_entry",
                  "min_confidence", "max_hold_hours", "daily_loss_limit_pct",
                  "flatten_on_daily_stop", "max_drawdown_pct",
                  "max_margin_usage_pct", "min_maintenance_margin_ratio",
@@ -183,12 +186,31 @@ def validate_config(raw: dict) -> dict:
     _number(risk, "max_btc_beta_exposure_pct", 1, 300, "risk")
     _integer(risk, "min_btc_beta_samples", 0, 200, "risk")
     _integer(risk, "max_concurrent_positions", 1, 20, "risk")
+    _integer(risk, "max_same_direction_positions", 1, 20, "risk")
+    if (int(risk["max_same_direction_positions"])
+            > int(risk["max_concurrent_positions"])):
+        raise ConfigError(
+            "risk.max_same_direction_positions cannot exceed "
+            "max_concurrent_positions")
+    # Simultaneous setups are one market-wide move expressed many ways. This
+    # is the count of instruments whose contract fires in a cycle, above
+    # which no new entry is allowed at all.
+    _integer(risk, "max_setups_firing_for_entry", 1, 100, "risk")
     _number(risk, "min_confidence", 0, 1, "risk")
     # This is a day-trading strategy. A position may run into a second
     # session, but a multi-day hold is a different strategy with different
     # risk (weekend gaps, funding accumulation, overnight news) and must not
     # be reachable by nudging one number.
     _number(risk, "max_hold_hours", 0.25, 48, "risk")
+    # A discretionary-close floor above the force-close ceiling would trap
+    # every position until the clock closed it at whatever price was
+    # available, which is the opposite of what the floor is for.
+    if (float(strategy["min_hold_minutes"])
+            >= float(risk["max_hold_hours"]) * 60):
+        raise ConfigError(
+            "strategy.min_hold_minutes must be below risk.max_hold_hours "
+            "expressed in minutes, otherwise no model close is ever "
+            "permitted before the max-hold timer fires")
     _number(risk, "daily_loss_limit_pct", 0.1, 20, "risk")
     _boolean(risk, "flatten_on_daily_stop", "risk")
     _number(risk, "max_drawdown_pct", 1, 50, "risk")

@@ -289,5 +289,104 @@ class VetOpenSymbolTests(unittest.TestCase):
         self.assertAlmostEqual(plan["risk_usd"], 20.0, places=6)
 
 
+class SameDirectionCapTests(unittest.TestCase):
+    """Correlated concentration is capped in position count, not notional.
+
+    At the shipped 30% per-position cap three same-direction positions total
+    90% net against a 100% net-direction cap, so a wholly one-sided book
+    passes every exposure check. This is the guard that does bind.
+    """
+
+    def setUp(self):
+        self.risk = RiskEngine(valid_config())
+
+    def _market(self):
+        market = snapshot()
+        for symbol in ("ETH/USDT:USDT", "SOL/USDT:USDT"):
+            market[symbol] = dict(market["BTC/USDT:USDT"])
+            market[symbol].update(
+                {"beta_btc_1h_72": 0.1, "corr_btc_samples": 72})
+        return market
+
+    def _held_shorts(self, count: int):
+        symbols = ("ETH/USDT:USDT", "SOL/USDT:USDT")[:count]
+        held = [{"symbol": s, "side": "short", "notional": 100.0}
+                for s in symbols]
+        active = {s: {"risk_usd": 1.0} for s in symbols}
+        return held, active
+
+    def test_third_same_direction_position_is_refused(self):
+        held, active = self._held_shorts(2)
+        plan, why = self.risk.vet_open(
+            decision(direction="short"), 10_000, held, self._market(), {},
+            200.0, active_trades=active)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "max same-direction positions reached (2 short)")
+
+    def test_opposite_direction_is_unaffected(self):
+        held, active = self._held_shorts(2)
+        plan, why = self.risk.vet_open(
+            decision(direction="long"), 10_000, held, self._market(), {},
+            200.0, active_trades=active)
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+
+    def test_second_same_direction_position_still_allowed(self):
+        held, active = self._held_shorts(1)
+        plan, why = self.risk.vet_open(
+            decision(direction="short"), 10_000, held, self._market(), {},
+            100.0, active_trades=active)
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+
+    def test_invalid_direction_fails_closed(self):
+        plan, why = self.risk.vet_open(
+            decision(direction="sideways"), 10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "direction is invalid")
+
+
+class SetupBreadthCapTests(unittest.TestCase):
+    """Simultaneous setups are one market move, not many opportunities."""
+
+    def setUp(self):
+        self.risk = RiskEngine(valid_config())
+
+    def _market(self, firing):
+        market = snapshot()
+        market["_market_context"]["instruments_scanned"] = 10
+        market["_market_context"]["instruments_with_a_valid_setup"] = firing
+        return market
+
+    def test_crowded_cycle_refuses_every_entry(self):
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], self._market(5), {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(
+            why,
+            "setup breadth 5 instruments exceeds 4: correlated market-wide "
+            "move")
+
+    def test_quiet_cycle_is_allowed(self):
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], self._market(4), {}, 0)
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+
+    def test_missing_breadth_does_not_block(self):
+        # Older snapshots and unit fixtures carry no breadth field; the guard
+        # must not turn that into a silent refusal to ever trade.
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], snapshot(), {}, 0)
+        self.assertIsNone(why)
+        self.assertIsNotNone(plan)
+
+    def test_malformed_breadth_fails_closed(self):
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], self._market("many"), {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "setup breadth measurement is invalid")
+
+
 if __name__ == "__main__":
     unittest.main()

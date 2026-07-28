@@ -98,6 +98,43 @@ class RiskEngine:
             return None, "already holding this symbol"
         if len(positions) >= int(self.r["max_concurrent_positions"]):
             return None, "max concurrent positions reached"
+
+        # Correlated-concentration guard, counted in positions rather than
+        # notional. The notional caps below do not bind here in practice: at
+        # the shipped 30% per-position cap, three same-direction positions
+        # total 90% net against a 100% net-direction cap, so an entirely
+        # one-sided book passes every exposure check with headroom.
+        direction = decision.get("direction")
+        if direction not in {"long", "short"}:
+            return None, "direction is invalid"
+        same_side = "long" if direction == "long" else "short"
+        held_same_side = sum(
+            1 for p in positions if p.get("side") == same_side)
+        if held_same_side >= int(self.r["max_same_direction_positions"]):
+            return None, (
+                f"max same-direction positions reached "
+                f"({held_same_side} {same_side})")
+
+        # Breadth guard. When many instruments qualify at once they are not
+        # independent setups; they are one market-wide move, and those bars
+        # were measured materially worse than quiet ones. The count is
+        # supplied by market._market_context, which is a context block in the
+        # snapshot rather than a tradable symbol.
+        breadth_limit = self.r.get("max_setups_firing_for_entry")
+        if breadth_limit is not None:
+            context = snapshot.get("_market_context")
+            firing = (context.get("instruments_with_a_valid_setup")
+                      if isinstance(context, dict) else None)
+            if firing is not None:
+                try:
+                    firing = int(firing)
+                except (TypeError, ValueError):
+                    return None, "setup breadth measurement is invalid"
+                if firing > int(breadth_limit):
+                    return None, (
+                        f"setup breadth {firing} instruments exceeds "
+                        f"{int(breadth_limit)}: correlated market-wide move")
+
         confidence = float(decision.get("confidence", 0))
         if not math.isfinite(confidence):
             return None, "confidence is not finite"
