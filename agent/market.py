@@ -166,8 +166,8 @@ def _okx_oi_history(ex, symbol: str) -> list[float]:
     inst_id = _inst_id(ex, symbol)
     if not inst_id:
         return []
-    raw = ex.public_get(
-        "/api/v5/rubik/stat/contracts/open-interest-history",
+    raw = ex.public_call(
+        "publicGetRubikStatContractsOpenInterestHistory",
         {"instId": inst_id, "period": "1H", "limit": "24"})
     out = []
     for row in raw or []:
@@ -205,8 +205,8 @@ def _long_short_ratio(ex, symbol: str) -> dict:
 
 def _okx_long_short(ex, symbol: str) -> list[float]:
     currency = symbol.split("/")[0]
-    raw = ex.public_get(
-        "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+    raw = ex.public_call(
+        "publicGetRubikStatContractsLongShortAccountRatio",
         {"ccy": currency, "period": "1H", "limit": "100"})
     out = []
     for row in raw or []:
