@@ -507,6 +507,13 @@ class Engine:
         # the one that is trading. Costs no LLM call and places no order.
         self._record_shadow_decisions(snapshot)
 
+        # B0.5: start the irreversible clock. These fields are journalled and
+        # read by nothing for months - that is the point. A snapshot taken
+        # today without open interest in it can never be made to have open
+        # interest in it, so the only genuinely unrecoverable decision in the
+        # programme is the decision not to record.
+        self._record_observations(snapshot)
+
         portfolio = self._portfolio_view(equity, positions, st,
                                          day_pnl_pct, drawdown_pct)
         # While DAY_STOPPED the engine drops every open, so tell the model
@@ -1769,6 +1776,55 @@ class Engine:
             except Exception as exc:                       # noqa: BLE001
                 log.warning("Shadow evaluation failed for %s: %s",
                             strategy_id, exc)
+
+    def _record_observations(self, snapshot: dict) -> None:
+        """Journal the enrichment fields and the per-cycle book state.
+
+        Two events, both write-only for now, and deliberately so. Nothing in
+        this repository reads them today; H-G and H-H cannot be tested for
+        roughly three months because the sample does not exist yet. Waiting
+        until the analysis is ready to write the collection would mean
+        starting the three-month clock three months late.
+
+        ``book_state`` is the one that matters most and costs the least. The
+        depth and spread reading already happens at entry, but it is only
+        journalled when it *rejects*, so every ordinary observation is thrown
+        away - and the ordinary observations are the baseline against which a
+        cascade's depth collapse and refill are measured.
+
+        Never raises. Observation must not be able to interrupt trading.
+        """
+        symbols = [s for s in snapshot
+                   if not s.startswith("_") and isinstance(snapshot[s], dict)]
+        try:
+            enrichment = {
+                symbol: snapshot[symbol].get(brain.ENRICHMENT_KEY)
+                for symbol in symbols
+            }
+            context = snapshot.get("_market_context") or {}
+            state.log_event(
+                "snapshot_enrichment",
+                self._audit_json({
+                    "market": context.get(brain.ENRICHMENT_KEY),
+                    "symbols": enrichment,
+                }),
+            )
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Snapshot enrichment journalling failed: %s", exc)
+
+        for symbol in symbols:
+            try:
+                state.log_event(
+                    "book_state",
+                    self._audit_json({
+                        "signal_ts": self._plain(
+                            snapshot[symbol].get("signal_ts")),
+                        **self.ex.book_state(symbol),
+                    }),
+                )
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("Book state journalling failed for %s: %s",
+                            symbol, exc)
 
     def _too_young_to_close(self, pos: dict, decision: dict,
                             st: dict) -> bool:

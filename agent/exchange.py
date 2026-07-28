@@ -1134,6 +1134,73 @@ class Exchange:
             return 0.0
         return amt
 
+    def book_state(self, symbol: str, band_pct: float = 0.35) -> dict:
+        """Observe the order book without judging it.
+
+        ``guarded_entry_limit`` reads the same book but only journals when it
+        rejects, so every passing observation is discarded. That is precisely
+        backwards for H-H, which claims the tradeable moment in a liquidation
+        cascade is the depth *restoration* rather than the impulse: spread
+        spikes then normalises, top-of-book depth collapses then refills, and
+        price is still near the extreme when the refill happens. That
+        signature is only visible if the ordinary readings were kept too.
+
+        This raises nothing. A caller journalling market observations must
+        never be able to interrupt trading, so every failure becomes a row of
+        nulls carrying the reason.
+        """
+        blank = {
+            "symbol": symbol, "mid": None, "spread_pct": None,
+            "bid_depth_usd": None, "ask_depth_usd": None,
+            "top_bid_size": None, "top_ask_size": None,
+            "band_pct": float(band_pct), "book_ts": None, "error": None,
+        }
+        try:
+            book = self.retry(self.x.fetch_order_book, symbol, 50)
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            if not bids or not asks:
+                blank["error"] = "no two-sided depth"
+                return blank
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            if not (math.isfinite(best_bid) and math.isfinite(best_ask)
+                    and best_ask >= best_bid > 0):
+                blank["error"] = "invalid top of book"
+                return blank
+
+            mid = (best_bid + best_ask) / 2
+            contract_size = float(
+                self.x.market(symbol).get("contractSize") or 1)
+            floor = mid * (1 - float(band_pct) / 100)
+            ceiling = mid * (1 + float(band_pct) / 100)
+
+            def depth(levels, inside) -> float:
+                total = 0.0
+                for level in levels:
+                    price = float(level[0])
+                    amount = float(level[1])
+                    if not (math.isfinite(price) and math.isfinite(amount)):
+                        continue
+                    if not inside(price):
+                        break
+                    total += price * amount * contract_size
+                return round(total, 2)
+
+            blank.update({
+                "mid": round(mid, 10),
+                "spread_pct": round((best_ask - best_bid) / mid * 100, 6),
+                "bid_depth_usd": depth(bids, lambda p: p >= floor),
+                "ask_depth_usd": depth(asks, lambda p: p <= ceiling),
+                "top_bid_size": float(bids[0][1]),
+                "top_ask_size": float(asks[0][1]),
+                "book_ts": book.get("timestamp"),
+            })
+            return blank
+        except Exception as e:                      # observation, never a gate
+            blank["error"] = f"{type(e).__name__}: {e}"
+            return blank
+
     def guarded_entry_limit(self, symbol: str, side: str, contracts: float,
                             max_spread_pct: float,
                             max_slippage_pct: float,

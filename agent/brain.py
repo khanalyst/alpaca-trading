@@ -370,6 +370,37 @@ def prompt_version(system: str) -> str:
     return hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
 
 
+# The key every recorded-but-withheld field lives under. One name, checked in
+# one place, so "is this field visible to the model?" has a mechanical answer.
+ENRICHMENT_KEY = "_enrichment"
+
+
+def withhold_enrichment(value):
+    """Return ``value`` with every ``_enrichment`` block removed.
+
+    B0.5 records fields the model must not see yet - open-interest deltas,
+    book state, realised-volatility ratios. They are journalled from the
+    moment collection starts, because a snapshot taken without them can never
+    be made to have them, and they are withheld from the prompt because
+    changing the prompt changes model behaviour and forks the comparability
+    of every observation either side of the change.
+
+    Showing the model a new field is therefore a deliberate, versioned act
+    belonging to its own batch, with its own attribution fork and its own
+    before-and-after replay. It is not a side effect of starting to record.
+
+    The copy is deep enough to protect the caller's dict and no deeper: the
+    journal writes the same snapshot object after the prompt is built, and it
+    must still see everything.
+    """
+    if isinstance(value, dict):
+        return {key: withhold_enrichment(item)
+                for key, item in value.items() if key != ENRICHMENT_KEY}
+    if isinstance(value, list):
+        return [withhold_enrichment(item) for item in value]
+    return value
+
+
 class LLM:
     @staticmethod
     def _sampling_unsupported(model: str) -> bool:
@@ -573,7 +604,8 @@ class LLM:
     def _user_message(snapshot: dict, portfolio: dict, max_new: int) -> str:
         return (
             "MARKET SNAPSHOT (liquid USDT perpetual swaps on OKX):\n"
-            + json.dumps(snapshot, separators=(",", ":"), allow_nan=False)
+            + json.dumps(withhold_enrichment(snapshot),
+                         separators=(",", ":"), allow_nan=False)
             + "\n\nPORTFOLIO STATE:\n"
             + json.dumps(portfolio, separators=(",", ":"), allow_nan=False)
             + f"\n\nYou may propose at most {max(0, max_new)} new \"open\" "

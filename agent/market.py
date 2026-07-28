@@ -13,7 +13,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from . import strategy
+from . import brain, strategy
 from .exchange import OKX_CRYPTO_INSTRUMENT_CATEGORY
 
 log = logging.getLogger("market")
@@ -665,6 +665,14 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     snap = _json_safe(snap)
     snap["regime"] = classify_regime(snap)
     strategy.enrich_snapshot(snap, cfg)
+    # B0.5: recorded from today, shown to the model in no batch but the one
+    # that deliberately tests it. Added after enrich_snapshot so it can never
+    # reach a contract, and after _json_safe so it is sanitized in its own
+    # right rather than by a pass that ran before it existed.
+    snap[brain.ENRICHMENT_KEY] = _json_safe(realised_vol_enrichment(
+        list(df_fast["close"]),
+        utc_hour=int(time.gmtime(int(snap["signal_ts"]) / 1000).tm_hour),
+    ))
     return snap
 
 
@@ -697,6 +705,12 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
     except Exception as e:
         log.warning("benchmark snapshot failed: %s", e)
 
+    # B0.5.3: BTC reference returns, recorded so the residual computation
+    # H-J needs does not depend on the 1m price cache being complete for
+    # every symbol-day. Costs one OHLCV call per cycle and is withheld from
+    # the prompt like the rest of the enrichment.
+    context[brain.ENRICHMENT_KEY] = _btc_reference_returns(ex, benchmark, cfg)
+
     out = {"_market_context": context}
     for sym in symbols:
         try:
@@ -709,6 +723,94 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
     if len(out) > 1:
         context.update(_setup_crowding(out))
     return out if len(out) > 1 else {}
+
+
+def _btc_reference_returns(ex, benchmark: str, cfg: dict) -> dict:
+    """BTC 15m return over 1, 4 and 24 bars.
+
+    H-J claims a meaningful fraction of the variance in trade outcomes is
+    explained by contemporaneous BTC return rather than by the setup - that a
+    long breakout on three correlated perpetuals is one levered BTC bet
+    paying three sets of fees. Testing that needs the market factor at
+    decision time, and reconstructing it later from a per-symbol price cache
+    fails on exactly the symbol-days the cache is missing.
+
+    Recorded rather than derived, therefore. One call per cycle, and a
+    failure yields nulls rather than an exception: no order depends on it.
+    """
+    empty = {"btc_ref_return_1_pct": None, "btc_ref_return_4_pct": None,
+             "btc_ref_return_24_pct": None, "btc_ref_signal_ts": None}
+    try:
+        raw = _closed_ohlcv(ex, benchmark, "15m", 30)
+        closes = [float(row[4]) for row in raw or []]
+        stamps = [int(row[0]) for row in raw or []]
+    except Exception as e:
+        log.warning("btc reference returns failed: %s", e)
+        return empty
+    if len(closes) < 25 or not all(math.isfinite(c) and c > 0
+                                   for c in closes[-25:]):
+        return empty
+
+    def change(bars: int) -> float | None:
+        base = closes[-1 - bars]
+        return round((closes[-1] / base - 1) * 100, 4) if base > 0 else None
+
+    return {
+        "btc_ref_return_1_pct": change(1),
+        "btc_ref_return_4_pct": change(4),
+        "btc_ref_return_24_pct": change(24),
+        "btc_ref_signal_ts": stamps[-1] if stamps else None,
+    }
+
+
+def realised_vol_enrichment(closes, utc_hour: int) -> dict:
+    """Realised volatility over a fast and a slow window, plus their ratio.
+
+    The ratio is the regime variable H-I is built on: the claim is that
+    ``range_breakout`` has positive expectancy when volatility is expanding
+    from a compressed base and negative expectancy when volatility is already
+    elevated, so that the pooled figure is the average of two populations of
+    opposite sign and lands near zero.
+
+    Both windows are derivable later from cached OHLCV, so recording them now
+    is a convenience rather than a necessity. It is worth doing anyway: it
+    makes the replay cheaper and it costs one pass over a list already in
+    memory.
+
+    Every failure mode returns ``None`` rather than raising. Nothing here is
+    allowed to stop a cycle - no order depends on any of it.
+    """
+    out = {"realised_vol_8": None, "realised_vol_96": None,
+           "realised_vol_ratio_8_96": None, "utc_hour": utc_hour}
+    clean = []
+    for value in closes or []:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number > 0:
+            clean.append(number)
+    if len(clean) < 97:            # 96 returns needs 97 closes
+        return out
+
+    series = pd.Series(clean)
+    returns = series.pct_change().dropna()
+    if len(returns) < 96:
+        return out
+
+    fast = float(returns.iloc[-8:].std())
+    slow = float(returns.iloc[-96:].std())
+    if not math.isfinite(fast) or not math.isfinite(slow):
+        return out
+
+    out["realised_vol_8"] = round(fast * 100, 4)
+    out["realised_vol_96"] = round(slow * 100, 4)
+    # A zero slow window means a flat series, where the ratio is undefined
+    # rather than infinite. Recording inf would poison every bucket boundary
+    # computed from this column later.
+    if slow > 0:
+        out["realised_vol_ratio_8_96"] = round(fast / slow, 4)
+    return out
 
 
 def _setup_crowding(snapshot: dict) -> dict:
