@@ -16,6 +16,11 @@ never treated as USDT capital.
 > **New to all of this?** [SETUP.md](SETUP.md) is a step-by-step beginner
 > guide: installing, getting keys, running 24/7 on any machine or VPS, and
 > what it costs per month.
+>
+> **Deploying to Azure?** [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) walks
+> through it from an empty subscription: creating the VM, binding OKX keys to
+> a static IP, installing the three services, and verifying shadow evaluation
+> is recording.
 
 ## Read this first
 

@@ -1,5 +1,12 @@
 # Running this 24/7 on an Azure VM
 
+> **First time doing this?** Use
+> [`../AZURE_DEPLOYMENT.md`](../AZURE_DEPLOYMENT.md) instead — it is the same
+> deployment written as a step-by-step walkthrough, including creating the VM,
+> the deploy key, IP binding and what to check afterwards. This page is the
+> condensed reference for someone who has done it before.
+
+
 ## Why a VM and not Azure Functions
 
 The trading loop is long-running and stateful: it holds a single-process
