@@ -403,6 +403,34 @@ not a bug to work around.
 python main.py strategies --verbose   # the register, tiers and mechanisms
 ```
 
+**Shadow evaluation.** Every cycle, the agent evaluates *every* registered
+contract against the same snapshot and journals what each one would have
+done — not only the strategy holding capital. This costs no extra LLM call
+and places no orders. Without it, forward-testing five strategies would take
+five times as long as forward-testing one; with it they all accumulate
+out-of-sample evidence from the same market data, starting the day they are
+registered.
+
+The active strategy is shadowed too, which is the part that is easy to miss:
+comparing what the contract fired on against what the account actually opened
+is the only direct measurement of what the LLM layer contributes. Offline
+research can bound that contribution; it cannot observe it.
+
+```bash
+# resolve shadow decisions against real subsequent bars
+python research/export_live.py --mode demo --data runtime/research/data
+# score every strategy through the six gates, with forward evidence attached
+python research/tournament.py --data runtime/research/data
+```
+
+Shadow outcomes are resolved with the same simulator the backtests use, so
+the forward and backtest numbers are directly comparable. A **sign
+disagreement between them is the earliest available warning that a backtest
+was fitted**, and the report flags it long before the sample is large enough
+to prove anything. `T4_CONFIRMED` is the one tier offline data cannot grant:
+it requires forward evidence agreeing in sign, over at least as many trades
+as the detectability gate computed.
+
 **Change the momentum contract (`strategy:` block)**
 
 | Parameter | Default | What it does |

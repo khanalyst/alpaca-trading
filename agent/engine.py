@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from . import brain, market, state, strategy
+from . import brain, contracts, market, registry, state, strategy
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
                        EntryOrderRejected, Exchange)
@@ -498,6 +498,10 @@ class Engine:
         if not snapshot:
             log.warning("Empty market snapshot; holding")
             return
+
+        # Every registered contract is evaluated on this snapshot, not just
+        # the one that is trading. Costs no LLM call and places no order.
+        self._record_shadow_decisions(snapshot)
 
         portfolio = self._portfolio_view(equity, positions, st,
                                          day_pnl_pct, drawdown_pct)
@@ -1652,6 +1656,115 @@ class Engine:
         log.info("CLOSED %s (%s, %+.2f USDT realized): %s",
                  symbol, direction, total_realized, reason)
         return True
+
+    @staticmethod
+    def _plain(value):
+        """JSON-safe number, or None.
+
+        The journal serializer runs with allow_nan=False, so a single NaN
+        field would raise and cost the whole cycle's shadow records for that
+        strategy. A missing measurement recorded as null is recoverable;
+        a lost cycle is not.
+        """
+        if value is None or isinstance(value, (bool, str)):
+            return value if not isinstance(value, bool) else value
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _shadow_cfg(self, spec) -> dict:
+        """Config a shadow strategy's contract is evaluated against.
+
+        The active strategy uses config.yaml unchanged, so its shadow record
+        is exactly what the live contract saw. Every other strategy uses the
+        parameters declared on its registry entry, so a shadow result is
+        attributable to a stated parameter set rather than to whichever
+        strategy happened to be trading that day.
+        """
+        if spec.id == str(self.cfg["strategy"]["id"]):
+            return self.cfg
+        block = dict(self.cfg["strategy"])
+        block.update(spec.contract_params)
+        block["id"] = spec.id
+        block["version"] = spec.version
+        return {**self.cfg, "strategy": block}
+
+    def _record_shadow_decisions(self, snapshot: dict) -> None:
+        """Journal what every registered contract would have done.
+
+        This is the cheapest way to forward-test strategies that hold no
+        capital: without it, evaluating N strategies takes N times as long as
+        evaluating one, because each has to wait its turn at the account.
+        With it, every registered contract accumulates genuine out-of-sample
+        evidence from the same market data, at the same moments, starting the
+        day it is registered.
+
+        Recording the ACTIVE strategy too is deliberate and is the point that
+        is easy to miss: comparing what the contract fired on against what
+        the model actually took is the only direct measurement of what the
+        LLM layer contributes. Offline research can bound that; it cannot
+        observe it.
+
+        Deterministic only. No orders, no LLM call, no position state. Never
+        allowed to raise: shadow bookkeeping must not be able to interrupt
+        trading.
+        """
+        symbols = [s for s in snapshot
+                   if not s.startswith("_") and isinstance(snapshot[s], dict)]
+        for strategy_id, builder in sorted(contracts.EVIDENCE_BUILDERS.items()):
+            try:
+                spec = registry.spec_for(strategy_id)
+                shadow_cfg = self._shadow_cfg(spec)
+                fired = []
+                for symbol in symbols:
+                    data = snapshot[symbol]
+                    evidence = builder(data, shadow_cfg)
+                    for setup in spec.setup_types:
+                        contract = evidence.get(setup)
+                        if not isinstance(contract, dict):
+                            continue
+                        for direction in ("long", "short"):
+                            if contract.get(direction) is not True:
+                                continue
+                            extension = (evidence.get("extension_atr")
+                                         or {}).get(direction)
+                            fired.append({
+                                "symbol": symbol,
+                                "setup_type": setup,
+                                "direction": direction,
+                                "price": self._plain(data.get("price")),
+                                "signal_ts": self._plain(data.get("signal_ts")),
+                                "atr_1h_pct": self._plain(data.get("atr_1h_pct")),
+                                "swing_low_pct": self._plain(
+                                    data.get("swing_low_pct")),
+                                "swing_high_pct": self._plain(
+                                    data.get("swing_high_pct")),
+                                "extension_atr": self._plain(extension),
+                            })
+                # One summary per strategy per cycle. Without the denominator
+                # a count of firings cannot be turned into a rate.
+                state.log_event(
+                    "shadow_summary",
+                    self._audit_json({
+                        "instruments_scanned": len(symbols),
+                        "instruments_fired": len({f["symbol"]
+                                                  for f in fired}),
+                        "signals": len(fired),
+                        "is_active": spec.id == str(
+                            self.cfg["strategy"]["id"]),
+                    }),
+                    strategy_id=spec.id,
+                    strategy_version=spec.version,
+                )
+                for signal in fired:
+                    state.log_event(
+                        "shadow_decision", self._audit_json(signal),
+                        strategy_id=spec.id, strategy_version=spec.version)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("Shadow evaluation failed for %s: %s",
+                            strategy_id, exc)
 
     def _too_young_to_close(self, pos: dict, decision: dict,
                             st: dict) -> bool:

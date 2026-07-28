@@ -78,6 +78,13 @@ class StrategySpec:
     # Free-form note explaining a tier or an implementation gap.
     notes: str = ""
     evidence: tuple[str, ...] = field(default_factory=tuple)
+    # Parameters this strategy's contract reads out of cfg["strategy"] when
+    # it is evaluated in SHADOW, i.e. while a different strategy is the one
+    # actually trading. The active strategy always uses config.yaml; these
+    # are what a non-active strategy is evaluated with, so that shadow
+    # results are attributable to a stated parameter set rather than to
+    # whatever the live config happened to hold.
+    contract_params: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.tier not in TIERS:
@@ -161,6 +168,12 @@ REGISTRY: dict[str, StrategySpec] = {
                 "Runnable on demo as an operations rehearsal. Blocked from "
                 "live by LIVE_MIN_TIER, which is the intended behaviour."),
             evidence=("research/results/edge-audit-2024-2026/REPORT.md",),
+            contract_params={
+                "breakout_range_threshold_pct": 85.0,
+                "breakout_min_relative_volume": 1.0,
+                "funding_extreme_pct_per_8h": 0.01,
+                "hard_max_entry_extension_atr": 1.2,
+            },
         ),
         StrategySpec(
             id="flush-fade",

@@ -10,12 +10,15 @@
   "cost_scenario": "base",
   "data_root": "runtime/research/data",
   "exit_policy": "fixed_rr",
-  "generated_utc": "2026-07-28 10:11:15Z",
+  "generated_utc": "2026-07-28 11:30:01Z",
   "instruments": 8,
   "min_bars": 19200,
   "strategies": [
     {
       "falsification": "Already falsified: directional hit rate 45.6-47.3% at every horizon from 15m to 24h, -0.096 R at ordinary costs (t=-4.60), 0 of 79 walk-forward variants positive out-of-sample, and at zero cost both random entry timing and the inverted signal beat it.",
+      "forward": {
+        "status": "no forward evidence recorded yet"
+      },
       "gates": [
         {
           "gate": "has_mechanism",
@@ -146,6 +149,9 @@
     },
     {
       "falsification": "Among the largest adverse moves, bars with open interest falling show no more 4-24h reversion than bars with open interest rising. If both subsets behave alike, OI adds nothing and the move is noise.",
+      "forward": {
+        "status": "no forward evidence recorded yet"
+      },
       "gates": [
         {
           "gate": "has_mechanism",

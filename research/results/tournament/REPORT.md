@@ -1,6 +1,6 @@
 # Strategy tournament
 
-Generated 2026-07-28 10:11:15Z from `runtime/research/data`.
+Generated 2026-07-28 11:30:01Z from `runtime/research/data`.
 
 - instruments: 8
 - bars per instrument (min): 19200
@@ -43,6 +43,8 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 | `survive_placebo` | FAIL | candidate expectancy is not positive; placebo not decisive |
 | `is_detectable` | FAIL | effect -0.0741 R is not positive; nothing to size for |
 
+*Forward evidence: no forward evidence recorded yet.*
+
 ## flush-fade/v1
 
 **Measured tier: T0_REJECTED** - signal -0.2876% does not beat: null_random_timing
@@ -59,6 +61,8 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 | `survive_costs` | FAIL | net -0.2876% at base costs, breakeven cost -0.0431% vs 0.20% charged |
 | `survive_placebo` | FAIL | candidate expectancy is not positive; placebo not decisive |
 | `is_detectable` | FAIL | effect -0.1572 R is not positive; nothing to size for |
+
+*Forward evidence: no forward evidence recorded yet.*
 
 ## How to read this
 

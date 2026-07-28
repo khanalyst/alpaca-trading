@@ -136,6 +136,63 @@ def benchmark_check(rows: list[dict]) -> dict:
     }
 
 
+def apply_forward_evidence(row: dict, forward: dict) -> None:
+    """Attach live/shadow results and decide whether T4 is earned.
+
+    T4_CONFIRMED is the only tier offline data cannot grant, because it is
+    the only one that asks whether the effect survived contact with the
+    future. Two conditions, both necessary: the forward result agrees in
+    sign with the backtest, and there are at least as many forward trades as
+    the detectability gate said the effect size requires.
+
+    A sign DISAGREEMENT is recorded loudly even when the counts are small.
+    It is the earliest available warning that a backtest was fitted, and it
+    arrives long before the sample is large enough to prove anything.
+    """
+    if not row.get("scored"):
+        return
+    entry = (forward.get("strategies") or {}).get(row["strategy_id"])
+    if not entry:
+        row["forward"] = {"status": "no forward evidence recorded yet"}
+        return
+
+    observed = int(entry.get("resolved_trades") or 0)
+    forward_pct = entry.get("forward_expectancy_pct")
+    backtest_pct = row["headline"].get("expectancy_pct")
+    needed = 0
+    for gate in row["gates"]:
+        if gate["gate"] == "is_detectable":
+            needed = int(gate["numbers"].get("trades_needed") or 0)
+
+    agrees = None
+    if forward_pct is not None and backtest_pct is not None:
+        agrees = (forward_pct >= 0) == (backtest_pct >= 0)
+
+    row["forward"] = {
+        "resolved_trades": observed,
+        "trades_needed": needed,
+        "forward_expectancy_pct": forward_pct,
+        "backtest_expectancy_pct": backtest_pct,
+        "signs_agree": agrees,
+        "signals_fired": entry.get("signals_fired"),
+        "positions_actually_opened": entry.get("positions_actually_opened"),
+        "selectivity_pct": entry.get("selectivity_pct"),
+        "progress_pct": (round(observed / needed * 100, 1)
+                         if needed else None),
+    }
+
+    if agrees is False:
+        row["forward"]["warning"] = (
+            "forward and backtest disagree in sign; treat the backtest as "
+            "unconfirmed regardless of how clean it looked")
+    if (row["measured_tier"] == "T3_VALIDATED" and agrees
+            and needed and observed >= needed):
+        row["measured_tier"] = "T4_CONFIRMED"
+        row["tier_reason"] = (
+            f"forward evidence agrees in sign over {observed} trades "
+            f"against the {needed} required")
+
+
 def recommendation(row: dict) -> str:
     """Deterministic, so nobody has to decide how impressed to be."""
     if not row.get("scored"):
@@ -149,6 +206,8 @@ def recommendation(row: dict) -> str:
         return "HOLD - promising but not clear of the placebo/cost gates"
     if tier == "T3_VALIDATED":
         return "PROMOTE - eligible for demo; forward evidence required for T4"
+    if tier == "T4_CONFIRMED":
+        return "CONFIRMED - forward evidence agrees; live capital may be discussed"
     return "HOLD"
 
 
@@ -237,6 +296,37 @@ def write_report(path: Path, payload: dict) -> None:
                 f"| `{gate['gate']}` | {mark} | {gate['summary']} |")
         lines.append("")
 
+        fwd = row.get("forward") or {}
+        if fwd.get("status"):
+            lines += [f"*Forward evidence: {fwd['status']}.*", ""]
+        elif fwd:
+            agree = fwd.get("signs_agree")
+            lines += [
+                "**Forward (live shadow).** "
+                f"{fwd.get('resolved_trades', 0)} resolved trades of the "
+                f"{fwd.get('trades_needed') or '?'} this effect size needs"
+                + (f" ({fwd['progress_pct']}%)"
+                   if fwd.get("progress_pct") is not None else "")
+                + ".",
+                "",
+                f"- forward expectancy: "
+                f"{fwd.get('forward_expectancy_pct', float('nan')):+.4f}% "
+                f"vs backtest "
+                f"{fwd.get('backtest_expectancy_pct', float('nan')):+.4f}%",
+                f"- signs agree: "
+                f"{'yes' if agree else 'NO' if agree is False else 'unknown'}",
+            ]
+            if fwd.get("selectivity_pct") is not None:
+                lines.append(
+                    f"- the contract fired {fwd.get('signals_fired')} times "
+                    f"and the account opened "
+                    f"{fwd.get('positions_actually_opened')} positions "
+                    f"({fwd['selectivity_pct']}%) - the gap is the analyst "
+                    f"layer's contribution")
+            if fwd.get("warning"):
+                lines += ["", f"> {fwd['warning']}"]
+            lines.append("")
+
     lines += [
         "## How to read this", "",
         "No gate here tests a t-statistic. On this data a placebo reached "
@@ -262,6 +352,10 @@ def main() -> int:
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--only", default="",
                         help="comma-separated strategy ids to score")
+    parser.add_argument("--forward", type=Path,
+                        default=REPO / "runtime" / "research"
+                        / "forward_evidence.json",
+                        help="output of research/export_live.py")
     args = parser.parse_args()
 
     frames = load_dataset(args.data, min_bars=args.min_bars)
@@ -290,6 +384,16 @@ def main() -> int:
         print(f"scoring {spec.id}/{spec.version} ...", file=sys.stderr)
         rows.append(score_strategy(spec, frames, membership, cfg,
                                    args.cost, args.exit_policy))
+
+    forward = {}
+    if args.forward and args.forward.exists():
+        try:
+            forward = json.loads(args.forward.read_text())
+        except (OSError, ValueError) as exc:               # noqa: BLE001
+            print(f"note: could not read forward evidence ({exc})",
+                  file=sys.stderr)
+    for row in rows:
+        apply_forward_evidence(row, forward)
 
     scored = [r for r in rows if r.get("scored")]
     scored.sort(key=lambda r: (-TIERS.index(r["measured_tier"]),
