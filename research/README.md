@@ -1,5 +1,21 @@
 # Historical research
 
+> **Two evidence paths, and they are not interchangeable.**
+>
+> **Journal replay is authoritative.** `corpus.py`, `replay.py`,
+> `outcomes.py`, `score.py`, `sweep.py` and `findings.py` re-derive decisions
+> from the snapshot the agent actually recorded, using the production
+> contract and risk engine. Driven by `research.py` at the repository root.
+> Gate G2 requires this path to reproduce the live agent's own decisions
+> before anything downstream of it is trusted.
+>
+> **Everything else on this page is exploratory.** The scripts below
+> recompute indicators from downloaded OHLCV, which findings.md section 9.2
+> establishes is a different system than the one you run: fields sourced from
+> the live 24h ticker cannot be reconstructed after the fact. Their evidence
+> is enough to withhold capital from a strategy and is **not** enough to
+> raise a tier. See `plan/RECONCILIATION.md`.
+
 Two independent research paths live here. Both replay the deterministic
 strategy contracts and the repository's `RiskEngine` without placing orders or
 calling an LLM.

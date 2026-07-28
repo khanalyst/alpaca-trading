@@ -23,6 +23,28 @@ ordinary costs, with 0 of 79 walk-forward variants positive out-of-sample.
 Demo may run anything implemented, because demo is an operations rehearsal.
 Live requires T3_VALIDATED, so a strategy known to be negative cannot reach
 real capital by editing one line of config.
+
+**Where that evidence comes from, and what it is not.** Every tier claim in
+this module currently rests on a *recomputed* backtest over downloaded OHLCV
+- ``research/edge_lab.py`` and its dependents - which reconstructs indicators
+after the fact rather than reading the snapshot the agent actually decided
+from. findings.md section 9.2 is explicit that this is a different system
+than the one you run: some snapshot fields come from the live 24h ticker and
+cannot be reconstructed, so a recomputed backtest silently mixes revised data
+with the original.
+
+That does not make the evidence worthless, and the direction of the bias is
+against the strategy rather than for it, so a T0_REJECTED verdict is the
+conservative reading. It does mean the verdict is **exploratory and not yet
+confirmed by the faithful path**: the replay harness in ``research/replay.py``
+re-derives decisions from the recorded snapshot using the production contract
+and risk engine, and gate G2 requires it to reproduce the live agent's own
+decisions before any number downstream is trusted.
+
+The tier gate stays as it is. Keeping momentum away from live capital on
+exploratory evidence is the right way to be wrong. But a tier may only be
+*raised* on journal-replay evidence, never on a recomputed backtest. See
+``research/plan/RECONCILIATION.md``.
 """
 
 from __future__ import annotations
@@ -166,7 +188,12 @@ REGISTRY: dict[str, StrategySpec] = {
             implemented=True,
             notes=(
                 "Runnable on demo as an operations rehearsal. Blocked from "
-                "live by LIVE_MIN_TIER, which is the intended behaviour."),
+                "live by LIVE_MIN_TIER, which is the intended behaviour. "
+                "The T0 verdict rests on a recomputed OHLCV backtest, which "
+                "is exploratory evidence: it is enough to withhold capital "
+                "and not enough to raise a tier. Confirmation requires the "
+                "journal replay to pass gate G2 and the three-arm H-E test "
+                "to run - see research/plan/RECONCILIATION.md."),
             evidence=("research/results/edge-audit-2024-2026/REPORT.md",),
             contract_params={
                 "breakout_range_threshold_pct": 85.0,
