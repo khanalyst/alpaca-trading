@@ -171,7 +171,7 @@ The suite is plain `unittest`, so it needs nothing beyond the production
 dependencies:
 
 ```bash
-python -m unittest discover -s tests -t . -q     # 304 tests
+python -m unittest discover -s tests -t . -q     # full suite
 ```
 
 Two alarming-looking lines in the output — `event journal write failed: disk
