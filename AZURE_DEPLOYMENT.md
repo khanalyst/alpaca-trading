@@ -20,6 +20,20 @@ label is on every block without exception.
 
 ---
 
+## Which document to read, and when
+
+| Document | When |
+| --- | --- |
+| **This one** | Deploying to Azure. Self-contained: VM creation through everyday operation |
+| `SETUP.md` §2.3 | Only if you use Azure AI Foundry for the model rather than Anthropic/OpenAI directly |
+| `SETUP.md` **Step 10** | After the agent has been running about a week, when the research commands start having data to read |
+| `README.md` | Reference: configuration, the research layer, what is still pending |
+
+You do not need `SETUP.md` to get running. It covers laptop and generic-VPS
+installs, which this document replaces for Azure.
+
+---
+
 ## Part 0 — The mental model: two computers
 
 This is the part that makes everything else make sense.
@@ -370,7 +384,16 @@ sudo chown okx:okx /opt/okx-agent-crypto
 ```
 
 Everything from here uses `sudo -u okx`, which means "run this as the `okx`
-user".
+user" **while you remain logged in as `azureuser`**.
+
+> ⚠️ **Do not become the `okx` user.** `sudo -iu okx` or `su okx` will leave
+> you as an account with no password and no sudo rights, and the next
+> `sudo systemctl ...` will prompt for a password that does not exist. If
+> that happens, type `exit` to get back to `azureuser` and try again.
+>
+> The `-r` and `-s /usr/sbin/nologin` flags above are what make `okx` a
+> service account rather than a login: it is meant to own files and run
+> units, never to be typed into.
 
 ### 6b. A read-only deploy key
 
@@ -594,6 +617,24 @@ number in that run is unverified. `nightly.sh` exits non-zero in that case,
 so a red `okx-research` unit means exactly this — not that a strategy
 performed badly.
 
+### Then check what the research layer says
+
+The nightly run does two things: the journal-replay path, which is
+authoritative, and the OHLCV tournament above, which is exploratory. The one
+command that summarises where you stand:
+
+```bash
+sudo -u okx /opt/okx-agent-crypto/.venv/bin/python research.py readiness
+```
+
+On a fresh VM everything will say "run the agent", which is correct — the
+research corpus is written by the trader as a side effect of running, so
+there is nothing to read on day one. Come back to it after a week.
+
+`SETUP.md` **Step 10** explains what each check answers and roughly when it
+becomes meaningful. That is the section to read once the agent has been
+running; the rest of `SETUP.md` covers ground this document already did.
+
 To force a completely clean re-download:
 
 ```bash
@@ -789,12 +830,24 @@ line.
 
 ## Part 12 — Back up what cannot be re-downloaded
 
-Candles can always be re-fetched from OKX. Two things cannot:
+Candles can always be re-fetched from OKX. Three things cannot:
 
 - `/opt/okx-agent-crypto/runtime/research/recorded/` — order-book depth and
   liquidations, which OKX never serves historically
-- `/opt/okx-agent-crypto/runtime/demo/journal.db` — your own trade and
-  shadow-decision history
+- `/opt/okx-agent-crypto/runtime/demo/journal.db` — your own decision corpus,
+  trade history and shadow evidence. **This is what gate G2 and every
+  research command read.** Losing it resets the research clock to zero
+- `/opt/okx-agent-crypto/research/cache/findings.db` — the append-only
+  findings store: which variants were rejected, on what sample, and why.
+  Deliberately not in git, so nothing else holds it
+
+> ⚠️ **You set "Delete with VM: Checked" in Part 1.** That is right for cost
+> — an orphaned disk keeps billing — but it means deleting the VM destroys
+> all three of the above permanently. Take a snapshot before you delete
+> anything, and take one periodically regardless.
+
+The committed `findings/*.md` scorecards are a readable summary of the store
+and they live in git, so they survive. The SQLite behind them does not.
 
 🖥️ **ON YOUR MAC**, in the browser: **VM** → **Disks** → click the OS disk →
 **Create snapshot**. Or set up a Backup policy for automatic daily snapshots.

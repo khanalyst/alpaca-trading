@@ -23,7 +23,9 @@ from agent.config import validate_config
 REPO = Path(__file__).resolve().parents[2]
 README = (REPO / "README.md").read_text(encoding="utf-8")
 SETUP = (REPO / "SETUP.md").read_text(encoding="utf-8")
+AZURE = (REPO / "AZURE_DEPLOYMENT.md").read_text(encoding="utf-8")
 BOTH = README + SETUP
+ALL_DOCS = README + SETUP + AZURE
 
 
 class ReferencedPathsExistTests(unittest.TestCase):
@@ -34,7 +36,7 @@ class ReferencedPathsExistTests(unittest.TestCase):
             r"`((?:agent|research|tests|deploy|findings)/[\w./-]+"
             r"\.(?:py|md|yaml|sh|timer|service))`")
         missing = sorted({
-            path for path in pattern.findall(BOTH)
+            path for path in pattern.findall(ALL_DOCS)
             if not (REPO / path).exists()
         })
         self.assertEqual(missing, [], f"documented paths do not exist: {missing}")
@@ -157,6 +159,52 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
     def test_the_new_journal_events_are_documented(self):
         for kind in ("book_state", "snapshot_enrichment", "shadow_decision"):
             self.assertIn(kind, README, f"journal event {kind} undocumented")
+
+
+class DeploymentDocTests(unittest.TestCase):
+    """The Azure guide drifted unchecked while the research layer was built.
+
+    It is the only document a VM deployment follows end to end, so a stale
+    instruction there costs more than a stale one in README - the reader is
+    at a terminal, not browsing.
+    """
+
+    def test_it_says_which_document_to_read_when(self):
+        self.assertIn("SETUP.md", AZURE)
+        self.assertIn("README.md", AZURE)
+
+    def test_it_points_at_the_readiness_command(self):
+        self.assertIn("research.py readiness", AZURE)
+
+    def test_the_backup_list_covers_everything_unrecoverable(self):
+        """Losing any of these cannot be undone by re-downloading."""
+        for path in ("runtime/research/recorded",
+                     "journal.db",
+                     "findings.db"):
+            self.assertIn(path, AZURE,
+                          f"{path} is missing from the backup guidance")
+
+    def test_it_warns_that_deleting_the_vm_destroys_the_corpus(self):
+        """The doc itself recommends "Delete with VM: Checked"."""
+        self.assertIn("Delete with VM", AZURE)
+        self.assertIn("snapshot", AZURE.lower())
+
+    def test_it_warns_against_becoming_the_service_user(self):
+        """The first thing that bites: sudo prompting for a password."""
+        self.assertIn("nologin", AZURE)
+        self.assertIn("sudo -iu okx", AZURE)
+
+    def test_every_service_unit_it_names_exists(self):
+        import re
+        for unit in set(re.findall(r"okx-[a-z]+\.(?:service|timer)", AZURE)):
+            self.assertTrue(
+                (REPO / "deploy" / unit).exists(),
+                f"AZURE_DEPLOYMENT.md names {unit}, which is not in deploy/")
+
+    def test_the_recorder_is_started_before_the_trader(self):
+        """Every hour it is off is data OKX will never serve again."""
+        self.assertLess(AZURE.index("enable --now okx-recorder"),
+                        AZURE.index("enable --now okx-trader"))
 
 
 if __name__ == "__main__":
