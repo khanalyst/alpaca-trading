@@ -43,6 +43,12 @@ def row(**overrides) -> dict:
 
 def cycle(n: int = 0, symbols=("BTC/USDT:USDT",), **overrides) -> CycleRecord:
     cfg = valid_config()
+    ts = 1_760_000_000.0 + n * 300
+    # The signal bar advances with wall time, as it does live: a 300s cycle
+    # against a 900s bar sees each bar about three times. A fixture that
+    # reused one signal_ts forever would be burned by per-bar idempotency
+    # after the first cycle and would test nothing beyond it.
+    overrides.setdefault("signal_ts", int(ts // 900) * 900 * 1000)
     snapshot = {}
     for symbol in symbols:
         data = row(**overrides)
@@ -50,7 +56,7 @@ def cycle(n: int = 0, symbols=("BTC/USDT:USDT",), **overrides) -> CycleRecord:
         snapshot[symbol] = data
     snapshot["_market_context"] = {"benchmark": "BTC/USDT:USDT"}
     return CycleRecord(
-        ts=1_760_000_000.0 + n * 300, run_id="run-a", cycle_id=f"c{n}",
+        ts=ts, run_id="run-a", cycle_id=f"c{n}",
         snapshot=snapshot, portfolio={"equity_usdt": 10_000.0},
         max_new=3, provider="anthropic")
 
@@ -299,3 +305,80 @@ def funnel_upper_bound(cycles) -> int:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetupMemoryTests(unittest.TestCase):
+    """The replay keeps setup memory, so its funnel is not an upper bound.
+
+    _prepare_setup_decision applies three checks beyond the contract: per-bar
+    idempotency, semantic cooldown, and failed-thesis re-entry. A replay
+    without them re-proposes setups the live agent had already refused, which
+    inflates the proposal count and distorts the veto distribution that gate
+    G4 reads - in the direction that makes the contract look busier than it
+    is.
+    """
+
+    def test_a_symbol_is_evaluated_once_per_signal_bar(self):
+        # Three cycles inside one 900s bar, all proposing the same symbol.
+        cycles = [cycle(i, signal_ts=1_760_000_000_000) for i in range(3)]
+        outputs = [model_output(i, [open_decision()]) for i in range(3)]
+
+        result = replay.Replay(valid_config(), mode="recorded_llm").run(
+            cycles, outputs)
+
+        reasons = result.funnel["veto_reasons"]
+        self.assertTrue(
+            any("already evaluated" in r for r in reasons),
+            f"per-bar idempotency did not bind: {reasons}")
+
+    def test_a_new_bar_is_a_fresh_opportunity(self):
+        """Burning the bar must not burn the symbol forever."""
+        cycles = [cycle(i) for i in range(10)]        # bars advance
+        outputs = [model_output(i, [open_decision()]) for i in range(10)]
+
+        result = replay.Replay(valid_config(), mode="recorded_llm").run(
+            cycles, outputs)
+
+        self.assertGreater(result.funnel["executed"], 0)
+
+    def test_the_funnel_still_reconciles_with_memory_in_play(self):
+        cycles = [cycle(i) for i in range(12)]
+        outputs = [model_output(i, [open_decision()]) for i in range(12)]
+
+        result = replay.Replay(valid_config(), mode="recorded_llm").run(
+            cycles, outputs)
+        funnel = result.funnel
+
+        self.assertEqual(funnel["fired"],
+                         funnel["vetoed"] + funnel["executed"])
+
+    def test_memory_makes_the_replay_more_conservative_not_less(self):
+        """Every memory check can only remove proposals, never add them."""
+        cycles = [cycle(i, signal_ts=1_760_000_000_000) for i in range(6)]
+        outputs = [model_output(i, [open_decision()]) for i in range(6)]
+
+        result = replay.Replay(valid_config(), mode="recorded_llm").run(
+            cycles, outputs)
+
+        self.assertLessEqual(result.funnel["executed"], 1,
+                             "one bar can produce at most one entry")
+
+    def test_memory_is_still_deterministic(self):
+        cycles = [cycle(i) for i in range(8)]
+        outputs = [model_output(i, [open_decision()]) for i in range(8)]
+
+        first = replay.Replay(valid_config(), mode="recorded_llm").run(
+            cycles, outputs)
+        second = replay.Replay(valid_config(), mode="recorded_llm").run(
+            cycles, outputs)
+
+        self.assertEqual(first.digest(), second.digest())
+
+    def test_the_memory_checks_use_the_cycle_clock(self):
+        """Wall-clock would expire every cooldown in the corpus at once."""
+        import inspect
+        source = inspect.getsource(replay.Replay.run)
+
+        self.assertIn("semantic_block(", source)
+        self.assertIn("now=now", source)
+        self.assertNotIn("time.time()", source)

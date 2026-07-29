@@ -231,6 +231,14 @@ class Replay:
         # bind the way they do live rather than every cycle starting flat.
         positions: list = []
         active_trades: dict = {}
+        # Setup memory, simulated forward exactly as the engine keeps it in
+        # st["recent_setups"]. Without it the replay re-proposes setups the
+        # live agent had already burned for the bar, blocked on a semantic
+        # cooldown, or refused as a failed-thesis re-entry - so the funnel
+        # overstates proposals and the veto distribution that gate G4 reads
+        # is wrong in the direction that makes the contract look busier than
+        # it is.
+        records: dict = {}
         cooldowns: dict = {}
         gross_notional = 0.0
         equity = 10_000.0
@@ -253,9 +261,39 @@ class Replay:
 
                 for decision in proposals:
                     decision = dict(decision, symbol=symbol)
+
+                    # Per-bar idempotency. A symbol that reached the contract
+                    # and failed is burned for the whole signal bar, and the
+                    # model cannot evade that by relabelling or flipping
+                    # direction next cycle.
+                    probe = strategy.signal_probe(decision, row, self.cfg)
+                    if (probe is not None
+                            and strategy.evaluated_signal(
+                                records, probe) is not None):
+                        result.decisions.append(ReplayDecision(
+                            cycle.cycle_id, now, symbol, signal_ts,
+                            "vetoed", decision.get("direction"),
+                            decision.get("setup_type"),
+                            _confidence(decision),
+                            reason=("symbol already evaluated for this "
+                                    "completed signal candle")))
+                        funnel["vetoed"] += 1
+                        _count(funnel["veto_reasons"],
+                               "symbol already evaluated for this completed "
+                               "signal candle")
+                        continue
+
                     plan, why = strategy.build_setup_plan(
                         decision, row, self.cfg)
                     if plan is None:
+                        # The live engine burns the bar here too, so a later
+                        # cycle cannot retry the same symbol.
+                        if probe is not None:
+                            record = strategy.new_setup_record(
+                                probe, self.cfg, now=now)
+                            strategy.mark_setup(
+                                record, "risk_rejected", self.cfg, now=now)
+                            records[probe["setup_id"]] = record
                         result.decisions.append(ReplayDecision(
                             cycle.cycle_id, now, symbol, signal_ts,
                             "vetoed", decision.get("direction"),
@@ -264,6 +302,35 @@ class Replay:
                         funnel["vetoed"] += 1
                         _count(funnel["veto_reasons"], why)
                         continue
+
+                    blocked = strategy.semantic_block(
+                        records, plan["setup_key"], now=now)
+                    if blocked is not None:
+                        reason = ("semantically identical setup is cooling "
+                                  "down")
+                        result.decisions.append(ReplayDecision(
+                            cycle.cycle_id, now, symbol, signal_ts,
+                            "vetoed", decision.get("direction"),
+                            decision.get("setup_type"),
+                            _confidence(decision), reason=reason))
+                        funnel["vetoed"] += 1
+                        _count(funnel["veto_reasons"], reason)
+                        continue
+
+                    reentry = strategy.failed_thesis_reentry_reason(
+                        records, plan, self.cfg, now=now)
+                    if reentry is not None:
+                        result.decisions.append(ReplayDecision(
+                            cycle.cycle_id, now, symbol, signal_ts,
+                            "vetoed", decision.get("direction"),
+                            decision.get("setup_type"),
+                            _confidence(decision), reason=reentry))
+                        funnel["vetoed"] += 1
+                        _count(funnel["veto_reasons"], reentry)
+                        continue
+
+                    records[plan["setup_id"]] = strategy.new_setup_record(
+                        plan, self.cfg, now=now)
 
                     funnel["proposed"] += 1
                     merged = dict(decision)
@@ -441,21 +508,19 @@ def fidelity(result: ReplayResult, db) -> dict:
     - Cycles where reconciliation set ``max_new = 0``, so the agent could not
       act on a setup the contract genuinely fired.
 
-    In the *extra* direction (replay proposed, live did not) there is a
-    structural gap this harness does not yet close. ``_prepare_setup_decision``
-    applies three checks the replay does not simulate:
+    In the *extra* direction (replay proposed, live did not) the three
+    checks ``_prepare_setup_decision`` applies beyond the contract are now
+    simulated - per-bar idempotency, semantic cooldown, and failed-thesis
+    re-entry - so the replayed funnel is a measurement rather than an upper
+    bound. On the demonstration corpus, adding them moved the proposal count
+    from 954 to 707 and revealed that a quarter of all vetoes were per-bar
+    idempotency, which had been invisible.
 
-    - ``strategy.semantic_block`` - a semantically identical setup cooling
-      down.
-    - ``strategy.failed_thesis_reentry_reason`` - re-entry after a recorded
-      loss.
-    - per-bar idempotency via ``strategy.evaluated_signal``.
-
-    All three require replaying setup *memory* forward, not just positions.
-    Extras do not affect the G2 rate, which is ``matched / recorded``, so the
-    gate remains sound - but the replayed funnel will overstate proposals
-    until setup memory is simulated. Read the funnel's proposal count as an
-    upper bound.
+    What remains unsimulated is the *outcome* feedback: the live engine marks
+    a setup closed with a cooldown when a trade exits at a loss, and the
+    replay has no PnL to mark with unless a price cache is supplied. With one
+    supplied, the loss cooldown still is not applied. Expect a small residual
+    excess of proposals after a losing streak.
     """
     recorded = corpus.load_events(db, "setup_proposed")
     recorded_keys = {
