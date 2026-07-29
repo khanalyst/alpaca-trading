@@ -70,7 +70,8 @@ class FidelityFixture(unittest.TestCase):
             self.record(f"c{i}", "BTC/USDT:USDT", "long")
             result.decisions.append(replay.ReplayDecision(
                 cycle_id=f"c{i}", ts=float(i), symbol="BTC/USDT:USDT",
-                signal_ts=None, stage="executed", direction="long"))
+                signal_ts=None, stage="executed", direction="long",
+                contract_passed=True))
         for i in range(missing):
             self.record(f"ghost{i}", "BTC/USDT:USDT", "long")
         return result
@@ -205,3 +206,65 @@ class VacuousGateTests(FidelityFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComparisonStageTests(FidelityFixture):
+    """G2 must compare at the stage the engine actually journals.
+
+    `setup_proposed` is written inside _prepare_setup_decision, which runs
+    BEFORE RiskEngine.vet_open. Comparing it against replayed *executions*
+    would count every risk-vetoed setup as a reproduction failure - roughly
+    four fifths of them on the historical corpus - and G2 would hard-fail at
+    ~20% while the replay was entirely correct.
+    """
+
+    def test_a_risk_vetoed_setup_still_counts_as_reproduced(self):
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm")
+        self.record("c1", "BTC/USDT:USDT", "long")
+        result.decisions.append(replay.ReplayDecision(
+            cycle_id="c1", ts=1.0, symbol="BTC/USDT:USDT", signal_ts=None,
+            stage="vetoed", direction="long",
+            reason="max concurrent positions reached",
+            contract_passed=True))
+
+        report = replay.fidelity(result, self.db)
+
+        self.assertEqual(report["reproduction_rate"], 1.0)
+        self.assertTrue(report["passes_g2"])
+
+    def test_a_contract_refusal_does_not_count_as_reproduced(self):
+        """The contract refused it, so the live engine never proposed it."""
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm")
+        self.record("c1", "BTC/USDT:USDT", "long")
+        result.decisions.append(replay.ReplayDecision(
+            cycle_id="c1", ts=1.0, symbol="BTC/USDT:USDT", signal_ts=None,
+            stage="vetoed", direction="long",
+            reason="evidence contract is not met",
+            contract_passed=False))
+
+        report = replay.fidelity(result, self.db)
+
+        self.assertEqual(report["reproduction_rate"], 0.0)
+        self.assertFalse(report["passes_g2"])
+
+    def test_the_historical_ratio_would_have_failed_the_old_comparison(self):
+        """206 proposals, 41 executions: the shape that broke the gate."""
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm")
+        for i in range(206):
+            self.record(f"c{i}", "BTC/USDT:USDT", "long")
+            result.decisions.append(replay.ReplayDecision(
+                cycle_id=f"c{i}", ts=float(i), symbol="BTC/USDT:USDT",
+                signal_ts=None,
+                stage="executed" if i < 41 else "vetoed",
+                direction="long", contract_passed=True))
+
+        report = replay.fidelity(result, self.db)
+
+        self.assertEqual(report["reproduction_rate"], 1.0)
+        executions_only = len([d for d in result.decisions
+                               if d.stage == "executed"])
+        self.assertLess(executions_only / 206, 0.99,
+                        "comparing against executions alone would fail G2")

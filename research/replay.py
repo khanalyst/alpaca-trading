@@ -70,6 +70,11 @@ class ReplayDecision:
     take_pct: float | None = None
     notional: float | None = None
     outcome: dict | None = None
+    # True once the strategy contract has accepted the setup, whether or not
+    # the risk engine later refused it. This is the stage the live engine
+    # journals `setup_proposed` at - before vet_open, not after - so gate G2
+    # must compare against this rather than against executions.
+    contract_passed: bool = False
     # The B0.5 enrichment for this symbol-cycle, carried alongside the
     # decision so a conditioning axis can partition on it without a second
     # pass over the corpus. Recorded, never shown to the model.
@@ -277,7 +282,8 @@ class Replay:
                             decision.get("setup_type"),
                             _confidence(decision), reason=veto,
                             stop_pct=plan.get("stop_loss_pct"),
-                            take_pct=plan.get("take_profit_pct")))
+                            take_pct=plan.get("take_profit_pct"),
+                            contract_passed=True))
                         funnel["vetoed"] += 1
                         _count(funnel["veto_reasons"], veto)
                         continue
@@ -290,6 +296,7 @@ class Replay:
                         stop_pct=sized.get("sl_pct"),
                         take_pct=sized.get("tp_pct"),
                         notional=sized.get("notional"),
+                        contract_passed=True,
                         enrichment=_enrichment_of(row, cycle, symbol))
                     record.outcome = self._resolve(
                         symbol, row, sized, decision, max_hold)
@@ -425,19 +432,45 @@ def fidelity(result: ReplayResult, db) -> dict:
     is wrong. Treat a G2 failure as a full stop rather than a debugging task
     to work around.
 
-    Known-benign mismatch sources, expected and individually explained:
-    ``time.time()`` boundary effects on cooldown expiry, and cycles where
-    reconciliation set ``max_new = 0`` so the agent could not act on a setup
-    the contract genuinely fired.
+    **Known mismatch sources, to explain rather than to work around.**
+
+    In the *missing* direction (live proposed, replay did not) these are
+    expected and should be individually accounted for:
+
+    - ``time.time()`` boundary effects on cooldown expiry.
+    - Cycles where reconciliation set ``max_new = 0``, so the agent could not
+      act on a setup the contract genuinely fired.
+
+    In the *extra* direction (replay proposed, live did not) there is a
+    structural gap this harness does not yet close. ``_prepare_setup_decision``
+    applies three checks the replay does not simulate:
+
+    - ``strategy.semantic_block`` - a semantically identical setup cooling
+      down.
+    - ``strategy.failed_thesis_reentry_reason`` - re-entry after a recorded
+      loss.
+    - per-bar idempotency via ``strategy.evaluated_signal``.
+
+    All three require replaying setup *memory* forward, not just positions.
+    Extras do not affect the G2 rate, which is ``matched / recorded``, so the
+    gate remains sound - but the replayed funnel will overstate proposals
+    until setup memory is simulated. Read the funnel's proposal count as an
+    upper bound.
     """
     recorded = corpus.load_events(db, "setup_proposed")
     recorded_keys = {
         (r.get("cycle_id"), r.get("symbol"), r.get("direction"))
         for r in recorded
     }
+    # Everything the contract accepted, not everything that executed. The
+    # live engine journals setup_proposed in _prepare_setup_decision, which
+    # runs BEFORE RiskEngine.vet_open - so comparing against executions
+    # would count every risk-vetoed setup as a reproduction failure. On the
+    # historical corpus that is roughly four fifths of them, and G2 would
+    # fail at ~20% while the replay was in fact correct.
     replayed_keys = {
         (d.cycle_id, d.symbol, d.direction)
-        for d in result.decisions if d.stage == "executed"
+        for d in result.decisions if d.contract_passed
     }
     matched = recorded_keys & replayed_keys
     missing = recorded_keys - replayed_keys
