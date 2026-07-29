@@ -1310,6 +1310,30 @@ class Engine:
             symbol, delay, classification, count)
         return record
 
+    # ------------------------------------------------------------ B7.5
+    #
+    # H-K(ii), maker-first entry, is NOT wired into the entry path, and the
+    # reason is worth stating rather than leaving as an omission.
+    #
+    # Exchange.maker_first_entry() exists and is tested: it posts passively,
+    # polls for a fill, and guarantees the order is never left resting. What
+    # is missing is the other half. A passive fill creates a position, and
+    # every position this engine opens must also get a trade_id, a journalled
+    # trade row, a liquidation-distance check and a protection audit
+    # confirming the exchange-side stop actually exists. That bookkeeping
+    # currently lives inside open_position() and its callers.
+    #
+    # Wiring the maker path without it would create positions with no journal
+    # row and no verified protection - which is a far worse outcome than
+    # paying the spread. Doing it properly means extracting the
+    # post-fill verification so both paths share it, and that is a refactor
+    # of the code whose entire job is to guarantee no position is ever naked.
+    # It cannot be validated against mocks alone.
+    #
+    # So the exchange primitive ships, the config flag ships defaulting off,
+    # and the integration waits for someone who can exercise it against the
+    # demo account. See research/plan/B7.5-record.md.
+
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
         if state.load_state()["state"] != state.RUNNING:

@@ -301,7 +301,8 @@ def validate_config(raw: dict) -> dict:
             "or by raising risk.max_margin_usage_pct")
 
     execution = _mapping(cfg.get("execution"), "execution")
-    _keys(execution, {"slippage_guard_pct", "max_spread_pct",
+    _keys(execution, {"maker_first_enabled", "maker_first_wait_seconds",
+                      "slippage_guard_pct", "max_spread_pct",
                       "max_order_book_slippage_pct",
                       "max_market_data_age_seconds", "fill_timeout_seconds",
                       "liquidity_feedback_ttl_minutes",
@@ -312,6 +313,19 @@ def validate_config(raw: dict) -> dict:
                       "entry_failure_backoff_max_minutes",
                       "entry_failure_ttl_minutes"},
           "execution")
+    # B7.5 / H-K(ii). Off unless set: this is the only research feature that
+    # modifies the entry path, so it must be turned on deliberately.
+    if execution.get("maker_first_enabled") is not None:
+        _boolean(execution, "maker_first_enabled", "execution")
+    else:
+        execution["maker_first_enabled"] = False
+    if execution.get("maker_first_wait_seconds") is not None:
+        # Bounded well inside a 15m signal bar. A passive order must resolve
+        # within the bar it was signalled on, or the setup it was based on is
+        # no longer the setup being traded.
+        _number(execution, "maker_first_wait_seconds", 1, 120, "execution")
+    else:
+        execution["maker_first_wait_seconds"] = 20
     _number(execution, "slippage_guard_pct", 0, 5, "execution")
     _number(execution, "max_spread_pct", 0.001, 2, "execution")
     _number(execution, "max_order_book_slippage_pct", 0.001, 5, "execution")

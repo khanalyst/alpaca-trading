@@ -1428,6 +1428,114 @@ class Exchange:
         time.sleep(0.5)
         return self.protection_status(symbol, contracts, side, mark_price)
 
+    def maker_first_entry(self, symbol: str, side: str, contracts: float,
+                          leverage: float, sl_price: float, tp_price: float,
+                          wait_seconds: float,
+                          reference_price: float) -> dict:
+        """Post passively for ``wait_seconds``, then get out of the way.
+
+        H-K(ii). Every IOC entry crosses the spread and accepts adverse
+        selection: you buy at the moment a seller wants to sell to you. At a
+        2% stop, round-trip friction is roughly 10% of the risk unit, so
+        converting the filled fraction from taker to maker moves expectancy
+        by more than most of the parameter axes queued for sweeping - and it
+        does so without requiring any signal to have edge.
+
+        Fill rate is not knowable from history, because the passive order was
+        never there. This is a live experiment and nothing else.
+
+        **The order is never left resting.** Every exit from this method
+        either returns a filled position or has cancelled the order. If the
+        cancel fails, the fill state is re-read and reported rather than
+        assumed, because an abandoned resting order is an unmanaged position
+        waiting to happen.
+
+        Protection is unchanged: stop-loss and take-profit are attached to
+        the order server-side exactly as the IOC path attaches them, so a
+        fill arrives already protected.
+        """
+        self.retry(self.x.set_leverage, int(leverage), symbol,
+                   {"mgnMode": "cross"})
+        book = self.retry(self.x.fetch_order_book, symbol, 5)
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            raise RuntimeError(f"{symbol} order book has no two-sided depth")
+
+        # Join the near touch rather than improving it: improving would cross
+        # into the spread we are trying to capture.
+        passive = float(bids[0][0]) if side == "buy" else float(asks[0][0])
+        limit = float(self.x.price_to_precision(symbol, passive))
+
+        params = {
+            "tdMode": "cross",
+            "stopLoss": {"triggerPrice":
+                         self.x.price_to_precision(symbol, sl_price)},
+            "takeProfit": {"triggerPrice":
+                           self.x.price_to_precision(symbol, tp_price)},
+            # Post-only: if it would cross, it is rejected rather than
+            # silently becoming the taker order this method exists to avoid.
+            "postOnly": True,
+        }
+        order = self.retry(self.x.create_order, symbol, "limit", side,
+                           contracts, limit, params)
+        order_id = order.get("id")
+
+        deadline = time.time() + max(0.0, float(wait_seconds))
+        filled = float(order.get("filled") or 0)
+        while time.time() < deadline and filled < contracts:
+            time.sleep(min(1.0, max(0.05, deadline - time.time())))
+            try:
+                order = self.retry(self.x.fetch_order, order_id, symbol)
+                filled = float(order.get("filled") or 0)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("maker-first fill poll failed for %s: %s",
+                            symbol, exc)
+                break
+
+        cancelled = True
+        if filled < contracts:
+            try:
+                self.retry(self.x.cancel_order, order_id, symbol)
+            except Exception as exc:                       # noqa: BLE001
+                # The order may have filled in the race. Re-read rather than
+                # assume either way: assuming unfilled would double the
+                # position, assuming filled would leave one unmanaged.
+                cancelled = False
+                log.warning("maker-first cancel failed for %s: %s",
+                            symbol, exc)
+            try:
+                order = self.retry(self.x.fetch_order, order_id, symbol)
+                filled = float(order.get("filled") or 0)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("maker-first post-cancel read failed for %s: %s",
+                            symbol, exc)
+
+        average = order.get("average") or (limit if filled else None)
+        slippage_saved_pct = None
+        if average and reference_price:
+            realised = float(average)
+            direction = 1.0 if side == "buy" else -1.0
+            # Positive means the passive fill beat the reference.
+            slippage_saved_pct = round(
+                direction * (reference_price - realised)
+                / reference_price * 100, 6)
+
+        return {
+            "order_id": order_id,
+            "requested_contracts": float(contracts),
+            "filled_contracts": float(filled),
+            "fill_rate": (float(filled) / float(contracts)
+                          if contracts else 0.0),
+            "limit_price": limit,
+            "average_price": float(average) if average else None,
+            "reference_price": float(reference_price),
+            "ioc_counterfactual_pct": slippage_saved_pct,
+            "wait_seconds": float(wait_seconds),
+            "cancelled": cancelled,
+            "resting": bool(not cancelled and filled < contracts),
+        }
+
     def open_position(self, symbol: str, side: str, contracts: float,
                       leverage: float, sl_price: float, tp_price: float,
                       expected_price: float | None = None,
