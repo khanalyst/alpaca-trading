@@ -152,7 +152,7 @@ class ConfigValidationTests(unittest.TestCase):
 
     def test_strategy_version_must_match_the_registered_spec(self):
         cfg = valid_config()
-        cfg["strategy"]["version"] = "phase1-v3"
+        cfg["strategy"]["version"] = "phase1-v99-unregistered"
         with self.assertRaisesRegex(
                 ConfigError, "needs its own registry entry"):
             validate_config(cfg)

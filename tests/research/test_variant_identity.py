@@ -81,7 +81,7 @@ class VariantRegistrationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             variants.Variant(
                 variant_id="momentum.rr.fixed_2_5", strategy_id="momentum",
-                base_version="phase1-v2",
+                base_version="phase1-v3",
                 overrides={"strategy.fixed_reward_risk": 2.5},
                 hypothesis="")
 
@@ -90,14 +90,14 @@ class VariantRegistrationTests(unittest.TestCase):
             with self.assertRaises(ConfigError, msg=bad):
                 variants.Variant(
                     variant_id=bad, strategy_id="momentum",
-                    base_version="phase1-v2",
+                    base_version="phase1-v3",
                     hypothesis="a claim long enough to count as a sentence")
 
     def test_unknown_status_is_refused(self):
         with self.assertRaises(ConfigError):
             variants.Variant(
                 variant_id="momentum.x", strategy_id="momentum",
-                base_version="phase1-v2", status="maybe",
+                base_version="phase1-v3", status="maybe",
                 hypothesis="a claim long enough to count as a sentence")
 
 
@@ -105,7 +105,7 @@ class VariantApplicationTests(unittest.TestCase):
     def test_overrides_are_applied_and_validated(self):
         variant = variants.Variant(
             variant_id="momentum.rr.fixed_2_5", strategy_id="momentum",
-            base_version="phase1-v2",
+            base_version="phase1-v3",
             overrides={"strategy.fixed_reward_risk": 2.5},
             hypothesis="A 2.5R fixed target outperforms the default 2.0R.")
 
@@ -116,7 +116,7 @@ class VariantApplicationTests(unittest.TestCase):
     def test_an_override_that_violates_bounds_raises_at_registration(self):
         variant = variants.Variant(
             variant_id="momentum.rr.absurd", strategy_id="momentum",
-            base_version="phase1-v2",
+            base_version="phase1-v3",
             overrides={"strategy.fixed_reward_risk": 9999},
             hypothesis="An implausible target, to prove bounds are enforced.")
 
@@ -127,7 +127,7 @@ class VariantApplicationTests(unittest.TestCase):
         """The failure this prevents is a week of replay reporting nothing."""
         variant = variants.Variant(
             variant_id="momentum.typo", strategy_id="momentum",
-            base_version="phase1-v2",
+            base_version="phase1-v3",
             overrides={"strategy.fixed_reward_ratio": 2.5},   # not _risk
             hypothesis="A misspelled path must fail loudly, not silently.")
 
@@ -140,7 +140,7 @@ class VariantApplicationTests(unittest.TestCase):
         original = base["strategy"]["fixed_reward_risk"]
         variant = variants.Variant(
             variant_id="momentum.rr.fixed_2_5", strategy_id="momentum",
-            base_version="phase1-v2",
+            base_version="phase1-v3",
             overrides={"strategy.fixed_reward_risk": 2.5},
             hypothesis="A 2.5R fixed target outperforms the default 2.0R.")
 
@@ -150,15 +150,15 @@ class VariantApplicationTests(unittest.TestCase):
 
     def test_baseline_variant_applies_cleanly(self):
         cfg = variants.apply(
-            variants.baseline("momentum", "phase1-v2"), valid_config())
+            variants.baseline("momentum", "phase1-v3"), valid_config())
         self.assertEqual(cfg["strategy"]["id"], "momentum")
 
     def test_variants_differing_only_in_overrides_fingerprint_differently(self):
         base = valid_config()
-        a = variants.apply(variants.baseline("momentum", "phase1-v2"), base)
+        a = variants.apply(variants.baseline("momentum", "phase1-v3"), base)
         b = variants.apply(variants.Variant(
             variant_id="momentum.rr.fixed_2_5", strategy_id="momentum",
-            base_version="phase1-v2",
+            base_version="phase1-v3",
             overrides={"strategy.fixed_reward_risk": 2.5},
             hypothesis="A 2.5R fixed target outperforms the default 2.0R."),
             base)
@@ -178,7 +178,7 @@ class RegistryFileTests(unittest.TestCase):
         registry = {
             "momentum.rr.fixed_2_5": variants.Variant(
                 variant_id="momentum.rr.fixed_2_5", strategy_id="momentum",
-                base_version="phase1-v2",
+                base_version="phase1-v3",
                 overrides={"strategy.fixed_reward_risk": 2.5},
                 hypothesis="A 2.5R fixed target outperforms the default 2.0R.",
                 status="testing"),
@@ -197,11 +197,11 @@ class RegistryFileTests(unittest.TestCase):
             "variants:\n"
             "  - variant_id: momentum.a\n"
             "    strategy_id: momentum\n"
-            "    base_version: phase1-v2\n"
+            "    base_version: phase1-v3\n"
             "    hypothesis: a claim long enough to count as a sentence\n"
             "  - variant_id: momentum.a\n"
             "    strategy_id: momentum\n"
-            "    base_version: phase1-v2\n"
+            "    base_version: phase1-v3\n"
             "    hypothesis: a claim long enough to count as a sentence\n",
             encoding="utf-8")
 
@@ -214,7 +214,7 @@ class RegistryFileTests(unittest.TestCase):
             "variants:\n"
             "  - variant_id: momentum.a\n"
             "    strategy_id: momentum\n"
-            "    base_version: phase1-v2\n"
+            "    base_version: phase1-v3\n"
             "    hypothesis: a claim long enough to count as a sentence\n"
             "    notes: this field does not exist\n",
             encoding="utf-8")

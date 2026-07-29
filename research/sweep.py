@@ -123,12 +123,12 @@ def expand(spec: SweepSpec, registry: dict) -> list:
     """Generate one named variant per grid point."""
     if spec.is_conditioning():
         return [registry.get(spec.base)
-                or variant_mod.baseline("momentum", "phase1-v2")]
+                or variant_mod.baseline("momentum", "phase1-v3")]
 
     import itertools
 
     base = registry.get(spec.base) or variant_mod.baseline(
-        "momentum", "phase1-v2")
+        "momentum", "phase1-v3")
     paths = sorted(spec.axis)
     out = []
     # A cross product, matching what grid_points() counts. A union would

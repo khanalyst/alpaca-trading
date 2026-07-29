@@ -15,6 +15,7 @@ import hashlib
 import json
 import time
 
+from . import hypotheses
 from .contracts import EVIDENCE_BUILDERS, finite as _finite
 from .registry import spec_for
 
@@ -77,8 +78,16 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
     strategy_id, strategy_version = identity(cfg)
     setup_type = str(decision.get("setup_type") or "invalid")[:80]
     if setup_type == "other":
-        strategy_id = f"{strategy_id}-experimental"
-        strategy_version = f"{strategy_version}-experimental-v1"
+        # Match the attribution build_setup_plan will assign, so the
+        # idempotency identity and the recorded trade agree. An unregistered
+        # or absent id keeps a distinct bucket rather than silently joining
+        # a real hypothesis's row - the plan will reject it moments later.
+        spec = hypotheses.spec_for(decision.get("hypothesis_id"))
+        if spec is not None:
+            strategy_id, strategy_version = spec.attribution(strategy_id)
+        else:
+            strategy_id = f"{strategy_id}-experimental-unregistered"
+            strategy_version = f"{strategy_version}-experimental-v1"
     setup_key = _hash({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
@@ -209,10 +218,24 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     # from being labellable while a different strategy is running.
     if setup_type not in spec_for(str(cfg["strategy"]["id"])).setup_types:
         return None, "setup type is not recognised"
-    if setup_type == "other" and (
-            cfg["mode"] != "demo"
-            or not cfg["strategy"]["allow_experimental_setups_in_demo"]):
-        return None, "experimental setups are allowed only in demo mode"
+    hypothesis_id = str(decision.get("hypothesis_id") or "")
+    if setup_type == "other":
+        # 6.3: an experimental setup must now name a registered hypothesis.
+        # Without one it is the unlabelled bucket again, and a category
+        # meaning "everything else" teaches nothing.
+        if (cfg["mode"] != "demo"
+                or not cfg["strategy"]["allow_experimental_setups_in_demo"]):
+            return None, "experimental setups are allowed only in demo mode"
+        if not hypothesis_id:
+            return None, ("an experimental setup must name a registered "
+                          "hypothesis_id")
+        fires, why = hypotheses.evaluate(
+            hypothesis_id, symbol_snapshot, direction, cfg)
+        if not fires:
+            return None, f"hypothesis {hypothesis_id}: {why}"
+    elif hypothesis_id:
+        return None, ("hypothesis_id belongs to an experimental setup, not "
+                      f"to {setup_type}")
 
     anchor = str(decision.get("invalidation_anchor") or "")
     if anchor not in INVALIDATION_ANCHORS:
@@ -282,8 +305,10 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
 
     strategy_id, strategy_version = identity(cfg)
     if setup_type == "other":
-        strategy_id = f"{strategy_id}-experimental"
-        strategy_version = f"{strategy_version}-experimental-v1"
+        # Its own attribution, so ten experiments produce ten rows rather
+        # than one average that describes none of them.
+        strategy_id, strategy_version = hypotheses.spec_for(
+            hypothesis_id).attribution(strategy_id)
     setup_key = _hash({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,

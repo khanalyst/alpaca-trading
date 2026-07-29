@@ -11,7 +11,7 @@ VALID_CONFIG = {
     },
     "strategy": {
         "id": "momentum",
-        "version": "phase1-v2",
+        "version": "phase1-v3",
         "signal_timeframe": "15m",
         "allow_experimental_setups_in_demo": True,
         "setup_cooldown_minutes": 45,

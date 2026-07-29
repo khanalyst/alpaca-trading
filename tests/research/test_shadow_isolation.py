@@ -24,7 +24,7 @@ from tests.research.test_enrichment_isolation import symbol_snapshot
 def variant(variant_id="momentum.rr.fixed_2_5", overrides=None):
     return variants.Variant(
         variant_id=variant_id, strategy_id="momentum",
-        base_version="phase1-v2",
+        base_version="phase1-v3",
         overrides=overrides if overrides is not None
         else {"strategy.fixed_reward_risk": 2.5},
         hypothesis="A 2.5R fixed target outperforms the default 2.0R.",

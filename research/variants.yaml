@@ -16,7 +16,7 @@
 variants:
   - variant_id: momentum.baseline
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides: {}
     hypothesis: >-
       The configuration as shipped. The comparison floor for every other
@@ -29,7 +29,7 @@ variants:
   # alternative. Three settings minimum before this axis may be rejected.
   - variant_id: momentum.rr.fixed_1_5
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       strategy.fixed_reward_risk: 1.5
     hypothesis: >-
@@ -39,7 +39,7 @@ variants:
 
   - variant_id: momentum.rr.fixed_2_5
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       strategy.fixed_reward_risk: 2.5
     hypothesis: >-
@@ -49,7 +49,7 @@ variants:
 
   - variant_id: momentum.rr.fixed_3_0
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       strategy.fixed_reward_risk: 3.0
     hypothesis: >-
@@ -62,7 +62,7 @@ variants:
   # invalidation, so it drives stop distance, position size and R together.
   - variant_id: momentum.stop.atr_1_5
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       strategy.min_stop_atr_multiple: 1.5
     hypothesis: >-
@@ -72,7 +72,7 @@ variants:
 
   - variant_id: momentum.stop.atr_2_0
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       strategy.min_stop_atr_multiple: 2.0
     hypothesis: >-
@@ -86,7 +86,7 @@ variants:
   # priority if the funnel confirms it dominates.
   - variant_id: momentum.net_direction.60
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       risk.max_net_direction_pct: 60
     hypothesis: >-
@@ -101,7 +101,7 @@ variants:
   # confidences the model actually recorded.
   - variant_id: momentum.conf.floor_0_50
     strategy_id: momentum
-    base_version: phase1-v2
+    base_version: phase1-v3
     overrides:
       risk.min_confidence: 0.50
     hypothesis: >-

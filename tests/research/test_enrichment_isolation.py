@@ -172,13 +172,19 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         #
         # b9a09a9dc3bc59ec -> 8d99182f0dcea1c4 in batch 6.1, which removed
         # structure_target from the model's option set and tightened the
-        # invalidation-anchor rule. That is a deliberate attribution fork:
-        # pre-6.1 and post-6.1 observations describe different decision
-        # spaces and must never be pooled. The constant moves only in a batch
-        # that intends it.
+        # invalidation-anchor rule.
+        # 8d99182f0dcea1c4 -> 0f85dcf00f2acd36 in batch 6.3, which replaced
+        # the unlabelled `other` escape hatch with a versioned list of
+        # registered hypotheses injected into the prompt.
+        #
+        # Both are deliberate attribution forks: observations either side of
+        # them describe different decision spaces and must never be pooled.
+        # strategy.version moved phase1-v2 -> phase1-v3 with the second, so
+        # the fork is visible in the journal without reading a prompt hash.
+        # This constant moves only in a batch that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "8d99182f0dcea1c4",
+            "0f85dcf00f2acd36",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

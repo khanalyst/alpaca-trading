@@ -27,7 +27,7 @@ llm:
 # changing these rules in place.
 strategy:
   id: momentum
-  version: phase1-v2
+  version: phase1-v3
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
   # Batch 6.3, interim. "other" bypasses the evidence contract entirely and
   # pools every distinct experimental idea under one label, so report.py

@@ -54,7 +54,7 @@ class EngineStartupTests(unittest.TestCase):
     def test_strategy_identity_is_captured_for_the_journal(self):
         engine = self._build()
         self.assertEqual(engine.strategy_id, "momentum")
-        self.assertEqual(engine.strategy_version, "phase1-v2")
+        self.assertEqual(engine.strategy_version, "phase1-v3")
 
     def test_two_strategies_produce_different_prompt_versions(self):
         # Prompt caching keys off this, so two strategies sharing a version

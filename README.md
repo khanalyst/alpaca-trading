@@ -416,7 +416,7 @@ observation would kill it), plus a **confidence tier** set by research:
 Demo runs any implemented strategy — paper trading is an operations
 rehearsal and running a known-negative strategy there is legitimate. **Live
 requires `T3_VALIDATED` or better**, enforced in `agent/config.py`. The
-shipped `momentum`/`phase1-v2` is `T0_REJECTED` on the evidence in
+shipped `momentum`/`phase1-v3` is `T0_REJECTED` on the evidence in
 `research/results/edge-audit-2024-2026/`, so switching `mode: live` with it
 active fails validation and prints the reason. That is intended behaviour,
 not a bug to work around.
@@ -457,7 +457,7 @@ as the detectability gate computed.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `id` / `version` | `momentum` / `phase1-v2` | Must name an entry in the strategy register (`agent/registry.py`). Stored with every run, setup and trade. Run `python main.py strategies` to list them |
+| `id` / `version` | `momentum` / `phase1-v3` | Must name an entry in the strategy register (`agent/registry.py`). Stored with every run, setup and trade. Run `python main.py strategies` to list them |
 | `signal_timeframe` | `15m` | Must equal the registered spec's timeframe; one symbol evaluation per completed bar |
 | `setup_cooldown_minutes` | 45 | Blocks a completed semantic setup before it can be reused |
 | `setup_memory_hours` | 72 | Persists bounded setup/idempotency history across restarts |

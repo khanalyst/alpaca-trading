@@ -255,12 +255,69 @@ class StrategyContractTests(unittest.TestCase):
             why, "experimental setups are allowed only in demo mode")
 
     def test_experimental_setup_has_separate_attribution_identity(self):
+        """Batch 6.3: each registered hypothesis gets its own row.
+
+        `other` pooled every distinct experimental idea under one label, and
+        report.py groups by setup_type, so ten experiments produced one
+        average that described none of them.
+        """
+        plan, why = strategy.build_setup_plan(
+            decision(setup_type="other", invalidation_anchor="atr",
+                     hypothesis_id="volume-thrust"),
+            snapshot(relative_volume_1h=1.6), valid_config())
+
+        self.assertIsNone(why)
+        self.assertEqual(plan["strategy_id"], "momentum-hyp-volume-thrust")
+
+    def test_an_experimental_setup_without_a_hypothesis_is_refused(self):
         plan, why = strategy.build_setup_plan(
             decision(setup_type="other", invalidation_anchor="atr"),
             snapshot(), valid_config())
+
+        self.assertIsNone(plan)
+        self.assertIn("registered hypothesis_id", why)
+
+    def test_an_unregistered_hypothesis_is_refused(self):
+        """The model may not invent one; that is what `other` allowed."""
+        plan, why = strategy.build_setup_plan(
+            decision(setup_type="other", invalidation_anchor="atr",
+                     hypothesis_id="my-great-idea"),
+            snapshot(), valid_config())
+
+        self.assertIsNone(plan)
+        self.assertIn("not registered", why)
+
+    def test_a_registered_hypothesis_still_has_to_fire(self):
+        """A permissive contract is still a contract."""
+        plan, why = strategy.build_setup_plan(
+            decision(setup_type="other", invalidation_anchor="atr",
+                     hypothesis_id="volume-thrust"),
+            snapshot(relative_volume_1h=1.0), valid_config())
+
+        self.assertIsNone(plan)
+        self.assertIn("below 1.5", why)
+
+    def test_hypothesis_id_on_a_contracted_setup_is_refused(self):
+        plan, why = strategy.build_setup_plan(
+            decision(hypothesis_id="volume-thrust"),
+            snapshot(), valid_config())
+
+        self.assertIsNone(plan)
+        self.assertIn("belongs to an experimental setup", why)
+
+    def test_two_hypotheses_do_not_share_an_attribution(self):
+        first, _ = strategy.build_setup_plan(
+            decision(setup_type="other", invalidation_anchor="atr",
+                     hypothesis_id="volume-thrust"),
+            snapshot(relative_volume_1h=1.6), valid_config())
+        second, why = strategy.build_setup_plan(
+            decision(setup_type="other", invalidation_anchor="atr",
+                     direction="short", hypothesis_id="oi-divergence"),
+            snapshot(mom_1h_pct=0.8, oi_change_4h_pct=-2.0),
+            valid_config())
+
         self.assertIsNone(why)
-        self.assertEqual(plan["strategy_id"], "momentum-experimental")
-        self.assertIn("experimental", plan["strategy_version"])
+        self.assertNotEqual(first["strategy_id"], second["strategy_id"])
 
     def test_semantic_cooldown_blocks_new_candle_without_erasing_history(self):
         cfg = valid_config()
@@ -289,16 +346,18 @@ class StrategyContractTests(unittest.TestCase):
                 setup_type="other",
                 invalidation_anchor="atr",
                 direction="short",
+                hypothesis_id="volume-thrust",
             ),
-            snapshot(),
+            snapshot(relative_volume_1h=1.6, mom_1h_pct=-0.5),
             cfg,
         )
 
         self.assertIsNotNone(
             strategy.evaluated_signal(records, relabelled))
         next_bar, _ = strategy.build_setup_plan(
-            decision(setup_type="other", invalidation_anchor="atr"),
-            snapshot(signal_ts=2_000),
+            decision(setup_type="other", invalidation_anchor="atr",
+                     hypothesis_id="volume-thrust"),
+            snapshot(signal_ts=2_000, relative_volume_1h=1.6),
             cfg,
         )
         self.assertIsNone(strategy.evaluated_signal(records, next_bar))

@@ -166,7 +166,7 @@ REGISTRY: dict[str, StrategySpec] = {
     spec.id: spec for spec in (
         StrategySpec(
             id="momentum",
-            version="phase1-v2",
+            version="phase1-v3",
             mechanism=(
                 "None established. Retained as the benchmark null that any "
                 "new strategy must beat, and as the only strategy here whose "

@@ -1,6 +1,14 @@
 # Trading decision examples
 
-These examples explain the current `momentum / phase1-v2` decision contract.
+These examples explain the current `momentum / phase1-v3` decision contract.
+
+> **Batch 6 changed two things these walkthroughs depend on.** `exit_policy`
+> no longer accepts `structure_target` (6.1: it was arithmetically identical
+> to `fixed_rr` in both setups it was designed for), and `funding_squeeze`
+> now requires a structure invalidation rather than being the one setup
+> allowed the tightest ATR stop (6.2 / defect D3). An experimental setup also
+> requires a registered `hypothesis_id` (6.3). Any arithmetic below that
+> walks through `structure_target` describes the v2 contract.
 The KAITO, CL and AAVE observations come from the agent's July 23, 2026
 journal. Those trades were originally evaluated by an older interface in
 which the model supplied numeric leverage, size, stop and target. Phase 1 no

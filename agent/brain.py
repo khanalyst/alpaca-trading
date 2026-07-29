@@ -30,6 +30,7 @@ import math
 import os
 from copy import deepcopy
 
+from . import hypotheses
 from .registry import spec_for
 
 log = logging.getLogger("brain")
@@ -62,6 +63,15 @@ momentum died, funding turned sharply against it), close it rather than hope - \
 but not in the first minutes of the trade. A freshly opened position moving \
 against you is the normal cost of entry, not evidence. See POSITION MANAGEMENT \
 for the minimum-hold rule that deterministic code enforces.
+
+REGISTERED HYPOTHESES
+An experimental setup (setup_type "other") must name one of these in \
+hypothesis_id. Each has its own deterministic contract, which is checked \
+before the trade is allowed, and its own separately attributed results. You \
+may not invent one: an unregistered id is rejected. Propose one only when \
+its stated condition genuinely holds - these exist to be measured, and a \
+loosely applied label makes its row meaningless.
+__HYPOTHESIS_LIST__
 
 MARKET SNAPSHOT FIELD REFERENCE
 The special _market_context object summarizes BTC as the market benchmark: \
@@ -289,7 +299,10 @@ no markdown fences, no comments. Schema:
   {"action": "hold", "symbol": "SOL/USDT:USDT"}
 ]}
 Rules: setup_type must be trend_continuation, range_breakout, funding_squeeze \
-or other; other is experimental and demo-only. invalidation_anchor must be \
+or other. other is experimental, demo-only, and REQUIRES a hypothesis_id \
+chosen from the REGISTERED HYPOTHESES list below - an experimental setup \
+without one is rejected. Do not send hypothesis_id with any other \
+setup_type. invalidation_anchor must be \
 structure or atr; every contracted setup requires structure. \
 exit_policy must be fixed_rr or extended_rr. \
 execution_choice is normal unless current liquidity feedback justifies \
@@ -349,6 +362,9 @@ Example C - short setup:
 _ARCHETYPE_MARKER = "__SETUP_ARCHETYPES__"
 
 
+_HYPOTHESIS_MARKER = "__HYPOTHESIS_LIST__"
+
+
 def build_system(cfg: dict) -> str:
     """Assemble the system prompt for the configured strategy.
 
@@ -363,7 +379,11 @@ def build_system(cfg: dict) -> str:
     given strategy, not one global constant.
     """
     fragment = spec_for(str(cfg["strategy"]["id"])).prompt_fragment.strip()
-    return SYSTEM.replace(_ARCHETYPE_MARKER, fragment)
+    system = SYSTEM.replace(_ARCHETYPE_MARKER, fragment)
+    # The experimental list is versioned into the prompt rather than left
+    # open-ended, so every experimental trade is attributable to a claim
+    # registered before it was taken.
+    return system.replace(_HYPOTHESIS_MARKER, hypotheses.prompt_fragment())
 
 
 def prompt_version(system: str) -> str:
@@ -705,6 +725,12 @@ def parse_decisions(text: str) -> list[dict]:
                 "invalidation_anchor": str(
                     d.get("invalidation_anchor") or "").lower(),
                 "exit_policy": str(d.get("exit_policy") or "").lower(),
+                # Bounded and lowercased like every other model-supplied
+                # label. Validity is decided by the hypothesis register, not
+                # here: an unregistered id must reach build_setup_plan so it
+                # is rejected with a reason rather than silently dropped.
+                "hypothesis_id": str(
+                    d.get("hypothesis_id") or "").lower()[:60],
                 "execution_choice": str(
                     d.get("execution_choice") or "normal").lower(),
                 "what_changed_since_last_loss": str(
