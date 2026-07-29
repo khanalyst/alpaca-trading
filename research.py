@@ -20,8 +20,8 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from research import (corpus, findings as findings_mod,         # noqa: E402
-                      prices as prices_mod, replay as replay_mod,
-                      score, stats, sweep)
+                      prices as prices_mod, protocol,
+                      replay as replay_mod, score, stats, sweep)
 
 
 def default_db(mode: str = "demo") -> Path:
@@ -236,32 +236,77 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
         buckets = sweep.partition(result.executed(), axis, value_of)
         scored = sweep.score_partition(buckets)
+        # The family-wise correction is applied here rather than left to
+        # whoever writes the summary. Several cells against a few hundred
+        # round trips guarantees something looks significant.
+        corrected = protocol.correct_family(scored)
+
         print(f"\nconditioning on {axis.variable}, "
               f"pre-registered buckets:\n")
         for name in [b.get("name") for b in axis.buckets]:
-            row = scored.get(name) or {"n": 0, "expectancy_r": 0.0,
-                                       "verdict": stats.INSUFFICIENT_SAMPLE,
-                                       "mde_r": float("inf")}
+            row = corrected.get(name) or {
+                "n": 0, "expectancy_r": 0.0, "mde_r": float("inf"),
+                "verdict": stats.INSUFFICIENT_SAMPLE, "p_adjusted": 1.0}
             print(f"  {name:<20} n={row['n']:<5} "
                   f"expectancy {row['expectancy_r']:+.4f}R  "
-                  f"MDE {row['mde_r']:.4f}R  {row['verdict']}")
-        print("\nEvery bucket is reported, including the empty ones. A "
-              "programme that\nrecords only positives records only noise.")
+                  f"MDE {row['mde_r']:.4f}R  "
+                  f"p_adj {row.get('p_adjusted', 1.0):.3f}  {row['verdict']}")
+
+        # Out-of-sample split per bucket, with the regime profile of both
+        # windows beside it: a corpus spanning a volatility change makes the
+        # split a regime test rather than a robustness test.
+        print("\nout-of-sample (70/30 by time):\n")
+        for name in [b.get("name") for b in axis.buckets]:
+            rows = buckets.get(name) or []
+            if len(rows) < 2:
+                print(f"  {name:<20} too few observations to split")
+                continue
+            split = protocol.out_of_sample(rows)
+            comparable = split["fit_regime"].get("comparable")
+            note = ("" if comparable is not False
+                    else "  REGIME SHIFT: this is a regime test, not a "
+                         "robustness test")
+            print(f"  {name:<20} survives={split['survives']}  "
+                  f"fit n={split['fit']['n']} confirm n={split['confirm']['n']}"
+                  f"{note}")
+
+        print("\nOnly the corrected p is quoted. Every bucket is reported, "
+              "including the\nempty ones: a programme that records only "
+              "positives records only noise.")
         return 0
 
     from agent import variants as variant_mod
     registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
     print()
+    settings = []
     for variant in sweep.expand(spec, registry):
         variant_cfg = variant_mod.apply(variant, cfg)
         result = replay_mod.Replay(
             variant_cfg, variant_id=variant.variant_id,
             mode=args.replay_mode, price_cache=cache).run(cycles, outputs)
-        returns = [d.outcome["r_multiple"] for d in result.executed()
-                   if d.outcome]
+        executed = result.executed()
+        settings.append((variant.variant_id, executed))
+        returns = [d.outcome["r_multiple"] for d in executed if d.outcome]
         row = score.score_returns(returns, label=variant.variant_id)
         print(f"  {variant.variant_id:<40} n={row['n']:<5} "
               f"expectancy {row['expectancy_r']:+.4f}R  {row['verdict']}")
+
+    # The axis is the unit of decision, not the individual setting: a
+    # hypothesis is never rejected on one parameter value.
+    base_variant = registry.get(spec.base) or variant_mod.baseline(
+        "momentum", "phase1-v2")
+    baseline_result = replay_mod.Replay(
+        variant_mod.apply(base_variant, cfg),
+        variant_id=base_variant.variant_id, mode=args.replay_mode,
+        price_cache=cache).run(cycles, outputs)
+    verdict = protocol.evaluate_axis(settings, baseline_result.executed())
+    print(f"\naxis verdict: {verdict.verdict}")
+    print(f"  governing criterion: {verdict.governing_criterion}")
+    print(f"  {verdict.detail}")
+    if verdict.verdict == stats.INSUFFICIENT_SAMPLE:
+        print("\nThe question is open, not answered in the negative. That "
+              "distinction is\nthe one most likely to erode: see "
+              "research/protocol.md.")
     return 0
 
 

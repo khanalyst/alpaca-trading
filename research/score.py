@@ -221,15 +221,47 @@ def score_returns(returns: list, label: str = "") -> dict:
     }
 
 
-def compare(variant: dict, baseline: dict) -> dict:
-    """A delta is only meaningful when both arms could support one."""
+def compare(variant_returns: list, baseline_returns: list,
+            label: str = "") -> dict:
+    """Difference between two arms, with a bootstrap interval on the delta.
+
+    Takes the raw return series rather than two scored dicts. A scored dict
+    has already collapsed to a point estimate and an interval, and the
+    interval on a *difference* is not recoverable from the two marginal
+    intervals - resampling both arms is the only way to get it.
+
+    The distinction matters more than it sounds. Two arms whose intervals
+    overlap can still differ significantly, and two whose intervals are wide
+    can still have a tightly bounded difference when they move together.
+    Reading significance off the marginals is the most common way to get a
+    small-sample comparison wrong in the direction of a false positive.
+    """
     from .stats import bootstrap_difference
-    if variant["n"] == 0 or baseline["n"] == 0:
-        return {"verdict": INSUFFICIENT_SAMPLE, "delta_r": 0.0,
-                "ci_low": 0.0, "ci_high": 0.0, "significant": False}
-    return {"verdict": variant["verdict"],
-            "delta_r": variant["expectancy_r"] - baseline["expectancy_r"],
-            "significant": False, "ci_low": 0.0, "ci_high": 0.0}
+
+    clean_v = [float(r) for r in variant_returns
+               if r is not None and math.isfinite(float(r))]
+    clean_b = [float(r) for r in baseline_returns
+               if r is not None and math.isfinite(float(r))]
+    if not clean_v or not clean_b:
+        return {"label": label, "verdict": INSUFFICIENT_SAMPLE,
+                "delta_r": 0.0, "ci_low": 0.0, "ci_high": 0.0,
+                "significant": False, "n_variant": len(clean_v),
+                "n_baseline": len(clean_b)}
+
+    difference = bootstrap_difference(clean_v, clean_b)
+    return {
+        "label": label,
+        "delta_r": difference.point,
+        "ci_low": difference.low,
+        "ci_high": difference.high,
+        # An interval excluding zero is the only evidence of a real
+        # difference this module will assert.
+        "significant": difference.excludes_zero(),
+        "n_variant": len(clean_v),
+        "n_baseline": len(clean_b),
+        "verdict": (INSUFFICIENT_SAMPLE
+                    if min(len(clean_v), len(clean_b)) < 100 else "SCORED"),
+    }
 
 
 # ----------------------------------------------------------------- funnel
