@@ -71,6 +71,20 @@ class NoLookaheadTests(unittest.TestCase):
         with self.assertRaises(LookaheadError):
             resolve(hourly, [just_inside])
 
+    def test_pre_entry_minutes_after_signal_close_are_not_visible(self):
+        entry_ts = FIRST_VISIBLE + 5 * 60_000 + 30_000
+        before_entry = Bar(FIRST_VISIBLE + 5 * 60_000,
+                           100.0, 105.0, 97.0, 100.0, 1000.0)
+
+        with self.assertRaises(LookaheadError):
+            resolve(plan(entry_ts=entry_ts), [before_entry])
+
+        first_post_entry = Bar(FIRST_VISIBLE + 6 * 60_000,
+                               100.0, 101.0, 99.0, 100.0, 1000.0)
+        self.assertNotEqual(
+            resolve(plan(entry_ts=entry_ts), [first_post_entry]).result,
+            "no_data")
+
 
 class GoldenPathTests(unittest.TestCase):
     """A hand-built price path with three known outcomes."""

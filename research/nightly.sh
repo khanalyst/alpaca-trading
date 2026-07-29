@@ -56,8 +56,8 @@ if [ -f "$JOURNAL" ]; then
   set -e
   case "$g2" in
     0) ;;
-    4) echo "G2 vacuous - the corpus has no recorded decisions yet." >&2
-       echo "Continuing, but nothing below is validated evidence." >&2 ;;
+    4) echo "G2 collecting - fewer than 100 proposals are recorded." >&2
+       echo "Gated commands below will refuse; collection continues." >&2 ;;
     *) echo "G2 FAILED - stopping. Every downstream number would be " >&2
        echo "precise, plausible, internally consistent and wrong." >&2
        exit 3 ;;

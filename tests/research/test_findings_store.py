@@ -112,6 +112,18 @@ class AppendOnlyTests(StoreFixture):
         with self.assertRaises(ValueError):
             self.store.add_finding("v", "vibes", "text")
 
+    def test_an_unknown_variant_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "unknown variant_id"):
+            self.store.add_finding("missing", "observation", "text")
+
+    def test_run_ids_cannot_rewrite_history(self):
+        self.store.register(variant())
+        self.store.record_run("run-1", "momentum.rr.fixed_2_5", result())
+
+        with self.assertRaises(Exception):
+            self.store.record_run(
+                "run-1", "momentum.rr.fixed_2_5", result(cycles=9999))
+
 
 class NullResultTests(StoreFixture):
     def test_an_insufficient_sample_is_recorded_as_a_finding(self):
@@ -193,6 +205,28 @@ class ScorecardTests(StoreFixture):
     def test_an_unregistered_variant_renders_rather_than_raising(self):
         card = findings_mod.scorecard(self.store, "momentum.nope")
         self.assertIn("Not registered", card)
+
+    def test_atomic_evaluation_persists_run_metrics_and_finding(self):
+        self.store.register(variant())
+        scored = {
+            "label": "momentum.rr.fixed_2_5", "n": 120,
+            "expectancy_r": 0.2, "ci_low": 0.1, "ci_high": 0.3,
+            "mde_r": 0.05, "verdict": "SCORED"}
+
+        self.store.record_evaluation(
+            "run-atomic", "momentum.rr.fixed_2_5", result(), scored,
+            "CONTINUE: collect more evidence")
+
+        self.assertEqual(len(self.store.runs_for(
+            "momentum.rr.fixed_2_5")), 1)
+        self.assertIn("expectancy_r", self.store.metrics_for("run-atomic"))
+        self.assertIn("CONTINUE", self.store.findings_for(
+            "momentum.rr.fixed_2_5")[0]["text"])
+        self.assertTrue(self.store.backup_path.exists())
+
+        backup = findings_mod.FindingsStore(self.store.backup_path)
+        self.assertEqual(len(backup.runs_for(
+            "momentum.rr.fixed_2_5")), 1)
 
 
 class IndexTests(StoreFixture):

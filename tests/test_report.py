@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 
 from report import (
     adjusted_equity_curve,
+    json_report,
     match_round_trips,
     print_equity,
     print_per_strategy,
@@ -23,6 +24,7 @@ def event(**overrides):
         "funding_status": "available", "pnl_semantics": None,
         "strategy_id": None, "strategy_version": None,
         "setup_type": None, "entry_equity_usd": None,
+        "variant_id": None, "strategy_config_version": None,
     }
     base.update(overrides)
     return base
@@ -262,6 +264,66 @@ class PerformanceReportTests(unittest.TestCase):
         self.assertIn("runtime demo / okx-demo-a", rendered)
         self.assertIn("runtime live / okx-live-b", rendered)
         self.assertEqual(rendered.count("momentum / phase1-v2"), 2)
+
+    def test_strategy_report_separates_parameter_variants(self):
+        events = [
+            event(ts=1, action="open", trade_id="a", risk_usd=10,
+                  strategy_id="momentum", strategy_version="phase1-v3",
+                  variant_id="momentum.rr.2_5",
+                  strategy_config_version="strategy-a"),
+            event(ts=2, action="close", trade_id="a", realized_pnl_usd=1,
+                  pnl_semantics="incremental_v1"),
+            event(ts=3, action="open", trade_id="b", risk_usd=10,
+                  strategy_id="momentum", strategy_version="phase1-v3",
+                  variant_id="momentum.rr.3_0",
+                  strategy_config_version="strategy-b"),
+            event(ts=4, action="close", trade_id="b", realized_pnl_usd=-1,
+                  pnl_semantics="incremental_v1"),
+        ]
+        trades, _ = match_round_trips(events)
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            print_per_strategy(trades)
+
+        rendered = output.getvalue()
+        self.assertIn("parameter=momentum.rr.2_5", rendered)
+        self.assertIn("parameter=momentum.rr.3_0", rendered)
+        self.assertEqual(rendered.count("momentum / phase1-v3"), 2)
+
+    def test_json_report_uses_full_provenance_groups(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute(
+            "CREATE TABLE trades (ts REAL, action TEXT, trade_id TEXT, "
+            "risk_usd REAL, realized_pnl_usd REAL, pnl_semantics TEXT, "
+            "strategy_id TEXT, strategy_version TEXT, runtime_mode TEXT, "
+            "account_fingerprint TEXT, variant_id TEXT, "
+            "strategy_config_version TEXT)")
+        db.executemany(
+            "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+                (1, "open", "a", 10, None, None, "momentum", "phase1-v3",
+                 "demo", "account-a", "rr.2_5", "strategy-a"),
+                (2, "close", "a", None, 1, "incremental_v1", None, None,
+                 None, None, None, None),
+                (3, "open", "b", 10, None, None, "momentum", "phase1-v3",
+                 "demo", "account-b", "rr.2_5", "strategy-a"),
+                (4, "close", "b", None, -1, "incremental_v1", None, None,
+                 None, None, None, None),
+            ])
+        db.execute("CREATE TABLE events (ts REAL, kind TEXT, payload TEXT)")
+        db.execute(
+            "INSERT INTO events VALUES (?,?,?)",
+            (5, "transfer", json.dumps({"net_usdt": 25})))
+
+        payload = json_report(db)
+
+        self.assertEqual(payload["schema"], 2)
+        self.assertEqual(len(payload["groups"]), 2)
+        self.assertEqual(
+            {g["provenance"]["account_fingerprint"]
+             for g in payload["groups"]}, {"account-a", "account-b"})
+        self.assertEqual(payload["transfers"], {"count": 1, "net_usdt": 25})
 
 
 if __name__ == "__main__":

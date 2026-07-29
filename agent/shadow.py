@@ -152,11 +152,13 @@ class ShadowEvaluator:
     def _evaluate_one(self, variant_id: str, cfg: dict, engine: RiskEngine,
                       snapshot: dict, symbol: str, portfolio: dict,
                       now: float) -> ShadowRecord:
-        row = snapshot[symbol]
+        # Cached evidence belongs to the live configuration. Recompute it for
+        # the candidate so evidence-changing variants do not replay baseline
+        # decisions under a different name.
+        row = dict(snapshot[symbol])
+        row["setup_evidence"] = strategy.setup_evidence(row, cfg)
         signal_ts = row.get("signal_ts")
-        evidence = row.get("setup_evidence")
-        if not isinstance(evidence, dict):
-            evidence = strategy.setup_evidence(row, cfg)
+        evidence = row["setup_evidence"]
 
         for setup_type, contract in sorted(evidence.items()):
             if not isinstance(contract, dict):

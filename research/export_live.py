@@ -39,21 +39,37 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "research"))
 
 from edge_lab import COST_SCENARIOS, load_dataset, simulate  # noqa: E402
+from agent.registry import spec_for  # noqa: E402
 
 BAR_MS = 900_000
 
 
 def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
                                          pd.DataFrame]:
-    """Return (shadow decisions, shadow summaries, real trades)."""
+    """Return (strategy decisions, strategy summaries, real trades).
+
+    New journals use event names whose schema is explicit. Legacy
+    ``shadow_decision`` rows are accepted only when they have strategy
+    attribution and no variant attribution; this deliberately excludes the
+    parameter-variant rows that historically shared the same event name.
+    """
     if not db_path.exists():
         raise SystemExit(
             f"no journal at {db_path}. Run the agent first, or pass --mode "
             f"live / --journal explicitly.")
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        event_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(events)")
+        }
+        variant_expr = (
+            "variant_id" if "variant_id" in event_columns
+            else "NULL AS variant_id"
+        )
         events = pd.read_sql_query(
-            "SELECT ts, kind, payload, strategy_id, strategy_version "
-            "FROM events WHERE kind IN ('shadow_decision','shadow_summary')",
+            "SELECT ts, kind, payload, strategy_id, strategy_version, "
+            f"{variant_expr} FROM events WHERE kind IN ("
+            "'strategy_shadow_decision','strategy_shadow_summary',"
+            "'shadow_decision','shadow_summary')",
             conn)
         try:
             trades = pd.read_sql_query(
@@ -62,9 +78,14 @@ def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
         except Exception:                                  # noqa: BLE001
             trades = pd.DataFrame()
 
-    def expand(kind: str) -> pd.DataFrame:
+    def expand(kinds: set[str], *, decisions: bool = False) -> pd.DataFrame:
         rows = []
-        for row in events[events["kind"] == kind].itertuples(index=False):
+        selected = events[events["kind"].isin(kinds)]
+        for row in selected.itertuples(index=False):
+            if decisions and row.kind == "shadow_decision":
+                if (not pd.isna(row.variant_id)
+                        or pd.isna(row.strategy_id)):
+                    continue
             try:
                 payload = json.loads(row.payload)
             except (TypeError, ValueError):
@@ -77,7 +98,10 @@ def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
             rows.append(payload)
         return pd.DataFrame(rows)
 
-    return expand("shadow_decision"), expand("shadow_summary"), trades
+    decisions = expand(
+        {"strategy_shadow_decision", "shadow_decision"}, decisions=True)
+    summaries = expand({"strategy_shadow_summary", "shadow_summary"})
+    return decisions, summaries, trades
 
 
 def derive_levels(row, min_stop_atr: float, buffer_atr: float,
@@ -110,6 +134,15 @@ def resolve(decisions: pd.DataFrame, frames: dict, costs, max_hold_bars: int,
     unresolved = defaultdict(int)
     for (strategy_id, symbol, direction), group in decisions.groupby(
             ["strategy_id", "symbol", "direction"]):
+        try:
+            scoring_ready = spec_for(str(strategy_id)).forward_model_ready
+        except Exception:                                  # noqa: BLE001
+            scoring_ready = False
+        if not scoring_ready:
+            unresolved[
+                f"{strategy_id}: no validated forward outcome model"] += len(
+                    group)
+            continue
         frame = frames.get(symbol)
         if frame is None:
             unresolved[f"{symbol}: no bar data"] += len(group)

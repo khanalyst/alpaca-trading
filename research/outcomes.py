@@ -8,11 +8,13 @@ Three rules here are not configurable, and each exists because the
 convenient alternative manufactures edge out of nothing:
 
 **No lookahead, enforced by raising.** The resolver may only read bars whose
-open is at or after ``signal_ts + signal_bar_duration``. Reading the signal
-bar itself would let the outcome peek at the candle the decision was made
-from. This is checked in code rather than trusted, because a lookahead bug
-produces numbers that are precise, plausible, internally consistent and
-wrong - with no error and no failing test.
+open is at or after both ``signal_ts + signal_bar_duration`` and the actual
+decision/entry timestamp. Reading the signal bar itself would let the outcome
+peek at the candle the decision was made from; reading the minutes between a
+bar close and a later decision would credit movement that happened before the
+trade existed. This is checked in code rather than trusted, because a
+lookahead bug produces numbers that are precise, plausible, internally
+consistent and wrong - with no error and no failing test.
 
 **Same-bar ties resolve as a stop.** When one 1-minute bar's range spans both
 the stop and the target, the order of the two touches is genuinely unknown.
@@ -52,6 +54,7 @@ class SetupPlan:
     stop_pct: float                # distance from entry, positive percent
     take_pct: float                # distance from entry, positive percent
     signal_ts: int                 # epoch ms, the signal bar's OPEN time
+    entry_ts: int | None = None    # epoch ms, actual decision/entry time
     signal_timeframe: str = "15m"
     spread_pct: float = 0.0
     funding_rate_pct: float = 0.0
@@ -61,7 +64,8 @@ class SetupPlan:
     @property
     def first_visible_ts(self) -> int:
         """The earliest bar the resolver is permitted to read."""
-        return int(self.signal_ts) + TIMEFRAME_MS[self.signal_timeframe]
+        signal_close = int(self.signal_ts) + TIMEFRAME_MS[self.signal_timeframe]
+        return max(signal_close, int(self.entry_ts or signal_close))
 
     def stop_price(self) -> float:
         move = self.entry_price * self.stop_pct / 100.0
@@ -145,11 +149,11 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
             costs: CostModel | None = None) -> Outcome:
     """Resolve one setup against 1-minute bars strictly after the signal bar.
 
-    ``bars`` must be ascending and must not contain anything at or before the
-    signal bar's close. Handing this function an earlier bar is a programming
-    error, not a data condition, so it raises rather than filtering: a
-    resolver that quietly discarded lookahead would hide the bug that
-    produced it.
+    ``bars`` must be ascending and must not contain anything before the later
+    of the signal bar's close and the actual decision/entry time. Handing this
+    function an earlier bar is a programming error, not a data condition, so
+    it raises rather than filtering: a resolver that quietly discarded
+    lookahead would hide the bug that produced it.
     """
     costs = costs or CostModel()
     if plan.direction not in ("long", "short"):
@@ -161,8 +165,8 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
     for bar in bars:
         if int(bar.ts) < floor_ts:
             raise LookaheadError(
-                f"{plan.symbol}: bar at {bar.ts} is at or before the signal "
-                f"bar's close ({floor_ts}); the resolver may not see it")
+                f"{plan.symbol}: bar at {bar.ts} precedes the first observable "
+                f"post-entry bar ({floor_ts}); the resolver may not see it")
 
     if not bars:
         return Outcome(result="no_data")

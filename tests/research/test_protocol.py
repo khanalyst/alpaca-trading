@@ -175,6 +175,19 @@ class RejectionTests(unittest.TestCase):
         self.assertEqual(verdict.verdict, protocol.CONTINUE)
         self.assertIn("too few settings", verdict.governing_criterion)
 
+    def test_an_under_observed_setting_blocks_whole_axis_rejection(self):
+        baseline = strong(120, value=1.0)
+        settings = [
+            ("v0", series([-1.0] * 120)),
+            ("v1", series([-1.0] * 120, start=1000)),
+            ("v2", series([-1.0] * 12, start=2000)),
+        ]
+
+        verdict = protocol.evaluate_axis(settings, baseline)
+
+        self.assertEqual(verdict.verdict, stats.INSUFFICIENT_SAMPLE)
+        self.assertIn("rejection floor", verdict.governing_criterion)
+
 
 class PromotionTests(unittest.TestCase):
     def test_a_small_sample_refuses_to_promote(self):
@@ -224,6 +237,23 @@ class PromotionTests(unittest.TestCase):
         verdict = protocol.evaluate_axis(settings, baseline)
 
         self.assertEqual(verdict.verdict, protocol.CONTINUE)
+
+    def test_confirmation_window_cannot_select_its_own_winner(self):
+        baseline = flat(200)
+        fit_winner = (series([2.0] * 140)
+                      + series([-2.0] * 60, start=1000))
+        full_sample_winner = (series([0.8] * 140, start=2000)
+                              + series([3.0] * 60, start=3000))
+        settings = [
+            ("fit-winner", fit_winner),
+            ("full-winner", full_sample_winner),
+            ("control", series([0.7] * 200, start=4000)),
+        ]
+
+        verdict = protocol.evaluate_axis(settings, baseline)
+
+        self.assertEqual(verdict.verdict, protocol.CONTINUE)
+        self.assertEqual(verdict.evidence["best"], "fit-winner")
 
     def test_a_variant_meeting_every_criterion_promotes(self):
         baseline = series([-0.2 if i % 2 else 0.1 for i in range(200)])

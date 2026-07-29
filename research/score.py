@@ -113,6 +113,10 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
                 opened.get("config_version") or "legacy"),
             "code_version": (
                 opened.get("code_version") or "legacy"),
+            "variant_id": (
+                opened.get("variant_id") or "legacy_baseline"),
+            "strategy_config_version": (
+                opened.get("strategy_config_version") or "legacy"),
             "runtime_mode": (
                 opened.get("runtime_mode") or "legacy_unknown"),
             "account_fingerprint": (

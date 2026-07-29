@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from .registry import (LIVE_MIN_TIER, UnknownStrategy, implemented_ids,
-                       live_eligible_ids, spec_for)
+from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
+                       runnable_ids, spec_for)
 
 
 # Batch 6.4. "none" is the shipped behaviour: the two contracts overlap and
@@ -112,11 +112,15 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError(
             f"strategy.id {spec.id!r} is registered for research but has no "
             f"live contract implementation. Runnable strategies: "
-            f"{', '.join(implemented_ids())}")
-    # Demo is an operations rehearsal, so any implemented strategy may run
-    # there. Live capital requires a strategy that has actually cleared the
-    # evidence gates, which is what stops a measured-negative strategy from
-    # reaching real money by editing one line.
+            f"{', '.join(runnable_ids())}")
+    if not spec.analyst_ready:
+        raise ConfigError(
+            f"strategy.id {spec.id!r} has a deterministic shadow contract "
+            "but its analyst prompt/schema is not implemented. Runnable "
+            f"strategies: {', '.join(runnable_ids())}")
+    # Demo is an operations rehearsal, but it still needs a complete analyst
+    # contract. Live capital additionally requires a strategy that has
+    # cleared the evidence gates.
     if cfg["mode"] == "live" and not spec.meets(LIVE_MIN_TIER):
         eligible = live_eligible_ids()
         raise ConfigError(

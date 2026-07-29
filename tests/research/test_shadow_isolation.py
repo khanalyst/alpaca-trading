@@ -80,6 +80,18 @@ class TypeBoundaryTests(unittest.TestCase):
         for record in records:
             self.assertIsInstance(record, shadow.ShadowRecord)
 
+    def test_variant_recomputes_cached_live_evidence(self):
+        snap = snapshot()
+        snap["BTC/USDT:USDT"]["setup_evidence"] = {
+            "trend_continuation": {"long": False, "short": False}}
+        evaluator = shadow.ShadowEvaluator([variant()], valid_config())
+
+        with patch("agent.shadow.strategy.setup_evidence",
+                   wraps=shadow.strategy.setup_evidence) as evidence:
+            evaluator.evaluate(snap, portfolio(), 1_760_000_000.0)
+
+        self.assertTrue(evidence.called)
+
 
 class NoOpTests(unittest.TestCase):
     def test_an_absent_research_block_builds_nothing(self):
@@ -174,13 +186,14 @@ class EngineHookTests(unittest.TestCase):
             [variant()], valid_config())
 
     @patch("agent.engine.state.log_event")
-    def test_records_are_journalled_as_shadow_decisions(self, log_event):
+    def test_records_are_journalled_as_variant_shadow_decisions(
+            self, log_event):
         self.engine._run_shadow_variants(
             snapshot(), 10_000.0, [], {}, 0.0)
 
         kinds = [c.args[0] for c in log_event.call_args_list]
         self.assertTrue(kinds)
-        self.assertEqual(set(kinds), {"shadow_decision"})
+        self.assertEqual(set(kinds), {"variant_shadow_decision"})
 
     @patch("agent.engine.state.log_event")
     def test_every_record_carries_its_own_variant_attribution(self, log_event):

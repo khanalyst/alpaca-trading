@@ -34,12 +34,21 @@ DEFAULT_STORE = Path(__file__).resolve().parent / "cache" / "findings.db"
 KINDS = ("observation", "recommendation", "decision")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _connect(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=10, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS variants (
             variant_id TEXT PRIMARY KEY, strategy_id TEXT,
@@ -48,16 +57,47 @@ def _connect(path: str | Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS variant_runs (
             run_id TEXT PRIMARY KEY, variant_id TEXT, corpus_from_ts REAL,
             corpus_to_ts REAL, corpus_cycles INTEGER, mode TEXT,
-            code_version TEXT, scorer_version TEXT, ts REAL);
+            code_version TEXT, scorer_version TEXT, ts REAL,
+            FOREIGN KEY (variant_id) REFERENCES variants(variant_id));
         CREATE TABLE IF NOT EXISTS variant_results (
             run_id TEXT, metric TEXT, value REAL, ci_low REAL,
-            ci_high REAL, n INTEGER);
+            ci_high REAL, n INTEGER,
+            FOREIGN KEY (run_id) REFERENCES variant_runs(run_id),
+            UNIQUE (run_id, metric));
         CREATE TABLE IF NOT EXISTS findings (
             finding_id INTEGER PRIMARY KEY AUTOINCREMENT,
             variant_id TEXT, ts REAL, author TEXT, kind TEXT, text TEXT,
-            run_id TEXT);
+            run_id TEXT,
+            FOREIGN KEY (variant_id) REFERENCES variants(variant_id),
+            FOREIGN KEY (run_id) REFERENCES variant_runs(run_id));
         CREATE INDEX IF NOT EXISTS findings_variant
             ON findings (variant_id, ts);
+        CREATE UNIQUE INDEX IF NOT EXISTS variant_result_metric
+            ON variant_results (run_id, metric);
+        CREATE TRIGGER IF NOT EXISTS findings_no_update
+            BEFORE UPDATE ON findings BEGIN
+                SELECT RAISE(ABORT, 'findings are append-only');
+            END;
+        CREATE TRIGGER IF NOT EXISTS findings_no_delete
+            BEFORE DELETE ON findings BEGIN
+                SELECT RAISE(ABORT, 'findings are append-only');
+            END;
+        CREATE TRIGGER IF NOT EXISTS variant_runs_no_update
+            BEFORE UPDATE ON variant_runs BEGIN
+                SELECT RAISE(ABORT, 'variant runs are immutable');
+            END;
+        CREATE TRIGGER IF NOT EXISTS variant_runs_no_delete
+            BEFORE DELETE ON variant_runs BEGIN
+                SELECT RAISE(ABORT, 'variant runs are immutable');
+            END;
+        CREATE TRIGGER IF NOT EXISTS variant_results_no_update
+            BEFORE UPDATE ON variant_results BEGIN
+                SELECT RAISE(ABORT, 'variant results are immutable');
+            END;
+        CREATE TRIGGER IF NOT EXISTS variant_results_no_delete
+            BEFORE DELETE ON variant_results BEGIN
+                SELECT RAISE(ABORT, 'variant results are immutable');
+            END;
     """)
     return conn
 
@@ -65,6 +105,19 @@ def _connect(path: str | Path) -> sqlite3.Connection:
 class FindingsStore:
     def __init__(self, path: str | Path = DEFAULT_STORE) -> None:
         self.path = Path(path)
+
+    @property
+    def backup_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.backup")
+
+    def backup(self, destination: str | Path | None = None) -> Path:
+        """Write a transactionally consistent SQLite backup."""
+        target = Path(destination) if destination else self.backup_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with _connect(self.path) as source, sqlite3.connect(
+                target, factory=_ClosingConnection) as copy:
+            source.backup(copy)
+        return target
 
     # ------------------------------------------------------------- variants
 
@@ -91,9 +144,15 @@ class FindingsStore:
                 if unchanged:
                     return
             conn.execute(
-                "INSERT OR REPLACE INTO variants (variant_id, strategy_id, "
+                "INSERT INTO variants (variant_id, strategy_id, "
                 "base_version, overrides_json, hypothesis, status, "
-                "created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
+                "created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(variant_id) DO UPDATE SET "
+                "strategy_id=excluded.strategy_id, "
+                "base_version=excluded.base_version, "
+                "overrides_json=excluded.overrides_json, "
+                "hypothesis=excluded.hypothesis, status=excluded.status, "
+                "updated_ts=excluded.updated_ts",
                 (variant.variant_id, variant.strategy_id,
                  variant.base_version, overrides,
                  variant.hypothesis, variant.status,
@@ -122,8 +181,9 @@ class FindingsStore:
     def record_run(self, run_id: str, variant_id: str, result,
                    scorer_version: str = "1", code_version: str = "") -> None:
         with _connect(self.path) as conn:
+            self._require_variant(conn, variant_id)
             conn.execute(
-                "INSERT OR REPLACE INTO variant_runs (run_id, variant_id, "
+                "INSERT INTO variant_runs (run_id, variant_id, "
                 "corpus_from_ts, corpus_to_ts, corpus_cycles, mode, "
                 "code_version, scorer_version, ts) VALUES (?,?,?,?,?,?,?,?,?)",
                 (run_id, variant_id, result.corpus_from_ts,
@@ -131,6 +191,49 @@ class FindingsStore:
                  code_version, scorer_version, time.time()))
 
     def record_metrics(self, run_id: str, scored: dict) -> None:
+        rows = self._metric_rows(run_id, scored)
+        with _connect(self.path) as conn:
+            if conn.execute(
+                    "SELECT 1 FROM variant_runs WHERE run_id=?",
+                    (run_id,)).fetchone() is None:
+                raise ValueError(f"unknown run_id {run_id!r}")
+            conn.executemany(
+                "INSERT INTO variant_results (run_id, metric, value, "
+                "ci_low, ci_high, n) VALUES (?,?,?,?,?,?)", rows)
+
+    def record_evaluation(
+            self, run_id: str, variant_id: str, result, scored: dict,
+            finding_text: str, kind: str = "decision",
+            author: str = "research", scorer_version: str = "1",
+            code_version: str = "") -> int:
+        """Atomically append one run, its metrics, and its conclusion."""
+        if kind not in KINDS:
+            raise ValueError(
+                f"kind must be one of {', '.join(KINDS)}, got {kind!r}")
+        rows = self._metric_rows(run_id, scored)
+        now = time.time()
+        with _connect(self.path) as conn:
+            self._require_variant(conn, variant_id)
+            conn.execute(
+                "INSERT INTO variant_runs (run_id, variant_id, "
+                "corpus_from_ts, corpus_to_ts, corpus_cycles, mode, "
+                "code_version, scorer_version, ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                (run_id, variant_id, result.corpus_from_ts,
+                 result.corpus_to_ts, result.cycles, result.mode,
+                 code_version, scorer_version, now))
+            conn.executemany(
+                "INSERT INTO variant_results (run_id, metric, value, "
+                "ci_low, ci_high, n) VALUES (?,?,?,?,?,?)", rows)
+            cursor = conn.execute(
+                "INSERT INTO findings (variant_id, ts, author, kind, text, "
+                "run_id) VALUES (?,?,?,?,?,?)",
+                (variant_id, now, author, kind, finding_text, run_id))
+            finding_id = int(cursor.lastrowid)
+        self.backup()
+        return finding_id
+
+    @staticmethod
+    def _metric_rows(run_id: str, scored: dict) -> list:
         rows = []
         for metric, value in scored.items():
             if metric in ("label", "verdict"):
@@ -143,12 +246,14 @@ class FindingsStore:
                          float(scored.get("ci_low") or 0.0),
                          float(scored.get("ci_high") or 0.0),
                          int(scored.get("n") or 0)))
-        with _connect(self.path) as conn:
-            conn.execute("DELETE FROM variant_results WHERE run_id=?",
-                         (run_id,))
-            conn.executemany(
-                "INSERT INTO variant_results (run_id, metric, value, "
-                "ci_low, ci_high, n) VALUES (?,?,?,?,?,?)", rows)
+        return rows
+
+    @staticmethod
+    def _require_variant(conn: sqlite3.Connection, variant_id: str) -> None:
+        if conn.execute(
+                "SELECT 1 FROM variants WHERE variant_id=?",
+                (variant_id,)).fetchone() is None:
+            raise ValueError(f"unknown variant_id {variant_id!r}")
 
     def runs_for(self, variant_id: str) -> list:
         with _connect(self.path) as conn:
@@ -171,12 +276,19 @@ class FindingsStore:
             raise ValueError(
                 f"kind must be one of {', '.join(KINDS)}, got {kind!r}")
         with _connect(self.path) as conn:
+            self._require_variant(conn, variant_id)
+            if run_id and conn.execute(
+                    "SELECT 1 FROM variant_runs WHERE run_id=?",
+                    (run_id,)).fetchone() is None:
+                raise ValueError(f"unknown run_id {run_id!r}")
             cursor = conn.execute(
                 "INSERT INTO findings (variant_id, ts, author, kind, text, "
                 "run_id) VALUES (?,?,?,?,?,?)",
                 (variant_id, ts if ts is not None else time.time(),
-                 author, kind, text, run_id))
-            return int(cursor.lastrowid)
+                 author, kind, text, run_id or None))
+            finding_id = int(cursor.lastrowid)
+        self.backup()
+        return finding_id
 
     def findings_for(self, variant_id: str) -> list:
         with _connect(self.path) as conn:

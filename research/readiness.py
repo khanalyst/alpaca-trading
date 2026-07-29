@@ -21,11 +21,14 @@ and fell short, and the shortfall is quoted.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import corpus
+from agent import state
+
+from . import corpus, replay
 
 
 PASS = "PASS"
@@ -75,6 +78,32 @@ def _has_kind(db, kind: str) -> bool:
     return _count(db, kind) > 0
 
 
+def _proposal_snapshot(db) -> tuple[int, float]:
+    try:
+        with sqlite3.connect(f"file:{Path(db)}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM events "
+                "WHERE kind='setup_proposed'").fetchone()
+        return int(row[0]), float(row[1])
+    except Exception:                                      # noqa: BLE001
+        return 0, 0.0
+
+
+def _latest_g2_result(db) -> dict | None:
+    try:
+        with sqlite3.connect(f"file:{Path(db)}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT payload FROM events "
+                "WHERE kind='research_gate_result' "
+                "ORDER BY ts DESC, rowid DESC LIMIT 1").fetchone()
+        payload = json.loads(row[0]) if row else None
+        if isinstance(payload, dict) and payload.get("gate") == "G2":
+            return payload
+    except Exception:                                      # noqa: BLE001
+        pass
+    return None
+
+
 def gate_g1() -> Gate:
     """Enrichment records without changing a decision.
 
@@ -88,9 +117,30 @@ def gate_g1() -> Gate:
         "python -m pytest tests/research/test_enrichment_isolation.py")
 
 
-def gate_g2(db, stats: dict) -> Gate:
+def gate_g2(db, stats: dict, cfg: dict) -> Gate:
     """The keystone. Nothing downstream means anything until this passes."""
-    proposals = _count(db, "setup_proposed")
+    proposals, max_proposal_ts = _proposal_snapshot(db)
+    result = _latest_g2_result(db)
+    result_is_current = bool(
+        result
+        and int(result.get("proposal_count", -1)) == proposals
+        and float(result.get("max_proposal_ts", -1)) == max_proposal_ts
+        and result.get("strategy_config_version")
+        == state.strategy_fingerprint(cfg)
+        and result.get("fidelity_code_version")
+        == replay.fidelity_code_fingerprint())
+    if result_is_current and result.get("status") == PASS:
+        return Gate(
+            "G2", "Replay reproduces the agent's own decisions", PASS,
+            f"{result.get('matched', 0)}/{result.get('recorded', 0)} "
+            "recorded proposals reproduced; result persisted in the journal",
+            "re-run after code/config changes or after collecting new proposals")
+    if result_is_current and result.get("status") == FAILED:
+        return Gate(
+            "G2", "Replay reproduces the agent's own decisions", FAILED,
+            f"latest persisted run reproduced {result.get('matched', 0)}/"
+            f"{result.get('recorded', 0)} recorded proposals",
+            "explain every mismatch, then rerun replay --check-fidelity")
     if proposals == 0:
         return Gate(
             "G2", "Replay reproduces the agent's own decisions", COLLECTING,
@@ -104,10 +154,13 @@ def gate_g2(db, stats: dict) -> Gate:
             "needed before a 99% ratio is meaningful (at this n a single "
             f"mismatch reads as {(proposals - 1) / proposals:.0%})",
             "keep the agent running", blocks=["B7.5"])
+    stale = (
+        " A prior G2 result is stale because the corpus has changed."
+        if result else "")
     return Gate(
         "G2", "Replay reproduces the agent's own decisions", READY,
         f"{proposals} recorded proposals: enough for the threshold to mean "
-        "something. It has not been run here.",
+        f"something. It has not passed on this exact corpus.{stale}",
         "python research.py replay --check-fidelity")
 
 
@@ -181,7 +234,7 @@ def gate_b75(db, cfg: dict, g2: Gate) -> Gate:
             "investigate before re-enabling; see research/plan/"
             "B7.5-record.md")
 
-    if g2.status not in (PASS, READY):
+    if g2.status != PASS:
         return Gate(
             "B7.5", "Passive entry validated on a live account", BLOCKED,
             "gate G2 must pass first, so a working replay can detect any "
@@ -214,7 +267,7 @@ def report(db: str | Path | None, cfg: dict) -> list:
              else {"cycles": 0, "matched_round_trips": 0,
                    "book_state_events": 0, "enrichment_events": 0,
                    "from_ts": 0.0, "to_ts": 0.0})
-    g2 = gate_g2(db, stats) if db and Path(db).exists() else Gate(
+    g2 = gate_g2(db, stats, cfg) if db and Path(db).exists() else Gate(
         "G2", "Replay reproduces the agent's own decisions", COLLECTING,
         "no journal yet", "run the agent", blocks=["B7.5"])
     return [

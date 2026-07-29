@@ -150,6 +150,13 @@ class ConfigValidationTests(unittest.TestCase):
                 ConfigError, "no live contract implementation"):
             validate_config(cfg)
 
+    def test_shadow_contract_without_analyst_schema_is_not_runnable(self):
+        cfg = valid_config()
+        cfg["strategy"]["id"] = "flush-fade"
+        cfg["strategy"]["version"] = "v1"
+        with self.assertRaisesRegex(ConfigError, "analyst prompt/schema"):
+            validate_config(cfg)
+
     def test_strategy_version_must_match_the_registered_spec(self):
         cfg = valid_config()
         cfg["strategy"]["version"] = "phase1-v99-unregistered"

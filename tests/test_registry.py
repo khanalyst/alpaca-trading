@@ -3,7 +3,7 @@ import unittest
 from agent import registry
 from agent.registry import (LIVE_MIN_TIER, REGISTRY, StrategySpec, TIERS,
                             UnknownStrategy, implemented_ids,
-                            live_eligible_ids, spec_for)
+                            live_eligible_ids, runnable_ids, spec_for)
 
 
 def spec(**overrides):
@@ -78,7 +78,17 @@ class RegisterContentTests(unittest.TestCase):
         momentum = spec_for("momentum")
         self.assertEqual(momentum.tier, "T0_REJECTED")
         self.assertTrue(momentum.implemented)
+        self.assertTrue(momentum.analyst_ready)
+        self.assertTrue(momentum.forward_model_ready)
         self.assertFalse(momentum.meets(LIVE_MIN_TIER))
+
+    def test_only_analyst_ready_contracts_are_runnable(self):
+        self.assertEqual(runnable_ids(), ("momentum",))
+        self.assertNotIn("flush-fade", runnable_ids())
+
+    def test_unvalidated_outcome_models_cannot_emit_expectancy(self):
+        self.assertFalse(spec_for("funding-carry").forward_model_ready)
+        self.assertFalse(spec_for("trend-multiday").forward_model_ready)
 
     def test_every_implemented_strategy_declares_shadow_parameters(self):
         # A strategy shadowed with whatever the live config happens to hold

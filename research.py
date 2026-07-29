@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """The research CLI: offline analysis of the corpus the agent already writes.
 
-Nothing here touches the trading path. Every command is read-only against
-``journal.db`` and, from batch 2 onward, a local price cache. No command
-places an order, calls an LLM, or writes to the runtime state.
+Nothing here touches the trading path. Commands read ``journal.db`` and, from
+batch 2 onward, a local price cache. A G2 check appends its pass/fail audit
+record to that journal; sweeps append results to ``findings.db`` and maintain
+a consistent backup. No command places an order, calls an LLM, or mutates
+trading state.
 
     python research.py corpus stats
     python research.py corpus stats --db runtime/demo/journal.db
@@ -12,7 +14,11 @@ places an order, calls an LLM, or writes to the runtime state.
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
 import sys
+import time
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -78,6 +84,84 @@ def _corpus_for(db: Path):
     return cycles, outputs
 
 
+def _proposal_snapshot(db: Path) -> tuple[int, float]:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM events "
+            "WHERE kind='setup_proposed'").fetchone()
+    return int(row[0]), float(row[1])
+
+
+def _record_g2_result(
+        db: Path, status: str, report: dict, result, cfg: dict) -> bool:
+    """Append a durable G2 audit record to the journal being checked."""
+    from agent import state
+
+    proposals, max_proposal_ts = _proposal_snapshot(db)
+    payload = json.dumps({
+        "gate": "G2",
+        "status": status,
+        "proposal_count": proposals,
+        "max_proposal_ts": max_proposal_ts,
+        "matched": report["matched"],
+        "recorded": report["recorded"],
+        "reproduction_rate": report["reproduction_rate"],
+        "replay_digest": result.digest(),
+        "variant_id": result.variant_id,
+        "replay_mode": result.mode,
+        "strategy_config_version": state.strategy_fingerprint(cfg),
+        "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+    }, sort_keys=True)
+    try:
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "INSERT INTO events (ts, kind, payload) VALUES (?,?,?)",
+                (time.time(), "research_gate_result", payload))
+    except sqlite3.Error as exc:
+        print(f"could not persist G2 result to {db}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def _require_g2(db: Path, cfg: dict, cycles: list, outputs: list) -> int:
+    """Refuse downstream research unless baseline replay fidelity is real."""
+    baseline = replay_mod.Replay(
+        cfg, variant_id="momentum.baseline", mode="recorded_llm").run(
+            cycles, outputs)
+    report = replay_mod.fidelity(baseline, db)
+    print(f"G2 fidelity: {report['reproduction_rate']:.4%} "
+          f"({report['matched']}/{report['recorded']})")
+    if report["vacuous"]:
+        _record_g2_result(db, "VACUOUS", report, baseline, cfg)
+        print("G2 VACUOUS: no recorded setup proposals exist. Downstream "
+              "research is blocked until fidelity can be measured.",
+              file=sys.stderr)
+        return 4
+    if report["recorded"] < readiness_mod.MIN_PROPOSALS_FOR_G2:
+        _record_g2_result(
+            db, "INSUFFICIENT_SAMPLE", report, baseline, cfg)
+        print(
+            f"G2 COLLECTING: {report['recorded']} recorded proposals; "
+            f"{readiness_mod.MIN_PROPOSALS_FOR_G2} are required before the "
+            "fidelity ratio can unlock downstream research.",
+            file=sys.stderr)
+        return 4
+    if not report["passes_g2"]:
+        _record_g2_result(db, "FAILED", report, baseline, cfg)
+        print("G2 FAILED: downstream research is blocked until every "
+              "mismatch is explained.", file=sys.stderr)
+        return 2
+    if not _record_g2_result(db, "PASS", report, baseline, cfg):
+        print("G2 passed but its audit record was not stored; downstream "
+              "research remains blocked.", file=sys.stderr)
+        return 5
+    return 0
+
+
+def _run_id(subject: str, result) -> str:
+    return f"{subject}:{result.digest()}:{uuid.uuid4().hex}"
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     db = Path(args.db) if args.db else default_db(args.mode)
     if not db.exists():
@@ -103,22 +187,39 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print(f"  {count:>6,}  {reason}")
 
     if args.check_fidelity:
+        if (args.variant not in ("live", "momentum.baseline")
+                or args.replay_mode != "recorded_llm"):
+            print("G2 must use momentum.baseline in recorded_llm mode.",
+                  file=sys.stderr)
+            return 2
         report = replay_mod.fidelity(result, db)
         print(f"\nG2 fidelity: {report['reproduction_rate']:.4%} "
               f"({report['matched']}/{report['recorded']} recorded "
               f"decisions reproduced)")
         if report["vacuous"]:
+            _record_g2_result(db, "VACUOUS", report, result, cfg)
             print("G2 VACUOUS: the corpus contains no recorded decisions, so "
                   "the replay\nreproduced 100% of nothing. That is not "
                   "evidence of fidelity. Run the agent\nuntil it has "
                   "proposed setups, then re-check before trusting any "
                   "number\ndownstream of this replay.", file=sys.stderr)
             return 4
+        if report["recorded"] < readiness_mod.MIN_PROPOSALS_FOR_G2:
+            _record_g2_result(
+                db, "INSUFFICIENT_SAMPLE", report, result, cfg)
+            print(
+                f"G2 COLLECTING: {report['recorded']} recorded proposals; "
+                f"{readiness_mod.MIN_PROPOSALS_FOR_G2} are required before "
+                "this ratio can pass the gate.", file=sys.stderr)
+            return 4
         if not report["passes_g2"]:
+            _record_g2_result(db, "FAILED", report, result, cfg)
             print("G2 FAILED. Every number downstream of this replay is "
                   "worthless until it is explained. This is a full stop, "
                   "not a debugging task to work around.", file=sys.stderr)
             return 2
+        if not _record_g2_result(db, "PASS", report, result, cfg):
+            return 5
     return 0
 
 
@@ -130,6 +231,9 @@ def cmd_three_arm(args: argparse.Namespace) -> int:
         return 1
     cfg = _load_config()
     cycles, outputs = _corpus_for(db)
+    gate = _require_g2(db, cfg, cycles, outputs)
+    if gate:
+        return gate
     cache = _price_cache(args)
     if cache is None:
         print("note: no --prices cache given, so no outcomes are resolved "
@@ -188,6 +292,9 @@ def cmd_funnel(args: argparse.Namespace) -> int:
         return 1
     cfg = _load_config()
     cycles, outputs = _corpus_for(db)
+    gate = _require_g2(db, cfg, cycles, outputs)
+    if gate:
+        return gate
     result = replay_mod.Replay(
         cfg, mode=args.replay_mode, price_cache=_price_cache(args)).run(
             cycles, outputs)
@@ -233,6 +340,14 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     cfg = _load_config()
     cache = _price_cache(args)
     cycles, outputs = _corpus_for(db)
+    gate = _require_g2(db, cfg, cycles, outputs)
+    if gate:
+        return gate
+
+    from agent import variants as variant_mod
+    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    store = findings_mod.FindingsStore(
+        args.store or findings_mod.DEFAULT_STORE)
 
     if spec.is_conditioning():
         axis = spec.condition_axis
@@ -281,13 +396,35 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         print("\nOnly the corrected p is quoted. Every bucket is reported, "
               "including the\nempty ones: a programme that records only "
               "positives records only noise.")
+        base_variant = registry.get(spec.base) or variant_mod.baseline(
+            "momentum", "phase1-v3")
+        subject = variant_mod.Variant(
+            variant_id=f"{base_variant.strategy_id}.condition.{spec.name}",
+            strategy_id=base_variant.strategy_id,
+            base_version=base_variant.base_version,
+            overrides={}, hypothesis=spec.hypothesis, status="candidate")
+        store.register(subject)
+        pooled = score.score_returns(
+            [d.outcome["r_multiple"] for d in result.executed()
+             if d.outcome and d.outcome.get("r_multiple") is not None],
+            label=subject.variant_id)
+        store.record_evaluation(
+            _run_id(subject.variant_id, result), subject.variant_id,
+            result, pooled,
+            json.dumps({
+                "sweep": spec.name, "axis": axis.variable,
+                "verdict": "CONDITIONING_RESULT",
+                "buckets": corrected,
+            }, sort_keys=True, default=str),
+            kind="observation")
+        print(f"\npersisted conditioning evidence to {store.path}")
         return 0
 
-    from agent import variants as variant_mod
-    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
     print()
     settings = []
+    evaluations = []
     for variant in sweep.expand(spec, registry):
+        store.register(variant)
         variant_cfg = variant_mod.apply(variant, cfg)
         result = replay_mod.Replay(
             variant_cfg, variant_id=variant.variant_id,
@@ -296,6 +433,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         settings.append((variant.variant_id, executed))
         returns = [d.outcome["r_multiple"] for d in executed if d.outcome]
         row = score.score_returns(returns, label=variant.variant_id)
+        evaluations.append((variant, result, row))
         print(f"  {variant.variant_id:<40} n={row['n']:<5} "
               f"expectancy {row['expectancy_r']:+.4f}R  {row['verdict']}")
 
@@ -315,6 +453,13 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         print("\nThe question is open, not answered in the negative. That "
               "distinction is\nthe one most likely to erode: see "
               "research/protocol.md.")
+    for variant, result, row in evaluations:
+        store.record_evaluation(
+            _run_id(variant.variant_id, result), variant.variant_id,
+            result, row,
+            f"{spec.name}: {verdict.verdict} — "
+            f"{verdict.governing_criterion}. {verdict.detail}")
+    print(f"\npersisted {len(evaluations)} variant result(s) to {store.path}")
     return 0
 
 
@@ -332,8 +477,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     written = findings_mod.write_scorecards(
         store, args.out or (REPO / "findings"))
+    backup = store.backup()
     print(f"regenerated {len(written)} files under "
           f"{args.out or (REPO / 'findings')}")
+    print(f"backed up findings store to {backup}")
     for path in written:
         print(f"  {path}")
     return 0
@@ -478,6 +625,9 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_parser.add_argument("--mode", default="demo",
                               choices=["demo", "live"])
     sweep_parser.add_argument("--prices", default=None)
+    sweep_parser.add_argument(
+        "--store", default=None,
+        help="findings.db path; defaults to research/cache/findings.db")
     sweep_parser.add_argument("--replay-mode", default="recorded_llm",
                               choices=replay_mod.MODES)
     sweep_parser.add_argument(

@@ -166,13 +166,11 @@ def benchmark_check(rows: list[dict]) -> dict:
 
 
 def apply_forward_evidence(row: dict, forward: dict) -> None:
-    """Attach live/shadow results and decide whether T4 is earned.
+    """Attach live/shadow results without promoting an exploratory tier.
 
-    T4_CONFIRMED is the only tier offline data cannot grant, because it is
-    the only one that asks whether the effect survived contact with the
-    future. Two conditions, both necessary: the forward result agrees in
-    sign with the backtest, and there are at least as many forward trades as
-    the detectability gate said the effect size requires.
+    Forward agreement is useful evidence, but this tournament is still the
+    recomputed-OHLCV path. T3/T4 promotion belongs to an authoritative,
+    G2-valid recorded replay with a persisted decision, not to this report.
 
     A sign DISAGREEMENT is recorded loudly even when the counts are small.
     It is the earliest available warning that a backtest was fitted, and it
@@ -214,12 +212,10 @@ def apply_forward_evidence(row: dict, forward: dict) -> None:
         row["forward"]["warning"] = (
             "forward and backtest disagree in sign; treat the backtest as "
             "unconfirmed regardless of how clean it looked")
-    if (row["measured_tier"] == "T3_VALIDATED" and agrees
-            and needed and observed >= needed):
-        row["measured_tier"] = "T4_CONFIRMED"
-        row["tier_reason"] = (
-            f"forward evidence agrees in sign over {observed} trades "
-            f"against the {needed} required")
+    if agrees and needed and observed >= needed:
+        row["forward"]["next_step"] = (
+            "sample target reached; run the authoritative recorded-replay "
+            "confirmation before changing a tier")
 
 
 def recommendation(row: dict) -> str:
@@ -232,7 +228,7 @@ def recommendation(row: dict) -> str:
     if tier == "T1_HYPOTHESIS":
         return "HOLD - keep collecting data; nothing testable has passed yet"
     if tier == "T2_CANDIDATE":
-        return "HOLD - promising but not clear of the placebo/cost gates"
+        return "HOLD - exploratory candidate; authoritative recorded replay is required"
     if tier == "T3_VALIDATED":
         return "PROMOTE - eligible for demo; forward evidence required for T4"
     if tier == "T4_CONFIRMED":
@@ -417,10 +413,10 @@ def write_report(path: Path, payload: dict) -> None:
         "No gate here tests a t-statistic. On this data a placebo reached "
         "t = 2.60 on deliberately destroyed information, so `t > 2` is not "
         "evidence - the placebo ratio is.", "",
-        "A tier is a claim about evidence, not about promise. `T3_VALIDATED` "
-        "means every offline gate passed; `T4_CONFIRMED` additionally "
-        "requires forward trades at the sample size the detectability gate "
-        "computed, agreeing in sign with the backtest.", "",
+        "A tier is a claim about evidence, not about promise. This OHLCV "
+        "tournament is capped at `T2_CANDIDATE`; `T3_VALIDATED` and "
+        "`T4_CONFIRMED` require the authoritative recorded-replay path and "
+        "persisted confirmation evidence.", "",
     ]
     path.write_text("\n".join(lines) + "\n")
 

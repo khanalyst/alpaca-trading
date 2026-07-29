@@ -187,8 +187,18 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             "tested; a hypothesis is never decided on one parameter value",
             {"settings": len(scored)})
 
-    best_id, best_score, best_decisions = max(
-        scored, key=lambda row: row[1]["expectancy_r"])
+    # Select on the fit window only. Selecting on the full corpus and then
+    # calling the last 30% "confirmation" lets that confirmation window pick
+    # its own winner.
+    split_settings = []
+    for vid, full_score, decisions in scored:
+        fit, confirm = split_by_time(decisions)
+        split_settings.append((
+            vid, full_score, decisions,
+            score_returns(_returns(fit), label=f"{vid}:fit"),
+            fit, confirm))
+    best_id, best_score, best_decisions, best_fit_score, best_fit, best_confirm = max(
+        split_settings, key=lambda row: row[3]["expectancy_r"])
 
     if best_score["n"] < MIN_ROUND_TRIPS:
         return Verdict(
@@ -200,8 +210,20 @@ def evaluate_axis(settings: list, baseline_decisions: list,
              "mde_r": best_score["mde_r"]})
 
     # Rejection: every setting's upper bound below the baseline's point
-    # estimate. The whole axis has to be bad, not just the one that was tried.
-    if all(row[1]["ci_high"] < baseline["expectancy_r"] for row in scored):
+    # estimate, with an adequate sample for every pre-registered setting. A
+    # nearly empty grid point is an open question, not evidence against the
+    # whole axis.
+    all_underperform = all(
+        row[1]["ci_high"] < baseline["expectancy_r"] for row in scored)
+    if all_underperform and any(
+            row[1]["n"] < MIN_ROUND_TRIPS for row in scored):
+        return Verdict(
+            INSUFFICIENT_SAMPLE, "axis settings below the rejection floor",
+            "every setting currently underperforms, but at least one has "
+            f"fewer than {MIN_ROUND_TRIPS} resolved round trips; the whole "
+            "axis cannot be rejected on an under-observed setting",
+            {"settings": {vid: row["n"] for vid, row, _ in scored}})
+    if all_underperform:
         return Verdict(
             REJECT, "whole axis underperforms the baseline",
             f"all {len(scored)} settings have an expectancy interval whose "
@@ -210,13 +232,16 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             {"settings": len(scored),
              "baseline_expectancy_r": baseline["expectancy_r"]})
 
-    if best_score["ci_low"] <= baseline["expectancy_r"]:
+    baseline_fit, baseline_confirm = split_by_time(baseline_decisions)
+    baseline_fit_score = score_returns(
+        _returns(baseline_fit), label="baseline:fit")
+    if best_fit_score["ci_low"] <= baseline_fit_score["expectancy_r"]:
         return Verdict(
-            CONTINUE, "delta is inside the interval",
-            f"best setting {best_id} has a lower bound of "
-            f"{best_score['ci_low']:+.4f}R against a baseline point estimate "
-            f"of {baseline['expectancy_r']:+.4f}R",
-            {"best": best_id, "ci_low": best_score["ci_low"]})
+            CONTINUE, "fit-window delta is inside the interval",
+            f"fit-selected setting {best_id} has a fit lower bound of "
+            f"{best_fit_score['ci_low']:+.4f}R against the fit baseline point "
+            f"estimate of {baseline_fit_score['expectancy_r']:+.4f}R",
+            {"best": best_id, "fit_ci_low": best_fit_score["ci_low"]})
 
     if best_score["max_drawdown_r"] > baseline["max_drawdown_r"]:
         return Verdict(
@@ -236,6 +261,17 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             f"{split['confirm_regime']['median_vol_ratio']}",
             {"best": best_id, "split": split})
 
+    confirm_difference = bootstrap_difference(
+        _returns(best_confirm), _returns(baseline_confirm))
+    if confirm_difference.n == 0 or confirm_difference.low <= 0:
+        return Verdict(
+            CONTINUE, "confirmation delta does not clear zero",
+            f"fit-selected setting {best_id} has confirmation delta vs "
+            f"baseline {confirm_difference}; promotion requires the entire "
+            "confirmation interval to be positive",
+            {"best": best_id, "split": split,
+             "confirm_delta": str(confirm_difference)})
+
     difference = bootstrap_difference(
         _returns(best_decisions), _returns(baseline_decisions))
     return Verdict(
@@ -245,6 +281,7 @@ def evaluate_axis(settings: list, baseline_decisions: list,
         f"[{best_score['ci_low']:+.4f},{best_score['ci_high']:+.4f}], "
         f"delta vs baseline {difference}, survived the out-of-sample split",
         {"best": best_id, "n": best_score["n"], "split": split,
+         "selection_window": "fit", "confirm_delta": str(confirm_difference),
          "regime_comparable": split["fit_regime"].get("comparable")})
 
 

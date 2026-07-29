@@ -91,8 +91,8 @@ class ShadowRecordingTests(unittest.TestCase):
         snapshot = {"BTC/USDT:USDT": symbol_snapshot()}
         self.engine._record_shadow_decisions(snapshot)
         kinds = [kind for kind, _, _ in self._events(log_event)]
-        self.assertIn("shadow_decision", kinds)
-        self.assertIn("shadow_summary", kinds)
+        self.assertIn("strategy_shadow_decision", kinds)
+        self.assertIn("strategy_shadow_summary", kinds)
 
     @patch("agent.engine.state.log_event")
     def test_records_carry_their_own_strategy_attribution(self, log_event):
@@ -120,7 +120,8 @@ class ShadowRecordingTests(unittest.TestCase):
                                 mom_1h_pct=0.0, mom_15m_pct=0.0)
         self.engine._record_shadow_decisions({"BTC/USDT:USDT": quiet})
         events = self._events(log_event)
-        summaries = [(k, p) for k, p, _ in events if k == "shadow_summary"]
+        summaries = [(k, p) for k, p, _ in events
+                     if k == "strategy_shadow_summary"]
         # One per implemented contract, always - the denominator is what
         # turns a count of firings into a rate.
         self.assertEqual(len(summaries),
@@ -136,7 +137,7 @@ class ShadowRecordingTests(unittest.TestCase):
         }
         self.engine._record_shadow_decisions(snapshot)
         summaries = [p for kind, p, _ in self._events(log_event)
-                     if kind == "shadow_summary"]
+                     if kind == "strategy_shadow_summary"]
         self.assertEqual(summaries[0]["instruments_scanned"], 1)
 
     @patch("agent.engine.state.log_event")
@@ -145,7 +146,8 @@ class ShadowRecordingTests(unittest.TestCase):
             {"BTC/USDT:USDT": symbol_snapshot()})
         active = [kwargs["strategy_id"]
                   for kind, payload, kwargs in self._events(log_event)
-                  if kind == "shadow_summary" and payload["is_active"]]
+                  if (kind == "strategy_shadow_summary"
+                      and payload["is_active"])]
         self.assertEqual(active, ["momentum"])
 
     @patch("agent.engine.log")
@@ -170,7 +172,7 @@ class ShadowRecordingTests(unittest.TestCase):
             swing_low_pct=float("nan"), price=float("inf"))}
         self.engine._record_shadow_decisions(snapshot)
         decisions = [p for kind, p, _ in self._events(log_event)
-                     if kind == "shadow_decision"]
+                     if kind == "strategy_shadow_decision"]
         self.assertTrue(decisions)
         self.assertIsNone(decisions[0]["swing_low_pct"])
         self.assertIsNone(decisions[0]["price"])
@@ -180,7 +182,7 @@ class ShadowRecordingTests(unittest.TestCase):
         snapshot = {"BTC/USDT:USDT": "not a dict"}
         self.engine._record_shadow_decisions(snapshot)
         summaries = [p for kind, p, _ in self._events(log_event)
-                     if kind == "shadow_summary"]
+                     if kind == "strategy_shadow_summary"]
         self.assertTrue(summaries)
         for payload in summaries:
             self.assertEqual(payload["instruments_scanned"], 0)

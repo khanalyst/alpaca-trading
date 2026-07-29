@@ -57,7 +57,8 @@ TRADE_FIELDS = (
     "invalidation_anchor", "run_id", "cycle_id", "prompt_version",
     "config_version", "code_version", "equity_basis_id",
     "entry_equity_usd", "close_trigger", "close_evidence",
-    "runtime_mode", "account_fingerprint",
+    "runtime_mode", "account_fingerprint", "variant_id",
+    "strategy_config_version",
 )
 
 
@@ -313,10 +314,13 @@ def print_per_strategy(trades: list[dict]) -> None:
             trade["prompt_version"],
             trade["config_version"],
             trade["code_version"],
+            trade["variant_id"],
+            trade["strategy_config_version"],
         )].append(trade)
     for (
             runtime_mode, account_fingerprint, strategy_id, version,
-            prompt_version, config_version, code_version
+            prompt_version, config_version, code_version, variant_id,
+            strategy_config_version
     ), rows in sorted(grouped.items()):
         pnl = sum(row["net_pnl_usd"] for row in rows)
         wins = [row for row in rows if row["net_pnl_usd"] > 0]
@@ -336,7 +340,8 @@ def print_per_strategy(trades: list[dict]) -> None:
         print(f"\n  {strategy_id} / {version}")
         print(f"    runtime {runtime_mode} / {account_fingerprint}")
         print(f"    variant prompt={prompt_version} config={config_version} "
-              f"code={code_version}")
+              f"code={code_version} parameter={variant_id} "
+              f"strategy-config={strategy_config_version}")
         print(f"    trades {len(rows)}   win rate "
               f"{len(wins) / len(rows) * 100:.1f}%   "
               f"net realized {pnl:+,.2f} USDT")
@@ -485,23 +490,43 @@ def json_report(db: sqlite3.Connection) -> dict:
     trades, diagnostics = match_round_trips(events)
     r_values = [t["r_multiple"] for t in trades
                 if t.get("r_multiple") is not None]
-    per_strategy: dict = {}
+    grouped: dict = {}
     for trade in trades:
-        per_strategy.setdefault(
-            trade.get("strategy_id") or "unknown", []).append(trade)
+        provenance = (
+            trade["runtime_mode"], trade["account_fingerprint"],
+            trade["strategy_id"], trade["strategy_version"],
+            trade["prompt_version"], trade["config_version"],
+            trade["code_version"], trade["variant_id"],
+            trade["strategy_config_version"],
+        )
+        grouped.setdefault(provenance, []).append(trade)
+
+    groups = []
+    fields = (
+        "runtime_mode", "account_fingerprint", "strategy_id",
+        "strategy_version", "prompt_version", "config_version",
+        "code_version", "variant_id", "strategy_config_version",
+    )
+    for provenance, rows in sorted(grouped.items()):
+        identity = dict(zip(fields, provenance))
+        label = "/".join(str(identity[name]) for name in fields)
+        groups.append({
+            "provenance": identity,
+            "score": score_returns(
+                [t["r_multiple"] for t in rows
+                 if t.get("r_multiple") is not None], label=label),
+        })
 
     return {
-        "schema": 1,
+        "schema": 2,
         "round_trips": len(trades),
         "diagnostics": diagnostics,
         "overall": score_returns(r_values, label="all"),
-        "per_strategy": {
-            name: score_returns(
-                [t["r_multiple"] for t in rows
-                 if t.get("r_multiple") is not None], label=name)
-            for name, rows in sorted(per_strategy.items())
+        "groups": groups,
+        "transfers": {
+            "count": len(transfers),
+            "net_usdt": sum(net for _, net in transfers),
         },
-        "transfers": len(transfers),
     }
 
 

@@ -40,8 +40,10 @@ already recorded.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from agent import strategy
 from agent.risk import RiskEngine
@@ -51,6 +53,23 @@ from .outcomes import CostModel, SetupPlan, resolve_from_cache
 
 
 MODES = ("deterministic", "recorded_llm", "deterministic_vetoed")
+
+
+def fidelity_code_fingerprint() -> str:
+    """Hash every source file that can change a G2 replay conclusion."""
+    root = Path(__file__).resolve().parents[1]
+    files = list((root / "agent").rglob("*.py"))
+    files += [root / "main.py", root / "research.py",
+              root / "research" / "corpus.py",
+              root / "research" / "outcomes.py",
+              root / "research" / "replay.py"]
+    digest = hashlib.sha256()
+    for path in sorted(set(files)):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
 
 
 @dataclass
@@ -136,9 +155,10 @@ def _anchor_for(setup_type: str) -> str:
 
 def deterministic_proposals(row: dict, cfg: dict) -> list:
     """Every setup the contract declares valid, taken at face value."""
-    evidence = row.get("setup_evidence")
-    if not isinstance(evidence, dict):
-        evidence = strategy.setup_evidence(row, cfg)
+    # Recorded snapshots contain evidence computed with the configuration
+    # that was live at the time. Reusing it for a candidate whose parameters
+    # change the contract would silently replay the baseline.
+    evidence = strategy.setup_evidence(row, cfg)
     direction = trend_majority(row)
     if direction is None:
         return []
@@ -252,7 +272,8 @@ class Replay:
                              for p in positions}
 
             for symbol in cycle.symbols():
-                row = cycle.snapshot[symbol]
+                row = dict(cycle.snapshot[symbol])
+                row["setup_evidence"] = strategy.setup_evidence(row, self.cfg)
                 signal_ts = row.get("signal_ts")
                 proposals = self._proposals(cycle, row, symbol, recorded)
                 if not proposals:
@@ -366,7 +387,8 @@ class Replay:
                         contract_passed=True,
                         enrichment=_enrichment_of(row, cycle, symbol))
                     record.outcome = self._resolve(
-                        symbol, row, sized, decision, max_hold)
+                        symbol, row, sized, decision, max_hold,
+                        decision_ts=now)
                     result.decisions.append(record)
 
                     # "side", not "direction": vet_open validates held
@@ -416,7 +438,8 @@ class Replay:
         return keep, sum(abs(float(p.get("notional") or 0)) for p in keep)
 
     def _resolve(self, symbol: str, row: dict, sized: dict,
-                 decision: dict, max_hold_hours: float) -> dict | None:
+                 decision: dict, max_hold_hours: float,
+                 decision_ts: float) -> dict | None:
         if self.price_cache is None:
             return None
         signal_ts = row.get("signal_ts")
@@ -428,6 +451,7 @@ class Replay:
             stop_pct=float(sized.get("sl_pct") or 0),
             take_pct=float(sized.get("tp_pct") or 0),
             signal_ts=int(signal_ts),
+            entry_ts=int(float(decision_ts) * 1000),
             signal_timeframe=str(self.cfg["strategy"]["signal_timeframe"]),
             spread_pct=float(row.get("spread_pct") or 0),
             funding_rate_pct=float(row.get("funding_rate_pct") or 0),

@@ -89,6 +89,24 @@ class DeterminismTests(unittest.TestCase):
         self.assertEqual(first.digest(), second.digest())
         self.assertEqual(len(first.decisions), len(second.decisions))
 
+    def test_variant_recomputes_evidence_instead_of_using_snapshot_cache(self):
+        candidate_cfg = valid_config()
+        candidate_cfg["strategy"]["breakout_discriminator"] = (
+            "volatility_regime")
+        observed = cycle(0)
+        observed.snapshot["BTC/USDT:USDT"]["setup_evidence"] = {
+            "trend_continuation": {"long": False}}
+
+        with patch("agent.strategy.setup_evidence",
+                   wraps=strategy.setup_evidence) as evidence:
+            replay.Replay(candidate_cfg, mode="deterministic").run(
+                [observed], [])
+
+        self.assertTrue(evidence.called)
+        self.assertIn(
+            candidate_cfg,
+            [call.args[1] for call in evidence.call_args_list])
+
     def test_the_deterministic_arm_is_also_stable(self):
         cycles = [cycle(i) for i in range(5)]
 

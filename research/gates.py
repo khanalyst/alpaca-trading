@@ -438,10 +438,14 @@ def tier_from_gates(results: list[GateResult]) -> tuple[str, str]:
             f"{needed} its own effect size requires; collect more before "
             f"calling this validated")
 
-    # T4 requires forward evidence, which offline data cannot supply. The
-    # tournament promotes to T4 only once live/shadow trades agree in sign at
-    # the required sample size.
-    return "T3_VALIDATED", "cleared every offline gate"
+    # This battery runs on reconstructed/downloaded market data. It can reject
+    # a strategy or produce a candidate, but it cannot validate the exact
+    # recorded decision system: that requires G2-clean journal replay and an
+    # explicitly persisted confirmation result. Exploratory evidence must
+    # never authorize capital merely because every exploratory gate agrees.
+    return "T2_CANDIDATE", (
+        "cleared every exploratory offline gate; authoritative recorded "
+        "replay confirmation is still required for T3_VALIDATED")
 
 
 def run_all(spec, frames, membership, contract,

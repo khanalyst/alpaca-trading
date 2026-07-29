@@ -16,7 +16,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent import state
 from research import readiness
+from research import replay
 from tests.helpers import valid_config
 
 
@@ -48,6 +50,17 @@ class ReadinessFixture(unittest.TestCase):
         gates, _ = readiness.report(
             db if db is not None else self.db, self.cfg)
         return {g.name: g for g in gates}
+
+    def g2_result(self, status="PASS"):
+        return {
+            "gate": "G2", "status": status,
+            "proposal_count": readiness.MIN_PROPOSALS_FOR_G2,
+            "max_proposal_ts": float(readiness.MIN_PROPOSALS_FOR_G2),
+            "matched": readiness.MIN_PROPOSALS_FOR_G2,
+            "recorded": readiness.MIN_PROPOSALS_FOR_G2,
+            "strategy_config_version": state.strategy_fingerprint(self.cfg),
+            "fidelity_code_version": replay.fidelity_code_fingerprint(),
+        }
 
 
 class NoJournalTests(ReadinessFixture):
@@ -92,6 +105,34 @@ class G2Tests(ReadinessFixture):
         self.assertEqual(gate.status, readiness.READY)
         self.assertIn("check-fidelity", gate.next_step)
 
+    def test_a_persisted_pass_is_a_pass_for_the_exact_corpus(self):
+        for i in range(readiness.MIN_PROPOSALS_FOR_G2):
+            self.event("setup_proposed", ts=float(i + 1), cycle_id=f"c{i}")
+        self.event("research_gate_result", self.g2_result(), ts=101.0)
+
+        self.assertEqual(self.gates()["G2"].status, readiness.PASS)
+
+    def test_a_pass_becomes_stale_when_new_proposals_arrive(self):
+        for i in range(readiness.MIN_PROPOSALS_FOR_G2):
+            self.event("setup_proposed", ts=float(i + 1), cycle_id=f"c{i}")
+        self.event("research_gate_result", self.g2_result(), ts=101.0)
+        self.event("setup_proposed", ts=102.0, cycle_id="new")
+
+        gate = self.gates()["G2"]
+        self.assertEqual(gate.status, readiness.READY)
+        self.assertIn("stale", gate.detail)
+
+    def test_a_pass_becomes_stale_when_strategy_config_changes(self):
+        for i in range(readiness.MIN_PROPOSALS_FOR_G2):
+            self.event("setup_proposed", ts=float(i + 1), cycle_id=f"c{i}")
+        self.event("research_gate_result", self.g2_result(), ts=101.0)
+        self.cfg["risk"]["risk_per_trade_pct"] = 0.4
+
+        gate = self.gates()["G2"]
+
+        self.assertEqual(gate.status, readiness.READY)
+        self.assertIn("stale", gate.detail)
+
     def test_g2_blocks_b75_until_it_is_reachable(self):
         for i in range(5):
             self.event("setup_proposed", cycle_id=f"c{i}")
@@ -105,7 +146,9 @@ class G2Tests(ReadinessFixture):
 class B75Tests(ReadinessFixture):
     def _reachable_g2(self):
         for i in range(readiness.MIN_PROPOSALS_FOR_G2):
-            self.event("setup_proposed", cycle_id=f"c{i}")
+            self.event("setup_proposed", ts=float(i + 1), cycle_id=f"c{i}")
+        self.event("research_gate_result", self.g2_result(),
+                   ts=float(readiness.MIN_PROPOSALS_FOR_G2 + 1))
 
     def test_a_resting_order_fails_regardless_of_everything_else(self):
         """The one failure mode the design forbids."""
@@ -131,8 +174,8 @@ class B75Tests(ReadinessFixture):
         self.assertIn("maker_first_enabled", gate.next_step)
 
     def test_enabled_with_too_few_attempts_is_collecting(self):
-        self._reachable_g2()
         self.cfg["execution"]["maker_first_enabled"] = True
+        self._reachable_g2()
         for i in range(3):
             self.event("maker_attempt",
                        {"resting": False, "filled_contracts": 1},
@@ -144,8 +187,8 @@ class B75Tests(ReadinessFixture):
         self.assertIn(f"of {readiness.MIN_MAKER_ATTEMPTS}", gate.detail)
 
     def test_enough_clean_attempts_passes(self):
-        self._reachable_g2()
         self.cfg["execution"]["maker_first_enabled"] = True
+        self._reachable_g2()
         for i in range(readiness.MIN_MAKER_ATTEMPTS):
             self.event("maker_attempt",
                        {"resting": False, "filled_contracts": 1},

@@ -65,7 +65,7 @@ never treated as USDT capital.
 | `main.py` | CLI: run, pause, resume, kill, flatten, status, check |
 | `agent/engine.py` | The loop: circuit breakers, transfer detection, execution |
 | `agent/brain.py` | LLM providers, trader persona prompt, JSON decision parsing |
-| `agent/registry.py` | The strategy register: every strategy's mechanism, falsification test and confidence tier. Policy reads it; research writes the tiers |
+| `agent/registry.py` | The strategy register: every strategy's mechanism, falsification test and confidence tier. Policy reads it; tier changes are deliberate reviewed code changes backed by persisted research evidence |
 | `agent/contracts/` | One evidence contract per strategy. `strategy.id` selects which one runs |
 | `agent/strategy.py` | Contract dispatch, deterministic stop/target derivation, setup memory |
 | `agent/risk.py` | Deterministic sizing and hard caps |
@@ -416,20 +416,24 @@ Verify the share on your own journal with `python research.py cadence`.
 `strategy.id` selects which registered strategy runs. `agent/registry.py`
 holds one entry per strategy, and each entry must state a **mechanism** (who
 loses the money and why they cannot stop) and a **falsification** (what
-observation would kill it), plus a **confidence tier** set by research:
+observation would kill it), plus a **confidence tier** backed by persisted
+research and changed through review:
 
 | Tier | Meaning |
 | --- | --- |
 | `T0_REJECTED` | Failed a gate, or its placebo scored close to it |
 | `T1_HYPOTHESIS` | Mechanism stated, nothing tested yet |
-| `T2_CANDIDATE` | Beat the nulls and stayed positive out-of-sample |
-| `T3_VALIDATED` | Also survived the placebo and realistic costs |
+| `T2_CANDIDATE` | Cleared exploratory gates, or has promising authoritative evidence that is not yet sufficient for capital |
+| `T3_VALIDATED` | Cleared an authoritative, G2-valid recorded-replay confirmation with persisted evidence |
 | `T4_CONFIRMED` | Forward evidence agrees, at the required sample size |
 
-Demo runs any implemented strategy — paper trading is an operations
-rehearsal and running a known-negative strategy there is legitimate. **Live
-requires `T3_VALIDATED` or better**, enforced in `agent/config.py`. The
-shipped `momentum`/`phase1-v3` is `T0_REJECTED` on the evidence in
+Demo runs only a strategy whose deterministic evidence contract and analyst
+prompt/schema are both implemented. Other implemented contracts remain
+**shadow-only** until the analyst can emit their setup types correctly.
+Paper trading a known-negative but fully runnable strategy is still a useful
+operations rehearsal. **Live requires `T3_VALIDATED` or better**, enforced in
+`agent/config.py`. The shipped `momentum`/`phase1-v3` is the only analyst-ready
+strategy and is `T0_REJECTED` on the evidence in
 `research/results/edge-audit-2024-2026/`, so switching `mode: live` with it
 active fails validation and prints the reason. That is intended behaviour,
 not a bug to work around.
@@ -473,7 +477,7 @@ The evaluator is constructed from configuration alone — it receives no
 `Exchange`, no state handle, no journal writer — and a test walks its
 attribute graph to assert no exchange is reachable from it. It runs after
 trading decisions are committed, inside `try/except`, and writes only
-`shadow_decision` events.
+`variant_shadow_decision` events.
 
 **Passive entry (`execution.maker_first_*`)**
 
@@ -486,13 +490,16 @@ trading decisions are committed, inside `try/except`, and writes only
 python main.py strategies --verbose   # the register, tiers and mechanisms
 ```
 
-**Shadow evaluation.** Every cycle, the agent evaluates *every* registered
-contract against the same snapshot and journals what each one would have
-done — not only the strategy holding capital. This costs no extra LLM call
-and places no orders. Without it, forward-testing five strategies would take
-five times as long as forward-testing one; with it they all accumulate
-out-of-sample evidence from the same market data, starting the day they are
-registered.
+**Shadow evaluation.** Every cycle, the agent evaluates every implemented
+deterministic contract against the same snapshot and journals what each one
+would have done — not only the strategy holding capital. Strategy shadows use
+`strategy_shadow_decision` / `strategy_shadow_summary`; parameter variants use
+the separate `variant_shadow_decision` schema, so the two populations cannot
+be pooled accidentally. Every implemented contract can collect raw firing
+evidence, but forward expectancy is emitted only when its registry entry has
+a validated outcome model; currently that is momentum only. This prevents a
+carry or multi-day mechanism from inheriting momentum's exit horizon and cost
+model. Shadowing costs no extra LLM call and places no orders.
 
 The active strategy is shadowed too, which is the part that is easy to miss:
 comparing what the contract fired on against what the account actually opened
@@ -623,13 +630,14 @@ Two evidence paths live in this repository and **they are not equals**. The
 distinction decides what is allowed to put capital at risk, so it is worth
 stating before the commands.
 
-**Journal replay is authoritative.** Every cycle the agent journals an
-`llm_input` event holding the exact per-symbol snapshot and portfolio state
-the model received — which is precisely what `strategy.setup_evidence`,
-`strategy.build_setup_plan` and `RiskEngine.vet_open` consume, all three
-being pure functions of `(snapshot, cfg)`. So what any candidate
-configuration *would* have decided is computable exactly, offline, with no
-exchange risk and no LLM spend.
+**Journal replay is the authoritative path, after G2 passes.** Every cycle the
+agent journals the per-symbol snapshot and portfolio state the model received.
+Replay recomputes setup evidence under each candidate configuration instead
+of reusing cached baseline evidence, and outcome resolution excludes bars that
+precede the recorded decision/entry time. It still has explicit state-model
+limits (including loss-cooldown feedback and some universe-selection effects),
+which is why fidelity is measured rather than assumed. Until G2 passes on the
+exact current corpus, replay output is diagnostic, not promotion evidence.
 
 **The OHLCV backtest is exploratory.** It recomputes indicators from
 downloaded candles, and some snapshot fields (`range_pos_pct`,
@@ -655,9 +663,12 @@ python research.py sweep research/sweeps/regime_conditioning.yaml
 python research.py report                  # regenerate findings/ scorecards
 ```
 
-Nothing here touches the trading path. Every command is read-only against
-`journal.db` plus a local price cache; none places an order, calls an LLM or
-writes runtime state.
+Nothing here touches the trading path or places an order. Commands read the
+journal and a local price cache; `replay --check-fidelity` appends a durable
+`research_gate_result` audit row, while sweeps append atomic run/metric/finding
+records to `findings.db`. Successful evaluations and `research.py report`
+also maintain `findings.db.backup`. No command calls an LLM or mutates trading
+state.
 
 `research/nightly.sh` runs the whole sequence (authoritative path first) and
 is wired to `deploy/okx-research.timer`.
@@ -674,7 +685,15 @@ internally consistent table describing a system nobody runs.
 | --- | --- |
 | 0 | Reproduced ≥ 99%. Proceed. |
 | 2 | **Failed.** Stop and explain every mismatch before trusting anything. |
-| 4 | **Vacuous** — the corpus has no recorded decisions, so it reproduced 100% of nothing. Not evidence of fidelity. |
+| 4 | **Collecting/vacuous** — fewer than 100 recorded proposals, including an empty corpus. Not enough evidence for the ratio. |
+| 5 | Fidelity passed but its durable audit record could not be stored. Downstream work stays blocked. |
+
+A pass is stored with the proposal count, latest proposal timestamp, strategy
+configuration fingerprint and fidelity-code fingerprint. New proposals or a
+decision/replay code or strategy-config change makes that pass stale and
+returns G2 to `READY` until it is rerun.
+`three-arm`, `funnel`, and `sweep` enforce G2 themselves; a caller cannot skip
+the gate by invoking those commands directly.
 
 ### The three arms
 
@@ -706,11 +725,15 @@ Two kinds of axis, and only one divides the sample:
   bucket and reuses trades that already exist, so it is affordable at samples
   where a parameter sweep is not. Buckets must be pre-registered.
 
-[`research/protocol.md`](research/protocol.md) is the promotion rule, applied
-by code. Promotion needs all five criteria (≥100 round trips, ≥3 settings,
-expectancy CI clearing the baseline, drawdown no worse, and an out-of-sample
-survival). Rejection needs the whole axis tried — a hypothesis is never
-killed by one badly chosen parameter value.
+[`research/protocol.md`](research/protocol.md) is the comparison rule, applied
+by code. Selection occurs only on the 70% fit window; the 30% confirmation
+window cannot choose its own winner. Promotion needs all five criteria (≥100
+round trips **for every setting**, ≥3 settings, expectancy CI clearing the
+baseline, drawdown no worse, and a positive out-of-sample confirmation delta).
+Rejection also requires every setting to meet the sample floor — a hypothesis
+is never killed by one badly chosen or under-observed value. Exploratory OHLCV
+gates are capped at `T2_CANDIDATE`; no research command silently rewrites the
+static strategy tier in `agent/registry.py`.
 
 **`INSUFFICIENT_SAMPLE` means the question is open, not answered in the
 negative.** It will be returned repeatedly and it is the most important
@@ -753,7 +776,7 @@ eventually decides they have waited long enough.
 | Status | Meaning |
 | --- | --- |
 | `PASS` | Satisfied, on evidence |
-| `READY` | Enough data exists; the command has not been run |
+| `READY` | Enough data exists, but no persisted pass covers the exact current corpus |
 | `....` | Collecting. The shortfall is counted, never estimated |
 | `BLKD` | Something upstream must happen first |
 | `FAIL` | It ran and did not pass. **A stop, not a delay** |
@@ -772,7 +795,8 @@ gate becomes meaningful in about a week. `readiness` counts them and says how
 many are missing.
 
 **What "ready" does not mean:** that it passed. `READY` means the sample is
-sufficient and the command has not been run yet.
+sufficient but no persisted pass covers this exact corpus. `PASS` is reserved
+for a successful fidelity run whose audit row still matches the corpus.
 
 #### B7.5 — passive entry
 
@@ -882,8 +906,10 @@ Entries and exits share a durable trade ID and record actual fill price,
 quantity, fees, signed implementation shortfall, adverse slippage, planned
 risk, funding status and incremental net realized USDT. The report excludes
 unmatched/open rows, never chains equity across valuation-basis migrations,
-and reports momentum independently by strategy/version, prompt/config/code
-variant and setup:
+and reports independently by runtime account, strategy/version,
+prompt/config/code version, parameter variant, strategy-config version and
+setup. `--json` uses the same full-provenance groups rather than pooling them
+under a strategy name:
 
 ```bash
 python3 report.py    # basis-segmented equity; matched net USDT, expectancy,
@@ -905,7 +931,10 @@ Plain-text logs are in `runtime/demo/agent.log` or `runtime/live/agent.log`.
 | --- | --- | --- |
 | `book_state` | Per symbol, per cycle — **including when the book is fine** | H-H. The entry guard already read depth but journalled it only on rejection, so every ordinary observation was discarded — and the ordinary readings are the baseline a cascade's collapse is measured against |
 | `snapshot_enrichment` | Per cycle | H-I, H-J, H-L. Realised-vol ratio, UTC hour, BTC reference returns. Deliberately **not** in `llm_input`, so the corpus loader joins it by `cycle_id` |
-| `shadow_decision` | Per variant, per symbol | Forward evidence for parameter variants that hold no capital |
+| `variant_shadow_decision` | Per parameter variant, per symbol | Forward evidence for parameter variants that hold no capital |
+| `strategy_shadow_decision` | Per strategy contract, per symbol | Cross-strategy forward signals; exported separately from parameter variants |
+| `strategy_shadow_summary` | Per strategy contract, per cycle | The scanned-instrument denominator needed to turn signals into rates |
+| `research_gate_result` | After every G2 fidelity check | Durable pass/fail/sample record tied to the exact proposal corpus |
 | `maker_attempt` | Per passive entry attempt | H-K(ii), once B7.5 is wired |
 | `decision_skipped` | When `decision_interval_seconds` defers a decision | Cost accounting |
 

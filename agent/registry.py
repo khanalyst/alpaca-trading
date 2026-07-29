@@ -13,16 +13,19 @@ Three ideas are encoded here, and they are the point of the module:
 ``falsification`` (what observation would kill it). A strategy that cannot
 state both is not ready to be registered, let alone traded.
 
-**Confidence is computed, not asserted.** ``tier`` records how far a strategy
+**Confidence is evidenced, not asserted.** ``tier`` records how far a strategy
 has actually got through the evidence gates, from T0_REJECTED to T4_CONFIRMED.
-It is set by research, read by policy, and never by a hunch.
+It is backed by persisted research, changed through review, read by policy,
+and never moved by a hunch or by an exploratory command editing code.
 
 **The tier is enforced where it matters.** ``momentum`` is T0_REJECTED: across
 115,929 signals it showed a 45.6-47.3% directional hit rate and -0.096 R at
 ordinary costs, with 0 of 79 walk-forward variants positive out-of-sample.
-Demo may run anything implemented, because demo is an operations rehearsal.
-Live requires T3_VALIDATED, so a strategy known to be negative cannot reach
-real capital by editing one line of config.
+Demo may run only a strategy whose deterministic contract and analyst prompt
+are both ready. Contracts that are implemented only for cross-strategy shadow
+research remain unavailable to the trading loop. Live additionally requires
+T3_VALIDATED, so a strategy known to be negative cannot reach real capital by
+editing one line of config.
 
 **Where that evidence comes from, and what it is not.** Every tier claim in
 this module currently rests on a *recomputed* backtest over downloaded OHLCV
@@ -97,6 +100,14 @@ class StrategySpec:
     # False while a strategy is registered for research but has no live
     # contract implementation. Configuration refuses to start on one.
     implemented: bool = False
+    # True only when the analyst schema/prompt can produce this strategy's
+    # setup types. An implemented evidence builder is sufficient for shadow
+    # research but not sufficient to make the active LLM trading path valid.
+    analyst_ready: bool = False
+    # True only when research/export_live.py has a validated stop/target,
+    # cost and holding model for this mechanism. Raw shadow signals may be
+    # collected without it, but they must not be converted into expectancy.
+    forward_model_ready: bool = False
     # Free-form note explaining a tier or an implementation gap.
     notes: str = ""
     evidence: tuple[str, ...] = field(default_factory=tuple)
@@ -186,6 +197,8 @@ REGISTRY: dict[str, StrategySpec] = {
                          "funding_squeeze", "other"),
             prompt_fragment=_MOMENTUM_PROMPT,
             implemented=True,
+            analyst_ready=True,
+            forward_model_ready=True,
             notes=(
                 "Runnable on demo as an operations rehearsal. Blocked from "
                 "live by LIVE_MIN_TIER, which is the intended behaviour. "
@@ -446,7 +459,13 @@ def implemented_ids() -> tuple[str, ...]:
     return tuple(sorted(s.id for s in REGISTRY.values() if s.implemented))
 
 
+def runnable_ids() -> tuple[str, ...]:
+    return tuple(sorted(
+        s.id for s in REGISTRY.values()
+        if s.implemented and s.analyst_ready))
+
+
 def live_eligible_ids() -> tuple[str, ...]:
     return tuple(sorted(
         s.id for s in REGISTRY.values()
-        if s.implemented and s.meets(LIVE_MIN_TIER)))
+        if s.implemented and s.analyst_ready and s.meets(LIVE_MIN_TIER)))

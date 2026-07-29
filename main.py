@@ -382,7 +382,10 @@ def cmd_strategies(args, cfg) -> int:
         marks = []
         if spec.id == active:
             marks.append("ACTIVE")
-        marks.append("runnable" if spec.implemented else "research-only")
+        marks.append(
+            "runnable" if spec.implemented and spec.analyst_ready
+            else "shadow-only" if spec.implemented
+            else "research-only")
         if spec.meets(LIVE_MIN_TIER):
             marks.append("live-eligible")
         print(f"  {spec.id}/{spec.version}  [{spec.tier}]  "

@@ -725,7 +725,7 @@ class Engine:
         state.commit(st)
 
         # After every trading decision is committed, so it cannot influence
-        # one. Wrapped, budgeted, and writing only shadow_decision events.
+        # one. Wrapped, budgeted, and writing only variant shadow events.
         self._run_shadow_variants(snapshot, equity, positions, st, gross)
 
     def _run_shadow_variants(self, snapshot: dict, equity: float,
@@ -736,8 +736,11 @@ class Engine:
         Three properties, each individually tested. It runs after
         ``state.commit``, so it can never affect a decision. It is wrapped in
         try/except, so a failure is journalled and swallowed. And it writes
-        only ``shadow_decision`` events, never a key in ``state.LOOP_KEYS``,
-        so it cannot corrupt trading state even if it is wrong.
+        only ``variant_shadow_decision`` events, never a key in
+        ``state.LOOP_KEYS``, so it cannot corrupt trading state even if it
+        is wrong. The distinct name prevents parameter-variant records from
+        being pooled with cross-strategy shadow records, whose payload has a
+        different schema and research meaning.
 
         A research feature that could interrupt a trading cycle would be a
         safety regression however good its output.
@@ -756,7 +759,8 @@ class Engine:
             records = evaluator.evaluate(snapshot, portfolio, time.time())
             for record in records:
                 state.log_event(
-                    "shadow_decision", self._audit_json(record.as_event()),
+                    "variant_shadow_decision",
+                    self._audit_json(record.as_event()),
                     variant_id=record.variant_id)
             budget = getattr(evaluator, "last_budget", None)
             if budget is not None and budget.overran:
@@ -1981,7 +1985,7 @@ class Engine:
                 # One summary per strategy per cycle. Without the denominator
                 # a count of firings cannot be turned into a rate.
                 state.log_event(
-                    "shadow_summary",
+                    "strategy_shadow_summary",
                     self._audit_json({
                         "instruments_scanned": len(symbols),
                         "instruments_fired": len({f["symbol"]
@@ -1995,7 +1999,7 @@ class Engine:
                 )
                 for signal in fired:
                     state.log_event(
-                        "shadow_decision", self._audit_json(signal),
+                        "strategy_shadow_decision", self._audit_json(signal),
                         strategy_id=spec.id, strategy_version=spec.version)
             except Exception as exc:                       # noqa: BLE001
                 log.warning("Shadow evaluation failed for %s: %s",
