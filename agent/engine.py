@@ -234,6 +234,37 @@ class Engine:
             if owns_lock:
                 state.release_run_lock(run_lock)
 
+    def _decision_due(self, now: float) -> bool:
+        """True when the decision cadence has elapsed. Records the attempt.
+
+        Absent configuration means every cycle is a decision cycle, which is
+        the pre-B9.2 behaviour, so this cannot change an existing deployment
+        until it is deliberately configured.
+        """
+        interval = self.cfg["cycle"].get("decision_interval_seconds")
+        if not interval:
+            # Unconfigured means no gate at all, rather than a gate set to
+            # the housekeeping cadence. Those are not the same thing: the run
+            # loop already sleeps interval_seconds between cycles, so a gate
+            # at that value would do nothing in the ordinary case and would
+            # silently drop a decision whenever a cycle finished marginally
+            # early. A feature that is off must be off.
+            return True
+
+        # A tolerance below the configured interval, for the same reason:
+        # scheduling jitter must not be able to defer a decision by a whole
+        # extra period.
+        last = getattr(self, "_last_decision_ts", None)
+        if last is not None and (now - last) < float(interval) * 0.95:
+            state.log_event("decision_skipped", self._audit_json({
+                "reason": "decision cadence not elapsed",
+                "seconds_since_last": round(now - last, 1),
+                "decision_interval_seconds": float(interval),
+            }))
+            return False
+        self._last_decision_ts = now
+        return True
+
     def _wait_for_next_cycle(self) -> None:
         """Sleep responsively so a kill is observed within about one second."""
         deadline = time.monotonic() + int(
@@ -524,6 +555,24 @@ class Engine:
             return  # PAUSED: no LLM calls, no new trades
         if st["state"] == state.DAY_STOPPED and not positions:
             return  # opens blocked and nothing held: an LLM call cannot act
+
+        # --- B9.2: decisions run on their own cadence, housekeeping does not
+        #
+        # Everything above this line has already run: reconciliation, the
+        # protection audit, cooldown expiry, the day rollover, both circuit
+        # breakers and the max-hold force close inside _manage_positions.
+        # They keep running every interval_seconds, so safety reaction time
+        # is unchanged.
+        #
+        # What is skipped is the snapshot build and the LLM call. Measured
+        # over the corpus, 66.5% of cycles observe only signal bars that were
+        # already evaluated, and an LLM call on one of those cannot produce a
+        # fresh evaluation for any symbol - strategy.evaluated_signal blocks
+        # it. Simply raising interval_seconds would also slow the margin
+        # guard to 15 minutes, which is not an acceptable trade; this split
+        # avoids that.
+        if not self._decision_due(now):
+            return
 
         # --- build snapshot and ask the brain
         symbols = list(dict.fromkeys(

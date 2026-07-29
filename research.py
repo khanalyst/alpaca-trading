@@ -331,6 +331,61 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cadence(args: argparse.Namespace) -> int:
+    """B9.2 evidence: how much LLM spend buys a re-evaluation of nothing?
+
+    The plan requires this published before the cadence split merges, and
+    reframed per H-M: if expectancy also decays with latency from the bar
+    close, aligning the decision cadence is an alpha fix and the cost saving
+    is incidental.
+    """
+    db = Path(args.db) if args.db else default_db(args.mode)
+    if not db.exists():
+        print(f"no journal at {db}", file=sys.stderr)
+        return 1
+    cycles, _ = _corpus_for(db)
+    if not cycles:
+        print("no cycles in the corpus", file=sys.stderr)
+        return 1
+
+    seen: set = set()
+    fresh_cycles = repeat_cycles = 0
+    for cycle in cycles:
+        fresh = False
+        for symbol in cycle.symbols():
+            signal_ts = cycle.snapshot[symbol].get("signal_ts")
+            if signal_ts is None:
+                continue
+            key = (symbol, int(signal_ts))
+            if key not in seen:
+                seen.add(key)
+                fresh = True
+        fresh_cycles += 1 if fresh else 0
+        repeat_cycles += 0 if fresh else 1
+
+    total = fresh_cycles + repeat_cycles
+    share = repeat_cycles / total if total else 0.0
+    print(f"decision cadence, over {total:,} cycles\n")
+    print(f"  produced a fresh signal bar   {fresh_cycles:>7,}  "
+          f"({fresh_cycles / total:.1%})")
+    print(f"  saw only evaluated bars       {repeat_cycles:>7,}  "
+          f"({share:.1%})")
+    print()
+    print("An LLM call on a repeat cycle cannot produce a fresh evaluation "
+          "for a symbol\nalready evaluated this bar - "
+          "strategy.evaluated_signal blocks it.")
+    if share > 0.5:
+        saving = 1.0 / max(1e-9, 1.0 - share)
+        print(f"\nAligning cycle.decision_interval_seconds to the signal bar "
+              f"cuts roughly\n{share:.0%} of LLM calls (~{saving:.1f}x). "
+              "Housekeeping, both circuit breakers,\nreconciliation and the "
+              "max-hold force close keep running at\ncycle.interval_seconds.")
+    else:
+        print("\nBelow half. The plan's own advice applies: if the answer is "
+              "not 'more than\na handful', do not make the change.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -409,6 +464,13 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--store", default=None)
     report_parser.add_argument("--out", default=None)
     report_parser.set_defaults(func=cmd_report)
+
+    cadence = sub.add_parser(
+        "cadence",
+        help="B9.2 evidence: share of cycles that re-observe evaluated bars")
+    cadence.add_argument("--db", default=None)
+    cadence.add_argument("--mode", default="demo", choices=["demo", "live"])
+    cadence.set_defaults(func=cmd_cadence)
 
     return parser
 

@@ -160,8 +160,19 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError("universe.denylist must be a list of symbols")
 
     cycle = _mapping(cfg.get("cycle"), "cycle")
-    _keys(cycle, {"interval_seconds", "candles", "timeframes"}, "cycle")
+    _keys(cycle, {"interval_seconds", "decision_interval_seconds",
+                  "candles", "timeframes"}, "cycle")
     _integer(cycle, "interval_seconds", 30, 86400, "cycle")
+    # Optional. Absent means decisions run at the housekeeping cadence,
+    # which is the pre-B9.2 behaviour, so an existing config is unaffected.
+    if cycle.get("decision_interval_seconds") is not None:
+        _integer(cycle, "decision_interval_seconds", 30, 86400, "cycle")
+        if (cycle["decision_interval_seconds"]
+                < cycle["interval_seconds"]):
+            raise ConfigError(
+                "cycle.decision_interval_seconds cannot be below "
+                "cycle.interval_seconds: the decision cadence is a multiple "
+                "of the housekeeping cadence, never a fraction of it")
     _integer(cycle, "candles", 60, 1000, "cycle")
     timeframes = cycle.get("timeframes")
     if not isinstance(timeframes, list) or not all(

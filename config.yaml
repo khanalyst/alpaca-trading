@@ -92,7 +92,21 @@ universe:
   refresh_minutes: 60                # how often the volume ranking is rebuilt
 
 cycle:
-  interval_seconds: 300              # decision cycle (300 = one LLM call every 5 min)
+  interval_seconds: 300              # housekeeping, breakers, reconciliation
+  # B9.2. Uncomment to align decisions to the 15m signal bar. Measured over
+  # the corpus, 66.5% of cycles observe only bars that were already
+  # evaluated, and an LLM call on one of those cannot produce a fresh
+  # evaluation for any symbol - strategy.evaluated_signal blocks it. So this
+  # is roughly a 3x reduction in LLM spend.
+  #
+  # It is a SPLIT rather than simply raising interval_seconds, because that
+  # would also take the drawdown breaker, the daily-loss stop, reconciliation
+  # and the max-hold force close from a 5-minute reaction time to a
+  # 15-minute one. Those keep running at interval_seconds.
+  #
+  # Left commented so this batch changes nothing until it is turned on
+  # deliberately. Verify with: python research.py cadence
+  # decision_interval_seconds: 900
   timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model.
                                      # NOTE: the model's field reference in
                                      # agent/brain.py describes these defaults
