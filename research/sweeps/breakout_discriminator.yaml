@@ -1,0 +1,17 @@
+# Batch 6.4, as a question rather than a decision.
+#
+# This is a PARAMETER axis, so it divides the sample and the forecast will
+# refuse it until the corpus is large enough. That refusal is correct: the
+# three settings need 300 matched round trips between them before any
+# ranking means anything.
+#
+# Run it when the sample allows. Until then the discriminator stays "none",
+# which is the shipped behaviour and bakes in neither answer - so neither
+# filters the population the other one needs.
+hypothesis: >-
+  range_breakout and trend_continuation overlap, and separating them by
+  volatility regime produces a cleaner partition than separating them by
+  trend alignment.
+base: momentum.baseline
+axis:
+  strategy.breakout_discriminator: [none, trend_alignment, volatility_regime]

@@ -13,6 +13,12 @@ from .registry import (LIVE_MIN_TIER, UnknownStrategy, implemented_ids,
                        live_eligible_ids, spec_for)
 
 
+# Batch 6.4. "none" is the shipped behaviour: the two contracts overlap and
+# nothing separates them. The other two are competing answers to which
+# variable should - see agent/contracts/momentum_phase1v2.py.
+BREAKOUT_DISCRIMINATORS = {"none", "trend_alignment", "volatility_regime"}
+
+
 class ConfigError(ValueError):
     """Raised when configuration is missing, malformed, or outside safe bounds."""
 
@@ -77,6 +83,7 @@ def validate_config(raw: dict) -> dict:
     strategy = _mapping(cfg.get("strategy"), "strategy")
     _keys(strategy, {
         "id", "version", "signal_timeframe",
+        "breakout_discriminator", "breakout_compression_max_atr_ratio",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
         "setup_memory_hours", "loss_reentry_min_minutes",
         "min_stop_atr_multiple", "min_hold_minutes",
@@ -121,6 +128,21 @@ def validate_config(raw: dict) -> dict:
             + f" Reason: {spec.falsification}")
     _boolean(
         strategy, "allow_experimental_setups_in_demo", "strategy")
+    # Batch 6.4. Which variable separates range_breakout from
+    # trend_continuation. Defaults to "none" - the shipped behaviour - so
+    # the choice is made deliberately and its attribution fork is visible.
+    discriminator = strategy.get("breakout_discriminator")
+    if discriminator is None:
+        strategy["breakout_discriminator"] = "none"
+    elif discriminator not in BREAKOUT_DISCRIMINATORS:
+        raise ConfigError(
+            "strategy.breakout_discriminator must be one of: "
+            + ", ".join(sorted(BREAKOUT_DISCRIMINATORS)))
+    if strategy.get("breakout_compression_max_atr_ratio") is None:
+        strategy["breakout_compression_max_atr_ratio"] = 1.0
+    else:
+        _number(strategy, "breakout_compression_max_atr_ratio",
+                0.1, 5.0, "strategy")
     _number(strategy, "setup_cooldown_minutes", 0, 1440, "strategy")
     _number(strategy, "setup_memory_hours", 1, 720, "strategy")
     _number(strategy, "loss_reentry_min_minutes", 0, 10080, "strategy")

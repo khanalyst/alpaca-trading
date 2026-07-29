@@ -21,6 +21,8 @@ VALID_CONFIG = {
         "min_hold_minutes": 90,
         "structure_buffer_atr_multiple": 0.15,
         "hard_max_entry_extension_atr": 2.5,
+        "breakout_discriminator": "none",
+        "breakout_compression_max_atr_ratio": 1.0,
         "breakout_range_threshold_pct": 85,
         "breakout_min_relative_volume": 1.0,
         "funding_extreme_pct_per_8h": 0.01,

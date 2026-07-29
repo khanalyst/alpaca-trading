@@ -53,8 +53,57 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
     min_relative_volume = float(block["breakout_min_relative_volume"])
     funding_extreme = float(block["funding_extreme_pct_per_8h"])
 
+    # --- batch 6.4: which variable separates a breakout from a continuation
+    #
+    # The two contracts overlap: a symbol in a strong aligned uptrend is
+    # almost always in the top of its 24h range with elevated volume, so both
+    # fire and which label a trade receives depends on which word the model
+    # chose rather than on a difference in the market. Attributing
+    # performance by setup_type then splits one phenomenon across two rows.
+    #
+    # What it should be separated BY is an open question, and the plan and
+    # the edge hypotheses disagree:
+    #
+    #   trend_alignment    6.4 as originally specified. A breakout is a
+    #                      transition OUT of chop, so it requires the absence
+    #                      of prior multi-timeframe alignment.
+    #   volatility_regime  H-I. The real partition is compression versus
+    #                      expansion, and trend alignment is a correlated
+    #                      proxy for it. A breakout from a compressed base is
+    #                      a real event; a "break" when volatility is already
+    #                      elevated is an ordinary excursion in a wide
+    #                      distribution.
+    #   none               Neither. The shipped behaviour, kept as the
+    #                      default so this batch changes nothing until a
+    #                      discriminator is chosen deliberately.
+    #
+    # Making it configurable is what lets the corpus decide instead of the
+    # argument. Baking one in and then testing the other would filter the
+    # population on a correlated variable first, which is precisely what
+    # makes the regime test impossible to run cleanly afterwards.
+    discriminator = str(block.get("breakout_discriminator") or "none")
+    compression_max = float(
+        block.get("breakout_compression_max_atr_ratio") or 1.0)
+    atr_ratio = _finite(snapshot.get("atr_1h_ratio"))
+
+    aligned_long = trend_1h == "up" and trend_4h == "up"
+    aligned_short = trend_1h == "down" and trend_4h == "down"
+    if discriminator == "trend_alignment":
+        breakout_allowed_long = not aligned_long
+        breakout_allowed_short = not aligned_short
+    elif discriminator == "volatility_regime":
+        # Compressed base. Unknown volatility does not qualify: a missing
+        # measurement must not read as "compressed".
+        compressed = atr_ratio is not None and atr_ratio <= compression_max
+        breakout_allowed_long = compressed
+        breakout_allowed_short = compressed
+    else:
+        breakout_allowed_long = True
+        breakout_allowed_short = True
+
     breakout_long = (
-        range_position is not None
+        breakout_allowed_long
+        and range_position is not None
         and relative_volume is not None
         and range_position >= range_threshold
         and relative_volume >= min_relative_volume
@@ -64,7 +113,8 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
         and trend_1h != "down"
     )
     breakout_short = (
-        range_position is not None
+        breakout_allowed_short
+        and range_position is not None
         and relative_volume is not None
         and range_position <= 100 - range_threshold
         and relative_volume >= min_relative_volume

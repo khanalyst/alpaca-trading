@@ -64,6 +64,25 @@ strategy:
   # clears the worst of the adverse window without approaching the 8h point
   # where an early-exit overlay was measured to start helping.
   min_hold_minutes: 90
+  # Batch 6.4. Which variable separates range_breakout from
+  # trend_continuation. The two contracts overlap - a symbol in a strong
+  # aligned uptrend is almost always high in its 24h range on good volume -
+  # so which label a trade gets depends on which word the model chose rather
+  # than on a difference in the market, and attribution splits one
+  # phenomenon across two rows.
+  #
+  #   none               shipped behaviour; they overlap
+  #   trend_alignment    a breakout is a transition OUT of chop, so it
+  #                      requires the absence of prior 1h/4h alignment
+  #   volatility_regime  the partition is compression vs expansion; a break
+  #                      when volatility is already high is an ordinary
+  #                      excursion in a distribution that is already wide
+  #
+  # Left at "none" so neither answer is baked in - baking one in would filter
+  # the population the other one needs. Compare them with:
+  #   python research.py sweep research/sweeps/breakout_discriminator.yaml
+  breakout_discriminator: none
+  breakout_compression_max_atr_ratio: 1.0   # volatility_regime only
   breakout_range_threshold_pct: 85
   breakout_min_relative_volume: 1.0
   # Absolute funding floor for the funding_squeeze setup, expressed as an
