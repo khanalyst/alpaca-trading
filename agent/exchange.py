@@ -1428,6 +1428,80 @@ class Exchange:
         time.sleep(0.5)
         return self.protection_status(symbol, contracts, side, mark_price)
 
+    def settle_fill(self, fill: dict, symbol: str, side: str,
+                    contracts: float, sl_price: float,
+                    tp_price: float) -> dict:
+        """Verify the position and its protection after ANY entry fills.
+
+        Extracted so every path capable of creating a position runs the same
+        verification: read the live position, confirm the exchange-side stop
+        actually exists, alert loudly if it does not, and attach the mark and
+        liquidation prices the engine needs to judge whether that stop sits
+        inside the liquidation distance.
+
+        B7.5 is why this is shared rather than inlined. A maker-first fill
+        creates a position exactly as an IOC fill does, and one that skipped
+        this would be a position the engine believes is protected without
+        anything having checked.
+        """
+        position_side = "long" if side == "buy" else "short"
+        try:
+            live_position = self.position(symbol)
+        except Exception as exc:
+            # The verified fill is enough to protect the position even when
+            # the positions endpoint is temporarily unavailable.
+            live_position = None
+            log.warning("position verification failed after %s fill: %s",
+                        symbol, exc)
+            self._alert("warning", "position_read_after_fill_failed",
+                        f"Using the verified {symbol} fill to place protection",
+                        {"error": str(exc)})
+        live_contracts = abs(float((live_position or {}).get("contracts")
+                                   or fill["filled"]))
+        mark = float((live_position or {}).get("markPrice")
+                     or fill["average"])
+        # Attached algo orders can be eventually consistent on the read API.
+        time.sleep(0.4)
+        try:
+            protection = self.ensure_protection(
+                symbol, position_side, live_contracts, sl_price, tp_price, mark)
+        except Exception as e:
+            protection = {"stop_loss": False, "take_profit": False}
+            log.error("protection verification failed for %s: %s", symbol, e)
+
+        if not protection.get("stop_loss"):
+            self._alert("critical", "unprotected_position",
+                        f"{symbol} entry filled without a verified stop-loss",
+                        {"contracts": live_contracts})
+        if fill["partial"]:
+            log.warning("PARTIAL ENTRY %s: requested %s, filled %s", symbol,
+                        contracts, fill["filled"])
+            self._alert("warning", "partial_entry",
+                        f"{symbol} entry partially filled",
+                        {"requested": contracts, "filled": fill["filled"]})
+        fill["protection"] = protection
+        fill["position_contracts"] = live_contracts
+        fill["position_id"] = ((live_position or {}).get("id")
+                               or ((live_position or {}).get("info") or {}).get(
+                                   "posId"))
+        liquidation_raw = (
+            (live_position or {}).get("liquidationPrice")
+            or ((live_position or {}).get("info") or {}).get("liqPx")
+        )
+        if liquidation_raw in (None, "", "0", 0):
+            liquidation_price = None
+        else:
+            try:
+                liquidation_price = float(liquidation_raw)
+            except (TypeError, ValueError):
+                # The engine treats an invalid available measurement as unsafe
+                # and emergency-closes the already-filled position. Never raise
+                # here and accidentally make a real fill look like no fill.
+                liquidation_price = liquidation_raw
+        fill["liquidation_price"] = liquidation_price
+        fill["mark_price"] = mark
+        return fill
+
     def maker_first_entry(self, symbol: str, side: str, contracts: float,
                           leverage: float, sl_price: float, tp_price: float,
                           wait_seconds: float,
@@ -1511,6 +1585,27 @@ class Exchange:
                 log.warning("maker-first post-cancel read failed for %s: %s",
                             symbol, exc)
 
+        # A passive fill is a position, so it goes through exactly the same
+        # verification an IOC fill does - live position read, protection
+        # audit, mark and liquidation prices. Skipping it would leave the
+        # engine believing a position is protected without anything having
+        # checked.
+        settled = None
+        if filled > 0:
+            settled = self.settle_fill(
+                {"filled": float(filled),
+                 "average": float(order.get("average") or limit),
+                 "requested": float(contracts),
+                 "partial": float(filled) < float(contracts),
+                 "order_id": order_id,
+                 "client_order_id": (order.get("clientOrderId")
+                                     or (order.get("info") or {}).get(
+                                         "clOrdId")),
+                 "status": order.get("status"),
+                 "fee_usd": 0.0, "slippage_usd": 0.0,
+                 "submission_audit": {"path": "maker_first"}},
+                symbol, side, contracts, sl_price, tp_price)
+
         average = order.get("average") or (limit if filled else None)
         slippage_saved_pct = None
         if average and reference_price:
@@ -1534,6 +1629,10 @@ class Exchange:
             "wait_seconds": float(wait_seconds),
             "cancelled": cancelled,
             "resting": bool(not cancelled and filled < contracts),
+            # The settled fill, shaped exactly like open_position's return so
+            # the engine's own post-fill bookkeeping can consume it unchanged.
+            # None when nothing filled, which is the ordinary outcome.
+            "execution": settled,
         }
 
     def open_position(self, symbol: str, side: str, contracts: float,
@@ -1574,63 +1673,8 @@ class Exchange:
 
         fill = self.verify_fill(
             order, symbol, contracts, expected_price, side=side)
-        position_side = "long" if side == "buy" else "short"
-        try:
-            live_position = self.position(symbol)
-        except Exception as exc:
-            # The verified fill is enough to protect the position even when
-            # the positions endpoint is temporarily unavailable.
-            live_position = None
-            log.warning("position verification failed after %s fill: %s",
-                        symbol, exc)
-            self._alert("warning", "position_read_after_fill_failed",
-                        f"Using the verified {symbol} fill to place protection",
-                        {"error": str(exc)})
-        live_contracts = abs(float((live_position or {}).get("contracts")
-                                   or fill["filled"]))
-        mark = float((live_position or {}).get("markPrice")
-                     or fill["average"])
-        # Attached algo orders can be eventually consistent on the read API.
-        time.sleep(0.4)
-        try:
-            protection = self.ensure_protection(
-                symbol, position_side, live_contracts, sl_price, tp_price, mark)
-        except Exception as e:
-            protection = {"stop_loss": False, "take_profit": False}
-            log.error("protection verification failed for %s: %s", symbol, e)
-
-        if not protection.get("stop_loss"):
-            self._alert("critical", "unprotected_position",
-                        f"{symbol} entry filled without a verified stop-loss",
-                        {"contracts": live_contracts})
-        if fill["partial"]:
-            log.warning("PARTIAL ENTRY %s: requested %s, filled %s", symbol,
-                        contracts, fill["filled"])
-            self._alert("warning", "partial_entry",
-                        f"{symbol} entry partially filled",
-                        {"requested": contracts, "filled": fill["filled"]})
-        fill["protection"] = protection
-        fill["position_contracts"] = live_contracts
-        fill["position_id"] = ((live_position or {}).get("id")
-                               or ((live_position or {}).get("info") or {}).get(
-                                   "posId"))
-        liquidation_raw = (
-            (live_position or {}).get("liquidationPrice")
-            or ((live_position or {}).get("info") or {}).get("liqPx")
-        )
-        if liquidation_raw in (None, "", "0", 0):
-            liquidation_price = None
-        else:
-            try:
-                liquidation_price = float(liquidation_raw)
-            except (TypeError, ValueError):
-                # The engine treats an invalid available measurement as unsafe
-                # and emergency-closes the already-filled position. Never raise
-                # here and accidentally make a real fill look like no fill.
-                liquidation_price = liquidation_raw
-        fill["liquidation_price"] = liquidation_price
-        fill["mark_price"] = mark
-        return fill
+        return self.settle_fill(
+            fill, symbol, side, contracts, sl_price, tp_price)
 
     def close_position(self, pos: dict) -> dict:
         symbol = pos["symbol"]

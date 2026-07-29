@@ -1310,29 +1310,67 @@ class Engine:
             symbol, delay, classification, count)
         return record
 
-    # ------------------------------------------------------------ B7.5
-    #
-    # H-K(ii), maker-first entry, is NOT wired into the entry path, and the
-    # reason is worth stating rather than leaving as an omission.
-    #
-    # Exchange.maker_first_entry() exists and is tested: it posts passively,
-    # polls for a fill, and guarantees the order is never left resting. What
-    # is missing is the other half. A passive fill creates a position, and
-    # every position this engine opens must also get a trade_id, a journalled
-    # trade row, a liquidation-distance check and a protection audit
-    # confirming the exchange-side stop actually exists. That bookkeeping
-    # currently lives inside open_position() and its callers.
-    #
-    # Wiring the maker path without it would create positions with no journal
-    # row and no verified protection - which is a far worse outcome than
-    # paying the spread. Doing it properly means extracting the
-    # post-fill verification so both paths share it, and that is a refactor
-    # of the code whose entire job is to guarantee no position is ever naked.
-    # It cannot be validated against mocks alone.
-    #
-    # So the exchange primitive ships, the config flag ships defaulting off,
-    # and the integration waits for someone who can exercise it against the
-    # demo account. See research/plan/B7.5-record.md.
+    def _maker_first_attempt(self, plan: dict, st: dict, symbol: str,
+                             side: str, contracts: float, sl_price: float,
+                             tp_price: float, reference: float):
+        """Try passively first. Returns a settled execution, or None to cross.
+
+        H-K(ii). Every IOC entry crosses the spread and accepts adverse
+        selection, and at a 2% stop round-trip friction is roughly 10% of the
+        risk unit - so converting the filled fraction from taker to maker
+        moves expectancy by more than most of the parameter axes queued for
+        sweeping, without requiring any signal to have edge.
+
+        Failure degrades to crossing, never to no entry and never to a
+        resting order. A broken experiment must fall back to the behaviour
+        that already works.
+        """
+        execution_cfg = self.cfg["execution"]
+        if not execution_cfg.get("maker_first_enabled"):
+            return None
+
+        try:
+            attempt = self.ex.maker_first_entry(
+                symbol, side, contracts, plan["leverage"], sl_price,
+                tp_price,
+                float(execution_cfg["maker_first_wait_seconds"]),
+                reference)
+        except CredentialError:
+            raise
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("maker-first attempt failed for %s, crossing: %s",
+                        symbol, exc)
+            state.log_event("maker_attempt", self._audit_json({
+                "symbol": symbol, "outcome": "error",
+                "error": f"{type(exc).__name__}: {exc}"}))
+            return None
+
+        journalled = {k: v for k, v in attempt.items() if k != "execution"}
+        state.log_event("maker_attempt", self._audit_json({
+            "symbol": symbol,
+            "outcome": ("filled" if attempt["fill_rate"] >= 1.0
+                        else "partial" if attempt["filled_contracts"] > 0
+                        else "unfilled"),
+            **journalled}))
+
+        if attempt.get("resting"):
+            # The cancel failed and the order may still be live. Crossing now
+            # could double the position, so this cycle ends here.
+            log.error("maker-first order for %s may still be resting; "
+                      "not crossing on top of it", symbol)
+            self.alerts.send(
+                "critical", "maker_order_may_rest",
+                f"A maker-first entry order for {symbol} could not be "
+                "cancelled and may still be resting",
+                {"symbol": symbol, "order_id": attempt.get("order_id")})
+            return attempt.get("execution") or False
+
+        # A partial fill is NOT topped up by crossing the remainder. Splitting
+        # one setup across two prices would make the recorded entry an average
+        # of two decisions, and entry price is exactly what H-K(ii) measures.
+        # The position is smaller than planned, which is journalled and is the
+        # conservative direction.
+        return attempt.get("execution")
 
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
@@ -1422,6 +1460,19 @@ class Engine:
             log.info("Control state changed before order; skipping %s", symbol)
             return False
 
+        # B7.5 / H-K(ii): post passively first when enabled, then cross.
+        # A passive fill returns a settled execution shaped exactly like
+        # open_position's, so the bookkeeping below is identical either way -
+        # same trade row, same liquidation check, same protection audit.
+        maker = self._maker_first_attempt(
+            plan, st, symbol, side, contracts, sl_price, tp_price,
+            entry_reference)
+        if maker is False:
+            return False                     # order may be resting; stop
+        if maker is not None:
+            return self._settle_entry(
+                plan, st, maker, symbol, side, sl_price, tp_price)
+
         try:
             execution = self.ex.open_position(
                 symbol, side, contracts, plan["leverage"], sl_price, tp_price,
@@ -1435,6 +1486,27 @@ class Engine:
             log.error("Entry failed for %s: %s", symbol, e)
             return False
 
+        return self._settle_entry(
+            plan, st, execution, symbol, side, sl_price, tp_price)
+
+    def _settle_entry(self, plan: dict, st: dict, execution: dict,
+                      symbol: str, side: str, sl_price: float,
+                      tp_price: float) -> bool:
+        """Everything that must happen once an entry has actually filled.
+
+        Extracted so that any path which can create a position runs the same
+        code: the trade journal row, the liquidation-distance check, the
+        protection audit that confirms the exchange-side stop really exists,
+        and the state bookkeeping that lets reconciliation recognise the
+        position later.
+
+        This exists because B7.5 needs a second entry path. A passive
+        maker-first fill creates a position exactly as an IOC fill does, and
+        a position that skipped any of the below is one the engine cannot
+        manage - unjournalled, unverified, or invisible to reconciliation.
+        Sharing the code is the only way both paths stay correct as it
+        changes.
+        """
         filled = float(execution["filled"])
         fill_price = float(execution["average"])
         contract_size = float(

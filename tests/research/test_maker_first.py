@@ -13,6 +13,7 @@ there - so the only real validation is a live demo account.
 """
 
 import unittest
+import unittest.mock
 from unittest.mock import Mock
 
 from agent.config import ConfigError, validate_config
@@ -35,6 +36,16 @@ def exchange(order_states, book=None):
     ex.x.fetch_order.side_effect = (
         lambda *a, **k: dict(remaining.pop(0) if len(remaining) > 1
                              else remaining[0]))
+    # A passive fill now runs the same settlement an IOC fill does, so the
+    # fixture has to provide what that settlement reads. That the fixture
+    # grew is the point of the refactor: the maker path can no longer create
+    # a position without the protection audit running.
+    ex.position = Mock(return_value={
+        "contracts": 10, "markPrice": 100.0, "id": "pos-1",
+        "liquidationPrice": 80.0, "info": {}})
+    ex.ensure_protection = Mock(
+        return_value={"stop_loss": True, "take_profit": True})
+    ex._alert = Mock()
     return ex
 
 
@@ -197,22 +208,149 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["execution"]["maker_first_wait_seconds"], 30)
 
 
-class NotWiredTests(unittest.TestCase):
-    """The integration is deliberately absent; this pins that it stays so.
+class WiredSafelyTests(unittest.TestCase):
+    """The integration, and the guarantees that made it safe to add.
 
-    If someone wires it later, this test fails and points them at the
-    reason - which is that a passive fill needs the same journal row,
-    liquidation check and protection audit an IOC fill gets.
+    The first attempt at this returned early on a passive fill and would have
+    created a position with no journal row, no liquidation check and no
+    protection audit. It was reverted. What made the second attempt safe was
+    extracting Exchange.settle_fill and Engine._settle_entry so both entry
+    paths run identical bookkeeping - these tests hold that.
     """
 
-    def test_the_entry_path_does_not_call_the_maker_primitive(self):
+    def _engine(self, enabled=True):
+        from unittest.mock import Mock as M
+        from agent.engine import Engine
+
+        engine = Engine.__new__(Engine)
+        cfg = valid_config()
+        cfg["execution"]["maker_first_enabled"] = enabled
+        cfg["execution"]["maker_first_wait_seconds"] = 1
+        engine.cfg = cfg
+        engine._audit_json = staticmethod(lambda payload: "{}")
+        engine.ex = M()
+        engine.alerts = M()
+        return engine
+
+    def _plan(self):
+        return {"symbol": "BTC/USDT:USDT", "direction": "long",
+                "leverage": 2, "notional": 1000.0, "sl_pct": 2.0,
+                "tp_pct": 4.0, "estimated_loss_pct": 2.62,
+                "risk_budget_usd": 100.0, "price": 100.0}
+
+    def test_disabled_never_touches_the_exchange(self):
+        engine = self._engine(enabled=False)
+
+        result = engine._maker_first_attempt(
+            self._plan(), {}, "BTC/USDT:USDT", "buy", 10, 97.0, 103.0, 100.0)
+
+        self.assertIsNone(result)
+        engine.ex.maker_first_entry.assert_not_called()
+
+    def test_an_unfilled_attempt_falls_through_to_crossing(self):
+        engine = self._engine()
+        engine.ex.maker_first_entry.return_value = {
+            "fill_rate": 0.0, "filled_contracts": 0, "resting": False,
+            "order_id": "o1", "execution": None}
+
+        with unittest.mock.patch("agent.engine.state.log_event"):
+            result = engine._maker_first_attempt(
+                self._plan(), {}, "BTC/USDT:USDT", "buy", 10, 97.0, 103.0,
+                100.0)
+
+        self.assertIsNone(result, "None means cross as normal")
+
+    def test_a_raising_attempt_falls_through_to_crossing(self):
+        """A broken experiment degrades to the behaviour that works."""
+        engine = self._engine()
+        engine.ex.maker_first_entry.side_effect = RuntimeError("boom")
+
+        with unittest.mock.patch("agent.engine.state.log_event"):
+            result = engine._maker_first_attempt(
+                self._plan(), {}, "BTC/USDT:USDT", "buy", 10, 97.0, 103.0,
+                100.0)
+
+        self.assertIsNone(result)
+
+    def test_a_possibly_resting_order_stops_the_entry(self):
+        """Crossing on top of a live order could double the position."""
+        engine = self._engine()
+        engine.ex.maker_first_entry.return_value = {
+            "fill_rate": 0.0, "filled_contracts": 0, "resting": True,
+            "order_id": "o1", "execution": None}
+
+        with unittest.mock.patch("agent.engine.state.log_event"):
+            result = engine._maker_first_attempt(
+                self._plan(), {}, "BTC/USDT:USDT", "buy", 10, 97.0, 103.0,
+                100.0)
+
+        self.assertIs(result, False, "False means stop, not cross")
+        engine.alerts.send.assert_called_once()
+
+    def test_a_fill_returns_a_settled_execution(self):
+        engine = self._engine()
+        settled = {"filled": 10, "average": 99.0,
+                   "protection": {"stop_loss": True}}
+        engine.ex.maker_first_entry.return_value = {
+            "fill_rate": 1.0, "filled_contracts": 10, "resting": False,
+            "order_id": "o1", "execution": settled}
+
+        with unittest.mock.patch("agent.engine.state.log_event"):
+            result = engine._maker_first_attempt(
+                self._plan(), {}, "BTC/USDT:USDT", "buy", 10, 97.0, 103.0,
+                100.0)
+
+        self.assertIs(result, settled)
+
+    def test_the_attempt_is_journalled_without_the_execution_blob(self):
+        engine = self._engine()
+        engine.ex.maker_first_entry.return_value = {
+            "fill_rate": 1.0, "filled_contracts": 10, "resting": False,
+            "order_id": "o1", "execution": {"filled": 10}}
+
+        with unittest.mock.patch("agent.engine.state.log_event") as logged:
+            engine._maker_first_attempt(
+                self._plan(), {}, "BTC/USDT:USDT", "buy", 10, 97.0, 103.0,
+                100.0)
+
+        self.assertEqual(logged.call_args.args[0], "maker_attempt")
+
+
+class SharedSettlementTests(unittest.TestCase):
+    """Both entry paths must run the same post-fill verification."""
+
+    def test_the_exchange_exposes_a_shared_settle_fill(self):
+        self.assertTrue(hasattr(Exchange, "settle_fill"))
+
+    def test_open_position_delegates_to_it(self):
         import inspect
-        from agent import engine as engine_mod
+        source = inspect.getsource(Exchange.open_position)
+        self.assertIn("self.settle_fill(", source)
 
-        source = inspect.getsource(engine_mod.Engine._execute_open)
+    def test_the_maker_path_delegates_to_it(self):
+        import inspect
+        source = inspect.getsource(Exchange.maker_first_entry)
+        self.assertIn("self.settle_fill(", source)
 
-        self.assertNotIn("maker_first_entry", source)
-        self.assertNotIn("_maker_first_attempt", source)
+    def test_the_engine_exposes_a_shared_settle_entry(self):
+        from agent.engine import Engine
+        self.assertTrue(hasattr(Engine, "_settle_entry"))
+
+    def test_both_engine_paths_delegate_to_it(self):
+        import inspect
+        from agent.engine import Engine
+
+        source = inspect.getsource(Engine._execute_open)
+
+        # Once for the maker fill, once for the IOC fill.
+        self.assertEqual(source.count("_settle_entry("), 2)
+
+    def test_settlement_runs_the_protection_audit(self):
+        import inspect
+        source = inspect.getsource(Exchange.settle_fill)
+
+        self.assertIn("ensure_protection", source)
+        self.assertIn("unprotected_position", source)
 
 
 if __name__ == "__main__":
