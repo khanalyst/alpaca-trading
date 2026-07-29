@@ -652,6 +652,34 @@ weeks of data, not hours.
 **Nothing in this step can place an order.** Every command is read-only
 against the journal.
 
+### The one command to remember
+
+```bash
+./.venv/bin/python research.py readiness
+```
+
+It reads the journal and tells you which checks are open, which are still
+collecting, and what would unblock each one. Run it whenever you wonder
+whether it is time yet — the answer comes from your data rather than from
+guessing.
+
+On a fresh install everything says "run the agent", which is correct.
+
+```
+  GATE   STATUS      WHAT IT MEANS
+  G1     PASS        B0.5 enrichment changes no decision
+  G2     ....        Replay reproduces the agent's own decisions
+                     12 recorded proposals; ~100 needed before a 99% ratio
+                     is meaningful
+                     -> keep the agent running
+  B7.5   BLKD        Passive entry validated on a live account
+                     gate G2 must pass first
+```
+
+`....` means collecting — it counted and came up short, and says by how much.
+`FAIL` means something is wrong and should be investigated before continuing;
+the command exits non-zero so the nightly run surfaces it.
+
 ### What to run, and when
 
 | After roughly | Command | Answers |
@@ -694,6 +722,36 @@ refuses to rank noise on purpose — see
 [`research/protocol.md`](research/protocol.md). At a few dozen trades, a
 sweep that names a winner has found the largest of a few dozen random
 numbers.
+
+### What is not finished yet
+
+Two things are complete as code and incomplete as evidence. Neither needs any
+work from you beyond letting the agent run.
+
+**Replay fidelity (G2).** The harness re-derives what the agent would have
+decided and compares it against what it actually did. The check needs about a
+hundred recorded proposals before its 99% threshold means anything — at ten,
+a single mismatch reads as 90% and fails a replay that is fine. Roughly a
+week of running. Until then `readiness` says how many are missing.
+
+**Passive entry (B7.5).** The agent can post a resting order and capture the
+spread instead of paying it, which is worth more than most parameter tuning.
+It is off by default because fill rates cannot be simulated — the order was
+never there to fill. Enabling it means G2 first, then
+`execution.maker_first_enabled: true` on demo, then twenty clean attempts.
+`readiness` counts them and fails immediately if any order could not be
+cancelled.
+
+Three longer waits, all just calendar time:
+
+| Check | Waiting for | Roughly |
+| --- | --- | --- |
+| G4 | Enough cycles to publish the funnel | Days |
+| G5 | 300 round trips to settle a contract question | Weeks |
+| G6 | Book-depth history for the cascade hypotheses | ~3 months |
+
+None of these block trading. The agent runs normally throughout; these decide
+what you are allowed to *conclude* from it.
 
 ---
 

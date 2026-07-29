@@ -139,6 +139,21 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
     def test_insufficient_sample_is_explained(self):
         self.assertIn("INSUFFICIENT_SAMPLE", BOTH)
 
+    def test_pending_work_is_documented_in_both(self):
+        """An undocumented blocker becomes a surprise three weeks in."""
+        for doc, name in ((README, "README"), (SETUP, "SETUP")):
+            self.assertIn("readiness", doc, f"{name} omits the readiness cmd")
+            self.assertIn("G2", doc, f"{name} omits gate G2")
+            self.assertIn("B7.5", doc, f"{name} omits B7.5")
+
+    def test_each_pending_item_says_how_it_completes(self):
+        self.assertIn("How it completes", README)
+        self.assertIn("Why it waits", README)
+
+    def test_the_known_gaps_are_stated_rather_than_hidden(self):
+        for gap in ("loss cooldown", "select_universe"):
+            self.assertIn(gap, README, f"known gap {gap!r} is undocumented")
+
     def test_the_new_journal_events_are_documented(self):
         for kind in ("book_state", "snapshot_enrichment", "shadow_decision"):
             self.assertIn(kind, README, f"journal event {kind} undocumented")

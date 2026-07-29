@@ -36,6 +36,12 @@ JOURNAL="${JOURNAL_DB:-$ROOT/runtime/$MODE/journal.db}"
 # Authoritative path: journal replay.
 # ---------------------------------------------------------------------------
 
+echo "=== $(date -u +%FT%TZ) readiness ==="
+# First, because it answers "is any of the rest worth running yet?" and
+# because it is the one command that fails loudly when a passive order may
+# have been left resting. Non-zero here is a real problem, not a delay.
+"$PY" research.py readiness --db "$JOURNAL" || readiness_failed=1
+
 if [ -f "$JOURNAL" ]; then
   echo "=== $(date -u +%FT%TZ) corpus ==="
   "$PY" research.py corpus stats --db "$JOURNAL"
@@ -106,5 +112,10 @@ echo "=== $(date -u +%FT%TZ) scoring the tournament ==="
 "$PY" research/tournament.py --data "$DATA"
 status=$?
 
-echo "=== $(date -u +%FT%TZ) done (tournament exit $status) ==="
+if [ "${readiness_failed:-0}" = "1" ]; then
+  echo "=== readiness reported a FAILED gate; see the top of this log ===" >&2
+  status=4
+fi
+
+echo "=== $(date -u +%FT%TZ) done (exit $status) ==="
 exit $status

@@ -645,6 +645,7 @@ strategy and **not** enough to raise a tier. See
 ### The research CLI
 
 ```bash
+python research.py readiness               # which gates are open or blocked
 python research.py corpus stats            # how much data is there?
 python research.py replay --check-fidelity # gate G2 — exits non-zero on failure
 python research.py funnel                  # gate G4 — the veto distribution
@@ -729,6 +730,83 @@ to the provider. Changing the prompt changes model behaviour, which forks the
 comparability of every observation either side of the change — so showing the
 model a new field is a deliberate, versioned act with its own batch, not a
 side effect of starting to record.
+
+### What is still pending, and how you will know
+
+Two things are finished as code and unfinished as evidence. Both wait on the
+agent running, and both fail the same quiet way if nobody checks — someone
+eventually decides they have waited long enough.
+
+`python research.py readiness` answers it mechanically instead:
+
+```
+  GATE   STATUS      WHAT IT MEANS
+  G1     PASS        B0.5 enrichment changes no decision
+  G2     ....        Replay reproduces the agent's own decisions
+                     12 recorded proposals; ~100 needed before a 99% ratio
+                     is meaningful (at this n one mismatch reads as 92%)
+                     -> keep the agent running
+  B7.5   BLKD        Passive entry validated on a live account
+                     gate G2 must pass first
+```
+
+| Status | Meaning |
+| --- | --- |
+| `PASS` | Satisfied, on evidence |
+| `READY` | Enough data exists; the command has not been run |
+| `....` | Collecting. The shortfall is counted, never estimated |
+| `BLKD` | Something upstream must happen first |
+| `FAIL` | It ran and did not pass. **A stop, not a delay** |
+
+The command exits non-zero on any failure, so the nightly run surfaces it
+rather than printing a report that looks fine.
+
+#### G2 — replay fidelity
+
+**Why it waits:** the 99% threshold is a ratio, so it is meaningless on a
+handful of events. At ten recorded proposals a single mismatch reads as 90%
+and fails a replay that is perfectly correct.
+
+**How it completes:** run the agent. At roughly fifteen proposals a day the
+gate becomes meaningful in about a week. `readiness` counts them and says how
+many are missing.
+
+**What "ready" does not mean:** that it passed. `READY` means the sample is
+sufficient and the command has not been run yet.
+
+#### B7.5 — passive entry
+
+**Why it waits:** fill rate cannot be inferred from history, because the
+passive order was never there. Every test runs against a mock, which proves
+the logic and says nothing about OKX's real post-only semantics or cancel
+races under load.
+
+**How it completes:** G2 first, then `execution.maker_first_enabled: true` on
+demo, then twenty clean attempts. `readiness` tracks the count.
+
+**The one thing that fails it:** an order that could not be cancelled and may
+still be resting. That is the single failure mode the design forbids, and it
+fails the gate immediately regardless of anything else.
+
+#### Gates still collecting
+
+| Gate | Waiting for | Roughly |
+| --- | --- | --- |
+| **G4** | Any corpus at all, to publish the funnel | Days |
+| **G5** | 300 matched round trips to rank the breakout discriminator | Weeks. The contract default is `none`, so nothing is baked in meanwhile |
+| **G6** | 150 observations per conditioning cell for H-G / H-H | ~3 months. Cascades are infrequent by construction |
+
+#### Known gaps, stated rather than hidden
+
+- **The replay does not simulate the loss cooldown.** It replays setup memory
+  — per-bar idempotency, semantic cooldown, failed-thesis re-entry — but the
+  live engine also cools a setup down after a losing exit, and the replay has
+  no PnL to mark with. Expect a small residual excess of replayed proposals
+  after a losing streak.
+- **`select_universe` needs an authenticated account endpoint,** so it cannot
+  be exercised without credentials.
+- **`research.py` and the `research/` package share a name.** Python resolves
+  the package first, so the CLI is a script and cannot be imported by name.
 
 ## Caveats and limitations
 

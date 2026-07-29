@@ -21,6 +21,7 @@ if str(REPO) not in sys.path:
 
 from research import (corpus, findings as findings_mod,         # noqa: E402
                       prices as prices_mod, protocol,
+                      readiness as readiness_mod,
                       replay as replay_mod, score, stats, sweep)
 
 
@@ -393,6 +394,24 @@ def cmd_cadence(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_readiness(args: argparse.Namespace) -> int:
+    """Answer "is it ready yet?" from the journal rather than from memory.
+
+    Two items in this programme wait on data rather than on engineering, and
+    both fail the same quiet way: someone decides they have waited long
+    enough. This makes the answer mechanical.
+    """
+    db = Path(args.db) if args.db else default_db(args.mode)
+    cfg = _load_config()
+    gates, stats = readiness_mod.report(db if db.exists() else None, cfg)
+    print(readiness_mod.format_report(
+        gates, stats, db if db.exists() else f"{db} (absent)"))
+
+    if any(g.status == readiness_mod.FAILED for g in gates):
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -478,6 +497,13 @@ def build_parser() -> argparse.ArgumentParser:
     cadence.add_argument("--db", default=None)
     cadence.add_argument("--mode", default="demo", choices=["demo", "live"])
     cadence.set_defaults(func=cmd_cadence)
+
+    ready = sub.add_parser(
+        "readiness",
+        help="which gates are open, blocked, or still collecting")
+    ready.add_argument("--db", default=None)
+    ready.add_argument("--mode", default="demo", choices=["demo", "live"])
+    ready.set_defaults(func=cmd_readiness)
 
     return parser
 
