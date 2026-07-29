@@ -394,9 +394,22 @@ API keys; the mode must match the keys in `.env`.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `interval_seconds` | 300 | Seconds between decisions. **Biggest cost lever** — raising it cuts the AI bill proportionally |
+| `interval_seconds` | 300 | Seconds between **housekeeping** cycles: reconciliation, circuit breakers, the max-hold force close |
+| `decision_interval_seconds` | *(unset)* | Seconds between **decisions** (the snapshot build and LLM call). Unset means every cycle decides, which is the pre-B9.2 behaviour. Set to `900` to align with the 15m signal bar |
 | `timeframes` | `[15m,1h,4h]` | Candle timeframes fed to the model |
 | `candles` | 120 | Candles per timeframe; also excludes coins lacking history |
+
+**The cost lever is `decision_interval_seconds`, not `interval_seconds`.**
+Measured over the corpus, 66.5% of cycles observe only signal bars that were
+already evaluated, and an LLM call on one of those cannot produce a fresh
+evaluation for any symbol — `strategy.evaluated_signal` blocks it. Aligning
+the decision cadence to the bar is roughly a **3× reduction in LLM spend**.
+
+Raising `interval_seconds` instead would buy the same saving and take the
+drawdown breaker, the daily-loss stop, reconciliation and the max-hold force
+close from a 5-minute reaction time to a 15-minute one. That is not an
+acceptable price for a cost reduction, which is why the two are separate.
+Verify the share on your own journal with `python research.py cadence`.
 
 **Choosing a strategy (the register)**
 
@@ -420,6 +433,54 @@ shipped `momentum`/`phase1-v3` is `T0_REJECTED` on the evidence in
 `research/results/edge-audit-2024-2026/`, so switching `mode: live` with it
 active fails validation and prints the reason. That is intended behaviour,
 not a bug to work around.
+
+**Exit policies**
+
+The model chooses `exit_policy` and deterministic code converts it into a
+target. Two are accepted: `fixed_rr` (target at `fixed_reward_risk` x the
+stop) and `extended_rr` (at `extended_reward_risk`).
+
+A third, `structure_target`, was **removed in batch 6.1**. It computed
+`max(stop x fixed_rr, distance to the recent extreme)`, and in both setups it
+was designed for the first term always won — a `range_breakout` fires with
+price already at the highs, so the remaining distance is near zero. It was
+therefore identical to `fixed_rr` precisely where it was meant to differ. An
+inert choice is worse than no choice: it makes the decision space look richer
+than it is and attributes outcomes to a policy that never applied.
+
+**Experimental setups (`hypothesis_id`)**
+
+`setup_type: "other"` no longer accepts anything the model invents. An
+experimental setup must name a hypothesis registered in
+`agent/hypotheses.py`, each of which states a mechanism, a falsifier and its
+own contract, and each of which gets **its own attribution** — so ten
+experiments produce ten rows rather than one average describing none of them.
+The list is versioned into the prompt; an unregistered id is rejected.
+
+Gated by `strategy.allow_experimental_setups_in_demo` (default `false`) and
+demo-only regardless.
+
+**Shadow evaluation of parameter variants (`research:` block)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `shadow_enabled` | `false` | Master switch. Absent or false is a complete no-op |
+| `shadow_variants` | `[]` | Variant ids from `research/variants.yaml` to evaluate each cycle |
+| `shadow_budget_ms` | 500 | Wall-clock budget; overrun abandons the rest and journals it |
+| `shadow_llm_variants` | `[]` | **Capped at 2.** Each costs a full extra model call per cycle (~288/day) |
+
+The evaluator is constructed from configuration alone — it receives no
+`Exchange`, no state handle, no journal writer — and a test walks its
+attribute graph to assert no exchange is reachable from it. It runs after
+trading decisions are committed, inside `try/except`, and writes only
+`shadow_decision` events.
+
+**Passive entry (`execution.maker_first_*`)**
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `maker_first_enabled` | `false` | H-K(ii). **The exchange primitive exists; the entry-path integration deliberately does not** — see [`research/plan/B7.5-record.md`](research/plan/B7.5-record.md) |
+| `maker_first_wait_seconds` | 20 | Bounded to 120, well inside a 15m bar |
 
 ```bash
 python main.py strategies --verbose   # the register, tiers and mechanisms
@@ -556,6 +617,119 @@ three times; exhausted messages are stored in
 
 ---
 
+## The research layer
+
+Two evidence paths live in this repository and **they are not equals**. The
+distinction decides what is allowed to put capital at risk, so it is worth
+stating before the commands.
+
+**Journal replay is authoritative.** Every cycle the agent journals an
+`llm_input` event holding the exact per-symbol snapshot and portfolio state
+the model received — which is precisely what `strategy.setup_evidence`,
+`strategy.build_setup_plan` and `RiskEngine.vet_open` consume, all three
+being pure functions of `(snapshot, cfg)`. So what any candidate
+configuration *would* have decided is computable exactly, offline, with no
+exchange risk and no LLM spend.
+
+**The OHLCV backtest is exploratory.** It recomputes indicators from
+downloaded candles, and some snapshot fields (`range_pos_pct`,
+`chg_24h_pct`, `vol_24h_musd`) come from the live 24h ticker and cannot be
+reconstructed afterwards. Its evidence is enough to withhold capital from a
+strategy and **not** enough to raise a tier. See
+[`research/plan/RECONCILIATION.md`](research/plan/RECONCILIATION.md).
+
+> A tier may be **lowered** on exploratory evidence and **raised** only on
+> journal-replay evidence. Withholding capital on suspicion is the right way
+> to be wrong; granting it on suspicion is not.
+
+### The research CLI
+
+```bash
+python research.py corpus stats            # how much data is there?
+python research.py replay --check-fidelity # gate G2 — exits non-zero on failure
+python research.py funnel                  # gate G4 — the veto distribution
+python research.py cadence                 # B9.2 evidence
+python research.py three-arm               # H-E: does the LLM earn its keep?
+python research.py sweep research/sweeps/regime_conditioning.yaml
+python research.py report                  # regenerate findings/ scorecards
+```
+
+Nothing here touches the trading path. Every command is read-only against
+`journal.db` plus a local price cache; none places an order, calls an LLM or
+writes runtime state.
+
+`research/nightly.sh` runs the whole sequence (authoritative path first) and
+is wired to `deploy/okx-research.timer`.
+
+### Gate G2 is a full stop
+
+`replay --check-fidelity` asserts that replaying the baseline reproduces at
+least 99% of the agent's own recorded decisions. If it does not, the replay
+is wrong and **every number downstream of it is worthless** — and the failure
+is silent, because a broken replay still emits a clean, plausible,
+internally consistent table describing a system nobody runs.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Reproduced ≥ 99%. Proceed. |
+| 2 | **Failed.** Stop and explain every mismatch before trusting anything. |
+| 4 | **Vacuous** — the corpus has no recorded decisions, so it reproduced 100% of nothing. Not evidence of fidelity. |
+
+### The three arms
+
+`three-arm` answers whether the LLM's value is in *selection*, in
+*rejection*, or absent. A two-arm test cannot tell those apart: if the model
+is a poor selector but a good vetoer, the pooled LLM arm looks mediocre and
+the conclusion drawn is "it does not earn its keep" — the wrong conclusion
+from the right data, and an expensive one.
+
+| Arm | Proposals from |
+| --- | --- |
+| A `deterministic` | The contract fired, so take it. The floor. |
+| B `recorded_llm` | The model's own recorded decisions. |
+| C `deterministic_vetoed` | Contract proposes; the model may only *suppress*. |
+
+### Variants, sweeps and the promotion protocol
+
+A **variant** is a named parameter hypothesis in
+[`research/variants.yaml`](research/variants.yaml) — `momentum.rr.fixed_2_5`,
+not a sixteen-character hash. It must state what it claims, and an override
+naming a path that does not exist is refused at registration rather than
+after a week of replay reporting no difference.
+
+Two kinds of axis, and only one divides the sample:
+
+- A **parameter axis** generates variants. Three settings at 100 round trips
+  each is 300 before it can conclude anything.
+- A **conditioning axis** partitions results. One replay produces every
+  bucket and reuses trades that already exist, so it is affordable at samples
+  where a parameter sweep is not. Buckets must be pre-registered.
+
+[`research/protocol.md`](research/protocol.md) is the promotion rule, applied
+by code. Promotion needs all five criteria (≥100 round trips, ≥3 settings,
+expectancy CI clearing the baseline, drawdown no worse, and an out-of-sample
+survival). Rejection needs the whole axis tried — a hypothesis is never
+killed by one badly chosen parameter value.
+
+**`INSUFFICIENT_SAMPLE` means the question is open, not answered in the
+negative.** It will be returned repeatedly and it is the most important
+verdict the harness produces.
+
+### What is recorded and never shown to the model
+
+Batch B0.5 journals fields months before anything reads them, because a
+snapshot taken without book depth in it can never be made to have book depth
+in it. `book_state` (per symbol, per cycle) and `snapshot_enrichment`
+(realised-vol ratio, UTC hour, BTC reference returns) are written every
+cycle and cost **1.88 MB/day** plus 3,168 OKX calls/day.
+
+They are withheld from the prompt by construction: enrichment lives under
+`_enrichment` keys and `brain.withhold_enrichment()` strips them on the way
+to the provider. Changing the prompt changes model behaviour, which forks the
+comparability of every observation either side of the change — so showing the
+model a new field is a deliberate, versioned act with its own batch, not a
+side effect of starting to record.
+
 ## Caveats and limitations
 
 Read these before running anything with real money.
@@ -646,6 +820,30 @@ you think.
 Plain-text logs are in `runtime/demo/agent.log` or `runtime/live/agent.log`.
 
 ---
+
+### Event kinds added by the research layer
+
+| Kind | Written | Read by |
+| --- | --- | --- |
+| `book_state` | Per symbol, per cycle — **including when the book is fine** | H-H. The entry guard already read depth but journalled it only on rejection, so every ordinary observation was discarded — and the ordinary readings are the baseline a cascade's collapse is measured against |
+| `snapshot_enrichment` | Per cycle | H-I, H-J, H-L. Realised-vol ratio, UTC hour, BTC reference returns. Deliberately **not** in `llm_input`, so the corpus loader joins it by `cycle_id` |
+| `shadow_decision` | Per variant, per symbol | Forward evidence for parameter variants that hold no capital |
+| `maker_attempt` | Per passive entry attempt | H-K(ii), once B7.5 is wired |
+| `decision_skipped` | When `decision_interval_seconds` defers a decision | Cost accounting |
+
+**Attribution columns** (`journal_schema_version` 4). `events` and `trades`
+gained `variant_id` and `strategy_config_version`. Live trading writes
+`variant_id = "live"`; replayed and shadow records carry their own readable
+ids, so the two populations can never be pooled by accident.
+
+`strategy_config_version` fingerprints only the blocks that can change a
+decision — `strategy`, `risk`, `execution`, `trading_costs` and
+`cycle.timeframes`. The older whole-config `config_version` is still written
+beside it, but it changes when an alert timeout changes, which forks the
+attribution bucket and splits an already-small sample for no reason.
+
+Rows written before schema 4 keep `NULL` rather than being back-filled with
+`"live"` — back-filling would assert an attribution nobody recorded.
 
 ## Historical backtest
 

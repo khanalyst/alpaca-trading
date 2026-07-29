@@ -492,6 +492,16 @@ After any edit here, restart the agent for it to take effect.
    any open positions keep their stop-losses on OKX's servers. (A Ctrl+C
    pause does not stick across restarts; an explicit `pause` command does.)
 
+3. After it has run for a while, check what it has collected:
+
+   ```bash
+   ./.venv/bin/python research.py corpus stats
+   ```
+
+   This is the command that answers whether there is enough data to conclude
+   anything yet. On a fresh install it will say there is not, which is
+   correct — see Step 10.
+
 ---
 
 ## Step 8 — Keep it running 24/7
@@ -630,6 +640,60 @@ cycles, `grep cache_read runtime/demo/agent.log` — from the second call onward
 it should show total input, fresh input, cache reads and cache-hit percentage.
 Total input includes cached tokens. If cache reads stay 0, see the note in
 `config.yaml` about per-model cache minimums.
+
+---
+
+## Step 10 — The research layer (once data exists)
+
+The agent writes a complete research corpus as a side effect of running. None
+of it is useful on day one, and that is expected: the questions below need
+weeks of data, not hours.
+
+**Nothing in this step can place an order.** Every command is read-only
+against the journal.
+
+### What to run, and when
+
+| After roughly | Command | Answers |
+| --- | --- | --- |
+| Immediately | `research.py corpus stats` | How much data is there? |
+| ~1 week | `research.py cadence` | How many LLM calls are buying a re-evaluation of nothing? |
+| ~2 weeks | `research.py replay --check-fidelity` | **Gate G2** — does the replay reproduce what the agent actually decided? |
+| ~2 weeks | `research.py funnel` | Which veto is actually binding? |
+| ~4–6 weeks | `research.py three-arm` | Does the LLM earn its keep? |
+| ~3 months | `research.py sweep research/sweeps/regime_conditioning.yaml` | Does the setup only work in one volatility regime? |
+
+### Run gate G2 before trusting anything else
+
+```bash
+./.venv/bin/python research.py replay --check-fidelity
+```
+
+If this fails, **stop**. The replay does not reproduce the agent's own
+decisions, so every number any other command produces is wrong — and wrong
+quietly, because a broken replay still prints a clean, plausible table.
+
+Exit `4` means the corpus has no recorded decisions yet, so it reproduced
+100% of nothing. That is not a pass; it means keep collecting.
+
+### Automating it
+
+`research/nightly.sh` runs the whole sequence and is wired to
+`deploy/okx-research.timer` (03:00 UTC daily). It stops on a G2 failure
+rather than producing a report that looks fine.
+
+```bash
+sudo systemctl enable --now okx-research.timer
+```
+
+### Expect to be told the sample is too small
+
+`INSUFFICIENT_SAMPLE` will come back repeatedly for the first few months.
+That means **the question is open**, not that the idea failed. The harness
+refuses to rank noise on purpose — see
+[`research/protocol.md`](research/protocol.md). At a few dozen trades, a
+sweep that names a winner has found the largest of a few dozen random
+numbers.
 
 ---
 
