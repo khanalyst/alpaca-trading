@@ -106,6 +106,13 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print(f"\nG2 fidelity: {report['reproduction_rate']:.4%} "
               f"({report['matched']}/{report['recorded']} recorded "
               f"decisions reproduced)")
+        if report["vacuous"]:
+            print("G2 VACUOUS: the corpus contains no recorded decisions, so "
+                  "the replay\nreproduced 100% of nothing. That is not "
+                  "evidence of fidelity. Run the agent\nuntil it has "
+                  "proposed setups, then re-check before trusting any "
+                  "number\ndownstream of this replay.", file=sys.stderr)
+            return 4
         if not report["passes_g2"]:
             print("G2 FAILED. Every number downstream of this replay is "
                   "worthless until it is explained. This is a full stop, "

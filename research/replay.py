@@ -453,4 +453,10 @@ def fidelity(result: ReplayResult, db) -> dict:
         "extra_count": len(extra),
         "reproduction_rate": (len(matched) / total) if total else 1.0,
         "passes_g2": ((len(matched) / total) >= 0.99) if total else True,
+        # A corpus with nothing recorded reproduces 100% of nothing. That is
+        # not evidence the replay is faithful, and treating it as a pass
+        # would let an empty or broken journal clear the keystone gate while
+        # every downstream number ran on air. Callers gating on G2 must check
+        # this and refuse to proceed, rather than reading the rate alone.
+        "vacuous": total == 0,
     }

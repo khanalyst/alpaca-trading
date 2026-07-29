@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
-# Nightly research cycle: refresh data, resolve forward evidence, re-score
-# every registered strategy, regenerate the report.
+# Nightly research cycle.
+#
+# Two evidence paths run here and they are not equals. The AUTHORITATIVE
+# path replays the recorded snapshot through the production contract and risk
+# engine; the EXPLORATORY path recomputes indicators from downloaded OHLCV.
+# See research/plan/RECONCILIATION.md - a tier may be lowered on the second
+# and raised only on the first.
+#
+# The authoritative path runs FIRST and its gate is hard. If G2 fidelity
+# fails, the replay does not reproduce the live agent's own decisions, every
+# number downstream of it is worthless, and this script stops rather than
+# producing a report that looks fine. That is the plan's instruction: treat a
+# G2 failure as a full stop, not a debugging task to work around.
 #
 # Idempotent and safe to kill: downloads resume, and every step rewrites its
-# output rather than appending. Exits non-zero if the tournament's benchmark
-# check fails, so a broken harness surfaces as a failed unit rather than as a
-# quietly wrong report.
+# output rather than appending.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,6 +28,68 @@ if [ ! -x "$PY" ]; then
   echo "no interpreter at $PY (set PYTHON=/path/to/python)" >&2
   exit 2
 fi
+
+PRICES="${PRICE_CACHE:-$ROOT/research/cache/prices.db}"
+JOURNAL="${JOURNAL_DB:-$ROOT/runtime/$MODE/journal.db}"
+
+# ---------------------------------------------------------------------------
+# Authoritative path: journal replay.
+# ---------------------------------------------------------------------------
+
+if [ -f "$JOURNAL" ]; then
+  echo "=== $(date -u +%FT%TZ) corpus ==="
+  "$PY" research.py corpus stats --db "$JOURNAL"
+
+  echo "=== $(date -u +%FT%TZ) gate G2: replay fidelity ==="
+  # Hard gate. Nothing below this line means anything if the replay cannot
+  # reproduce what the agent actually decided.
+  set +e
+  "$PY" research.py replay --db "$JOURNAL" --variant momentum.baseline \
+    --replay-mode recorded_llm --check-fidelity
+  g2=$?
+  set -e
+  case "$g2" in
+    0) ;;
+    4) echo "G2 vacuous - the corpus has no recorded decisions yet." >&2
+       echo "Continuing, but nothing below is validated evidence." >&2 ;;
+    *) echo "G2 FAILED - stopping. Every downstream number would be " >&2
+       echo "precise, plausible, internally consistent and wrong." >&2
+       exit 3 ;;
+  esac
+
+  echo "=== $(date -u +%FT%TZ) funnel (gate G4) ==="
+  # Published before any sweep: if the binding veto sits downstream of the
+  # strategy contract, no contract parameter can change the trade count.
+  "$PY" research.py funnel --db "$JOURNAL" --prices "$PRICES" || true
+
+  echo "=== $(date -u +%FT%TZ) decision cadence (B9.2 evidence) ==="
+  "$PY" research.py cadence --db "$JOURNAL" || true
+
+  echo "=== $(date -u +%FT%TZ) pre-registered conditioning axes ==="
+  # Conditioning first, always: these reuse every trade instead of dividing
+  # them, so they are affordable at samples where a parameter sweep is not.
+  for spec in "$ROOT"/research/sweeps/*.yaml; do
+    echo "--- $(basename "$spec")"
+    # A sweep that refuses an underpowered grid exits 3. That is a correct
+    # outcome, not a failure of the run.
+    "$PY" research.py sweep "$spec" --db "$JOURNAL" --prices "$PRICES" \
+      || echo "  (refused or incomplete; see above)"
+  done
+
+  echo "=== $(date -u +%FT%TZ) three-arm H-E ==="
+  "$PY" research.py three-arm --db "$JOURNAL" --prices "$PRICES" || true
+
+  echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
+  "$PY" research.py report
+else
+  echo "=== no journal at $JOURNAL; skipping the authoritative path ==="
+  echo "The corpus is written by the running agent. Until it exists, only" >&2
+  echo "exploratory evidence is available and no tier may be raised." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Exploratory path: recomputed OHLCV. Cannot raise a tier.
+# ---------------------------------------------------------------------------
 
 echo "=== $(date -u +%FT%TZ) refreshing market history ==="
 # Open interest and funding have short retention, so this re-fetches the

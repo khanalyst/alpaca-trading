@@ -57,6 +57,25 @@ class FidelityFixture(unittest.TestCase):
             valid_config(), variant_id="momentum.baseline",
             mode="recorded_llm").run(cycles, outputs)
 
+    def _synthetic(self, matched: int, missing: int):
+        """Record ``matched + missing`` events, reproduce only ``matched``.
+
+        Built directly rather than through a replay run so the boundary is
+        exercised at an exact rate, without depending on how portfolio
+        dynamics happen to distribute executions across cycles.
+        """
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm")
+        for i in range(matched):
+            self.record(f"c{i}", "BTC/USDT:USDT", "long")
+            result.decisions.append(replay.ReplayDecision(
+                cycle_id=f"c{i}", ts=float(i), symbol="BTC/USDT:USDT",
+                signal_ts=None, stage="executed", direction="long"))
+        for i in range(missing):
+            self.record(f"ghost{i}", "BTC/USDT:USDT", "long")
+        return result
+
+
 
 class ReproductionTests(FidelityFixture):
     def test_a_perfect_reproduction_passes_g2(self):
@@ -122,24 +141,6 @@ class ReproductionTests(FidelityFixture):
         self.assertFalse(report["passes_g2"])
         self.assertLess(report["reproduction_rate"], 0.99)
 
-    def _synthetic(self, matched: int, missing: int):
-        """Record ``matched + missing`` events, reproduce only ``matched``.
-
-        Built directly rather than through a replay run so the boundary is
-        exercised at an exact rate, without depending on how portfolio
-        dynamics happen to distribute executions across cycles.
-        """
-        result = replay.ReplayResult(
-            variant_id="momentum.baseline", mode="recorded_llm")
-        for i in range(matched):
-            self.record(f"c{i}", "BTC/USDT:USDT", "long")
-            result.decisions.append(replay.ReplayDecision(
-                cycle_id=f"c{i}", ts=float(i), symbol="BTC/USDT:USDT",
-                signal_ts=None, stage="executed", direction="long"))
-        for i in range(missing):
-            self.record(f"ghost{i}", "BTC/USDT:USDT", "long")
-        return result
-
     def test_ninety_nine_percent_passes_the_gate(self):
         report = replay.fidelity(self._synthetic(99, 1), self.db)
 
@@ -174,6 +175,32 @@ class ReproductionTests(FidelityFixture):
 
         self.assertEqual(len(report["missing"]), report["missing_count"])
         self.assertIn(("cX", "AAA/USDT:USDT", "long"), report["missing"])
+
+
+class VacuousGateTests(FidelityFixture):
+    """100% of nothing is not evidence of fidelity."""
+
+    def test_an_empty_corpus_is_marked_vacuous(self):
+        report = replay.fidelity(self.replay_baseline([], []), self.db)
+
+        self.assertTrue(report["vacuous"])
+        self.assertEqual(report["recorded"], 0)
+
+    def test_a_real_corpus_is_not_vacuous(self):
+        result = self._synthetic(matched=10, missing=0)
+
+        report = replay.fidelity(result, self.db)
+
+        self.assertFalse(report["vacuous"])
+        self.assertTrue(report["passes_g2"])
+
+    def test_vacuous_and_passing_are_distinguishable(self):
+        """A caller reading passes_g2 alone would be misled, so both exist."""
+        empty = replay.fidelity(self.replay_baseline([], []), self.db)
+
+        self.assertTrue(empty["passes_g2"])
+        self.assertTrue(empty["vacuous"],
+                        "the gate must expose that it checked nothing")
 
 
 if __name__ == "__main__":
