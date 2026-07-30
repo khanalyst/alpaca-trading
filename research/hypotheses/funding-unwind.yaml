@@ -59,7 +59,36 @@ reward_risk: 2.0
 max_hold_bars: 960
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-hypotheses_tested: 2
+# --- the parameterisations that will be tested -----------------------------
+# Registered 2026-07-30. The percentile is the whole hypothesis here: the claim
+# is that funding measures POSITIONING, so the unwind should strengthen as
+# positioning gets more crowded and weaken as it gets less. That is a
+# monotonicity prediction, and a hypothesis that scores best at whichever
+# percentile happens to be tried first is not making one.
+#
+# None of this can confirm anything on this window - the tier stays T1 by
+# in_sample_by_construction regardless of how the settings come back.
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The pre-registered 80th-percentile crowding threshold inherited from
+      funding-carry's decomposition.
+  - id: extreme_crowding
+    params:
+      percentile: 95.0
+      min_samples: 30
+    claim: >-
+      More crowded positioning should unwind harder. If expectancy does not
+      rise, funding is not measuring positioning pressure here.
+  - id: mild_crowding
+    params:
+      percentile: 60.0
+    claim: >-
+      Expectancy should fall towards the unconditional case as the crowding
+      requirement relaxes. If it does not, the percentile is not the signal.
+
+hypotheses_tested: 4
 multiple_testing_note: |
   Counted as 2, not 1: funding-carry and funding-unwind are the same entry
   rule tested under two different mechanism claims. The entry has been
