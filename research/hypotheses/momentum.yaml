@@ -34,7 +34,37 @@ horizons_bars: [96, 192]
 exit_policies: [fixed_rr, extended_rr, structure_target]
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-hypotheses_tested: 79
+# --- the parameterisations that will be tested -----------------------------
+# Registered 2026-07-30. Unlike the other hypotheses, momentum's axis has
+# already been explored: 79 walk-forward variants, 0 positive out-of-sample,
+# recorded in results/edge-audit-2024-2026. These three settings are not that
+# search repeated - they are the benchmark's reproduction check widened from one
+# point to three, so a harness fault that happens to flatter the shipped
+# configuration cannot hide behind a single number.
+#
+# The registered point tracks config.yaml, so it moves when the shipped
+# configuration moves. The two alternatives bracket it deliberately.
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The shipped configuration, sourced from config.yaml. The arm
+      benchmark_check compares against its stored expectation.
+  - id: target_2r
+    params:
+      fixed_reward_risk: 2.0
+    claim: >-
+      The pre-3R shipped target. Reproduces the earlier audit's parameterisation
+      so a change in the harness shows up as a change against it.
+  - id: wider_stop
+    params:
+      min_stop_atr_multiple: 1.5
+    claim: >-
+      A 1.5 ATR stop floor, the widest setting the shadow registry carries. A
+      benchmark null that turns positive here would mean the audit's stop-width
+      conclusion no longer reproduces.
+
+hypotheses_tested: 82
 multiple_testing_note: |
   79 pre-registered parameter variants scored on a purged walk-forward
   split. Share positive out-of-sample: 0.0%. There is no winner to discount.
