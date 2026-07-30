@@ -424,6 +424,136 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class SymbolVisibilityTests(unittest.TestCase):
+    """A simulated holding must not become a live candidate.
+
+    Variant accounts hold positions the exchange account does not, and those
+    symbols are fetched so each account can mark its own book. The channel
+    that opens is not the mark - it is everything downstream that reads the
+    symbol map: the model gets an extra candidate, and ``_market_context``
+    counts an extra firing instrument into the breadth veto. Both would let a
+    position that exists only in a database change one that exists on OKX.
+    """
+
+    @staticmethod
+    def _wide():
+        """A snapshot holding one live symbol and one shadow-only symbol.
+
+        Both rows carry a firing contract, so breadth counts two while only
+        one is live-eligible - which is the situation the veto reads wrong.
+        """
+        from agent import market
+        firing = {"trend_continuation": {"long": True, "short": False}}
+        snap = {
+            "BTC/USDT:USDT": symbol_snapshot(setup_evidence=firing),
+            "DOGE/USDT:USDT": symbol_snapshot(setup_evidence=firing),
+            "_market_context": {"benchmark": "BTC/USDT:USDT"},
+        }
+        snap["_market_context"].update(market._setup_crowding(snap))
+        return snap
+
+    def test_a_shadow_only_symbol_is_withheld_from_the_live_view(self):
+        from agent import market
+
+        view = market.restrict_snapshot(self._wide(), ["BTC/USDT:USDT"])
+
+        self.assertIn("BTC/USDT:USDT", view)
+        self.assertNotIn("DOGE/USDT:USDT", view)
+
+    def test_breadth_is_recomputed_so_it_describes_only_what_is_visible(self):
+        from agent import market
+
+        wide = self._wide()
+        view = market.restrict_snapshot(wide, ["BTC/USDT:USDT"])
+
+        # Both rows satisfy the continuation contract, so the wide snapshot
+        # counts two. Slicing the map without recomputing would leave the
+        # live path reading 2 while able to see 1.
+        self.assertEqual(
+            wide["_market_context"]["instruments_with_a_valid_setup"], 2)
+        self.assertEqual(
+            view["_market_context"]["instruments_with_a_valid_setup"], 1)
+        self.assertEqual(view["_market_context"]["instruments_scanned"], 1)
+        self.assertEqual(view["_market_context"]["benchmark"],
+                         "BTC/USDT:USDT")
+
+    def test_the_wide_snapshot_is_left_untouched(self):
+        from agent import market
+
+        wide = self._wide()
+        before = json.dumps(wide, sort_keys=True, default=str)
+
+        market.restrict_snapshot(wide, ["BTC/USDT:USDT"])
+
+        self.assertEqual(
+            json.dumps(wide, sort_keys=True, default=str), before)
+
+    def test_a_snapshot_with_nothing_to_withhold_is_returned_as_is(self):
+        from agent import market
+
+        wide = self._wide()
+
+        view = market.restrict_snapshot(
+            wide, ["BTC/USDT:USDT", "DOGE/USDT:USDT"])
+
+        self.assertIs(view, wide)
+
+    def test_an_empty_snapshot_survives_restriction(self):
+        from agent import market
+
+        self.assertEqual(market.restrict_snapshot({}, ["BTC/USDT:USDT"]), {})
+
+    def test_the_cycle_asks_the_model_only_about_live_symbols(self):
+        """End to end: a shadow holding never reaches the LLM or the veto."""
+        from agent import market
+
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = Mock()
+        engine.universe = ["BTC/USDT:USDT"]
+        engine.shadow = Mock()
+        engine.shadow.held_symbols.return_value = ["DOGE/USDT:USDT"]
+
+        # What the fetch layer returns for the union of both symbol sets.
+        wide = self._wide()
+        seen = {}
+
+        def fake_snapshot(ex, symbols, cfg):
+            seen["fetched"] = list(symbols)
+            return wide
+
+        with patch.object(market, "market_snapshot", fake_snapshot):
+            fetched = market.market_snapshot(
+                engine.ex,
+                list(dict.fromkeys(engine.universe
+                                   + engine.shadow.held_symbols())),
+                engine.cfg)
+        live_view = market.restrict_snapshot(fetched, engine.universe)
+
+        # The shadow symbol is fetched, so its account can mark its position.
+        self.assertIn("DOGE/USDT:USDT", seen["fetched"])
+        self.assertIn("DOGE/USDT:USDT", fetched)
+        # And it is invisible to everything the live path reads.
+        self.assertNotIn("DOGE/USDT:USDT", live_view)
+        self.assertEqual(
+            live_view["_market_context"]["instruments_with_a_valid_setup"], 1)
+
+    def test_the_engine_routes_the_restricted_view_to_the_live_path(self):
+        """Guards the wiring: a future edit must not pass the wide map on."""
+        import inspect
+
+        from agent import engine as engine_mod
+
+        source = inspect.getsource(engine_mod.Engine.cycle)
+        for call in ("self.llm.decide(live_snapshot",
+                     "self._journal_llm_input(live_snapshot",
+                     "self._record_shadow_decisions(live_snapshot",
+                     "self._record_observations(live_snapshot"):
+            self.assertIn(call, source, f"{call} is no longer restricted")
+        # The variant accounts still need the wide map to mark their books.
+        self.assertIn("self._advance_shadow_variants(snapshot", source)
+
+
 class NonInterferenceTests(unittest.TestCase):
     """Trading decisions must be byte-identical with and without shadow."""
 

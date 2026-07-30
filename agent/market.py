@@ -725,6 +725,30 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
     return out if len(out) > 1 else {}
 
 
+def restrict_snapshot(snapshot: dict, symbols: list[str]) -> dict:
+    """Narrow a snapshot to ``symbols``, recomputing market-wide context.
+
+    A snapshot is fetched for the union of everything that needs a mark this
+    cycle, which is wider than the set any one consumer is allowed to act on.
+    Slicing the symbol map alone is not enough: ``_market_context`` carries
+    breadth counts derived from *every* symbol in the map, and breadth drives
+    a risk veto. Dropping a symbol without recomputing the count would leave
+    the caller reading a number describing symbols it cannot see.
+    """
+    if not snapshot:
+        return snapshot
+    allowed = set(symbols)
+    tradable = [sym for sym in snapshot if not sym.startswith("_")]
+    if all(sym in allowed for sym in tradable):
+        return snapshot
+    view = {sym: value for sym, value in snapshot.items()
+            if sym.startswith("_") or sym in allowed}
+    context = dict(snapshot.get("_market_context") or {})
+    context.update(_setup_crowding(view))
+    view["_market_context"] = context
+    return view
+
+
 def _btc_reference_returns(ex, benchmark: str, cfg: dict) -> dict:
     """BTC 15m return over 1, 4 and 24 bars.
 

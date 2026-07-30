@@ -621,12 +621,22 @@ class Engine:
         if not decision_due and evaluator is None:
             return
 
-        symbols = list(dict.fromkeys(
-            self.universe + [p["symbol"] for p in positions]
-            + shadow_symbols))
+        # Two symbol sets, deliberately. The live path may only see what live
+        # universe selection chose plus what the exchange account actually
+        # holds. Symbols present solely because a local variant account holds
+        # them are fetched so that account can mark its own positions, and are
+        # withheld from everything else: they would otherwise reach the model
+        # as candidates and inflate the breadth count that vetoes opens, which
+        # would let a simulated position change a real one.
+        live_symbols = list(dict.fromkeys(
+            self.universe + [p["symbol"] for p in positions]))
+        symbols = list(dict.fromkeys(live_symbols + shadow_symbols))
         snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
         if snapshot and evaluator is not None:
             self._advance_shadow_variants(snapshot, now)
+        # Everything below this line runs on the restricted view, so the live
+        # decision is byte-identical to the one taken with shadow disabled.
+        live_snapshot = market.restrict_snapshot(snapshot, live_symbols)
 
         if not can_decide:
             return  # PAUSED: shadow marks advance, but there is no LLM call
@@ -654,20 +664,23 @@ class Engine:
             return
 
         # --- ask the brain using the same snapshot every variant just marked
-        if not snapshot:
+        if not live_snapshot:
             log.warning("Empty market snapshot; holding")
             return
 
         # Every registered contract is evaluated on this snapshot, not just
         # the one that is trading. Costs no LLM call and places no order.
-        self._record_shadow_decisions(snapshot)
+        # Restricted like the live path: a cross-strategy population whose
+        # symbol set moved with another variant's holdings would not be
+        # comparable from one cycle to the next.
+        self._record_shadow_decisions(live_snapshot)
 
         # B0.5: start the irreversible clock. These fields are journalled and
         # read by nothing for months - that is the point. A snapshot taken
         # today without open interest in it can never be made to have open
         # interest in it, so the only genuinely unrecoverable decision in the
         # programme is the decision not to record.
-        self._record_observations(snapshot)
+        self._record_observations(live_snapshot)
 
         portfolio = self._portfolio_view(equity, positions, st,
                                          day_pnl_pct, drawdown_pct)
@@ -680,9 +693,9 @@ class Engine:
         # The model is the one nondeterministic component in the pipeline.
         # Journal the exact provider request and the raw provider result so
         # every parsed decision - and every silent hold - can be reconstructed.
-        self._journal_llm_input(snapshot, portfolio, max_new)
+        self._journal_llm_input(live_snapshot, portfolio, max_new)
         try:
-            decisions = self.llm.decide(snapshot, portfolio, max_new)
+            decisions = self.llm.decide(live_snapshot, portfolio, max_new)
         except Exception as e:
             self._journal_llm_output()
             log.error("LLM call failed; holding this cycle: %s", e)
@@ -761,7 +774,7 @@ class Engine:
             if latest["state"] != state.RUNNING:
                 return
             prepared, why = self._prepare_setup_decision(
-                d, snapshot, st)
+                d, live_snapshot, st)
             if not prepared:
                 log.info("Rejected %s %s: %s", d.get("direction"),
                          d.get("symbol"), why)
@@ -769,11 +782,11 @@ class Engine:
                     {"symbol": d.get("symbol"), "why": why}))
                 continue
             plan, why = self.risk.vet_open(
-                prepared, equity, positions, snapshot,
-                                           st.get("cooldowns", {}), gross,
-                                           st.get("entry_feedback", {}),
-                                           st.get("entry_failures", {}),
-                                           st.get("active_trades", {}))
+                prepared, equity, positions, live_snapshot,
+                st.get("cooldowns", {}), gross,
+                st.get("entry_feedback", {}),
+                st.get("entry_failures", {}),
+                st.get("active_trades", {}))
             if not plan:
                 self._mark_setup_status(
                     st, prepared["setup_id"], "risk_rejected")

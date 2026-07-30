@@ -43,6 +43,14 @@ MIN_PAIRED_FIT_OBSERVATIONS = 70
 MIN_PAIRED_CONFIRM_OBSERVATIONS = 30
 PAIR_BOOTSTRAP_KIND = "paired_cluster_block"
 PAIR_CLUSTER_SECONDS = 21_600
+# Independent six-hour market episodes required before a clustered interval is
+# allowed to decide anything. The pair minimums above count trades, and trades
+# inside one episode are close to one observation: a hundred of them would
+# otherwise produce a *narrower* interval than ten spread across a month,
+# which inverts the thing the clustered bootstrap exists to correct. Eight
+# episodes is two days of distinct market conditions - the least that can
+# separate an edge from one afternoon.
+MIN_BOOTSTRAP_CLUSTERS = 8
 
 
 @dataclass
@@ -282,6 +290,8 @@ def paired_arm_comparison(left: list, right: list) -> dict:
             "kind": PAIR_BOOTSTRAP_KIND,
             "cluster_seconds": PAIR_CLUSTER_SECONDS,
             "seed": 20260728,
+            "clusters": int(getattr(interval, "clusters", 0) or 0),
+            "min_clusters": MIN_BOOTSTRAP_CLUSTERS,
         },
     }
 
@@ -301,6 +311,11 @@ def paired_window_adequate(comparison: dict, minimum: int) -> bool:
         and interval is not None
         and int(getattr(interval, "n", -1))
         == int(comparison.get("paired_n") or 0)
+        # Enough independent market episodes for the width to mean something,
+        # and never a collapsed interval: one cluster resamples to itself, so
+        # its zero width is an absence of evidence that reads like proof.
+        and int(bootstrap.get("clusters") or 0) >= MIN_BOOTSTRAP_CLUSTERS
+        and not interval.is_degenerate()
     )
 
 
@@ -412,9 +427,12 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             INSUFFICIENT_SAMPLE, "paired proposal coverage is inadequate",
             f"fit-selected setting {best_id} has {full_pair['paired_n']} "
             f"resolved pairs covering {full_pair['pair_coverage_pct']:.1f}% "
-            f"of the proposal union; promotion requires {MIN_ROUND_TRIPS} "
-            f"pairs, {MIN_PAIR_COVERAGE_PCT:.0f}% coverage, and no duplicate "
-            "proposal identities",
+            f"of the proposal union across "
+            f"{full_pair['bootstrap']['clusters']} market episodes; promotion "
+            f"requires {MIN_ROUND_TRIPS} pairs, "
+            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, "
+            f"{MIN_BOOTSTRAP_CLUSTERS} episodes, and no duplicate proposal "
+            "identities",
             {"best": best_id, "paired": _paired_evidence(full_pair)})
 
     fit_pair = paired_arm_comparison(best_fit, baseline_fit)
@@ -424,9 +442,11 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             INSUFFICIENT_SAMPLE, "fit-window paired evidence is inadequate",
             f"fit-selected setting {best_id} has {fit_pair['paired_n']} "
             f"resolved fit pairs covering {fit_pair['pair_coverage_pct']:.1f}% "
-            f"of the fit proposal union; promotion requires "
-            f"{MIN_PAIRED_FIT_OBSERVATIONS} pairs, "
-            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, no duplicates, and the "
+            f"of the fit proposal union across "
+            f"{fit_pair['bootstrap']['clusters']} market episodes; promotion "
+            f"requires {MIN_PAIRED_FIT_OBSERVATIONS} pairs, "
+            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, "
+            f"{MIN_BOOTSTRAP_CLUSTERS} episodes, no duplicates, and the "
             "registered dependence-aware bootstrap",
             {"best": best_id, "fit_paired": _paired_evidence(fit_pair)})
     fit_difference = fit_pair["interval"]
@@ -466,9 +486,11 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             f"fit-selected setting {best_id} has {confirm_pair['paired_n']} "
             f"resolved confirmation pairs covering "
             f"{confirm_pair['pair_coverage_pct']:.1f}% of the confirmation "
-            f"proposal union; promotion requires "
-            f"{MIN_PAIRED_CONFIRM_OBSERVATIONS} pairs, "
-            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, no duplicates, and the "
+            f"proposal union across "
+            f"{confirm_pair['bootstrap']['clusters']} market episodes; "
+            f"promotion requires {MIN_PAIRED_CONFIRM_OBSERVATIONS} pairs, "
+            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, "
+            f"{MIN_BOOTSTRAP_CLUSTERS} episodes, no duplicates, and the "
             "registered dependence-aware bootstrap",
             {"best": best_id, "split": split,
              "confirmation_paired": _paired_evidence(confirm_pair)})

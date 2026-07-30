@@ -34,6 +34,10 @@ finding, it is an opinion with a timestamp.
 4. **The fit window contains ≥ 70 resolved pairs**, with ≥ 80% coverage, no
    duplicate identities and the registered six-hour paired cluster/block
    bootstrap. These are separate requirements from the full-sample floor.
+4b. **Every window spans ≥ 8 distinct six-hour market episodes.** Trades
+   inside one episode are close to one observation, and a single-cluster
+   interval collapses to zero width — an absence of evidence that reads as
+   certainty. See "Pairing and dependence".
 5. **The paired fit-window delta interval is entirely positive.** Point
    estimates are not enough.
 6. **Max drawdown ≤ the baseline's.** A better expectancy bought with a
@@ -84,6 +88,17 @@ pairs, 30 confirmation pairs and 80% coverage in every relevant population.
 The natural 70/30 allocation of the 100-pair promotion floor therefore cannot
 be satisfied by accumulating nearly all evidence on only one side of the
 chronological cutoff.
+
+**Pairs are not the precision.** A clustered bootstrap's width is governed by
+the number of independent episodes, not the number of trades inside them, so
+every window additionally requires **≥ 8 distinct six-hour episodes**
+(`MIN_BOOTSTRAP_CLUSTERS`). Without that floor the arithmetic inverts: pack a
+hundred pairs into one afternoon and there is only one cluster to resample, so
+every draw returns the same mean, the percentiles collapse onto the point
+estimate, and a zero-width interval clears any "entirely positive" test. Ten
+pairs spread over a month would report an honest interval and be refused while
+the single afternoon promoted. The interval carries its own cluster count and a
+collapsed one is rejected outright, never read as certainty.
 
 ## The out-of-sample split
 
