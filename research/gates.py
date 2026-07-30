@@ -453,6 +453,120 @@ def tier_from_gates(results: list[GateResult]) -> tuple[str, str]:
         "cleared every exploratory offline gate; authoritative recorded "
         "replay confirmation is still required for T3_VALIDATED")
 
+def _structurally_failed(results: list[GateResult]) -> bool:
+    """Did this setting fail for a reason no parameter value can fix?
+
+    A missing mechanism or falsifier is a property of the hypothesis, not of
+    the thresholds it was tested at, so it is rejected at any number of
+    settings. Everything else the battery can fail - the nulls, the placebo,
+    the attribution - is measured from data and could in principle come out
+    differently at a different threshold, which is exactly why one setting
+    must not be allowed to speak for the axis.
+    """
+    by_name = {r.name: r for r in results}
+    return "has_mechanism" in by_name and not by_name["has_mechanism"].passed
+
+
+def tier_from_settings(settings: list[dict],
+                       min_settings: int = MIN_SETTINGS_TO_REJECT
+                       ) -> tuple[str, str, dict]:
+    """Decide a tier for the hypothesis, not for one parameterisation.
+
+    ``settings`` is every pre-registered parameterisation of one hypothesis,
+    each already scored by ``run_all`` and ``tier_from_gates``. The unit of
+    decision is the whole set, because a mechanism rejected at one threshold
+    has not been tested - it has been guessed at once. ``protocol.md``
+    criterion 1 states this rule for the journal path and
+    ``protocol.MIN_AXIS_SETTINGS`` is the same number: *a hypothesis is never
+    killed by one badly chosen parameter value.*
+
+    Two asymmetries, both deliberate and both inherited from that protocol:
+
+    **Rejection needs the whole set.** Every setting must fail, and there must
+    be at least ``min_settings`` of them. Fewer, and the verdict is
+    ``T1_HYPOTHESIS`` with the reason stated: the question is open, not
+    answered in the negative. This is the offline twin of
+    ``INSUFFICIENT_SAMPLE``.
+
+    **Promotion pays for the search.** The awarded tier comes from the best
+    setting, and the best of *k* settings is the largest of *k* random numbers
+    unless the search is charged for. So a tier above ``T1_HYPOTHESIS``
+    additionally requires that setting to survive a Holm correction across the
+    settings tested. Without it, adding parameterisations to protect a
+    mechanism from a bad guess would quietly become a way to manufacture a
+    candidate.
+    """
+    from research.protocol import correct_family
+
+    if not settings:
+        raise ValueError("a hypothesis needs at least one scored setting")
+
+    corrected = correct_family({
+        setting["setting_id"]: _significance_row(setting)
+        for setting in settings})
+    for setting in settings:
+        setting["significant_corrected"] = bool(
+            corrected[setting["setting_id"]]["significant_corrected"])
+        setting["p_adjusted"] = corrected[setting["setting_id"]]["p_adjusted"]
+
+    ranked = sorted(
+        settings,
+        key=lambda s: (TIER_ORDER.index(s["tier"]),
+                       s["significant_corrected"],
+                       _finite_or(s.get("headline", {}).get("expectancy_r"),
+                                  -1e9)),
+        reverse=True)
+    best = ranked[0]
+    tested = len(settings)
+
+    if any(_structurally_failed(setting["results"]) for setting in settings):
+        return "T0_REJECTED", best["why"], best
+
+    if best["tier"] == "T0_REJECTED":
+        if tested < min_settings:
+            return "T1_HYPOTHESIS", (
+                f"every one of {tested} tested parameterisation(s) failed, but "
+                f"{min_settings} are required before the hypothesis itself may "
+                f"be rejected: a mechanism killed at one threshold has been "
+                f"guessed at once, not tested. Best failure: {best['why']}"
+            ), best
+        return "T0_REJECTED", (
+            f"all {tested} pre-registered parameterisations fail, so this is "
+            f"the mechanism and not one badly chosen threshold. "
+            f"{best['setting_id']}: {best['why']}"), best
+
+    if (TIER_ORDER.index(best["tier"]) > TIER_ORDER.index("T1_HYPOTHESIS")
+            and tested > 1 and not best["significant_corrected"]):
+        return "T1_HYPOTHESIS", (
+            f"{best['setting_id']} reaches {best['tier']} on its gates, but it "
+            f"is the best of {tested} parameterisations and does not survive "
+            f"the Holm correction across them (p_adj "
+            f"{best['p_adjusted']:.3f}). The search has to be paid for before "
+            f"the winner counts"), best
+
+    detail = best["why"]
+    if tested > 1:
+        detail = f"{best['setting_id']} of {tested} parameterisations: {detail}"
+    return best["tier"], detail, best
+
+
+def _significance_row(setting: dict) -> dict:
+    """The interval ``correct_family`` corrects, from one scored setting."""
+    headline = setting.get("headline") or {}
+    interval = headline.get("expectancy_r_ci95") or (float("nan"),) * 2
+    return {"n": int(headline.get("trades") or 0),
+            "ci_low": interval[0], "ci_high": interval[1]}
+
+
+def _finite_or(value, fallback: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+
+
 
 def run_all(spec, frames, membership, contract,
             cost_name: str = "base",
