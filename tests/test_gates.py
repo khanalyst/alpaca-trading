@@ -405,6 +405,120 @@ class PreRegistrationTests(unittest.TestCase):
                 data = yaml.safe_load(path.read_text())
                 self.assertIn(data["strategy_id"], REGISTRY)
 
+    def setting(setting_id, tier, *, expectancy_r=0.1, trades=400,
+                ci=(0.05, 0.15), gates_list=None, registered=False):
+        """One scored parameterisation, as tier_from_settings receives it."""
+        return {
+            "setting_id": setting_id, "params": {} if registered else {"x": 1},
+            "claim": "a stated claim", "registered": registered,
+            "tier": tier, "why": f"{setting_id} said so",
+            "results": gates_list if gates_list is not None else all_passing(),
+            "headline": {"trades": trades, "expectancy_r": expectancy_r,
+                         "expectancy_pct": expectancy_r * 0.5,
+                         "expectancy_r_ci95": list(ci)},
+    }
+
+
+class SettingsAxisTests(unittest.TestCase):
+    """The unit of decision is the hypothesis, not one parameterisation."""
+
+    def test_the_reject_floor_matches_the_promotion_protocol(self):
+        from research.protocol import MIN_AXIS_SETTINGS
+
+        self.assertEqual(gates.MIN_SETTINGS_TO_REJECT, MIN_AXIS_SETTINGS)
+
+    def test_the_tier_ladder_matches_the_register(self):
+        from agent.registry import TIERS
+
+        self.assertEqual(gates.TIER_ORDER, TIERS)
+
+    def test_one_failing_setting_cannot_reject_the_hypothesis(self):
+        """This is the flush-fade failure, as a test."""
+        tier, why, _ = gates.tier_from_settings(
+            [setting("registered", "T0_REJECTED", registered=True)])
+
+        self.assertEqual(tier, "T1_HYPOTHESIS")
+        self.assertIn("guessed at once", why)
+
+    def test_two_failing_settings_are_still_not_enough(self):
+        tier, _, _ = gates.tier_from_settings([
+            setting("registered", "T0_REJECTED", registered=True),
+            setting("other", "T0_REJECTED")])
+
+        self.assertEqual(tier, "T1_HYPOTHESIS")
+
+    def test_three_failing_settings_reject_the_hypothesis(self):
+        tier, why, _ = gates.tier_from_settings([
+            setting("registered", "T0_REJECTED", registered=True),
+            setting("violent_only", "T0_REJECTED"),
+            setting("permissive", "T0_REJECTED")])
+
+        self.assertEqual(tier, "T0_REJECTED")
+        self.assertIn("all 3 pre-registered parameterisations fail", why)
+
+    def test_a_missing_mechanism_is_rejected_at_any_setting_count(self):
+        """No threshold can supply a mechanism the hypothesis does not state."""
+        broken = all_passing()
+        broken[0] = result("has_mechanism", False)
+
+        tier, _, _ = gates.tier_from_settings(
+            [setting("registered", "T0_REJECTED", registered=True,
+                     gates_list=broken)])
+
+        self.assertEqual(tier, "T0_REJECTED")
+
+    def test_the_best_setting_carries_the_tier(self):
+        tier, why, best = gates.tier_from_settings([
+            setting("registered", "T0_REJECTED", registered=True,
+                    ci=(-0.3, -0.1), expectancy_r=-0.2),
+            setting("violent_only", "T2_CANDIDATE", ci=(0.20, 0.30),
+                    expectancy_r=0.25),
+            setting("permissive", "T0_REJECTED", ci=(-0.2, -0.05),
+                    expectancy_r=-0.1)])
+
+        self.assertEqual(tier, "T2_CANDIDATE")
+        self.assertEqual(best["setting_id"], "violent_only")
+        self.assertIn("violent_only of 3 parameterisations", why)
+
+    def test_the_search_is_paid_for_before_the_winner_counts(self):
+        """Best of k is the largest of k random numbers until corrected."""
+        marginal = (0.001, 0.400)
+        tier, why, _ = gates.tier_from_settings([
+            setting("registered", "T0_REJECTED", registered=True,
+                    ci=(-0.3, -0.1)),
+            setting("a", "T2_CANDIDATE", ci=marginal),
+            setting("b", "T1_HYPOTHESIS", ci=marginal),
+            setting("c", "T1_HYPOTHESIS", ci=marginal),
+            setting("d", "T1_HYPOTHESIS", ci=marginal),
+            setting("e", "T1_HYPOTHESIS", ci=marginal)])
+
+        self.assertEqual(tier, "T1_HYPOTHESIS")
+        self.assertIn("does not survive the Holm correction", why)
+
+    def test_a_lone_setting_is_not_charged_for_a_search(self):
+        tier, _, _ = gates.tier_from_settings(
+            [setting("registered", "T2_CANDIDATE", registered=True,
+                     ci=(0.001, 0.400))])
+
+        self.assertEqual(tier, "T2_CANDIDATE")
+
+    def test_every_setting_carries_its_corrected_figure(self):
+        settings = [
+            setting("registered", "T0_REJECTED", registered=True),
+            setting("a", "T2_CANDIDATE"),
+            setting("b", "T1_HYPOTHESIS")]
+
+        gates.tier_from_settings(settings)
+
+        for row in settings:
+            with self.subTest(setting=row["setting_id"]):
+                self.assertIn("p_adjusted", row)
+                self.assertIn("significant_corrected", row)
+
+    def test_no_settings_at_all_is_an_error(self):
+        with self.assertRaises(ValueError):
+            gates.tier_from_settings([])
+
 
 if __name__ == "__main__":
     unittest.main()
