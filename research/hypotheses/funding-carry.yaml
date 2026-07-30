@@ -40,7 +40,38 @@ reward_risk: 2.0
 max_hold_bars: 960         # 10 days
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-hypotheses_tested: 1
+# --- the parameterisations that will be tested -----------------------------
+# Registered 2026-07-30. This hypothesis was rejected on ATTRIBUTION, not on a
+# threshold: funding contributed +0.039% of a +2.008% result. A crowding
+# threshold cannot fix that, and the expectation is that all three settings
+# fail gate 5 for the same reason.
+#
+# They are registered anyway, and the prediction is written here before the
+# run: an axis-wide failure is evidence about the mechanism, whereas the single
+# point it was rejected on was evidence about one guess. If instead the funding
+# share rises materially at the 95th percentile, the carry claim was thrown out
+# too early and the retest condition below applies.
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The originally pre-registered crowding threshold, kept so the +2.008%
+      result and its 2% funding attribution stay reproducible.
+  - id: extreme_crowding
+    params:
+      percentile: 95.0
+      min_samples: 30
+    claim: >-
+      If the return source is carry, the funding share of the result must rise
+      as crowding becomes more extreme, because the rate paid is the return.
+  - id: mild_crowding
+    params:
+      percentile: 60.0
+    claim: >-
+      The mirror test: at mild crowding the carry is smaller, so a result that
+      holds up here is a directional result wearing a carry label.
+
+hypotheses_tested: 3
 multiple_testing_note: |
   One parameter set, registered before the first run.
 
