@@ -8,6 +8,19 @@ is p-hacking with extra steps. The only defence is a rule fixed in advance
 that code applies mechanically — including on the fourth consecutive occasion
 it says the sample is too small.
 
+
+## Amendments
+
+A rule fixed in advance can still be wrong, and the honest way to change one
+is in public, before the evidence that would benefit from the change exists.
+Every amendment is recorded here with its date and its reason. An amendment
+made while a candidate is waiting on the criterion it changes is not an
+amendment, it is a result being negotiated.
+
+| Date | Amendment | Reason |
+| --- | --- | --- |
+| 2026-07-30 | **Criterion 10 added**: a Holm correction across every axis evaluated in one qualification run. **Criterion 5 reclassified** as a selection screen rather than an independent test. | The correction existed only for conditioning cells, so the path that actually qualifies an edge corrected nothing while this document claimed the corrected figure was the only quotable one. Five axes are registered and the count grows with the registry. No variant had forward evidence at the time, so nothing was pending on either criterion. |
+
 ---
 
 ## The verdicts
@@ -39,7 +52,11 @@ finding, it is an opinion with a timestamp.
    interval collapses to zero width — an absence of evidence that reads as
    certainty. See "Pairing and dependence".
 5. **The paired fit-window delta interval is entirely positive.** Point
-   estimates are not enough.
+   estimates are not enough. **This is a selection screen, not a test.** The
+   setting was chosen as the best of its axis on this same window, so the
+   interval is inflated by that selection and cannot be quoted as evidence.
+   It is here to stop a winner being carried forward on a point estimate;
+   criterion 9 is what the claim rests on.
 6. **Max drawdown ≤ the baseline's.** A better expectancy bought with a
    deeper hole is not an improvement.
 7. **The setting survives the chronological 70/30 split.** One cutoff is
@@ -48,7 +65,22 @@ finding, it is an opinion with a timestamp.
 8. **The confirmation window contains ≥ 30 resolved pairs**, with ≥ 80%
    coverage, no duplicate identities and the same registered dependence-aware
    bootstrap.
-9. **The paired confirmation delta interval is entirely positive.**
+9. **The paired confirmation delta interval is entirely positive.** This is
+   the criterion the claim rests on: the window is held out, it did not choose
+   the winner, and it is the interval criterion 10 corrects.
+10. **The confirmation result survives a Holm correction across every axis
+   evaluated in the same qualification run.** Each axis is a separate chance
+   to promote something, so a 5% test performed across five axes is not a 5%
+   test. The family is every axis that produced a valid verdict in the run,
+   including the axes that failed earlier — an axis that failed still consumed
+   a chance, and dropping it would shrink the family exactly when a candidate
+   needs the family small. `correct_axis_family()` records the family size, the
+   adjusted figure and the axis list on every verdict, promoted or not, and
+   `research.py forward-qualify` persists one `forward_axis_family` analysis
+   per run so the count that governed the decision is auditable afterwards.
+   A promotion that fails the correction becomes `CONTINUE`: the axis is not
+   refuted, it has not cleared a bar that accounts for how many axes were
+   asked the same question.
 
 ## Rejection — either
 
@@ -125,10 +157,28 @@ between the windows marks the comparison as not comparable.
 Six hypotheses, several conditioning cells each, against a few hundred round
 trips. Something will look significant.
 
-`correct_family()` applies a Holm–Bonferroni correction across each batch,
-and **the corrected figure is the only one any recommendation may quote.**
-The uncorrected significance flag is deliberately not carried forward into
-the output.
+**The corrected figure is the only one any recommendation may quote.** The
+uncorrected significance flag is deliberately not carried forward into any
+output. Two corrections apply, at the two places a family exists, and both are
+Holm–Bonferroni:
+
+
+| Family | Applied by | Corrects |
+| --- | --- | --- |
+| Conditioning cells in one sweep | `correct_family()` | Several buckets of one axis tested against the same corpus |
+| Axes in one qualification run | `correct_axis_family()` | Criterion 10. Several axes each given a chance to promote a winner |
+
+Until 2026-07-30 only the first existed, which meant the sweep report was
+corrected and the path that actually qualified an edge for paper was not. That
+is the wrong way round: a conditioning cell produces a paragraph, an axis
+produces a variant with its own paper account.
+
+**Where the correction is *not* applied, and why.** Within an axis, the winner
+is chosen as the best of its settings on the fit window. That selection is
+handled by holding out the confirmation window rather than by correcting the
+fit interval, because correcting a screen and then testing on held-out data
+would charge the same multiplicity twice. Criterion 5 is therefore explicitly
+labelled a screen.
 
 The p-values are approximated from each bucket's bootstrap interval. That is
 coarse, and it is the honest resolution available at this sample size — it is
