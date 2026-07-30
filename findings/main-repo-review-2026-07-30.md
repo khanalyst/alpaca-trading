@@ -142,7 +142,7 @@ registered variant has a committed card; each card's `Hypothesis`, `Status` and
 `Overrides` match the registry; the index links every card and every document
 beside it. All were confirmed to fail when the defects are reintroduced.
 
-### R1-04 — the packet-to-register lock is not machine-checkable · **Recommended**
+### R1-04 — the packet-to-register lock is not machine-checkable · **Fixed**
 
 `StrategySpec.evidence` is a free-form tuple of paths. Nothing requires a spec
 at `T3_VALIDATED` or above to cite the SHA-256 of the packet that authorised
