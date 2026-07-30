@@ -480,14 +480,14 @@ class FamilyCorrectionTests(unittest.TestCase):
         self.assertEqual(corrected["a"]["verdict"],
                          stats.INSUFFICIENT_SAMPLE)
         
-    def promoted(axis_id, low, high, n=120):
-        """A PROMOTE verdict carrying one confirmation interval."""
-        return protocol.Verdict(
-            protocol.PROMOTE, "every promotion criterion holds",
-            f"{axis_id} cleared every criterion",
-            {"best": f"{axis_id}.best",
-             "confirmation_interval": {"point": (low + high) / 2, "low": low,
-                                       "high": high, "n": n}})
+def promoted(axis_id, low, high, n=120):
+    """A PROMOTE verdict carrying one confirmation interval."""
+    return protocol.Verdict(
+        protocol.PROMOTE, "every promotion criterion holds",
+        f"{axis_id} cleared every criterion",
+        {"best": f"{axis_id}.best",
+         "confirmation_interval": {"point": (low + high) / 2, "low": low,
+                                   "high": high, "n": n}})
 
 
 class AxisFamilyCorrectionTests(unittest.TestCase):

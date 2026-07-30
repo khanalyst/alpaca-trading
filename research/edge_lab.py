@@ -264,13 +264,23 @@ class SymbolFrame:
             rate_pct[ok] = f_rate[f_index[ok]] * 100
             pct_rank[ok] = ranks[f_index[ok]]
             samples[ok] = counts[f_index[ok]].astype(int)
-            nxt = np.where(f_index + 1 < len(f_ts),
-                           np.clip(f_index + 1, 0, len(f_ts) - 1), -1)
-            has_next = ok & (f_index + 1 < len(f_ts))
-            next_minutes[has_next] = np.maximum(
-                0.0, (f_ts[nxt[has_next]] - signal_end[has_next]) / 60_000)
-            interval_hours[has_next] = (
-                f_ts[nxt[has_next]] - f_ts[f_index[has_next]]) / HOUR_MS
+            # Derive the next settlement from the current/previous observed
+            # interval. Looking up f_ts[f_index + 1] makes the last retained
+            # bar change when future funding rows are removed, which is a
+            # direct lookahead leak at a truncated corpus boundary.
+            interval_ms = np.full(len(f_ts), 8 * HOUR_MS, dtype=float)
+            if len(f_ts) > 1:
+                observed = np.diff(f_ts).astype(float)
+                positive = observed[observed > 0]
+                default_interval = (float(np.median(positive))
+                                    if len(positive) else 8 * HOUR_MS)
+                interval_ms[0] = default_interval
+                interval_ms[1:] = np.where(observed > 0, observed,
+                                           default_interval)
+            next_ts = f_ts + interval_ms
+            next_minutes[ok] = np.maximum(
+                0.0, (next_ts[f_index[ok]] - signal_end[ok]) / 60_000)
+            interval_hours[ok] = interval_ms[f_index[ok]] / HOUR_MS
         data["funding_rate_pct"] = np.round(rate_pct, 4)
         data["funding_percentile_30"] = np.round(pct_rank, 1)
         data["funding_samples_30"] = samples
@@ -882,6 +892,8 @@ def simulate(frame: SymbolFrame, idx: np.ndarray, direction: str,
         "entry_ts": frame.ts[entry_idx],
         "exit_ts": frame.ts[exit_idx] + BAR_MS,
         "entry_price": entry,
+        "stop_price": stop_level,
+        "take_price": take_level,
         "exit_price": exit_price,
         "stop_pct": stop_pct,
         "take_pct": take_pct,

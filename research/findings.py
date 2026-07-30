@@ -1907,6 +1907,144 @@ class FindingsStore:
                 + ", ".join(failed))
         return payload
 
+    @classmethod
+    def _validated_family_correction(
+            cls, conn: sqlite3.Connection, variant_id: str,
+            source_analysis_id: str, scope_key: str, detail: dict,
+            source_payload: dict | None = None) -> dict:
+        """Prove qualification is backed by the persisted axis family result."""
+        from research import protocol
+
+        if not isinstance(detail, dict):
+            raise ValueError("edge qualification detail must be a mapping")
+        family_analysis_id = str(detail.get("family_analysis_id") or "")
+        if not family_analysis_id:
+            raise ValueError(
+                "edge qualification requires a persisted forward_axis_family "
+                "analysis")
+
+        variant = cls._require_variant(conn, variant_id)
+        family_row = conn.execute(
+            "SELECT * FROM analysis_runs WHERE analysis_id=?",
+            (family_analysis_id,)).fetchone()
+        if family_row is None or family_row["kind"] != "forward_axis_family":
+            raise ValueError(
+                "edge qualification requires a valid forward_axis_family "
+                "analysis")
+        family_payload = cls._analysis_payload(family_row)
+        strategy_id = str(variant["strategy_id"])
+        if (family_row["subject_id"] != f"{strategy_id}:{scope_key}"
+                or family_payload.get("strategy_id") != strategy_id
+                or family_payload.get("scope_key") != scope_key):
+            raise ValueError(
+                "family correction does not match the qualification "
+                "strategy or scope")
+
+        expected_axis_ids = set()
+        baseline_id = f"{strategy_id}.baseline"
+        for registered in conn.execute(
+                "SELECT variant_id, strategy_id, status, overrides_json "
+                "FROM variants"):
+            if (registered["strategy_id"] != strategy_id
+                    or registered["variant_id"] == baseline_id
+                    or registered["status"] not in {"candidate", "testing"}):
+                continue
+            try:
+                overrides = json.loads(registered["overrides_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "active registered variant has invalid overrides") from exc
+            if not isinstance(overrides, dict):
+                raise ValueError(
+                    "active registered variant overrides are not a mapping")
+            axis = tuple(sorted(str(path) for path in overrides))
+            if axis:
+                expected_axis_ids.add("+".join(axis))
+
+        source_payload = source_payload or cls._validated_forward_analysis(
+            conn, variant_id, source_analysis_id, scope_key)
+        axis = _canonical_axis(source_payload.get("axis"))
+        axis_id = "+".join(axis)
+        supplied_axis = detail.get("axis")
+        if supplied_axis is None or _canonical_axis(supplied_axis) != axis:
+            raise ValueError(
+                "family correction does not match the selected forward axis")
+
+        axes = family_payload.get("axes")
+        if not isinstance(axes, dict) or not axes:
+            raise ValueError("forward_axis_family analysis has no axis records")
+        if set(axes) != expected_axis_ids:
+            raise ValueError(
+                "forward_axis_family analysis does not contain the complete "
+                "active axis set")
+        selected = axes.get(axis_id)
+        if not isinstance(selected, dict):
+            raise ValueError(
+                "forward_axis_family analysis does not contain the selected "
+                "axis")
+        if selected.get("analysis_id") != source_analysis_id:
+            raise ValueError(
+                "family correction is not linked to the selected forward "
+                "analysis")
+
+        persisted_verdicts = {}
+        for persisted_axis_id, record in axes.items():
+            if (not isinstance(persisted_axis_id, str)
+                    or not isinstance(record, dict)):
+                raise ValueError(
+                    "forward_axis_family analysis has invalid axis records")
+            analysis_id = str(record.get("analysis_id") or "")
+            axis_row = conn.execute(
+                "SELECT * FROM analysis_runs WHERE analysis_id=?",
+                (analysis_id,)).fetchone()
+            if axis_row is None or axis_row["kind"] != "forward_parameter_axis":
+                raise ValueError(
+                    "forward_axis_family analysis references an invalid axis "
+                    "analysis")
+            axis_payload = cls._analysis_payload(axis_row)
+            if (axis_payload.get("strategy_id") != strategy_id
+                    or axis_payload.get("scope_key") != scope_key
+                    or "+".join(_canonical_axis(axis_payload.get("axis")))
+                    != persisted_axis_id):
+                raise ValueError(
+                    "forward_axis_family analysis mixes strategy, scope, or "
+                    "axis records")
+            recomputed = cls._forward_verdict_from_payload(conn, axis_payload)
+            stored_claim = {
+                "verdict": axis_payload.get("verdict"),
+                "governing_criterion": axis_payload.get("governing_criterion"),
+                "detail": axis_payload.get("detail"),
+                "evidence": axis_payload.get("evidence") or {},
+            }
+            recomputed_claim = {
+                "verdict": recomputed.verdict,
+                "governing_criterion": recomputed.governing_criterion,
+                "detail": recomputed.detail,
+                "evidence": recomputed.evidence,
+            }
+            if _canonical_json(stored_claim) != _canonical_json(recomputed_claim):
+                raise ValueError(
+                    "family axis analysis does not recompute from evidence")
+            persisted_verdicts[persisted_axis_id] = recomputed
+
+        corrected = protocol.apply_axis_family_correction(persisted_verdicts)
+        expected = corrected[axis_id]
+        expected_record = {
+            "analysis_id": source_analysis_id,
+            "verdict_before_correction": source_payload.get("verdict"),
+            "verdict": expected.verdict,
+            "governing_criterion": expected.governing_criterion,
+            "family": expected.evidence.get("family"),
+        }
+        if _canonical_json(selected) != _canonical_json(expected_record):
+            raise ValueError(
+                "forward_axis_family analysis failed its correction check")
+        family = expected.evidence.get("family") or {}
+        if expected.verdict != protocol.PROMOTE or not family.get("significant"):
+            raise ValueError(
+                "selected forward axis did not survive the family correction")
+        return family_payload
+
     def qualify_variant(
             self, variant_id: str, detail: dict, *,
             source_analysis_id: str | None = None,
@@ -1916,8 +2054,11 @@ class FindingsStore:
         with _connect(self.path) as conn:
             variant = self._require_variant(conn, variant_id)
             require_validated(str(variant["strategy_id"]))
-            self._validated_forward_analysis(
+            source_payload = self._validated_forward_analysis(
                 conn, variant_id, source_analysis_id, scope_key)
+            self._validated_family_correction(
+                conn, variant_id, str(source_analysis_id or ""), scope_key,
+                detail, source_payload)
             current = self._latest_qualification(
                 conn, variant_id, scope_key)
             if current and current["status"] == "QUALIFIED":
@@ -2028,8 +2169,12 @@ class FindingsStore:
             if supplied_qualification.get("event_id") != qualification["event_id"]:
                 return False
             analysis_id = str(qualification["source_analysis_id"] or "")
-            cls._validated_forward_analysis(
+            source_payload = cls._validated_forward_analysis(
                 conn, variant_id, analysis_id, scope_key)
+            qualification_detail = json.loads(qualification["detail_json"])
+            cls._validated_family_correction(
+                conn, variant_id, analysis_id, scope_key,
+                qualification_detail, source_payload)
             supplied_analysis = payload.get("forward_analysis") or {}
             if supplied_analysis.get("analysis_id") != analysis_id:
                 return False
@@ -2075,7 +2220,8 @@ class FindingsStore:
         required = {
             "current_g2_pass", "held_out_confirmation", "corpus_provenance",
             "config_provenance", "code_provenance", "forward_sample",
-            "paper_sample", "paper_positive", "manual_registry_review",
+            "axis_family_corrected", "paper_sample", "paper_positive",
+            "manual_registry_review",
         }
         with _connect(self.path) as conn:
             self._require_variant(conn, variant_id)

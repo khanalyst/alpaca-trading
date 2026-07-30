@@ -1,4 +1,4 @@
-"""Score every registered strategy through the six gates, and rank them.
+"""Score every registered strategy through the seven gates, and rank them.
 
 One command answers "what do we currently believe about each strategy, and
 why". It reads the register (agent/registry.py) for what exists, the
@@ -36,11 +36,17 @@ sys.path.insert(0, str(REPO / "research"))
 
 import yaml  # noqa: E402
 
-import gates as gate_mod  # noqa: E402
 from agent.registry import REGISTRY, TIERS  # noqa: E402
-from edge_lab import (Contract, FlushFadeContract,  # noqa: E402
-                      FundingCarryContract, TrendMultidayContract,
-                      load_dataset, universe_membership)
+try:  # support both `python -m research.tournament` and legacy imports
+    from . import gates as gate_mod  # noqa: E402
+    from .edge_lab import (Contract, FlushFadeContract,  # noqa: E402
+                           FundingCarryContract, TrendMultidayContract,
+                           load_dataset, universe_membership)
+except ImportError:  # tests and direct script execution
+    import gates as gate_mod  # noqa: E402
+    from edge_lab import (Contract, FlushFadeContract,  # noqa: E402
+                          FundingCarryContract, TrendMultidayContract,
+                          load_dataset, universe_membership)
 
 
 HYPOTHESES = REPO / "research" / "hypotheses"
@@ -70,6 +76,32 @@ CONTRACTS = {
     # data that does not exist.
 }
 
+# Registry names are the live/shadow contract names. Most research contracts
+# use the same names; the few aliases below are explicit because silently
+# relying on dataclass defaults is how the registered point drifted. Momentum
+# is intentionally absent: it remains config-driven so the benchmark keeps
+# its existing semantics. Strategies without a research contract are not
+# scored here, so no mapping is guessed for them.
+REGISTERED_PARAM_ALIASES = {
+    "flush-fade": {
+        "flush_min_move_atr": "min_move_atr",
+        "flush_min_oi_drop_pct": "min_oi_drop_pct",
+        "flush_min_relative_volume": "min_relative_volume",
+    },
+    "funding-carry": {
+        "carry_percentile": "percentile",
+        "carry_min_samples": "min_samples",
+    },
+    "funding-unwind": {
+        "unwind_percentile": "percentile",
+        "unwind_min_samples": "min_samples",
+    },
+    "trend-multiday": {
+        "trend_min_range_pos_pct": "min_range_pos_pct",
+        "trend_max_atr_ratio": "max_atr_ratio",
+    },
+}
+
 # The benchmark's known values, from research/results/edge-audit-2024-2026.
 # Reproduction is checked loosely: different data windows legitimately move
 # the number, but a sign flip or an order-of-magnitude change means the
@@ -86,6 +118,25 @@ def load_preregistration(strategy_id: str) -> dict | None:
     return yaml.safe_load(path.read_text())
 
 REGISTERED_SETTING = "registered"
+
+
+def registered_contract(strategy_id: str, cfg: dict | None):
+    """Build the research contract at the registry's stated point."""
+    base = CONTRACTS[strategy_id](cfg)
+    if strategy_id == BENCHMARK_ID:
+        return base
+
+    fields = {field.name for field in dataclasses.fields(base)}
+    aliases = REGISTERED_PARAM_ALIASES.get(strategy_id, {})
+    params = {}
+    for name, value in REGISTRY[strategy_id].contract_params.items():
+        target = name if name in fields else aliases.get(name)
+        if target not in fields:
+            raise ValueError(
+                f"{strategy_id}: registered parameter {name!r} has no safe "
+                "mapping to its research contract")
+        params[target] = value
+    return dataclasses.replace(base, **params) if params else base
 
 
 def axis_settings(strategy_id: str, prereg: dict, cfg: dict | None) -> list[dict]:
@@ -106,7 +157,7 @@ def axis_settings(strategy_id: str, prereg: dict, cfg: dict | None) -> list[dict
     registered point three times and report that the parameter made no
     difference.
     """
-    base = CONTRACTS[strategy_id](cfg)
+    base = registered_contract(strategy_id, cfg)
     known = {field.name for field in dataclasses.fields(base)}
     declared = prereg.get("settings")
     if not declared:
@@ -518,13 +569,13 @@ def write_report(path: Path, payload: dict) -> None:
 
     lines += ["## Leaderboard", "",
               "| Strategy | Tier | Trades | Expectancy % | Expectancy R | "
-              "Hypotheses | Recommendation |",
-              "| --- | --- | ---: | ---: | ---: | ---: | --- |"]
+              "Hypotheses | Settings | Selected setting | Recommendation |",
+              "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"]
     for row in rows:
         if not row.get("scored"):
             lines.append(
                 f"| `{row['strategy_id']}` | {row['registered_tier']} "
-                f"(registered) | - | - | - | - | {row['reason']} |")
+                f"(registered) | - | - | - | - | - | - | {row['reason']} |")
             continue
         head = row["headline"]
         lines.append(
@@ -534,6 +585,8 @@ def write_report(path: Path, payload: dict) -> None:
             f"| {_format_signed(head.get('expectancy_pct'))} "
             f"| {_format_signed(head.get('expectancy_r'))} "
             f"| {row.get('hypotheses_tested', '?')} "
+            f"| {row.get('settings_tested', len(row.get('settings') or []))} "
+            f"| `{row.get('best_setting', '-')}` "
             f"| {recommendation(row)} |")
     lines.append("")
 
@@ -577,8 +630,9 @@ def write_report(path: Path, payload: dict) -> None:
 
         settings = row.get("settings") or []
         if len(settings) > 1:
+            setting_count = row.get("settings_tested", len(settings))
             lines += [
-                f"**Pre-registered parameterisations ({len(settings)}).** The "
+                f"**Pre-registered parameterisations ({setting_count}).** The "
                 "tier above is a verdict on the hypothesis, not on one "
                 "threshold: rejection requires every setting to fail, and a "
                 "tier above T1 requires the best setting to survive a Holm "
@@ -601,7 +655,7 @@ def write_report(path: Path, payload: dict) -> None:
                     f"| {f'{float(p_adj):.3f}' if p_adj is not None else '-'} "
                     f"| {setting['claim']} |")
             lines += ["",
-                      f"Best setting: `{row.get('best_setting')}`. Gates below "
+                      f"Selected setting: `{row.get('best_setting')}`. Gates below "
                       "are the registered parameterisation's.", ""]
 
         lines += ["| Gate | Result | Detail |", "| --- | --- | --- |"]

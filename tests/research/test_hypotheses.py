@@ -32,6 +32,24 @@ class RegisterTests(unittest.TestCase):
         for hypothesis_id, spec in hypotheses.REGISTRY.items():
             self.assertTrue(callable(spec.contract), hypothesis_id)
 
+    def test_every_hypothesis_has_a_registered_point_and_settings_axis(self):
+        for hypothesis_id, spec in hypotheses.REGISTRY.items():
+            with self.subTest(hypothesis=hypothesis_id):
+                self.assertTrue(spec.contract_params)
+                self.assertGreaterEqual(len(spec.settings), 3)
+                self.assertEqual(spec.settings[0]["id"], "registered")
+
+    def test_settings_are_testable_without_mutating_the_registered_point(self):
+        snapshot = {"relative_volume_1h": 1.6, "mom_1h_pct": 0.5}
+        cfg = valid_config()
+        self.assertTrue(hypotheses.evaluate(
+            "volume-thrust", snapshot, "long", cfg)[0])
+        self.assertFalse(hypotheses.evaluate(
+            "volume-thrust", snapshot, "long", cfg,
+            {"min_relative_volume": 2.0})[0])
+        self.assertTrue(hypotheses.evaluate(
+            "volume-thrust", snapshot, "long", cfg)[0])
+
     def test_ids_are_their_own_keys(self):
         for key, spec in hypotheses.REGISTRY.items():
             self.assertEqual(key, spec.id)

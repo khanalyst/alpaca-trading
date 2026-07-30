@@ -127,6 +127,10 @@ def truncated(root, keep_bars: int, out):
         (out / folder).mkdir(parents=True, exist_ok=True)
         for path in sorted((root / folder).glob("*.csv")):
             frame = pd.read_csv(path)
-            frame[frame["timestamp_ms"] <= cutoff].to_csv(
+            # The last retained candle's evidence is evaluated at its close,
+            # so auxiliary series stamped exactly at that close are available
+            # without exposing any later bar.
+            limit = cutoff if folder == "swap" else cutoff + BAR_MS
+            frame[frame["timestamp_ms"] <= limit].to_csv(
                 out / folder / path.name, index=False)
     return cutoff

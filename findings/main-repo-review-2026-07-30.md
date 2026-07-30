@@ -1,6 +1,7 @@
 # Main repository review — 2026-07-30
 
-Reviewed at `4791dda` against four requirements:
+Reviewed at `4791dda` against four requirements. The status notes below also
+include subsequent changes now present on `main`.
 
 1. finding an edge, automatically documenting it, and locking it as a strategy;
 2. no overfitting;
@@ -142,7 +143,7 @@ registered variant has a committed card; each card's `Hypothesis`, `Status` and
 `Overrides` match the registry; the index links every card and every document
 beside it. All were confirmed to fail when the defects are reintroduced.
 
-### R1-04 — the packet-to-register lock is not machine-checkable · **Fixed**
+### R1-04 — the packet-to-register lock is not machine-checkable · **Partially implemented**
 
 `StrategySpec.evidence` is a free-form tuple of paths. Nothing requires a spec
 at `T3_VALIDATED` or above to cite the SHA-256 of the packet that authorised
@@ -150,13 +151,11 @@ it, so the content-addressed packet and the tier it exists to justify are
 joined only by a reviewer's diligence. `test_nothing_is_live_eligible_yet` is
 the sole tripwire, and someone raising a tier edits it in the same commit.
 
-Recommended: require any spec at `≥ T3_VALIDATED` to carry a
-`t3-packet:<sha256>` reference in `evidence`, validated in `__post_init__`, with
-a test resolving it against `t3_evidence_packets`. Precedent exists —
-`test_every_validated_model_cites_evidence_that_exists` already does this for
-forward models. Not implemented here because it defines what counts as
-authority for live capital, which is the repository owner's call, not a
-reviewer's.
+Current `main` now requires the `t3-packet:<sha256>` shape for tiers at or above
+`T3_VALIDATED`, and the qualification/T3 path validates persisted family
+evidence. The remaining gap is that the registry guard does not resolve the
+cited hash against `t3_evidence_packets` and confirm that the packet belongs to
+the strategy.
 
 ---
 
@@ -210,14 +209,12 @@ clear zero"), so it is inflated by the selection and is a screen rather than a
 test. Nothing is wrong with using it as a screen; the documentation should stop
 implying it is independent evidence.
 
-Recommended: record the axis count in the qualification payload, apply Holm
-across the axes evaluated in one `forward-qualify` run, and state in
-`protocol.md` that criterion 5 is a selection screen while criterion 9 is the
-test. Not implemented here: `protocol.md` is explicit that the promotion rule
-is fixed in advance and applied mechanically, so changing it is a deliberate
-reviewed act and not something a review should do to itself.
+Current `main` applies the correction across all axes evaluated by
+`forward-qualify`, persists a `forward_axis_family` record, and requires that
+complete persisted family to survive again at qualification and T3 packet
+creation. The promotion rule remains manual and review-gated.
 
-### R2-02 — the exploratory engine that produced every verdict is untested · **Recommended**
+### R2-02 — the exploratory engine that produced every verdict is untested · **Partially implemented**
 
 Test references by research module: `replay` 30, `corpus` 30, `findings` 12,
 `gates` 12, `score` 12, `stats` 12 — and **`edge_lab` 0**, alongside
@@ -227,8 +224,10 @@ Test references by research module: `replay` 30, `corpus` 30, `findings` 12,
 
 `tests/test_gates.py` is explicit that "the gates themselves are
 integration-tested by running the tournament against real data", and that data
-lives under gitignored `runtime/`. So nothing in the 839-test suite exercises
-the 1,170-line feature/signal/simulation engine on which
+lives under gitignored `runtime/`. Current `main` now adds a small deterministic
+fixture and focused lookahead/reproduction/cost tests for `edge_lab`, but the
+remaining exploratory modules are still largely untested. The 1,170-line
+feature/signal/simulation engine on which
 `research/results/edge-audit-2024-2026`, the tournament leaderboard, and three
 `T0_REJECTED` tiers all rest. `validate_features.py` is the only cross-check and
 it also cannot run in CI, so its clean result survives as prose in
@@ -244,14 +243,11 @@ protects against wrongly *granting* capital and says nothing about a silent
 index shift wrongly rejecting a mechanism, which is the failure requirement 4
 also cares about.
 
-Recommended: commit a small fixture dataset — 2-3 symbols, a few hundred bars,
-a few KB — and add two tests against it: no-lookahead (every feature at bar *i*
-uses only bars ≤ *i*) and reproduction (a frozen expected summary for one
-contract). Mirror `tests/research/test_no_lookahead.py`. This is a few hundred
-lines and it is the cheapest large reduction in risk available in this
-repository.
+The remaining recommendation is to extend that fixture coverage only to the
+highest-risk exploratory modules that materially feed published verdicts; do
+not turn every one-shot study into a permanent test surface.
 
-### R2-03 — exploratory evidence changed the shipped configuration · **Recommended**
+### R2-03 — exploratory evidence changed the shipped configuration · **Implemented**
 
 `RECONCILIATION.md` draws its rule about **tiers**: lowered on exploratory
 evidence, raised only on journal replay. Configuration is not covered, and
@@ -267,13 +263,13 @@ comparison floor for every variant, and the arm G2 must reproduce — is itself 
 fitted point, and `momentum.rr.fixed_3_0` had to be marked `superseded` because
 the search moved the baseline onto it.
 
-None of this is hidden and each value has a stated reason, so this is a
-consistency gap rather than a defect. Recommended: extend the reconciliation
-rule to configuration in one paragraph — exploratory evidence may set a shipped
-default, and when it does the baseline is a fitted point and the fit window is
-recorded beside it — or hold the defaults at their unfitted values until the
-journal path confirms them. The first option is probably right; the point is
-that the choice should be written down where the tier rule is.
+None of this is hidden and each value has a stated reason. The reconciliation
+rule now covers configuration as well as tiers: exploratory evidence may set a
+shipped default, and when it does the baseline is explicitly a fitted point.
+The fit window, corpus provenance, selection rule, and configuration/code
+fingerprints must be recorded beside it. This still does not allow exploratory
+evidence to raise a tier; journal replay and forward confirmation remain
+authoritative for promotion.
 
 ---
 
@@ -363,11 +359,22 @@ The best instance of requirement 4 done right is `momentum.discriminator.*`:
 two registered variants for an argument about which variable separates breakout
 from continuation, so the corpus decides instead of the argument.
 
-### R4-01 — six of seven hypotheses have no variants at all · **Recommended (highest value)**
+### R4-01 — six of seven hypotheses have no variants at all · **Partially implemented (highest value)**
 
-Every entry in `research/variants.yaml` is `strategy_id: momentum`. For every
-other hypothesis, `tournament.py` constructs the contract at one hard-coded
-point:
+> Historical finding: this conclusion describes the July 28 pre-settings
+> tournament output; the checked-in July 28 report and leaderboard are
+> historical/pre-settings evidence, not current results.
+
+Current `main` now declares three pre-registered settings for each of the five
+backtestable non-momentum strategies and the tournament generator scores each
+setting. The historical tournament output has not been regenerated, so the
+existing T0/T1/T2 conclusions remain single-point historical evidence until a
+current corpus is scored.
+
+Every entry in `research/variants.yaml` is still `strategy_id: momentum`; the
+non-momentum settings live in the hypothesis pre-registrations rather than in
+that shadow-variant registry. Before the current changes, `tournament.py`
+constructed each non-momentum contract at one hard-coded point:
 
 ```python
 CONTRACTS = {
@@ -378,7 +385,7 @@ CONTRACTS = {
 }
 ```
 
-Those are dataclass defaults — `FlushFadeContract` fires at `min_move_atr=1.5`,
+The historical report therefore reflects dataclass defaults — `FlushFadeContract` fires at `min_move_atr=1.5`,
 `min_oi_drop_pct=1.0`, `min_relative_volume=1.2` and nothing else is ever
 tried. `score_strategy` then passes the gates to `tier_from_gates`, where a
 failed `beat_nulls` returns `T0_REJECTED` directly. `flush-fade` and
@@ -413,23 +420,29 @@ for the hypothesis *layer*, and not met for the variant layer of any hypothesis
 that is not momentum — which is where the search for an edge actually is, since
 momentum is retained explicitly as the benchmark null.
 
-Not implemented here because it changes what a published tier means, needs the
-downloaded dataset to re-score, and would rewrite committed results — a change
-to make deliberately, with the re-scored reports reviewed.
+The remaining work is the deliberate re-score and review of the committed
+results; no current tier should be inferred from the new settings until that
+run exists.
 
-### R4-02 — the in-prompt hypotheses cannot be swept · **Recommended**
+The authoritative corpus is being collected on the user's VM by
+`research/nightly.sh`. This checkout does not contain that VM's ignored
+`runtime/` data, so the local absence is a mount/location issue rather than a
+claim that collection has not started. Before the re-score, export or mount
+the VM journal, price cache, and corpus manifest and record their window and
+fingerprints in the run output.
 
-`agent/hypotheses.py` hard-codes its thresholds inside the contract functions:
-`relative_volume < 1.5`, `oi_change_4h_pct < -1.0`, basis `±0.05` with funding
-percentile 80/20. They are absent from `variants.yaml`, so they inherit R4-01's
-single-point problem and additionally cannot be varied at all. Each falsifier
-is phrased "…does not exceed the unconditional expectancy by more than the MDE
-at n >= 100", which is a detectability bar, not a second setting.
+### R4-02 — the in-prompt hypotheses cannot be swept · **Implemented**
 
-Recommended: move those constants into `contract_params`, the mechanism
-`agent/registry.py` already uses to give a non-active strategy a stated
-parameter set under shadow, so each hypothesis can carry 2-3 settings on the
-same footing as a momentum axis.
+Previously, `agent/hypotheses.py` hard-coded its thresholds inside the contract
+functions: `relative_volume < 1.5`, `oi_change_4h_pct < -1.0`, basis `±0.05`
+with funding percentile 80/20. They were absent from the setting mechanism, so
+they inherited R4-01's single-point problem and could not be varied at all.
+Each falsifier is phrased as a detectability bar, not as a second setting.
+
+The three hypothesis contracts now carry explicit `contract_params` for their
+registered point and three pre-registered settings each. The contract evaluator
+accepts a setting override, so shadow/research callers can test the same named
+hypothesis at multiple thresholds without changing the production baseline.
 
 ### R4-03 — no axis tests an entry threshold · **Observation, no action**
 
@@ -448,15 +461,15 @@ Recorded here so it does not read as an oversight to the next reviewer.
 | R1-01 | 1 | P0 | **Fixed** — registered claims restored; identity-drift tests added |
 | R1-02 | 1 | P1 | **Fixed** — the index can no longer orphan a document |
 | R1-03 | 1 | P1 | **Fixed** — all 16 scorecards committed and enforced |
-| R1-04 | 1 | P2 | Recommended — tie a `≥T3` tier to a packet hash |
-| R2-01 | 2 | P1 | Recommended — Holm across axes in `forward-qualify` |
-| R2-02 | 2 | P1 | Recommended — fixture dataset + lookahead test for `edge_lab` |
-| R2-03 | 2 | P2 | Recommended — extend the reconciliation rule to config values |
+| R1-04 | 1 | P2 | **Partially implemented** — packet hash shape is enforced; packet resolution remains |
+| R2-01 | 2 | P1 | **Fixed** — family correction is applied and enforced at qualification/T3 |
+| R2-02 | 2 | P1 | **Partially implemented** — `edge_lab` fixture coverage exists; other studies remain |
+| R2-03 | 2 | P2 | **Implemented** — exploratory configuration is recorded as a fitted baseline |
 | R3-01 | 3 | P2 | Recommended — separate one-shot studies from infrastructure |
 | R3-02 | 3 | P2 | Recommended — split `engine.py` when next touched |
 | R3-03 | 3 | P3 | Recommended — stop forcing README/SETUP duplication |
-| R4-01 | 4 | P0 | Recommended — per-hypothesis setting axes in the tournament |
-| R4-02 | 4 | P2 | Recommended — move in-prompt thresholds into `contract_params` |
+| R4-01 | 4 | P0 | **Partially implemented** — settings are registered and scored by code; results need re-scoring |
+| R4-02 | 4 | P2 | **Implemented** — hypothesis thresholds have contract params and settings |
 | R4-03 | 4 | — | Observation, no action |
 
 Suggested order: R4-01 and R2-02 together, because the first re-scores every

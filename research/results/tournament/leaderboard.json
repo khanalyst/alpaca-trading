@@ -10,6 +10,8 @@
   "cost_scenario": "base",
   "data_root": "runtime/research/data",
   "exit_policy": "fixed_rr",
+  "evidence_note": "Historical/pre-settings evidence: generated July 28, 2026, before the preregistered settings axis was added; retained for historical context, not current tournament results.",
+  "evidence_status": "historical_pre_settings",
   "generated_utc": "2026-07-28 12:12:46Z",
   "instruments": 8,
   "min_bars": 19200,

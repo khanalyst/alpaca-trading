@@ -170,12 +170,12 @@ class StrategySpec:
         if (self.tier_rank() >= TIERS.index(LIVE_MIN_TIER)
             and not any(PACKET_REFERENCE.match(reference)
                         for reference in self.evidence)):
-        raise ValueError(
-            f"strategy {self.id!r} claims {self.tier}, which authorises "
-            "live capital, without citing the evidence packet that "
-            "granted it. Add the packet hash from `research.py t3-packet` "
-            "to evidence as 't3-packet:<sha256>'. A tier that can be "
-            "raised by editing one string is not a gate.")
+            raise ValueError(
+                f"strategy {self.id!r} claims {self.tier}, which authorises "
+                "live capital, without citing the evidence packet that "
+                "granted it. Add the packet hash from `research.py t3-packet` "
+                "to evidence as 't3-packet:<sha256>'. A tier that can be "
+                "raised by editing one string is not a gate.")
 
     @property
     def forward_model(self) -> ForwardOutcomeModel:

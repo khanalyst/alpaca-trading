@@ -176,6 +176,9 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # 8d99182f0dcea1c4 -> 0f85dcf00f2acd36 in batch 6.3, which replaced
         # the unlabelled `other` escape hatch with a versioned list of
         # registered hypotheses injected into the prompt.
+        # 0f85dcf00f2acd36 -> c61905480bfef239 in R4-02, which made the
+        # hypothesis descriptions parameter-backed and explicitly stated
+        # that the registered contract threshold is the tested point.
         #
         # Both are deliberate attribution forks: observations either side of
         # them describe different decision spaces and must never be pooled.
@@ -184,7 +187,7 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # This constant moves only in a batch that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "0f85dcf00f2acd36",
+            "c61905480bfef239",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

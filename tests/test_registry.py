@@ -26,6 +26,9 @@ def spec(**overrides):
 class SpecValidationTests(unittest.TestCase):
     """A spec that cannot state its own claim must not construct."""
 
+    def test_registry_module_imports(self):
+        self.assertIsNotNone(registry.REGISTRY)
+
     def test_mechanism_is_mandatory(self):
         with self.assertRaisesRegex(ValueError, "must state a mechanism"):
             spec(mechanism="   ")

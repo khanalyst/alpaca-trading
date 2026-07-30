@@ -2,6 +2,10 @@
 
 Generated 2026-07-28 12:12:46Z from `runtime/research/data`.
 
+> Historical/pre-settings evidence: this report was generated on July 28,
+> 2026, before the preregistered settings axis was added. It is retained for
+> historical context and is not a current tournament result.
+
 - instruments: 8
 - bars per instrument (min): 19200
 - window: 2026-01-09 to 2026-07-28
@@ -134,4 +138,3 @@ Benchmark `momentum` measured -0.0741 R against an expected -0.0960 R (drift 0.0
 No gate here tests a t-statistic. On this data a placebo reached t = 2.60 on deliberately destroyed information, so `t > 2` is not evidence - the placebo ratio is.
 
 A tier is a claim about evidence, not about promise. `T3_VALIDATED` means every offline gate passed; `T4_CONFIRMED` additionally requires forward trades at the sample size the detectability gate computed, agreeing in sign with the backtest.
-

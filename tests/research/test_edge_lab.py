@@ -23,6 +23,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -34,6 +35,8 @@ from edge_lab import (COST_SCENARIOS, Contract,  # noqa: E402
                       FlushFadeContract, FundingCarryContract,
                       TrendMultidayContract, build_trades, load_dataset,
                       non_overlapping, summarize, universe_membership)
+import research.validate_features as validate_features  # noqa: E402
+from research.validate_features import contract_agreement  # noqa: E402
 from tests.research.synthetic_market import truncated, write_dataset  # noqa: E402
 
 
@@ -137,9 +140,9 @@ class ReproductionTests(DatasetFixture):
 
     EXPECTED = {
         "momentum": (286, -0.11471614378295505),
-        "flush-fade": (202, -0.09332887578440207),
-        "trend-multiday": (107, 0.01011764084835285),
-        "funding-carry": (48, 0.4980657493269698),
+        "flush-fade": (202, -0.08479908535145435),
+        "trend-multiday": (107, -0.06949926950360132),
+        "funding-carry": (48, 0.205675143146523),
     }
 
     def contracts(self):
@@ -188,6 +191,38 @@ class ReproductionTests(DatasetFixture):
                      >= ordered["exit_ts"].to_numpy()[:-1]).all())
 
 
+class ValidateFeaturesTests(DatasetFixture):
+    """The exploratory feature boundary must fail loudly when perturbed."""
+
+    FRAME = "BTC/USDT:USDT"
+
+    def test_synthetic_fixture_matches_authoritative_evidence(self):
+        report = contract_agreement(
+            {self.FRAME: self.frames[self.FRAME]}, samples=1, seed=17)
+
+        self.assertEqual(report["checked_bars"], 1)
+        self.assertEqual(report["disagreements"], 0)
+
+    def test_a_feature_perturbation_is_reported_as_drift(self):
+        real_masks = validate_features.evidence_masks
+
+        def perturbed_masks(df, contract):
+            masks = real_masks(df, contract)
+            masks["trend_continuation_long"] = (
+                ~masks["trend_continuation_long"])
+            return masks
+
+        with patch.object(validate_features, "evidence_masks",
+                          perturbed_masks):
+            report = contract_agreement(
+                {self.FRAME: self.frames[self.FRAME]}, samples=1, seed=17)
+
+        self.assertGreater(report["disagreements"], 0)
+        self.assertTrue(any(
+            issue.get("setup") == "trend_continuation_long"
+            for issue in report["examples"]))
+
+
 class TournamentEndToEndTests(DatasetFixture):
     """The settings axis, driven the way the nightly run drives it."""
 
@@ -227,6 +262,60 @@ class TournamentEndToEndTests(DatasetFixture):
 
         self.assertEqual(row["measured_tier"], "T1_HYPOTHESIS")
         self.assertIn("in-sample by construction", row["tier_reason"])
+
+    def test_registered_contract_and_setting_metadata_stay_aligned(self):
+        import tournament
+        from agent.registry import spec_for
+
+        for strategy_id in sorted(tournament.CONTRACTS):
+            if strategy_id == tournament.BENCHMARK_ID:
+                continue
+            spec = spec_for(strategy_id)
+            registered = next(
+                setting for setting in tournament.axis_settings(
+                    strategy_id, tournament.load_preregistration(strategy_id),
+                    None)
+                if setting["registered"])
+            aliases = tournament.REGISTERED_PARAM_ALIASES.get(
+                strategy_id, {})
+            for name, expected in spec.contract_params.items():
+                target = (name if hasattr(registered["contract"], name)
+                          else aliases.get(name))
+                with self.subTest(strategy=strategy_id, parameter=name):
+                    self.assertIsNotNone(target)
+                    self.assertEqual(
+                        getattr(registered["contract"], target), expected)
+
+        strategy_id = "funding-carry"
+
+        row = self.score(strategy_id)
+        self.assertEqual(row["settings_tested"], len(row["settings"]))
+        self.assertIn(
+            row["best_setting"], {setting["setting_id"]
+                                   for setting in row["settings"]})
+        payload = {
+            "generated_utc": "2026-07-30 00:00:00Z",
+            "data_root": "fixture",
+            "instruments": len(self.frames),
+            "min_bars": min(len(frame.df) for frame in self.frames.values()),
+            "window_start": "a", "window_end": "b",
+            "cost_scenario": "base", "exit_policy": "fixed_rr",
+            "benchmark_check": {"ok": True, "reason": "fixture"},
+            "strategies": [row],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "REPORT.md"
+            tournament.write_report(report, payload)
+            written = report.read_text(encoding="utf-8")
+        self.assertIn("| Settings | Selected setting |", written)
+        self.assertIn(
+            f"| {row['settings_tested']} | `{row['best_setting']}` |",
+            written)
+        self.assertIn(
+            f"Pre-registered parameterisations ({row['settings_tested']})",
+            written)
+        self.assertIn(
+            f"Selected setting: `{row['best_setting']}`", written)
 
 
 if __name__ == "__main__":

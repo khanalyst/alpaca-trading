@@ -576,6 +576,7 @@ class QualificationAndPacketTests(StoreFixture):
             "config_provenance": True,
             "code_provenance": True,
             "forward_sample": True,
+            "axis_family_corrected": True,
             "paper_sample": True,
             "paper_positive": True,
             "manual_registry_review": True,
@@ -668,6 +669,20 @@ class QualificationAndPacketTests(StoreFixture):
             [self.v.variant_id, self.control.variant_id])
         self.assertEqual(verdict.verdict, protocol.PROMOTE)
         self.assertEqual(verdict.evidence["best"], self.v.variant_id)
+        family = protocol.apply_axis_family_correction({
+            "strategy.fixed_reward_risk": verdict
+        })["strategy.fixed_reward_risk"]
+        self.family_analysis_id = self.store.record_analysis(
+            "forward_axis_family", f"momentum:{scope}", {
+                "strategy_id": "momentum", "scope_key": scope,
+                "axes": {"strategy.fixed_reward_risk": {
+                    "analysis_id": analysis_id,
+                    "verdict_before_correction": verdict.verdict,
+                    "verdict": family.verdict,
+                    "governing_criterion": family.governing_criterion,
+                    "family": family.evidence["family"],
+                }},
+            })
         return analysis_id
 
     def test_policy_axis_can_promote_from_explicit_accept_vs_veto_actions(self):
@@ -794,7 +809,9 @@ class QualificationAndPacketTests(StoreFixture):
         scope = "demo:prequalification-boundary"
         analysis_id = self.qualifying_analysis(scope)
         self.store.qualify_variant(
-            self.v.variant_id, {"reason": "paired edge"},
+            self.v.variant_id, {"reason": "paired edge",
+                                "family_analysis_id": self.family_analysis_id,
+                                "axis": ["strategy.fixed_reward_risk"]},
             source_analysis_id=analysis_id, scope_key=scope)
         qualification = self.store.qualification_status(
             self.v.variant_id, scope)
@@ -943,7 +960,9 @@ class QualificationAndPacketTests(StoreFixture):
         scope = "demo:a"
         analysis_id = self.qualifying_analysis(scope)
         self.store.qualify_variant(
-            self.v.variant_id, {"reason": "paired edge"},
+            self.v.variant_id, {"reason": "paired edge",
+                                "family_analysis_id": self.family_analysis_id,
+                                "axis": ["strategy.fixed_reward_risk"]},
             source_analysis_id=analysis_id, scope_key=scope)
         state, version = self.store.load_paper_portfolio(
             scope, self.v.variant_id, now=9)
@@ -1014,7 +1033,9 @@ class QualificationAndPacketTests(StoreFixture):
     def test_qualification_is_scope_specific_and_append_only(self):
         analysis_id = self.qualifying_analysis("demo:a")
         event_id = self.store.qualify_variant(
-            self.v.variant_id, {"reason": "paired edge"},
+            self.v.variant_id, {"reason": "paired edge",
+                                "family_analysis_id": self.family_analysis_id,
+                                "axis": ["strategy.fixed_reward_risk"]},
             source_analysis_id=analysis_id, scope_key="demo:a")
 
         self.assertEqual(
@@ -1029,7 +1050,9 @@ class QualificationAndPacketTests(StoreFixture):
             [self.v], valid_config(), store=self.store, scope_key=scope)
         analysis_id = self.qualifying_analysis(scope)
         self.store.qualify_variant(
-            self.v.variant_id, {"reason": "paired edge"},
+            self.v.variant_id, {"reason": "paired edge",
+                                "family_analysis_id": self.family_analysis_id,
+                                "axis": ["strategy.fixed_reward_risk"]},
             source_analysis_id=analysis_id, scope_key=scope)
 
         evaluator.evaluate({}, {}, now=100)
@@ -1049,6 +1072,29 @@ class QualificationAndPacketTests(StoreFixture):
             self.store.record_analysis(
                 "forward_parameter_axis", "demo:a:axis",
                 {"verdict": "PROMOTE"})
+
+    def test_qualification_cannot_bypass_family_correction_with_a_boolean(self):
+        scope = "demo:family-bypass"
+        analysis_id = self.qualifying_analysis(scope)
+        with self.assertRaisesRegex(ValueError, "forward_axis_family"):
+            self.store.qualify_variant(
+                self.v.variant_id,
+                {"axis": ["strategy.fixed_reward_risk"],
+                 "family": {"significant": True}},
+                source_analysis_id=analysis_id, scope_key=scope)
+
+    def test_family_correction_must_cover_every_active_axis(self):
+        self.store.register(variant(
+            "momentum.conf.floor_0_60",
+            {"risk.min_confidence": 0.60}))
+        scope = "demo:incomplete-family"
+        analysis_id = self.qualifying_analysis(scope)
+        with self.assertRaisesRegex(ValueError, "complete active axis set"):
+            self.store.qualify_variant(
+                self.v.variant_id,
+                {"axis": ["strategy.fixed_reward_risk"],
+                 "family_analysis_id": self.family_analysis_id},
+                source_analysis_id=analysis_id, scope_key=scope)
 
     def test_t3_packets_are_deterministic_review_gated_and_immutable(self):
         payload = self.complete_payload()
@@ -1098,6 +1144,28 @@ class QualificationAndPacketTests(StoreFixture):
             row for row in self.store.t3_packets_for(self.v.variant_id)
             if row["packet_id"] == packet_id)
 
+        self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
+
+    def test_t3_packet_family_evidence_cannot_be_faked_by_checklist(self):
+        payload = self.complete_payload()
+        payload["checklist"]["axis_family_corrected"] = True
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO edge_qualification_events "
+                "(event_id, variant_id, scope_key, status, ts, "
+                "source_analysis_id, detail_json) VALUES (?,?,?,?,?,?,?)",
+                ("missing-family", self.v.variant_id, "demo:a", "QUALIFIED",
+                 payload["qualification"]["ts"] + 1.0,
+                 payload["qualification"]["source_analysis_id"],
+                 json.dumps({"axis": ["strategy.fixed_reward_risk"]})))
+        payload["qualification"] = self.store.qualification_status(
+            self.v.variant_id, "demo:a")
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-123")
+        packet = next(
+            row for row in self.store.t3_packets_for(self.v.variant_id)
+            if row["packet_id"] == packet_id)
         self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
 
 

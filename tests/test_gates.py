@@ -36,6 +36,20 @@ def all_passing():
     ]
 
 
+def setting(setting_id, tier, *, expectancy_r=0.1, trades=400,
+            ci=(0.05, 0.15), gates_list=None, registered=False):
+    """One scored parameterisation, as tier_from_settings receives it."""
+    return {
+        "setting_id": setting_id, "params": {} if registered else {"x": 1},
+        "claim": "a stated claim", "registered": registered,
+        "tier": tier, "why": f"{setting_id} said so",
+        "results": gates_list if gates_list is not None else all_passing(),
+        "headline": {"trades": trades, "expectancy_r": expectancy_r,
+                     "expectancy_pct": expectancy_r * 0.5,
+                     "expectancy_r_ci95": list(ci)},
+    }
+
+
 class TierLogicTests(unittest.TestCase):
     def test_full_exploratory_pass_is_capped_at_candidate(self):
         tier, why = tier_from_gates(all_passing())
@@ -404,20 +418,6 @@ class PreRegistrationTests(unittest.TestCase):
             with self.subTest(hypothesis=path.name):
                 data = yaml.safe_load(path.read_text())
                 self.assertIn(data["strategy_id"], REGISTRY)
-
-    def setting(setting_id, tier, *, expectancy_r=0.1, trades=400,
-                ci=(0.05, 0.15), gates_list=None, registered=False):
-        """One scored parameterisation, as tier_from_settings receives it."""
-        return {
-            "setting_id": setting_id, "params": {} if registered else {"x": 1},
-            "claim": "a stated claim", "registered": registered,
-            "tier": tier, "why": f"{setting_id} said so",
-            "results": gates_list if gates_list is not None else all_passing(),
-            "headline": {"trades": trades, "expectancy_r": expectancy_r,
-                         "expectancy_pct": expectancy_r * 0.5,
-                         "expectancy_r_ci95": list(ci)},
-    }
-
 
 class SettingsAxisTests(unittest.TestCase):
     """The unit of decision is the hypothesis, not one parameterisation."""

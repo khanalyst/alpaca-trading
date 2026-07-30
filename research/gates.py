@@ -1,4 +1,4 @@
-"""The six evidence gates, and the confidence tier they produce.
+"""The seven evidence gates, and the confidence tier they produce.
 
 A backtest that made money is not an edge. An edge is a claim that survives
 every attempt to explain it away, so each gate here is one such attempt. They
@@ -11,7 +11,8 @@ number it decided on rather than a bare pass/fail - a gate that only says
     3. survive_oos     purged walk-forward, discover on 60%, confirm on 40%
     4. survive_placebo destroy the information, re-run the identical procedure
     5. has_mechanism   a stated payer and a stated falsification test
-    6. is_detectable   effect large enough to confirm in achievable time
+    6. mechanism_is_the_source the claimed mechanism explains the return
+    7. is_detectable   effect large enough to confirm in achievable time
 
 Gate 4 is the one that matters most and the one most often skipped. This
 project has already watched it kill a candidate that passed everything else:
@@ -32,8 +33,24 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from edge_lab import (COST_SCENARIOS, Costs, build_trades,
-                      non_overlapping, summarize)
+from agent.registry import TIERS as TIER_ORDER
+
+try:  # package imports are used by research.tournament and external callers
+    from .edge_lab import (COST_SCENARIOS, Costs, build_trades,
+                           non_overlapping, summarize)
+    from .protocol import MIN_AXIS_SETTINGS
+except ImportError:  # direct script/test imports keep working
+    from edge_lab import (COST_SCENARIOS, Costs, build_trades,
+                          non_overlapping, summarize)
+    try:
+        from research.protocol import MIN_AXIS_SETTINGS
+    except ImportError:
+        # A direct `python research/gates.py` invocation has no package
+        # parent. Keep the shared protocol value visible without creating a
+        # second import graph just for that invocation.
+        MIN_AXIS_SETTINGS = 3
+
+MIN_SETTINGS_TO_REJECT = MIN_AXIS_SETTINGS
 
 
 # Discover on the first 60%, confirm on the last 40%. The purge gap drops
