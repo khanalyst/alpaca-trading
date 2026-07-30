@@ -135,5 +135,39 @@ class ContractCoverageTests(unittest.TestCase):
                 self.assertIn(strategy_id, registry.REGISTRY)
 
 
+class ForwardModelEvidenceTests(unittest.TestCase):
+    """A validated model's evidence has to still be there.
+
+    ``validated=True`` is what allows a strategy to emit expectancy at all,
+    and it rests on named files. Renaming or deleting one of them would leave
+    the flag standing on a citation to nothing, and nothing else in the suite
+    would notice.
+    """
+
+    def test_every_validated_model_cites_evidence_that_exists(self):
+        from pathlib import Path
+
+        from agent.forward_models import MODELS
+
+        repo = Path(__file__).resolve().parents[1]
+        validated = [m for m in MODELS.values() if m.validated]
+        self.assertTrue(validated, "no validated model left to check")
+        for model in validated:
+            for reference in model.validation_evidence:
+                with self.subTest(model=model.model_id, path=reference):
+                    self.assertTrue(
+                        (repo / reference).exists(),
+                        f"{model.model_id} cites {reference}, which is gone")
+
+    def test_an_unvalidated_model_needs_no_evidence(self):
+        from agent.forward_models import MODELS
+
+        unvalidated = [m for m in MODELS.values() if not m.validated]
+        self.assertTrue(unvalidated)
+        for model in unvalidated:
+            with self.subTest(model=model.model_id):
+                self.assertEqual(model.validation_evidence, ())
+
+
 if __name__ == "__main__":
     unittest.main()

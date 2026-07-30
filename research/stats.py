@@ -28,12 +28,30 @@ class Interval:
     low: float
     high: float
     n: int
+    # Independent resampling units behind the interval, when they are not the
+    # observations themselves. A clustered bootstrap's precision is governed
+    # by this number, not by ``n``: a hundred trades inside one market episode
+    # are close to one observation of the quantity being estimated. Zero means
+    # "not clustered", which is the honest default for the IID bootstraps.
+    clusters: int = 0
 
     def excludes_zero(self) -> bool:
         return (self.low > 0) or (self.high < 0)
 
+    def is_degenerate(self) -> bool:
+        """True when the interval has no width the data actually supports.
+
+        A clustered bootstrap over a single cluster can only ever draw that
+        cluster, so every resample returns the same mean and the percentiles
+        collapse onto the point estimate. That is an undefined interval, not a
+        certain one, and it must never be read as evidence.
+        """
+        return bool(self.n) and self.clusters == 1
+
     def __str__(self) -> str:
-        return f"{self.point:+.4f} [{self.low:+.4f},{self.high:+.4f}] n={self.n}"
+        clusters = f" clusters={self.clusters}" if self.clusters else ""
+        return (f"{self.point:+.4f} [{self.low:+.4f},{self.high:+.4f}] "
+                f"n={self.n}{clusters}")
 
 
 def bootstrap_mean(values: list, iterations: int = 2000,
@@ -100,6 +118,13 @@ def cluster_block_bootstrap_difference(
     clusters; contiguous clusters are then sampled in blocks. This preserves
     both cross-symbol dependence within a market episode and short-run serial
     dependence instead of pretending every trade is independent.
+
+    The returned interval carries its cluster count, because that count - not
+    the pair count - is what the width can be trusted against. With a single
+    cluster there is only one possible resample, so the percentiles collapse
+    onto the point estimate; the interval is reported with ``clusters=1`` so a
+    caller can refuse it rather than read zero width as certainty. Refusing
+    that case is the caller's job: see ``protocol.paired_window_adequate``.
     """
     clean = []
     for ts, left, right in pairs:
@@ -117,7 +142,7 @@ def cluster_block_bootstrap_difference(
         clusters.setdefault(int(ts // cluster_seconds), []).append(delta)
     ordered = [clusters[key] for key in sorted(clusters)]
     if len(ordered) == 1:
-        return Interval(point, point, point, len(clean))
+        return Interval(point, point, point, len(clean), 1)
 
     block_size = max(1, min(len(ordered), int(round(math.sqrt(len(ordered))))))
     rng = random.Random(seed)
@@ -138,7 +163,7 @@ def cluster_block_bootstrap_difference(
     return Interval(
         point, means[int(tail * len(means))],
         means[min(len(means) - 1, int((1.0 - tail) * len(means)))],
-        len(clean))
+        len(clean), len(ordered))
 
 
 def stdev(values: list) -> float:

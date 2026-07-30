@@ -13,11 +13,27 @@ from research import protocol, score, stats
 from research.replay import ReplayDecision
 
 
-def decision(r_multiple, ts=0.0, vol_ratio=None):
+# Fixture timestamps are indices, spaced onto the clustered bootstrap's
+# six-hour grid so one index is one independent market episode. Spacing is not
+# cosmetic: packed one second apart, a whole fixture corpus collapses into a
+# single cluster, and a clustered bootstrap over one cluster can only draw that
+# cluster - so every interval comes back zero-width and every arm looks
+# certain. These tests would then assert PROMOTE on the strength of a bug.
+CLUSTER_GRID_SECONDS = 21_600
+
+
+def at_second(r_multiple, second):
+    """A decision at an exact wall-clock second, off the episode grid."""
     d = ReplayDecision(
-        cycle_id=f"c{ts}", ts=ts, symbol="BTC/USDT:USDT", signal_ts=int(ts),
-        stage="executed", direction="long", setup_type="range_breakout")
+        cycle_id=f"c{second}", ts=float(second), symbol="BTC/USDT:USDT",
+        signal_ts=int(second), stage="executed", direction="long",
+        setup_type="range_breakout")
     d.outcome = {"r_multiple": r_multiple, "result": "target"}
+    return d
+
+
+def decision(r_multiple, ts=0.0, vol_ratio=None):
+    d = at_second(r_multiple, int(float(ts) * CLUSTER_GRID_SECONDS))
     if vol_ratio is not None:
         d.enrichment = {"realised_vol_ratio_8_96": vol_ratio}
     return d
@@ -111,7 +127,7 @@ class SplitTests(unittest.TestCase):
         dense_fit, dense_confirm = protocol.split_at_time(dense, cutoff)
         sparse_fit, sparse_confirm = protocol.split_at_time(sparse, cutoff)
 
-        self.assertEqual(cutoff, 107.0)
+        self.assertEqual(cutoff, 107.0 * CLUSTER_GRID_SECONDS)
         self.assertTrue(all(item.ts < cutoff
                             for item in dense_fit + sparse_fit))
         self.assertTrue(all(item.ts >= cutoff
@@ -358,6 +374,50 @@ class PromotionTests(unittest.TestCase):
         clean["bootstrap"]["cluster_seconds"] = 1
         self.assertFalse(protocol.paired_window_adequate(
             clean, protocol.MIN_PAIRED_FIT_OBSERVATIONS))
+
+    def test_one_market_episode_cannot_promote_however_many_trades(self):
+        """A collapsed interval is an absence of evidence, not certainty.
+
+        Packed into a single six-hour cluster, the block bootstrap has one
+        possible resample, so it returns zero width around a positive point
+        estimate - which reads as a delta known exactly and clears any
+        lower-bound test. It has to be refused on the cluster count.
+        """
+        # One second apart, so all 200 land in the same six-hour bucket while
+        # still carrying distinct proposal identities that pair cleanly.
+        packed = [at_second(1.0 if i % 4 else 0.6, i) for i in range(200)]
+        packed_baseline = [at_second(0.5 if i % 2 else -0.5, i)
+                           for i in range(200)]
+        comparison = protocol.paired_arm_comparison(packed, packed_baseline)
+        interval = comparison["interval"]
+
+        # The degeneracy is real: 200 pairs, zero width, lower bound above 0.
+        self.assertEqual(comparison["bootstrap"]["clusters"], 1)
+        self.assertEqual(interval.n, 200)
+        self.assertEqual(interval.low, interval.high)
+        self.assertGreater(interval.low, 0)
+        self.assertTrue(interval.is_degenerate())
+
+        # And it is refused rather than believed.
+        self.assertFalse(protocol.paired_window_adequate(
+            comparison, protocol.MIN_ROUND_TRIPS))
+        verdict = protocol.evaluate_axis(
+            [("packed", packed), ("control", list(packed))], packed_baseline)
+        self.assertEqual(verdict.verdict, stats.INSUFFICIENT_SAMPLE)
+        self.assertIn("episode", verdict.detail)
+
+    def test_too_few_episodes_is_refused_even_with_a_wide_interval(self):
+        left = series([1.0] * 120)
+        right = series([0.0] * 120)
+        comparison = protocol.paired_arm_comparison(left, right)
+        self.assertTrue(protocol.paired_window_adequate(
+            comparison, protocol.MIN_ROUND_TRIPS))
+
+        comparison["bootstrap"]["clusters"] = (
+            protocol.MIN_BOOTSTRAP_CLUSTERS - 1)
+
+        self.assertFalse(protocol.paired_window_adequate(
+            comparison, protocol.MIN_ROUND_TRIPS))
 
     def test_no_baseline_is_insufficient_not_a_promotion(self):
         verdict = protocol.evaluate_axis(

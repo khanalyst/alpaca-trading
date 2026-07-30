@@ -8,6 +8,7 @@ that is where a silent mistake would promote a strategy it should not.
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -113,6 +114,164 @@ class TierLogicTests(unittest.TestCase):
         gates_list[6] = result("is_detectable", True,
                                trades_needed=900, observed_trades=1200)
         self.assertEqual(tier_from_gates(gates_list)[0], "T2_CANDIDATE")
+
+
+class ExploratoryAuthorityTests(unittest.TestCase):
+    """Where the battery's authority stops, and who has to know about it.
+
+    Capping the tier without telling the consumers that compare tiers is how a
+    cap turns into a nightly false alarm: a strategy registered at T3 on
+    recorded-replay evidence would measure T2 here forever, and every run
+    would report it as fresh evidence of failure.
+    """
+
+    def test_the_ceiling_is_the_highest_tier_the_battery_awards(self):
+        self.assertEqual(gates.EXPLORATORY_CEILING, "T2_CANDIDATE")
+        self.assertEqual(tier_from_gates(all_passing())[0],
+                         gates.EXPLORATORY_CEILING)
+
+    def test_a_tier_above_the_ceiling_is_not_reported_as_a_change(self):
+        import tournament
+
+        row = {
+            "scored": True, "registered_tier": "T3_VALIDATED",
+            "measured_tier": gates.EXPLORATORY_CEILING,
+            "beyond_exploratory_authority": True,
+            "exploratory_ceiling": gates.EXPLORATORY_CEILING,
+            "tier_changed": False,
+        }
+
+        self.assertIn("NO CHANGE", tournament.recommendation(row))
+        self.assertIn("T3_VALIDATED", tournament.recommendation(row))
+
+    def test_a_change_inside_the_ceiling_still_recommends_action(self):
+        import tournament
+
+        row = {
+            "scored": True, "registered_tier": "T1_HYPOTHESIS",
+            "measured_tier": "T0_REJECTED",
+            "beyond_exploratory_authority": False,
+            "exploratory_ceiling": gates.EXPLORATORY_CEILING,
+            "tier_changed": True,
+        }
+
+        self.assertIn("REJECT", tournament.recommendation(row))
+
+    def test_a_registered_tier_above_the_ceiling_raises_no_alert(self):
+        """The whole point: a demotion alert must describe a real demotion."""
+        import tournament
+
+        rows = [{
+            "scored": True, "strategy_id": "momentum", "version": "phase1-v3",
+            "registered_tier": "T3_VALIDATED",
+            "measured_tier": gates.EXPLORATORY_CEILING,
+            "beyond_exploratory_authority": True,
+            "exploratory_ceiling": gates.EXPLORATORY_CEILING,
+            "tier_changed": False,
+            "tier_reason": "cleared every exploratory offline gate",
+            "headline": {"expectancy_pct": 0.1, "trades": 500},
+        }]
+
+        with patch("agent.alerts.AlertManager") as manager:
+            tournament.alert_on_tier_changes(
+                rows, {"benchmark_check": {"ok": True}})
+
+        manager.assert_not_called()
+
+
+class ForwardEvidenceTests(unittest.TestCase):
+    """Pending is not zero, and a missing number must not lose the report."""
+
+    @staticmethod
+    def _row(expectancy_pct=0.5):
+        return {
+            "scored": True, "strategy_id": "momentum",
+            "measured_tier": "T2_CANDIDATE",
+            "headline": {"expectancy_pct": expectancy_pct},
+            "gates": [{"gate": "is_detectable",
+                       "numbers": {"trades_needed": 80}}],
+        }
+
+    def _apply(self, row, entry):
+        import tournament
+        tournament.apply_forward_evidence(
+            row, {"strategies": {"momentum": entry}})
+        return row["forward"]
+
+    def test_fired_signals_without_a_resolution_do_not_compare_signs(self):
+        forward = self._apply(self._row(), {
+            "resolved_trades": 0, "signals_fired": 120,
+            "positions_actually_opened": 14})
+
+        self.assertIsNone(forward["signs_agree"])
+        self.assertIn("no resolved forward trades", forward["status"])
+
+    def test_a_missing_forward_expectancy_defers_instead_of_agreeing(self):
+        forward = self._apply(self._row(), {
+            "resolved_trades": 12, "forward_expectancy_pct": None})
+
+        self.assertIsNone(forward["signs_agree"])
+        self.assertIn("expectancy is missing", forward["status"])
+
+    def test_a_resolved_disagreement_is_still_recorded_loudly(self):
+        forward = self._apply(self._row(expectancy_pct=0.5), {
+            "resolved_trades": 90, "forward_expectancy_pct": -0.4})
+
+        self.assertFalse(forward["signs_agree"])
+        self.assertIn("disagree in sign", forward["warning"])
+
+    def test_reaching_the_sample_target_asks_for_the_authoritative_run(self):
+        forward = self._apply(self._row(expectancy_pct=0.5), {
+            "resolved_trades": 90, "forward_expectancy_pct": 0.4})
+
+        self.assertTrue(forward["signs_agree"])
+        self.assertIn("recorded-replay", forward["next_step"])
+
+    def test_malformed_evidence_is_named_not_coerced(self):
+        forward = self._apply(self._row(), {"resolved_trades": "many"})
+
+        self.assertIn("malformed", forward["status"])
+
+    def test_a_report_survives_a_strategy_with_no_expectancy(self):
+        """A nightly run must not lose every result to one missing number."""
+        import tempfile
+
+        import tournament
+
+        row = self._row(expectancy_pct=None)
+        row.update({
+            "version": "phase1-v3", "tier_reason": "capped",
+            "registered_tier": "T1_HYPOTHESIS", "tier_changed": True,
+            "beyond_exploratory_authority": False,
+            "exploratory_ceiling": gates.EXPLORATORY_CEILING,
+            "mechanism": "m", "falsification": "f",
+            "hypotheses_tested": 1,
+            "gates": [{"gate": "is_detectable", "passed": True,
+                       "summary": "ok", "numbers": {"trades_needed": 80}}],
+            "forward": {"resolved_trades": 3, "trades_needed": 80,
+                        "forward_expectancy_pct": None,
+                        "backtest_expectancy_pct": None,
+                        "signs_agree": None},
+        })
+        payload = {
+            "generated_utc": "2026-07-30T00:00:00Z", "data_root": "/data",
+            "instruments": 8, "min_bars": 100,
+            "window_start": "a", "window_end": "b",
+            "cost_scenario": "base", "exit_policy": "fixed_rr",
+            "benchmark_check": {"ok": True, "reason": "reproduced",
+                                "measured_expectancy_r": None,
+                                "expected_expectancy_r": -0.0963,
+                                "drift_r": None, "tolerance_r": 0.02},
+            "strategies": [row],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "REPORT.md"
+            tournament.write_report(out, payload)
+            written = out.read_text(encoding="utf-8")
+
+        self.assertIn("n/a", written)
+        self.assertIn("momentum/phase1-v3", written)
 
 
 class ProvenanceCapTests(unittest.TestCase):

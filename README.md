@@ -535,6 +535,16 @@ model. Parameter variants additionally run as independent local `SHADOW`
 portfolios in `findings.db`. Shadowing costs no extra LLM call and places no
 orders.
 
+**Isolation runs both ways.** Variant accounts hold positions the exchange
+account does not, so the cycle fetches their symbols too — otherwise a
+simulated position could not be marked. Those symbols are then withheld from
+everything on the live path: the model is asked only about live universe
+symbols plus real open positions, and `_market_context` breadth is recomputed
+over that restricted view before the risk veto reads it. Without both, a
+position existing only in `findings.db` could put a symbol in front of the
+analyst or inflate the breadth count that blocks opens — a simulated trade
+changing a real one.
+
 The active strategy is shadowed too, which is the part that is easy to miss:
 comparing what the contract fired on against what the account actually opened
 is the only direct measurement of what the LLM layer contributes. Offline
@@ -551,9 +561,13 @@ Shadow outcomes are resolved with the same simulator the backtests use, so
 the forward and backtest numbers are directly comparable. A **sign
 disagreement between them is the earliest available warning that a backtest
 was fitted**, and the report flags it long before the sample is large enough
-to prove anything. `T4_CONFIRMED` is the one tier offline data cannot grant:
-it requires forward evidence agreeing in sign, over at least as many trades
-as the detectability gate computed.
+to prove anything. The tournament itself awards no tier above
+`T2_CANDIDATE`: when forward evidence agrees in sign over the trade count the
+detectability gate computed, the report says the sample target is reached and
+asks for the authoritative recorded-replay confirmation. It does not move the
+tier. A strategy already registered above that ceiling is reported as
+unrevised rather than as demoted — this battery cannot reproduce the evidence
+that granted the tier, so it can neither confirm nor withdraw it.
 
 **Change the momentum contract (`strategy:` block)**
 

@@ -26,6 +26,7 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -125,6 +126,14 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
             .replace("\n", " ")[:200])
     stats = gate_mod.headline(frames, membership, contract, cost_name,
                               exit_policy)
+    # A tier registered above this battery's ceiling was granted by the
+    # authoritative recorded-replay path, which this run cannot reproduce and
+    # therefore cannot contradict. Measuring T2 against a registered T3 is not
+    # a demotion, it is the battery reaching the end of what it may say - so it
+    # must not be reported or alerted as evidence of failure, or the nightly
+    # run would file the same false alarm forever.
+    beyond_authority = (TIERS.index(spec.tier)
+                        > TIERS.index(gate_mod.EXPLORATORY_CEILING))
     return {
         "strategy_id": spec.id,
         "version": spec.version,
@@ -132,7 +141,9 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
         "registered_tier": spec.tier,
         "measured_tier": tier,
         "tier_reason": why,
-        "tier_changed": tier != spec.tier,
+        "exploratory_ceiling": gate_mod.EXPLORATORY_CEILING,
+        "beyond_exploratory_authority": beyond_authority,
+        "tier_changed": tier != spec.tier and not beyond_authority,
         "hypotheses_tested": prereg.get("hypotheses_tested"),
         "mechanism": spec.mechanism,
         "falsification": spec.falsification,
@@ -165,6 +176,28 @@ def benchmark_check(rows: list[dict]) -> dict:
     }
 
 
+def _finite_float(value: object) -> float | None:
+    """Return a finite float, or None for a missing or malformed value."""
+    try:
+        number = float(value)                              # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None
+
+
+def _format_signed(value: object, suffix: str = "") -> str:
+    """Format an optional number without letting the report raise.
+
+    A missing expectancy is a normal state - a strategy can have resolved
+    trades journalled before any of them has an R multiple - and a nightly
+    report that raises on it loses every other strategy's result too.
+    """
+    number = _finite_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:+.4f}{suffix}"
+
+
 def apply_forward_evidence(row: dict, forward: dict) -> None:
     """Attach live/shadow results without promoting an exploratory tier.
 
@@ -175,38 +208,66 @@ def apply_forward_evidence(row: dict, forward: dict) -> None:
     A sign DISAGREEMENT is recorded loudly even when the counts are small.
     It is the earliest available warning that a backtest was fitted, and it
     arrives long before the sample is large enough to prove anything.
+
+    A strategy can have fired signals and shadow summaries before any trade
+    has enough future data to resolve. That is a pending state, and comparing
+    signs against it would read an absent expectancy as a flat one - which is
+    the same sign as the backtest half the time, and means nothing either way.
     """
     if not row.get("scored"):
         return
     entry = (forward.get("strategies") or {}).get(row["strategy_id"])
-    if not entry:
+    if not isinstance(entry, dict) or not entry:
         row["forward"] = {"status": "no forward evidence recorded yet"}
         return
 
-    observed = int(entry.get("resolved_trades") or 0)
-    forward_pct = entry.get("forward_expectancy_pct")
-    backtest_pct = row["headline"].get("expectancy_pct")
-    needed = 0
-    for gate in row["gates"]:
-        if gate["gate"] == "is_detectable":
-            needed = int(gate["numbers"].get("trades_needed") or 0)
+    try:
+        observed = max(0, int(entry.get("resolved_trades") or 0))
+    except (TypeError, ValueError):
+        row["forward"] = {
+            "status": ("forward evidence is malformed: resolved_trades is "
+                       "not an integer")}
+        return
 
-    agrees = None
-    if forward_pct is not None and backtest_pct is not None:
-        agrees = (forward_pct >= 0) == (backtest_pct >= 0)
+    forward_pct = _finite_float(entry.get("forward_expectancy_pct"))
+    backtest_pct = _finite_float((row.get("headline") or {}).get(
+        "expectancy_pct"))
+    needed = 0
+    for gate in row.get("gates") or []:
+        if gate.get("gate") == "is_detectable":
+            needed = _finite_float(
+                (gate.get("numbers") or {}).get("trades_needed")) or 0
+            needed = max(0, int(needed))
+            break
 
     row["forward"] = {
         "resolved_trades": observed,
         "trades_needed": needed,
         "forward_expectancy_pct": forward_pct,
         "backtest_expectancy_pct": backtest_pct,
-        "signs_agree": agrees,
+        "signs_agree": None,
         "signals_fired": entry.get("signals_fired"),
         "positions_actually_opened": entry.get("positions_actually_opened"),
         "selectivity_pct": entry.get("selectivity_pct"),
         "progress_pct": (round(observed / needed * 100, 1)
                          if needed else None),
     }
+
+    if not observed:
+        row["forward"]["status"] = "no resolved forward trades yet"
+        return
+    if forward_pct is None:
+        row["forward"]["status"] = (
+            "resolved trades exist but their expectancy is missing; sign "
+            "comparison deferred")
+        return
+    if backtest_pct is None:
+        row["forward"]["status"] = (
+            "backtest expectancy is unavailable; sign comparison deferred")
+        return
+
+    agrees = (forward_pct >= 0) == (backtest_pct >= 0)
+    row["forward"]["signs_agree"] = agrees
 
     if agrees is False:
         row["forward"]["warning"] = (
@@ -228,12 +289,18 @@ def recommendation(row: dict) -> str:
     if tier == "T1_HYPOTHESIS":
         return "HOLD - keep collecting data; nothing testable has passed yet"
     if tier == "T2_CANDIDATE":
+        if row.get("beyond_exploratory_authority"):
+            return (f"NO CHANGE - already registered "
+                    f"{row['registered_tier']} on authoritative evidence this "
+                    f"battery cannot reproduce; nothing here revises it")
         return "HOLD - exploratory candidate; authoritative recorded replay is required"
-    if tier == "T3_VALIDATED":
-        return "PROMOTE - eligible for demo; forward evidence required for T4"
-    if tier == "T4_CONFIRMED":
-        return "CONFIRMED - forward evidence agrees; live capital may be discussed"
-    return "HOLD"
+    # Above the ceiling this battery cannot reach. Reachable only if the tier
+    # rubric is ever widened, so it states the boundary rather than assuming
+    # the tier came from evidence that can authorize anything.
+    return (f"HOLD - {tier} is above this battery's "
+            f"{row.get('exploratory_ceiling', gate_mod.EXPLORATORY_CEILING)} "
+            f"ceiling; only the authoritative recorded-replay path may award "
+            f"it")
 
 
 def alert_on_tier_changes(rows: list[dict], payload: dict) -> None:
@@ -314,10 +381,11 @@ def write_report(path: Path, payload: dict) -> None:
     if "measured_expectancy_r" in check:
         lines.append(
             f"Benchmark `{BENCHMARK_ID}` measured "
-            f"{check['measured_expectancy_r']:+.4f} R against an expected "
-            f"{check['expected_expectancy_r']:+.4f} R "
-            f"(drift {check['drift_r']:.4f}, tolerance "
-            f"{check['tolerance_r']:.2f}).")
+            f"{_format_signed(check.get('measured_expectancy_r'))} R against "
+            f"an expected "
+            f"{_format_signed(check.get('expected_expectancy_r'))} R "
+            f"(drift {_format_signed(check.get('drift_r'))}, tolerance "
+            f"{_format_signed(check.get('tolerance_r'))}).")
         lines.append("")
 
     lines += ["## Leaderboard", "",
@@ -335,8 +403,8 @@ def write_report(path: Path, payload: dict) -> None:
             f"| `{row['strategy_id']}/{row['version']}` "
             f"| {row['measured_tier']} "
             f"| {head.get('trades', 0)} "
-            f"| {head.get('expectancy_pct', float('nan')):+.4f} "
-            f"| {head.get('expectancy_r', float('nan')):+.4f} "
+            f"| {_format_signed(head.get('expectancy_pct'))} "
+            f"| {_format_signed(head.get('expectancy_r'))} "
             f"| {row.get('hypotheses_tested', '?')} "
             f"| {recommendation(row)} |")
     lines.append("")
@@ -347,7 +415,15 @@ def write_report(path: Path, payload: dict) -> None:
         lines += [f"## {row['strategy_id']}/{row['version']}", "",
                   f"**Measured tier: {row['measured_tier']}** - "
                   f"{row['tier_reason']}", ""]
-        if row["tier_changed"]:
+        if row.get("beyond_exploratory_authority"):
+            lines += [
+                f"> Registered {row['registered_tier']} is above this "
+                f"battery's {row['exploratory_ceiling']} ceiling. The "
+                f"measured tier below is what exploratory data can show on "
+                f"its own; it is not a demotion and it does not revise the "
+                f"registered tier. Only the authoritative recorded-replay "
+                f"path can change that.", ""]
+        elif row["tier_changed"]:
             promoted = (TIERS.index(row["measured_tier"])
                         > TIERS.index(row["registered_tier"]))
             if promoted:
@@ -390,10 +466,10 @@ def write_report(path: Path, payload: dict) -> None:
                    if fwd.get("progress_pct") is not None else "")
                 + ".",
                 "",
-                f"- forward expectancy: "
-                f"{fwd.get('forward_expectancy_pct', float('nan')):+.4f}% "
-                f"vs backtest "
-                f"{fwd.get('backtest_expectancy_pct', float('nan')):+.4f}%",
+                "- forward expectancy: "
+                f"{_format_signed(fwd.get('forward_expectancy_pct'), '%')} "
+                "vs backtest "
+                f"{_format_signed(fwd.get('backtest_expectancy_pct'), '%')}",
                 f"- signs agree: "
                 f"{'yes' if agree else 'NO' if agree is False else 'unknown'}",
             ]
@@ -518,7 +594,7 @@ def main() -> int:
             head = row["headline"]
             print(f"  {row['strategy_id']:<16} {row['measured_tier']:<15} "
                   f"{head.get('trades', 0):>6} trades  "
-                  f"{head.get('expectancy_pct', float('nan')):+.4f}%  "
+                  f"{_format_signed(head.get('expectancy_pct'), '%')}  "
                   f"{recommendation(row)}")
         else:
             print(f"  {row['strategy_id']:<16} {'NOT SCORED':<15} "

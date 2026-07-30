@@ -29,6 +29,20 @@ ALL_DOCS = README + SETUP + AZURE
 PROTOCOL = (REPO / "research" / "protocol.md").read_text(encoding="utf-8")
 
 
+def flowed(text: str) -> str:
+    """Collapse whitespace so a phrase assertion survives a reflow.
+
+    Asserting a phrase with the line break where it happens to fall today
+    makes the test fail on rewrapping a paragraph, which teaches whoever hits
+    it that these tests are noise. Match on the prose, not the column width.
+    """
+    return " ".join(text.split())
+
+
+README_FLOWED = flowed(README)
+PROTOCOL_FLOWED = flowed(PROTOCOL)
+
+
 class ReferencedPathsExistTests(unittest.TestCase):
     def test_every_repo_path_named_in_backticks_exists(self):
         # Only paths that look like real files in this repo: a directory
@@ -127,6 +141,30 @@ class ResearchProtocolDocumentationTests(unittest.TestCase):
         for phrase in ("100 full pairs", "70 fit", "30 confirmation",
                        "80% coverage"):
             self.assertIn(phrase, PROTOCOL)
+
+    def test_the_episode_minimum_is_documented_with_its_reason(self):
+        """A pair count is not a precision, and the doc has to say why."""
+        from research.protocol import MIN_BOOTSTRAP_CLUSTERS
+
+        self.assertIn(f"{MIN_BOOTSTRAP_CLUSTERS} distinct six-hour episodes",
+                      PROTOCOL_FLOWED)
+        self.assertIn("zero-width", PROTOCOL_FLOWED)
+
+    def test_the_exploratory_tier_ceiling_is_documented(self):
+        import sys
+
+        sys.path.insert(0, str(REPO / "research"))
+        from gates import EXPLORATORY_CEILING
+
+        self.assertIn(f"awards no tier above `{EXPLORATORY_CEILING}`",
+                      README_FLOWED)
+        self.assertIn("unrevised rather than as demoted", README_FLOWED)
+
+    def test_two_way_shadow_isolation_is_documented(self):
+        for phrase in ("Isolation runs both ways",
+                       "withheld from everything on the live path",
+                       "breadth is recomputed"):
+            self.assertIn(phrase, README_FLOWED)
 
     def test_executable_fingerprint_scope_is_documented(self):
         for phrase in ("LLM provider", "universe selection",

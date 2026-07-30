@@ -47,6 +47,15 @@ PURGE_DAYS = 3
 PLACEBO_FAIL_RATIO = 0.50
 PLACEBO_PASS_RATIO = 0.25
 
+# The highest tier this battery may award. It runs on reconstructed market
+# data, so it can reject a strategy or nominate a candidate, but it cannot
+# confirm the recorded decision system - that needs G2-clean journal replay
+# and a persisted confirmation result. Everything above this line is outside
+# the battery's authority: it can neither grant those tiers nor take them
+# away, and a consumer comparing a measured tier against a registered one has
+# to know where that authority stops.
+EXPLORATORY_CEILING = "T2_CANDIDATE"
+
 # Detectability targets: 95% confidence, 80% power.
 Z_ALPHA, Z_POWER = 1.96, 0.84
 # Beyond this, no forward test of a reasonable length can confirm the effect.
@@ -438,12 +447,9 @@ def tier_from_gates(results: list[GateResult]) -> tuple[str, str]:
             f"{needed} its own effect size requires; collect more before "
             f"calling this validated")
 
-    # This battery runs on reconstructed/downloaded market data. It can reject
-    # a strategy or produce a candidate, but it cannot validate the exact
-    # recorded decision system: that requires G2-clean journal replay and an
-    # explicitly persisted confirmation result. Exploratory evidence must
-    # never authorize capital merely because every exploratory gate agrees.
-    return "T2_CANDIDATE", (
+    # Exploratory evidence must never authorize capital merely because every
+    # exploratory gate agrees; see EXPLORATORY_CEILING for why this stops here.
+    return EXPLORATORY_CEILING, (
         "cleared every exploratory offline gate; authoritative recorded "
         "replay confirmation is still required for T3_VALIDATED")
 
