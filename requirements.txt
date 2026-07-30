@@ -1,3 +1,6 @@
+# Python 3.12+ is required: the numpy and pandas pins below publish no
+# wheels for 3.11 or older, and pip fails the whole install with
+# "No matching distribution found for numpy" rather than a version hint.
 ccxt==4.5.67
 anthropic==0.117.1
 openai==2.46.0
@@ -5,3 +8,7 @@ pandas==3.0.3
 numpy==2.5.1
 PyYAML==6.0.3
 python-dotenv==1.2.2
+# Used directly by research/download_okx_history.py, research/record_flow.py
+# and research/fetch_flow_data.py. It also arrives transitively, but a
+# transitive dependency is not a contract: pin it where it is imported.
+requests==2.34.2

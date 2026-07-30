@@ -1,7 +1,9 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
-from agent.brain import LLM, SYSTEM, parse_decisions
+from agent.brain import LLM, build_system, parse_decisions
+from tests.helpers import valid_config
 
 
 class LLMPreflightTests(unittest.TestCase):
@@ -34,6 +36,8 @@ class OpenAITemperatureFallbackTests(unittest.TestCase):
         llm.cfg = {"model": "gpt-test", "temperature": 0.2,
                    "max_tokens": 2000}
         llm.provider = "openai"
+        llm.system = build_system(valid_config())
+        llm.prompt_version = "test-prompt"
         llm._no_temperature = False
         llm.client = Mock()
         return llm
@@ -71,6 +75,34 @@ class OpenAITemperatureFallbackTests(unittest.TestCase):
         self.assertEqual(create.call_count, 1)
         self.assertFalse(llm._no_temperature)
 
+    def test_gpt5_family_omits_temperature_before_first_request(self):
+        llm = self._llm()
+        llm.cfg["model"] = "gpt-5.6-terra"
+        llm._no_temperature = LLM._sampling_unsupported(
+            llm.cfg["model"])
+        params = llm._openai_params("sys", "user")
+        self.assertNotIn("temperature", params)
+        self.assertIn("prompt_cache_key", params)
+
+    def test_usage_separates_total_input_from_uncached_input(self):
+        llm = self._llm()
+        response = self._response()
+        response.usage = SimpleNamespace(
+            prompt_tokens=5_388,
+            completion_tokens=457,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=3_407),
+        )
+        llm.client.chat.completions.create.return_value = response
+
+        llm._openai("sys", "user")
+
+        self.assertEqual(
+            llm._last_usage_audit["input_tokens_total"], 5_388)
+        self.assertEqual(
+            llm._last_usage_audit["input_tokens_fresh"], 1_981)
+        self.assertEqual(
+            llm._last_usage_audit["cache_read_tokens"], 3_407)
+
 
 class ModelOutputValidationTests(unittest.TestCase):
     def test_non_finite_confidence_is_safe_and_numeric_risk_fields_are_ignored(self):
@@ -89,6 +121,22 @@ class ModelOutputValidationTests(unittest.TestCase):
         self.assertEqual(
             decisions[0]["setup_type"], "trend_continuation")
 
+    def test_close_requires_structured_trigger_and_evidence_change(self):
+        missing = parse_decisions(
+            '{"decisions":[{"action":"close",'
+            '"symbol":"BTC/USDT:USDT","reasoning":"looks weak"}]}')
+        self.assertEqual(missing, [])
+
+        decisions = parse_decisions(
+            '{"decisions":[{"action":"close",'
+            '"symbol":"BTC/USDT:USDT",'
+            '"close_trigger":"thesis_invalidated",'
+            '"evidence_change":"entry trend was up; current 1h trend is down",'
+            '"reasoning":"the recorded thesis has broken"}]}')
+        self.assertEqual(
+            decisions[0]["close_trigger"], "thesis_invalidated")
+        self.assertIn("current 1h trend", decisions[0]["evidence_change"])
+
 
 class LLMAuditTests(unittest.TestCase):
     @staticmethod
@@ -97,6 +145,8 @@ class LLMAuditTests(unittest.TestCase):
         llm.cfg = {"model": "gpt-test", "temperature": 0.2,
                    "max_tokens": 2000}
         llm.provider = "openai"
+        llm.system = build_system(valid_config())
+        llm.prompt_version = "test-prompt"
         llm._no_temperature = False
         llm._call = Mock(return_value='{"decisions":[]}')
         llm._last_request_attempts = []
@@ -113,7 +163,8 @@ class LLMAuditTests(unittest.TestCase):
         request = audit["request"]
         self.assertEqual(request["model"], "gpt-test")
         self.assertEqual(request["temperature"], 0.2)
-        self.assertEqual(request["messages"][0]["content"], SYSTEM)
+        self.assertIn("prompt_cache_key", request)
+        self.assertEqual(request["messages"][0]["content"], llm.system)
         self.assertIn('"equity_usdt":10000',
                       request["messages"][1]["content"])
 

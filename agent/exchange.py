@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 
 import ccxt
 
@@ -29,6 +30,41 @@ CLOCK_SKEW_WARN_MS = 3_000
 CLOCK_RECHECK_SECONDS = 900
 ACCOUNT_RECHECK_SECONDS = 900
 OKX_CRYPTO_INSTRUMENT_CATEGORY = "1"
+
+
+@dataclass(frozen=True)
+class TransferRecord:
+    """One OKX ledger transfer with explicit identity quality."""
+
+    transfer_id: str | None
+    ts_ms: int
+    net_usdt: float
+    reconciliation_required: bool
+    reconciliation_key: str
+
+    def as_event(self) -> dict:
+        return {
+            "transfer_id": self.transfer_id,
+            "ledger_ts_ms": self.ts_ms,
+            "net_usdt": self.net_usdt,
+            "identity_status": (
+                "identified" if self.transfer_id
+                else "reconciliation_required"),
+            "reconciliation_required": self.reconciliation_required,
+            "reconciliation_key": self.reconciliation_key,
+        }
+
+
+@dataclass(frozen=True)
+class TransferBatch:
+    net_usdt: float
+    next_since_ms: int
+    records: tuple[TransferRecord, ...]
+
+    def __iter__(self):
+        """Preserve the historical two-value unpacking contract."""
+        yield self.net_usdt
+        yield self.next_since_ms
 
 
 class CredentialError(RuntimeError):
@@ -142,6 +178,37 @@ class Exchange:
                 last = e
                 time.sleep(1.5 * (i + 1))
         raise last
+
+    def public_call(self, method: str, params: dict) -> list:
+        """Call one of ccxt's generated public OKX endpoints, return `data`.
+
+        Used for the statistics endpoints (open-interest history, long/short
+        ratio) that back enrichment fields. Public and unsigned, so it cannot
+        touch the account.
+
+        Goes through ccxt's implicit method rather than a hand-built URL.
+        That is not stylistic: ``urls["api"]["rest"]`` is the unexpanded
+        template ``https://{hostname}``, so assembling a URL from it produces
+        a request that always fails - and because these fields degrade to
+        None by design, it would fail *silently*, leaving the strategies that
+        depend on them never firing with nothing in the logs.
+
+        Returns an empty list on any failure: no order depends on these
+        fields, so a statistics outage must never be able to stop trading.
+        """
+        fetcher = getattr(self.x, method, None)
+        if not callable(fetcher):
+            log.warning("ccxt has no public endpoint %s; "
+                        "enrichment field unavailable", method)
+            return []
+        try:
+            response = self.retry(fetcher, params)
+        except Exception:
+            return []
+        if not isinstance(response, dict) or str(response.get("code")) != "0":
+            return []
+        data = response.get("data")
+        return data if isinstance(data, list) else []
 
     @staticmethod
     def _safe_exchange_error_text(value: object) -> str:
@@ -931,13 +998,16 @@ class Exchange:
         return float(
             self.account_risk_metrics()["initial_margin_usage_pct"])
 
-    def transfers_since(self, since_ms: int) -> tuple[float, int]:
+    def transfers_since(
+            self, since_ms: int,
+            seen_ids: set[str] | None = None) -> TransferBatch:
         """Net USDT transferred in/out of the trading account since since_ms.
 
         Used to rebase the drawdown and daily-loss benchmarks so a deposit is
         not counted as profit and a withdrawal is not counted as a crash.
 
-        Returns (net_usdt, next_since_ms). fetch_ledger treats `since` as
+        Returns a TransferBatch that still unpacks as
+        ``(net_usdt, next_since_ms)``. fetch_ledger treats `since` as
         inclusive, so the cursor advances one past the newest entry counted --
         otherwise the same transfer is re-counted every cycle until a newer
         ledger entry appears. On error the cursor stays put so transfers that
@@ -947,10 +1017,12 @@ class Exchange:
             entries = self.retry(self.x.fetch_ledger, "USDT", since_ms, 100)
         except Exception as e:
             log.debug("fetch_ledger unavailable: %s", e)
-            return 0.0, since_ms
+            return TransferBatch(0.0, since_ms, ())
+        already_seen = set(seen_ids or ())
         net = 0.0
         latest = since_ms - 1
-        for e in entries or []:
+        records = []
+        for index, e in enumerate(entries or []):
             ts = int(e.get("timestamp") or 0)
             if ts < since_ms:
                 continue
@@ -962,10 +1034,32 @@ class Exchange:
             amt = abs(float(e.get("amount") or 0))
             direction = e.get("direction")
             if direction == "in":
-                net += amt
+                signed = amt
             elif direction == "out":
-                net -= amt
-        return net, latest + 1
+                signed = -amt
+            else:
+                continue
+            info = e.get("info") or {}
+            raw_id = next((value for value in (
+                e.get("id"), info.get("billId"), info.get("id"),
+                info.get("tradeId"), info.get("ordId"), info.get("txId"))
+                if value not in (None, "")), None)
+            transfer_id = f"okx:{raw_id}" if raw_id is not None else None
+            # This key is for an operator's reconciliation queue only. It is
+            # deliberately not used as an idempotency key: equal legitimate
+            # transfers can share timestamp, direction and amount.
+            reconciliation_key = (
+                f"ledger:{ts}:{direction}:{amt:.12g}:{index}")
+            if transfer_id and transfer_id in already_seen:
+                continue
+            if transfer_id:
+                already_seen.add(transfer_id)
+            net += signed
+            records.append(TransferRecord(
+                transfer_id=transfer_id, ts_ms=ts, net_usdt=signed,
+                reconciliation_required=transfer_id is None,
+                reconciliation_key=reconciliation_key))
+        return TransferBatch(net, latest + 1, tuple(records))
 
     def funding_since(self, symbol: str, since_ms: int) -> float | None:
         """Return signed funding paid/received, or None if it cannot be read."""
@@ -976,6 +1070,84 @@ class Exchange:
             log.warning("funding history unavailable for %s: %s", symbol, exc)
             return None
         return sum(float(row.get("amount") or 0) for row in rows)
+
+    @staticmethod
+    def _seconds_timestamp(value: object) -> float | None:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        now = time.time()
+        if timestamp < 1_230_768_000 or timestamp > now + 60:
+            return None
+        return timestamp
+
+    def position_opened_at(self, pos: dict) -> float | None:
+        """Recover the start of the current continuous net position.
+
+        OKX normally returns ``cTime`` on a position. If an adapter omits it,
+        reverse the account's fills until the current net position crosses
+        flat. Returning ``None`` is intentional: the engine pauses rather
+        than inventing a fresh timestamp and silently defeating max-hold.
+        """
+        info = pos.get("info") or {}
+        for value in (
+                info.get("cTime"), info.get("createdTime"),
+                info.get("openTime"), info.get("openTimestamp"),
+                pos.get("created"), pos.get("datetime")):
+            if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+                continue
+            recovered = self._seconds_timestamp(value)
+            if recovered is not None:
+                return recovered
+
+        symbol = pos.get("symbol")
+        contracts = abs(float(pos.get("contracts") or 0))
+        if not symbol or not math.isfinite(contracts) or contracts <= 0:
+            return None
+        side = str(pos.get("side") or info.get("posSide") or "").lower()
+        if side not in {"long", "short"}:
+            raw = float(info.get("pos") or 0)
+            side = "long" if raw >= 0 else "short"
+        current = contracts if side == "long" else -contracts
+        lookback_hours = max(
+            24.0 * 30,
+            float(self.cfg.get("risk", {}).get("max_hold_hours") or 24) * 2,
+        )
+        since_ms = int((time.time() - lookback_hours * 3600) * 1000)
+        try:
+            fills = self.retry(
+                self.x.fetch_my_trades, symbol, since_ms, 100) or []
+        except Exception as exc:
+            log.warning("position age fill history unavailable for %s: %s",
+                        symbol, exc)
+            return None
+        for fill in sorted(
+                fills,
+                key=lambda row: int(row.get("timestamp") or 0),
+                reverse=True):
+            fill_side = str(fill.get("side") or "").lower()
+            try:
+                amount = abs(float(fill.get("amount") or 0))
+            except (TypeError, ValueError):
+                continue
+            if fill_side not in {"buy", "sell"} \
+                    or not math.isfinite(amount) or amount <= 0:
+                continue
+            signed = amount if fill_side == "buy" else -amount
+            previous = current - signed
+            if current != 0 and (
+                    abs(previous) <= max(1e-12, contracts * 1e-9)
+                    or previous * current < 0):
+                recovered = self._seconds_timestamp(fill.get("timestamp"))
+                if recovered is not None:
+                    return recovered
+            current = previous
+        return None
 
     def positions(self) -> list[dict]:
         out = []
@@ -1024,6 +1196,73 @@ class Exchange:
         if amt <= 0 or amt < float(min_amt or 0):
             return 0.0
         return amt
+
+    def book_state(self, symbol: str, band_pct: float = 0.35) -> dict:
+        """Observe the order book without judging it.
+
+        ``guarded_entry_limit`` reads the same book but only journals when it
+        rejects, so every passing observation is discarded. That is precisely
+        backwards for H-H, which claims the tradeable moment in a liquidation
+        cascade is the depth *restoration* rather than the impulse: spread
+        spikes then normalises, top-of-book depth collapses then refills, and
+        price is still near the extreme when the refill happens. That
+        signature is only visible if the ordinary readings were kept too.
+
+        This raises nothing. A caller journalling market observations must
+        never be able to interrupt trading, so every failure becomes a row of
+        nulls carrying the reason.
+        """
+        blank = {
+            "symbol": symbol, "mid": None, "spread_pct": None,
+            "bid_depth_usd": None, "ask_depth_usd": None,
+            "top_bid_size": None, "top_ask_size": None,
+            "band_pct": float(band_pct), "book_ts": None, "error": None,
+        }
+        try:
+            book = self.retry(self.x.fetch_order_book, symbol, 50)
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            if not bids or not asks:
+                blank["error"] = "no two-sided depth"
+                return blank
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            if not (math.isfinite(best_bid) and math.isfinite(best_ask)
+                    and best_ask >= best_bid > 0):
+                blank["error"] = "invalid top of book"
+                return blank
+
+            mid = (best_bid + best_ask) / 2
+            contract_size = float(
+                self.x.market(symbol).get("contractSize") or 1)
+            floor = mid * (1 - float(band_pct) / 100)
+            ceiling = mid * (1 + float(band_pct) / 100)
+
+            def depth(levels, inside) -> float:
+                total = 0.0
+                for level in levels:
+                    price = float(level[0])
+                    amount = float(level[1])
+                    if not (math.isfinite(price) and math.isfinite(amount)):
+                        continue
+                    if not inside(price):
+                        break
+                    total += price * amount * contract_size
+                return round(total, 2)
+
+            blank.update({
+                "mid": round(mid, 10),
+                "spread_pct": round((best_ask - best_bid) / mid * 100, 6),
+                "bid_depth_usd": depth(bids, lambda p: p >= floor),
+                "ask_depth_usd": depth(asks, lambda p: p <= ceiling),
+                "top_bid_size": float(bids[0][1]),
+                "top_ask_size": float(asks[0][1]),
+                "book_ts": book.get("timestamp"),
+            })
+            return blank
+        except Exception as e:                      # observation, never a gate
+            blank["error"] = f"{type(e).__name__}: {e}"
+            return blank
 
     def guarded_entry_limit(self, symbol: str, side: str, contracts: float,
                             max_spread_pct: float,
@@ -1252,44 +1491,22 @@ class Exchange:
         time.sleep(0.5)
         return self.protection_status(symbol, contracts, side, mark_price)
 
-    def open_position(self, symbol: str, side: str, contracts: float,
-                      leverage: float, sl_price: float, tp_price: float,
-                      expected_price: float | None = None,
-                      entry_limit_price: float | None = None) -> dict:
-        try:
-            self.retry(self.x.set_leverage, int(leverage), symbol,
-                       {"mgnMode": "cross"})
-        except CredentialError:
-            raise
-        except ccxt.ExchangeError as e:
-            raise self._entry_order_rejection(
-                symbol, "set_leverage", e) from e
-        except Exception as e:
-            raise RuntimeError(f"set_leverage failed for {symbol}: {e}") from e
+    def settle_fill(self, fill: dict, symbol: str, side: str,
+                    contracts: float, sl_price: float,
+                    tp_price: float) -> dict:
+        """Verify the position and its protection after ANY entry fills.
 
-        sl = self.x.price_to_precision(symbol, sl_price)
-        tp = self.x.price_to_precision(symbol, tp_price)
-        params = {
-            "tdMode": "cross",
-            "stopLoss": {"triggerPrice": sl},
-            "takeProfit": {"triggerPrice": tp},
-        }
-        order_type = "limit" if entry_limit_price is not None else "market"
-        order_price = (self.x.price_to_precision(symbol, entry_limit_price)
-                       if entry_limit_price is not None else None)
-        if entry_limit_price is not None:
-            params["timeInForce"] = "IOC"
-        try:
-            # Preferred path: entry with SL/TP attached server-side.
-            order = self._create_order_once(
-                symbol, order_type, side, contracts, order_price, params,
-                "okxent")
-        except ccxt.ExchangeError as e:
-            raise self._entry_order_rejection(
-                symbol, "attached_entry", e) from e
+        Extracted so every path capable of creating a position runs the same
+        verification: read the live position, confirm the exchange-side stop
+        actually exists, alert loudly if it does not, and attach the mark and
+        liquidation prices the engine needs to judge whether that stop sits
+        inside the liquidation distance.
 
-        fill = self.verify_fill(
-            order, symbol, contracts, expected_price, side=side)
+        B7.5 is why this is shared rather than inlined. A maker-first fill
+        creates a position exactly as an IOC fill does, and one that skipped
+        this would be a position the engine believes is protected without
+        anything having checked.
+        """
         position_side = "long" if side == "buy" else "short"
         try:
             live_position = self.position(symbol)
@@ -1347,6 +1564,180 @@ class Exchange:
         fill["liquidation_price"] = liquidation_price
         fill["mark_price"] = mark
         return fill
+
+    def maker_first_entry(self, symbol: str, side: str, contracts: float,
+                          leverage: float, sl_price: float, tp_price: float,
+                          wait_seconds: float,
+                          reference_price: float) -> dict:
+        """Post passively for ``wait_seconds``, then get out of the way.
+
+        H-K(ii). Every IOC entry crosses the spread and accepts adverse
+        selection: you buy at the moment a seller wants to sell to you. At a
+        2% stop, round-trip friction is roughly 10% of the risk unit, so
+        converting the filled fraction from taker to maker moves expectancy
+        by more than most of the parameter axes queued for sweeping - and it
+        does so without requiring any signal to have edge.
+
+        Fill rate is not knowable from history, because the passive order was
+        never there. This is a live experiment and nothing else.
+
+        **The order is never left resting.** Every exit from this method
+        either returns a filled position or has cancelled the order. If the
+        cancel fails, the fill state is re-read and reported rather than
+        assumed, because an abandoned resting order is an unmanaged position
+        waiting to happen.
+
+        Protection is unchanged: stop-loss and take-profit are attached to
+        the order server-side exactly as the IOC path attaches them, so a
+        fill arrives already protected.
+        """
+        self.retry(self.x.set_leverage, int(leverage), symbol,
+                   {"mgnMode": "cross"})
+        book = self.retry(self.x.fetch_order_book, symbol, 5)
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            raise RuntimeError(f"{symbol} order book has no two-sided depth")
+
+        # Join the near touch rather than improving it: improving would cross
+        # into the spread we are trying to capture.
+        passive = float(bids[0][0]) if side == "buy" else float(asks[0][0])
+        limit = float(self.x.price_to_precision(symbol, passive))
+
+        params = {
+            "tdMode": "cross",
+            "stopLoss": {"triggerPrice":
+                         self.x.price_to_precision(symbol, sl_price)},
+            "takeProfit": {"triggerPrice":
+                           self.x.price_to_precision(symbol, tp_price)},
+            # Post-only: if it would cross, it is rejected rather than
+            # silently becoming the taker order this method exists to avoid.
+            "postOnly": True,
+        }
+        order = self.retry(self.x.create_order, symbol, "limit", side,
+                           contracts, limit, params)
+        order_id = order.get("id")
+
+        deadline = time.time() + max(0.0, float(wait_seconds))
+        filled = float(order.get("filled") or 0)
+        while time.time() < deadline and filled < contracts:
+            time.sleep(min(1.0, max(0.05, deadline - time.time())))
+            try:
+                order = self.retry(self.x.fetch_order, order_id, symbol)
+                filled = float(order.get("filled") or 0)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("maker-first fill poll failed for %s: %s",
+                            symbol, exc)
+                break
+
+        cancelled = True
+        if filled < contracts:
+            try:
+                self.retry(self.x.cancel_order, order_id, symbol)
+            except Exception as exc:                       # noqa: BLE001
+                # The order may have filled in the race. Re-read rather than
+                # assume either way: assuming unfilled would double the
+                # position, assuming filled would leave one unmanaged.
+                cancelled = False
+                log.warning("maker-first cancel failed for %s: %s",
+                            symbol, exc)
+            try:
+                order = self.retry(self.x.fetch_order, order_id, symbol)
+                filled = float(order.get("filled") or 0)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("maker-first post-cancel read failed for %s: %s",
+                            symbol, exc)
+
+        # A passive fill is a position, so it goes through exactly the same
+        # verification an IOC fill does - live position read, protection
+        # audit, mark and liquidation prices. Skipping it would leave the
+        # engine believing a position is protected without anything having
+        # checked.
+        settled = None
+        if filled > 0:
+            settled = self.settle_fill(
+                {"filled": float(filled),
+                 "average": float(order.get("average") or limit),
+                 "requested": float(contracts),
+                 "partial": float(filled) < float(contracts),
+                 "order_id": order_id,
+                 "client_order_id": (order.get("clientOrderId")
+                                     or (order.get("info") or {}).get(
+                                         "clOrdId")),
+                 "status": order.get("status"),
+                 "fee_usd": 0.0, "slippage_usd": 0.0,
+                 "submission_audit": {"path": "maker_first"}},
+                symbol, side, contracts, sl_price, tp_price)
+
+        average = order.get("average") or (limit if filled else None)
+        slippage_saved_pct = None
+        if average and reference_price:
+            realised = float(average)
+            direction = 1.0 if side == "buy" else -1.0
+            # Positive means the passive fill beat the reference.
+            slippage_saved_pct = round(
+                direction * (reference_price - realised)
+                / reference_price * 100, 6)
+
+        return {
+            "order_id": order_id,
+            "requested_contracts": float(contracts),
+            "filled_contracts": float(filled),
+            "fill_rate": (float(filled) / float(contracts)
+                          if contracts else 0.0),
+            "limit_price": limit,
+            "average_price": float(average) if average else None,
+            "reference_price": float(reference_price),
+            "ioc_counterfactual_pct": slippage_saved_pct,
+            "wait_seconds": float(wait_seconds),
+            "cancelled": cancelled,
+            "resting": bool(not cancelled and filled < contracts),
+            # The settled fill, shaped exactly like open_position's return so
+            # the engine's own post-fill bookkeeping can consume it unchanged.
+            # None when nothing filled, which is the ordinary outcome.
+            "execution": settled,
+        }
+
+    def open_position(self, symbol: str, side: str, contracts: float,
+                      leverage: float, sl_price: float, tp_price: float,
+                      expected_price: float | None = None,
+                      entry_limit_price: float | None = None) -> dict:
+        try:
+            self.retry(self.x.set_leverage, int(leverage), symbol,
+                       {"mgnMode": "cross"})
+        except CredentialError:
+            raise
+        except ccxt.ExchangeError as e:
+            raise self._entry_order_rejection(
+                symbol, "set_leverage", e) from e
+        except Exception as e:
+            raise RuntimeError(f"set_leverage failed for {symbol}: {e}") from e
+
+        sl = self.x.price_to_precision(symbol, sl_price)
+        tp = self.x.price_to_precision(symbol, tp_price)
+        params = {
+            "tdMode": "cross",
+            "stopLoss": {"triggerPrice": sl},
+            "takeProfit": {"triggerPrice": tp},
+        }
+        order_type = "limit" if entry_limit_price is not None else "market"
+        order_price = (self.x.price_to_precision(symbol, entry_limit_price)
+                       if entry_limit_price is not None else None)
+        if entry_limit_price is not None:
+            params["timeInForce"] = "IOC"
+        try:
+            # Preferred path: entry with SL/TP attached server-side.
+            order = self._create_order_once(
+                symbol, order_type, side, contracts, order_price, params,
+                "okxent")
+        except ccxt.ExchangeError as e:
+            raise self._entry_order_rejection(
+                symbol, "attached_entry", e) from e
+
+        fill = self.verify_fill(
+            order, symbol, contracts, expected_price, side=side)
+        return self.settle_fill(
+            fill, symbol, side, contracts, sl_price, tp_price)
 
     def close_position(self, pos: dict) -> dict:
         symbol = pos["symbol"]

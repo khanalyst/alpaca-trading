@@ -1,0 +1,4022 @@
+{
+  "candidate_count": 61305,
+  "data": {
+    "bars_per_symbol": 70080,
+    "downloaded_at": "2026-07-27",
+    "manifest": {
+      "downloaded_at": "2026-07-27",
+      "source": "OKX public v5 REST",
+      "symbols": [
+        "AAVE/USDT:USDT",
+        "BTC/USDT:USDT",
+        "DOGE/USDT:USDT",
+        "ETH/USDT:USDT",
+        "SOL/USDT:USDT",
+        "XRP/USDT:USDT"
+      ]
+    },
+    "source": "OKX public v5 REST"
+  },
+  "event_studies": [
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 11.876913730255165,
+        "expectancy_r": 0.013987183796714143,
+        "expectancy_r_ci95": [
+          -0.026523439646822175,
+          0.056846210774242366
+        ],
+        "expectancy_return_pct": -0.017641363856374048,
+        "max_hold_pct": 23.669501822600242,
+        "median_return_pct": -0.8382016764033495,
+        "profit_factor": 0.9846955915785307,
+        "stop_pct": 51.786148238153096,
+        "take_profit_pct": 24.54434993924666,
+        "trades": 4115,
+        "win_rate_pct": 38.90643985419198
+      },
+      "scenario": "frictionless",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 11.431971904266389,
+            "expectancy_r": 0.011795265282059753,
+            "expectancy_r_ci95": [
+              -0.03823474803407454,
+              0.05043925003855438
+            ],
+            "expectancy_return_pct": 0.01824491232988373,
+            "max_hold_pct": 21.69614984391259,
+            "median_return_pct": -0.8577500000000016,
+            "profit_factor": 1.0162974440602028,
+            "stop_pct": 53.38189386056192,
+            "take_profit_pct": 24.921956295525494,
+            "trades": 1922,
+            "win_rate_pct": 38.50156087408949
+          },
+          "short": {
+            "average_hold_hours": 12.26687186502508,
+            "expectancy_r": 0.01590823595593244,
+            "expectancy_r_ci95": [
+              -0.056140520620022345,
+              0.08791302987000996
+            ],
+            "expectancy_return_pct": -0.04909299305381476,
+            "max_hold_pct": 25.398996808025537,
+            "median_return_pct": -0.8174705126708037,
+            "profit_factor": 0.9584590661576314,
+            "stop_pct": 50.3875968992248,
+            "take_profit_pct": 24.21340629274966,
+            "trades": 2193,
+            "win_rate_pct": 39.261285909712726
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 12.253963414634146,
+            "expectancy_r": 0.03362853602615486,
+            "expectancy_r_ci95": [
+              -0.02088419908973587,
+              0.08704575288511222
+            ],
+            "expectancy_return_pct": 0.07066119848939631,
+            "max_hold_pct": 24.878048780487806,
+            "median_return_pct": -0.9234999999999993,
+            "profit_factor": 1.0554886619395065,
+            "stop_pct": 49.75609756097561,
+            "take_profit_pct": 25.365853658536587,
+            "trades": 820,
+            "win_rate_pct": 39.390243902439025
+          },
+          "2025": {
+            "average_hold_hours": 11.811298076923077,
+            "expectancy_r": -0.007756800468554556,
+            "expectancy_r_ci95": [
+              -0.06545055089150509,
+              0.055855238243232075
+            ],
+            "expectancy_return_pct": -0.1088961044763053,
+            "max_hold_pct": 23.942307692307693,
+            "median_return_pct": -0.8870000000000045,
+            "profit_factor": 0.9110631509857453,
+            "stop_pct": 52.45192307692308,
+            "take_profit_pct": 23.60576923076923,
+            "trades": 2080,
+            "win_rate_pct": 37.74038461538461
+          },
+          "2026": {
+            "average_hold_hours": 11.73477366255144,
+            "expectancy_r": 0.03795556111656394,
+            "expectancy_r_ci95": [
+              -0.036759528745642096,
+              0.11381923322430587
+            ],
+            "expectancy_return_pct": 0.07898559858471674,
+            "max_hold_pct": 22.386831275720166,
+            "median_return_pct": -0.7264999999999966,
+            "profit_factor": 1.083280420572526,
+            "stop_pct": 52.016460905349795,
+            "take_profit_pct": 25.596707818930042,
+            "trades": 1215,
+            "win_rate_pct": 40.5761316872428
+          }
+        },
+        "setup_type": {
+          "trend_continuation": {
+            "average_hold_hours": 11.876913730255165,
+            "expectancy_r": 0.013987183796714143,
+            "expectancy_r_ci95": [
+              -0.026523439646822175,
+              0.056846210774242366
+            ],
+            "expectancy_return_pct": -0.017641363856374048,
+            "max_hold_pct": 23.669501822600242,
+            "median_return_pct": -0.8382016764033495,
+            "profit_factor": 0.9846955915785307,
+            "stop_pct": 51.786148238153096,
+            "take_profit_pct": 24.54434993924666,
+            "trades": 4115,
+            "win_rate_pct": 38.90643985419198
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 11.881851851851852,
+            "expectancy_r": -0.05553783767909829,
+            "expectancy_r_ci95": [
+              -0.11289076731284851,
+              -0.0012573756423786414
+            ],
+            "expectancy_return_pct": -0.26070866185415104,
+            "max_hold_pct": 22.22222222222222,
+            "median_return_pct": -1.3865000000000016,
+            "profit_factor": 0.8352592154851509,
+            "stop_pct": 56.00000000000001,
+            "take_profit_pct": 21.777777777777775,
+            "trades": 675,
+            "win_rate_pct": 36.148148148148145
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 12.358197932053177,
+            "expectancy_r": 0.033521925452396004,
+            "expectancy_r_ci95": [
+              -0.022437786738589798,
+              0.09143271873665326
+            ],
+            "expectancy_return_pct": 0.008241053001663072,
+            "max_hold_pct": 24.66765140324963,
+            "median_return_pct": -0.5100000000000104,
+            "profit_factor": 1.0123109244529218,
+            "stop_pct": 49.48301329394387,
+            "take_profit_pct": 25.849335302806498,
+            "trades": 677,
+            "win_rate_pct": 39.5864106351551
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 11.36707492795389,
+            "expectancy_r": 0.047161896409878286,
+            "expectancy_r_ci95": [
+              -0.019893859816864767,
+              0.11754349997413192
+            ],
+            "expectancy_return_pct": 0.11480691183919037,
+            "max_hold_pct": 21.75792507204611,
+            "median_return_pct": -1.033999999999996,
+            "profit_factor": 1.0877644290975192,
+            "stop_pct": 51.5850144092219,
+            "take_profit_pct": 26.65706051873199,
+            "trades": 694,
+            "win_rate_pct": 39.76945244956772
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 11.600071736011477,
+            "expectancy_r": -0.020142650305948275,
+            "expectancy_r_ci95": [
+              -0.06848374680084068,
+              0.03290576377367165
+            ],
+            "expectancy_return_pct": -0.07749351431766795,
+            "max_hold_pct": 24.2467718794835,
+            "median_return_pct": -0.8694999999999897,
+            "profit_factor": 0.9236919861236824,
+            "stop_pct": 52.94117647058824,
+            "take_profit_pct": 22.812051649928264,
+            "trades": 697,
+            "win_rate_pct": 37.87661406025825
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 12.275773195876289,
+            "expectancy_r": 0.059224622132632104,
+            "expectancy_r_ci95": [
+              -0.0005143511012301538,
+              0.11717100860097944
+            ],
+            "expectancy_return_pct": 0.07925068781830444,
+            "max_hold_pct": 24.889543446244478,
+            "median_return_pct": -0.9330475349892842,
+            "profit_factor": 1.0658690912569009,
+            "stop_pct": 49.337260677466865,
+            "take_profit_pct": 25.773195876288657,
+            "trades": 679,
+            "win_rate_pct": 41.531664212076585
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 11.8001443001443,
+            "expectancy_r": 0.01940333470754858,
+            "expectancy_r_ci95": [
+              -0.04981950530279324,
+              0.09778212343522019
+            ],
+            "expectancy_return_pct": 0.026451236991103213,
+            "max_hold_pct": 24.242424242424242,
+            "median_return_pct": -0.8299999999999863,
+            "profit_factor": 1.0232228429998838,
+            "stop_pct": 51.37085137085137,
+            "take_profit_pct": 24.38672438672439,
+            "trades": 693,
+            "win_rate_pct": 38.52813852813853
+          }
+        }
+      },
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 11.763065569804017,
+        "expectancy_r": -0.09055393917126887,
+        "expectancy_r_ci95": [
+          -0.13511632102972604,
+          -0.04472718809293284
+        ],
+        "expectancy_return_pct": -0.25409445329833197,
+        "max_hold_pct": 23.37285264940721,
+        "median_return_pct": -1.0982256374999892,
+        "profit_factor": 0.806301436027245,
+        "stop_pct": 52.818775707718366,
+        "take_profit_pct": 23.808371642874427,
+        "trades": 4133,
+        "win_rate_pct": 36.89813694652795
+      },
+      "scenario": "base",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 11.319135163127912,
+            "expectancy_r": -0.09392741747879638,
+            "expectancy_r_ci95": [
+              -0.14701145358589757,
+              -0.05149551159515652
+            ],
+            "expectancy_return_pct": -0.21660359060806297,
+            "max_hold_pct": 21.128948731227343,
+            "median_return_pct": -1.1176866521249949,
+            "profit_factor": 0.8306357813793122,
+            "stop_pct": 54.53133091662351,
+            "take_profit_pct": 24.339720352149147,
+            "trades": 1931,
+            "win_rate_pct": 36.509580528223715
+          },
+          "short": {
+            "average_hold_hours": 12.15236148955495,
+            "expectancy_r": -0.08759563462456789,
+            "expectancy_r_ci95": [
+              -0.16435199125430366,
+              -0.01046027434891399
+            ],
+            "expectancy_return_pct": -0.2869713179009248,
+            "max_hold_pct": 25.340599455040874,
+            "median_return_pct": -1.0774771193124861,
+            "profit_factor": 0.785944287499245,
+            "stop_pct": 51.316984559491374,
+            "take_profit_pct": 23.342415985467756,
+            "trades": 2202,
+            "win_rate_pct": 37.23887375113533
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 12.161192214111923,
+            "expectancy_r": -0.05865822211902473,
+            "expectancy_r_ci95": [
+              -0.11718544135444223,
+              -0.003699563073775102
+            ],
+            "expectancy_return_pct": -0.15673403720532825,
+            "max_hold_pct": 24.695863746958636,
+            "median_return_pct": -1.1765686963749924,
+            "profit_factor": 0.8903144866037459,
+            "stop_pct": 50.48661800486618,
+            "take_profit_pct": 24.817518248175183,
+            "trades": 822,
+            "win_rate_pct": 37.71289537712895
+          },
+          "2025": {
+            "average_hold_hours": 11.682535885167464,
+            "expectancy_r": -0.10857570157305903,
+            "expectancy_r_ci95": [
+              -0.1694200651187836,
+              -0.04140159888406282
+            ],
+            "expectancy_return_pct": -0.3425856370273355,
+            "max_hold_pct": 23.779904306220097,
+            "median_return_pct": -1.1438239406865311,
+            "profit_factor": 0.7519189093437653,
+            "stop_pct": 53.34928229665071,
+            "take_profit_pct": 22.870813397129186,
+            "trades": 2090,
+            "win_rate_pct": 35.98086124401914
+          },
+          "2026": {
+            "average_hold_hours": 11.632882882882884,
+            "expectancy_r": -0.08117866971770893,
+            "expectancy_r_ci95": [
+              -0.17197005567110843,
+              0.009394292801102405
+            ],
+            "expectancy_return_pct": -0.16816790787231337,
+            "max_hold_pct": 21.785421785421786,
+            "median_return_pct": -1.0025491045099444,
+            "profit_factor": 0.8491225609342227,
+            "stop_pct": 53.480753480753485,
+            "take_profit_pct": 24.733824733824733,
+            "trades": 1221,
+            "win_rate_pct": 37.91973791973792
+          }
+        },
+        "setup_type": {
+          "trend_continuation": {
+            "average_hold_hours": 11.763065569804017,
+            "expectancy_r": -0.09055393917126887,
+            "expectancy_r_ci95": [
+              -0.13511632102972604,
+              -0.04472718809293284
+            ],
+            "expectancy_return_pct": -0.25409445329833197,
+            "max_hold_pct": 23.37285264940721,
+            "median_return_pct": -1.0982256374999892,
+            "profit_factor": 0.806301436027245,
+            "stop_pct": 52.818775707718366,
+            "take_profit_pct": 23.808371642874427,
+            "trades": 4133,
+            "win_rate_pct": 36.89813694652795
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 11.790929203539823,
+            "expectancy_r": -0.14601529216774847,
+            "expectancy_r_ci95": [
+              -0.20212570451064021,
+              -0.09153201366087191
+            ],
+            "expectancy_return_pct": -0.512451543059777,
+            "max_hold_pct": 22.566371681415927,
+            "median_return_pct": -1.6556312731908216,
+            "profit_factor": 0.7074137701341897,
+            "stop_pct": 56.78466076696165,
+            "take_profit_pct": 20.64896755162242,
+            "trades": 678,
+            "win_rate_pct": 34.51327433628318
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 12.190528634361234,
+            "expectancy_r": -0.10705791077123449,
+            "expectancy_r_ci95": [
+              -0.16790319942399676,
+              -0.04019761334807457
+            ],
+            "expectancy_return_pct": -0.2257316965769774,
+            "max_hold_pct": 23.93538913362702,
+            "median_return_pct": -0.7788653974999938,
+            "profit_factor": 0.7275096240697182,
+            "stop_pct": 51.395007342143906,
+            "take_profit_pct": 24.669603524229075,
+            "trades": 681,
+            "win_rate_pct": 36.41703377386197
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 11.310791366906475,
+            "expectancy_r": -0.04174453496289321,
+            "expectancy_r_ci95": [
+              -0.1112396249681601,
+              0.03047943873249985
+            ],
+            "expectancy_return_pct": -0.11654878039033735,
+            "max_hold_pct": 21.8705035971223,
+            "median_return_pct": -1.2858497785000036,
+            "profit_factor": 0.9204096121980457,
+            "stop_pct": 52.0863309352518,
+            "take_profit_pct": 26.0431654676259,
+            "trades": 695,
+            "win_rate_pct": 38.41726618705036
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 11.5032281205165,
+            "expectancy_r": -0.12165003882201958,
+            "expectancy_r_ci95": [
+              -0.1726140161656621,
+              -0.06637513078344506
+            ],
+            "expectancy_return_pct": -0.29805240910670083,
+            "max_hold_pct": 23.959827833572454,
+            "median_return_pct": -1.1209381695158642,
+            "profit_factor": 0.7449973190585699,
+            "stop_pct": 53.51506456241033,
+            "take_profit_pct": 22.525107604017215,
+            "trades": 697,
+            "win_rate_pct": 36.728837876614065
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 12.126277372262773,
+            "expectancy_r": -0.03831383462406065,
+            "expectancy_r_ci95": [
+              -0.10237847559996274,
+              0.02524684583412202
+            ],
+            "expectancy_return_pct": -0.154584544315038,
+            "max_hold_pct": 24.671532846715326,
+            "median_return_pct": -1.152376675374983,
+            "profit_factor": 0.8851243662302297,
+            "stop_pct": 50.21897810218978,
+            "take_profit_pct": 25.10948905109489,
+            "trades": 685,
+            "win_rate_pct": 38.97810218978102
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 11.672166427546628,
+            "expectancy_r": -0.08939328507068897,
+            "expectancy_r_ci95": [
+              -0.16341993577213462,
+              -0.0049494960376593134
+            ],
+            "expectancy_return_pct": -0.22148149145494894,
+            "max_hold_pct": 23.242467718794835,
+            "median_return_pct": -1.1017756375000014,
+            "profit_factor": 0.8314481295324643,
+            "stop_pct": 52.94117647058824,
+            "take_profit_pct": 23.81635581061693,
+            "trades": 697,
+            "win_rate_pct": 36.29842180774749
+          }
+        }
+      },
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 9.72117212249208,
+        "expectancy_r": -0.24830926761222183,
+        "expectancy_r_ci95": [
+          -0.2945691659279688,
+          -0.20036052546163322
+        ],
+        "expectancy_return_pct": -0.5752684121876125,
+        "max_hold_pct": 17.909186906019006,
+        "median_return_pct": -1.2039797140000064,
+        "profit_factor": 0.5891957827561697,
+        "stop_pct": 63.8648363252376,
+        "take_profit_pct": 18.2259767687434,
+        "trades": 4735,
+        "win_rate_pct": 28.13093980992608
+      },
+      "scenario": "entry_cap",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 9.38569488456315,
+            "expectancy_r": -0.2511536055729634,
+            "expectancy_r_ci95": [
+              -0.30782956441849035,
+              -0.20388732604531604
+            ],
+            "expectancy_return_pct": -0.5105971835985845,
+            "max_hold_pct": 17.06654594839294,
+            "median_return_pct": -1.1780656974999881,
+            "profit_factor": 0.6191471650632004,
+            "stop_pct": 64.87098234495247,
+            "take_profit_pct": 18.062471706654595,
+            "trades": 2209,
+            "win_rate_pct": 28.066998641919422
+          },
+          "short": {
+            "average_hold_hours": 10.014548693586699,
+            "expectancy_r": -0.24582187942723446,
+            "expectancy_r_ci95": [
+              -0.31456577597833446,
+              -0.17465265210722844
+            ],
+            "expectancy_return_pct": -0.6318237344176848,
+            "max_hold_pct": 18.646080760095014,
+            "median_return_pct": -1.2220157275000156,
+            "profit_factor": 0.5650203966276367,
+            "stop_pct": 62.98495645288994,
+            "take_profit_pct": 18.368962787015043,
+            "trades": 2526,
+            "win_rate_pct": 28.18685669041964
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 10.365509761388287,
+            "expectancy_r": -0.20459604495802472,
+            "expectancy_r_ci95": [
+              -0.2866821711624039,
+              -0.13806404932235408
+            ],
+            "expectancy_return_pct": -0.47331672455637125,
+            "max_hold_pct": 19.414316702819956,
+            "median_return_pct": -1.288398277187501,
+            "profit_factor": 0.6880812821092713,
+            "stop_pct": 61.06290672451193,
+            "take_profit_pct": 19.522776572668114,
+            "trades": 922,
+            "win_rate_pct": 30.585683297180044
+          },
+          "2025": {
+            "average_hold_hours": 9.6732693911593,
+            "expectancy_r": -0.2629288057113751,
+            "expectancy_r_ci95": [
+              -0.3276238707446634,
+              -0.1937592980675603
+            ],
+            "expectancy_return_pct": -0.6581267873026572,
+            "max_hold_pct": 18.015012510425354,
+            "median_return_pct": -1.2587250275911903,
+            "profit_factor": 0.5543482972784942,
+            "stop_pct": 64.38698915763136,
+            "take_profit_pct": 17.597998331943284,
+            "trades": 2398,
+            "win_rate_pct": 27.314428690575483
+          },
+          "2026": {
+            "average_hold_hours": 9.38250883392226,
+            "expectancy_r": -0.2520166449446601,
+            "expectancy_r_ci95": [
+              -0.33659649488968185,
+              -0.1634646569556429
+            ],
+            "expectancy_return_pct": -0.5012790641099638,
+            "max_hold_pct": 16.74911660777385,
+            "median_return_pct": -1.1012746371250028,
+            "profit_factor": 0.5803552593079399,
+            "stop_pct": 64.80565371024734,
+            "take_profit_pct": 18.445229681978798,
+            "trades": 1415,
+            "win_rate_pct": 27.915194346289752
+          }
+        },
+        "setup_type": {
+          "trend_continuation": {
+            "average_hold_hours": 9.72117212249208,
+            "expectancy_r": -0.24830926761222183,
+            "expectancy_r_ci95": [
+              -0.2945691659279688,
+              -0.20036052546163322
+            ],
+            "expectancy_return_pct": -0.5752684121876125,
+            "max_hold_pct": 17.909186906019006,
+            "median_return_pct": -1.2039797140000064,
+            "profit_factor": 0.5891957827561697,
+            "stop_pct": 63.8648363252376,
+            "take_profit_pct": 18.2259767687434,
+            "trades": 4735,
+            "win_rate_pct": 28.13093980992608
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 10.453867028493894,
+            "expectancy_r": -0.2646356904064705,
+            "expectancy_r_ci95": [
+              -0.3176083244143891,
+              -0.21181031877237622
+            ],
+            "expectancy_return_pct": -0.8404802660841095,
+            "max_hold_pct": 19.26729986431479,
+            "median_return_pct": -1.7968461549999972,
+            "profit_factor": 0.5509324895242824,
+            "stop_pct": 63.907734056987785,
+            "take_profit_pct": 16.824966078697422,
+            "trades": 737,
+            "win_rate_pct": 28.222523744911804
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 8.409192825112108,
+            "expectancy_r": -0.34838171770206394,
+            "expectancy_r_ci95": [
+              -0.412777450414839,
+              -0.27829990656716663
+            ],
+            "expectancy_return_pct": -0.5693633146140865,
+            "max_hold_pct": 14.573991031390134,
+            "median_return_pct": -0.8792750441779217,
+            "profit_factor": 0.3970241666532822,
+            "stop_pct": 70.96412556053812,
+            "take_profit_pct": 14.461883408071749,
+            "trades": 892,
+            "win_rate_pct": 21.748878923766814
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 9.842242503259452,
+            "expectancy_r": -0.17174424814468703,
+            "expectancy_r_ci95": [
+              -0.24114442624990484,
+              -0.09803558360606647
+            ],
+            "expectancy_return_pct": -0.4197133206807901,
+            "max_hold_pct": 17.60104302477184,
+            "median_return_pct": -1.3723158400000195,
+            "profit_factor": 0.7313398624463417,
+            "stop_pct": 60.625814863103,
+            "take_profit_pct": 21.773142112125164,
+            "trades": 767,
+            "win_rate_pct": 31.94263363754889
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 9.253982843137255,
+            "expectancy_r": -0.2831381821418142,
+            "expectancy_r_ci95": [
+              -0.3360800631693545,
+              -0.23009959238770902
+            ],
+            "expectancy_return_pct": -0.6000078987662627,
+            "max_hold_pct": 17.892156862745097,
+            "median_return_pct": -1.1832481999374915,
+            "profit_factor": 0.5177865130752555,
+            "stop_pct": 65.07352941176471,
+            "take_profit_pct": 17.034313725490197,
+            "trades": 816,
+            "win_rate_pct": 26.59313725490196
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 10.464144736842105,
+            "expectancy_r": -0.17492119073949525,
+            "expectancy_r_ci95": [
+              -0.23793239417204573,
+              -0.11207412533613935
+            ],
+            "expectancy_return_pct": -0.513799422461985,
+            "max_hold_pct": 20.394736842105264,
+            "median_return_pct": -1.3786775763296957,
+            "profit_factor": 0.6471059114716692,
+            "stop_pct": 58.81578947368421,
+            "take_profit_pct": 20.789473684210527,
+            "trades": 760,
+            "win_rate_pct": 32.89473684210527
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 10.185124508519005,
+            "expectancy_r": -0.22836525059940876,
+            "expectancy_r_ci95": [
+              -0.3035949174431891,
+              -0.1406592586963005
+            ],
+            "expectancy_return_pct": -0.517137320500716,
+            "max_hold_pct": 18.34862385321101,
+            "median_return_pct": -1.2296909470957762,
+            "profit_factor": 0.637633202358237,
+            "stop_pct": 62.516382699868934,
+            "take_profit_pct": 19.134993446920053,
+            "trades": 763,
+            "win_rate_pct": 28.57142857142857
+          }
+        }
+      },
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 13.221036585365853,
+        "expectancy_r": 0.020955359636140914,
+        "expectancy_r_ci95": [
+          -0.030140956030988476,
+          0.07361903180571816
+        ],
+        "expectancy_return_pct": -0.0018016326281696342,
+        "max_hold_pct": 31.071049840933192,
+        "median_return_pct": -0.8799999999999919,
+        "profit_factor": 0.998437289987027,
+        "stop_pct": 54.42735949098621,
+        "take_profit_pct": 14.501590668080594,
+        "trades": 3772,
+        "win_rate_pct": 35.65747613997879
+      },
+      "scenario": "frictionless",
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 13.046858569926393,
+        "expectancy_r": -0.09017750358601487,
+        "expectancy_r_ci95": [
+          -0.14433525728932478,
+          -0.03474386508491895
+        ],
+        "expectancy_return_pct": -0.2521336432447906,
+        "max_hold_pct": 30.41535226077813,
+        "median_return_pct": -1.1389009459505566,
+        "profit_factor": 0.8096783639597351,
+        "stop_pct": 55.520504731861195,
+        "take_profit_pct": 14.064143007360673,
+        "trades": 3804,
+        "win_rate_pct": 33.4384858044164
+      },
+      "scenario": "base",
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 10.771749084249084,
+        "expectancy_r": -0.2508030674236245,
+        "expectancy_r_ci95": [
+          -0.3025987510058164,
+          -0.1955033335576148
+        ],
+        "expectancy_return_pct": -0.5770982431954385,
+        "max_hold_pct": 23.09981684981685,
+        "median_return_pct": -1.2254707331249883,
+        "profit_factor": 0.5911540991967335,
+        "stop_pct": 66.18589743589743,
+        "take_profit_pct": 10.714285714285714,
+        "trades": 4368,
+        "win_rate_pct": 25.34340659340659
+      },
+      "scenario": "entry_cap",
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 11.905138821237214,
+        "expectancy_r": 0.013355153572075439,
+        "expectancy_r_ci95": [
+          -0.02764403909198401,
+          0.05636811235927088
+        ],
+        "expectancy_return_pct": -0.01906617110381764,
+        "max_hold_pct": 23.672674135411594,
+        "median_return_pct": -0.8418529009238063,
+        "profit_factor": 0.9835058951218503,
+        "stop_pct": 51.92401363857769,
+        "take_profit_pct": 24.403312226010716,
+        "trades": 4106,
+        "win_rate_pct": 38.7481734047735
+      },
+      "scenario": "frictionless",
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 11.794263885520252,
+        "expectancy_r": -0.09151824217430918,
+        "expectancy_r_ci95": [
+          -0.13604084271044287,
+          -0.04547019668053603
+        ],
+        "expectancy_return_pct": -0.2562313053771008,
+        "max_hold_pct": 23.405287412078586,
+        "median_return_pct": -1.1017756375000014,
+        "profit_factor": 0.8052706714196866,
+        "stop_pct": 52.946883337375695,
+        "take_profit_pct": 23.64782925054572,
+        "trades": 4123,
+        "win_rate_pct": 36.720834343924324
+      },
+      "scenario": "base",
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 9.733298097251586,
+        "expectancy_r": -0.24752995096351485,
+        "expectancy_r_ci95": [
+          -0.2937920783700322,
+          -0.19913219026945828
+        ],
+        "expectancy_return_pct": -0.5740682361098529,
+        "max_hold_pct": 17.864693446088793,
+        "median_return_pct": -1.2060097184999938,
+        "profit_factor": 0.5907754403933861,
+        "stop_pct": 63.91120507399577,
+        "take_profit_pct": 18.224101479915433,
+        "trades": 4730,
+        "win_rate_pct": 28.054968287526428
+      },
+      "scenario": "entry_cap",
+      "setup": "trend_continuation"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 14.918090961761298,
+        "expectancy_r": 0.009623710651164318,
+        "expectancy_r_ci95": [
+          -0.03301281678222982,
+          0.053851266046341016
+        ],
+        "expectancy_return_pct": -0.04106287906849844,
+        "max_hold_pct": 36.50057937427578,
+        "median_return_pct": -0.8040716545329618,
+        "profit_factor": 0.9660120232982211,
+        "stop_pct": 44.43800695249131,
+        "take_profit_pct": 19.061413673232906,
+        "trades": 3452,
+        "win_rate_pct": 41.07763615295481
+      },
+      "scenario": "frictionless",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 14.526927604473219,
+            "expectancy_r": -0.004299664563520686,
+            "expectancy_r_ci95": [
+              -0.06465410408908169,
+              0.05897988137898466
+            ],
+            "expectancy_return_pct": -0.014320341636396916,
+            "max_hold_pct": 34.37316068275456,
+            "median_return_pct": -0.8305000000000007,
+            "profit_factor": 0.9877504748089622,
+            "stop_pct": 46.144791053560915,
+            "take_profit_pct": 19.482048263684522,
+            "trades": 1699,
+            "win_rate_pct": 39.61153619776339
+          },
+          "short": {
+            "average_hold_hours": 15.29720479178551,
+            "expectancy_r": 0.02311818554548823,
+            "expectancy_r_ci95": [
+              -0.03835020683477723,
+              0.08499744757435558
+            ],
+            "expectancy_return_pct": -0.0669816304074263,
+            "max_hold_pct": 38.562464346834,
+            "median_return_pct": -0.7528721583964781,
+            "profit_factor": 0.9462452829805988,
+            "stop_pct": 42.783799201369085,
+            "take_profit_pct": 18.65373645179692,
+            "trades": 1753,
+            "win_rate_pct": 42.49857387335995
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 14.520114942528735,
+            "expectancy_r": -0.00330868457737211,
+            "expectancy_r_ci95": [
+              -0.07046111409553474,
+              0.07356030940688219
+            ],
+            "expectancy_return_pct": -0.10225992221613238,
+            "max_hold_pct": 34.62643678160919,
+            "median_return_pct": -1.0452500000000031,
+            "profit_factor": 0.9267283376216525,
+            "stop_pct": 45.689655172413794,
+            "take_profit_pct": 19.68390804597701,
+            "trades": 696,
+            "win_rate_pct": 39.224137931034484
+          },
+          "2025": {
+            "average_hold_hours": 15.204087346024636,
+            "expectancy_r": -0.01905522937253153,
+            "expectancy_r_ci95": [
+              -0.07005916693566917,
+              0.03260381148195473
+            ],
+            "expectancy_return_pct": -0.12193501348387054,
+            "max_hold_pct": 38.68980963045912,
+            "median_return_pct": -0.8500419551530913,
+            "profit_factor": 0.9032574975328636,
+            "stop_pct": 44.06494960806271,
+            "take_profit_pct": 17.245240761478165,
+            "trades": 1786,
+            "win_rate_pct": 39.41769316909294
+          },
+          "2026": {
+            "average_hold_hours": 14.677061855670104,
+            "expectancy_r": 0.07170776628145517,
+            "expectancy_r_ci95": [
+              -0.025478045751469957,
+              0.16171129291572597
+            ],
+            "expectancy_return_pct": 0.15175235195893227,
+            "max_hold_pct": 33.81443298969072,
+            "median_return_pct": -0.5159001487964998,
+            "profit_factor": 1.1552544143524948,
+            "stop_pct": 44.22680412371134,
+            "take_profit_pct": 21.95876288659794,
+            "trades": 970,
+            "win_rate_pct": 45.4639175257732
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 14.918090961761298,
+            "expectancy_r": 0.009623710651164318,
+            "expectancy_r_ci95": [
+              -0.03301281678222982,
+              0.053851266046341016
+            ],
+            "expectancy_return_pct": -0.04106287906849844,
+            "max_hold_pct": 36.50057937427578,
+            "median_return_pct": -0.8040716545329618,
+            "profit_factor": 0.9660120232982211,
+            "stop_pct": 44.43800695249131,
+            "take_profit_pct": 19.061413673232906,
+            "trades": 3452,
+            "win_rate_pct": 41.07763615295481
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 15.256260434056761,
+            "expectancy_r": -0.027999422954855337,
+            "expectancy_r_ci95": [
+              -0.08387177360479961,
+              0.03533451378966911
+            ],
+            "expectancy_return_pct": -0.3283182395590698,
+            "max_hold_pct": 36.56093489148581,
+            "median_return_pct": -1.4244641923679913,
+            "profit_factor": 0.8158392191446695,
+            "stop_pct": 44.74123539232053,
+            "take_profit_pct": 18.697829716193656,
+            "trades": 599,
+            "win_rate_pct": 37.061769616026716
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 13.826689774696707,
+            "expectancy_r": 0.005077097260734094,
+            "expectancy_r_ci95": [
+              -0.03589461735035515,
+              0.04338633667284064
+            ],
+            "expectancy_return_pct": -0.012308122953471999,
+            "max_hold_pct": 34.1421143847487,
+            "median_return_pct": -0.5179999999999962,
+            "profit_factor": 0.98186346614787,
+            "stop_pct": 45.92720970537262,
+            "take_profit_pct": 19.930675909878683,
+            "trades": 577,
+            "win_rate_pct": 41.24783362218371
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 15.232046678635548,
+            "expectancy_r": 0.04060594254158421,
+            "expectancy_r_ci95": [
+              -0.028935347166791855,
+              0.11415439560318857
+            ],
+            "expectancy_return_pct": 0.06812256208243277,
+            "max_hold_pct": 38.42010771992819,
+            "median_return_pct": -0.8912126433366918,
+            "profit_factor": 1.0509234557650953,
+            "stop_pct": 42.36983842010772,
+            "take_profit_pct": 19.210053859964095,
+            "trades": 557,
+            "win_rate_pct": 42.908438061041295
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 14.560313075506446,
+            "expectancy_r": -0.01982329997160502,
+            "expectancy_r_ci95": [
+              -0.09385073746995089,
+              0.06052775528779354
+            ],
+            "expectancy_return_pct": -0.11906755688600226,
+            "max_hold_pct": 34.43830570902394,
+            "median_return_pct": -0.8581251464083506,
+            "profit_factor": 0.8919602104363465,
+            "stop_pct": 46.77716390423573,
+            "take_profit_pct": 18.784530386740332,
+            "trades": 543,
+            "win_rate_pct": 40.331491712707184
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 15.478547854785479,
+            "expectancy_r": 0.0011549377779883486,
+            "expectancy_r_ci95": [
+              -0.07120127671662341,
+              0.07278028211784385
+            ],
+            "expectancy_return_pct": -0.010885430491959443,
+            "max_hold_pct": 39.603960396039604,
+            "median_return_pct": -0.9740753315043427,
+            "profit_factor": 0.9912032975894974,
+            "stop_pct": 43.72937293729373,
+            "take_profit_pct": 16.666666666666664,
+            "trades": 606,
+            "win_rate_pct": 42.40924092409241
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 15.105701754385965,
+            "expectancy_r": 0.06054362805928448,
+            "expectancy_r_ci95": [
+              -0.002360996056350641,
+              0.12176523768088772
+            ],
+            "expectancy_return_pct": 0.1672304229524407,
+            "max_hold_pct": 35.6140350877193,
+            "median_return_pct": -0.8031021925967052,
+            "profit_factor": 1.1543250334379538,
+            "stop_pct": 43.15789473684211,
+            "take_profit_pct": 21.228070175438596,
+            "trades": 570,
+            "win_rate_pct": 42.63157894736842
+          }
+        }
+      },
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 14.807171658986174,
+        "expectancy_r": -0.08057460398809124,
+        "expectancy_r_ci95": [
+          -0.12298648989917127,
+          -0.03752489744426404
+        ],
+        "expectancy_return_pct": -0.2810734621465989,
+        "max_hold_pct": 36.08870967741936,
+        "median_return_pct": -1.0617501088124968,
+        "profit_factor": 0.79408885434804,
+        "stop_pct": 45.50691244239631,
+        "take_profit_pct": 18.40437788018433,
+        "trades": 3472,
+        "win_rate_pct": 38.796082949308754
+      },
+      "scenario": "base",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 14.387295081967213,
+            "expectancy_r": -0.0961099158877529,
+            "expectancy_r_ci95": [
+              -0.15644594772745427,
+              -0.03403048237427663
+            ],
+            "expectancy_return_pct": -0.25022400757718904,
+            "max_hold_pct": 33.48946135831382,
+            "median_return_pct": -1.0940309623500666,
+            "profit_factor": 0.8115421948257167,
+            "stop_pct": 47.423887587822016,
+            "take_profit_pct": 19.086651053864166,
+            "trades": 1708,
+            "win_rate_pct": 37.295081967213115
+          },
+          "short": {
+            "average_hold_hours": 15.213718820861677,
+            "expectancy_r": -0.06553247659318077,
+            "expectancy_r_ci95": [
+              -0.12779246140979916,
+              -0.0023256828242571377
+            ],
+            "expectancy_return_pct": -0.31094356895190045,
+            "max_hold_pct": 38.605442176870746,
+            "median_return_pct": -1.029312646110201,
+            "profit_factor": 0.7780745442259,
+            "stop_pct": 43.65079365079365,
+            "take_profit_pct": 17.743764172335602,
+            "trades": 1764,
+            "win_rate_pct": 40.249433106575964
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 14.409513590844062,
+            "expectancy_r": -0.0772270085814462,
+            "expectancy_r_ci95": [
+              -0.1451597720864449,
+              -0.005554093647948577
+            ],
+            "expectancy_return_pct": -0.3154535512297595,
+            "max_hold_pct": 34.19170243204578,
+            "median_return_pct": -1.2928357837499913,
+            "profit_factor": 0.7956588651467614,
+            "stop_pct": 46.065808297567955,
+            "take_profit_pct": 19.742489270386265,
+            "trades": 699,
+            "win_rate_pct": 37.911301859799714
+          },
+          "2025": {
+            "average_hold_hours": 15.083982202447164,
+            "expectancy_r": -0.10579554931555997,
+            "expectancy_r_ci95": [
+              -0.15657496264930013,
+              -0.054505745360521766
+            ],
+            "expectancy_return_pct": -0.3649442603696119,
+            "max_hold_pct": 38.26473859844272,
+            "median_return_pct": -1.1007581380624996,
+            "profit_factor": 0.7439287616119474,
+            "stop_pct": 45.16129032258064,
+            "take_profit_pct": 16.57397107897664,
+            "trades": 1798,
+            "win_rate_pct": 37.1523915461624
+          },
+          "2026": {
+            "average_hold_hours": 14.581794871794871,
+            "expectancy_r": -0.03646456243984113,
+            "expectancy_r_ci95": [
+              -0.13907337421322777,
+              0.05353708232461023
+            ],
+            "expectancy_return_pct": -0.10175922883982301,
+            "max_hold_pct": 33.43589743589744,
+            "median_return_pct": -0.8000990089569653,
+            "profit_factor": 0.9096253858889041,
+            "stop_pct": 45.74358974358974,
+            "take_profit_pct": 20.82051282051282,
+            "trades": 975,
+            "win_rate_pct": 42.46153846153846
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 14.807171658986174,
+            "expectancy_r": -0.08057460398809124,
+            "expectancy_r_ci95": [
+              -0.12298648989917127,
+              -0.03752489744426404
+            ],
+            "expectancy_return_pct": -0.2810734621465989,
+            "max_hold_pct": 36.08870967741936,
+            "median_return_pct": -1.0617501088124968,
+            "profit_factor": 0.79408885434804,
+            "stop_pct": 45.50691244239631,
+            "take_profit_pct": 18.40437788018433,
+            "trades": 3472,
+            "win_rate_pct": 38.796082949308754
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 15.196339434276206,
+            "expectancy_r": -0.10321209355679048,
+            "expectancy_r_ci95": [
+              -0.1552499017531136,
+              -0.047401785143305904
+            ],
+            "expectancy_return_pct": -0.5933366299733913,
+            "max_hold_pct": 35.94009983361065,
+            "median_return_pct": -1.7489221265000015,
+            "profit_factor": 0.6967968460090496,
+            "stop_pct": 45.92346089850249,
+            "take_profit_pct": 18.136439267886857,
+            "trades": 601,
+            "win_rate_pct": 35.108153078202996
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 13.832612456747405,
+            "expectancy_r": -0.12211225132233312,
+            "expectancy_r_ci95": [
+              -0.16325700588182512,
+              -0.0799859184850085
+            ],
+            "expectancy_return_pct": -0.2482699169755336,
+            "max_hold_pct": 34.602076124567475,
+            "median_return_pct": -0.7809393495080602,
+            "profit_factor": 0.7019889448134665,
+            "stop_pct": 47.05882352941176,
+            "take_profit_pct": 18.33910034602076,
+            "trades": 578,
+            "win_rate_pct": 37.19723183391003
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 15.118962432915922,
+            "expectancy_r": -0.03136653458957433,
+            "expectancy_r_ci95": [
+              -0.10425416602602953,
+              0.04321646865957443
+            ],
+            "expectancy_return_pct": -0.15845629127021119,
+            "max_hold_pct": 37.567084078711986,
+            "median_return_pct": -1.1839379803589072,
+            "profit_factor": 0.8934550143334787,
+            "stop_pct": 43.47048300536673,
+            "take_profit_pct": 18.962432915921287,
+            "trades": 559,
+            "win_rate_pct": 41.14490161001789
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 14.387362637362637,
+            "expectancy_r": -0.11628108894168215,
+            "expectancy_r_ci95": [
+              -0.18648338865060946,
+              -0.03861089434392614
+            ],
+            "expectancy_return_pct": -0.3673778012189223,
+            "max_hold_pct": 34.065934065934066,
+            "median_return_pct": -1.110794852783899,
+            "profit_factor": 0.7085538190460438,
+            "stop_pct": 47.8021978021978,
+            "take_profit_pct": 18.13186813186813,
+            "trades": 546,
+            "win_rate_pct": 37.91208791208791
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 15.289689034369886,
+            "expectancy_r": -0.07879356926117378,
+            "expectancy_r_ci95": [
+              -0.14869036893366977,
+              -0.010760898396360404
+            ],
+            "expectancy_return_pct": -0.24083357408157893,
+            "max_hold_pct": 39.11620294599018,
+            "median_return_pct": -1.2843527773749912,
+            "profit_factor": 0.8270693967597526,
+            "stop_pct": 44.680851063829785,
+            "take_profit_pct": 16.20294599018003,
+            "trades": 611,
+            "win_rate_pct": 40.752864157119475
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 14.962305025996534,
+            "expectancy_r": -0.031156737154948926,
+            "expectancy_r_ci95": [
+              -0.09940209594714383,
+              0.0369865630472411
+            ],
+            "expectancy_return_pct": -0.06841780571525208,
+            "max_hold_pct": 35.008665511265164,
+            "median_return_pct": -1.0344949269547221,
+            "profit_factor": 0.9444934948621643,
+            "stop_pct": 44.194107452339686,
+            "take_profit_pct": 20.797227036395146,
+            "trades": 577,
+            "win_rate_pct": 40.72790294627383
+          }
+        }
+      },
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 13.412425554953979,
+        "expectancy_r": -0.19248297187272928,
+        "expectancy_r_ci95": [
+          -0.23242800843131964,
+          -0.1521442163360187
+        ],
+        "expectancy_return_pct": -0.580906230954672,
+        "max_hold_pct": 31.402273957769356,
+        "median_return_pct": -1.3306191071869908,
+        "profit_factor": 0.616274401217822,
+        "stop_pct": 53.0860855441256,
+        "take_profit_pct": 15.511640498105036,
+        "trades": 3694,
+        "win_rate_pct": 32.4038982133189
+      },
+      "scenario": "entry_cap",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 12.910626029654036,
+            "expectancy_r": -0.206443767101444,
+            "expectancy_r_ci95": [
+              -0.2643025285201156,
+              -0.151160911202352
+            ],
+            "expectancy_return_pct": -0.5402124495918218,
+            "max_hold_pct": 29.59912136188907,
+            "median_return_pct": -1.3422368208749895,
+            "profit_factor": 0.6309142688599456,
+            "stop_pct": 54.64030752333883,
+            "take_profit_pct": 15.760571114772103,
+            "trades": 1821,
+            "win_rate_pct": 31.191652937946184
+          },
+          "short": {
+            "average_hold_hours": 13.900293646556326,
+            "expectancy_r": -0.1789097694640323,
+            "expectancy_r_ci95": [
+              -0.24265925001633662,
+              -0.11542477642104255
+            ],
+            "expectancy_return_pct": -0.6204702330164712,
+            "max_hold_pct": 33.15536572343834,
+            "median_return_pct": -1.3231860719077644,
+            "profit_factor": 0.6029429123830876,
+            "stop_pct": 51.57501334757074,
+            "take_profit_pct": 15.269620928990923,
+            "trades": 1873,
+            "win_rate_pct": 33.58248798718633
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 13.386239782016348,
+            "expectancy_r": -0.19692976071108464,
+            "expectancy_r_ci95": [
+              -0.26923207996525417,
+              -0.13611000365643175
+            ],
+            "expectancy_return_pct": -0.6622231236157781,
+            "max_hold_pct": 29.56403269754768,
+            "median_return_pct": -1.5208624511875055,
+            "profit_factor": 0.6161666003722286,
+            "stop_pct": 54.223433242506815,
+            "take_profit_pct": 16.212534059945504,
+            "trades": 734,
+            "win_rate_pct": 31.062670299727518
+          },
+          "2025": {
+            "average_hold_hours": 13.672834645669292,
+            "expectancy_r": -0.21419671327672346,
+            "expectancy_r_ci95": [
+              -0.2676229189040923,
+              -0.1589562272187745
+            ],
+            "expectancy_return_pct": -0.666955753659858,
+            "max_hold_pct": 33.07086614173229,
+            "median_return_pct": -1.3736738445000056,
+            "profit_factor": 0.5761165025953887,
+            "stop_pct": 52.75590551181102,
+            "take_profit_pct": 14.173228346456693,
+            "trades": 1905,
+            "win_rate_pct": 31.338582677165356
+          },
+          "2026": {
+            "average_hold_hours": 12.96042654028436,
+            "expectancy_r": -0.15018096203200726,
+            "expectancy_r_ci95": [
+              -0.23419574453654352,
+              -0.08054401923583347
+            ],
+            "expectancy_return_pct": -0.36895273335596906,
+            "max_hold_pct": 29.66824644549763,
+            "median_return_pct": -1.1755706956249934,
+            "profit_factor": 0.7069877702966877,
+            "stop_pct": 52.89099526066351,
+            "take_profit_pct": 17.44075829383886,
+            "trades": 1055,
+            "win_rate_pct": 35.260663507109
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 13.412425554953979,
+            "expectancy_r": -0.19248297187272928,
+            "expectancy_r_ci95": [
+              -0.23242800843131964,
+              -0.1521442163360187
+            ],
+            "expectancy_return_pct": -0.580906230954672,
+            "max_hold_pct": 31.402273957769356,
+            "median_return_pct": -1.3306191071869908,
+            "profit_factor": 0.616274401217822,
+            "stop_pct": 53.0860855441256,
+            "take_profit_pct": 15.511640498105036,
+            "trades": 3694,
+            "win_rate_pct": 32.4038982133189
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 14.206677265500796,
+            "expectancy_r": -0.1787942753429434,
+            "expectancy_r_ci95": [
+              -0.2423362267273286,
+              -0.11554056340468885
+            ],
+            "expectancy_return_pct": -0.8296049708692842,
+            "max_hold_pct": 32.11446740858506,
+            "median_return_pct": -1.9734722952499961,
+            "profit_factor": 0.6005464289450017,
+            "stop_pct": 51.19236883942766,
+            "take_profit_pct": 16.69316375198728,
+            "trades": 629,
+            "win_rate_pct": 31.955484896661368
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 11.635769230769231,
+            "expectancy_r": -0.275195608953793,
+            "expectancy_r_ci95": [
+              -0.3196458109903489,
+              -0.22665412850534936
+            ],
+            "expectancy_return_pct": -0.5411117509500535,
+            "max_hold_pct": 28.923076923076923,
+            "median_return_pct": -0.9434595189999959,
+            "profit_factor": 0.4450490396283802,
+            "stop_pct": 58.15384615384615,
+            "take_profit_pct": 12.923076923076923,
+            "trades": 650,
+            "win_rate_pct": 27.53846153846154
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 14.045685279187817,
+            "expectancy_r": -0.1537802985005782,
+            "expectancy_r_ci95": [
+              -0.22014749543651063,
+              -0.07966715229365122
+            ],
+            "expectancy_return_pct": -0.5444296226800861,
+            "max_hold_pct": 35.36379018612521,
+            "median_return_pct": -1.5812018957945546,
+            "profit_factor": 0.6744178033554714,
+            "stop_pct": 49.91539763113367,
+            "take_profit_pct": 14.720812182741117,
+            "trades": 591,
+            "win_rate_pct": 34.686971235194584
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 13.100174216027874,
+            "expectancy_r": -0.20594165573431067,
+            "expectancy_r_ci95": [
+              -0.266522038453523,
+              -0.1408172392916743
+            ],
+            "expectancy_return_pct": -0.5990215592036654,
+            "max_hold_pct": 29.61672473867596,
+            "median_return_pct": -1.3574304134033968,
+            "profit_factor": 0.5686663859874643,
+            "stop_pct": 54.181184668989545,
+            "take_profit_pct": 16.202090592334496,
+            "trades": 574,
+            "win_rate_pct": 32.22996515679443
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 14.5,
+            "expectancy_r": -0.1676453519298683,
+            "expectancy_r_ci95": [
+              -0.24095171674347432,
+              -0.09460402502611652
+            ],
+            "expectancy_return_pct": -0.5244118469444508,
+            "max_hold_pct": 33.80726698262243,
+            "median_return_pct": -1.4864479292499888,
+            "profit_factor": 0.6640074575464944,
+            "stop_pct": 51.18483412322274,
+            "take_profit_pct": 15.00789889415482,
+            "trades": 633,
+            "win_rate_pct": 35.07109004739337
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 13.04254457050243,
+            "expectancy_r": -0.16933416290152747,
+            "expectancy_r_ci95": [
+              -0.23147439978530773,
+              -0.1088066739708623
+            ],
+            "expectancy_return_pct": -0.4453394995941191,
+            "max_hold_pct": 28.687196110210696,
+            "median_return_pct": -1.3636938369999934,
+            "profit_factor": 0.6872879131694718,
+            "stop_pct": 53.64667747163695,
+            "take_profit_pct": 17.666126418152352,
+            "trades": 617,
+            "win_rate_pct": 33.22528363047002
+          }
+        }
+      },
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 16.339338671411625,
+        "expectancy_r": 0.02235912674306258,
+        "expectancy_r_ci95": [
+          -0.02829513635525231,
+          0.07474275958808133
+        ],
+        "expectancy_return_pct": -0.020864339242766216,
+        "max_hold_pct": 44.928825622775804,
+        "median_return_pct": -0.8544104938271624,
+        "profit_factor": 0.9830559992158899,
+        "stop_pct": 45.25504151838671,
+        "take_profit_pct": 9.816132858837486,
+        "trades": 3372,
+        "win_rate_pct": 39.8576512455516
+      },
+      "scenario": "frictionless",
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 16.200795521508546,
+        "expectancy_r": -0.06853014294621655,
+        "expectancy_r_ci95": [
+          -0.11983587392085202,
+          -0.01514531011847258
+        ],
+        "expectancy_return_pct": -0.2606306166110631,
+        "max_hold_pct": 44.37242192103712,
+        "median_return_pct": -1.108748144062503,
+        "profit_factor": 0.8121158577420071,
+        "stop_pct": 46.16971125515616,
+        "take_profit_pct": 9.457866823806718,
+        "trades": 3394,
+        "win_rate_pct": 37.566293459045376
+      },
+      "scenario": "base",
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 14.48957475994513,
+        "expectancy_r": -0.18503025723002264,
+        "expectancy_r_ci95": [
+          -0.23251308584599586,
+          -0.13780160780188133
+        ],
+        "expectancy_return_pct": -0.5807751443756611,
+        "max_hold_pct": 38.02469135802469,
+        "median_return_pct": -1.3541609920567914,
+        "profit_factor": 0.6227660266838809,
+        "stop_pct": 53.88203017832648,
+        "take_profit_pct": 8.093278463648835,
+        "trades": 3645,
+        "win_rate_pct": 31.193415637860085
+      },
+      "scenario": "entry_cap",
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 14.918090961761298,
+        "expectancy_r": 0.009623710651164318,
+        "expectancy_r_ci95": [
+          -0.03301281678222982,
+          0.053851266046341016
+        ],
+        "expectancy_return_pct": -0.04106287906849844,
+        "max_hold_pct": 36.50057937427578,
+        "median_return_pct": -0.8040716545329618,
+        "profit_factor": 0.9660120232982211,
+        "stop_pct": 44.43800695249131,
+        "take_profit_pct": 19.061413673232906,
+        "trades": 3452,
+        "win_rate_pct": 41.07763615295481
+      },
+      "scenario": "frictionless",
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 14.807171658986174,
+        "expectancy_r": -0.08057460398809124,
+        "expectancy_r_ci95": [
+          -0.12298648989917127,
+          -0.03752489744426404
+        ],
+        "expectancy_return_pct": -0.2810734621465989,
+        "max_hold_pct": 36.08870967741936,
+        "median_return_pct": -1.0617501088124968,
+        "profit_factor": 0.79408885434804,
+        "stop_pct": 45.50691244239631,
+        "take_profit_pct": 18.40437788018433,
+        "trades": 3472,
+        "win_rate_pct": 38.796082949308754
+      },
+      "scenario": "base",
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 13.412425554953979,
+        "expectancy_r": -0.19248297187272928,
+        "expectancy_r_ci95": [
+          -0.23242800843131964,
+          -0.1521442163360187
+        ],
+        "expectancy_return_pct": -0.580906230954672,
+        "max_hold_pct": 31.402273957769356,
+        "median_return_pct": -1.3306191071869908,
+        "profit_factor": 0.616274401217822,
+        "stop_pct": 53.0860855441256,
+        "take_profit_pct": 15.511640498105036,
+        "trades": 3694,
+        "win_rate_pct": 32.4038982133189
+      },
+      "scenario": "entry_cap",
+      "setup": "range_breakout"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 13.165668754605749,
+        "expectancy_r": 0.014037097378282765,
+        "expectancy_r_ci95": [
+          -0.021037518602139288,
+          0.04946772526922308
+        ],
+        "expectancy_return_pct": -0.01616924951379442,
+        "max_hold_pct": 29.329403095062638,
+        "median_return_pct": -0.830249999999999,
+        "profit_factor": 0.9860665614317202,
+        "stop_pct": 48.41562269712602,
+        "take_profit_pct": 22.254974207811347,
+        "trades": 5428,
+        "win_rate_pct": 39.812085482682384
+      },
+      "scenario": "frictionless",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 12.66967680608365,
+            "expectancy_r": 0.00792878006465922,
+            "expectancy_r_ci95": [
+              -0.04516556647021306,
+              0.05496745474136417
+            ],
+            "expectancy_return_pct": 0.002084406494930881,
+            "max_hold_pct": 26.844106463878326,
+            "median_return_pct": -0.8502499999999968,
+            "profit_factor": 1.001859882007989,
+            "stop_pct": 50.152091254752854,
+            "take_profit_pct": 23.00380228136882,
+            "trades": 2630,
+            "win_rate_pct": 39.08745247148289
+          },
+          "short": {
+            "average_hold_hours": 13.631879914224447,
+            "expectancy_r": 0.019778653680938216,
+            "expectancy_r_ci95": [
+              -0.04465014491102726,
+              0.08282957491675838
+            ],
+            "expectancy_return_pct": -0.033326903303268214,
+            "max_hold_pct": 31.665475339528232,
+            "median_return_pct": -0.8054999999999923,
+            "profit_factor": 0.9721770654493653,
+            "stop_pct": 46.78341672623302,
+            "take_profit_pct": 21.551107934238743,
+            "trades": 2798,
+            "win_rate_pct": 40.49320943531093
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 13.21819870009285,
+            "expectancy_r": 0.017798849352114794,
+            "expectancy_r_ci95": [
+              -0.043006261298729476,
+              0.08436109732718196
+            ],
+            "expectancy_return_pct": -0.022929341465160576,
+            "max_hold_pct": 29.619312906220983,
+            "median_return_pct": -0.9399999999999964,
+            "profit_factor": 0.9825345640540118,
+            "stop_pct": 47.63231197771588,
+            "take_profit_pct": 22.748375116063137,
+            "trades": 1077,
+            "win_rate_pct": 39.83286908077994
+          },
+          "2025": {
+            "average_hold_hours": 13.24097798628654,
+            "expectancy_r": 0.004737610283694288,
+            "expectancy_r_ci95": [
+              -0.03989491319045829,
+              0.05284737535386567
+            ],
+            "expectancy_return_pct": -0.057107444197053873,
+            "max_hold_pct": 30.7831107903284,
+            "median_return_pct": -0.847500000000001,
+            "profit_factor": 0.952895109778196,
+            "stop_pct": 47.78058462648863,
+            "take_profit_pct": 21.436304583182967,
+            "trades": 2771,
+            "win_rate_pct": 39.227715626127754
+          },
+          "2026": {
+            "average_hold_hours": 12.997784810126582,
+            "expectancy_r": 0.027782332734793885,
+            "expectancy_r_ci95": [
+              -0.051862472547976705,
+              0.09830431910087017
+            ],
+            "expectancy_return_pct": 0.06023603940958105,
+            "max_hold_pct": 26.582278481012654,
+            "median_return_pct": -0.7702499999999946,
+            "profit_factor": 1.0623816852420604,
+            "stop_pct": 50.063291139240505,
+            "take_profit_pct": 23.354430379746834,
+            "trades": 1580,
+            "win_rate_pct": 40.822784810126585
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 15.458392603129445,
+            "expectancy_r": -0.023274493902152214,
+            "expectancy_r_ci95": [
+              -0.07167911677482547,
+              0.025797827007905973
+            ],
+            "expectancy_return_pct": -0.14968964770246518,
+            "max_hold_pct": 39.59222380275012,
+            "median_return_pct": -0.8358478132695302,
+            "profit_factor": 0.8773136241570414,
+            "stop_pct": 43.81223328591749,
+            "take_profit_pct": 16.595542911332384,
+            "trades": 2109,
+            "win_rate_pct": 39.73447131341869
+          },
+          "trend_continuation": {
+            "average_hold_hours": 11.70879783067189,
+            "expectancy_r": 0.03774608984903823,
+            "expectancy_r_ci95": [
+              -0.006036458044379858,
+              0.08388148645674232
+            ],
+            "expectancy_return_pct": 0.06867393210112172,
+            "max_hold_pct": 22.808074721301598,
+            "median_return_pct": -0.8269982079850413,
+            "profit_factor": 1.0611756975942832,
+            "stop_pct": 51.34076529075023,
+            "take_profit_pct": 25.851159987948176,
+            "trades": 3319,
+            "win_rate_pct": 39.86140403736065
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 13.550441014332966,
+            "expectancy_r": -0.037423067428496465,
+            "expectancy_r_ci95": [
+              -0.07439403042746426,
+              0.000489677290743525
+            ],
+            "expectancy_return_pct": -0.2047564443886242,
+            "max_hold_pct": 29.878721058434397,
+            "median_return_pct": -1.3419999999999987,
+            "profit_factor": 0.8719378054200021,
+            "stop_pct": 50.27563395810364,
+            "take_profit_pct": 19.845644983461963,
+            "trades": 907,
+            "win_rate_pct": 37.70672546857773
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 13.171404682274247,
+            "expectancy_r": 0.019878744899458987,
+            "expectancy_r_ci95": [
+              -0.01750231250203658,
+              0.06005296104846702
+            ],
+            "expectancy_return_pct": -0.011469518188940183,
+            "max_hold_pct": 29.09698996655518,
+            "median_return_pct": -0.48550000000000537,
+            "profit_factor": 0.9829757647633449,
+            "stop_pct": 48.16053511705686,
+            "take_profit_pct": 22.74247491638796,
+            "trades": 897,
+            "win_rate_pct": 40.802675585284284
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 13.031458797327394,
+            "expectancy_r": 0.050990962367285675,
+            "expectancy_r_ci95": [
+              -0.001684507321403699,
+              0.10678311172106333
+            ],
+            "expectancy_return_pct": 0.10156938608418624,
+            "max_hold_pct": 29.398663697104677,
+            "median_return_pct": -1.0042499999999954,
+            "profit_factor": 1.0780868676634408,
+            "stop_pct": 46.770601336302896,
+            "take_profit_pct": 23.83073496659243,
+            "trades": 898,
+            "win_rate_pct": 41.202672605790646
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 12.877777777777778,
+            "expectancy_r": -0.0027104492427956553,
+            "expectancy_r_ci95": [
+              -0.05694141188074851,
+              0.052532267049740705
+            ],
+            "expectancy_return_pct": -0.06246549526501572,
+            "max_hold_pct": 28.333333333333332,
+            "median_return_pct": -0.8795752772662313,
+            "profit_factor": 0.9400443967062206,
+            "stop_pct": 49.111111111111114,
+            "take_profit_pct": 22.555555555555557,
+            "trades": 900,
+            "win_rate_pct": 38.666666666666664
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 13.212581344902386,
+            "expectancy_r": 0.020531770872237995,
+            "expectancy_r_ci95": [
+              -0.03623925165773841,
+              0.0759863639850808
+            ],
+            "expectancy_return_pct": 0.007987603384835831,
+            "max_hold_pct": 29.50108459869848,
+            "median_return_pct": -0.9498559862992417,
+            "profit_factor": 1.0065815553986217,
+            "stop_pct": 48.590021691973966,
+            "take_profit_pct": 21.908893709327547,
+            "trades": 922,
+            "win_rate_pct": 40.99783080260303
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 13.146017699115044,
+            "expectancy_r": 0.033212477788319185,
+            "expectancy_r_ci95": [
+              -0.024825289547110028,
+              0.0933114144453306
+            ],
+            "expectancy_return_pct": 0.07287680666944868,
+            "max_hold_pct": 29.75663716814159,
+            "median_return_pct": -0.8542500000000008,
+            "profit_factor": 1.0646022001729,
+            "stop_pct": 47.56637168141593,
+            "take_profit_pct": 22.676991150442475,
+            "trades": 904,
+            "win_rate_pct": 39.491150442477874
+          }
+        }
+      },
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 13.031335647725196,
+        "expectancy_r": -0.08429415960123807,
+        "expectancy_r_ci95": [
+          -0.12263453406556771,
+          -0.04673443111912055
+        ],
+        "expectancy_return_pct": -0.25356101505883216,
+        "max_hold_pct": 28.81417869541385,
+        "median_return_pct": -1.0831772855211803,
+        "profit_factor": 0.8079550921724178,
+        "stop_pct": 49.49753334551434,
+        "take_profit_pct": 21.688287959071808,
+        "trades": 5473,
+        "win_rate_pct": 37.67586332906998
+      },
+      "scenario": "base",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 12.55831452219714,
+            "expectancy_r": -0.0954843898284075,
+            "expectancy_r_ci95": [
+              -0.14967752747392277,
+              -0.04682186758870332
+            ],
+            "expectancy_return_pct": -0.2442868100047149,
+            "max_hold_pct": 26.260346124905944,
+            "median_return_pct": -1.1177778018461937,
+            "profit_factor": 0.8103624988374762,
+            "stop_pct": 51.316779533483825,
+            "take_profit_pct": 22.422874341610232,
+            "trades": 2658,
+            "win_rate_pct": 36.606471030850265
+          },
+          "short": {
+            "average_hold_hours": 13.47797513321492,
+            "expectancy_r": -0.07372803812918961,
+            "expectancy_r_ci95": [
+              -0.14036371346338666,
+              -0.00842615075196726
+            ],
+            "expectancy_return_pct": -0.2623179731525599,
+            "max_hold_pct": 31.22557726465364,
+            "median_return_pct": -1.0426434282405534,
+            "profit_factor": 0.8057871295544103,
+            "stop_pct": 47.7797513321492,
+            "take_profit_pct": 20.994671403197156,
+            "trades": 2815,
+            "win_rate_pct": 38.685612788632326
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 12.982110091743118,
+            "expectancy_r": -0.0747613146733468,
+            "expectancy_r_ci95": [
+              -0.14972358089233123,
+              -0.015105515663557804
+            ],
+            "expectancy_return_pct": -0.2624869173459708,
+            "max_hold_pct": 28.71559633027523,
+            "median_return_pct": -1.2167382265624958,
+            "profit_factor": 0.8219856306886284,
+            "stop_pct": 48.89908256880734,
+            "take_profit_pct": 22.385321100917434,
+            "trades": 1090,
+            "win_rate_pct": 37.706422018348626
+          },
+          "2025": {
+            "average_hold_hours": 13.091771019677996,
+            "expectancy_r": -0.09117358704362459,
+            "expectancy_r_ci95": [
+              -0.13888376126261848,
+              -0.04006303658459495
+            ],
+            "expectancy_return_pct": -0.29884072405192724,
+            "max_hold_pct": 30.196779964221825,
+            "median_return_pct": -1.0982256374999892,
+            "profit_factor": 0.7826436188998529,
+            "stop_pct": 48.98032200357782,
+            "take_profit_pct": 20.822898032200357,
+            "trades": 2795,
+            "win_rate_pct": 37.0304114490161
+          },
+          "2026": {
+            "average_hold_hours": 12.95875314861461,
+            "expectancy_r": -0.07872917299540125,
+            "expectancy_r_ci95": [
+              -0.16570810745899456,
+              0.000266000604701095
+            ],
+            "expectancy_return_pct": -0.1677385842473197,
+            "max_hold_pct": 26.448362720403022,
+            "median_return_pct": -1.0106536021964767,
+            "profit_factor": 0.8500236850021219,
+            "stop_pct": 50.81863979848866,
+            "take_profit_pct": 22.732997481108313,
+            "trades": 1588,
+            "win_rate_pct": 38.79093198992443
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 15.332317073170731,
+            "expectancy_r": -0.11058816718359145,
+            "expectancy_r_ci95": [
+              -0.16021976010082667,
+              -0.061919474775878024
+            ],
+            "expectancy_return_pct": -0.3905127894346644,
+            "max_hold_pct": 39.07129455909944,
+            "median_return_pct": -1.0928398462050226,
+            "profit_factor": 0.7174819240258241,
+            "stop_pct": 44.746716697936215,
+            "take_profit_pct": 16.181988742964354,
+            "trades": 2132,
+            "win_rate_pct": 37.570356472795496
+          },
+          "trend_continuation": {
+            "average_hold_hours": 11.563005088296917,
+            "expectancy_r": -0.06751510417903592,
+            "expectancy_r_ci95": [
+              -0.11543558791713832,
+              -0.017451423308472238
+            ],
+            "expectancy_return_pct": -0.16616766487347612,
+            "max_hold_pct": 22.268781801855734,
+            "median_return_pct": -1.0817356224999861,
+            "profit_factor": 0.8702623904272501,
+            "stop_pct": 52.52918287937744,
+            "take_profit_pct": 25.202035318766836,
+            "trades": 3341,
+            "win_rate_pct": 37.7431906614786
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 13.516758241758241,
+            "expectancy_r": -0.11428060754409823,
+            "expectancy_r_ci95": [
+              -0.15575810251640235,
+              -0.07424038355383995
+            ],
+            "expectancy_return_pct": -0.45184808579325103,
+            "max_hold_pct": 29.560439560439562,
+            "median_return_pct": -1.6012325134374938,
+            "profit_factor": 0.7457922270879348,
+            "stop_pct": 50.989010989010985,
+            "take_profit_pct": 19.450549450549453,
+            "trades": 910,
+            "win_rate_pct": 35.934065934065934
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 13.041436464088397,
+            "expectancy_r": -0.10966604755466738,
+            "expectancy_r_ci95": [
+              -0.15126415731301787,
+              -0.06583166403989296
+            ],
+            "expectancy_return_pct": -0.22721033953373096,
+            "max_hold_pct": 28.839779005524864,
+            "median_return_pct": -0.751322462418347,
+            "profit_factor": 0.7212640743154473,
+            "stop_pct": 49.2817679558011,
+            "take_profit_pct": 21.878453038674035,
+            "trades": 905,
+            "win_rate_pct": 37.4585635359116
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 12.957134955752212,
+            "expectancy_r": -0.02752462135199604,
+            "expectancy_r_ci95": [
+              -0.08543157740083732,
+              0.0333163691943682
+            ],
+            "expectancy_return_pct": -0.11864846796158415,
+            "max_hold_pct": 29.20353982300885,
+            "median_return_pct": -1.2656052567137053,
+            "profit_factor": 0.918375129057339,
+            "stop_pct": 47.23451327433628,
+            "take_profit_pct": 23.561946902654867,
+            "trades": 904,
+            "win_rate_pct": 39.71238938053097
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 12.680892070484582,
+            "expectancy_r": -0.10356062393193823,
+            "expectancy_r_ci95": [
+              -0.1563614839155495,
+              -0.04883567603650024
+            ],
+            "expectancy_return_pct": -0.2953168127457967,
+            "max_hold_pct": 27.863436123348016,
+            "median_return_pct": -1.1193124108204295,
+            "profit_factor": 0.752618753116765,
+            "stop_pct": 50.110132158590304,
+            "take_profit_pct": 22.026431718061673,
+            "trades": 908,
+            "win_rate_pct": 36.8942731277533
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 13.037862513426424,
+            "expectancy_r": -0.07595853240755555,
+            "expectancy_r_ci95": [
+              -0.13774360831703716,
+              -0.015955811581472485
+            ],
+            "expectancy_return_pct": -0.23658130302939576,
+            "max_hold_pct": 28.678839957035446,
+            "median_return_pct": -1.226468733875004,
+            "profit_factor": 0.8277821886142005,
+            "stop_pct": 49.94629430719657,
+            "take_profit_pct": 21.374865735767994,
+            "trades": 931,
+            "win_rate_pct": 38.88292158968851
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 12.953005464480874,
+            "expectancy_r": -0.07482635157555627,
+            "expectancy_r_ci95": [
+              -0.13630726484863584,
+              -0.01015749744182789
+            ],
+            "expectancy_return_pct": -0.19155108845495117,
+            "max_hold_pct": 28.743169398907103,
+            "median_return_pct": -1.131835659999991,
+            "profit_factor": 0.8532060163410389,
+            "stop_pct": 49.39890710382514,
+            "take_profit_pct": 21.85792349726776,
+            "trades": 915,
+            "win_rate_pct": 37.15846994535519
+          }
+        }
+      },
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "fixed_rr",
+      "metrics": {
+        "average_hold_hours": 11.12211925866237,
+        "expectancy_r": -0.22566854082089438,
+        "expectancy_r_ci95": [
+          -0.2656378106304639,
+          -0.18565091995465685
+        ],
+        "expectancy_return_pct": -0.5637923381905391,
+        "max_hold_pct": 23.029814665592262,
+        "median_return_pct": -1.210802940498385,
+        "profit_factor": 0.6022158088753519,
+        "stop_pct": 59.709911361805,
+        "take_profit_pct": 17.26027397260274,
+        "trades": 6205,
+        "win_rate_pct": 29.89524576954069
+      },
+      "scenario": "entry_cap",
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 10.71558872305141,
+            "expectancy_r": -0.2308742066555547,
+            "expectancy_r_ci95": [
+              -0.28114396515977463,
+              -0.1823926091190633
+            ],
+            "expectancy_return_pct": -0.5148588022103072,
+            "max_hold_pct": 21.791044776119403,
+            "median_return_pct": -1.2010197147500041,
+            "profit_factor": 0.6214154297833451,
+            "stop_pct": 60.6301824212272,
+            "take_profit_pct": 17.5787728026534,
+            "trades": 3015,
+            "win_rate_pct": 29.35323383084577
+          },
+          "short": {
+            "average_hold_hours": 11.506347962382446,
+            "expectancy_r": -0.220748452265565,
+            "expectancy_r_ci95": [
+              -0.2834062620284298,
+              -0.1573103202477041
+            ],
+            "expectancy_return_pct": -0.6100414325417615,
+            "max_hold_pct": 24.200626959247646,
+            "median_return_pct": -1.2224118498294287,
+            "profit_factor": 0.585445670648754,
+            "stop_pct": 58.840125391849526,
+            "take_profit_pct": 16.959247648902824,
+            "trades": 3190,
+            "win_rate_pct": 30.407523510971785
+          }
+        },
+        "period": {
+          "2024": {
+            "average_hold_hours": 11.244877049180328,
+            "expectancy_r": -0.21177076857950322,
+            "expectancy_r_ci95": [
+              -0.2785157311466933,
+              -0.16368541525617805
+            ],
+            "expectancy_return_pct": -0.5677248273296783,
+            "max_hold_pct": 22.213114754098363,
+            "median_return_pct": -1.3247453060624994,
+            "profit_factor": 0.6413394514664181,
+            "stop_pct": 59.42622950819673,
+            "take_profit_pct": 18.360655737704917,
+            "trades": 1220,
+            "win_rate_pct": 29.918032786885245
+          },
+          "2025": {
+            "average_hold_hours": 11.311407689863362,
+            "expectancy_r": -0.23017258200752666,
+            "expectancy_r_ci95": [
+              -0.28599608605192595,
+              -0.17310218630302596
+            ],
+            "expectancy_return_pct": -0.6130517891359254,
+            "max_hold_pct": 24.02287893231649,
+            "median_return_pct": -1.253414754124983,
+            "profit_factor": 0.585565392912698,
+            "stop_pct": 59.19923736892279,
+            "take_profit_pct": 16.777883698760725,
+            "trades": 3147,
+            "win_rate_pct": 29.488401652367337
+          },
+          "2026": {
+            "average_hold_hours": 10.716539717083787,
+            "expectancy_r": -0.2271816335957396,
+            "expectancy_r_ci95": [
+              -0.30707261212407466,
+              -0.15207944124007178
+            ],
+            "expectancy_return_pct": -0.47684069027167025,
+            "max_hold_pct": 21.871599564744287,
+            "median_return_pct": -1.1194996521250167,
+            "profit_factor": 0.60310233886584,
+            "stop_pct": 60.772578890097925,
+            "take_profit_pct": 17.35582154515778,
+            "trades": 1838,
+            "win_rate_pct": 30.576713819368877
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 13.74670493197279,
+            "expectancy_r": -0.21546484382683082,
+            "expectancy_r_ci95": [
+              -0.26608632066764537,
+              -0.16650930448595205
+            ],
+            "expectancy_return_pct": -0.6573383648417933,
+            "max_hold_pct": 33.205782312925166,
+            "median_return_pct": -1.312827944292605,
+            "profit_factor": 0.5647517614036154,
+            "stop_pct": 52.976190476190474,
+            "take_profit_pct": 13.818027210884354,
+            "trades": 2352,
+            "win_rate_pct": 31.93027210884354
+          },
+          "trend_continuation": {
+            "average_hold_hours": 9.519984427718661,
+            "expectancy_r": -0.231897218560328,
+            "expectancy_r_ci95": [
+              -0.2845524342742203,
+              -0.17421584390118378
+            ],
+            "expectancy_return_pct": -0.5066887164195165,
+            "max_hold_pct": 16.81806384635349,
+            "median_return_pct": -1.1725766933749906,
+            "profit_factor": 0.6276005511209582,
+            "stop_pct": 63.820399688554375,
+            "take_profit_pct": 19.361536465092136,
+            "trades": 3853,
+            "win_rate_pct": 28.652997664157798
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 12.183823529411764,
+            "expectancy_r": -0.21954902031893936,
+            "expectancy_r_ci95": [
+              -0.26328903520191327,
+              -0.17547674892771553
+            ],
+            "expectancy_return_pct": -0.7770227591922112,
+            "max_hold_pct": 24.746450304259636,
+            "median_return_pct": -1.7702516401874986,
+            "profit_factor": 0.5915579663057225,
+            "stop_pct": 58.113590263691684,
+            "take_profit_pct": 17.13995943204868,
+            "trades": 986,
+            "win_rate_pct": 30.425963488843816
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 9.247464074387151,
+            "expectancy_r": -0.32899681302167333,
+            "expectancy_r_ci95": [
+              -0.37881487455680724,
+              -0.27345077370461457
+            ],
+            "expectancy_return_pct": -0.5568003619120153,
+            "max_hold_pct": 18.850380388841927,
+            "median_return_pct": -0.8587054574999927,
+            "profit_factor": 0.4032009063393125,
+            "stop_pct": 67.37109044801353,
+            "take_profit_pct": 13.778529163144547,
+            "trades": 1183,
+            "win_rate_pct": 23.668639053254438
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 11.927179487179487,
+            "expectancy_r": -0.15456162801215617,
+            "expectancy_r_ci95": [
+              -0.2170498545508074,
+              -0.0872081979905126
+            ],
+            "expectancy_return_pct": -0.4131371554981682,
+            "max_hold_pct": 26.153846153846157,
+            "median_return_pct": -1.427565885000008,
+            "profit_factor": 0.7348428794160428,
+            "stop_pct": 54.871794871794876,
+            "take_profit_pct": 18.974358974358974,
+            "trades": 975,
+            "win_rate_pct": 33.743589743589745
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 10.695599613152805,
+            "expectancy_r": -0.24317358453903265,
+            "expectancy_r_ci95": [
+              -0.2928634300156274,
+              -0.1932882148609851
+            ],
+            "expectancy_return_pct": -0.5581291649035102,
+            "max_hold_pct": 21.953578336557058,
+            "median_return_pct": -1.2174867271250018,
+            "profit_factor": 0.5598319213374656,
+            "stop_pct": 60.63829787234043,
+            "take_profit_pct": 17.408123791102515,
+            "trades": 1034,
+            "win_rate_pct": 29.593810444874276
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 11.965139442231076,
+            "expectancy_r": -0.17671566832444982,
+            "expectancy_r_ci95": [
+              -0.2350694447547374,
+              -0.12156163814119623
+            ],
+            "expectancy_return_pct": -0.539926537222569,
+            "max_hold_pct": 25.796812749003983,
+            "median_return_pct": -1.388753354062505,
+            "profit_factor": 0.6390353305881636,
+            "stop_pct": 55.87649402390438,
+            "take_profit_pct": 18.326693227091635,
+            "trades": 1004,
+            "win_rate_pct": 33.266932270916335
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 11.103128054740958,
+            "expectancy_r": -0.21019856034367185,
+            "expectancy_r_ci95": [
+              -0.26895019978543816,
+              -0.14567158020414278
+            ],
+            "expectancy_return_pct": -0.5390925349701443,
+            "max_hold_pct": 21.603128054740957,
+            "median_return_pct": -1.278384765374996,
+            "profit_factor": 0.6281380351793469,
+            "stop_pct": 59.82404692082112,
+            "take_profit_pct": 18.57282502443793,
+            "trades": 1023,
+            "win_rate_pct": 29.91202346041056
+          }
+        }
+      },
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 14.446048482459599,
+        "expectancy_r": 0.02089795785821664,
+        "expectancy_r_ci95": [
+          -0.023667353523454296,
+          0.06455405352471225
+        ],
+        "expectancy_return_pct": -0.010933527909383239,
+        "max_hold_pct": 36.46038628301143,
+        "median_return_pct": -0.8795589661537373,
+        "profit_factor": 0.9907246660563508,
+        "stop_pct": 50.72920772566023,
+        "take_profit_pct": 12.810405991328341,
+        "trades": 5074,
+        "win_rate_pct": 37.05163579030351
+      },
+      "scenario": "frictionless",
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 14.255169722980881,
+        "expectancy_r": -0.0824611252616502,
+        "expectancy_r_ci95": [
+          -0.12940200357211054,
+          -0.03659129196487349
+        ],
+        "expectancy_return_pct": -0.2587324975058363,
+        "max_hold_pct": 35.836909871244636,
+        "median_return_pct": -1.128415160187497,
+        "profit_factor": 0.8075853111760991,
+        "stop_pct": 51.7947717518533,
+        "take_profit_pct": 12.368318376902069,
+        "trades": 5126,
+        "win_rate_pct": 34.93952399531799
+      },
+      "scenario": "base",
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "extended_rr",
+      "metrics": {
+        "average_hold_hours": 12.177546813262326,
+        "expectancy_r": -0.22072953064552414,
+        "expectancy_r_ci95": [
+          -0.26509915254656574,
+          -0.17660661979042036
+        ],
+        "expectancy_return_pct": -0.5552977944292703,
+        "max_hold_pct": 28.94691633739907,
+        "median_return_pct": -1.2324567383749983,
+        "profit_factor": 0.6130560000965288,
+        "stop_pct": 61.20941419000172,
+        "take_profit_pct": 9.84366947259921,
+        "trades": 5821,
+        "win_rate_pct": 27.71001546126095
+      },
+      "scenario": "entry_cap",
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 13.18844592100406,
+        "expectancy_r": 0.013134954151879664,
+        "expectancy_r_ci95": [
+          -0.021926231379356856,
+          0.048243022830445535
+        ],
+        "expectancy_return_pct": -0.01839805696644003,
+        "max_hold_pct": 29.346622369878183,
+        "median_return_pct": -0.8364239066347645,
+        "profit_factor": 0.9841822980656214,
+        "stop_pct": 48.5234403839055,
+        "take_profit_pct": 22.129937246216315,
+        "trades": 5418,
+        "win_rate_pct": 39.682539682539684
+      },
+      "scenario": "frictionless",
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 13.052983162518302,
+        "expectancy_r": -0.08498206715389653,
+        "expectancy_r_ci95": [
+          -0.12294650577981245,
+          -0.04742110043297247
+        ],
+        "expectancy_return_pct": -0.255449745182304,
+        "max_hold_pct": 28.84333821376281,
+        "median_return_pct": -1.0889173559584804,
+        "profit_factor": 0.8069110236469315,
+        "stop_pct": 49.579062957540266,
+        "take_profit_pct": 21.577598828696924,
+        "trades": 5464,
+        "win_rate_pct": 37.55490483162519
+      },
+      "scenario": "base",
+      "setup": "combined"
+    },
+    {
+      "exit_policy": "structure_target",
+      "metrics": {
+        "average_hold_hours": 11.132620967741936,
+        "expectancy_r": -0.2250917437290086,
+        "expectancy_r_ci95": [
+          -0.2653555242287714,
+          -0.1850173736285418
+        ],
+        "expectancy_return_pct": -0.5631851895400621,
+        "max_hold_pct": 23.0,
+        "median_return_pct": -1.2111837636126004,
+        "profit_factor": 0.6031821237056152,
+        "stop_pct": 59.74193548387097,
+        "take_profit_pct": 17.258064516129032,
+        "trades": 6200,
+        "win_rate_pct": 29.838709677419356
+      },
+      "scenario": "entry_cap",
+      "setup": "combined"
+    }
+  ],
+  "methodology_version": "phase1-v2-proxy-backtest-v1",
+  "period": {
+    "first_signal": "2024-08-16T09:30:00+00:00",
+    "last_bar": "2026-07-27T09:00:00+00:00"
+  },
+  "portfolio": {
+    "base": {
+      "metrics": {
+        "average_hold_hours": 11.760204081632653,
+        "cagr_pct": -7.988792378628007,
+        "daily_sharpe": -1.7551060440422421,
+        "expectancy_r": -0.4155067403597961,
+        "expectancy_r_ci95": [
+          -0.4155067403597961,
+          -0.4155067403597961
+        ],
+        "expectancy_return_pct": -0.8854858820478478,
+        "fees_usd": 1627.4340480413466,
+        "final_equity_usd": 85057.97897663577,
+        "funding_usd": -18.223846101296306,
+        "initial_equity_usd": 100000.0,
+        "kill_index": 61667,
+        "killed_by_drawdown_guard": true,
+        "max_drawdown_pct": 15.136483705298135,
+        "max_hold_pct": 24.489795918367346,
+        "median_return_pct": -1.189498848807279,
+        "net_realized_pnl_usd": -14942.02102336419,
+        "positive_months_pct": 0.0,
+        "profit_factor": 0.25443459976475674,
+        "stop_pct": 61.224489795918366,
+        "take_profit_pct": 8.16326530612245,
+        "total_return_pct": -14.942021023364227,
+        "trades": 49,
+        "win_rate_pct": 18.367346938775512
+      },
+      "rejections": {
+        "already_holding": 371,
+        "failed_thesis_evidence": 2,
+        "post_loss_cooldown": 13,
+        "risk:BTC-beta-weighted exposure cap reached": 2,
+        "risk:live funding rate unavailable": 49633,
+        "risk:max concurrent positions reached": 194,
+        "risk:net directional exposure cap reached": 61,
+        "risk:stop distance 0.18% out of bounds": 1,
+        "risk:stop distance 0.187% out of bounds": 1,
+        "risk:stop distance 0.197% out of bounds": 1,
+        "risk:stop distance 15.286% out of bounds": 1,
+        "risk:stop distance 15.403% out of bounds": 1,
+        "risk:stop distance 15.8485% out of bounds": 1,
+        "risk:stop distance 16.243% out of bounds": 1,
+        "risk:stop distance 16.2695% out of bounds": 1,
+        "risk:stop distance 16.386% out of bounds": 1,
+        "risk:stop distance 16.5155% out of bounds": 1,
+        "risk:stop distance 16.716% out of bounds": 1,
+        "risk:stop distance 17.174% out of bounds": 1,
+        "risk:stop distance 17.2095% out of bounds": 1,
+        "risk:stop distance 17.2665% out of bounds": 1,
+        "risk:stop distance 17.291% out of bounds": 1,
+        "risk:stop distance 17.8435% out of bounds": 1,
+        "risk:stop distance 18.2195% out of bounds": 1,
+        "risk:stop distance 18.482% out of bounds": 1,
+        "risk:stop distance 19.1495% out of bounds": 1,
+        "risk:stop distance 19.5395% out of bounds": 1,
+        "risk:stop distance 20.2335% out of bounds": 1,
+        "risk:stop distance 21.0695% out of bounds": 1,
+        "risk:stop distance 21.502% out of bounds": 1,
+        "risk:stop distance 21.527% out of bounds": 1,
+        "risk:stop distance 21.767% out of bounds": 1,
+        "risk:stop distance 21.8245% out of bounds": 1,
+        "risk:stop distance 22.3595% out of bounds": 1,
+        "risk:stop distance 24.2295% out of bounds": 1,
+        "risk:stop distance 25.1995% out of bounds": 1,
+        "risk:total planned open-risk cap reached": 1,
+        "same_candle_lower_priority": 3294,
+        "setup_cooldown": 3
+      },
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 9.098214285714286,
+            "expectancy_r": -0.3895729586573422,
+            "expectancy_r_ci95": [
+              -0.3895729586573422,
+              -0.3895729586573422
+            ],
+            "expectancy_return_pct": -0.7079626985453938,
+            "max_hold_pct": 14.285714285714285,
+            "median_return_pct": -1.187275275778645,
+            "profit_factor": 0.3448156124561631,
+            "stop_pct": 67.85714285714286,
+            "take_profit_pct": 14.285714285714285,
+            "trades": 28,
+            "win_rate_pct": 17.857142857142858
+          },
+          "short": {
+            "average_hold_hours": 15.30952380952381,
+            "expectancy_r": -0.450085115963068,
+            "expectancy_r_ci95": [
+              -0.450085115963068,
+              -0.450085115963068
+            ],
+            "expectancy_return_pct": -1.12218346005112,
+            "max_hold_pct": 38.095238095238095,
+            "median_return_pct": -1.1919557050000218,
+            "profit_factor": 0.15656430680656164,
+            "stop_pct": 52.38095238095239,
+            "take_profit_pct": 0.0,
+            "trades": 21,
+            "win_rate_pct": 19.047619047619047
+          }
+        },
+        "period": {
+          "2026": {
+            "average_hold_hours": 11.760204081632653,
+            "expectancy_r": -0.4155067403597961,
+            "expectancy_r_ci95": [
+              -0.4155067403597961,
+              -0.4155067403597961
+            ],
+            "expectancy_return_pct": -0.8854858820478478,
+            "max_hold_pct": 24.489795918367346,
+            "median_return_pct": -1.189498848807279,
+            "profit_factor": 0.25443459976475674,
+            "stop_pct": 61.224489795918366,
+            "take_profit_pct": 8.16326530612245,
+            "trades": 49,
+            "win_rate_pct": 18.367346938775512
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 16.291666666666668,
+            "expectancy_r": -0.28358448929718877,
+            "expectancy_r_ci95": [
+              -0.28358448929718877,
+              -0.28358448929718877
+            ],
+            "expectancy_return_pct": -0.8207117113808562,
+            "max_hold_pct": 38.88888888888889,
+            "median_return_pct": -1.1921158236926535,
+            "profit_factor": 0.3516719237260396,
+            "stop_pct": 50.0,
+            "take_profit_pct": 11.11111111111111,
+            "trades": 18,
+            "win_rate_pct": 27.77777777777778
+          },
+          "trend_continuation": {
+            "average_hold_hours": 9.129032258064516,
+            "expectancy_r": -0.4921067571058263,
+            "expectancy_r_ci95": [
+              -0.4921067571058263,
+              -0.4921067571058263
+            ],
+            "expectancy_return_pct": -0.9230966908222303,
+            "max_hold_pct": 16.129032258064516,
+            "median_return_pct": -1.189498848807279,
+            "profit_factor": 0.19186297670463082,
+            "stop_pct": 67.74193548387096,
+            "take_profit_pct": 6.451612903225806,
+            "trades": 31,
+            "win_rate_pct": 12.903225806451612
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 9.357142857142858,
+            "expectancy_r": -0.5712008061638187,
+            "expectancy_r_ci95": [
+              -0.5712008061638187,
+              -0.5712008061638187
+            ],
+            "expectancy_return_pct": -1.4959778008804143,
+            "max_hold_pct": 28.57142857142857,
+            "median_return_pct": -1.4617370739413744,
+            "profit_factor": 0.09565845181691954,
+            "stop_pct": 57.14285714285714,
+            "take_profit_pct": 0.0,
+            "trades": 7,
+            "win_rate_pct": 14.285714285714285
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 8.863636363636363,
+            "expectancy_r": -0.4663493928130362,
+            "expectancy_r_ci95": [
+              -0.4663493928130362,
+              -0.4663493928130362
+            ],
+            "expectancy_return_pct": -0.8369742594198183,
+            "max_hold_pct": 9.090909090909092,
+            "median_return_pct": -1.1850517027500107,
+            "profit_factor": 0.22494766436707975,
+            "stop_pct": 81.81818181818183,
+            "take_profit_pct": 9.090909090909092,
+            "trades": 11,
+            "win_rate_pct": 18.181818181818183
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 9.886363636363637,
+            "expectancy_r": -0.2867475697222762,
+            "expectancy_r_ci95": [
+              -0.2867475697222762,
+              -0.2867475697222762
+            ],
+            "expectancy_return_pct": -0.7605453634631408,
+            "max_hold_pct": 9.090909090909092,
+            "median_return_pct": -1.2678857649999848,
+            "profit_factor": 0.43108089430351265,
+            "stop_pct": 63.63636363636363,
+            "take_profit_pct": 18.181818181818183,
+            "trades": 11,
+            "win_rate_pct": 27.27272727272727
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 13.875,
+            "expectancy_r": 0.4669883971415004,
+            "expectancy_r_ci95": [
+              0.4669883971415004,
+              0.4669883971415004
+            ],
+            "expectancy_return_pct": 0.6511652744058577,
+            "max_hold_pct": 50.0,
+            "median_return_pct": 0.6511652744058577,
+            "profit_factor": 1.7662840327093476,
+            "stop_pct": 0.0,
+            "take_profit_pct": 50.0,
+            "trades": 2,
+            "win_rate_pct": 50.0
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 16.694444444444443,
+            "expectancy_r": -0.5389561304570776,
+            "expectancy_r_ci95": [
+              -0.5389561304570776,
+              -0.5389561304570776
+            ],
+            "expectancy_return_pct": -1.0704147855844885,
+            "max_hold_pct": 33.33333333333333,
+            "median_return_pct": -1.2808603785602863,
+            "profit_factor": 0.11334600133552115,
+            "stop_pct": 66.66666666666666,
+            "take_profit_pct": 0.0,
+            "trades": 9,
+            "win_rate_pct": 11.11111111111111
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 14.055555555555555,
+            "expectancy_r": -0.46230329630712735,
+            "expectancy_r_ci95": [
+              -0.46230329630712735,
+              -0.46230329630712735
+            ],
+            "expectancy_return_pct": -0.7792050267800461,
+            "max_hold_pct": 44.44444444444444,
+            "median_return_pct": -0.9134544065750698,
+            "profit_factor": 0.06089751425045861,
+            "stop_pct": 44.44444444444444,
+            "take_profit_pct": 0.0,
+            "trades": 9,
+            "win_rate_pct": 11.11111111111111
+          }
+        }
+      }
+    },
+    "entry_cap": {
+      "metrics": {
+        "average_hold_hours": 9.698717948717949,
+        "cagr_pct": -8.053388563534835,
+        "daily_sharpe": -1.8583245672974495,
+        "expectancy_r": -0.518771354727203,
+        "expectancy_r_ci95": [
+          -0.518771354727203,
+          -0.518771354727203
+        ],
+        "expectancy_return_pct": -1.0640800045218317,
+        "fees_usd": 1325.666628102958,
+        "final_equity_usd": 84941.94640044202,
+        "funding_usd": -10.238040181275684,
+        "initial_equity_usd": 100000.0,
+        "kill_index": 61443,
+        "killed_by_drawdown_guard": true,
+        "max_drawdown_pct": 15.058053599557987,
+        "max_hold_pct": 15.384615384615385,
+        "median_return_pct": -1.2098267401877225,
+        "net_realized_pnl_usd": -15058.053599557927,
+        "positive_months_pct": 0.0,
+        "profit_factor": 0.15586958051247318,
+        "stop_pct": 74.35897435897436,
+        "take_profit_pct": 5.128205128205128,
+        "total_return_pct": -15.058053599557987,
+        "trades": 39,
+        "win_rate_pct": 15.384615384615385
+      },
+      "rejections": {
+        "already_holding": 250,
+        "failed_thesis_evidence": 2,
+        "post_loss_cooldown": 9,
+        "risk:live funding rate unavailable": 49633,
+        "risk:max concurrent positions reached": 103,
+        "risk:net directional exposure cap reached": 82,
+        "risk:stop distance 0.18% out of bounds": 1,
+        "risk:stop distance 0.187% out of bounds": 1,
+        "risk:stop distance 0.197% out of bounds": 1,
+        "risk:stop distance 15.286% out of bounds": 1,
+        "risk:stop distance 15.403% out of bounds": 1,
+        "risk:stop distance 15.8485% out of bounds": 1,
+        "risk:stop distance 16.243% out of bounds": 1,
+        "risk:stop distance 16.2695% out of bounds": 1,
+        "risk:stop distance 16.386% out of bounds": 1,
+        "risk:stop distance 16.5155% out of bounds": 1,
+        "risk:stop distance 16.716% out of bounds": 1,
+        "risk:stop distance 17.174% out of bounds": 1,
+        "risk:stop distance 17.2095% out of bounds": 1,
+        "risk:stop distance 17.2665% out of bounds": 1,
+        "risk:stop distance 17.291% out of bounds": 1,
+        "risk:stop distance 17.8435% out of bounds": 1,
+        "risk:stop distance 18.2195% out of bounds": 1,
+        "risk:stop distance 18.482% out of bounds": 1,
+        "risk:stop distance 19.1495% out of bounds": 1,
+        "risk:stop distance 19.5395% out of bounds": 1,
+        "risk:stop distance 20.2335% out of bounds": 1,
+        "risk:stop distance 21.0695% out of bounds": 1,
+        "risk:stop distance 21.502% out of bounds": 1,
+        "risk:stop distance 21.527% out of bounds": 1,
+        "risk:stop distance 21.767% out of bounds": 1,
+        "risk:stop distance 21.8245% out of bounds": 1,
+        "risk:stop distance 22.3595% out of bounds": 1,
+        "risk:stop distance 24.2295% out of bounds": 1,
+        "risk:stop distance 25.1995% out of bounds": 1,
+        "risk:total planned open-risk cap reached": 1,
+        "same_candle_lower_priority": 3288,
+        "setup_cooldown": 3
+      },
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 8.34,
+            "expectancy_r": -0.48294106295519046,
+            "expectancy_r_ci95": [
+              -0.48294106295519046,
+              -0.48294106295519046
+            ],
+            "expectancy_return_pct": -0.8535583690795664,
+            "max_hold_pct": 12.0,
+            "median_return_pct": -1.2098267401877225,
+            "profit_factor": 0.22832472900990317,
+            "stop_pct": 76.0,
+            "take_profit_pct": 8.0,
+            "trades": 25,
+            "win_rate_pct": 16.0
+          },
+          "short": {
+            "average_hold_hours": 12.125,
+            "expectancy_r": -0.5827540186057968,
+            "expectancy_r_ci95": [
+              -0.5827540186057968,
+              -0.5827540186057968
+            ],
+            "expectancy_return_pct": -1.4400114963830202,
+            "max_hold_pct": 21.428571428571427,
+            "median_return_pct": -1.1405255716796368,
+            "profit_factor": 0.0627194396442797,
+            "stop_pct": 71.42857142857143,
+            "take_profit_pct": 0.0,
+            "trades": 14,
+            "win_rate_pct": 14.285714285714285
+          }
+        },
+        "period": {
+          "2026": {
+            "average_hold_hours": 9.698717948717949,
+            "expectancy_r": -0.518771354727203,
+            "expectancy_r_ci95": [
+              -0.518771354727203,
+              -0.518771354727203
+            ],
+            "expectancy_return_pct": -1.0640800045218317,
+            "max_hold_pct": 15.384615384615385,
+            "median_return_pct": -1.2098267401877225,
+            "profit_factor": 0.15586958051247318,
+            "stop_pct": 74.35897435897436,
+            "take_profit_pct": 5.128205128205128,
+            "trades": 39,
+            "win_rate_pct": 15.384615384615385
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 12.98076923076923,
+            "expectancy_r": -0.4621726293151566,
+            "expectancy_r_ci95": [
+              -0.4621726293151566,
+              -0.4621726293151566
+            ],
+            "expectancy_return_pct": -1.2377457351302779,
+            "max_hold_pct": 15.384615384615385,
+            "median_return_pct": -1.0645464199842876,
+            "profit_factor": 0.1318917595989872,
+            "stop_pct": 69.23076923076923,
+            "take_profit_pct": 7.6923076923076925,
+            "trades": 13,
+            "win_rate_pct": 23.076923076923077
+          },
+          "trend_continuation": {
+            "average_hold_hours": 8.057692307692308,
+            "expectancy_r": -0.5470707174332261,
+            "expectancy_r_ci95": [
+              -0.5470707174332261,
+              -0.5470707174332261
+            ],
+            "expectancy_return_pct": -0.977247139217609,
+            "max_hold_pct": 15.384615384615385,
+            "median_return_pct": -1.2104132312188631,
+            "profit_factor": 0.17038105457075933,
+            "stop_pct": 76.92307692307693,
+            "take_profit_pct": 3.8461538461538463,
+            "trades": 26,
+            "win_rate_pct": 11.538461538461538
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 7.5,
+            "expectancy_r": -0.7306102756075639,
+            "expectancy_r_ci95": [
+              -0.7306102756075639,
+              -0.7306102756075639
+            ],
+            "expectancy_return_pct": -2.2893409256924397,
+            "max_hold_pct": 20.0,
+            "median_return_pct": -2.3327525652499874,
+            "profit_factor": 0.0,
+            "stop_pct": 60.0,
+            "take_profit_pct": 0.0,
+            "trades": 5,
+            "win_rate_pct": 0.0
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 9.275,
+            "expectancy_r": -0.3426485964138735,
+            "expectancy_r_ci95": [
+              -0.3426485964138735,
+              -0.3426485964138735
+            ],
+            "expectancy_return_pct": -0.5576302148487531,
+            "max_hold_pct": 10.0,
+            "median_return_pct": -1.1247990613671401,
+            "profit_factor": 0.40099519037841036,
+            "stop_pct": 70.0,
+            "take_profit_pct": 10.0,
+            "trades": 10,
+            "win_rate_pct": 30.0
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 10.63888888888889,
+            "expectancy_r": -0.43546648159598966,
+            "expectancy_r_ci95": [
+              -0.43546648159598966,
+              -0.43546648159598966
+            ],
+            "expectancy_return_pct": -1.0930866217136126,
+            "max_hold_pct": 11.11111111111111,
+            "median_return_pct": -1.2678857649999986,
+            "profit_factor": 0.2334190731045879,
+            "stop_pct": 77.77777777777779,
+            "take_profit_pct": 11.11111111111111,
+            "trades": 9,
+            "win_rate_pct": 22.22222222222222
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 4.3125,
+            "expectancy_r": -0.7167491908467569,
+            "expectancy_r_ci95": [
+              -0.7167491908467569,
+              -0.7167491908467569
+            ],
+            "expectancy_return_pct": -1.0793028548846324,
+            "max_hold_pct": 0.0,
+            "median_return_pct": -1.189351348237762,
+            "profit_factor": 0.0,
+            "stop_pct": 100.0,
+            "take_profit_pct": 0.0,
+            "trades": 4,
+            "win_rate_pct": 0.0
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 9.875,
+            "expectancy_r": -0.45669232632203643,
+            "expectancy_r_ci95": [
+              -0.45669232632203643,
+              -0.45669232632203643
+            ],
+            "expectancy_return_pct": -0.6359495610884259,
+            "max_hold_pct": 33.33333333333333,
+            "median_return_pct": -0.9370693772357179,
+            "profit_factor": 0.19670145305013545,
+            "stop_pct": 66.66666666666666,
+            "take_profit_pct": 0.0,
+            "trades": 6,
+            "win_rate_pct": 16.666666666666664
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 15.15,
+            "expectancy_r": -0.7252392873002413,
+            "expectancy_r_ci95": [
+              -0.7252392873002413,
+              -0.7252392873002413
+            ],
+            "expectancy_return_pct": -1.3010850035820238,
+            "max_hold_pct": 20.0,
+            "median_return_pct": -1.2098267401877225,
+            "profit_factor": 0.0,
+            "stop_pct": 80.0,
+            "take_profit_pct": 0.0,
+            "trades": 5,
+            "win_rate_pct": 0.0
+          }
+        }
+      }
+    },
+    "frictionless": {
+      "metrics": {
+        "average_hold_hours": 13.391975308641975,
+        "cagr_pct": -7.882041920809513,
+        "daily_sharpe": -1.3845584226901355,
+        "expectancy_r": -0.10704665513090053,
+        "expectancy_r_ci95": [
+          -0.28733928426463157,
+          -0.028866665506539286
+        ],
+        "expectancy_return_pct": -0.26729402051743106,
+        "fees_usd": 0.0,
+        "final_equity_usd": 85249.90081928473,
+        "funding_usd": 0.0,
+        "initial_equity_usd": 100000.0,
+        "kill_index": 64609,
+        "killed_by_drawdown_guard": true,
+        "max_drawdown_pct": 15.012963629269985,
+        "max_hold_pct": 31.48148148148148,
+        "median_return_pct": -0.789124999999997,
+        "net_realized_pnl_usd": -14750.099180715226,
+        "positive_months_pct": 0.0,
+        "profit_factor": 0.6707775527712343,
+        "stop_pct": 51.23456790123457,
+        "take_profit_pct": 15.432098765432098,
+        "total_return_pct": -14.75009918071527,
+        "trades": 162,
+        "win_rate_pct": 33.95061728395062
+      },
+      "rejections": {
+        "already_holding": 1445,
+        "failed_thesis_evidence": 21,
+        "failed_thesis_time": 1,
+        "post_loss_cooldown": 37,
+        "risk:BTC-beta-weighted exposure cap reached": 86,
+        "risk:live funding rate unavailable": 49633,
+        "risk:max concurrent positions reached": 516,
+        "risk:net directional exposure cap reached": 763,
+        "risk:stop distance 0.18% out of bounds": 1,
+        "risk:stop distance 0.187% out of bounds": 1,
+        "risk:stop distance 0.197% out of bounds": 1,
+        "risk:stop distance 15.286% out of bounds": 1,
+        "risk:stop distance 15.403% out of bounds": 1,
+        "risk:stop distance 15.8485% out of bounds": 1,
+        "risk:stop distance 16.243% out of bounds": 1,
+        "risk:stop distance 16.2695% out of bounds": 1,
+        "risk:stop distance 16.386% out of bounds": 1,
+        "risk:stop distance 16.5155% out of bounds": 1,
+        "risk:stop distance 16.716% out of bounds": 1,
+        "risk:stop distance 17.174% out of bounds": 1,
+        "risk:stop distance 17.2095% out of bounds": 1,
+        "risk:stop distance 17.2665% out of bounds": 1,
+        "risk:stop distance 17.291% out of bounds": 1,
+        "risk:stop distance 17.8435% out of bounds": 1,
+        "risk:stop distance 18.2195% out of bounds": 1,
+        "risk:stop distance 18.482% out of bounds": 1,
+        "risk:stop distance 19.1495% out of bounds": 1,
+        "risk:stop distance 19.5395% out of bounds": 1,
+        "risk:stop distance 20.2335% out of bounds": 1,
+        "risk:stop distance 21.0695% out of bounds": 1,
+        "risk:stop distance 21.502% out of bounds": 1,
+        "risk:stop distance 21.527% out of bounds": 1,
+        "risk:stop distance 21.767% out of bounds": 1,
+        "risk:stop distance 21.8245% out of bounds": 1,
+        "risk:stop distance 22.3595% out of bounds": 1,
+        "risk:stop distance 24.2295% out of bounds": 1,
+        "risk:stop distance 25.1995% out of bounds": 1,
+        "risk:total planned open-risk cap reached": 1,
+        "same_candle_lower_priority": 3407,
+        "setup_cooldown": 23
+      },
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 12.698051948051948,
+            "expectancy_r": -0.14781748037624753,
+            "expectancy_r_ci95": [
+              -0.21455520913575257,
+              -0.10968163537081609
+            ],
+            "expectancy_return_pct": -0.32024250211011157,
+            "max_hold_pct": 29.87012987012987,
+            "median_return_pct": -0.805714588565896,
+            "profit_factor": 0.5908684887373938,
+            "stop_pct": 54.54545454545454,
+            "take_profit_pct": 14.285714285714285,
+            "trades": 77,
+            "win_rate_pct": 31.16883116883117
+          },
+          "short": {
+            "average_hold_hours": 14.020588235294118,
+            "expectancy_r": -0.07011308402629207,
+            "expectancy_r_ci95": [
+              -0.3843847177698036,
+              0.033007295795797656
+            ],
+            "expectancy_return_pct": -0.2193289254275911,
+            "max_hold_pct": 32.94117647058823,
+            "median_return_pct": -0.7665000000000038,
+            "profit_factor": 0.73836719777496,
+            "stop_pct": 48.23529411764706,
+            "take_profit_pct": 16.470588235294116,
+            "trades": 85,
+            "win_rate_pct": 36.470588235294116
+          }
+        },
+        "period": {
+          "2026": {
+            "average_hold_hours": 13.391975308641975,
+            "expectancy_r": -0.10704665513090053,
+            "expectancy_r_ci95": [
+              -0.28733928426463157,
+              -0.028866665506539286
+            ],
+            "expectancy_return_pct": -0.26729402051743106,
+            "max_hold_pct": 31.48148148148148,
+            "median_return_pct": -0.789124999999997,
+            "profit_factor": 0.6707775527712343,
+            "stop_pct": 51.23456790123457,
+            "take_profit_pct": 15.432098765432098,
+            "trades": 162,
+            "win_rate_pct": 33.95061728395062
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 15.09375,
+            "expectancy_r": -0.19315572976436593,
+            "expectancy_r_ci95": [
+              -0.2031568561270381,
+              -0.165505556879331
+            ],
+            "expectancy_return_pct": -0.490642470479443,
+            "max_hold_pct": 37.5,
+            "median_return_pct": -0.836000000000005,
+            "profit_factor": 0.49889232078343465,
+            "stop_pct": 50.0,
+            "take_profit_pct": 7.8125,
+            "trades": 64,
+            "win_rate_pct": 31.25
+          },
+          "trend_continuation": {
+            "average_hold_hours": 12.28061224489796,
+            "expectancy_r": -0.050812157411086405,
+            "expectancy_r_ci95": [
+              -0.35206345193807254,
+              0.09524907629896745
+            ],
+            "expectancy_return_pct": -0.12143380829734174,
+            "max_hold_pct": 27.55102040816326,
+            "median_return_pct": -0.7722015219842171,
+            "profit_factor": 0.8271870673776252,
+            "stop_pct": 52.04081632653062,
+            "take_profit_pct": 20.408163265306122,
+            "trades": 98,
+            "win_rate_pct": 35.714285714285715
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 13.548076923076923,
+            "expectancy_r": -0.3674131049593299,
+            "expectancy_r_ci95": [
+              -0.5419419920782659,
+              -0.30311298865235353
+            ],
+            "expectancy_return_pct": -0.9613971242655903,
+            "max_hold_pct": 38.46153846153847,
+            "median_return_pct": -1.1938030656253578,
+            "profit_factor": 0.3016467917388834,
+            "stop_pct": 61.53846153846154,
+            "take_profit_pct": 0.0,
+            "trades": 26,
+            "win_rate_pct": 23.076923076923077
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 12.757142857142858,
+            "expectancy_r": 0.00822237384212386,
+            "expectancy_r_ci95": [
+              -0.29919223557402075,
+              0.14912073649119015
+            ],
+            "expectancy_return_pct": -0.05329220974282381,
+            "max_hold_pct": 25.71428571428571,
+            "median_return_pct": -0.4254702054324567,
+            "profit_factor": 0.9015546286911102,
+            "stop_pct": 45.714285714285715,
+            "take_profit_pct": 25.71428571428571,
+            "trades": 35,
+            "win_rate_pct": 40.0
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 13.741666666666667,
+            "expectancy_r": -0.06529254162047492,
+            "expectancy_r_ci95": [
+              -0.06937484830734963,
+              -0.05824128461587316
+            ],
+            "expectancy_return_pct": -0.1318224110773571,
+            "max_hold_pct": 26.666666666666668,
+            "median_return_pct": -0.8093749999999955,
+            "profit_factor": 0.8479414156994715,
+            "stop_pct": 53.333333333333336,
+            "take_profit_pct": 16.666666666666664,
+            "trades": 30,
+            "win_rate_pct": 30.0
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 15.25,
+            "expectancy_r": 0.02522576433488756,
+            "expectancy_r_ci95": [
+              -0.013328336129730068,
+              0.20835774154182135
+            ],
+            "expectancy_return_pct": 0.014007995458021531,
+            "max_hold_pct": 43.47826086956522,
+            "median_return_pct": -0.2864230254467529,
+            "profit_factor": 1.021333502535199,
+            "stop_pct": 39.130434782608695,
+            "take_profit_pct": 17.391304347826086,
+            "trades": 23,
+            "win_rate_pct": 47.82608695652174
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 13.727272727272727,
+            "expectancy_r": -0.089164165523085,
+            "expectancy_r_ci95": [
+              -0.4798399754472751,
+              0.13407915443359503
+            ],
+            "expectancy_return_pct": -0.22979682839559423,
+            "max_hold_pct": 27.27272727272727,
+            "median_return_pct": -0.8749999999999929,
+            "profit_factor": 0.731373302826088,
+            "stop_pct": 54.54545454545454,
+            "take_profit_pct": 18.181818181818183,
+            "trades": 22,
+            "win_rate_pct": 36.36363636363637
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 11.759615384615385,
+            "expectancy_r": -0.18216942985838225,
+            "expectancy_r_ci95": [
+              -0.41862167811491724,
+              -0.07707954174436674
+            ],
+            "expectancy_return_pct": -0.2981561573242446,
+            "max_hold_pct": 30.76923076923077,
+            "median_return_pct": -0.6909722222222219,
+            "profit_factor": 0.54013319957389,
+            "stop_pct": 53.84615384615385,
+            "take_profit_pct": 11.538461538461538,
+            "trades": 26,
+            "win_rate_pct": 26.923076923076923
+          }
+        }
+      }
+    }
+  },
+  "portfolio_no_kill": {
+    "base": {
+      "metrics": {
+        "average_hold_hours": 13.595663265306122,
+        "cagr_pct": -13.809618463523188,
+        "daily_sharpe": -1.0678930769009343,
+        "expectancy_r": -0.11626459676598142,
+        "expectancy_r_ci95": [
+          -0.27167863820819926,
+          -0.009310026610359595
+        ],
+        "expectancy_return_pct": -0.18694526239865636,
+        "fees_usd": 11368.296784462113,
+        "final_equity_usd": 74911.31218725619,
+        "funding_usd": -7.326545926300298,
+        "initial_equity_usd": 100000.0,
+        "kill_index": null,
+        "killed_by_drawdown_guard": false,
+        "max_drawdown_pct": 29.163430541449287,
+        "max_hold_pct": 29.336734693877553,
+        "median_return_pct": -0.9257785274908847,
+        "net_realized_pnl_usd": -25088.687812743847,
+        "positive_months_pct": 4.3478260869565215,
+        "profit_factor": 0.8104124519485156,
+        "stop_pct": 51.275510204081634,
+        "take_profit_pct": 19.387755102040817,
+        "total_return_pct": -25.088687812743814,
+        "trades": 392,
+        "win_rate_pct": 37.755102040816325
+      },
+      "rejections": {
+        "already_holding": 3840,
+        "failed_thesis_evidence": 49,
+        "failed_thesis_time": 5,
+        "post_loss_cooldown": 109,
+        "risk:BTC-beta-weighted exposure cap reached": 264,
+        "risk:live funding rate unavailable": 49633,
+        "risk:max concurrent positions reached": 1570,
+        "risk:net directional exposure cap reached": 1621,
+        "risk:stop distance 0.18% out of bounds": 1,
+        "risk:stop distance 0.187% out of bounds": 1,
+        "risk:stop distance 0.197% out of bounds": 1,
+        "risk:stop distance 15.286% out of bounds": 1,
+        "risk:stop distance 15.403% out of bounds": 1,
+        "risk:stop distance 15.8485% out of bounds": 1,
+        "risk:stop distance 16.243% out of bounds": 1,
+        "risk:stop distance 16.2695% out of bounds": 1,
+        "risk:stop distance 16.386% out of bounds": 1,
+        "risk:stop distance 16.5155% out of bounds": 1,
+        "risk:stop distance 16.716% out of bounds": 1,
+        "risk:stop distance 17.174% out of bounds": 1,
+        "risk:stop distance 17.2095% out of bounds": 1,
+        "risk:stop distance 17.2665% out of bounds": 1,
+        "risk:stop distance 17.291% out of bounds": 1,
+        "risk:stop distance 17.8435% out of bounds": 1,
+        "risk:stop distance 18.2195% out of bounds": 1,
+        "risk:stop distance 18.482% out of bounds": 1,
+        "risk:stop distance 19.1495% out of bounds": 1,
+        "risk:stop distance 19.5395% out of bounds": 1,
+        "risk:stop distance 20.2335% out of bounds": 1,
+        "risk:stop distance 21.0695% out of bounds": 1,
+        "risk:stop distance 21.502% out of bounds": 1,
+        "risk:stop distance 21.527% out of bounds": 1,
+        "risk:stop distance 21.767% out of bounds": 1,
+        "risk:stop distance 21.8245% out of bounds": 1,
+        "risk:stop distance 22.3595% out of bounds": 1,
+        "risk:stop distance 24.2295% out of bounds": 1,
+        "risk:stop distance 25.1995% out of bounds": 1,
+        "risk:total planned open-risk cap reached": 25,
+        "same_candle_lower_priority": 3710,
+        "setup_cooldown": 51
+      },
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 13.20054945054945,
+            "expectancy_r": -0.11318789325045736,
+            "expectancy_r_ci95": [
+              -0.25269823774302536,
+              -0.006184813494021716
+            ],
+            "expectancy_return_pct": -0.17714889418834984,
+            "max_hold_pct": 28.57142857142857,
+            "median_return_pct": -0.8916394822499979,
+            "profit_factor": 0.8177852071066014,
+            "stop_pct": 51.098901098901095,
+            "take_profit_pct": 20.32967032967033,
+            "trades": 182,
+            "win_rate_pct": 37.362637362637365
+          },
+          "short": {
+            "average_hold_hours": 13.938095238095238,
+            "expectancy_r": -0.11893107314610225,
+            "expectancy_r_ci95": [
+              -0.3299667060350948,
+              0.05274392697518805
+            ],
+            "expectancy_return_pct": -0.19543544818092207,
+            "max_hold_pct": 30.0,
+            "median_return_pct": -0.9817675463732607,
+            "profit_factor": 0.8041884209140967,
+            "stop_pct": 51.42857142857142,
+            "take_profit_pct": 18.571428571428573,
+            "trades": 210,
+            "win_rate_pct": 38.095238095238095
+          }
+        },
+        "period": {
+          "2026": {
+            "average_hold_hours": 13.595663265306122,
+            "expectancy_r": -0.11626459676598142,
+            "expectancy_r_ci95": [
+              -0.27167863820819926,
+              -0.009310026610359595
+            ],
+            "expectancy_return_pct": -0.18694526239865636,
+            "max_hold_pct": 29.336734693877553,
+            "median_return_pct": -0.9257785274908847,
+            "profit_factor": 0.8104124519485156,
+            "stop_pct": 51.275510204081634,
+            "take_profit_pct": 19.387755102040817,
+            "trades": 392,
+            "win_rate_pct": 37.755102040816325
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 16.305555555555557,
+            "expectancy_r": -0.06427350335719063,
+            "expectancy_r_ci95": [
+              -0.305526591226486,
+              0.11025000701634217
+            ],
+            "expectancy_return_pct": -0.08725474397650085,
+            "max_hold_pct": 42.592592592592595,
+            "median_return_pct": -0.48281539585140987,
+            "profit_factor": 0.9121915300511532,
+            "stop_pct": 43.20987654320987,
+            "take_profit_pct": 14.19753086419753,
+            "trades": 162,
+            "win_rate_pct": 42.592592592592595
+          },
+          "trend_continuation": {
+            "average_hold_hours": 11.68695652173913,
+            "expectancy_r": -0.15288441038434705,
+            "expectancy_r_ci95": [
+              -0.31563318231827925,
+              -0.035840349592549635
+            ],
+            "expectancy_return_pct": -0.2571620623307833,
+            "max_hold_pct": 20.0,
+            "median_return_pct": -0.9933790319049185,
+            "profit_factor": 0.73777386109628,
+            "stop_pct": 56.95652173913044,
+            "take_profit_pct": 23.043478260869566,
+            "trades": 230,
+            "win_rate_pct": 34.34782608695652
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 13.11986301369863,
+            "expectancy_r": -0.15581558892597902,
+            "expectancy_r_ci95": [
+              -0.39017003654457433,
+              0.06780061794354794
+            ],
+            "expectancy_return_pct": -0.2521395839040448,
+            "max_hold_pct": 32.87671232876712,
+            "median_return_pct": -1.2563346915501858,
+            "profit_factor": 0.8209161320284771,
+            "stop_pct": 53.42465753424658,
+            "take_profit_pct": 13.698630136986301,
+            "trades": 73,
+            "win_rate_pct": 38.35616438356164
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 12.774305555555555,
+            "expectancy_r": -0.22883953587865888,
+            "expectancy_r_ci95": [
+              -0.41435805335149223,
+              -0.09632630911234934
+            ],
+            "expectancy_return_pct": -0.41685815317511415,
+            "max_hold_pct": 26.38888888888889,
+            "median_return_pct": -0.8897565415388868,
+            "profit_factor": 0.48510682732420074,
+            "stop_pct": 56.94444444444444,
+            "take_profit_pct": 16.666666666666664,
+            "trades": 72,
+            "win_rate_pct": 33.33333333333333
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 13.293478260869565,
+            "expectancy_r": -0.11255669304909463,
+            "expectancy_r_ci95": [
+              -0.2604879172814657,
+              0.05548863370032139
+            ],
+            "expectancy_return_pct": -0.20017574661202436,
+            "max_hold_pct": 21.73913043478261,
+            "median_return_pct": -1.105016953707038,
+            "profit_factor": 0.8114573443012496,
+            "stop_pct": 55.072463768115945,
+            "take_profit_pct": 23.18840579710145,
+            "trades": 69,
+            "win_rate_pct": 34.78260869565217
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 13.773584905660377,
+            "expectancy_r": -0.026159288675108725,
+            "expectancy_r_ci95": [
+              -0.16166019495710496,
+              0.16163051571723952
+            ],
+            "expectancy_return_pct": 0.03260873556777512,
+            "max_hold_pct": 30.18867924528302,
+            "median_return_pct": -0.5379184268471855,
+            "profit_factor": 1.0414944096309413,
+            "stop_pct": 45.28301886792453,
+            "take_profit_pct": 24.528301886792452,
+            "trades": 53,
+            "win_rate_pct": 41.509433962264154
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 14.951754385964913,
+            "expectancy_r": -0.01195701974649548,
+            "expectancy_r_ci95": [
+              -0.31636811854106633,
+              0.13489397986614668
+            ],
+            "expectancy_return_pct": -0.019613346363679694,
+            "max_hold_pct": 33.33333333333333,
+            "median_return_pct": -0.8085625961977064,
+            "profit_factor": 0.9801327463010538,
+            "stop_pct": 45.614035087719294,
+            "take_profit_pct": 21.052631578947366,
+            "trades": 57,
+            "win_rate_pct": 42.10526315789473
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 14.007352941176471,
+            "expectancy_r": -0.1160343104659745,
+            "expectancy_r_ci95": [
+              -0.36990389797548545,
+              0.13522514966261495
+            ],
+            "expectancy_return_pct": -0.17148149901180107,
+            "max_hold_pct": 32.35294117647059,
+            "median_return_pct": -0.8568901991733628,
+            "profit_factor": 0.7851993548184286,
+            "stop_pct": 48.529411764705884,
+            "take_profit_pct": 19.11764705882353,
+            "trades": 68,
+            "win_rate_pct": 38.23529411764706
+          }
+        }
+      }
+    },
+    "entry_cap": {
+      "metrics": {
+        "average_hold_hours": 10.705852156057494,
+        "cagr_pct": -35.366193871557485,
+        "daily_sharpe": -2.872936629257554,
+        "expectancy_r": -0.2373538929440047,
+        "expectancy_r_ci95": [
+          -0.3563604277255909,
+          -0.15498802636784406
+        ],
+        "expectancy_return_pct": -0.4009232030813188,
+        "fees_usd": 11229.30771600566,
+        "final_equity_usd": 42813.3499397832,
+        "funding_usd": 7.301506302937071,
+        "initial_equity_usd": 100000.0,
+        "kill_index": null,
+        "killed_by_drawdown_guard": false,
+        "max_drawdown_pct": 57.72221467772738,
+        "max_hold_pct": 22.99794661190965,
+        "median_return_pct": -1.038283399787633,
+        "net_realized_pnl_usd": -57186.65006021674,
+        "positive_months_pct": 0.0,
+        "profit_factor": 0.6233506514303188,
+        "stop_pct": 61.39630390143738,
+        "take_profit_pct": 15.195071868583163,
+        "total_return_pct": -57.186650060216806,
+        "trades": 487,
+        "win_rate_pct": 31.211498973305957
+      },
+      "rejections": {
+        "already_holding": 3815,
+        "failed_thesis_evidence": 50,
+        "failed_thesis_time": 11,
+        "post_loss_cooldown": 120,
+        "risk:BTC-beta-weighted exposure cap reached": 260,
+        "risk:live funding rate unavailable": 49633,
+        "risk:max concurrent positions reached": 1488,
+        "risk:net directional exposure cap reached": 1636,
+        "risk:stop distance 0.18% out of bounds": 1,
+        "risk:stop distance 0.187% out of bounds": 1,
+        "risk:stop distance 0.197% out of bounds": 1,
+        "risk:stop distance 15.286% out of bounds": 1,
+        "risk:stop distance 15.403% out of bounds": 1,
+        "risk:stop distance 15.8485% out of bounds": 1,
+        "risk:stop distance 16.243% out of bounds": 1,
+        "risk:stop distance 16.2695% out of bounds": 1,
+        "risk:stop distance 16.386% out of bounds": 1,
+        "risk:stop distance 16.5155% out of bounds": 1,
+        "risk:stop distance 16.716% out of bounds": 1,
+        "risk:stop distance 17.174% out of bounds": 1,
+        "risk:stop distance 17.2095% out of bounds": 1,
+        "risk:stop distance 17.2665% out of bounds": 1,
+        "risk:stop distance 17.291% out of bounds": 1,
+        "risk:stop distance 17.8435% out of bounds": 1,
+        "risk:stop distance 18.2195% out of bounds": 1,
+        "risk:stop distance 18.482% out of bounds": 1,
+        "risk:stop distance 19.1495% out of bounds": 1,
+        "risk:stop distance 19.5395% out of bounds": 1,
+        "risk:stop distance 20.2335% out of bounds": 1,
+        "risk:stop distance 21.0695% out of bounds": 1,
+        "risk:stop distance 21.502% out of bounds": 1,
+        "risk:stop distance 21.527% out of bounds": 1,
+        "risk:stop distance 21.767% out of bounds": 1,
+        "risk:stop distance 21.8245% out of bounds": 1,
+        "risk:stop distance 22.3595% out of bounds": 1,
+        "risk:stop distance 24.2295% out of bounds": 1,
+        "risk:stop distance 25.1995% out of bounds": 1,
+        "risk:total planned open-risk cap reached": 14,
+        "same_candle_lower_priority": 3710,
+        "setup_cooldown": 51
+      },
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 10.50107296137339,
+            "expectancy_r": -0.23166567178130942,
+            "expectancy_r_ci95": [
+              -0.35741031299661447,
+              -0.14207261104189944
+            ],
+            "expectancy_return_pct": -0.407533202443773,
+            "max_hold_pct": 22.317596566523605,
+            "median_return_pct": -1.0545626567262874,
+            "profit_factor": 0.6135775170255884,
+            "stop_pct": 60.51502145922747,
+            "take_profit_pct": 16.30901287553648,
+            "trades": 233,
+            "win_rate_pct": 31.759656652360512
+          },
+          "short": {
+            "average_hold_hours": 10.893700787401574,
+            "expectancy_r": -0.24257182810505984,
+            "expectancy_r_ci95": [
+              -0.4468315016388767,
+              -0.09684804388206332
+            ],
+            "expectancy_return_pct": -0.3948596997291461,
+            "max_hold_pct": 23.62204724409449,
+            "median_return_pct": -1.0155883845402163,
+            "profit_factor": 0.6321585942988535,
+            "stop_pct": 62.20472440944882,
+            "take_profit_pct": 14.173228346456693,
+            "trades": 254,
+            "win_rate_pct": 30.708661417322837
+          }
+        },
+        "period": {
+          "2026": {
+            "average_hold_hours": 10.705852156057494,
+            "expectancy_r": -0.2373538929440047,
+            "expectancy_r_ci95": [
+              -0.3563604277255909,
+              -0.15498802636784406
+            ],
+            "expectancy_return_pct": -0.4009232030813188,
+            "max_hold_pct": 22.99794661190965,
+            "median_return_pct": -1.038283399787633,
+            "profit_factor": 0.6233506514303188,
+            "stop_pct": 61.39630390143738,
+            "take_profit_pct": 15.195071868583163,
+            "trades": 487,
+            "win_rate_pct": 31.211498973305957
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 14.891812865497077,
+            "expectancy_r": -0.1873702920412427,
+            "expectancy_r_ci95": [
+              -0.4010923867236958,
+              -0.042793580932524465
+            ],
+            "expectancy_return_pct": -0.41913273634294534,
+            "max_hold_pct": 39.76608187134503,
+            "median_return_pct": -1.0788482061482143,
+            "profit_factor": 0.6337983252278357,
+            "stop_pct": 49.707602339181285,
+            "take_profit_pct": 9.941520467836257,
+            "trades": 171,
+            "win_rate_pct": 36.25730994152047
+          },
+          "trend_continuation": {
+            "average_hold_hours": 8.440664556962025,
+            "expectancy_r": -0.2644019807742968,
+            "expectancy_r_ci95": [
+              -0.39176879777268536,
+              -0.16565692040475954
+            ],
+            "expectancy_return_pct": -0.39106931008214735,
+            "max_hold_pct": 13.924050632911392,
+            "median_return_pct": -1.0298874392266837,
+            "profit_factor": 0.6170135662603665,
+            "stop_pct": 67.72151898734177,
+            "take_profit_pct": 18.037974683544302,
+            "trades": 316,
+            "win_rate_pct": 28.48101265822785
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 12.53012048192771,
+            "expectancy_r": -0.13667131706532681,
+            "expectancy_r_ci95": [
+              -0.34748116252271527,
+              -0.010996216888806707
+            ],
+            "expectancy_return_pct": -0.28387294972709914,
+            "max_hold_pct": 27.710843373493976,
+            "median_return_pct": -1.4178824332567241,
+            "profit_factor": 0.8029756387616934,
+            "stop_pct": 53.01204819277109,
+            "take_profit_pct": 18.072289156626507,
+            "trades": 83,
+            "win_rate_pct": 38.55421686746988
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 10.361413043478262,
+            "expectancy_r": -0.34210814645081455,
+            "expectancy_r_ci95": [
+              -0.4688305434970619,
+              -0.13931031351818512
+            ],
+            "expectancy_return_pct": -0.5433359019178063,
+            "max_hold_pct": 22.82608695652174,
+            "median_return_pct": -0.8337415292354098,
+            "profit_factor": 0.3700292402852151,
+            "stop_pct": 66.30434782608695,
+            "take_profit_pct": 9.782608695652174,
+            "trades": 92,
+            "win_rate_pct": 23.91304347826087
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 9.678571428571429,
+            "expectancy_r": -0.25210222059317944,
+            "expectancy_r_ci95": [
+              -0.331975122894623,
+              -0.18742037823101923
+            ],
+            "expectancy_return_pct": -0.5024223569269226,
+            "max_hold_pct": 17.582417582417584,
+            "median_return_pct": -1.1788981293469014,
+            "profit_factor": 0.5688325563665908,
+            "stop_pct": 64.83516483516483,
+            "take_profit_pct": 17.582417582417584,
+            "trades": 91,
+            "win_rate_pct": 28.57142857142857
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 8.992857142857142,
+            "expectancy_r": -0.3150861488929957,
+            "expectancy_r_ci95": [
+              -0.49836435245582306,
+              -0.2358929624569571
+            ],
+            "expectancy_return_pct": -0.5262127943555177,
+            "max_hold_pct": 18.571428571428573,
+            "median_return_pct": -1.1200014971730605,
+            "profit_factor": 0.48368754241774126,
+            "stop_pct": 67.14285714285714,
+            "take_profit_pct": 14.285714285714285,
+            "trades": 70,
+            "win_rate_pct": 27.142857142857142
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 11.884615384615385,
+            "expectancy_r": -0.1106758345812962,
+            "expectancy_r_ci95": [
+              -0.27906823980544065,
+              -0.03530653827649991
+            ],
+            "expectancy_return_pct": -0.1237930768001931,
+            "max_hold_pct": 26.153846153846157,
+            "median_return_pct": -0.8011754125000067,
+            "profit_factor": 0.8714749344451,
+            "stop_pct": 55.38461538461539,
+            "take_profit_pct": 18.461538461538463,
+            "trades": 65,
+            "win_rate_pct": 36.92307692307693
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 10.904069767441861,
+            "expectancy_r": -0.23933041080883663,
+            "expectancy_r_ci95": [
+              -0.444037133590904,
+              -0.1230338143476275
+            ],
+            "expectancy_return_pct": -0.3616204885996055,
+            "max_hold_pct": 25.581395348837212,
+            "median_return_pct": -1.0415033126382687,
+            "profit_factor": 0.6086324696535406,
+            "stop_pct": 60.46511627906976,
+            "take_profit_pct": 13.953488372093023,
+            "trades": 86,
+            "win_rate_pct": 33.72093023255814
+          }
+        }
+      }
+    },
+    "frictionless": {
+      "metrics": {
+        "average_hold_hours": 13.736641221374045,
+        "cagr_pct": 0.9562580274287802,
+        "daily_sharpe": 0.13793063711181766,
+        "expectancy_r": -0.005912395275165674,
+        "expectancy_r_ci95": [
+          -0.15254738993491535,
+          0.07375494127601598
+        ],
+        "expectancy_return_pct": 0.04319409210041199,
+        "fees_usd": 0.0,
+        "final_equity_usd": 101867.12192882336,
+        "funding_usd": 0.0,
+        "initial_equity_usd": 100000.0,
+        "kill_index": null,
+        "killed_by_drawdown_guard": false,
+        "max_drawdown_pct": 16.02734100235135,
+        "max_hold_pct": 31.043256997455472,
+        "median_return_pct": -0.6515000000000054,
+        "net_realized_pnl_usd": 1867.1219288234288,
+        "positive_months_pct": 8.695652173913043,
+        "profit_factor": 1.0517434135188672,
+        "stop_pct": 49.87277353689568,
+        "take_profit_pct": 18.575063613231553,
+        "total_return_pct": 1.8671219288233454,
+        "trades": 393,
+        "win_rate_pct": 40.966921119592875
+      },
+      "rejections": {
+        "already_holding": 3749,
+        "failed_thesis_evidence": 66,
+        "failed_thesis_time": 4,
+        "post_loss_cooldown": 100,
+        "risk:BTC-beta-weighted exposure cap reached": 200,
+        "risk:live funding rate unavailable": 49633,
+        "risk:max concurrent positions reached": 1616,
+        "risk:net directional exposure cap reached": 1731,
+        "risk:stop distance 0.18% out of bounds": 1,
+        "risk:stop distance 0.187% out of bounds": 1,
+        "risk:stop distance 0.197% out of bounds": 1,
+        "risk:stop distance 15.286% out of bounds": 1,
+        "risk:stop distance 15.403% out of bounds": 1,
+        "risk:stop distance 15.8485% out of bounds": 1,
+        "risk:stop distance 16.243% out of bounds": 1,
+        "risk:stop distance 16.2695% out of bounds": 1,
+        "risk:stop distance 16.386% out of bounds": 1,
+        "risk:stop distance 16.5155% out of bounds": 1,
+        "risk:stop distance 16.716% out of bounds": 1,
+        "risk:stop distance 17.174% out of bounds": 1,
+        "risk:stop distance 17.2095% out of bounds": 1,
+        "risk:stop distance 17.2665% out of bounds": 1,
+        "risk:stop distance 17.291% out of bounds": 1,
+        "risk:stop distance 17.8435% out of bounds": 1,
+        "risk:stop distance 18.2195% out of bounds": 1,
+        "risk:stop distance 18.482% out of bounds": 1,
+        "risk:stop distance 19.1495% out of bounds": 1,
+        "risk:stop distance 19.5395% out of bounds": 1,
+        "risk:stop distance 20.2335% out of bounds": 1,
+        "risk:stop distance 21.0695% out of bounds": 1,
+        "risk:stop distance 21.502% out of bounds": 1,
+        "risk:stop distance 21.527% out of bounds": 1,
+        "risk:stop distance 21.767% out of bounds": 1,
+        "risk:stop distance 21.8245% out of bounds": 1,
+        "risk:stop distance 22.3595% out of bounds": 1,
+        "risk:stop distance 24.2295% out of bounds": 1,
+        "risk:stop distance 25.1995% out of bounds": 1,
+        "risk:total planned open-risk cap reached": 14,
+        "same_candle_lower_priority": 3710,
+        "setup_cooldown": 57
+      },
+      "segments": {
+        "direction": {
+          "long": {
+            "average_hold_hours": 13.509562841530055,
+            "expectancy_r": -0.010067154944875445,
+            "expectancy_r_ci95": [
+              -0.1500542359337307,
+              0.09163828978878502
+            ],
+            "expectancy_return_pct": 0.06264960589651032,
+            "max_hold_pct": 30.05464480874317,
+            "median_return_pct": -0.6425000000000045,
+            "profit_factor": 1.0751761008451748,
+            "stop_pct": 50.27322404371585,
+            "take_profit_pct": 18.579234972677597,
+            "trades": 183,
+            "win_rate_pct": 39.89071038251366
+          },
+          "short": {
+            "average_hold_hours": 13.93452380952381,
+            "expectancy_r": -0.0022918189915614477,
+            "expectancy_r_ci95": [
+              -0.2017366321829727,
+              0.11216866580564443
+            ],
+            "expectancy_return_pct": 0.026240001506669077,
+            "max_hold_pct": 31.9047619047619,
+            "median_return_pct": -0.7087499999999909,
+            "profit_factor": 1.0313876503356771,
+            "stop_pct": 49.523809523809526,
+            "take_profit_pct": 18.571428571428573,
+            "trades": 210,
+            "win_rate_pct": 41.904761904761905
+          }
+        },
+        "period": {
+          "2026": {
+            "average_hold_hours": 13.736641221374045,
+            "expectancy_r": -0.005912395275165674,
+            "expectancy_r_ci95": [
+              -0.15254738993491535,
+              0.07375494127601598
+            ],
+            "expectancy_return_pct": 0.04319409210041199,
+            "max_hold_pct": 31.043256997455472,
+            "median_return_pct": -0.6515000000000054,
+            "profit_factor": 1.0517434135188672,
+            "stop_pct": 49.87277353689568,
+            "take_profit_pct": 18.575063613231553,
+            "trades": 393,
+            "win_rate_pct": 40.966921119592875
+          }
+        },
+        "setup_type": {
+          "range_breakout": {
+            "average_hold_hours": 16.531446540880502,
+            "expectancy_r": 0.021028235674839895,
+            "expectancy_r_ci95": [
+              -0.21287109328636622,
+              0.18276713336078032
+            ],
+            "expectancy_return_pct": 0.14366530724885404,
+            "max_hold_pct": 44.0251572327044,
+            "median_return_pct": -0.2435504239581386,
+            "profit_factor": 1.1649777478965313,
+            "stop_pct": 42.138364779874216,
+            "take_profit_pct": 13.20754716981132,
+            "trades": 159,
+            "win_rate_pct": 46.540880503144656
+          },
+          "trend_continuation": {
+            "average_hold_hours": 11.837606837606838,
+            "expectancy_r": -0.02421820861298998,
+            "expectancy_r_ci95": [
+              -0.1771009918119345,
+              0.08594732633919062
+            ],
+            "expectancy_return_pct": -0.02507481050045257,
+            "max_hold_pct": 22.22222222222222,
+            "median_return_pct": -0.7584999999999984,
+            "profit_factor": 0.9690543283585618,
+            "stop_pct": 55.12820512820513,
+            "take_profit_pct": 22.22222222222222,
+            "trades": 234,
+            "win_rate_pct": 37.17948717948718
+          }
+        },
+        "symbol": {
+          "AAVE/USDT:USDT": {
+            "average_hold_hours": 12.861940298507463,
+            "expectancy_r": -0.060254234923071456,
+            "expectancy_r_ci95": [
+              -0.3674131049593299,
+              0.19556087233822977
+            ],
+            "expectancy_return_pct": -0.06589344081837112,
+            "max_hold_pct": 29.850746268656714,
+            "median_return_pct": -1.0070000000000034,
+            "profit_factor": 0.9490331761897842,
+            "stop_pct": 53.73134328358209,
+            "take_profit_pct": 14.925373134328357,
+            "trades": 67,
+            "win_rate_pct": 40.298507462686565
+          },
+          "BTC/USDT:USDT": {
+            "average_hold_hours": 13.086666666666666,
+            "expectancy_r": -0.018313186899197843,
+            "expectancy_r_ci95": [
+              -0.19352007957657114,
+              0.1120733378839637
+            ],
+            "expectancy_return_pct": -0.06351832233923436,
+            "max_hold_pct": 26.666666666666668,
+            "median_return_pct": -0.5299999999999943,
+            "profit_factor": 0.8966891151568606,
+            "stop_pct": 52.0,
+            "take_profit_pct": 21.333333333333336,
+            "trades": 75,
+            "win_rate_pct": 41.333333333333336
+          },
+          "DOGE/USDT:USDT": {
+            "average_hold_hours": 13.838461538461539,
+            "expectancy_r": -0.030028206020387402,
+            "expectancy_r_ci95": [
+              -0.19668080845706398,
+              0.09867911440191629
+            ],
+            "expectancy_return_pct": -0.0007659766921880153,
+            "max_hold_pct": 29.230769230769234,
+            "median_return_pct": -0.8375000000000016,
+            "profit_factor": 0.9991554804634565,
+            "stop_pct": 52.307692307692314,
+            "take_profit_pct": 18.461538461538463,
+            "trades": 65,
+            "win_rate_pct": 35.38461538461539
+          },
+          "ETH/USDT:USDT": {
+            "average_hold_hours": 15.025862068965518,
+            "expectancy_r": -0.002729846604223989,
+            "expectancy_r_ci95": [
+              -0.07396282308748824,
+              0.07892244060483254
+            ],
+            "expectancy_return_pct": 0.10133636342047225,
+            "max_hold_pct": 39.6551724137931,
+            "median_return_pct": -0.31146151272337474,
+            "profit_factor": 1.143003320016505,
+            "stop_pct": 44.827586206896555,
+            "take_profit_pct": 15.517241379310345,
+            "trades": 58,
+            "win_rate_pct": 43.103448275862064
+          },
+          "SOL/USDT:USDT": {
+            "average_hold_hours": 14.142241379310345,
+            "expectancy_r": 0.11856294678548346,
+            "expectancy_r_ci95": [
+              -0.20711528582926575,
+              0.2720929260854077
+            ],
+            "expectancy_return_pct": 0.2622294011183825,
+            "max_hold_pct": 27.586206896551722,
+            "median_return_pct": -0.514890036452005,
+            "profit_factor": 1.2995172486578275,
+            "stop_pct": 46.55172413793103,
+            "take_profit_pct": 25.862068965517242,
+            "trades": 58,
+            "win_rate_pct": 46.55172413793103
+          },
+          "XRP/USDT:USDT": {
+            "average_hold_hours": 13.771428571428572,
+            "expectancy_r": -0.023993357214890793,
+            "expectancy_r_ci95": [
+              -0.2347050305292634,
+              0.11468537352473372
+            ],
+            "expectancy_return_pct": 0.07309981496391411,
+            "max_hold_pct": 34.285714285714285,
+            "median_return_pct": -0.6445346975088959,
+            "profit_factor": 1.1149949945231623,
+            "stop_pct": 48.57142857142857,
+            "take_profit_pct": 15.714285714285714,
+            "trades": 70,
+            "win_rate_pct": 40.0
+          }
+        }
+      }
+    }
+  },
+  "repository_commit": "8dbbdd185b7943331c60e83d0899342033c712f2",
+  "symbols": [
+    "AAVE/USDT:USDT",
+    "BTC/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "XRP/USDT:USDT"
+  ],
+  "verdict": {
+    "label": "NO RELIABLE EDGE DEMONSTRATED",
+    "reason": "The ordinary-cost executable proxy did not satisfy positive expectancy, profit factor, uncertainty and drawdown criteria. The safety controls can limit losses, but they do not create a profitable trading edge by themselves."
+  }
+}

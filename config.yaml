@@ -27,19 +27,81 @@ llm:
 # changing these rules in place.
 strategy:
   id: momentum
-  version: phase1-v1
+  version: phase1-v3
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
-  allow_experimental_setups_in_demo: true  # "other" ideas are demo-only
+  # Batch 6.3, interim. "other" bypasses the evidence contract entirely and
+  # pools every distinct experimental idea under one label, so report.py
+  # groups them into a single row and nothing can be learned from any of
+  # them. It is also demo-only, which means demo statistics are contaminated
+  # by a population of trades live will silently refuse.
+  #
+  # The replacement is a registered hypothesis id chosen from an explicit
+  # versioned list, each with its own contract and its own attribution. That
+  # changes the prompt, so it belongs with the 6.5 version bump rather than
+  # here. Until then this is false, so demo statistics mean something.
+  allow_experimental_setups_in_demo: false
   setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
   setup_memory_hours: 72        # bounded operational idempotency history
+  loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence
   min_stop_atr_multiple: 1.0
   structure_buffer_atr_multiple: 0.15
-  hard_max_entry_extension_atr: 2.5  # extreme no-chase safety boundary
+  # No-chase boundary, in ATRs from the 1h EMA20. Lowered from 2.5 because
+  # the model was treating the ceiling as a target: live entries arrived
+  # "just inside the no-chase extension limit", i.e. selling ~2.5 ATR BELOW
+  # the mean, which is the point of maximum mean-reversion risk. The best
+  # of 64 tested selector rules was extension_atr >= 1.977, and it scored
+  # -0.0999 R out-of-sample. 1.2 keeps the entry near the mean instead.
+  hard_max_entry_extension_atr: 1.2
+  # Floor on how long a position must be held before the model may close it
+  # on its own judgement. Exchange-side stops and targets are unaffected, and
+  # a risk_reduction close is always allowed.
+  #
+  # Measured forward return after a qualifying signal is most negative ~30
+  # minutes after entry (-0.0072%, t=-1.69) and the configuration's whole
+  # payoff depends on the ~20% of trades that reach a 3R target at a ~21h
+  # average hold. Discretionary closes at 17-75 minutes therefore removed
+  # the entire right tail while paying a full taker round trip. 90 minutes
+  # clears the worst of the adverse window without approaching the 8h point
+  # where an early-exit overlay was measured to start helping.
+  min_hold_minutes: 90
+  # Batch 6.4. Which variable separates range_breakout from
+  # trend_continuation. The two contracts overlap - a symbol in a strong
+  # aligned uptrend is almost always high in its 24h range on good volume -
+  # so which label a trade gets depends on which word the model chose rather
+  # than on a difference in the market, and attribution splits one
+  # phenomenon across two rows.
+  #
+  #   none               shipped behaviour; they overlap
+  #   trend_alignment    a breakout is a transition OUT of chop, so it
+  #                      requires the absence of prior 1h/4h alignment
+  #   volatility_regime  the partition is compression vs expansion; a break
+  #                      when volatility is already high is an ordinary
+  #                      excursion in a distribution that is already wide
+  #
+  # Left at "none" so neither answer is baked in - baking one in would filter
+  # the population the other one needs. Compare them with:
+  #   python research.py sweep research/sweeps/breakout_discriminator.yaml
+  breakout_discriminator: none
+  breakout_compression_max_atr_ratio: 1.0   # volatility_regime only
   breakout_range_threshold_pct: 85
   breakout_min_relative_volume: 1.0
-  funding_extreme_pct: 0.03
-  fixed_reward_risk: 2.0
-  extended_reward_risk: 3.0
+  # Absolute funding floor for the funding_squeeze setup, expressed as an
+  # 8h-EQUIVALENT rate: a 4h contract's rate is doubled before comparison so
+  # instruments on different settlement cadences face the same economic bar.
+  # 0.01 is where OKX routinely clamps funding on liquid instruments, so it
+  # marks "funding is pinned at its practical limit". The relative test
+  # (funding_percentile_30) is what decides "extreme for THIS instrument";
+  # this value only filters out near-zero funding. The previous 0.03 raw
+  # per-interval threshold was never reached on BTC, ETH, XRP or DOGE in 97
+  # days of settlements, which made the setup unreachable on liquid symbols.
+  funding_extreme_pct_per_8h: 0.01
+  # A 3R default target beat a 2R one in all four matched comparisons at the
+  # 48h hold (both cost scenarios, both walk-forward halves). With the longer
+  # hold the extra distance has time to be reached, so the wider target stops
+  # giving away winners to the clock. Beyond 3R the gain reverses
+  # out-of-sample, so this is a measured optimum rather than "wider is better".
+  fixed_reward_risk: 3.0
+  extended_reward_risk: 4.0
 
 universe:
   top_n: 10                          # trade only the N highest-volume USDT perpetuals
@@ -49,7 +111,21 @@ universe:
   refresh_minutes: 60                # how often the volume ranking is rebuilt
 
 cycle:
-  interval_seconds: 300              # decision cycle (300 = one LLM call every 5 min)
+  interval_seconds: 300              # housekeeping, breakers, reconciliation
+  # B9.2. Uncomment to align decisions to the 15m signal bar. Measured over
+  # the corpus, 66.5% of cycles observe only bars that were already
+  # evaluated, and an LLM call on one of those cannot produce a fresh
+  # evaluation for any symbol - strategy.evaluated_signal blocks it. So this
+  # is roughly a 3x reduction in LLM spend.
+  #
+  # It is a SPLIT rather than simply raising interval_seconds, because that
+  # would also take the drawdown breaker, the daily-loss stop, reconciliation
+  # and the max-hold force close from a 5-minute reaction time to a
+  # 15-minute one. Those keep running at interval_seconds.
+  #
+  # Left commented so this batch changes nothing until it is turned on
+  # deliberately. Verify with: python research.py cadence
+  # decision_interval_seconds: 900
   timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model.
                                      # NOTE: the model's field reference in
                                      # agent/brain.py describes these defaults
@@ -64,14 +140,44 @@ risk:
   max_leverage: 3                # per position; hard ceiling of 10 enforced in code
   entry_leverage: 2              # deterministic; the LLM cannot choose leverage
   risk_per_trade_pct: 1.5        # max all-in equity loss at the stop
-  max_position_notional_pct: 40  # per-position notional cap, % of equity
+  experimental_risk_per_trade_pct: 0.5  # demo-only "other" setup budget
+  max_total_open_risk_pct: 3.0   # sum of planned stop losses across the book
+  # Per-position notional cap, % of equity. This also sets margin usage at a
+  # full book: max_concurrent_positions x this / entry_leverage must stay at
+  # or below 80% of max_margin_usage_pct, or any unrealized loss on a full
+  # book trips the margin guard and force-closes the largest position.
+  # Here: 3 x 30 / 2 = 45%, against a 60% guard, so the book can lose ~25%
+  # before the guard engages. Config validation enforces this.
+  max_position_notional_pct: 30
   max_gross_exposure_pct: 150    # total notional across all positions, % of equity
   max_net_direction_pct: 100     # cap on |long minus short| notional, % of equity.
-                                 # Correlation guard: most alts follow BTC, so
-                                 # 3 same-direction positions act as one big bet.
+                                 # Kept separately from measured BTC beta.
+  max_btc_beta_exposure_pct: 100 # cap signed BTC-beta-weighted notional
+  min_btc_beta_samples: 24       # otherwise assume conservative beta=1
   max_concurrent_positions: 3
+  # Cap on positions held in the SAME direction at once. The notional caps
+  # above do not constrain correlated concentration in practice: 3 shorts x
+  # 30% notional = 90% net, which passes max_net_direction_pct=100 and the
+  # BTC-beta cap with room to spare. Every live entry in the observed losing
+  # window was a short, opened while every other cap still had headroom.
+  max_same_direction_positions: 2
+  # Refuse new entries when more than this many instruments satisfy a setup
+  # contract in the same cycle. Simultaneous setups are not independent -
+  # they are one market-wide move expressed many ways, and taking three of
+  # them is one correlated bet at triple size. Measured: bars where 5+ fired
+  # scored -0.3475% per trade against -0.1627% when only 1-2 fired, the
+  # largest effect in the project and the same sign in both walk-forward
+  # halves. Previously this count was reported to the model as advice only.
+  max_setups_firing_for_entry: 4
   min_confidence: 0.65           # model decisions below this are discarded
-  max_hold_hours: 24             # day-trading discipline: no stale positions
+  # Day-trading discipline: no multi-day positions. 48h rather than 24h is
+  # measured, not preference. Across 8 matched (reward:risk x cost) cells the
+  # 48h cap beat the 24h cap in 8/8 in-sample, 8/8 out-of-sample and 8/8
+  # full-sample, worth about +0.11% per trade on average. The 24h clock was
+  # closing trades that had not yet resolved: timeouts fall from ~29% of
+  # exits to ~20%. It reduces the loss rate; it does not make the strategy
+  # profitable. See research/results/edge-search-2024-2026/REPORT.md.
+  max_hold_hours: 48
 
   # --- circuit breakers ---
   daily_loss_limit_pct: 5        # down this much on the day -> no new entries until next UTC day
@@ -108,7 +214,10 @@ trading_costs:
   taker_fee_pct_per_side: 0.05
   expected_stop_slippage_pct: 0.15
   expected_funding_intervals_held: 1  # floor when funding schedule is unknown
-  expected_hold_hours: 8              # live interval/next time derive charges
+  # Measured average hold at the 48h cap and a 3R target is ~21h, so an 8h
+  # assumption understated the number of funding settlements a position pays
+  # and therefore undersized the cost baked into risk sizing.
+  expected_hold_hours: 20
 
 # Optional human alerts. The URL remains in .env, never in this file.
 alerts:
@@ -117,3 +226,32 @@ alerts:
   format: generic                 # generic | slack | discord
   minimum_level: error            # warning | error | critical
   timeout_seconds: 5
+
+# Shadow evaluation. The shipped configuration enrolls every active
+# deterministic parameter variant so learning starts with the agent.
+#
+# Every variant reuses the cycle's one recorded LLM proposal set and its exact
+# confidences. No variant makes an extra model call. The variant contract,
+# risk limits, sizing and forward account are then evaluated independently.
+#
+# shadow_variants names entries in research/variants.yaml. Use ["*"] to enroll
+# every candidate/testing variant plus each strategy baseline. A durable
+# least-observed-first scheduler prevents a custom positive wall-clock budget
+# from starving later entries. Zero disables the budget so every shipped
+# variant receives every complete proposal set. Each variant has its own cash,
+# positions, exposure,
+# cooldowns and circuit breakers. Nothing here can place an order: the
+# evaluator has no exchange to reach.
+#
+# A parameter edge that passes paired real-time forward qualification starts a
+# fresh isolated PAPER stage when flat; prequalification SHADOW trades remain
+# stored but are excluded from paper-only metrics. T3/live authority still
+# requires a reviewed content-addressed evidence packet and a code review.
+research:
+  shadow_enabled: true
+  shadow_variants: ["*"]
+  shadow_budget_ms: 0
+  findings_store: research/cache/findings.db
+  paper_initial_balance_usdt: 10000
+  paper_max_failures: 3
+  paper_min_closed_trades: 100

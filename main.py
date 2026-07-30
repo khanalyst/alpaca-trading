@@ -87,7 +87,10 @@ def load_cfg(path: str) -> dict:
 
 def load_exchange_cfg(path: str) -> dict:
     cfg = load_cfg(path)
+    state.configure_runtime(cfg["mode"])
     load_secrets(cfg["mode"])
+    state.bind_runtime_identity(
+        cfg["mode"], os.getenv("OKX_API_KEY") or "")
     return cfg
 
 
@@ -121,7 +124,7 @@ def _flatten(cfg, reason: str) -> bool:
         print("All orders cancelled and all positions closed.")
     else:
         print("Flatten was incomplete: positions or orders remain unverified. "
-              "See runtime/agent.log and inspect OKX manually.")
+              f"See {state.RUNTIME / 'agent.log'} and inspect OKX manually.")
     return ok
 
 
@@ -138,7 +141,8 @@ def cmd_run(args, cfg) -> int:
         st = state.load_state()
         if st["state"] == KILLED and not args.acknowledge_kill:
             print(f"Agent is KILLED (reason: {st.get('kill_reason')}).")
-            print("Review runtime/agent.log and the journal, then restart with:")
+            print(f"Review {state.RUNTIME / 'agent.log'} and the journal, "
+                  "then restart with:")
             print("  python main.py run --acknowledge-kill")
             return 1
         if st["state"] == KILLED:
@@ -351,8 +355,11 @@ def cmd_check(args, cfg) -> int:
             if ok:
                 try:
                     from agent.brain import LLM
-                    model = LLM(cfg).preflight()
-                    print(f"  LLM access OK ({model})")
+                    llm = LLM(cfg)
+                    model = llm.preflight()
+                    # Showing the endpoint makes a mis-set OPENAI_BASE_URL
+                    # obvious instead of silently routing to the wrong host.
+                    print(f"  LLM access OK ({model}) via {llm.endpoint()}")
                 except Exception as e:
                     print(f"  LLM CHECK FAILED: {e}")
                     ok = False
@@ -360,6 +367,46 @@ def cmd_check(args, cfg) -> int:
           if ok else
           "Fix the issues above, then re-run: python main.py check")
     return 0 if ok else 1
+
+
+def cmd_strategies(args, cfg) -> int:
+    """Print the strategy register: what may run, and on what evidence."""
+    from agent.registry import LIVE_MIN_TIER, REGISTRY
+
+    active = str(cfg["strategy"]["id"])
+    order = sorted(REGISTRY.values(),
+                   key=lambda s: (-s.tier_rank(), s.id))
+    print(f"Strategy register  (active: {active}, mode: {cfg['mode']})")
+    print(f"Live requires {LIVE_MIN_TIER} or better.\n")
+    for spec in order:
+        marks = []
+        if spec.id == active:
+            marks.append("ACTIVE")
+        marks.append(
+            "runnable" if spec.implemented and spec.analyst_ready
+            else "shadow-only" if spec.implemented
+            else "research-only")
+        if spec.meets(LIVE_MIN_TIER):
+            marks.append("live-eligible")
+        print(f"  {spec.id}/{spec.version}  [{spec.tier}]  "
+              f"({', '.join(marks)})")
+        print(f"      timeframe {spec.signal_timeframe}, hold <= "
+              f"{spec.max_hold_hours_ceiling:g}h, {spec.execution_style} "
+              f"execution")
+        if args.verbose:
+            print(f"      mechanism:     {spec.mechanism}")
+            print(f"      falsified by:  {spec.falsification}")
+            if spec.notes:
+                print(f"      notes:         {spec.notes}")
+            for source in spec.evidence:
+                print(f"      evidence:      {source}")
+        print()
+    if not args.verbose:
+        print("Use --verbose for each strategy's mechanism and "
+              "falsification criterion.")
+    print("To switch: set strategy.id and strategy.version in config.yaml, "
+          "then restart the loop.")
+    return 0
 
 
 def main() -> int:
@@ -399,25 +446,48 @@ def main() -> int:
     p = sub.add_parser("check", help="validate config, keys and connectivity")
     p.set_defaults(fn=cmd_check)
 
+    p = sub.add_parser("strategies",
+                       help="list registered strategies and their tiers")
+    p.add_argument("--verbose", action="store_true",
+                   help="also print each mechanism and falsification test")
+    p.set_defaults(fn=cmd_strategies)
+
     args = parser.parse_args()
+    # Runtime selection must happen before logging, state, PID or journal
+    # access. Demo and live therefore cannot share operational files.
     try:
-        setup_logging()
-    except OSError as exc:
-        if args.command not in {"pause", "resume", "kill"}:
-            print(f"Logging startup failed: {exc}", file=sys.stderr)
-            return 2
-        print(f"WARNING: logging is unavailable: {exc}", file=sys.stderr)
+        cfg = load_cfg(args.config)
+        state.configure_runtime(cfg["mode"])
+    except (OSError, yaml.YAMLError, ConfigError,
+            state.RuntimeIdentityError) as exc:
+        _print_configuration_error(exc)
+        return 2
     # These controls write only local durable state. They must remain usable
     # during credential loss, .env rotation or an exchange outage. Commands
     # that also flatten load credentials only after PAUSED/KILLED is saved.
-    if args.command in {"pause", "resume", "kill"}:
-        return _dispatch(args, None)
+    # "strategies" only reads the register and the local config, so it must
+    # work before .env exists - it is the command that tells a new operator
+    # what may be configured in the first place.
+    credential_free = args.command in {"pause", "resume", "kill", "strategies"}
     try:
-        cfg = load_cfg(args.config)
-        load_secrets(cfg["mode"])
-    except (OSError, yaml.YAMLError, ConfigError) as exc:
+        if not credential_free:
+            load_secrets(cfg["mode"])
+            state.bind_runtime_identity(
+                cfg["mode"], os.getenv("OKX_API_KEY") or "")
+        setup_logging()
+    except OSError as exc:
+        if not credential_free:
+            print(f"Logging startup failed: {exc}", file=sys.stderr)
+            return 2
+        print(f"WARNING: logging is unavailable: {exc}", file=sys.stderr)
+    except (state.RuntimeIdentityError, KeyError) as exc:
         _print_configuration_error(exc)
         return 2
+    if credential_free:
+        # pause/resume/kill act on local state alone and are deliberately
+        # given no config, so a malformed block cannot block a stop command.
+        # "strategies" is the exception: it reports on the config itself.
+        return _dispatch(args, cfg if args.command == "strategies" else None)
     return _dispatch(args, cfg)
 
 

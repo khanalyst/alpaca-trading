@@ -142,6 +142,32 @@ class MarketSnapshotTests(unittest.TestCase):
         self.assertGreaterEqual(
             snap["ETH/USDT:USDT"]["corr_btc_samples"], 24)
 
+    def test_market_context_reports_setup_breadth(self):
+        # How many instruments qualify at once is the difference between an
+        # idiosyncratic setup and one leg of a correlated market-wide move,
+        # and the model cannot see it from a per-symbol snapshot.
+        cfg = valid_config()
+        snap = market_snapshot(
+            FakeExchange(), ["BTC/USDT:USDT", "ETH/USDT:USDT"], cfg)
+        context = snap["_market_context"]
+        scanned = context["instruments_scanned"]
+        firing = context["instruments_with_a_valid_setup"]
+        self.assertEqual(scanned, 2)
+        self.assertGreaterEqual(firing, 0)
+        self.assertLessEqual(firing, scanned)
+        self.assertAlmostEqual(
+            context["setup_breadth_pct"], firing / scanned * 100, places=1)
+
+    def test_setup_breadth_counts_each_instrument_once(self):
+        # An instrument satisfying two contracts at the same time is still one
+        # instrument; double-counting would overstate breadth.
+        cfg = valid_config()
+        snap = market_snapshot(FakeExchange(), ["BTC/USDT:USDT"], cfg)
+        context = snap["_market_context"]
+        self.assertLessEqual(
+            context["instruments_with_a_valid_setup"],
+            context["instruments_scanned"])
+
     def test_all_up_history_reads_rsi_100_not_nan(self):
         # The fake client's closes rise monotonically: no down moves at all.
         # RSI must saturate at 100 instead of leaking NaN into the snapshot

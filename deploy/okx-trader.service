@@ -1,0 +1,23 @@
+# The trading loop. Long-running and stateful: it holds a single-process
+# lock and a local SQLite journal, which is why this is a VM service rather
+# than a serverless function.
+[Unit]
+Description=OKX AI Trading Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=okx
+WorkingDirectory=/opt/okx-agent-crypto
+ExecStart=/opt/okx-agent-crypto/.venv/bin/python main.py run
+Restart=on-failure
+RestartSec=30
+# A crash loop must not silently burn LLM budget.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

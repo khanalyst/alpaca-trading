@@ -1,0 +1,56 @@
+# Pre-registration: ls-ratio-fade / v1
+# Written BEFORE the first run. This one is SHADOW-ONLY by construction.
+
+strategy_id: ls-ratio-fade
+version: v1
+status: registered_shadow_only
+
+mechanism: |
+  Within an instrument, when the retail long/short account ratio rises
+  relative to its OWN average, that instrument tends to outperform over the
+  next 16-48 hours. Note the direction: this is not a naive "fade retail"
+  trade.
+
+  The obvious fixed-effect objection was tested and rejected during edge
+  discovery: a coin's average long/short ratio correlates -0.432 with its
+  30-day return, a headwind, and removing the fixed effect by per-instrument
+  demeaning made the signal STRONGER. That is why the contract triggers on
+  the percentile within an instrument's own recent history, never the level.
+
+prediction: |
+  Entries when the ratio sits in the top of its own recent range outperform
+  over 16-48h, and entries in the bottom underperform.
+
+falsification: |
+  On more than 30 days of data the effect fails to survive a placebo that
+  shuffles the signal within each timestamp. The published result is
+  +1.114% at 48h (t=2.72) on ~210 independent observations, and on this data
+  a placebo has already reached t=2.60 from destroyed information - so the
+  published number is explicitly NOT treated as evidence.
+
+signal_timeframe: 1h
+ls_high_percentile: 80.0
+ls_low_percentile: 20.0
+cost_scenarios: [base]
+
+hypotheses_tested: 1
+
+backtestable: false
+why_not_backtestable: |
+  OKX serves the long/short ratio for roughly 30 days and it is not in the
+  research dataset, so there is no honest way to backtest it. It is
+  evaluated by SHADOW EVALUATION ONLY: the live agent records what the
+  contract would have done every cycle, and research/export_live.py resolves
+  those decisions against real subsequent bars.
+
+  This is the case shadow evaluation exists for. A strategy whose input
+  series is too short to backtest can still accumulate genuine forward
+  evidence from the day it is registered, and the tournament reports it as
+  forward-only rather than scoring it on data that does not exist.
+
+data_limitation: |
+  The series is served per CURRENCY, not per instrument, so it aggregates
+  across every contract for that coin. The same aggregation is why taker
+  volume was rejected outright during edge discovery (correlation with the
+  same hour's return: +0.006). This one survived that check; it is still a
+  coin-level signal applied to an instrument.

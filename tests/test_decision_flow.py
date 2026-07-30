@@ -35,8 +35,14 @@ def setup_snapshot(signal_ts):
         "range_pos_pct": 70,
         "relative_volume_1h": 1.2,
         "mom_1h_pct": 0.5,
+        "mom_15m_pct": 0.2,
         "funding_rate_pct": 0.0,
         "signal_ts": signal_ts,
+        "signal_1h_ts": signal_ts - 100,
+        "fresh_breakout_long": False,
+        "fresh_breakout_short": False,
+        "price_stabilized_long": True,
+        "price_stabilized_short": False,
     }
 
 
@@ -170,7 +176,7 @@ class SequentialOpenValidationTests(unittest.TestCase):
         seen = []
 
         def vet(decision, equity, positions, snapshot, cooldowns, gross,
-                entry_feedback, entry_failures):
+                entry_feedback, entry_failures, active_trades):
             seen.append((
                 decision["symbol"],
                 [position["symbol"] for position in positions],
@@ -291,6 +297,52 @@ class PositionMetricTests(unittest.TestCase):
             "contracts": float("nan"), "markPrice": 100,
         }
         self.assertEqual(engine._notional(position), 0)
+
+
+class OriginalThesisViewTests(unittest.TestCase):
+    def test_portfolio_exposes_durable_entry_thesis_for_close_reasoning(self):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = Mock()
+        now = time.time()
+        st = {
+            "state": state.RUNNING,
+            "cooldowns": {}, "entry_feedback": {}, "entry_failures": {},
+            "recent_setups": {},
+            "opened_at": {"BTC/USDT:USDT": now - 3600},
+            "active_trades": {
+                "BTC/USDT:USDT": {
+                    "age_known": True,
+                    "risk_usd": 150,
+                    "entry_reason": "1h and 4h continuation aligned",
+                    "setup_type": "trend_continuation",
+                    "invalidation_anchor": "structure",
+                    "exit_policy": "fixed_rr",
+                    "stop_loss_pct": 2,
+                    "take_profit_pct": 4,
+                    "signal_ts": 1_000,
+                    "entry_evidence": {
+                        "trend_1h": "up", "trend_4h": "up",
+                        "evidence_fingerprint": "abc",
+                    },
+                },
+            },
+        }
+        positions = [{
+            "symbol": "BTC/USDT:USDT", "side": "long",
+            "entryPrice": 100, "markPrice": 101, "percentage": 1,
+            "leverage": 2, "notional": 1_000,
+        }]
+
+        with patch("agent.engine.time.time", return_value=now):
+            view = engine._portfolio_view(
+                10_000, positions, st, 0, 0)
+
+        held = view["open_positions"][0]
+        self.assertTrue(held["age_verified"])
+        self.assertEqual(
+            held["original_thesis"]["entry_evidence"]["trend_1h"], "up")
+        self.assertEqual(held["planned_risk_usd"], 150)
 
 
 class LLMAuditEventTests(unittest.TestCase):
@@ -592,6 +644,74 @@ class EntryFailureBackoffTests(unittest.TestCase):
         self.assertEqual(log_event.call_args.args[0],
                          "entry_execution_failed")
         commit.assert_called_once_with(st)
+
+
+class MinimumHoldTests(unittest.TestCase):
+    """The model may not close inside strategy.min_hold_minutes.
+
+    Measured forward return after a qualifying entry is at its worst around
+    30 minutes in, and the shipped payoff depends on the minority of trades
+    that reach a distant target. Sub-hour discretionary exits removed that
+    tail while still paying a full taker round trip.
+    """
+
+    def setUp(self):
+        self.engine = Engine.__new__(Engine)
+        self.engine.cfg = valid_config()
+        self.pos = {"symbol": "BTC/USDT:USDT", "side": "short"}
+
+    def _state(self, minutes_ago):
+        return {"opened_at": {
+            "BTC/USDT:USDT": time.time() - minutes_ago * 60}}
+
+    def _close(self, trigger="thesis_invalidated"):
+        return {"action": "close", "symbol": "BTC/USDT:USDT",
+                "close_trigger": trigger, "reasoning": "impulse reversed"}
+
+    @patch("agent.engine.state.log_event")
+    def test_close_inside_the_floor_is_blocked(self, log_event):
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(17)))
+        self.assertEqual(log_event.call_args.args[0], "rejected")
+
+    @patch("agent.engine.state.log_event")
+    def test_close_after_the_floor_is_allowed(self, log_event):
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(120)))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_risk_reduction_is_never_blocked(self, log_event):
+        # De-risking is not second-guessing the entry, so the floor must not
+        # stand between the model and a position it wants to shrink.
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close("risk_reduction"), self._state(5)))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_unknown_age_allows_the_close(self, log_event):
+        # Trapping a position we cannot age until the max-hold timer is the
+        # more dangerous failure, so this direction fails open.
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), {"opened_at": {}}))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_zero_floor_disables_the_guard(self, log_event):
+        self.engine.cfg["strategy"]["min_hold_minutes"] = 0
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(1)))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_the_observed_live_exits_would_all_have_been_blocked(
+            self, log_event):
+        # LTC 17 min, ETC 55 min, DOGE 75 min - every discretionary exit in
+        # the losing window, none of them a risk reduction.
+        for held_minutes in (17, 55, 75):
+            with self.subTest(held_minutes=held_minutes):
+                self.assertTrue(self.engine._too_young_to_close(
+                    self.pos, self._close(), self._state(held_minutes)))
 
 
 if __name__ == "__main__":

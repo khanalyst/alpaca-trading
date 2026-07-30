@@ -1,0 +1,21 @@
+# Order-book depth and the short-retention statistics series. OKX never
+# serves this historically, so every hour this is not running is data that
+# cannot be bought back at any price. Start it before anything else.
+[Unit]
+Description=OKX market-data recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=okx
+WorkingDirectory=/opt/okx-agent-crypto
+ExecStart=/opt/okx-agent-crypto/.venv/bin/python research/record_flow.py \
+  --out /opt/okx-agent-crypto/runtime/research/recorded
+Restart=always
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

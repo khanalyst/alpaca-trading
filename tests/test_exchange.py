@@ -104,6 +104,49 @@ class FillVerificationTests(unittest.TestCase):
             raised.exception._order_audit["outcome"], "fill_unverified")
 
 
+class PositionAgeRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _exchange(client):
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+        return exchange
+
+    def test_okx_position_creation_time_is_preferred(self):
+        opened_ms = int((time.time() - 3_600) * 1000)
+        client = Mock()
+        recovered = self._exchange(client).position_opened_at({
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 2,
+            "info": {"cTime": str(opened_ms)},
+        })
+        self.assertAlmostEqual(recovered, opened_ms / 1000, places=3)
+        client.fetch_my_trades.assert_not_called()
+
+    def test_fill_history_recovers_the_last_flat_to_open_transition(self):
+        now_ms = int(time.time() * 1000)
+        client = Mock()
+        client.fetch_my_trades.return_value = [
+            {"timestamp": now_ms - 20_000, "side": "buy", "amount": 2},
+            {"timestamp": now_ms - 10_000, "side": "buy", "amount": 1},
+        ]
+        recovered = self._exchange(client).position_opened_at({
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 3,
+            "info": {},
+        })
+        self.assertAlmostEqual(
+            recovered, (now_ms - 20_000) / 1000, places=3)
+
+    def test_unknown_position_age_is_never_replaced_with_now(self):
+        client = Mock()
+        client.fetch_my_trades.return_value = []
+        recovered = self._exchange(client).position_opened_at({
+            "symbol": "BTC/USDT:USDT", "side": "long", "contracts": 3,
+            "info": {},
+        })
+        self.assertIsNone(recovered)
+
+
 class ProtectionClient:
     def __init__(self):
         self.queries = []

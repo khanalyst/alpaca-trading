@@ -1,0 +1,17 @@
+[Unit]
+Description=OKX nightly research cycle
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=okx
+WorkingDirectory=/opt/okx-agent-crypto
+Environment=PYTHON=/opt/okx-agent-crypto/.venv/bin/python
+ExecStart=/opt/okx-agent-crypto/research/nightly.sh
+# The tournament is the only CPU spike on the box; keep it out of the
+# trading loop's way.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=4h
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,201 @@
+# Named parameter variants. The attribution key for every recorded result.
+#
+# A variant states one claim about one set of parameters. The hypothesis field
+# is required and is not decoration: at these sample sizes something always
+# looks best, and a table of rankings with no claim written beforehand is a
+# ranking of noise.
+#
+# Registered here is not the same as scheduled. Per action-plan-v2 C5, no
+# parameter sweep runs until the funnel report is published, because if the
+# binding veto sits downstream of the strategy contract then no setting of any
+# contract parameter can change the trade count and the whole sweep is wasted
+# calendar time. Per C4, conditioning axes are preferred over parameter axes
+# for the first six months: they partition trades that already exist instead
+# of dividing an already-small sample further.
+
+variants:
+  - variant_id: momentum.baseline
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides: {}
+    hypothesis: >-
+      The configuration as shipped. The comparison floor for every other
+      variant of this strategy, and the arm the replay must reproduce before
+      any other number here means anything.
+    status: testing
+
+  # --- exit policy -------------------------------------------------------
+  # findings.md: the 2R target has never been validated against any
+  # alternative. Three settings minimum before this axis may be rejected.
+  - variant_id: momentum.rr.fixed_1_5
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.fixed_reward_risk: 1.5
+    hypothesis: >-
+      A 1.5R target trades a lower average win for a higher hit rate, and at
+      this cost ratio the higher hit rate wins.
+    status: candidate
+
+  - variant_id: momentum.rr.fixed_2_5
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.fixed_reward_risk: 2.5
+    hypothesis: >-
+      A 2.5R fixed target improves hit rate against the shipped 3.0R target
+      without truncating enough of the right tail to lose expectancy.
+    status: candidate
+
+  - variant_id: momentum.rr.fixed_2_0
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.fixed_reward_risk: 2.0
+    hypothesis: >-
+      A 2.0R target converts more excursions into wins than the shipped 3.0R
+      target, and the higher hit rate outweighs the truncated right tail.
+    status: candidate
+
+  - variant_id: momentum.rr.fixed_3_0
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.fixed_reward_risk: 3.0
+    hypothesis: >-
+      Historical identity for the 3.0R setting, now identical to the shipped
+      baseline and therefore not an independent experimental arm.
+    status: superseded
+
+  # --- the noise floor ---------------------------------------------------
+  # min_stop_atr_multiple sets how much ordinary movement counts as
+  # invalidation, so it drives stop distance, position size and R together.
+  - variant_id: momentum.stop.atr_1_25
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.min_stop_atr_multiple: 1.25
+    hypothesis: >-
+      A modestly wider 1.25 ATR floor removes ordinary-noise stop-outs without
+      paying the full position-size and target-distance cost of a 1.5 ATR stop.
+    status: candidate
+
+  - variant_id: momentum.stop.atr_1_5
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.min_stop_atr_multiple: 1.5
+    hypothesis: >-
+      A 1.0 ATR stop sits inside ordinary noise, so a materially wider floor
+      converts stop-outs into trades that were right but too early.
+    status: candidate
+
+  - variant_id: momentum.stop.atr_2_0
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.min_stop_atr_multiple: 2.0
+    hypothesis: >-
+      The same claim at twice the default, to establish whether the effect is
+      monotonic or has an interior optimum.
+    status: candidate
+
+  # --- the veto suspected of binding hardest -----------------------------
+  # findings.md section 5 flags the net-direction cap as the step that kills
+  # most 2nd and 3rd same-side entries. Gate G4 promotes this to first
+  # priority if the funnel confirms it dominates.
+  - variant_id: momentum.net_direction.60
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.max_net_direction_pct: 60
+    hypothesis: >-
+      Tightening the net-direction cap costs little, because the entries it
+      refuses are correlated expressions of one market-wide move rather than
+      independent trades.
+    status: candidate
+
+  - variant_id: momentum.net_direction.80
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.max_net_direction_pct: 80
+    hypothesis: >-
+      An 80 percent net-direction cap removes the most correlated marginal
+      entry while retaining more independent opportunities than the 60 cap.
+    status: candidate
+
+  - variant_id: momentum.net_direction.120
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.max_net_direction_pct: 120
+    hypothesis: >-
+      A looser 120 percent cap reveals whether the shipped 100 percent ceiling
+      suppresses genuinely independent signals rather than correlated bets.
+    status: candidate
+
+  # --- the confidence floor ----------------------------------------------
+  # H-F: every arm reuses the same recorded LLM proposal and confidence, so
+  # downward floors are observable in real time without another model call.
+  - variant_id: momentum.conf.floor_0_50
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.50
+    hypothesis: >-
+      The 0.65 floor rejects trades that are profitable in aggregate, which
+      cannot be observed live because those trades are never taken.
+    status: candidate
+
+  - variant_id: momentum.conf.floor_0_55
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.55
+    hypothesis: >-
+      A 0.55 confidence floor recovers profitable lower-confidence trades while
+      filtering the weakest proposals admitted by the 0.50 setting.
+    status: candidate
+
+  - variant_id: momentum.conf.floor_0_60
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.60
+    hypothesis: >-
+      A 0.60 confidence floor improves sample size over 0.65 without admitting
+      enough weak proposals to erase the added observations' expectancy.
+    status: candidate
+
+  # --- batch 6.4: which variable separates breakout from continuation ------
+  # The two contracts overlap, so attribution splits one phenomenon across
+  # two rows. What they should be separated BY is the open question, and the
+  # plan and the edge hypotheses give different answers. Registering both as
+  # variants is what lets the corpus decide instead of the argument.
+  #
+  # Gate G5 previously blocked 6.4 on H-I. Making the discriminator a
+  # parameter dissolves that gate: neither answer is baked in, so neither
+  # filters the population the other one needs.
+  - variant_id: momentum.discriminator.trend_alignment
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.breakout_discriminator: trend_alignment
+    hypothesis: >-
+      A breakout is a transition out of chop, so requiring the absence of
+      prior multi-timeframe alignment separates it from a continuation
+      without losing real breakouts.
+    status: candidate
+
+  - variant_id: momentum.discriminator.volatility_regime
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.breakout_discriminator: volatility_regime
+    hypothesis: >-
+      The real partition is compression versus expansion, and trend alignment
+      is a correlated proxy for it. A breakout from a compressed base is an
+      event; a break when volatility is already elevated is an ordinary
+      excursion in a distribution that is already wide.
+    status: candidate

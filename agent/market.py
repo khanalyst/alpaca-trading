@@ -13,7 +13,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from . import strategy
+from . import brain, strategy
 from .exchange import OKX_CRYPTO_INSTRUMENT_CATEGORY
 
 log = logging.getLogger("market")
@@ -107,6 +107,123 @@ def _funding_history_context(ex, symbol: str,
         "funding_percentile_30": round(percentile, 1),
         "funding_change_pct": round(current_rate_pct - rates[-1], 4),
     }
+
+
+# Hourly series fetched per symbol per cycle would be wasteful and would
+# multiply rate-limit pressure: the underlying data only changes once an
+# hour, while the decision cycle runs every five minutes. Cached in-process
+# with a TTL well under the update interval.
+_SERIES_TTL_SECONDS = 900
+_series_cache: dict[tuple[str, str], tuple[float, object]] = {}
+
+
+def _cached_series(key: str, symbol: str, loader):
+    """Fetch an hourly series at most once per TTL, per symbol.
+
+    A failure is cached as None for the same TTL. Retrying a dead endpoint on
+    every symbol of every cycle turns one outage into a cycle-time problem,
+    and these series are enrichment: no trade depends on them being present.
+    """
+    entry = _series_cache.get((key, symbol))
+    now = time.time()
+    if entry is not None and now - entry[0] < _SERIES_TTL_SECONDS:
+        return entry[1]
+    try:
+        value = loader()
+    except Exception:
+        value = None
+    _series_cache[(key, symbol)] = (now, value)
+    return value
+
+
+def _open_interest_change(ex, symbol: str) -> dict:
+    """Percent change in open interest over the last 1h and 4h.
+
+    Sourced from the same per-instrument endpoint the research downloader
+    uses, so the live field and the backtest field mean the same thing. That
+    equivalence is the whole reason shadow results can be compared with
+    backtest results at all.
+
+    Open interest FALLING while price moves is existing positions closing -
+    often forcibly. Open interest RISING is new money taking a side. The two
+    are indistinguishable on price alone, which is what makes this worth an
+    API call.
+    """
+    empty = {"oi_change_1h_pct": None, "oi_change_4h_pct": None}
+    rows = _cached_series("oi_history", symbol, lambda: _okx_oi_history(
+        ex, symbol))
+    if not rows or len(rows) < 5:
+        return empty
+    # Newest first from OKX; index 0 is now, index 4 is four hours ago.
+    def change(offset: int) -> float | None:
+        if len(rows) <= offset or rows[offset] <= 0:
+            return None
+        return round((rows[0] / rows[offset] - 1) * 100, 3)
+    return {"oi_change_1h_pct": change(1), "oi_change_4h_pct": change(4)}
+
+
+def _okx_oi_history(ex, symbol: str) -> list[float]:
+    inst_id = _inst_id(ex, symbol)
+    if not inst_id:
+        return []
+    raw = ex.public_call(
+        "publicGetRubikStatContractsOpenInterestHistory",
+        {"instId": inst_id, "period": "1H", "limit": "24"})
+    out = []
+    for row in raw or []:
+        try:
+            out.append(float(row[3]))       # oiUsd
+        except (TypeError, ValueError, IndexError):
+            out.append(0.0)
+    return out
+
+
+def _long_short_ratio(ex, symbol: str) -> dict:
+    """Retail long/short account ratio, and where it sits in its own recent range.
+
+    CAVEAT, and it is load-bearing: OKX serves this per CURRENCY, not per
+    instrument, so it aggregates across every contract for that coin. The
+    same aggregation is why taker-volume was rejected outright during edge
+    discovery (its correlation with the same hour's return was +0.006, i.e.
+    it did not measure what it claimed to). This series survived that check
+    where taker volume did not, but it is still a coin-level signal being
+    applied to an instrument, and the percentile - not the level - is what
+    the hypothesis rests on, because a coin's average ratio is a fixed
+    effect that correlates NEGATIVELY with its return.
+    """
+    empty = {"long_short_ratio": None, "long_short_percentile_30": None}
+    rows = _cached_series("ls_ratio", symbol,
+                          lambda: _okx_long_short(ex, symbol))
+    if not rows:
+        return empty
+    current = rows[0]
+    window = rows[:720]
+    percentile = sum(value <= current for value in window) / len(window) * 100
+    return {"long_short_ratio": round(current, 4),
+            "long_short_percentile_30": round(percentile, 1)}
+
+
+def _okx_long_short(ex, symbol: str) -> list[float]:
+    currency = symbol.split("/")[0]
+    raw = ex.public_call(
+        "publicGetRubikStatContractsLongShortAccountRatio",
+        {"ccy": currency, "period": "1H", "limit": "100"})
+    out = []
+    for row in raw or []:
+        try:
+            out.append(float(row[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _inst_id(ex, symbol: str) -> str | None:
+    try:
+        market = ex.x.market(symbol)
+    except Exception:
+        return None
+    inst = (market.get("info") or {}).get("instId")
+    return str(inst) if inst else None
 
 
 def _open_interest_usd(ex, symbol: str, last: float) -> float | None:
@@ -407,6 +524,11 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     open_interest = _open_interest_usd(ex, symbol, last)
     snap["open_interest_musd"] = (
         round(open_interest / 1e6, 2) if open_interest is not None else None)
+    # Enrichment for the positioning-based contracts. Both are cached hourly
+    # series and both degrade to None rather than raising: no order depends
+    # on them, so a statistics outage must not be able to stop trading.
+    snap.update(_open_interest_change(ex, symbol))
+    snap.update(_long_short_ratio(ex, symbol))
 
     for tf, df in frames.items():
         close = df["close"]
@@ -432,9 +554,48 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
 
     df_fast = frames.get("15m", frames[tfs[0]])
     snap["signal_ts"] = int(df_fast["ts"].iloc[-1])
+    snap["signal_1h_ts"] = int(df_1h["ts"].iloc[-1])
     snap["mom_1h_pct"] = round(
         float(df_fast["close"].pct_change(4).iloc[-1] * 100), 2
     )
+    signal_open = float(df_fast["open"].iloc[-1])
+    signal_close = float(df_fast["close"].iloc[-1])
+    previous_close = float(df_fast["close"].iloc[-2])
+    signal_low = float(df_fast["low"].iloc[-1])
+    previous_low = float(df_fast["low"].iloc[-2])
+    signal_high = float(df_fast["high"].iloc[-1])
+    previous_high = float(df_fast["high"].iloc[-2])
+    snap["mom_15m_pct"] = round(
+        (signal_close - previous_close) / previous_close * 100, 3
+    ) if previous_close > 0 else None
+    snap["signal_candle_return_pct"] = round(
+        (signal_close - signal_open) / signal_open * 100, 3
+    ) if signal_open > 0 else None
+    # A breakout must occur on the latest completed signal candle, beyond a
+    # prior range that excludes that candle. A 24h range-position reading by
+    # itself can describe an old move and is not proof of a fresh break.
+    prior_fast = df_fast.iloc[-21:-1]
+    prior_high = float(prior_fast["high"].max())
+    prior_low = float(prior_fast["low"].min())
+    snap["prior_range_high_20"] = round(prior_high, 10)
+    snap["prior_range_low_20"] = round(prior_low, 10)
+    snap["fresh_breakout_long"] = bool(
+        prior_high > 0 and signal_close > prior_high)
+    snap["fresh_breakout_short"] = bool(
+        prior_low > 0 and signal_close < prior_low)
+    snap["breakout_distance_pct"] = (
+        round((signal_close - prior_high) / prior_high * 100, 3)
+        if snap["fresh_breakout_long"] else
+        round((prior_low - signal_close) / prior_low * 100, 3)
+        if snap["fresh_breakout_short"] else 0.0
+    )
+    # Directional stabilization is deliberately modest evidence, not a buy
+    # signal: price must stop extending the adverse extreme and close back in
+    # the squeeze direction on the completed candle.
+    snap["price_stabilized_long"] = bool(
+        signal_low >= previous_low and signal_close > signal_open)
+    snap["price_stabilized_short"] = bool(
+        signal_high <= previous_high and signal_close < signal_open)
     recent_volume = float(df_fast["vol"].tail(4).sum())
     prior_windows = df_fast["vol"].iloc[:-4].rolling(4).sum().tail(20)
     normal_volume = float(prior_windows.median())
@@ -504,6 +665,14 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     snap = _json_safe(snap)
     snap["regime"] = classify_regime(snap)
     strategy.enrich_snapshot(snap, cfg)
+    # B0.5: recorded from today, shown to the model in no batch but the one
+    # that deliberately tests it. Added after enrich_snapshot so it can never
+    # reach a contract, and after _json_safe so it is sanitized in its own
+    # right rather than by a pass that ran before it existed.
+    snap[brain.ENRICHMENT_KEY] = _json_safe(realised_vol_enrichment(
+        list(df_fast["close"]),
+        utc_hour=int(time.gmtime(int(snap["signal_ts"]) / 1000).tm_hour),
+    ))
     return snap
 
 
@@ -536,6 +705,12 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
     except Exception as e:
         log.warning("benchmark snapshot failed: %s", e)
 
+    # B0.5.3: BTC reference returns, recorded so the residual computation
+    # H-J needs does not depend on the 1m price cache being complete for
+    # every symbol-day. Costs one OHLCV call per cycle and is withheld from
+    # the prompt like the rest of the enrichment.
+    context[brain.ENRICHMENT_KEY] = _btc_reference_returns(ex, benchmark, cfg)
+
     out = {"_market_context": context}
     for sym in symbols:
         try:
@@ -545,4 +720,156 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
                 out[sym] = symbol_snapshot(ex, sym, cfg, benchmark_returns)
         except Exception as e:
             log.warning("snapshot failed for %s: %s", sym, e)
+    if len(out) > 1:
+        context.update(_setup_crowding(out))
     return out if len(out) > 1 else {}
+
+
+def restrict_snapshot(snapshot: dict, symbols: list[str]) -> dict:
+    """Narrow a snapshot to ``symbols``, recomputing market-wide context.
+
+    A snapshot is fetched for the union of everything that needs a mark this
+    cycle, which is wider than the set any one consumer is allowed to act on.
+    Slicing the symbol map alone is not enough: ``_market_context`` carries
+    breadth counts derived from *every* symbol in the map, and breadth drives
+    a risk veto. Dropping a symbol without recomputing the count would leave
+    the caller reading a number describing symbols it cannot see.
+    """
+    if not snapshot:
+        return snapshot
+    allowed = set(symbols)
+    tradable = [sym for sym in snapshot if not sym.startswith("_")]
+    if all(sym in allowed for sym in tradable):
+        return snapshot
+    view = {sym: value for sym, value in snapshot.items()
+            if sym.startswith("_") or sym in allowed}
+    context = dict(snapshot.get("_market_context") or {})
+    context.update(_setup_crowding(view))
+    view["_market_context"] = context
+    return view
+
+
+def _btc_reference_returns(ex, benchmark: str, cfg: dict) -> dict:
+    """BTC 15m return over 1, 4 and 24 bars.
+
+    H-J claims a meaningful fraction of the variance in trade outcomes is
+    explained by contemporaneous BTC return rather than by the setup - that a
+    long breakout on three correlated perpetuals is one levered BTC bet
+    paying three sets of fees. Testing that needs the market factor at
+    decision time, and reconstructing it later from a per-symbol price cache
+    fails on exactly the symbol-days the cache is missing.
+
+    Recorded rather than derived, therefore. One call per cycle, and a
+    failure yields nulls rather than an exception: no order depends on it.
+    """
+    empty = {"btc_ref_return_1_pct": None, "btc_ref_return_4_pct": None,
+             "btc_ref_return_24_pct": None, "btc_ref_signal_ts": None}
+    try:
+        raw = _closed_ohlcv(ex, benchmark, "15m", 30)
+        closes = [float(row[4]) for row in raw or []]
+        stamps = [int(row[0]) for row in raw or []]
+    except Exception as e:
+        log.warning("btc reference returns failed: %s", e)
+        return empty
+    if len(closes) < 25 or not all(math.isfinite(c) and c > 0
+                                   for c in closes[-25:]):
+        return empty
+
+    def change(bars: int) -> float | None:
+        base = closes[-1 - bars]
+        return round((closes[-1] / base - 1) * 100, 4) if base > 0 else None
+
+    return {
+        "btc_ref_return_1_pct": change(1),
+        "btc_ref_return_4_pct": change(4),
+        "btc_ref_return_24_pct": change(24),
+        "btc_ref_signal_ts": stamps[-1] if stamps else None,
+    }
+
+
+def realised_vol_enrichment(closes, utc_hour: int) -> dict:
+    """Realised volatility over a fast and a slow window, plus their ratio.
+
+    The ratio is the regime variable H-I is built on: the claim is that
+    ``range_breakout`` has positive expectancy when volatility is expanding
+    from a compressed base and negative expectancy when volatility is already
+    elevated, so that the pooled figure is the average of two populations of
+    opposite sign and lands near zero.
+
+    Both windows are derivable later from cached OHLCV, so recording them now
+    is a convenience rather than a necessity. It is worth doing anyway: it
+    makes the replay cheaper and it costs one pass over a list already in
+    memory.
+
+    Every failure mode returns ``None`` rather than raising. Nothing here is
+    allowed to stop a cycle - no order depends on any of it.
+    """
+    out = {"realised_vol_8": None, "realised_vol_96": None,
+           "realised_vol_ratio_8_96": None, "utc_hour": utc_hour}
+    clean = []
+    for value in closes or []:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number > 0:
+            clean.append(number)
+    if len(clean) < 97:            # 96 returns needs 97 closes
+        return out
+
+    series = pd.Series(clean)
+    returns = series.pct_change().dropna()
+    if len(returns) < 96:
+        return out
+
+    fast = float(returns.iloc[-8:].std())
+    slow = float(returns.iloc[-96:].std())
+    if not math.isfinite(fast) or not math.isfinite(slow):
+        return out
+
+    out["realised_vol_8"] = round(fast * 100, 4)
+    out["realised_vol_96"] = round(slow * 100, 4)
+    # A zero slow window means a flat series, where the ratio is undefined
+    # rather than infinite. Recording inf would poison every bucket boundary
+    # computed from this column later.
+    if slow > 0:
+        out["realised_vol_ratio_8_96"] = round(fast / slow, 4)
+    return out
+
+
+def _setup_crowding(snapshot: dict) -> dict:
+    """Count how many instruments satisfy any setup contract right now.
+
+    Measured over two years, simultaneity is informative: when five or more
+    instruments qualify at once they are almost always expressions of one
+    market-wide move, and those trades were materially worse than the ones
+    taken when only one or two qualified (-0.15% vs -0.03% per trade
+    out-of-sample, same sign in both walk-forward halves).
+
+    The count is context, not a rule. Deterministic exposure caps already
+    limit correlated risk by notional; this exposes the *breadth* of the
+    signal so the analyst layer can be pickier when everything fires together.
+    """
+    tradable = 0
+    firing = 0
+    for symbol, data in snapshot.items():
+        if symbol.startswith("_") or not isinstance(data, dict):
+            continue
+        tradable += 1
+        evidence = data.get("setup_evidence")
+        if not isinstance(evidence, dict):
+            continue
+        for setup in ("trend_continuation", "range_breakout",
+                      "funding_squeeze"):
+            contract = evidence.get(setup)
+            if isinstance(contract, dict) and (
+                    contract.get("long") is True
+                    or contract.get("short") is True):
+                firing += 1
+                break
+    return {
+        "instruments_scanned": tradable,
+        "instruments_with_a_valid_setup": firing,
+        "setup_breadth_pct": (
+            round(firing / tradable * 100, 1) if tradable else None),
+    }

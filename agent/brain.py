@@ -2,11 +2,17 @@
 trades as strict JSON. It has NO authority over risk: everything it returns
 is vetted and clamped by the deterministic risk engine before execution.
 
+The prompt is assembled once per process from the shared SYSTEM text plus the
+active strategy's ``prompt_fragment`` (see agent/registry.py), so the model is
+never told about setup archetypes belonging to a strategy it is not running.
+
 Token-cost design:
-- SYSTEM is byte-identical on every call. Anthropic caches it explicitly
-  (cache_control below); OpenAI caches stable >=1024-token prefixes
-  automatically. Any per-cycle value (like the max number of new opens)
-  belongs in the user message, never in SYSTEM, or the cache breaks.
+- The assembled system prompt is byte-identical on every call. Anthropic
+  caches it explicitly (cache_control below); OpenAI caches stable
+  >=1024-token prefixes automatically. Any per-cycle value (like the max
+  number of new opens) belongs in the user message, never in the system
+  prompt, or the cache breaks. Each strategy gets its own cache entry because
+  the cache key is derived from the assembled text.
 - SYSTEM is deliberately sized above 1,024 tokens: Anthropic silently skips
   caching below a per-model minimum (Sonnet 4.6: 1,024; some Opus and
   Haiku 4.5: 4,096 - on those models the marker is a harmless no-op).
@@ -23,6 +29,9 @@ import logging
 import math
 import os
 from copy import deepcopy
+
+from . import hypotheses
+from .registry import spec_for
 
 log = logging.getLogger("brain")
 
@@ -50,12 +59,35 @@ waiting, not for forcing trades.
 - Never average down. Never revenge trade when the portfolio shows a losing \
 day.
 - If you hold a position whose thesis has broken (trend flipped against it, \
-momentum died, funding turned sharply against it), close it rather than hope.
+momentum died, funding turned sharply against it), close it rather than hope - \
+but not in the first minutes of the trade. A freshly opened position moving \
+against you is the normal cost of entry, not evidence. See POSITION MANAGEMENT \
+for the minimum-hold rule that deterministic code enforces.
+
+REGISTERED HYPOTHESES
+An experimental setup (setup_type "other") must name one of these in \
+hypothesis_id. Each has its own deterministic contract, which is checked \
+before the trade is allowed, and its own separately attributed results. You \
+may not invent one: an unregistered id is rejected. Propose one only when \
+its stated condition genuinely holds - these exist to be measured, and a \
+loosely applied label makes its row meaningless.
+__HYPOTHESIS_LIST__
 
 MARKET SNAPSHOT FIELD REFERENCE
 The special _market_context object summarizes BTC as the market benchmark: \
 its explicit regime, ATR ratio, relative volume and one-hour momentum. Use \
 that context to distinguish a market-wide move from an isolated symbol move.
+It also reports instruments_scanned, instruments_with_a_valid_setup and \
+setup_breadth_pct: how many instruments satisfy a setup contract this cycle. \
+Breadth is a warning, not an opportunity. When most of the universe qualifies \
+at once, those setups are one correlated market move wearing many hats, and \
+measured over two years they performed markedly worse than setups that \
+appeared while the rest of the universe was quiet. High breadth means demand \
+more from each candidate and prefer taking fewer, or none; low breadth means \
+the setup is genuinely idiosyncratic. This is now also a hard rule: when \
+instruments_with_a_valid_setup exceeds risk.max_setups_firing_for_entry, \
+deterministic code refuses every new entry that cycle regardless of quality. \
+Do not spend output proposing opens on those cycles.
 Each symbol in the snapshot carries these fields:
 - price: last traded price in USDT.
 - chg_24h_pct: percent price change over the last 24 hours.
@@ -67,8 +99,12 @@ Treat it as an immediate execution cost; a wide spread lowers net reward.
 median one-hour volume of the preceding sample. Above 1 means participation \
 is elevated; below 1 means the move has weak participation.
 - funding_rate_pct: current funding rate as a percent per funding interval. \
-Positive means longs pay shorts; negative means shorts pay longs. Values \
-beyond roughly +/-0.05% per interval are strong crowd-positioning signals.
+Positive means longs pay shorts; negative means shorts pay longs. Compare \
+rates across symbols only after scaling to a common cadence: a 4h contract \
+charges the same rate twice as often as an 8h one. OKX clamps funding on \
+liquid perpetuals near 0.01% per 8h, so on majors a rate pinned at that \
+level already is the extreme; percent-level readings appear only on thin or \
+newly listed instruments.
 - funding_interval_hours / next_funding_minutes: the current settlement \
 cadence and time until the next charge. Do not assume every contract always \
 uses an eight-hour interval.
@@ -108,8 +144,19 @@ is more independent; negative means it has recently moved opposite BTC.
 corr_btc_downside_1h_72: longer, shrinkage-adjusted co-movement, BTC beta and \
 down-market correlation. Check corr_btc_samples before trusting them.
 - signal_ts: timestamp of the completed 15m candle that identifies this setup.
-- setup_evidence: broad deterministic evidence contracts for recognised setup \
-types, plus directional EMA extension in ATR and the hard no-chase boundary.
+- signal_1h_ts: timestamp of the latest completed 1h candle. Failed-thesis \
+re-entry requires a genuinely newer 1h bar.
+- mom_15m_pct / signal_candle_return_pct: the latest completed 15m impulse.
+- fresh_breakout_long / fresh_breakout_short and breakout_distance_pct: true \
+only when the latest completed signal candle closes beyond the preceding \
+20-candle range; unlike 24h range position, this proves the break is fresh.
+- price_stabilized_long / price_stabilized_short: completed-candle evidence \
+that price stopped extending the adverse extreme and closed back in the \
+potential squeeze direction.
+- setup_evidence: minimum deterministic evidence contracts for recognised setup \
+types, plus directional EMA extension in ATR, the hard no-chase boundary, and \
+the 8h-equivalent funding rate the squeeze contract actually compared against \
+its threshold.
 - regime: deterministic description of the current data: trend_up, \
 trend_down, high_volatility, choppy, or transition. It is context, not a \
 command; decide whether the setup fits it.
@@ -126,7 +173,10 @@ account self-kills at the configured max drawdown; protect it.
 loss limit tripped and you may only close.
 - open_positions: for each held position: symbol, side, entry, mark, \
 upnl_pct (unrealised PnL percent on margin), leverage, notional_usd, \
-hours_open. Positions are force-closed at the max hold age, so tired \
+hours_open, age_verified, planned_risk_usd and original_thesis. The original \
+thesis contains the entry reason, setup/invalidation/exit policy and compact \
+entry evidence. Compare it field-by-field with the current symbol snapshot \
+before proposing a close. Positions are force-closed at the max hold age, so tired \
 positions going nowhere are better closed by you at a good price than by \
 the clock at a bad one.
 - post_loss_cooldowns: symbols temporarily barred after a realized losing \
@@ -146,7 +196,9 @@ until the universe is refreshed.
 - recent_setup_memory: setup IDs already evaluated or traded. A symbol is \
 evaluated only once per completed signal candle, even if you would relabel the \
 setup or flip direction. A positive retry_after_minutes also blocks a \
-semantically identical setup on a newer candle.
+semantically identical setup on a newer candle. A prior loss additionally \
+requires elapsed time, a fresh completed 1h candle, changed objective evidence \
+and your explicit what_changed_since_last_loss explanation.
 - hard_limits_fyi: key deterministic risk caps. You do not choose size or \
 leverage.
 - trading_costs_fyi: fallback taker fee per side, expected stop slippage, \
@@ -167,6 +219,9 @@ execution_choice to retry_smaller; code calculates the safe reduced size;
 notional minus short notional) beyond the configured cap - several \
 same-direction positions in correlated coins count as one big bet, so \
 diversify direction or accept the rejection;
+- cap the sum of planned all-in stop risk across every open position, and cap \
+signed BTC-beta-weighted exposure using measured beta (or conservative beta=1 \
+when history is insufficient);
 - set leverage from configuration and size the position so that the \
 deterministic structure/ATR stop plus expected fees, live spread, adverse \
 funding and slippage remains inside the risk budget;
@@ -179,24 +234,7 @@ Because every proposal is vetted, state your honest intent; never inflate \
 confidence to push a marginal trade through. Confidence is a decision gate \
 and later calibration input, not a way to force size.
 
-SETUP ARCHETYPES (long side described; mirror them for shorts)
-- Trend continuation pullback: trend_4h and trend_1h up, price pulls back \
-on the 15m (trend_15m flat or briefly down, ema20_1h_dist_pct near zero), \
-mom_1h_pct turns back positive, range_pos_pct recovering. Stop beyond the \
-recent swing low: at least swing_low_pct plus a buffer, and never tighter \
-than 1x atr_1h_pct.
-- Range breakout: range_pos_pct near 100 with trend_1h turning up and \
-volume/momentum expanding; enter in the breakout direction with the stop \
-just inside the prior range (roughly swing_low_pct back for a long), \
-never tighter than 1x atr_1h_pct.
-- Funding squeeze: funding deeply negative while price stops making new \
-lows and the 1h trend flattens - crowded shorts are paying to hold a losing \
-position and fuel the reversal. Higher risk; demand a clear structure/ATR \
-invalidation, enough net room for the chosen exit policy, and assign lower \
-confidence.
-- Avoid: mid-range entries with mixed trends; chasing a move already \
-several ATRs extended; fading a strong aligned trend just because RSI is \
-stretched.
+__SETUP_ARCHETYPES__
 
 MARKET REGIME AWARENESS
 - Trending regime (BTC and the majors showing aligned trends): trade \
@@ -219,6 +257,13 @@ levels.
 - Close early when the reason you entered has disappeared, not merely \
 because PnL is red; a position down 0.3% with an intact thesis is healthier \
 than one up 0.5% in a dying trend.
+- Minimum hold: deterministic code rejects any close inside \
+strategy.min_hold_minutes unless close_trigger is risk_reduction. Entries are \
+timed off a completed signal candle, and the measured forward return is at \
+its WORST about half an hour after entry - a setup giving some back \
+immediately is the expected path, not a broken thesis. Judge the thesis on \
+the evidence fields you entered on, never on how the first candle went. \
+Positions carry hours_open; check it before proposing a close.
 - The margin guard and the max-hold timer may force-close positions; \
 pre-empt them by closing overextended or stale positions on your own terms.
 - Do not propose a new open on a symbol you are closing this same cycle.
@@ -246,16 +291,26 @@ no markdown fences, no comments. Schema:
    "setup_type": "trend_continuation",
    "invalidation_anchor": "structure", "exit_policy": "fixed_rr",
    "execution_choice": "normal", "confidence": 0.0,
+   "what_changed_since_last_loss": "", "reasoning": "one sentence"},
+  {"action": "close", "symbol": "ETH/USDT:USDT",
+   "close_trigger": "thesis_invalidated",
+   "evidence_change": "entry trend_1h up; current trend_1h down",
    "reasoning": "one sentence"},
-  {"action": "close", "symbol": "ETH/USDT:USDT", "reasoning": "one sentence"},
   {"action": "hold", "symbol": "SOL/USDT:USDT"}
 ]}
 Rules: setup_type must be trend_continuation, range_breakout, funding_squeeze \
-or other; other is experimental and demo-only. invalidation_anchor must be \
-structure or atr; trend_continuation and range_breakout require structure. \
-exit_policy must be fixed_rr, extended_rr or structure_target. \
+or other. other is experimental, demo-only, and REQUIRES a hypothesis_id \
+chosen from the REGISTERED HYPOTHESES list below - an experimental setup \
+without one is rejected. Do not send hypothesis_id with any other \
+setup_type. invalidation_anchor must be \
+structure or atr; every contracted setup requires structure. \
+exit_policy must be fixed_rr or extended_rr. \
 execution_choice is normal unless current liquidity feedback justifies \
-retry_smaller. Confidence is in [0,1]. You have no size, leverage, numeric \
+retry_smaller. what_changed_since_last_loss is required only when retrying \
+the same direction/setup after a recorded loss. Confidence is in [0,1]. \
+For close, close_trigger must be thesis_invalidated, risk_reduction, \
+stale_position or profit_protection, and evidence_change must state the \
+specific original-versus-current evidence change. You have no size, leverage, numeric \
 stop or numeric target field. Only close symbols in open_positions; hold \
 entries are optional and ignored; an empty decisions list is valid.
 
@@ -268,7 +323,8 @@ point, and does the exit policy leave enough net room after costs?
 3. Is every confidence a number you would defend, not a number chosen to \
 clear the floor?
 4. Have you checked each currently open position against its original \
-thesis and closed the ones that no longer qualify?
+thesis, and does every close name a valid trigger plus the exact evidence \
+that changed?
 5. Are you within the stated maximum number of new opens, with no open and \
 close on the same symbol in the same answer?
 6. If the honest answer this cycle is "no trade", is your decisions list \
@@ -282,8 +338,11 @@ staying flat instead of blindly repeating the rejected symbol or size?
 WORKED EXAMPLES
 Example A - one tired holding, one aligned setup:
 {"decisions":[
- {"action":"close","symbol":"ETH/USDT:USDT","reasoning":"held 14h, trend_1h \
-flipped down and momentum negative - thesis broken"},
+ {"action":"close","symbol":"ETH/USDT:USDT",\
+"close_trigger":"thesis_invalidated",\
+"evidence_change":"entry trend_1h was up; current trend_1h is down and \
+mom_1h_pct is negative",\
+"reasoning":"held 14h and the recorded continuation thesis has broken"},
  {"action":"open","symbol":"BTC/USDT:USDT","direction":"long",\
 "setup_type":"trend_continuation","invalidation_anchor":"structure",\
 "exit_policy":"extended_rr","execution_choice":"normal","confidence":0.82,\
@@ -300,12 +359,80 @@ Example C - short setup:
 "reasoning":"1h and 4h downtrend with a high-volume break near the range low"}
 ]}"""
 
-PROMPT_VERSION = hashlib.sha256(SYSTEM.encode("utf-8")).hexdigest()[:16]
+_ARCHETYPE_MARKER = "__SETUP_ARCHETYPES__"
+
+
+_HYPOTHESIS_MARKER = "__HYPOTHESIS_LIST__"
+
+
+def build_system(cfg: dict) -> str:
+    """Assemble the system prompt for the configured strategy.
+
+    The shared text covers the parts that are true of any strategy this agent
+    runs - the risk contract, the snapshot field reference, the output schema.
+    The setup archetypes are strategy-specific and come from the register, so
+    the model is never told about setups belonging to a strategy it is not
+    running.
+
+    Substitution happens once at startup rather than per call: the invariant
+    that makes prompt caching work is byte-identical text on every call for a
+    given strategy, not one global constant.
+    """
+    fragment = spec_for(str(cfg["strategy"]["id"])).prompt_fragment.strip()
+    system = SYSTEM.replace(_ARCHETYPE_MARKER, fragment)
+    # The experimental list is versioned into the prompt rather than left
+    # open-ended, so every experimental trade is attributable to a claim
+    # registered before it was taken.
+    return system.replace(_HYPOTHESIS_MARKER, hypotheses.prompt_fragment())
+
+
+def prompt_version(system: str) -> str:
+    return hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
+
+
+# The key every recorded-but-withheld field lives under. One name, checked in
+# one place, so "is this field visible to the model?" has a mechanical answer.
+ENRICHMENT_KEY = "_enrichment"
+
+
+def withhold_enrichment(value):
+    """Return ``value`` with every ``_enrichment`` block removed.
+
+    B0.5 records fields the model must not see yet - open-interest deltas,
+    book state, realised-volatility ratios. They are journalled from the
+    moment collection starts, because a snapshot taken without them can never
+    be made to have them, and they are withheld from the prompt because
+    changing the prompt changes model behaviour and forks the comparability
+    of every observation either side of the change.
+
+    Showing the model a new field is therefore a deliberate, versioned act
+    belonging to its own batch, with its own attribution fork and its own
+    before-and-after replay. It is not a side effect of starting to record.
+
+    The copy is deep enough to protect the caller's dict and no deeper: the
+    journal writes the same snapshot object after the prompt is built, and it
+    must still see everything.
+    """
+    if isinstance(value, dict):
+        return {key: withhold_enrichment(item)
+                for key, item in value.items() if key != ENRICHMENT_KEY}
+    if isinstance(value, list):
+        return [withhold_enrichment(item) for item in value]
+    return value
 
 
 class LLM:
+    @staticmethod
+    def _sampling_unsupported(model: str) -> bool:
+        name = str(model).lower()
+        return name.startswith(("gpt-5", "o1", "o3", "o4"))
+
     def __init__(self, cfg: dict):
         self.cfg = cfg["llm"]
+        # Resolved once, then byte-identical for the life of the process,
+        # which is what both providers' prompt caches require.
+        self.system = build_system(cfg)
+        self.prompt_version = prompt_version(self.system)
         provider = self.cfg["provider"]
         self.provider = provider
         if provider == "anthropic":
@@ -325,9 +452,11 @@ class LLM:
                              "(use anthropic or openai)")
         # Newer models (Sonnet 5, Opus 4.7+) reject sampling parameters;
         # discovered once at runtime, then omitted from every later call.
-        self._no_temperature = False
+        self._no_temperature = self._sampling_unsupported(
+            self.cfg["model"])
         self._last_request_attempts: list[dict] = []
         self._last_response_audit: dict | None = None
+        self._last_usage_audit: dict | None = None
 
     def _anthropic_params(self, system: str, user: str) -> dict:
         params = dict(
@@ -353,6 +482,9 @@ class LLM:
                 {"role": "user", "content": user},
             ],
             response_format={"type": "json_object"},
+            # Stable routing key for the byte-identical system-prefix cache.
+            # Dynamic market/portfolio data remains after that prefix.
+            prompt_cache_key=f"okx-agent-{self.prompt_version}",
         )
         if not self._no_temperature:
             params["temperature"] = float(self.cfg.get("temperature", 0.2))
@@ -379,10 +511,26 @@ class LLM:
         self._last_response_id = getattr(resp, "id", None)
         u = getattr(resp, "usage", None)
         if u:
-            log.info("tokens: in=%s out=%s cache_write=%s cache_read=%s",
-                     u.input_tokens, u.output_tokens,
-                     getattr(u, "cache_creation_input_tokens", 0) or 0,
-                     getattr(u, "cache_read_input_tokens", 0) or 0)
+            total = int(getattr(u, "input_tokens", 0) or 0)
+            written = int(
+                getattr(u, "cache_creation_input_tokens", 0) or 0)
+            cached = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+            fresh = max(0, total - cached)
+            hit_rate = (cached / total * 100) if total else 0.0
+            self._last_usage_audit = {
+                "input_tokens_total": total,
+                "input_tokens_fresh": fresh,
+                "output_tokens": int(
+                    getattr(u, "output_tokens", 0) or 0),
+                "cache_write_tokens": written,
+                "cache_read_tokens": cached,
+                "cache_hit_pct": round(hit_rate, 1),
+            }
+            log.info(
+                "tokens: in_total=%s in_fresh=%s out=%s cache_write=%s "
+                "cache_read=%s cache_hit=%.1f%%",
+                total, fresh, self._last_usage_audit["output_tokens"],
+                written, cached, hit_rate)
         return "".join(
             b.text for b in resp.content if getattr(b, "type", "") == "text"
         )
@@ -413,27 +561,71 @@ class LLM:
             details = getattr(u, "prompt_tokens_details", None)
             if details:
                 cached = getattr(details, "cached_tokens", 0) or 0
-            log.info("tokens: in=%s out=%s cache_read=%s",
-                     u.prompt_tokens, u.completion_tokens, cached)
+            total = int(getattr(u, "prompt_tokens", 0) or 0)
+            output = int(getattr(u, "completion_tokens", 0) or 0)
+            fresh = max(0, total - int(cached))
+            hit_rate = (int(cached) / total * 100) if total else 0.0
+            self._last_usage_audit = {
+                "input_tokens_total": total,
+                "input_tokens_fresh": fresh,
+                "output_tokens": output,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": int(cached),
+                "cache_hit_pct": round(hit_rate, 1),
+            }
+            log.info(
+                "tokens: in_total=%s in_fresh=%s out=%s cache_read=%s "
+                "cache_hit=%.1f%%",
+                total, fresh, output, cached, hit_rate)
         return resp.choices[0].message.content or ""
 
     # ----------------------------------------------------------- public
 
     def preflight(self) -> str:
-        """Verify API-key access to the configured model without generating."""
+        """Verify API-key access to the configured model.
+
+        Prefer the metadata endpoint because it costs nothing. Gateways that
+        serve an OpenAI-compatible surface without implementing `/models`
+        (Azure AI Foundry among them) would otherwise fail this check while
+        being perfectly able to run the agent, so fall back to the smallest
+        possible generation. A wrong key or an unavailable deployment still
+        fails - it just fails on the call that actually matters.
+        """
         model = self.cfg["model"]
-        if self.provider == "anthropic":
-            info = self.client.models.retrieve(model_id=model)
-        else:
-            info = self.client.models.retrieve(model=model)
-        return str(getattr(info, "id", None)
-                   or getattr(info, "display_name", None) or model)
+        try:
+            if self.provider == "anthropic":
+                info = self.client.models.retrieve(model_id=model)
+            else:
+                info = self.client.models.retrieve(model=model)
+            return str(getattr(info, "id", None)
+                       or getattr(info, "display_name", None) or model)
+        except Exception as metadata_error:
+            try:
+                if self.provider == "anthropic":
+                    self.client.messages.create(
+                        model=model, max_tokens=1,
+                        messages=[{"role": "user", "content": "ping"}])
+                else:
+                    self.client.chat.completions.create(
+                        model=model, max_completion_tokens=1,
+                        messages=[{"role": "user", "content": "ping"}])
+            except Exception as generate_error:
+                raise RuntimeError(
+                    f"{model} is not reachable. Metadata lookup said: "
+                    f"{metadata_error}. A minimal generation said: "
+                    f"{generate_error}") from generate_error
+            return f"{model} (generation probe; /models not served)"
+
+    def endpoint(self) -> str:
+        """The base URL actually in use, so `check` can show it."""
+        return str(getattr(self.client, "base_url", "provider default"))
 
     @staticmethod
     def _user_message(snapshot: dict, portfolio: dict, max_new: int) -> str:
         return (
             "MARKET SNAPSHOT (liquid USDT perpetual swaps on OKX):\n"
-            + json.dumps(snapshot, separators=(",", ":"), allow_nan=False)
+            + json.dumps(withhold_enrichment(snapshot),
+                         separators=(",", ":"), allow_nan=False)
             + "\n\nPORTFOLIO STATE:\n"
             + json.dumps(portfolio, separators=(",", ":"), allow_nan=False)
             + f"\n\nYou may propose at most {max(0, max_new)} new \"open\" "
@@ -444,9 +636,9 @@ class LLM:
                       max_new: int) -> dict:
         """Return the exact initial provider request before it is sent."""
         user = self._user_message(snapshot, portfolio, max_new)
-        request = (self._anthropic_params(SYSTEM, user)
+        request = (self._anthropic_params(self.system, user)
                    if self.provider == "anthropic"
-                   else self._openai_params(SYSTEM, user))
+                   else self._openai_params(self.system, user))
         return {"provider": self.provider, "request": request}
 
     def call_audit(self) -> dict | None:
@@ -460,6 +652,7 @@ class LLM:
             "model": self.cfg["model"],
             "request_attempts": deepcopy(attempts),
             "response": deepcopy(response),
+            "usage": deepcopy(getattr(self, "_last_usage_audit", None)),
         }
 
     def decide(self, snapshot: dict, portfolio: dict, max_new: int) -> list[dict]:
@@ -468,8 +661,9 @@ class LLM:
         user = self._user_message(snapshot, portfolio, max_new)
         self._last_request_attempts = []
         self._last_response_audit = None
+        self._last_usage_audit = None
         self._last_response_id = None
-        text = self._call(SYSTEM, user)
+        text = self._call(self.system, user)
         decisions = parse_decisions(text)
         self._last_response_audit = {
             "id": self._last_response_id,
@@ -531,8 +725,30 @@ def parse_decisions(text: str) -> list[dict]:
                 "invalidation_anchor": str(
                     d.get("invalidation_anchor") or "").lower(),
                 "exit_policy": str(d.get("exit_policy") or "").lower(),
+                # Bounded and lowercased like every other model-supplied
+                # label. Validity is decided by the hypothesis register, not
+                # here: an unregistered id must reach build_setup_plan so it
+                # is rejected with a reason rather than silently dropped.
+                "hypothesis_id": str(
+                    d.get("hypothesis_id") or "").lower()[:60],
                 "execution_choice": str(
                     d.get("execution_choice") or "normal").lower(),
+                "what_changed_since_last_loss": str(
+                    d.get("what_changed_since_last_loss") or "")[:300],
+            })
+        elif action == "close":
+            trigger = str(d.get("close_trigger") or "").lower()
+            evidence_change = str(
+                d.get("evidence_change") or "").strip()[:500]
+            if trigger not in {
+                    "thesis_invalidated", "risk_reduction",
+                    "stale_position", "profit_protection"}:
+                continue
+            if len(evidence_change) < 12:
+                continue
+            item.update({
+                "close_trigger": trigger,
+                "evidence_change": evidence_change,
             })
         out.append(item)
     return out

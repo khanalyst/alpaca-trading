@@ -1,0 +1,99 @@
+# Pre-registration: flush-fade / v1
+#
+# Written BEFORE the first result. The parameter values below are the ones
+# that will be tested; changing them after seeing a result and re-reporting
+# without incrementing hypotheses_tested is how a noise finding gets
+# published as an edge.
+
+strategy_id: flush-fade
+version: v1
+status: registered
+
+mechanism: |
+  A liquidation engine sells at market regardless of price. The trader being
+  liquidated has no discretion: their margin ran out, so the flow is
+  price-insensitive, mechanically finite, and exhausts. Whoever supplies
+  liquidity into it is compensated for doing so.
+
+  The payer is identifiable and specific: the over-leveraged trader whose
+  position was closed for them. That is what distinguishes this from a
+  pattern - there is a named counterparty who cannot choose to stop.
+
+  Open interest is what separates the two cases that look identical on a
+  price chart. Price falling while OI FALLS is existing longs being closed
+  or liquidated. Price falling while OI RISES is new shorts being opened,
+  which is genuine bearish positioning and carries no reason to revert.
+
+prediction: |
+  Among the largest adverse 4h moves, bars where open interest fell by at
+  least 1% show positive mean reversion over the following 4-24 hours, and
+  bars where open interest rose show materially less or none.
+
+falsification: |
+  The two subsets behave alike. If reversion after an OI-falling flush is
+  statistically indistinguishable from reversion after an OI-rising move,
+  open interest adds nothing and the move is noise. Also falsified if the
+  placebo (identical procedure, entry timing randomised) reaches 25% or more
+  of the candidate's expectancy.
+
+# --- exactly what will be tested -------------------------------------------
+signal_timeframe: 15m
+lookback_bars: 16          # 4 hours
+min_move_atr: 1.5
+min_oi_drop_pct: 1.0
+min_relative_volume: 1.2
+stop_atr_multiple: 1.5
+reward_risk: 2.0
+max_hold_bars: 96          # 24 hours
+cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
+
+hypotheses_tested: 1
+multiple_testing_note: |
+  One parameter set, registered before the first run. Any variant tested
+  later must increment this count, and the reported result must be
+  discounted accordingly.
+
+data_limitation: |
+  OKX serves roughly 60 days of open-interest history. At a 4-24h horizon
+  that is a few hundred independent observations against a noise floor where
+  a placebo has already reached t = 2.60 on this data. A positive first
+  result is grounds for continued collection via research/record_flow.py,
+  never for promotion. This limitation is stated before the result so it
+  cannot be forgotten after a favourable one.
+
+# --- outcome, appended after the first run ---------------------------------
+# The parameters above were NOT changed after seeing this result. Tuning them
+# and re-reporting without incrementing hypotheses_tested is precisely how a
+# noise finding becomes a published edge.
+
+outcome: falsified
+outcome_evidence: research/results/tournament/REPORT.md
+outcome_summary: |
+  337 non-overlapping trades, 8 instruments, 2026-01 to 2026-07 (open
+  interest limits the usable span to ~60 days).
+
+    base costs        -0.2876%
+    frictionless      -0.0431%   negative BEFORE costs
+    null random time  -0.2313%   beats the signal
+    inverted          -0.3677%   also negative, so not a sign error
+    in-sample         -0.1954%
+    out-of-sample     -0.6100%   worse out-of-sample
+
+  Failed beat_nulls, survive_oos and survive_costs. Negative frictionless
+  with an inverted variant that is also negative is the signature of a
+  signal carrying no directional information, not of an edge hidden under
+  transaction costs.
+
+outcome_caveat: |
+  Underpowered by construction: OKX serves ~60 days of open interest, and
+  the detectability gate would want far more trades than that window can
+  produce. This does not rescue the result - an underpowered test pointing
+  the wrong way is not evidence of a hidden edge - but it does mean the
+  mechanism itself is untouched. What was falsified is this specific
+  operationalisation of it: a 4h lookback, a 1.5-ATR move, a 1% OI drop and
+  a 1.5-ATR stop at 2R.
+
+what_would_justify_a_retest: |
+  Materially more open-interest history (record_flow.py accumulates it), or
+  a different operationalisation with its own pre-registration and an
+  incremented hypothesis count. Not a parameter sweep over these values.

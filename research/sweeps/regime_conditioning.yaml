@@ -1,0 +1,31 @@
+# H-I. Pre-registered before any query was run against the corpus.
+#
+# The claim is not that range_breakout works. It is that range_breakout has
+# opposite-signed expectancy in two regimes, so the pooled figure is the
+# average of two populations and lands near zero - and that a test which
+# pools them will correctly reject a hypothesis that was true in half the
+# sample.
+#
+# This gates batch 6.4. That batch proposes separating range_breakout from
+# trend_continuation by trend alignment; if this partition is the real one,
+# 6.4 would encode a proxy of the right idea in the wrong variable and
+# contaminate the population this test needs.
+hypothesis: >-
+  range_breakout expectancy is positive only when volatility is expanding
+  from a compressed base, and negative when volatility is already elevated.
+base: momentum.baseline
+condition_axis:
+  variable: realised_vol_ratio_8_96
+  pre_registered: true
+  definition: >-
+    Realised volatility over the trailing 8 bars divided by realised
+    volatility over the trailing 96 bars, recorded in B0.5. Boundaries are
+    fixed here, before the query, and are not data-derived.
+  buckets:
+    - name: compression
+      max: 0.85
+    - name: neutral
+      min: 0.85
+      max: 1.20
+    - name: expansion
+      min: 1.20

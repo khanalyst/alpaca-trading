@@ -19,12 +19,14 @@ State semantics:
 import json
 import logging
 import math
+import os
 import time
 from datetime import datetime, timezone
 
 import ccxt
 
-from . import brain, market, state, strategy
+from . import (brain, contracts, market, registry, shadow, state,
+               strategy, variants)
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
                        EntryOrderRejected, Exchange)
@@ -37,13 +39,36 @@ log = logging.getLogger("engine")
 MAX_CREDENTIAL_FAILURES = 3
 
 
+class PositionAgeUnknown(RuntimeError):
+    """A held position cannot be proven to be inside max-hold policy."""
+
+    def __init__(self, symbols: list[str]):
+        self.symbols = sorted(set(symbols))
+        super().__init__(
+            "cannot recover opening time for held position(s): "
+            + ", ".join(self.symbols))
+
+
 class Engine:
     def __init__(self, cfg: dict, light: bool = False):
         self.cfg = cfg
+        # Protect library/direct callers as well as main.py: state and journal
+        # access must already be scoped to, and bound to, this exact key/mode.
+        state.configure_runtime(cfg["mode"])
+        state.bind_runtime_identity(
+            cfg["mode"], os.environ.get("OKX_API_KEY", ""))
         self.run_id = state.new_run_id()
         self.config_version = state.stable_fingerprint(cfg)
+        # Narrower than config_version: covers only the blocks that can
+        # change a decision, so an edit to an alert timeout no longer splits
+        # the sample this run's results will be pooled into.
+        self.strategy_config_version = state.strategy_fingerprint(cfg)
         self.code_version = state.code_fingerprint()
-        self.prompt_version = brain.PROMPT_VERSION
+        # Derived from the assembled per-strategy prompt. There is no module
+        # -level PROMPT_VERSION any more: each strategy gets its own prompt,
+        # so the version is a property of the configuration rather than of
+        # the module.
+        self.prompt_version = brain.prompt_version(brain.build_system(cfg))
         self.strategy_id, self.strategy_version = strategy.identity(cfg)
         state.set_journal_context(
             run_id=self.run_id,
@@ -52,6 +77,11 @@ class Engine:
             prompt_version=self.prompt_version,
             config_version=self.config_version,
             code_version=self.code_version,
+            strategy_config_version=self.strategy_config_version,
+            # Everything the live agent writes is attributed to "live".
+            # Replayed and shadow variants carry their own readable ids, so
+            # the two populations can never be pooled by accident.
+            variant_id=variants.LIVE_VARIANT_ID,
         )
         self.alerts = AlertManager(cfg)
         if not light:
@@ -66,10 +96,32 @@ class Engine:
             self.llm = brain.LLM(cfg)
             self.llm.preflight()
             self.risk = RiskEngine(cfg)
+        # Built once from the research block. None when shadow evaluation
+        # is off, which makes the whole feature a no-op rather than a
+        # default-on cost.
+        self.shadow = self._build_shadow(cfg)
         self.universe: list[str] = []
         self.universe_ts = 0.0
         self._startup_reconciled = False
         self._credential_failures = 0
+
+    @staticmethod
+    def _build_shadow(cfg: dict):
+        """Never fatal. A bad research block disables shadow, not trading."""
+        try:
+            from pathlib import Path
+            registry_path = (Path(__file__).resolve().parent.parent
+                             / "research" / "variants.yaml")
+            context = state.journal_context()
+            scope_key = (
+                f"{context.get('runtime_mode') or cfg.get('mode', 'unknown')}:"
+                f"{context.get('account_fingerprint') or 'unscoped'}")
+            return shadow.build(
+                cfg, variants.load_registry(registry_path),
+                scope_key=scope_key)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Shadow evaluation disabled: %s", exc)
+            return None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -88,9 +140,15 @@ class Engine:
             self.strategy_id, self.strategy_version = strategy.identity(
                 self.cfg)
         if not hasattr(self, "prompt_version"):
-            self.prompt_version = brain.PROMPT_VERSION
+            # Derived from the assembled per-strategy prompt, so the journal
+            # records which prompt actually ran rather than a global constant
+            # that no longer distinguishes strategies.
+            self.prompt_version = brain.prompt_version(
+                brain.build_system(self.cfg))
         if not hasattr(self, "config_version"):
             self.config_version = state.stable_fingerprint(self.cfg)
+        if not hasattr(self, "strategy_config_version"):
+            self.strategy_config_version = state.strategy_fingerprint(self.cfg)
         if not hasattr(self, "code_version"):
             self.code_version = state.code_fingerprint()
         state.set_journal_context(
@@ -100,6 +158,8 @@ class Engine:
             prompt_version=self.prompt_version,
             config_version=self.config_version,
             code_version=self.code_version,
+            strategy_config_version=self.strategy_config_version,
+            variant_id=variants.LIVE_VARIANT_ID,
         )
         st = state.load_state()
         state.log_run(
@@ -179,6 +239,37 @@ class Engine:
         finally:
             if owns_lock:
                 state.release_run_lock(run_lock)
+
+    def _decision_due(self, now: float) -> bool:
+        """True when the decision cadence has elapsed. Records the attempt.
+
+        Absent configuration means every cycle is a decision cycle, which is
+        the pre-B9.2 behaviour, so this cannot change an existing deployment
+        until it is deliberately configured.
+        """
+        interval = self.cfg["cycle"].get("decision_interval_seconds")
+        if not interval:
+            # Unconfigured means no gate at all, rather than a gate set to
+            # the housekeeping cadence. Those are not the same thing: the run
+            # loop already sleeps interval_seconds between cycles, so a gate
+            # at that value would do nothing in the ordinary case and would
+            # silently drop a decision whenever a cycle finished marginally
+            # early. A feature that is off must be off.
+            return True
+
+        # A tolerance below the configured interval, for the same reason:
+        # scheduling jitter must not be able to defer a decision by a whole
+        # extra period.
+        last = getattr(self, "_last_decision_ts", None)
+        if last is not None and (now - last) < float(interval) * 0.95:
+            state.log_event("decision_skipped", self._audit_json({
+                "reason": "decision cadence not elapsed",
+                "seconds_since_last": round(now - last, 1),
+                "decision_interval_seconds": float(interval),
+            }))
+            return False
+        self._last_decision_ts = now
+        return True
 
     def _wait_for_next_cycle(self) -> None:
         """Sleep responsively so a kill is observed within about one second."""
@@ -280,6 +371,63 @@ class Engine:
             "USDT (non-USDT assets are excluded)", equity)
         return True
 
+    def _sync_transfers(self, st: dict, now: float) -> None:
+        """Apply each external cash flow once, with honest identity status."""
+        since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
+        processed = dict(st.get("processed_transfer_ids") or {})
+        pending = dict(st.get("transfer_reconciliation_required") or {})
+        batch = self.ex.transfers_since(since, set(processed))
+        net_transfer, next_since = batch
+        records = getattr(batch, "records", None)
+
+        if records is None:
+            # Compatibility for exchange fakes and journals produced before
+            # ledger identity was exposed. The amount is applied, but the
+            # aggregate is explicitly not represented as exactly deduplicated.
+            if abs(float(net_transfer)) > 0.01:
+                key = f"legacy-aggregate:{since}:{next_since}"
+                payload = {
+                    "net_usdt": float(net_transfer),
+                    "identity_status": "legacy_aggregate",
+                    "reconciliation_required": True,
+                    "reconciliation_key": key,
+                }
+                pending[key] = payload
+                state.log_event("transfer", json.dumps(payload))
+        else:
+            for record in records:
+                payload = record.as_event()
+                transfer_id = payload.get("transfer_id")
+                if transfer_id:
+                    processed[str(transfer_id)] = float(
+                        payload.get("ledger_ts_ms") or 0)
+                else:
+                    pending[str(payload["reconciliation_key"])] = payload
+                    state.log_event(
+                        "warning", json.dumps({
+                            "kind": "transfer_reconciliation_required",
+                            **payload,
+                        }))
+                state.log_event("transfer", json.dumps(payload))
+
+        # Bound operational state without weakening database history.
+        st["processed_transfer_ids"] = dict(sorted(
+            processed.items(), key=lambda item: item[1], reverse=True)[:2000])
+        st["transfer_reconciliation_required"] = dict(
+            list(pending.items())[-200:])
+        st["last_ledger_ts"] = int(next_since)
+
+        if abs(float(net_transfer)) <= 0.01:
+            return
+        log.info("Net transfer detected: %+.2f USDT; rebasing benchmarks",
+                 net_transfer)
+        if st.get("high_water_mark"):
+            st["high_water_mark"] = max(
+                1e-9, float(st["high_water_mark"]) + float(net_transfer))
+        if st.get("day_start_equity"):
+            st["day_start_equity"] = max(
+                1e-9, float(st["day_start_equity"]) + float(net_transfer))
+
     def cycle(self, st: dict) -> None:
         now = time.time()
         state.set_journal_context(
@@ -326,6 +474,30 @@ class Engine:
                 positions, st, startup=not self._startup_reconciled)
             self._startup_reconciled = True
             reconciled = not invalid_position_metrics
+        except PositionAgeUnknown as exc:
+            # Keep verified exchange-side protection in place, preserve the
+            # adopted trade metadata, and require an operator decision. A
+            # guessed "opened now" timestamp would silently reset max-hold.
+            state.commit(st)
+            paused = state.set_state(
+                state.PAUSED,
+                "position age is unknown; inspect OKX and flatten or resume "
+                "only after resolving: " + ", ".join(exc.symbols),
+                operator_pause=True,
+            )
+            st.clear()
+            st.update(paused)
+            detail = {"symbols": exc.symbols}
+            log.critical(
+                "Position age unavailable for %s; agent PAUSED",
+                ", ".join(exc.symbols))
+            state.log_event(
+                "position_age_unknown", self._audit_json(detail))
+            self.alerts.send(
+                "critical", "position_age_unknown",
+                "Agent paused because max-hold age cannot be verified",
+                detail)
+            reconciled = False
         except Exception as exc:
             # A reconciliation problem must not disable the account-level
             # circuit breakers below. Trade conservatively instead: keep
@@ -357,19 +529,7 @@ class Engine:
             st.get("recent_setups") or {}, now)
 
         # --- deposits / withdrawals: rebase benchmarks, never trade on them
-        since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
-        net_transfer, next_since = self.ex.transfers_since(since)
-        if abs(net_transfer) > 0.01:
-            log.info("Net transfer detected: %+.2f USDT; rebasing benchmarks",
-                     net_transfer)
-            if st.get("high_water_mark"):
-                st["high_water_mark"] = max(
-                    1e-9, st["high_water_mark"] + net_transfer)
-            if st.get("day_start_equity"):
-                st["day_start_equity"] = max(
-                    1e-9, st["day_start_equity"] + net_transfer)
-            state.log_event("transfer", json.dumps({"net_usdt": net_transfer}))
-        st["last_ledger_ts"] = next_since
+        self._sync_transfers(st, now)
 
         # --- UTC day rollover
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -442,18 +602,85 @@ class Engine:
         # --- position housekeeping (runs in every state except KILLED)
         positions = self._manage_positions(positions, st, equity)
 
-        if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
-            return  # PAUSED: no LLM calls, no new trades
+        can_decide = st["state"] in (state.RUNNING, state.DAY_STOPPED)
+        decision_due = bool(
+            can_decide
+            and not (st["state"] == state.DAY_STOPPED and not positions)
+            and self._decision_due(now))
+
+        # Local SHADOW/PAPER accounts are independent of the exchange account.
+        # Refresh their held symbols even after the live universe reranks, and
+        # advance them before every pause/day-stop/cadence/LLM early return.
+        evaluator = getattr(self, "shadow", None)
+        shadow_symbols = []
+        if evaluator is not None:
+            try:
+                shadow_symbols = evaluator.held_symbols()
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("Could not inspect shadow held symbols: %s", exc)
+        if not decision_due and evaluator is None:
+            return
+
+        # Two symbol sets, deliberately. The live path may only see what live
+        # universe selection chose plus what the exchange account actually
+        # holds. Symbols present solely because a local variant account holds
+        # them are fetched so that account can mark its own positions, and are
+        # withheld from everything else: they would otherwise reach the model
+        # as candidates and inflate the breadth count that vetoes opens, which
+        # would let a simulated position change a real one.
+        live_symbols = list(dict.fromkeys(
+            self.universe + [p["symbol"] for p in positions]))
+        symbols = list(dict.fromkeys(live_symbols + shadow_symbols))
+        snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
+        if snapshot and evaluator is not None:
+            self._advance_shadow_variants(snapshot, now)
+        # Everything below this line runs on the restricted view, so the live
+        # decision is byte-identical to the one taken with shadow disabled.
+        live_snapshot = market.restrict_snapshot(snapshot, live_symbols)
+
+        if not can_decide:
+            return  # PAUSED: shadow marks advance, but there is no LLM call
         if st["state"] == state.DAY_STOPPED and not positions:
             return  # opens blocked and nothing held: an LLM call cannot act
 
-        # --- build snapshot and ask the brain
-        symbols = list(dict.fromkeys(
-            self.universe + [p["symbol"] for p in positions]))
-        snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
-        if not snapshot:
+        # --- B9.2: decisions run on their own cadence, housekeeping does not
+        #
+        # Everything above this line has already run: reconciliation, the
+        # protection audit, cooldown expiry, the day rollover, both circuit
+        # breakers and the max-hold force close inside _manage_positions.
+        # They keep running every interval_seconds, so safety reaction time
+        # is unchanged.
+        #
+        # What is skipped is the live-decision recording and LLM call. When
+        # shadow research is enabled, its local accounts still receive a
+        # market snapshot so held positions cannot go stale. Measured
+        # over the corpus, 66.5% of cycles observe only signal bars that were
+        # already evaluated, and an LLM call on one of those cannot produce a
+        # fresh evaluation for any symbol - strategy.evaluated_signal blocks
+        # it. Simply raising interval_seconds would also slow the margin
+        # guard to 15 minutes, which is not an acceptable trade; this split
+        # avoids that.
+        if not decision_due:
+            return
+
+        # --- ask the brain using the same snapshot every variant just marked
+        if not live_snapshot:
             log.warning("Empty market snapshot; holding")
             return
+
+        # Every registered contract is evaluated on this snapshot, not just
+        # the one that is trading. Costs no LLM call and places no order.
+        # Restricted like the live path: a cross-strategy population whose
+        # symbol set moved with another variant's holdings would not be
+        # comparable from one cycle to the next.
+        self._record_shadow_decisions(live_snapshot)
+
+        # B0.5: start the irreversible clock. These fields are journalled and
+        # read by nothing for months - that is the point. A snapshot taken
+        # today without open interest in it can never be made to have open
+        # interest in it, so the only genuinely unrecoverable decision in the
+        # programme is the decision not to record.
+        self._record_observations(live_snapshot)
 
         portfolio = self._portfolio_view(equity, positions, st,
                                          day_pnl_pct, drawdown_pct)
@@ -466,9 +693,9 @@ class Engine:
         # The model is the one nondeterministic component in the pipeline.
         # Journal the exact provider request and the raw provider result so
         # every parsed decision - and every silent hold - can be reconstructed.
-        self._journal_llm_input(snapshot, portfolio, max_new)
+        self._journal_llm_input(live_snapshot, portfolio, max_new)
         try:
-            decisions = self.llm.decide(snapshot, portfolio, max_new)
+            decisions = self.llm.decide(live_snapshot, portfolio, max_new)
         except Exception as e:
             self._journal_llm_output()
             log.error("LLM call failed; holding this cycle: %s", e)
@@ -481,6 +708,11 @@ class Engine:
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
+        # Reuse the exact parsed proposals and confidences. No second LLM call,
+        # and no deterministic confidence substitution.
+        self._run_shadow_variants(
+            snapshot, equity, positions, st, 0.0, decisions=decisions,
+            advance_accounts=False)
         # Pick up any pause/kill the CLI issued while the LLM call was running.
         state.commit(st)
         if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
@@ -493,9 +725,36 @@ class Engine:
                 return
             pos = next((p for p in positions
                         if p.get("symbol") == d.get("symbol")), None)
-            if pos and self._close(pos,
-                                   "model close: " + d.get("reasoning", ""),
-                                   st):
+            if pos and self._too_young_to_close(pos, d, st):
+                continue
+            if pos:
+                trade = (st.get("active_trades") or {}).get(
+                    d.get("symbol")) or {}
+                state.log_event(
+                    "model_close_audit",
+                    self._audit_json({
+                        "symbol": d.get("symbol"),
+                        "trade_id": trade.get("trade_id"),
+                        "setup_id": trade.get("setup_id"),
+                        "close_trigger": d.get("close_trigger"),
+                        "evidence_change": d.get("evidence_change"),
+                        "reasoning": d.get("reasoning"),
+                        "original_thesis": {
+                            "reason": trade.get("entry_reason"),
+                            "entry_evidence": trade.get("entry_evidence"),
+                            "invalidation_anchor": trade.get(
+                                "invalidation_anchor"),
+                            "exit_policy": trade.get("exit_policy"),
+                        },
+                    }),
+                    setup_id=trade.get("setup_id"),
+                )
+            if pos and self._close(
+                    pos,
+                    "model close: " + d.get("reasoning", ""),
+                    st,
+                    close_trigger=d.get("close_trigger"),
+                    close_evidence=d.get("evidence_change")):
                 positions.remove(pos)
 
         # --- opens (blocked while DAY_STOPPED or after a failed reconcile,
@@ -515,7 +774,7 @@ class Engine:
             if latest["state"] != state.RUNNING:
                 return
             prepared, why = self._prepare_setup_decision(
-                d, snapshot, st)
+                d, live_snapshot, st)
             if not prepared:
                 log.info("Rejected %s %s: %s", d.get("direction"),
                          d.get("symbol"), why)
@@ -523,10 +782,11 @@ class Engine:
                     {"symbol": d.get("symbol"), "why": why}))
                 continue
             plan, why = self.risk.vet_open(
-                prepared, equity, positions, snapshot,
-                                           st.get("cooldowns", {}), gross,
-                                           st.get("entry_feedback", {}),
-                                           st.get("entry_failures", {}))
+                prepared, equity, positions, live_snapshot,
+                st.get("cooldowns", {}), gross,
+                st.get("entry_feedback", {}),
+                st.get("entry_failures", {}),
+                st.get("active_trades", {}))
             if not plan:
                 self._mark_setup_status(
                     st, prepared["setup_id"], "risk_rejected")
@@ -557,6 +817,96 @@ class Engine:
                     self._mark_setup_status(
                         st, plan["setup_id"], "execution_rejected")
         state.commit(st)
+
+    def _run_shadow_variants(self, snapshot: dict, equity: float,
+                             positions: list, st: dict,
+                             gross_notional: float, *,
+                             decisions: list[dict] | None = None,
+                             advance_accounts: bool = True) -> None:
+        """Evaluate registered parameter variants against this snapshot.
+
+        Three properties, each individually tested. It consumes only the
+        already-journalled model response and has no exchange, so it cannot
+        change the live decision. It is wrapped in try/except, so a failure is
+        journalled and swallowed. And it writes only
+        ``variant_shadow_decision`` events, never a key in
+        ``state.LOOP_KEYS``, so it cannot corrupt trading state even if it
+        is wrong. The distinct name prevents parameter-variant records from
+        being pooled with cross-strategy shadow records, whose payload has a
+        different schema and research meaning.
+
+        A research feature that could interrupt a trading cycle would be a
+        safety regression however good its output.
+        """
+        evaluator = getattr(self, "shadow", None)
+        if evaluator is None:
+            return
+        del equity, positions, st, gross_notional
+        try:
+            records = evaluator.evaluate(
+                snapshot, now=time.time(),
+                cycle_id=state.journal_context().get("cycle_id"),
+                proposals=decisions,
+                advance_accounts=advance_accounts)
+            for record in records:
+                state.log_event(
+                    "variant_shadow_decision",
+                    self._audit_json(record.as_event()),
+                    variant_id=record.variant_id)
+                if record.paper_action:
+                    state.log_event(
+                        ("variant_paper_trade"
+                         if record.portfolio_status == "PAPER"
+                         else "variant_shadow_trade"),
+                        self._audit_json(record.as_event()),
+                        variant_id=record.variant_id)
+            coverage = getattr(evaluator, "last_coverage", None)
+            if coverage:
+                state.log_event(
+                    "shadow_coverage", self._audit_json(coverage))
+            budget = getattr(evaluator, "last_budget", None)
+            if budget is not None and budget.overran:
+                state.log_event("shadow_budget_overrun", self._audit_json({
+                    "limit_ms": budget.limit_ms,
+                    "spent_ms": round(budget.spent_ms(), 2),
+                    "records": len(records),
+                    "coverage": getattr(evaluator, "last_coverage", {}),
+                }))
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Shadow variant evaluation failed: %s", exc)
+            try:
+                state.log_event("shadow_failed", self._audit_json(
+                    {"error": f"{type(exc).__name__}: {exc}"}))
+            except Exception:                              # noqa: BLE001
+                pass
+
+    def _advance_shadow_variants(self, snapshot: dict, now: float) -> None:
+        """Advance local accounts without scheduling any new proposal."""
+        evaluator = getattr(self, "shadow", None)
+        if evaluator is None:
+            return
+        try:
+            records = evaluator.advance(snapshot, now=now)
+            for record in records:
+                state.log_event(
+                    "variant_shadow_decision",
+                    self._audit_json(record.as_event()),
+                    variant_id=record.variant_id)
+                if record.paper_action:
+                    state.log_event(
+                        ("variant_paper_trade"
+                         if record.portfolio_status == "PAPER"
+                         else "variant_shadow_trade"),
+                        self._audit_json(record.as_event()),
+                        variant_id=record.variant_id)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Shadow portfolio advance failed: %s", exc)
+            try:
+                state.log_event("shadow_failed", self._audit_json(
+                    {"phase": "advance",
+                     "error": f"{type(exc).__name__}: {exc}"}))
+            except Exception:                              # noqa: BLE001
+                pass
 
     # ------------------------------------------------------ reconciliation
 
@@ -637,6 +987,7 @@ class Engine:
         protection = st.setdefault("protection", {})
         opened_at = st.setdefault("opened_at", {})
         cooldowns = st.setdefault("cooldowns", {})
+        unknown_age: list[str] = []
 
         # A tracked trade that disappeared was closed by exchange-side SL/TP
         # or another operator. Recover actual fills before allowing a re-entry.
@@ -648,6 +999,24 @@ class Engine:
             same_id = (not live_id or not trade.get("position_id")
                        or str(live_id) == str(trade.get("position_id")))
             if live is not None and same_direction and same_id:
+                opened = float(
+                    trade.get("opened_at")
+                    or opened_at.get(symbol) or 0)
+                if opened > 0:
+                    trade["opened_at"] = opened
+                    trade["age_known"] = True
+                    opened_at[symbol] = opened
+                if not trade.get("age_known", opened > 0) or opened <= 0:
+                    recovered = self.ex.position_opened_at(live)
+                    if recovered is None:
+                        trade["opened_at"] = 0.0
+                        trade["age_known"] = False
+                        opened_at.pop(symbol, None)
+                        unknown_age.append(symbol)
+                    else:
+                        trade["opened_at"] = float(recovered)
+                        trade["age_known"] = True
+                        opened_at[symbol] = float(recovered)
                 continue
             replaced = live is not None
             try:
@@ -701,6 +1070,10 @@ class Engine:
                     signal_ts=trade.get("signal_ts"),
                     exit_policy=trade.get("exit_policy"),
                     invalidation_anchor=trade.get("invalidation_anchor"),
+                    close_trigger="exchange_protection",
+                    close_evidence=(
+                        "position disappeared from OKX and actual exit "
+                        "fills were reconciled"),
                 )
                 if total_realized < 0:
                     cooldown = float(
@@ -713,7 +1086,8 @@ class Engine:
                     "setup_id": trade.get("setup_id"),
                 }), setup_id=trade.get("setup_id"))
                 self._mark_setup_status(
-                    st, trade.get("setup_id"), "closed", cooldown=True)
+                    st, trade.get("setup_id"), "closed", cooldown=True,
+                    realized_pnl_usd=total_realized)
                 active.pop(symbol, None)
                 protection.pop(symbol, None)
                 opened_at.pop(symbol, None)
@@ -758,10 +1132,15 @@ class Engine:
                 trade_id = state.new_trade_id()
                 entry = float(pos.get("entryPrice") or mark)
                 notional = self._notional(pos)
+                recovered_opened_at = opened_at.get(symbol)
+                if not recovered_opened_at:
+                    recovered_opened_at = self.ex.position_opened_at(pos)
+                age_known = bool(recovered_opened_at)
                 active[symbol] = {
                     "trade_id": trade_id,
                     "direction": direction,
-                    "opened_at": float(opened_at.get(symbol) or time.time()),
+                    "opened_at": float(recovered_opened_at or 0),
+                    "age_known": age_known,
                     "entry_price": entry,
                     "entry_notional": notional,
                     "qty": contracts,
@@ -781,7 +1160,11 @@ class Engine:
                         or "unknown-run"),
                     "cycle_id": state.journal_context().get("cycle_id"),
                 }
-                opened_at[symbol] = active[symbol]["opened_at"]
+                if age_known:
+                    opened_at[symbol] = active[symbol]["opened_at"]
+                else:
+                    opened_at.pop(symbol, None)
+                    unknown_age.append(symbol)
                 state.log_trade(
                     symbol, "buy" if direction == "long" else "sell", "open",
                     contracts, entry, notional, pos.get("leverage") or 0,
@@ -881,6 +1264,8 @@ class Engine:
         if startup:
             log.info("Startup reconciliation complete: %d open position(s)",
                      len(actual))
+        if unknown_age:
+            raise PositionAgeUnknown(unknown_age)
         return list(actual.values())
 
     # ------------------------------------------------------------ execution
@@ -1060,6 +1445,68 @@ class Engine:
             symbol, delay, classification, count)
         return record
 
+    def _maker_first_attempt(self, plan: dict, st: dict, symbol: str,
+                             side: str, contracts: float, sl_price: float,
+                             tp_price: float, reference: float):
+        """Try passively first. Returns a settled execution, or None to cross.
+
+        H-K(ii). Every IOC entry crosses the spread and accepts adverse
+        selection, and at a 2% stop round-trip friction is roughly 10% of the
+        risk unit - so converting the filled fraction from taker to maker
+        moves expectancy by more than most of the parameter axes queued for
+        sweeping, without requiring any signal to have edge.
+
+        Failure degrades to crossing, never to no entry and never to a
+        resting order. A broken experiment must fall back to the behaviour
+        that already works.
+        """
+        execution_cfg = self.cfg["execution"]
+        if not execution_cfg.get("maker_first_enabled"):
+            return None
+
+        try:
+            attempt = self.ex.maker_first_entry(
+                symbol, side, contracts, plan["leverage"], sl_price,
+                tp_price,
+                float(execution_cfg["maker_first_wait_seconds"]),
+                reference)
+        except CredentialError:
+            raise
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("maker-first attempt failed for %s, crossing: %s",
+                        symbol, exc)
+            state.log_event("maker_attempt", self._audit_json({
+                "symbol": symbol, "outcome": "error",
+                "error": f"{type(exc).__name__}: {exc}"}))
+            return None
+
+        journalled = {k: v for k, v in attempt.items() if k != "execution"}
+        state.log_event("maker_attempt", self._audit_json({
+            "symbol": symbol,
+            "outcome": ("filled" if attempt["fill_rate"] >= 1.0
+                        else "partial" if attempt["filled_contracts"] > 0
+                        else "unfilled"),
+            **journalled}))
+
+        if attempt.get("resting"):
+            # The cancel failed and the order may still be live. Crossing now
+            # could double the position, so this cycle ends here.
+            log.error("maker-first order for %s may still be resting; "
+                      "not crossing on top of it", symbol)
+            self.alerts.send(
+                "critical", "maker_order_may_rest",
+                f"A maker-first entry order for {symbol} could not be "
+                "cancelled and may still be resting",
+                {"symbol": symbol, "order_id": attempt.get("order_id")})
+            return attempt.get("execution") or False
+
+        # A partial fill is NOT topped up by crossing the remainder. Splitting
+        # one setup across two prices would make the recorded entry an average
+        # of two decisions, and entry price is exactly what H-K(ii) measures.
+        # The position is smaller than planned, which is journalled and is the
+        # conservative direction.
+        return attempt.get("execution")
+
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
         if state.load_state()["state"] != state.RUNNING:
@@ -1148,6 +1595,19 @@ class Engine:
             log.info("Control state changed before order; skipping %s", symbol)
             return False
 
+        # B7.5 / H-K(ii): post passively first when enabled, then cross.
+        # A passive fill returns a settled execution shaped exactly like
+        # open_position's, so the bookkeeping below is identical either way -
+        # same trade row, same liquidation check, same protection audit.
+        maker = self._maker_first_attempt(
+            plan, st, symbol, side, contracts, sl_price, tp_price,
+            entry_reference)
+        if maker is False:
+            return False                     # order may be resting; stop
+        if maker is not None:
+            return self._settle_entry(
+                plan, st, maker, symbol, side, sl_price, tp_price)
+
         try:
             execution = self.ex.open_position(
                 symbol, side, contracts, plan["leverage"], sl_price, tp_price,
@@ -1161,6 +1621,27 @@ class Engine:
             log.error("Entry failed for %s: %s", symbol, e)
             return False
 
+        return self._settle_entry(
+            plan, st, execution, symbol, side, sl_price, tp_price)
+
+    def _settle_entry(self, plan: dict, st: dict, execution: dict,
+                      symbol: str, side: str, sl_price: float,
+                      tp_price: float) -> bool:
+        """Everything that must happen once an entry has actually filled.
+
+        Extracted so that any path which can create a position runs the same
+        code: the trade journal row, the liquidation-distance check, the
+        protection audit that confirms the exchange-side stop really exists,
+        and the state bookkeeping that lets reconciliation recognise the
+        position later.
+
+        This exists because B7.5 needs a second entry path. A passive
+        maker-first fill creates a position exactly as an IOC fill does, and
+        a position that skipped any of the below is one the engine cannot
+        manage - unjournalled, unverified, or invisible to reconciliation.
+        Sharing the code is the only way both paths stay correct as it
+        changes.
+        """
         filled = float(execution["filled"])
         fill_price = float(execution["average"])
         contract_size = float(
@@ -1191,6 +1672,7 @@ class Engine:
             "trade_id": trade_id,
             "direction": plan["direction"],
             "opened_at": opened,
+            "age_known": True,
             "entry_price": fill_price,
             "entry_notional": actual_notional,
             "qty": filled,
@@ -1209,6 +1691,11 @@ class Engine:
             "signal_ts": plan.get("signal_ts"),
             "exit_policy": plan.get("exit_policy"),
             "invalidation_anchor": plan.get("invalidation_anchor"),
+            "entry_reason": (
+                plan.get("reason") or "model supplied no entry thesis"),
+            "entry_evidence": plan.get("entry_evidence") or {},
+            "stop_loss_pct": plan.get("sl_pct"),
+            "take_profit_pct": plan.get("tp_pct"),
             "run_id": getattr(
                 self, "run_id", state.journal_context().get("run_id")
                 or "unknown-run"),
@@ -1376,14 +1863,20 @@ class Engine:
         if persistence_error is not None:
             raise persistence_error
         log.info("OPENED %s %s | notional %.0f USDT | %.1fx | SL %.2f%% "
-                 "all-in risk %.2f%% | TP %.2f%% | conf %.2f | %s",
+                 "all-in risk %.2f%% | equity at risk %.2f%% (sized by %s) | "
+                 "TP %.2f%% | conf %.2f | %s",
                  plan["direction"].upper(), symbol, actual_notional,
                  plan["leverage"], plan["sl_pct"], estimated_loss_pct,
+                 risk_usd / plan["entry_equity_usd"] * 100.0
+                 if plan.get("entry_equity_usd") else float("nan"),
+                 plan.get("sizing_constraint", "unknown"),
                  plan["tp_pct"],
                  plan["confidence"], plan["reason"])
         return True
 
-    def _close(self, pos: dict, reason: str, st: dict) -> bool:
+    def _close(self, pos: dict, reason: str, st: dict,
+               *, close_trigger: str | None = None,
+               close_evidence: str | None = None) -> bool:
         symbol = pos["symbol"]
         try:
             execution = self.ex.close_position(pos)
@@ -1392,6 +1885,10 @@ class Engine:
             return False
         trade = (st.get("active_trades") or {}).get(symbol) or {}
         direction = trade.get("direction") or self._direction(pos)
+        if close_trigger is None:
+            close_trigger = "engine_safety"
+        if close_evidence is None:
+            close_evidence = reason
         if not execution.get("fully_closed"):
             remaining = float(execution.get("remaining_contracts") or 0)
             filled = float(execution.get("filled") or 0)
@@ -1442,7 +1939,9 @@ class Engine:
                 setup_type=trade.get("setup_type"),
                 signal_ts=trade.get("signal_ts"),
                 exit_policy=trade.get("exit_policy"),
-                invalidation_anchor=trade.get("invalidation_anchor"))
+                invalidation_anchor=trade.get("invalidation_anchor"),
+                close_trigger=close_trigger,
+                close_evidence=close_evidence)
             self._log_order_execution(
                 symbol, "partial_close", execution, trade)
             state.commit(st)
@@ -1510,19 +2009,227 @@ class Engine:
             setup_type=trade.get("setup_type"),
             signal_ts=trade.get("signal_ts"),
             exit_policy=trade.get("exit_policy"),
-            invalidation_anchor=trade.get("invalidation_anchor"))
+            invalidation_anchor=trade.get("invalidation_anchor"),
+            close_trigger=close_trigger,
+            close_evidence=close_evidence)
         self._log_order_execution(symbol, "close", execution, trade)
         if total_realized < 0:
             cooldown = float(self.cfg["risk"]["cooldown_minutes_after_loss"])
             st.setdefault("cooldowns", {})[symbol] = time.time() + cooldown * 60
         self._mark_setup_status(
-            st, trade.get("setup_id"), "closed", cooldown=True)
+            st, trade.get("setup_id"), "closed", cooldown=True,
+            realized_pnl_usd=total_realized)
         st.get("opened_at", {}).pop(symbol, None)
         st.get("active_trades", {}).pop(symbol, None)
         st.get("protection", {}).pop(symbol, None)
         state.commit(st)
         log.info("CLOSED %s (%s, %+.2f USDT realized): %s",
                  symbol, direction, total_realized, reason)
+        return True
+
+    @staticmethod
+    def _plain(value):
+        """JSON-safe number, or None.
+
+        The journal serializer runs with allow_nan=False, so a single NaN
+        field would raise and cost the whole cycle's shadow records for that
+        strategy. A missing measurement recorded as null is recoverable;
+        a lost cycle is not.
+        """
+        if value is None or isinstance(value, (bool, str)):
+            return value if not isinstance(value, bool) else value
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _shadow_cfg(self, spec) -> dict:
+        """Config a shadow strategy's contract is evaluated against.
+
+        The active strategy uses config.yaml unchanged, so its shadow record
+        is exactly what the live contract saw. Every other strategy uses the
+        parameters declared on its registry entry, so a shadow result is
+        attributable to a stated parameter set rather than to whichever
+        strategy happened to be trading that day.
+        """
+        if spec.id == str(self.cfg["strategy"]["id"]):
+            return self.cfg
+        block = dict(self.cfg["strategy"])
+        block.update(spec.contract_params)
+        block["id"] = spec.id
+        block["version"] = spec.version
+        return {**self.cfg, "strategy": block}
+
+    def _record_shadow_decisions(self, snapshot: dict) -> None:
+        """Journal what every registered contract would have done.
+
+        This is the cheapest way to forward-test strategies that hold no
+        capital: without it, evaluating N strategies takes N times as long as
+        evaluating one, because each has to wait its turn at the account.
+        With it, every registered contract accumulates genuine out-of-sample
+        evidence from the same market data, at the same moments, starting the
+        day it is registered.
+
+        Recording the ACTIVE strategy too is deliberate and is the point that
+        is easy to miss: comparing what the contract fired on against what
+        the model actually took is the only direct measurement of what the
+        LLM layer contributes. Offline research can bound that; it cannot
+        observe it.
+
+        Deterministic only. No orders, no LLM call, no position state. Never
+        allowed to raise: shadow bookkeeping must not be able to interrupt
+        trading.
+        """
+        symbols = [s for s in snapshot
+                   if not s.startswith("_") and isinstance(snapshot[s], dict)]
+        for strategy_id, builder in sorted(contracts.EVIDENCE_BUILDERS.items()):
+            try:
+                spec = registry.spec_for(strategy_id)
+                shadow_cfg = self._shadow_cfg(spec)
+                fired = []
+                for symbol in symbols:
+                    data = snapshot[symbol]
+                    evidence = builder(data, shadow_cfg)
+                    for setup in spec.setup_types:
+                        contract = evidence.get(setup)
+                        if not isinstance(contract, dict):
+                            continue
+                        for direction in ("long", "short"):
+                            if contract.get(direction) is not True:
+                                continue
+                            extension = (evidence.get("extension_atr")
+                                         or {}).get(direction)
+                            fired.append({
+                                "symbol": symbol,
+                                "setup_type": setup,
+                                "direction": direction,
+                                "price": self._plain(data.get("price")),
+                                "signal_ts": self._plain(data.get("signal_ts")),
+                                "atr_1h_pct": self._plain(data.get("atr_1h_pct")),
+                                "swing_low_pct": self._plain(
+                                    data.get("swing_low_pct")),
+                                "swing_high_pct": self._plain(
+                                    data.get("swing_high_pct")),
+                                "extension_atr": self._plain(extension),
+                            })
+                # One summary per strategy per cycle. Without the denominator
+                # a count of firings cannot be turned into a rate.
+                state.log_event(
+                    "strategy_shadow_summary",
+                    self._audit_json({
+                        "instruments_scanned": len(symbols),
+                        "instruments_fired": len({f["symbol"]
+                                                  for f in fired}),
+                        "signals": len(fired),
+                        "is_active": spec.id == str(
+                            self.cfg["strategy"]["id"]),
+                    }),
+                    strategy_id=spec.id,
+                    strategy_version=spec.version,
+                )
+                for signal in fired:
+                    state.log_event(
+                        "strategy_shadow_decision", self._audit_json(signal),
+                        strategy_id=spec.id, strategy_version=spec.version)
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("Shadow evaluation failed for %s: %s",
+                            strategy_id, exc)
+
+    def _record_observations(self, snapshot: dict) -> None:
+        """Journal the enrichment fields and the per-cycle book state.
+
+        Two events, both write-only for now, and deliberately so. Nothing in
+        this repository reads them today; H-G and H-H cannot be tested for
+        roughly three months because the sample does not exist yet. Waiting
+        until the analysis is ready to write the collection would mean
+        starting the three-month clock three months late.
+
+        ``book_state`` is the one that matters most and costs the least. The
+        depth and spread reading already happens at entry, but it is only
+        journalled when it *rejects*, so every ordinary observation is thrown
+        away - and the ordinary observations are the baseline against which a
+        cascade's depth collapse and refill are measured.
+
+        Never raises. Observation must not be able to interrupt trading.
+        """
+        symbols = [s for s in snapshot
+                   if not s.startswith("_") and isinstance(snapshot[s], dict)]
+        try:
+            enrichment = {
+                symbol: snapshot[symbol].get(brain.ENRICHMENT_KEY)
+                for symbol in symbols
+            }
+            context = snapshot.get("_market_context") or {}
+            state.log_event(
+                "snapshot_enrichment",
+                self._audit_json({
+                    "market": context.get(brain.ENRICHMENT_KEY),
+                    "symbols": enrichment,
+                }),
+            )
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Snapshot enrichment journalling failed: %s", exc)
+
+        for symbol in symbols:
+            try:
+                state.log_event(
+                    "book_state",
+                    self._audit_json({
+                        "signal_ts": self._plain(
+                            snapshot[symbol].get("signal_ts")),
+                        **self.ex.book_state(symbol),
+                    }),
+                )
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("Book state journalling failed for %s: %s",
+                            symbol, exc)
+
+    def _too_young_to_close(self, pos: dict, decision: dict,
+                            st: dict) -> bool:
+        """Block a discretionary close inside strategy.min_hold_minutes.
+
+        Exchange-side stops and targets are untouched, the max-hold timer
+        still fires, and the engine's own safety closes do not pass through
+        here - this only constrains the model's judgement calls.
+
+        A ``risk_reduction`` close is always allowed: that trigger means the
+        model is de-risking rather than second-guessing the entry, and a
+        floor that blocks de-risking would be a safety regression.
+
+        When the position's age is unknown the close is ALLOWED. Refusing to
+        close a position we cannot age would trap it until the max-hold
+        timer, which is the more dangerous failure.
+        """
+        floor_minutes = float(self.cfg["strategy"].get("min_hold_minutes", 0))
+        if floor_minutes <= 0:
+            return False
+        if str(decision.get("close_trigger") or "") == "risk_reduction":
+            return False
+        symbol = pos.get("symbol")
+        opened = (st.get("opened_at") or {}).get(symbol)
+        try:
+            opened = float(opened or 0)
+        except (TypeError, ValueError):
+            opened = 0.0
+        if opened <= 0:
+            return False
+        held_minutes = (time.time() - opened) / 60.0
+        if held_minutes >= floor_minutes:
+            return False
+        log.info(
+            "Rejected model close %s: held %.0f min, minimum is %.0f min "
+            "(trigger=%s)",
+            symbol, held_minutes, floor_minutes,
+            decision.get("close_trigger"))
+        state.log_event("rejected", json.dumps({
+            "symbol": symbol,
+            "action": "close",
+            "why": "inside strategy.min_hold_minutes",
+            "held_minutes": round(held_minutes, 1),
+            "min_hold_minutes": floor_minutes,
+            "close_trigger": decision.get("close_trigger"),
+        }))
         return True
 
     # --------------------------------------------------------- housekeeping
@@ -1684,6 +2391,8 @@ class Engine:
                 )
                 state.commit(st)
             return None, why
+        prepared["entry_evidence"] = strategy.compact_entry_evidence(
+            symbol_snapshot, snapshot.get("_market_context"))
         setup_id = prepared["setup_id"]
         blocked = strategy.semantic_block(
             records, prepared["setup_key"])
@@ -1693,6 +2402,10 @@ class Engine:
             return None, (
                 "semantically identical setup is cooling down for "
                 f"{remaining:.1f} more minute(s)")
+        failed_reentry = strategy.failed_thesis_reentry_reason(
+            records, prepared, self.cfg)
+        if failed_reentry is not None:
+            return None, failed_reentry
         records[setup_id] = strategy.new_setup_record(
             prepared, self.cfg)
         state.log_event(
@@ -1707,6 +2420,10 @@ class Engine:
                 "invalidation_anchor": prepared["invalidation_anchor"],
                 "exit_policy": prepared["exit_policy"],
                 "execution_choice": prepared["execution_choice"],
+                "entry_evidence_fingerprint": prepared.get(
+                    "entry_evidence_fingerprint"),
+                "what_changed_since_last_loss": prepared.get(
+                    "what_changed_since_last_loss") or None,
             }),
             setup_id=setup_id,
         )
@@ -1715,20 +2432,24 @@ class Engine:
 
     def _mark_setup_status(
             self, st: dict, setup_id: str | None, status: str,
-            *, cooldown: bool = False) -> None:
+            *, cooldown: bool = False,
+            realized_pnl_usd: float | None = None) -> None:
         if not setup_id:
             return
         record = (st.setdefault("recent_setups", {}).get(setup_id))
         if not isinstance(record, dict):
             return
         strategy.mark_setup(
-            record, status, self.cfg, apply_cooldown=cooldown)
+            record, status, self.cfg, apply_cooldown=cooldown,
+            realized_pnl_usd=realized_pnl_usd)
         state.log_event(
             "setup_status",
             self._audit_json({
                 "setup_id": setup_id,
                 "status": status,
                 "blocked_until": record.get("blocked_until"),
+                "outcome": record.get("outcome"),
+                "realized_pnl_usd": record.get("realized_pnl_usd"),
             }),
             setup_id=setup_id,
         )
@@ -1776,6 +2497,7 @@ class Engine:
         views = []
         for p in positions:
             opened = st.get("opened_at", {}).get(p["symbol"])
+            trade = (st.get("active_trades") or {}).get(p["symbol"]) or {}
             views.append({
                 "symbol": p["symbol"],
                 "side": p.get("side"),
@@ -1786,6 +2508,20 @@ class Engine:
                 "notional_usd": round(self._notional(p), 1),
                 "hours_open": round((now - opened) / 3600, 1)
                 if opened else None,
+                "age_verified": bool(
+                    trade.get("age_known", bool(opened))),
+                "planned_risk_usd": trade.get("risk_usd"),
+                "original_thesis": {
+                    "reason": trade.get("entry_reason"),
+                    "setup_type": trade.get("setup_type"),
+                    "invalidation_anchor": trade.get(
+                        "invalidation_anchor"),
+                    "exit_policy": trade.get("exit_policy"),
+                    "stop_loss_pct": trade.get("stop_loss_pct"),
+                    "take_profit_pct": trade.get("take_profit_pct"),
+                    "signal_ts": trade.get("signal_ts"),
+                    "entry_evidence": trade.get("entry_evidence"),
+                },
             })
         post_loss_cooldowns = [
             {
@@ -1859,9 +2595,15 @@ class Engine:
                 "max_leverage": r["max_leverage"],
                 "entry_leverage": r["entry_leverage"],
                 "risk_per_trade_pct": r["risk_per_trade_pct"],
+                "experimental_risk_per_trade_pct": r[
+                    "experimental_risk_per_trade_pct"],
+                "max_total_open_risk_pct": r[
+                    "max_total_open_risk_pct"],
                 "max_concurrent_positions": r["max_concurrent_positions"],
                 "min_confidence": r["min_confidence"],
                 "max_net_direction_pct": r.get("max_net_direction_pct", 100),
+                "max_btc_beta_exposure_pct": r[
+                    "max_btc_beta_exposure_pct"],
             },
             "trading_costs_fyi": self.cfg["trading_costs"],
         }
