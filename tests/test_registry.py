@@ -106,6 +106,53 @@ class RegisterContentTests(unittest.TestCase):
         # change should be deliberate and evidenced.
         self.assertEqual(live_eligible_ids(), ())
 
+    def test_a_live_tier_must_cite_its_evidence_packet(self):
+      """The tier that authorises capital has to name what authorised it."""
+      with self.assertRaises(ValueError) as caught:
+          StrategySpec(
+              id="wishful", version="v1", mechanism="a stated mechanism",
+              falsification="a stated falsifier", tier="T3_VALIDATED",
+              signal_timeframe="1h", required_timeframes=("1h",),
+              max_hold_hours_ceiling=24.0, execution_style="taker",
+              setup_types=("x",), evidence=("some/report.md",))
+
+      self.assertIn("t3-packet:", str(caught.exception))
+
+    def test_a_cited_packet_hash_satisfies_the_gate(self):
+        spec = StrategySpec(
+            id="evidenced", version="v1", mechanism="a stated mechanism",
+            falsification="a stated falsifier", tier="T3_VALIDATED",
+            signal_timeframe="1h", required_timeframes=("1h",),
+            max_hold_hours_ceiling=24.0, execution_style="taker",
+            setup_types=("x",),
+            evidence=("t3-packet:" + "a" * 64, "some/report.md"))
+
+        self.assertTrue(spec.meets(LIVE_MIN_TIER))
+
+    def test_a_malformed_packet_reference_does_not_satisfy_it(self):
+        for reference in ("t3-packet:", "t3-packet:abc", "t3-packet:" + "z" * 64,
+                          "sha256:" + "a" * 64):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    StrategySpec(
+                        id="sloppy", version="v1",
+                        mechanism="a stated mechanism",
+                        falsification="a stated falsifier",
+                        tier="T4_CONFIRMED", signal_timeframe="1h",
+                        required_timeframes=("1h",),
+                        max_hold_hours_ceiling=24.0, execution_style="taker",
+                        setup_types=("x",), evidence=(reference,))
+
+    def test_a_tier_below_live_needs_no_packet(self):
+        spec = StrategySpec(
+            id="candidate2", version="v1", mechanism="a stated mechanism",
+            falsification="a stated falsifier", tier="T2_CANDIDATE",
+            signal_timeframe="1h", required_timeframes=("1h",),
+            max_hold_hours_ceiling=24.0, execution_style="taker",
+            setup_types=("x",))
+
+        self.assertFalse(spec.meets(LIVE_MIN_TIER))
+      
     def test_unknown_id_names_the_alternatives(self):
         with self.assertRaises(UnknownStrategy) as caught:
             spec_for("nope")
