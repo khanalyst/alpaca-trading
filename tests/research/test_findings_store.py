@@ -251,6 +251,35 @@ class IndexTests(StoreFixture):
 
         self.assertEqual(before, after)
 
+    def test_the_index_links_documents_it_did_not_write(self):
+        """A generated index must not orphan a hand-written audit."""
+        self.store.register(variant())
+
+        with tempfile.TemporaryDirectory() as out:
+            audit = Path(out) / "orchestrated-audit-2026-07-29.md"
+            audit.write_text("# Orchestrated strategy audit — 2026-07-29\n")
+
+            findings_mod.write_scorecards(self.store, out)
+            text = (Path(out) / "README.md").read_text()
+
+        self.assertIn("## Repository audits", text)
+        self.assertIn("Orchestrated strategy audit — 2026-07-29", text)
+        self.assertIn("(orchestrated-audit-2026-07-29.md)", text)
+
+    def test_regenerating_the_index_preserves_the_audit_section(self):
+        """The second run is the one that used to delete the link."""
+        self.store.register(variant())
+
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "audit.md").write_text("# An audit\n")
+            findings_mod.write_scorecards(self.store, out)
+            first = (Path(out) / "README.md").read_text()
+            findings_mod.write_scorecards(self.store, out)
+            second = (Path(out) / "README.md").read_text()
+
+        self.assertEqual(first, second)
+        self.assertIn("(audit.md)", second)
+
     def test_scorecards_land_under_their_strategy(self):
         self.store.register(variant())
 
