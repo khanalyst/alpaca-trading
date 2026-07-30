@@ -37,14 +37,23 @@ variants:
       this cost ratio the higher hit rate wins.
     status: candidate
 
+  # The claim below names 2.0R as "the default" because that is what shipped
+  # when this arm was registered; the shipped target is now 3.0R. The text is
+  # deliberately NOT corrected in place: hypothesis is part of the immutable
+  # experiment identity in findings.db, so editing it makes every command that
+  # registers this registry abort, and - the reason the rule exists - a claim
+  # that can be reworded after the fact cannot be told apart from one
+  # retro-fitted to the result. The arm itself is unchanged: fixed_reward_risk
+  # 2.5 against whatever the baseline ships. To restate the comparison,
+  # register a new variant_id.
   - variant_id: momentum.rr.fixed_2_5
     strategy_id: momentum
     base_version: phase1-v3
     overrides:
       strategy.fixed_reward_risk: 2.5
     hypothesis: >-
-      A 2.5R fixed target improves hit rate against the shipped 3.0R target
-      without truncating enough of the right tail to lose expectancy.
+      A 2.5R fixed target outperforms the default 2.0R because the default was
+      chosen by convention rather than measured.
     status: candidate
 
   - variant_id: momentum.rr.fixed_2_0
@@ -57,14 +66,18 @@ variants:
       target, and the higher hit rate outweighs the truncated right tail.
     status: candidate
 
+  # Superseded because 3.0R is now the shipped baseline, so this arm duplicates
+  # momentum.baseline and is not an independent comparison. Only the status is
+  # changed: status is the one mutable field, and rewriting the registered
+  # claim to say so would break the identity the results are attributed to.
   - variant_id: momentum.rr.fixed_3_0
     strategy_id: momentum
     base_version: phase1-v3
     overrides:
       strategy.fixed_reward_risk: 3.0
     hypothesis: >-
-      Historical identity for the 3.0R setting, now identical to the shipped
-      baseline and therefore not an independent experimental arm.
+      A 3.0R target captures the tail that a 2R target truncates, and the tail
+      is where a momentum strategy's expectancy lives if it has any.
     status: superseded
 
   # --- the noise floor ---------------------------------------------------

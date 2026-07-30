@@ -2433,7 +2433,38 @@ def scorecard(store: FindingsStore, variant_id: str,
     return "\n".join(lines)
 
 
-def index(store: FindingsStore) -> str:
+def audit_documents(root: str | Path) -> list:
+    """Hand-written documents sitting beside the generated index.
+
+    The index is the only entry point to ``findings/``, and it is rewritten
+    from the store on every nightly run. Anything a person put there that the
+    generator does not know about therefore becomes unreachable the first time
+    the report runs - the file survives on disk and the link to it does not,
+    which is the failure that is hardest to notice because nothing errors.
+
+    So the section is discovered from disk rather than maintained by hand. A
+    generator may overwrite what it wrote; it may not silently orphan what it
+    did not.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.glob("*.md")
+                  if path.name != "README.md")
+
+
+def _document_title(path: Path) -> str:
+    """The document's own H1, falling back to its filename."""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("# "):
+                return line[2:].strip()
+    except OSError:
+        pass
+    return path.stem
+
+
+def index(store: FindingsStore, root: str | Path | None = None) -> str:
     """``findings/README.md``: every variant, status, sample, last updated."""
     lines = [
         "# Findings index",
@@ -2443,6 +2474,14 @@ def index(store: FindingsStore) -> str:
         "is not which variants are alive but why this one was rejected and "
         "on what sample.",
         "",
+    ]
+    documents = audit_documents(root) if root is not None else []
+    if documents:
+        lines += ["## Repository audits", ""]
+        for path in documents:
+            lines.append(f"- [{_document_title(path)}]({path.name})")
+        lines += ["", "## Variant scorecards", ""]
+    lines += [
         "| variant | status | round trips | expectancy | last updated |",
         "| --- | --- | --- | --- | --- |",
     ]
@@ -2474,6 +2513,6 @@ def write_scorecards(store: FindingsStore, root: str | Path) -> list:
                         encoding="utf-8")
         written.append(path)
     root.mkdir(parents=True, exist_ok=True)
-    (root / "README.md").write_text(index(store), encoding="utf-8")
+    (root / "README.md").write_text(index(store, root), encoding="utf-8")
     written.append(root / "README.md")
     return written

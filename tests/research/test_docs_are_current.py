@@ -246,6 +246,83 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
             self.assertIn(kind, README, f"journal event {kind} undocumented")
 
 
+class VariantScorecardsAreCurrentTests(unittest.TestCase):
+    """The committed scorecards are the registry's identity baseline.
+
+    ``findings.db`` lives on the host and is not in the repository, so the
+    committed cards are the only copy of what each variant was registered as.
+    That makes them the place to catch an in-place edit to a hypothesis or an
+    override, which is otherwise invisible until a host that already holds the
+    old row refuses to register the new one - and it refuses inside
+    ``research.py report``, ``forward-qualify`` and ``t3-packet``, so the
+    symptom is a research loop that stops rather than an error anyone reads.
+
+    A variant's claim is immutable by design. Restating it means a new
+    ``variant_id``; only ``status`` may move. These tests hold that line at
+    review time, where fixing it is free.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from agent import variants as variant_mod
+
+        cls.registry = variant_mod.load_registry(
+            REPO / "research" / "variants.yaml")
+        cls.findings = REPO / "findings"
+
+    def _card(self, variant):
+        return (self.findings / variant.strategy_id
+                / f"{variant.variant_id}.md")
+
+    def test_every_registered_variant_has_a_committed_scorecard(self):
+        missing = sorted(
+            variant.variant_id for variant in self.registry.values()
+            if not self._card(variant).exists())
+
+        self.assertEqual(
+            missing, [],
+            "registered variants with no committed scorecard: "
+            f"{missing}. Run `python research.py report`.")
+
+    def test_committed_claims_match_the_registry(self):
+        """An edited claim is an edited experiment identity."""
+        for variant in self.registry.values():
+            with self.subTest(variant=variant.variant_id):
+                card = flowed(self._card(variant).read_text(encoding="utf-8"))
+                self.assertIn(f"Hypothesis: {flowed(variant.hypothesis)}", card)
+                self.assertIn(f"Status: {variant.status}", card)
+
+    def test_committed_overrides_match_the_registry(self):
+        for variant in self.registry.values():
+            with self.subTest(variant=variant.variant_id):
+                card = flowed(self._card(variant).read_text(encoding="utf-8"))
+                rendered = ", ".join(
+                    f"{key} = {value}"
+                    for key, value in sorted(variant.overrides.items()))
+                self.assertIn(
+                    f"Overrides: {rendered}" if variant.overrides
+                    else "Overrides: none", card)
+
+    def test_the_index_links_every_scorecard(self):
+        text = (self.findings / "README.md").read_text(encoding="utf-8")
+        for variant in self.registry.values():
+            with self.subTest(variant=variant.variant_id):
+                self.assertIn(
+                    f"({variant.strategy_id}/{variant.variant_id}.md)", text)
+
+    def test_the_index_links_every_document_beside_it(self):
+        """The generator rewrites this file; it must not orphan an audit."""
+        from research import findings as findings_mod
+
+        text = (self.findings / "README.md").read_text(encoding="utf-8")
+        documents = findings_mod.audit_documents(self.findings)
+
+        self.assertTrue(documents, "findings/ has no audit documents at all")
+        for path in documents:
+            with self.subTest(document=path.name):
+                self.assertIn(f"({path.name})", text)
+
+
 class DeploymentDocTests(unittest.TestCase):
     """The Azure guide drifted unchecked while the research layer was built.
 
