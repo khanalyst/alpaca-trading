@@ -34,7 +34,35 @@ reward_risk: 3.0
 max_hold_bars: 1344        # 14 days
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-hypotheses_tested: 1
+# --- the parameterisations that will be tested -----------------------------
+# Registered 2026-07-30, before this hypothesis has been scored at all - which
+# is the right time to register them.
+#
+# The mechanism's claim is about HORIZON: cost falls from ~15% of a typical
+# intraday move to ~1% of a multi-day one, so the hold is the parameter the
+# claim actually rests on. Halving it is therefore the sharpest available test
+# of the mechanism rather than of the strategy.
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The pre-registered 14-day hold at a 55% range-position floor.
+  - id: half_horizon
+    params:
+      max_hold_bars: 672
+    claim: >-
+      If the edge is horizon economics, halving the hold to 7 days should cut
+      expectancy roughly in proportion. If expectancy is unchanged, the hold is
+      not where the return comes from and the mechanism is misstated.
+  - id: stronger_trend
+    params:
+      min_range_pos_pct: 70.0
+      max_atr_ratio: 1.5
+    claim: >-
+      Demanding a better-established trend in a calmer volatility regime should
+      improve expectancy if persistence is real, at the cost of sample.
+
+hypotheses_tested: 3
 multiple_testing_note: |
   One parameter set, registered before the first run.
 
