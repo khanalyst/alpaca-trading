@@ -1,6 +1,3 @@
-# Fully resolved production environment used by the pre-live safety suite.
-# Regenerate deliberately after reviewing CCXT/OKX adapter changes; do not
-# upgrade packages implicitly on a live host.
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.1
 aiohttp-fast-zlib==0.3.0
