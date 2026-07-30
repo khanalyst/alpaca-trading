@@ -41,13 +41,18 @@ def _series(bars: int, seed: int, start_price: float,
     spread = np.abs(close - open_) + close * vol * 0.5
     high = np.maximum(open_, close) + spread * rng.uniform(0.0, 0.5, size=bars)
     low = np.minimum(open_, close) - spread * rng.uniform(0.0, 0.5, size=bars)
-    ts = START_MS + np.arange(bars, dtype=np.int64) * BAR_MS
-    volume = QUOTE_VOLUME_PER_BAR / close
+    ts = START_MS + np.arange(bars, dtype=np.int64) * BAR_MS                        
+    # Turnover rises with the size of the bar's own move. Without this every
+    # relative-volume filter in the repository sees a flat 1.0 and silently
+    # admits nothing, so a contract that requires participation would produce
+    # zero trades and its tests would pass by measuring an empty set.
+    move = np.abs(steps) / vol
+    quote_volume = QUOTE_VOLUME_PER_BAR * (0.6 + 0.9 * move)    
     return pd.DataFrame({
         "timestamp_ms": ts,
         "open": open_, "high": high, "low": low, "close": close,
-        "volume": volume,
-        "quote_volume": np.full(bars, QUOTE_VOLUME_PER_BAR),
+        "volume": quote_volume / close,
+        "quote_volume": quote_volume,
     })
 
 
@@ -83,15 +88,23 @@ def write_dataset(root, bars: int = 4000, symbols=SYMBOLS) -> None:
                       "funding_rate": rate}).to_csv(
             root / "funding" / f"{stem}.csv", index=False)
 
-        # Open interest, hourly, with drawdowns so flush-fade's falling-OI
-        # condition is satisfied somewhere in the sample.
-        hourly = swap["timestamp_ms"].to_numpy()[::4]
-        wobble = np.sin(np.linspace(0.0, 40.0, len(hourly)))
-        noise = rng.normal(0.0, 0.01, size=len(hourly))
-        pd.DataFrame({
-            "timestamp_ms": hourly,
-            "oi_usd": 5e8 * (1.0 + 0.15 * wobble + noise),
-        }).to_csv(root / "oi" / f"{stem}.csv", index=False)
+      
+        # Open interest, hourly. It has to FALL during some adverse moves and
+        # rise during others, because that distinction is the whole of
+        # flush-fade's hypothesis: a dataset where OI only ever wobbles
+        # independently of price cannot exercise the gate that separates
+        # deleveraging from new positioning.
+        hourly_ts = swap["timestamp_ms"].to_numpy()[::4]
+        hourly_close = swap["close"].to_numpy()[::4]
+        drift = np.diff(hourly_close, prepend=hourly_close[0]) / hourly_close
+        # Alternating blocks: positions unwind with price in the first half of
+        # each stretch and build against it in the second.
+        unwinding = (np.arange(len(hourly_ts)) // 24) % 2 == 0
+        response = np.where(unwinding, 6.0, -3.0) * drift
+        level = 5e8 * np.exp(np.cumsum(
+            response + rng.normal(0.0, 0.001, size=len(hourly_ts))))
+        pd.DataFrame({"timestamp_ms": hourly_ts, "oi_usd": level}).to_csv(
+            root / "oi" / f"{stem}.csv", index=False)
 
 
 def truncated(root, keep_bars: int, out):
