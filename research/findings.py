@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 DEFAULT_STORE = Path(__file__).resolve().parent / "cache" / "findings.db"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 KINDS = ("observation", "recommendation", "decision")
 
@@ -134,12 +134,18 @@ def _rewrite_analysis_references(value: object, remap: dict[str, str]):
 def _variant_identity(row_or_variant) -> dict:
     if isinstance(row_or_variant, sqlite3.Row):
         overrides = json.loads(row_or_variant["overrides_json"])
+        columns = set(row_or_variant.keys())
         return {
             "variant_id": str(row_or_variant["variant_id"]),
             "strategy_id": str(row_or_variant["strategy_id"]),
             "base_version": str(row_or_variant["base_version"]),
             "overrides": overrides,
             "hypothesis": str(row_or_variant["hypothesis"]),
+            "hypothesis_id": str(row_or_variant["hypothesis_id"] or "")
+            if "hypothesis_id" in columns else "",
+            "hypothesis_params": json.loads(
+                row_or_variant["hypothesis_params_json"] or "{}")
+            if "hypothesis_params_json" in columns else {},
         }
     return {
         "variant_id": str(row_or_variant.variant_id),
@@ -147,6 +153,8 @@ def _variant_identity(row_or_variant) -> dict:
         "base_version": str(row_or_variant.base_version),
         "overrides": dict(row_or_variant.overrides),
         "hypothesis": str(row_or_variant.hypothesis),
+        "hypothesis_id": str(getattr(row_or_variant, "hypothesis_id", None) or ""),
+        "hypothesis_params": dict(getattr(row_or_variant, "hypothesis_params", {}) or {}),
     }
 
 
@@ -826,6 +834,36 @@ def _migration_7(conn: sqlite3.Connection) -> None:
             ON paper_decisions (scope_key, variant_id, decision_ts);
     """)
 
+
+def _migration_8(conn: sqlite3.Connection) -> None:
+    """Persist hypothesis identity and immutable adaptive proposals."""
+    conn.execute("ALTER TABLE variants ADD COLUMN hypothesis_id TEXT")
+    conn.execute("ALTER TABLE variants ADD COLUMN hypothesis_params_json TEXT NOT NULL DEFAULT '{}'")
+    _execute_script(conn, """
+        CREATE TABLE hypothesis_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            strategy_id TEXT NOT NULL,
+            hypothesis_id TEXT NOT NULL,
+            setting_id TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            proposed_ts REAL NOT NULL,
+            observation_until_ts REAL NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('PROPOSED','OBSERVED','REJECTED')),
+            UNIQUE (strategy_id, hypothesis_id, setting_id, run_id)
+        );
+        CREATE INDEX hypothesis_proposals_lock
+            ON hypothesis_proposals(strategy_id, hypothesis_id, proposed_ts);
+        CREATE TRIGGER hypothesis_proposals_no_update
+            BEFORE UPDATE ON hypothesis_proposals BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal history is immutable');
+            END;
+        CREATE TRIGGER hypothesis_proposals_no_delete
+            BEFORE DELETE ON hypothesis_proposals BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal history is immutable');
+            END;
+    """)
+
     # Executed trades are the only historical decisions that can be recovered.
     # They are retained for audit, but the ledger watermark below deliberately
     # excludes them from new forward qualification because historical vetoes
@@ -842,7 +880,7 @@ def _migration_7(conn: sqlite3.Connection) -> None:
             "signal_ts": row["signal_ts"],
         }
         conn.execute(
-            "INSERT INTO paper_decisions (decision_id, proposal_id, "
+            "INSERT OR IGNORE INTO paper_decisions (decision_id, proposal_id, "
             "scope_key, variant_id, cycle_id, symbol, direction, setup_type, "
             "signal_ts, confidence, decision_outcome, reason, "
             "paper_trade_id, model_id, assumptions_json, proposal_json, "
@@ -909,11 +947,11 @@ def _migration_7(conn: sqlite3.Connection) -> None:
              })))
 
     _execute_script(conn, """
-        CREATE TRIGGER paper_decisions_no_update
+        CREATE TRIGGER IF NOT EXISTS paper_decisions_no_update
             BEFORE UPDATE ON paper_decisions BEGIN
                 SELECT RAISE(ABORT, 'paper decisions are immutable');
             END;
-        CREATE TRIGGER paper_decisions_no_delete
+        CREATE TRIGGER IF NOT EXISTS paper_decisions_no_delete
             BEFORE DELETE ON paper_decisions BEGIN
                 SELECT RAISE(ABORT, 'paper decisions are immutable');
             END;
@@ -928,6 +966,7 @@ MIGRATIONS = {
     5: ("content_addressed_t3_packets", _migration_5),
     6: ("content_addressed_analyses", _migration_6),
     7: ("complete_paper_decision_ledger", _migration_7),
+    8: ("hypothesis_identity_and_adaptive_proposals", _migration_8),
 }
 
 
@@ -941,6 +980,8 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
     }
     if _stored_version(conn) >= 7:
         required.add("paper_decisions")
+    if _stored_version(conn) >= 8:
+        required.add("hypothesis_proposals")
     missing = sorted(table for table in required
                      if not _table_exists(conn, table))
     if missing:
@@ -1464,6 +1505,66 @@ class FindingsStore:
             baseline_id: str, setting_ids: list[str], arms: dict) -> list[str]:
         """Prove arms are one version of one strategy differing only on axis."""
         canonical_axis = _canonical_axis(axis)
+        # Hypothesis settings are metadata-backed experiment axes rather than
+        # executable strategy-config paths. They still need the same
+        # uniqueness/version/mechanism boundary before forward evidence can be
+        # used, but their exact values live in hypothesis_params_json.
+        if canonical_axis[0].startswith("hypothesis."):
+            prefixes = [path.split(".", 2) for path in canonical_axis]
+            if (not all(len(parts) == 3 and parts[0] == "hypothesis"
+                        for parts in prefixes)
+                    or len({parts[1] for parts in prefixes}) != 1):
+                raise ValueError("hypothesis forward axis is malformed")
+            hypothesis_id = prefixes[0][1]
+            keys = [parts[2] for parts in prefixes]
+            baseline = cls._require_variant(conn, baseline_id)
+            if (baseline["strategy_id"] != strategy_id
+                    or baseline["hypothesis_id"] != hypothesis_id):
+                raise ValueError(
+                    "hypothesis forward baseline does not match the axis")
+            try:
+                baseline_params = json.loads(
+                    baseline["hypothesis_params_json"] or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("hypothesis baseline has invalid params") from exc
+            if not isinstance(baseline_params, dict):
+                raise ValueError("hypothesis baseline params are not a mapping")
+            if any(key not in baseline_params for key in keys):
+                raise ValueError("hypothesis baseline is missing an axis value")
+            baseline_other = {
+                key: value for key, value in baseline_params.items()
+                if key not in keys}
+            seen_values = {_canonical_json([baseline_params[key] for key in keys])}
+            for variant_id in setting_ids:
+                variant = cls._require_variant(conn, variant_id)
+                if (variant["strategy_id"] != strategy_id
+                        or str(variant["base_version"])
+                        != str(baseline["base_version"])
+                        or variant["hypothesis_id"] != hypothesis_id):
+                    raise ValueError(
+                        "hypothesis axis mixes strategies, versions or hypotheses")
+                try:
+                    params = json.loads(
+                        variant["hypothesis_params_json"] or "{}")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"{variant_id}: invalid hypothesis params") from exc
+                if not isinstance(params, dict) or any(
+                        key not in params for key in keys):
+                    raise ValueError(
+                        f"{variant_id}: hypothesis params omit the declared axis")
+                if {key: value for key, value in params.items()
+                        if key not in keys} != baseline_other:
+                    raise ValueError(
+                        f"{variant_id}: non-axis hypothesis params differ "
+                        "from the baseline")
+                values = _canonical_json([params[key] for key in keys])
+                if values in seen_values:
+                    raise ValueError(
+                        f"{variant_id}: hypothesis setting duplicates another arm")
+                seen_values.add(values)
+            return canonical_axis
+
         expected_baseline = f"{strategy_id}.baseline"
         if baseline_id != expected_baseline:
             raise ValueError(
@@ -1942,12 +2043,21 @@ class FindingsStore:
 
         expected_axis_ids = set()
         baseline_id = f"{strategy_id}.baseline"
+        hypothesis_groups = {}
         for registered in conn.execute(
-                "SELECT variant_id, strategy_id, status, overrides_json "
+                "SELECT variant_id, strategy_id, status, overrides_json, "
+                "hypothesis_id, hypothesis_params_json "
                 "FROM variants"):
             if (registered["strategy_id"] != strategy_id
-                    or registered["variant_id"] == baseline_id
                     or registered["status"] not in {"candidate", "testing"}):
+                continue
+            hypothesis_id = registered["hypothesis_id"]
+            if (hypothesis_id and str(registered["variant_id"]).startswith(
+                    f"{strategy_id}.hyp.")):
+                hypothesis_groups.setdefault(str(hypothesis_id), []).append(
+                    registered)
+                continue
+            if registered["variant_id"] == baseline_id:
                 continue
             try:
                 overrides = json.loads(registered["overrides_json"])
@@ -1960,6 +2070,29 @@ class FindingsStore:
             axis = tuple(sorted(str(path) for path in overrides))
             if axis:
                 expected_axis_ids.add("+".join(axis))
+
+        for hypothesis_id, rows in hypothesis_groups.items():
+            baseline = next((row for row in rows
+                             if str(row["variant_id"]).endswith(".registered")),
+                            None)
+            if baseline is None:
+                continue
+            params_by_id = {}
+            for row in rows:
+                try:
+                    params = json.loads(row["hypothesis_params_json"] or "{}")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "active hypothesis variant has invalid params") from exc
+                if not isinstance(params, dict):
+                    raise ValueError(
+                        "active hypothesis variant params are not a mapping")
+                params_by_id[str(row["variant_id"])] = params
+            keys = sorted({str(key) for params in params_by_id.values()
+                           for key in params})
+            if keys and len(rows) > 1:
+                expected_axis_ids.add("+".join(
+                    f"hypothesis.{hypothesis_id}.{key}" for key in keys))
 
         source_payload = source_payload or cls._validated_forward_analysis(
             conn, variant_id, source_analysis_id, scope_key)
@@ -2059,6 +2192,14 @@ class FindingsStore:
             self._validated_family_correction(
                 conn, variant_id, str(source_analysis_id or ""), scope_key,
                 detail, source_payload)
+            detail = dict(detail)
+            detail.setdefault("variant_id", variant_id)
+            detail.setdefault("hypothesis_id", variant["hypothesis_id"])
+            detail.setdefault(
+                "hypothesis_params",
+                json.loads(variant["hypothesis_params_json"] or "{}"))
+            detail.setdefault(
+                "exact_overrides", json.loads(variant["overrides_json"] or "{}"))
             current = self._latest_qualification(
                 conn, variant_id, scope_key)
             if current and current["status"] == "QUALIFIED":
@@ -2294,13 +2435,88 @@ class FindingsStore:
                     "WHERE variant_id=?",
                     (variant.status, now, variant.variant_id))
                 return
+            if "hypothesis_id" in {
+                    str(row[1]) for row in conn.execute(
+                        "PRAGMA table_info(variants)").fetchall()}:
+                conn.execute(
+                    "INSERT INTO variants (variant_id, strategy_id, "
+                    "base_version, overrides_json, hypothesis, status, "
+                    "created_ts, updated_ts, hypothesis_id, hypothesis_params_json) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (variant.variant_id, variant.strategy_id,
+                     variant.base_version, overrides, variant.hypothesis,
+                     variant.status, now, now, getattr(variant, "hypothesis_id", None),
+                     _canonical_json(getattr(variant, "hypothesis_params", {}) or {})))
+            else:
+                conn.execute(
+                    "INSERT INTO variants (variant_id, strategy_id, "
+                    "base_version, overrides_json, hypothesis, status, "
+                    "created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
+                    (variant.variant_id, variant.strategy_id,
+                     variant.base_version, overrides, variant.hypothesis,
+                     variant.status, now, now))
+
+    def hypothesis_proposals(self, strategy_id: str, hypothesis_id: str) -> list:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM hypothesis_proposals WHERE strategy_id=? "
+                "AND hypothesis_id=? ORDER BY proposed_ts, proposal_id",
+                (strategy_id, hypothesis_id)).fetchall()
+        return [dict(row) for row in rows]
+
+    def propose_numeric_setting(
+            self, strategy_id: str, hypothesis_id: str, setting_id: str,
+            value, run_id: str, *, minimum: float, maximum: float,
+            reasoning: str = "",
+            observation_lock_seconds: float = 3600.0,
+            now: float | None = None) -> dict:
+        """Append one validated adaptive proposal, never silently retrying it."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("adaptive proposal value must be numeric") from exc
+        if not math.isfinite(number) or number < float(minimum) or number > float(maximum):
+            raise ValueError("adaptive proposal value is outside its registered bounds")
+        if float(observation_lock_seconds) <= 0:
+            raise ValueError("observation_lock_seconds must be positive")
+        reasoning = str(reasoning or "registered numeric hypothesis setting").strip()[:300]
+        timestamp = time.time() if now is None else float(now)
+        proposal_id = _content_hash({
+            "strategy_id": str(strategy_id), "hypothesis_id": str(hypothesis_id),
+            "setting_id": str(setting_id), "value": number, "run_id": str(run_id),
+        })[:32]
+        row = {
+            "proposal_id": proposal_id, "strategy_id": str(strategy_id),
+            "hypothesis_id": str(hypothesis_id), "setting_id": str(setting_id),
+            "value": number, "run_id": str(run_id), "proposed_ts": timestamp,
+            "observation_until_ts": timestamp + float(observation_lock_seconds),
+            "status": "PROPOSED",
+            "reasoning": reasoning,
+        }
+        with _connect(self.path) as conn:
+            existing = conn.execute(
+                "SELECT * FROM hypothesis_proposals WHERE proposal_id=?",
+                (proposal_id,)).fetchone()
+            if existing is not None:
+                raise ValueError("duplicate adaptive hypothesis proposal")
+            locked = conn.execute(
+                "SELECT 1 FROM hypothesis_proposals WHERE strategy_id=? "
+                "AND proposed_ts<=? AND observation_until_ts>?",
+                (strategy_id, timestamp, timestamp)).fetchone()
+            if locked:
+                raise ValueError("hypothesis observation lock is active")
+            duplicate = conn.execute(
+                "SELECT 1 FROM hypothesis_proposals WHERE strategy_id=? "
+                "AND hypothesis_id=? AND setting_id=? AND run_id=?",
+                (strategy_id, hypothesis_id, setting_id, run_id)).fetchone()
+            if duplicate:
+                raise ValueError("duplicate adaptive hypothesis proposal")
             conn.execute(
-                "INSERT INTO variants (variant_id, strategy_id, "
-                "base_version, overrides_json, hypothesis, status, "
-                "created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
-                (variant.variant_id, variant.strategy_id,
-                 variant.base_version, overrides, variant.hypothesis,
-                 variant.status, now, now))
+                "INSERT INTO hypothesis_proposals VALUES (?,?,?,?,?,?,?,?,?)",
+                (proposal_id, strategy_id, hypothesis_id, setting_id,
+                 _canonical_json(number), run_id, timestamp,
+                 row["observation_until_ts"], "PROPOSED"))
+        return row
 
     def set_status(self, variant_id: str, status: str) -> None:
         with _connect(self.path) as conn:

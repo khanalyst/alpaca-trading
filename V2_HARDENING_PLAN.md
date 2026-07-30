@@ -1,4 +1,10 @@
-# v2-hardening — development plan
+# v2-hardening — historical development plan
+
+> Current status: the plan's variant, findings-store, forward-qualification,
+> and bounded shadow-worker work is implemented in the current codebase. This
+> file remains as a historical rationale record; current operational policy is
+> in `README.md`, `SETUP.md`, and `research/protocol.md`. Promotion remains
+> manual and review-gated, and no VM import path is a production default.
 
 > **Status: batches 0-4 delivered.** See `research/results/tournament/REPORT.md`
 > for the current leaderboard. Three things the plan did not anticipate, all
@@ -222,7 +228,7 @@ exists.
 | 1.6 | Per-strategy risk profile | `agent/risk.py`, `config.yaml` | Move `risk_per_trade_pct`, `max_hold_hours`, `max_concurrent_positions` into the spec, with `config.yaml` values as global ceilings the spec can only tighten, never loosen. |
 
 **Acceptance:** `strategy.id: momentum-phase1-v2` reproduces today's behaviour
-exactly — `validate_features.py` clean, all 194 tests green. A second
+exactly — `validate_features.py` clean in that historical run. A second
 registered id starts and trades without touching `agent/` again.
 
 ---

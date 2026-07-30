@@ -55,6 +55,46 @@ def _resolve_cfg(variant_id: str) -> dict:
     return variant_mod.apply(registry[variant_id], base)
 
 
+def _load_experiment_registry(cfg: dict, store) -> dict:
+    """Load file, registered hypothesis, and persisted adaptive variants."""
+    from agent import variants as variant_mod
+
+    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    strategy = cfg.get("strategy") or {}
+    strategy_id = str(strategy.get("id") or "")
+    base_version = str(strategy.get("version") or "")
+    if strategy_id and base_version:
+        registry.setdefault(
+            f"{strategy_id}.baseline",
+            variant_mod.baseline(strategy_id, base_version),
+        )
+        for variant in variant_mod.hypothesis_variants(
+                strategy_id, base_version):
+            registry.setdefault(variant.variant_id, variant)
+
+    # The store is authoritative for identities that have already run: this
+    # preserves a mutable result status and rehydrates exact adaptive values
+    # that are not present in the hand-edited YAML registry.
+    for row in store.variants():
+        try:
+            variant = variant_mod.Variant(
+                variant_id=str(row["variant_id"]),
+                strategy_id=str(row["strategy_id"]),
+                base_version=str(row["base_version"]),
+                overrides=json.loads(row["overrides_json"] or "{}"),
+                hypothesis=str(row["hypothesis"] or ""),
+                status=str(row["status"]),
+                hypothesis_id=row.get("hypothesis_id"),
+                hypothesis_params=json.loads(
+                    row.get("hypothesis_params_json") or "{}"),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            # Invalid legacy rows cannot safely participate in a new run.
+            continue
+        registry[variant.variant_id] = variant
+    return registry
+
+
 def cmd_corpus_stats(args: argparse.Namespace) -> int:
     db = Path(args.db) if args.db else default_db(args.mode)
     if not db.exists():
@@ -529,13 +569,11 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 def cmd_forward_qualify(args: argparse.Namespace) -> int:
     """Select an edge from paired real-time shadow outcomes, then paper it."""
-    from agent import variants as variant_mod
-
     cfg = _load_config()
     store = findings_mod.FindingsStore(
         Path(args.store) if args.store else findings_mod.resolve_store_path(
             (cfg.get("research") or {}).get("findings_store")))
-    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    registry = _load_experiment_registry(cfg, store)
     for variant in registry.values():
         store.register(variant)
     scope = args.scope
@@ -548,20 +586,52 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
         scope = scopes[0]
     strategy_id = args.strategy
     baseline_id = f"{strategy_id}.baseline"
-    if baseline_id not in registry:
-        print(f"no registered baseline {baseline_id}", file=sys.stderr)
-        return 2
-
-    axes: dict[tuple[str, ...], list] = {}
+    axes: dict[str, dict] = {}
+    hypothesis_groups: dict[str, list] = {}
     for variant_id, variant in sorted(registry.items()):
-        if (variant.strategy_id != strategy_id or variant_id == baseline_id
+        if (variant.strategy_id != strategy_id
                 or variant.status not in {"candidate", "testing"}):
+            continue
+        if variant.hypothesis_id and variant_id.startswith(
+                f"{strategy_id}.hyp."):
+            hypothesis_groups.setdefault(str(variant.hypothesis_id), []).append(
+                variant)
+            continue
+        if variant_id == baseline_id:
             continue
         axis = tuple(sorted(str(path) for path in variant.overrides))
         if not axis:
-            print(f"skipping {variant_id}: no parameter axis", file=sys.stderr)
             continue
-        axes.setdefault(axis, []).append(variant)
+        axis_id = "+".join(axis)
+        axes.setdefault(axis_id, {
+            "axis": list(axis),
+            "baseline_id": baseline_id,
+            "variants": [],
+        })["variants"].append(variant)
+
+    # Metadata-backed hypothesis contracts are real experiment axes even
+    # though they do not map to executable config paths. The registered
+    # setting is the baseline; every other materialized setting (including an
+    # adaptive value) is an arm in the same hypothesis family.
+    for hypothesis_id, variants_for_hypothesis in sorted(
+            hypothesis_groups.items()):
+        baseline = next((variant for variant in variants_for_hypothesis
+                         if variant.variant_id.endswith(".registered")), None)
+        settings = [variant for variant in variants_for_hypothesis
+                    if variant is not baseline]
+        if baseline is None or not settings:
+            continue
+        keys = sorted({str(key)
+                       for variant in variants_for_hypothesis
+                       for key in variant.hypothesis_params})
+        if not keys:
+            continue
+        axis = [f"hypothesis.{hypothesis_id}.{key}" for key in keys]
+        axes["+".join(axis)] = {
+            "axis": axis,
+            "baseline_id": baseline.variant_id,
+            "variants": settings,
+        }
     if not axes:
         print(f"no active parameter axes for {strategy_id}", file=sys.stderr)
         return 2
@@ -570,12 +640,14 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
     # Criterion 10 corrects across the axes tested in one run, and a family
     # size cannot be known while still walking the family.
     evaluated: dict[str, dict] = {}
-    for axis, axis_variants in sorted(axes.items()):
-        axis_id = "+".join(axis)
-        setting_ids = [variant.variant_id for variant in axis_variants]
+    for axis_id, axis_record in sorted(axes.items()):
+        axis = axis_record["axis"]
+        setting_ids = [variant.variant_id
+                       for variant in axis_record["variants"]]
         try:
             analysis_id, verdict = store.record_forward_analysis(
-                scope, strategy_id, list(axis), baseline_id, setting_ids)
+                scope, strategy_id, list(axis),
+                axis_record["baseline_id"], setting_ids)
         except ValueError as exc:
             print(f"forward axis {axis_id}: evidence invalid: {exc}",
                   file=sys.stderr)
@@ -642,7 +714,7 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
 
 def cmd_t3_packet(args: argparse.Namespace) -> int:
     """Create a content-addressed, review-gated T3 evidence packet."""
-    from agent import state, variants as variant_mod
+    from agent import state
 
     if bool(args.reviewed_by) != bool(args.registry_change_ref):
         print("--reviewed-by and --registry-change-ref must be supplied "
@@ -652,7 +724,7 @@ def cmd_t3_packet(args: argparse.Namespace) -> int:
     store = findings_mod.FindingsStore(
         Path(args.store) if args.store else findings_mod.resolve_store_path(
             (cfg.get("research") or {}).get("findings_store")))
-    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    registry = _load_experiment_registry(cfg, store)
     if args.variant not in registry:
         print(f"unknown variant {args.variant}", file=sys.stderr)
         return 2
@@ -739,16 +811,14 @@ def cmd_t3_packet(args: argparse.Namespace) -> int:
 
 def cmd_report(args: argparse.Namespace) -> int:
     """Regenerate every scorecard from the store, deterministically."""
-    from agent import variants as variant_mod
-
     cfg = _load_config()
     store = findings_mod.FindingsStore(
         Path(args.store) if args.store else findings_mod.resolve_store_path(
             (cfg.get("research") or {}).get("findings_store")))
     # Registered-but-unrun variants still get a card: "no sample yet" is a
-    # state worth being able to see.
-    for variant in variant_mod.load_registry(
-            REPO / "research" / "variants.yaml").values():
+    # state worth being able to see. Persisted adaptive variants are included
+    # so the report cannot hide the exact values the live path tried.
+    for variant in _load_experiment_registry(cfg, store).values():
         store.register(variant)
 
     written = findings_mod.write_scorecards(

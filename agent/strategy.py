@@ -207,7 +207,8 @@ def compact_entry_evidence(
 
 
 def build_setup_plan(decision: dict, symbol_snapshot: dict,
-                     cfg: dict) -> tuple[dict | None, str | None]:
+                     cfg: dict, *, hypothesis_params: dict | None = None
+                     ) -> tuple[dict | None, str | None]:
     """Validate one model-labelled setup and derive deterministic SL/TP."""
     direction = decision.get("direction")
     if direction not in {"long", "short"}:
@@ -230,7 +231,8 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
             return None, ("an experimental setup must name a registered "
                           "hypothesis_id")
         fires, why = hypotheses.evaluate(
-            hypothesis_id, symbol_snapshot, direction, cfg)
+            hypothesis_id, symbol_snapshot, direction, cfg,
+            hypothesis_params)
         if not fires:
             return None, f"hypothesis {hypothesis_id}: {why}"
     elif hypothesis_id:

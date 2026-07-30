@@ -73,6 +73,14 @@ its stated condition genuinely holds - these exist to be measured, and a \
 loosely applied label makes its row meaningless.
 __HYPOTHESIS_LIST__
 
+ADAPTIVE RESEARCH PROPOSALS
+You may include at most one proposal object when a registered hypothesis has
+a numeric setting worth testing: {"hypothesis_id":"...","setting_id":"...",
+"value":0.0,"reasoning":"..."}. The id and setting must be registered,
+reasoning must explain why this exact value tests the registered mechanism,
+and value must be a finite number in the bounded research range -1000 to 1000.
+This proposal is research metadata only; it never changes live risk or configuration.
+
 MARKET SNAPSHOT FIELD REFERENCE
 The special _market_context object summarizes BTC as the market benchmark: \
 its explicit regime, ATR ratio, relative volume and one-hour momentum. Use \
@@ -699,6 +707,29 @@ def parse_decisions(text: str) -> list[dict]:
         log.warning("Model output was not valid JSON: %s", e)
         return []
 
+    proposal = obj.get("proposal")
+    parsed_proposal = None
+    if proposal is not None:
+        if not isinstance(proposal, dict):
+            return []
+        hypothesis_id = str(proposal.get("hypothesis_id") or "").lower()
+        setting_id = str(proposal.get("setting_id") or "")
+        reasoning = str(proposal.get("reasoning") or "").strip()[:300]
+        if len(reasoning) < 10:
+            return []
+        try:
+            number = float(proposal.get("value"))
+        except (TypeError, ValueError):
+            return []
+        spec = hypotheses.spec_for(hypothesis_id)
+        valid_setting = any(str(s.get("id")) == setting_id
+                            for s in (spec.settings if spec else ()))
+        if (spec is None or not valid_setting or not math.isfinite(number)
+                or number < -1000.0 or number > 1000.0):
+            return []
+        parsed_proposal = {"hypothesis_id": hypothesis_id,
+                           "setting_id": setting_id, "value": number,
+                           "reasoning": reasoning}
     out = []
     for d in obj.get("decisions", []) or []:
         if not isinstance(d, dict):
@@ -751,4 +782,6 @@ def parse_decisions(text: str) -> list[dict]:
                 "evidence_change": evidence_change,
             })
         out.append(item)
+    if parsed_proposal is not None:
+        out.append({"action": "research_proposal", **parsed_proposal})
     return out

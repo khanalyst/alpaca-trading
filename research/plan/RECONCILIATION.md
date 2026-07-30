@@ -1,5 +1,12 @@
 # Reconciling this branch with the planning documents
 
+> Current implementation note: hypothesis variants, adaptive proposal history
+> and locks, first-class `FindingsStore` metadata, forward-qualification
+> linkage, and bounded isolated shadow workers are now present. The remaining
+> change to strategy/variant identity and any promotion is manual and reviewed.
+> This document governs evidence authority and G2/safety rules; it does not
+> prescribe an import or VM handoff as a production/default execution path.
+
 This branch began as `codex/main-hardening-v2`, which had already built a
 substantial research programme. The four planning documents in this directory
 describe a different one. They agree on far more than they disagree on, but
@@ -135,10 +142,10 @@ commit.
 
 ## Still open
 
-- **Gate G2 has never been run against a real journal.** Every number the new
-  harness produces is unvalidated until it is. `research.py replay
-  --check-fidelity` exits non-zero on failure and should be the first command
-  run once a journal exists.
+- **A real-journal G2 result is still required for promotion.** Local fixture
+  tests do not replace `research.py replay --check-fidelity`; a failed G2 is a
+  hard stop. Do not read the historical exploratory reports as current G2
+  evidence.
 - **Batch 6.4 is blocked** on H-I, which is blocked on that same journal.
 - **H-G and H-H are blocked on calendar time.** B0.5 started their clock; the
   sample does not exist for roughly three months. That was always the plan.

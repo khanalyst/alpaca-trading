@@ -1,4 +1,11 @@
-# Findings — codebase analysis against the parallel-hypothesis-testing goal
+# Findings — historical codebase analysis against the parallel-hypothesis-testing goal
+
+> Historical planning record. The implementation described below has since
+> landed in `agent/variants.py`, `agent/shadow.py`, and `research/findings.py`:
+> connected hypothesis variants, adaptive proposal/history/locks, first-class
+> FindingsStore metadata, forward qualification linkage, and bounded shadow
+> workers. Use `research/protocol.md` and the current code/tests for policy;
+> keep this document for rationale and rejected alternatives.
 
 **Branch:** `claude/main-hardening-v2-67ebiz` @ `a0679c9`
 **Date:** 2026-07-28
@@ -6,9 +13,8 @@
 `config.yaml`, `tests/*.py`, all docs), plus a clean run of the test suite on
 Python 3.12.
 
-```
-170 passed, 1 skipped in 2.65s
-```
+The test-count snapshot below is historical and is not a current repository
+status claim.
 
 The single skip is `tests/test_okx_demo_integration.py`, which is gated behind
 `OKX_RUN_DEMO_INTEGRATION=1` by design.
@@ -593,9 +599,9 @@ Detailed sequencing, batch boundaries and acceptance criteria are in
 
 ## Appendix — verification notes
 
-- Test run: `python -m pytest tests -q` on Python 3.12 (the repo requires 3.12+;
-  the container default `python3` is 3.11 and cannot install the pinned
-  `numpy==2.5.1`). Result: **170 passed, 1 skipped**.
+- Test run: historical Python 3.12 verification snapshot; do not use its
+  result as the current suite status. The repo requires the pinned research
+  dependencies and a compatible interpreter.
 - `llm_input` / `llm_output` consumer search:
   `grep -rn "llm_input\|llm_output" --include=*.py .` → writer + its own unit
   tests only.

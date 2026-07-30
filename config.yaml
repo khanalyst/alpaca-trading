@@ -251,6 +251,7 @@ research:
   shadow_enabled: true
   shadow_variants: ["*"]
   shadow_budget_ms: 0
+  shadow_workers: 2
   findings_store: research/cache/findings.db
   paper_initial_balance_usdt: 10000
   paper_max_failures: 3

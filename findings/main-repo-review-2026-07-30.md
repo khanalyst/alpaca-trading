@@ -8,12 +8,24 @@ include subsequent changes now present on `main`.
 3. no over-engineering;
 4. different hypotheses, and different variants of each.
 
-Every claim below was checked against the code or reproduced. The test suite
-was run before anything was changed and passed clean — **832 passed, 1 skipped,
-56 subtests** on Python 3.12 — and passes at **839 passed, 1 skipped, 105
-subtests** with the fixes below. Items marked **Fixed** were repaired in this
-branch and carry a regression test that was confirmed to fail without the fix;
-items marked **Recommended** are not implemented here, and the reason is given.
+Every claim below was checked against the code or reproduced. The numeric test
+counts in the original review are historical snapshots, not current status;
+they are intentionally not repeated because later uncommitted implementation
+and test changes are present in this worktree. Items marked **Fixed** were
+repaired in this branch and carry a regression test; items marked
+**Recommended** are not implemented here, and the reason is given.
+
+### Current implementation reconciliation
+
+Later implementation now connects hypothesis variants to the prompt/parser,
+materializes first-class `hypothesis_id` and parameter metadata, and supports
+adaptive proposal selection. `FindingsStore` persists proposal history,
+setting locks, variant metadata, and forward-qualification linkage. Shadow
+evaluation uses bounded workers and isolated per-variant paper state, and is
+opt-in through `research:` configuration. The remaining manual boundary is
+deliberate: final strategy/variant-ID changes and reviewed promotion are still
+required; evidence does not edit the live registry or make a VM import path a
+production/default path.
 
 ---
 
@@ -42,21 +54,16 @@ whole nightly cycle at the scorecard step, while `forward-qualify`'s error
 handler reported the failure as "no promotable edge". Reproduced, fixed, and
 now caught at review time.
 
-**The anti-overfitting machinery guards the path with no data and not the path
-that produced every published verdict.** `research/edge_lab.py` and its eight
-dependents have zero test coverage. Every committed tier — including three
-`T0_REJECTED` verdicts — rests on that engine.
+**The anti-overfitting machinery has two evidence paths with different
+authority.** The exploratory `research/edge_lab.py` path now has focused
+fixture coverage; the authoritative journal-replay path remains the source
+for promotion. Published exploratory verdicts remain historical evidence, not
+automatic promotion authority.
 
-**Variants exist for exactly one strategy.** All 16 entries in
-`research/variants.yaml` are `strategy_id: momentum`. The other six hypotheses
-are each scored at one hard-coded parameterisation, and the tournament will
-award `T0_REJECTED` from it. This contradicts the repository's own rule —
-`MIN_AXIS_SETTINGS = 3`, "the rule that stops a good idea being killed by one
-badly chosen value" — which governs only the momentum path. `agent/registry.py`
-states the consequence out loud for `flush-fade`: *"The mechanism remains
-plausible; this parameterisation of it does not survive."* The framework knows
-the distinction and the scoring path cannot make it. This is the highest-value
-change available and it is requirement 4's core.
+**Variant coverage is now connected at the runtime boundary.** In-prompt
+hypotheses materialize deterministic, named variants and adaptive proposals
+select only registered bounded settings. The old one-strategy description is
+historical context for the original review, not current implementation status.
 
 ---
 
@@ -70,7 +77,7 @@ The pipeline exists end to end and is unusually well sequenced:
 | --- | --- |
 | Fidelity gate | `research.py replay --check-fidelity` (G2) must reproduce the agent's own recorded decisions; result journalled as `research_gate_result`; `sweep`, `funnel` and `three-arm` all refuse without a current PASS |
 | Discovery | `protocol.evaluate_axis` — selection on the fit window only, paired proposal identity, cluster-block bootstrap, verdict names its governing criterion |
-| Documentation | `findings.db`, append-only with history triggers, schema 7; `write_scorecards` regenerates one markdown card per variant into `findings/` |
+| Documentation | `findings.db`, append-only with history triggers, schema 8; `write_scorecards` regenerates one markdown card per variant into `findings/` |
 | Forward confirmation | `forward-qualify` re-derives the verdict from the immutable decision ledger, proving one strategy version, one declared axis, and identical non-axis config |
 | Paper | `qualify_variant` → `PAPER_PENDING` while a shadow position is open → clean rebased `PAPER` account when flat |
 | Lock | `t3-packet` builds a SHA-256 content-addressed packet, `DRAFT_REVIEW_REQUIRED` unless the full checklist passes **and** a reviewer plus a registry-change reference are supplied |
@@ -214,30 +221,26 @@ Current `main` applies the correction across all axes evaluated by
 complete persisted family to survive again at qualification and T3 packet
 creation. The promotion rule remains manual and review-gated.
 
-### R2-02 — the exploratory engine that produced every verdict is untested · **Partially implemented**
+### R2-02 — exploratory evidence needs continuing fixture coverage · **Partially implemented**
 
-Test references by research module: `replay` 30, `corpus` 30, `findings` 12,
-`gates` 12, `score` 12, `stats` 12 — and **`edge_lab` 0**, alongside
-`edge_report` 0, `signal_lab` 0, `find_edge` 0, `deep_edge` 0,
-`validate_candidate` 0, `unbiased_recheck` 0, `portfolio_sim` 0,
-`validate_features` 0.
+The current research suite includes focused deterministic coverage for
+`edge_lab`, hypothesis variants, findings-store metadata, and bounded shadow
+evaluation. The remaining exploratory studies are still largely report-driven
+and should not be mistaken for continuously maintained production modules.
 
 `tests/test_gates.py` is explicit that "the gates themselves are
 integration-tested by running the tournament against real data", and that data
-lives under gitignored `runtime/`. Current `main` now adds a small deterministic
-fixture and focused lookahead/reproduction/cost tests for `edge_lab`, but the
-remaining exploratory modules are still largely untested. The 1,170-line
+lives under gitignored `runtime/`. The 1,170-line
 feature/signal/simulation engine on which
 `research/results/edge-audit-2024-2026`, the tournament leaderboard, and three
 `T0_REJECTED` tiers all rest. `validate_features.py` is the only cross-check and
 it also cannot run in CI, so its clean result survives as prose in
 `research/README.md` rather than as a check.
 
-The asymmetry is exactly backwards from where the risk sits. The authoritative
-path — which has no corpus yet — has `test_no_lookahead.py`,
+The authoritative path has `test_no_lookahead.py`,
 `test_replay_determinism.py`, `test_replay_fidelity.py` and a hard G2 gate. The
-exploratory path, which has two years of data and has already issued every
-published verdict, has none. `agent/registry.py` argues the bias runs against
+exploratory reports remain historical and are not a substitute for journal
+replay. `agent/registry.py` argues the bias runs against
 the strategy so `T0_REJECTED` is the conservative reading; that argument
 protects against wrongly *granting* capital and says nothing about a silent
 index shift wrongly rejecting a mechanism, which is the failure requirement 4
@@ -415,10 +418,9 @@ Recommended, and cheap because the pieces already exist:
    absorb the added multiplicity.
 
 Then `T0_REJECTED` for a non-momentum hypothesis means the axis is bad rather
-than that one guess was. Until it exists, requirement 4 is met for momentum and
-for the hypothesis *layer*, and not met for the variant layer of any hypothesis
-that is not momentum — which is where the search for an edge actually is, since
-momentum is retained explicitly as the benchmark null.
+than that one guess was. The connected variant layer now satisfies the
+implementation requirement; qualification and promotion still depend on
+evidence and review for each variant.
 
 The remaining work is the deliberate re-score and review of the committed
 results; no current tier should be inferred from the new settings until that

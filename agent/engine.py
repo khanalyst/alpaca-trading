@@ -105,6 +105,32 @@ class Engine:
         self._startup_reconciled = False
         self._credential_failures = 0
 
+    def _record_research_proposals(self, decisions: list[dict]) -> None:
+        proposal = next((d for d in decisions
+                         if d.get("action") == "research_proposal"), None)
+        if proposal is None or self.shadow is None:
+            return
+        store = self.shadow.store
+        try:
+            from .variants import adaptive_hypothesis_variant
+            adaptive = adaptive_hypothesis_variant(
+                self.strategy_id, self.strategy_version,
+                proposal["hypothesis_id"], proposal["setting_id"],
+                float(proposal["value"]))
+            variant_id = adaptive.variant_id
+            stored = store.propose_numeric_setting(
+                self.strategy_id, proposal["hypothesis_id"],
+                proposal["setting_id"], proposal["value"], self.run_id,
+                minimum=-1000.0, maximum=1000.0,
+                reasoning=proposal["reasoning"])
+            store.add_finding(
+                variant_id, "observation", json.dumps({
+                    "type": "llm_numeric_proposal", "proposal": stored,
+                    "reasoning": proposal["reasoning"],
+                }, sort_keys=True), author="llm")
+        except (StopIteration, ValueError) as exc:
+            log.warning("research proposal rejected: %s", exc)
+
     @staticmethod
     def _build_shadow(cfg: dict):
         """Never fatal. A bad research block disables shadow, not trading."""
@@ -708,6 +734,7 @@ class Engine:
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
+        self._record_research_proposals(decisions)
         # Reuse the exact parsed proposals and confidences. No second LLM call,
         # and no deterministic confidence substitution.
         self._run_shadow_variants(

@@ -13,6 +13,7 @@ import math
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from research.findings import (FindingsStore, _content_hash,
@@ -90,11 +91,14 @@ class ShadowEvaluator:
             *, store: FindingsStore | None = None,
             scope_key: str = "demo:unscoped",
             initial_balance_usdt: float = 10_000.0,
-            max_failures: int = 3) -> None:
+            max_failures: int = 3,
+            workers: int = 1) -> None:
         self.budget_ms = float(budget_ms)
+        self.base_cfg = base_cfg
         self.scope_key = str(scope_key)
         self.initial_balance_usdt = float(initial_balance_usdt)
         self.max_failures = int(max_failures)
+        self.workers = max(1, int(workers))
         # Direct construction is intentionally isolated. Runtime construction
         # supplies the durable configured store through build(); tests and
         # one-off callers get a private database instead of contaminating the
@@ -193,6 +197,37 @@ class ShadowEvaluator:
         budget = ShadowBudget(self.budget_ms)
         records = (self.advance(snapshot, timestamp)
                    if advance_accounts else [])
+        for proposal in proposals or []:
+            if proposal.get("action") == "research_proposal":
+                from .variants import adaptive_hypothesis_variant
+                try:
+                    variant = adaptive_hypothesis_variant(
+                        str(self.base_cfg["strategy"]["id"]),
+                        str(self.base_cfg["strategy"]["version"]),
+                        str(proposal["hypothesis_id"]),
+                        str(proposal["setting_id"]), float(proposal["value"]))
+                    if variant.variant_id not in self._variants:
+                        cfg = apply(variant, self.base_cfg)
+                        model = require_validated(variant.strategy_id)
+                        self.store.register(variant)
+                        provenance = {
+                            "variant_definition_hash": variant_identity_hash(variant),
+                            "strategy_config_version": runtime_state.experiment_fingerprint(cfg),
+                            "experiment_config": runtime_state.experiment_fingerprint_material(cfg),
+                            "code_version": runtime_state.code_fingerprint(),
+                            "forward_model_id": model.model_id,
+                            "forward_model_assumptions_hash": _content_hash(model.as_dict()),
+                        }
+                        self.store.bind_paper_experiment(
+                            self.scope_key, variant.variant_id, provenance,
+                            self.initial_balance_usdt)
+                        self._variants[variant.variant_id] = variant
+                        self._configs[variant.variant_id] = cfg
+                        self._engines[variant.variant_id] = RiskEngine(cfg)
+                        self._models[variant.variant_id] = model
+                        self._provenance[variant.variant_id] = provenance
+                except (KeyError, TypeError, ValueError):
+                    pass
         recorded_opens = [dict(decision) for decision in (proposals or [])
                           if decision.get("action") == "open"]
 
@@ -206,40 +241,45 @@ class ShadowEvaluator:
                 self._record_failure(
                     variant_id, "portfolio_load_failed", exc, timestamp)
 
-        order = self.store.scheduler_order(self.scope_key, self.variant_ids)
+        order = self.store.scheduler_order(
+            self.scope_key, self._scheduled_variant_ids(proposals or []))
         evaluated: list[str] = []
         skipped: list[str] = []
+        pending = []
         for index, variant_id in enumerate(order):
             if budget.exhausted():
                 skipped.extend(order[index:])
                 break
-            account = accounts.get(variant_id)
-            if account is None:
+            if variant_id not in accounts:
                 skipped.append(variant_id)
                 continue
-            state, version = account
-            processed = 0
+            pending.append((variant_id, accounts[variant_id]))
+
+        # Workers never touch FindingsStore. They own one copied account state
+        # and return a commit packet; SQLite writes and scheduler accounting
+        # stay serialized here because the store is the durable isolation
+        # boundary.
+        if self.workers > 1 and len(pending) > 1:
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(pending)),
+                                    thread_name_prefix="shadow") as pool:
+                results = list(pool.map(
+                    lambda item: self._evaluate_variant(
+                        item[0], item[1], snapshot, recorded_opens,
+                        timestamp, cycle_id), pending))
+        else:
+            results = [self._evaluate_variant(
+                variant_id, account, snapshot, recorded_opens,
+                timestamp, cycle_id) for variant_id, account in pending]
+
+        for variant_id, result in zip((item[0] for item in pending), results):
             try:
-                pending_opens: list[dict] = []
-                pending_decisions: list[dict] = []
-                variant_records: list[ShadowRecord] = []
-                for decision in recorded_opens:
-                    record = self._evaluate_one(
-                        variant_id, snapshot, decision, state, timestamp,
-                        cycle_id, pending_opens)
-                    variant_records.append(record)
-                    if (record.proposal_id
-                            and record.reason != "proposal already evaluated"):
-                        pending_decisions.append(self._paper_decision(
-                            variant_id, cycle_id, decision, record, timestamp))
-                    processed += 1
-                self._refresh_metrics(state, snapshot, timestamp)
-                self._apply_circuit_breakers(
-                    state, self._configs[variant_id], timestamp)
+                if isinstance(result, Exception):
+                    raise result
+                state, version, variant_records, pending_opens, pending_decisions = result
                 self.store.commit_paper_portfolio(
                     self.scope_key, variant_id, state, version,
-                    opened_trades=pending_opens,
-                    decisions=pending_decisions, now=timestamp)
+                    opened_trades=pending_opens, decisions=pending_decisions,
+                    now=timestamp)
                 records.extend(variant_records)
                 if state.get("status") == "REVOKED":
                     qualification = self.store.qualification_status(
@@ -250,13 +290,9 @@ class ShadowEvaluator:
                             {"source": "paper_portfolio",
                              "reason": state.get("revoked_reason")},
                             scope_key=self.scope_key)
-                complete = processed == len(recorded_opens)
-                (evaluated if complete and processed else skipped).append(
-                    variant_id)
+                (evaluated if len(variant_records) == len(recorded_opens)
+                 and variant_records else skipped).append(variant_id)
             except Exception as exc:                       # noqa: BLE001
-                # A failed commit produced no durable learning, even if the
-                # evaluator spent CPU on one or more symbols. Keep it least-
-                # observed so the scheduler retries it promptly.
                 skipped.append(variant_id)
                 self._record_failure(
                     variant_id, "variant_evaluation_failed", exc, timestamp)
@@ -281,6 +317,56 @@ class ShadowEvaluator:
         }
         self.last_budget = budget
         return records
+
+    def _scheduled_variant_ids(self, proposals: list[dict]) -> list[str]:
+        """Select at most one adaptive setting per strategy and cycle.
+
+        Pre-registered variants have no ``hypothesis_id`` and remain ordinary
+        tournament arms. Adaptive variants are eligible only when this cycle
+        contains their matching proposal, preventing two settings of one
+        strategy from being observed in the same adaptive window.
+        """
+        adaptive = {(str(p.get("hypothesis_id")), str(p.get("setting_id")))
+                    for p in proposals if p.get("action") == "research_proposal"}
+        selected = []
+        by_strategy = {}
+        for variant_id in self.variant_ids:
+            variant = self._variants[variant_id]
+            if variant.hypothesis_id is None:
+                selected.append(variant_id)
+                continue
+            parts = variant_id.split(".")
+            setting_id = (
+                parts[-2] if len(parts) >= 2 and
+                parts[-1].startswith("adaptive_") else parts[-1])
+            if (str(variant.hypothesis_id), setting_id) in adaptive:
+                by_strategy.setdefault(variant.strategy_id, variant_id)
+        selected.extend(by_strategy.values())
+        return selected
+
+    def _evaluate_variant(self, variant_id, account, snapshot, proposals,
+                          timestamp, cycle_id):
+        try:
+            state, version = account
+            pending_opens = []
+            pending_decisions = []
+            variant_records = []
+            for decision in proposals:
+                record = self._evaluate_one(
+                    variant_id, snapshot, decision, state, timestamp,
+                    cycle_id, pending_opens)
+                variant_records.append(record)
+                if (record.proposal_id
+                        and record.reason != "proposal already evaluated"):
+                    pending_decisions.append(self._paper_decision(
+                        variant_id, cycle_id, decision, record, timestamp))
+            self._refresh_metrics(state, snapshot, timestamp)
+            self._apply_circuit_breakers(
+                state, self._configs[variant_id], timestamp)
+            return (state, version, variant_records, pending_opens,
+                    pending_decisions)
+        except Exception as exc:                       # noqa: BLE001
+            return exc
 
     def _advance_account(
             self, variant_id: str, snapshot: dict, now: float,
@@ -445,7 +531,12 @@ class ShadowEvaluator:
                 variant_id, symbol, signal_ts, state, "vetoed",
                 direction, setup_type,
                 "proposal already evaluated", proposal_id=proposal_id)
-        plan, why = strategy.build_setup_plan(decision, row, cfg)
+        variant = self._variants[variant_id]
+        plan, why = strategy.build_setup_plan(
+            decision, row, cfg,
+            hypothesis_params=(variant.hypothesis_params
+                               if variant.hypothesis_id == decision.get(
+                                   "hypothesis_id") else None))
         if plan is None:
             state.setdefault("seen_proposals", {})[proposal_id] = now
             return self._record(
@@ -722,6 +813,13 @@ def build(
     if not block.get("shadow_enabled"):
         return None
     names = list(block.get("shadow_variants") or [])
+    from .variants import hypothesis_variants, preregistered_variants
+    generated = hypothesis_variants(
+        str(cfg["strategy"]["id"]), str(cfg["strategy"]["version"]))
+    generated.extend(preregistered_variants(
+        str(cfg["strategy"]["id"]), str(cfg["strategy"]["version"])))
+    for variant in generated:
+        registry.setdefault(variant.variant_id, variant)
     if "*" in names:
         names = [
             name for name, variant in registry.items()
@@ -751,4 +849,5 @@ def build(
         initial_balance_usdt=float(
             block.get("paper_initial_balance_usdt") or 10_000),
         max_failures=int(block.get("paper_max_failures") or 3),
+        workers=int(block.get("shadow_workers") or 1),
     )

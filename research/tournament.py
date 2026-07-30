@@ -26,6 +26,7 @@ import argparse
 import dataclasses
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
@@ -719,6 +720,9 @@ def main() -> int:
     parser.add_argument("--exit-policy", default="fixed_rr")
     parser.add_argument("--min-bars", type=int, default=8000)
     parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument(
+        "--workers", type=int, default=2,
+        help="bounded concurrent strategy workers (each setting is scored once)")
     parser.add_argument("--only", default="",
                         help="comma-separated strategy ids to score")
     parser.add_argument("--forward", type=Path,
@@ -748,11 +752,20 @@ def main() -> int:
     specs = [s for s in REGISTRY.values() if not wanted or s.id in wanted]
     specs.sort(key=lambda s: (-TIERS.index(s.tier), s.id))
 
-    rows = []
-    for spec in specs:
+    def score_one(spec):
         print(f"scoring {spec.id}/{spec.version} ...", file=sys.stderr)
-        rows.append(score_strategy(spec, frames, membership, cfg,
-                                   args.cost, args.exit_policy))
+        return score_strategy(spec, frames, membership, cfg,
+                              args.cost, args.exit_policy)
+
+    worker_count = max(1, min(int(args.workers), len(specs) or 1))
+    if worker_count == 1 or len(specs) < 2:
+        rows = [score_one(spec) for spec in specs]
+    else:
+        # Inputs are read-only and each strategy owns its settings list. The
+        # result order remains the registry order so reports stay deterministic.
+        with ThreadPoolExecutor(max_workers=worker_count,
+                                thread_name_prefix="tournament") as pool:
+            rows = list(pool.map(score_one, specs))
 
     forward = {}
     if args.forward and args.forward.exists():

@@ -415,11 +415,14 @@ def validate_config(raw: dict) -> dict:
         research = _mapping(research, "research")
         _keys(research, {"shadow_enabled", "shadow_variants",
                          "shadow_budget_ms",
+                         "shadow_workers",
                          "findings_store", "paper_initial_balance_usdt",
                          "paper_max_failures", "paper_min_closed_trades"},
               "research")
         _boolean(research, "shadow_enabled", "research")
         _number(research, "shadow_budget_ms", 0, 60_000, "research")
+        if "shadow_workers" in research:
+            _integer(research, "shadow_workers", 1, 32, "research")
         if "paper_initial_balance_usdt" in research:
             _number(research, "paper_initial_balance_usdt", 100,
                     1_000_000_000, "research")

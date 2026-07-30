@@ -184,10 +184,14 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # them describe different decision spaces and must never be pooled.
         # strategy.version moved phase1-v2 -> phase1-v3 with the second, so
         # the fork is visible in the journal without reading a prompt hash.
+        # c61905480bfef239 -> 8790863bfadaf741 in R4-03, which added the
+        # bounded registered numeric research-proposal schema, then
+        # 8790863bfadaf741 -> 913e4bb0572a6e4e when proposal reasoning became
+        # required and persisted with the adaptive setting history.
         # This constant moves only in a batch that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "c61905480bfef239",
+            "913e4bb0572a6e4e",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

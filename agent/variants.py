@@ -55,6 +55,8 @@ class Variant:
     overrides: dict = field(default_factory=dict)
     hypothesis: str = ""
     status: str = "candidate"
+    hypothesis_id: str | None = None
+    hypothesis_params: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not _is_variant_id(self.variant_id):
@@ -86,6 +88,10 @@ class Variant:
             if not isinstance(path, str) or not path:
                 raise ConfigError(
                     f"{self.variant_id}: override keys must be dotted paths")
+        if self.hypothesis_id is not None and not str(self.hypothesis_id).strip():
+            raise ConfigError(f"{self.variant_id}: hypothesis_id cannot be empty")
+        if not isinstance(self.hypothesis_params, dict):
+            raise ConfigError(f"{self.variant_id}: hypothesis_params must be a map")
 
 
 def _is_variant_id(value: object) -> bool:
@@ -155,6 +161,102 @@ def baseline(strategy_id: str, base_version: str) -> Variant:
     )
 
 
+def hypothesis_variants(strategy_id: str, base_version: str) -> list[Variant]:
+    """Return deterministic first-class variants for registered hypotheses.
+
+    Hypothesis parameters are stored as experiment metadata, not as invented
+    executable config paths.  The deterministic contract consumes them at
+    proposal validation time; ordinary strategy overrides remain in
+    ``overrides`` and continue to use ``apply`` unchanged.
+    """
+    from . import hypotheses
+
+    out = []
+    for spec in sorted(hypotheses.REGISTRY.values(), key=lambda item: item.id):
+        for setting in sorted(spec.settings, key=lambda item: str(item["id"])):
+            setting_id = str(setting["id"])
+            safe_hypothesis_id = spec.id.replace("-", "_")
+            variant_id = f"{strategy_id}.hyp.{safe_hypothesis_id}.{setting_id}"
+            params = dict(spec.contract_params)
+            params.update(setting.get("params") or {})
+            out.append(Variant(
+                variant_id=variant_id,
+                strategy_id=strategy_id,
+                base_version=base_version,
+                hypothesis=str(setting.get("claim") or spec.claim),
+                status="candidate",
+                hypothesis_id=spec.id,
+                hypothesis_params=params,
+            ))
+    return out
+
+
+def adaptive_hypothesis_variant(strategy_id: str, base_version: str,
+                                hypothesis_id: str, setting_id: str,
+                                value: float) -> Variant:
+    """Materialize one exact, auditable numeric proposal as a variant."""
+    from . import hypotheses
+    spec = hypotheses.spec_for(hypothesis_id)
+    if spec is None or not any(str(s.get("id")) == str(setting_id)
+                               for s in spec.settings):
+        raise ConfigError("adaptive proposal is not registered")
+    params = dict(spec.contract_params)
+    setting = next(s for s in spec.settings if str(s.get("id")) == str(setting_id))
+    params.update(setting.get("params") or {})
+    params[str(next(iter(setting.get("params") or params), "value"))] = value
+    safe = str(hypothesis_id).replace("-", "_")
+    value_id = format(float(value), ".15g").replace("-", "m").replace(".", "_")
+    return Variant(
+        variant_id=f"{strategy_id}.hyp.{safe}.{setting_id}.adaptive_{value_id}",
+        strategy_id=strategy_id, base_version=base_version,
+        hypothesis=(f"Adaptive value {value} for {hypothesis_id}/{setting_id}: "
+                    "test the registered mechanism at this exact point."),
+        hypothesis_id=hypothesis_id, hypothesis_params=params)
+
+
+def preregistered_variants(
+        strategy_id: str, base_version: str,
+        path: str | Path | None = None) -> list[Variant]:
+    """Materialize research/hypotheses/<strategy>.yaml settings.
+
+    YAML is the pre-registration source of truth for research axes; the
+    resulting objects use the same immutable FindingsStore identity as
+    ordinary shadow variants. No status is changed and no paper/live action
+    is implied.
+    """
+    if path is None:
+        path = (Path(__file__).resolve().parents[1] / "research" /
+                "hypotheses" / f"{strategy_id}.yaml")
+    source = Path(path)
+    if not source.exists():
+        return []
+    raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    settings = raw.get("settings") or []
+    if not isinstance(settings, list):
+        raise ConfigError(f"{source}: settings must be a list")
+    out = []
+    for entry in settings:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            raise ConfigError(f"{source}: each setting requires an id")
+        setting_id = str(entry["id"])
+        params = dict(entry.get("params") or {})
+        overrides = {
+            (key if "." in key else f"strategy.{key}"): value
+            for key, value in params.items()
+        }
+        out.append(Variant(
+            variant_id=f"{strategy_id}.prereg.{setting_id}",
+            strategy_id=strategy_id,
+            base_version=base_version,
+            overrides=(overrides if strategy_id == "momentum" else {}),
+            hypothesis=str(entry.get("claim") or raw.get("prediction") or ""),
+            status="candidate",
+            hypothesis_id=f"{strategy_id}:{setting_id}",
+            hypothesis_params=params,
+        ))
+    return out
+
+
 def load_registry(path: str | Path) -> dict[str, Variant]:
     """Load and validate ``research/variants.yaml``.
 
@@ -178,7 +280,7 @@ def load_registry(path: str | Path) -> dict[str, Variant]:
             raise ConfigError(f"{path}: variant #{index} is not a mapping")
         unknown = set(entry) - {
             "variant_id", "strategy_id", "base_version", "overrides",
-            "hypothesis", "status",
+            "hypothesis", "status", "hypothesis_id", "hypothesis_params",
         }
         if unknown:
             raise ConfigError(
@@ -191,6 +293,8 @@ def load_registry(path: str | Path) -> dict[str, Variant]:
             overrides=dict(entry.get("overrides") or {}),
             hypothesis=str(entry.get("hypothesis", "")),
             status=str(entry.get("status", "candidate")),
+            hypothesis_id=entry.get("hypothesis_id"),
+            hypothesis_params=dict(entry.get("hypothesis_params") or {}),
         )
         if variant.variant_id in out:
             raise ConfigError(
@@ -209,6 +313,8 @@ def save_registry(path: str | Path, variants: dict[str, Variant]) -> None:
             "overrides": dict(v.overrides),
             "hypothesis": v.hypothesis,
             "status": v.status,
+            "hypothesis_id": v.hypothesis_id,
+            "hypothesis_params": dict(v.hypothesis_params),
         }
         for _, v in sorted(variants.items())
     ]}
