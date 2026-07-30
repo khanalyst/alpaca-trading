@@ -479,6 +479,91 @@ class FamilyCorrectionTests(unittest.TestCase):
 
         self.assertEqual(corrected["a"]["verdict"],
                          stats.INSUFFICIENT_SAMPLE)
+        
+    def promoted(axis_id, low, high, n=120):
+        """A PROMOTE verdict carrying one confirmation interval."""
+        return protocol.Verdict(
+            protocol.PROMOTE, "every promotion criterion holds",
+            f"{axis_id} cleared every criterion",
+            {"best": f"{axis_id}.best",
+             "confirmation_interval": {"point": (low + high) / 2, "low": low,
+                                       "high": high, "n": n}})
+
+
+class AxisFamilyCorrectionTests(unittest.TestCase):
+    """Criterion 10: several axes are several chances to promote something."""
+
+    def test_a_lone_strong_axis_survives(self):
+        corrected = protocol.apply_axis_family_correction(
+            {"strategy.fixed_reward_risk": promoted("rr", 0.40, 0.60)})
+
+        verdict = corrected["strategy.fixed_reward_risk"]
+        self.assertEqual(verdict.verdict, protocol.PROMOTE)
+        self.assertTrue(verdict.evidence["family"]["significant"])
+        self.assertEqual(verdict.evidence["family"]["family_n"], 1)
+
+    def test_a_marginal_axis_stops_promoting_once_the_family_grows(self):
+        """The same evidence, judged against how many axes were asked."""
+        alone = protocol.apply_axis_family_correction(
+            {"a": promoted("a", 0.01, 0.30)})
+        crowded = protocol.apply_axis_family_correction({
+            "a": promoted("a", 0.01, 0.30),
+            **{name: protocol.Verdict(
+                protocol.CONTINUE, "confirmation delta does not clear zero",
+                "", {}) for name in "bcdefgh"},
+        })
+
+        self.assertEqual(alone["a"].verdict, protocol.PROMOTE)
+        self.assertEqual(crowded["a"].verdict, protocol.CONTINUE)
+        self.assertEqual(
+            crowded["a"].governing_criterion,
+            "family-wise correction across the axes tested")
+        self.assertGreater(crowded["a"].evidence["family"]["p_adjusted"],
+                           alone["a"].evidence["family"]["p_adjusted"])
+
+    def test_failed_axes_stay_in_the_family(self):
+        """An axis that failed still consumed a chance."""
+        corrected = protocol.apply_axis_family_correction({
+            "a": promoted("a", 0.40, 0.60),
+            "b": protocol.Verdict(protocol.CONTINUE, "x", "y", {}),
+            "c": protocol.Verdict(stats.INSUFFICIENT_SAMPLE, "x", "y", {}),
+        })
+
+        self.assertEqual(corrected["a"].evidence["family"]["family_n"], 3)
+        self.assertEqual(corrected["a"].evidence["family"]["axes"],
+                         ["a", "b", "c"])
+
+    def test_the_family_record_reaches_every_verdict(self):
+        corrected = protocol.apply_axis_family_correction({
+            "a": promoted("a", 0.40, 0.60),
+            "b": protocol.Verdict(protocol.CONTINUE, "x", "y", {}),
+        })
+
+        for axis_id in ("a", "b"):
+            with self.subTest(axis=axis_id):
+                self.assertIn("family", corrected[axis_id].evidence)
+
+    def test_an_axis_that_never_promoted_is_never_significant(self):
+        corrected = protocol.apply_axis_family_correction(
+            {"a": protocol.Verdict(protocol.CONTINUE, "x", "y", {
+                "confirmation_interval": {"low": 0.4, "high": 0.6, "n": 120}})})
+
+        self.assertFalse(corrected["a"].evidence["family"]["significant"])
+
+    def test_correction_reads_the_confirmation_not_the_fit_interval(self):
+        """Criterion 5 is a screen; the held-out window is the test."""
+        verdict = promoted("a", 0.40, 0.60)
+        verdict.evidence["fit_interval"] = {
+            "low": 5.0, "high": 6.0, "n": 500}
+        wide_confirmation = promoted("a", -0.10, 0.90)
+        wide_confirmation.evidence["fit_interval"] = verdict.evidence[
+            "fit_interval"]
+
+        self.assertTrue(protocol.apply_axis_family_correction(
+            {"a": verdict})["a"].evidence["family"]["significant"])
+        self.assertFalse(protocol.apply_axis_family_correction(
+            {"a": wide_confirmation})["a"].evidence["family"]["significant"])
+
 
 
 if __name__ == "__main__":
