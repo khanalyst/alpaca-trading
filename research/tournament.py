@@ -23,6 +23,7 @@ is suspect. That check is the reason this is a tournament and not a search.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from datetime import datetime, timezone
@@ -47,6 +48,11 @@ HYPOTHESES = REPO / "research" / "hypotheses"
 # Which research contract implements each registered strategy. A strategy in
 # the register with no entry here is registered but not yet testable, which
 # the report states rather than silently skipping.
+
+# Each entry returns the contract at its REGISTERED parameterisation. The
+# pre-registration's `settings:` block names the alternatives, and
+# `axis_settings` derives them from this one with `dataclasses.replace`, so a
+# setting cannot silently change a field the registered point never had.
 CONTRACTS = {
     "momentum": lambda cfg: Contract.from_config(cfg) if cfg else Contract(),
     "flush-fade": lambda cfg: FlushFadeContract(),
@@ -79,6 +85,87 @@ def load_preregistration(strategy_id: str) -> dict | None:
         return None
     return yaml.safe_load(path.read_text())
 
+REGISTERED_SETTING = "registered"
+
+
+def axis_settings(strategy_id: str, prereg: dict, cfg: dict | None) -> list[dict]:
+    """Every pre-registered parameterisation of one hypothesis.
+
+    A hypothesis used to be scored at exactly one point - the contract's
+    dataclass defaults - and the battery would turn that single point into a
+    tier. `flush-fade` was rejected at `min_move_atr=1.5` and nothing else was
+    ever tried, while the register recorded that the mechanism remained
+    plausible. That is the failure `protocol.md` criterion 1 exists to prevent,
+    and it only ever governed the journal path.
+
+    The alternatives are declared in the pre-registration file, beside the
+    mechanism and the falsifier and before any of them is scored, because a
+    parameterisation added after seeing the result is not a robustness check.
+    Validation is fail-closed for the same reason `agent/variants.py` refuses
+    to invent config structure: a typo that registers cleanly would score the
+    registered point three times and report that the parameter made no
+    difference.
+    """
+    base = CONTRACTS[strategy_id](cfg)
+    known = {field.name for field in dataclasses.fields(base)}
+    declared = prereg.get("settings")
+    if not declared:
+        return [{"setting_id": REGISTERED_SETTING, "params": {},
+                 "claim": "the pre-registered parameterisation",
+                 "contract": base, "registered": True}]
+    if not isinstance(declared, list):
+        raise ValueError(f"{strategy_id}: settings must be a list")
+
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_values: set[tuple] = set()
+    for index, entry in enumerate(declared):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{strategy_id}: setting #{index} is not a mapping")
+        unknown_keys = set(entry) - {"id", "params", "claim"}
+        if unknown_keys:
+            raise ValueError(
+                f"{strategy_id}: setting #{index} has unknown field(s): "
+                f"{', '.join(sorted(unknown_keys))}")
+        setting_id = str(entry.get("id") or "").strip()
+        if not setting_id:
+            raise ValueError(f"{strategy_id}: setting #{index} has no id")
+        if setting_id in seen_ids:
+            raise ValueError(
+                f"{strategy_id}: duplicate setting id {setting_id!r}")
+        params = entry.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError(f"{strategy_id}: {setting_id} params must be a map")
+        invalid = sorted(set(params) - known)
+        if invalid:
+            raise ValueError(
+                f"{strategy_id}: {setting_id} sets {', '.join(invalid)}, which "
+                f"{base.__class__.__name__} does not have. Available: "
+                f"{', '.join(sorted(known))}")
+        claim = str(entry.get("claim") or "").strip()
+        if len(claim) < 10:
+            raise ValueError(
+                f"{strategy_id}: {setting_id} must say what it claims, in a "
+                "sentence - an unexplained parameterisation is a grid point")
+        fingerprint = tuple(sorted(params.items(), key=lambda kv: kv[0]))
+        if fingerprint in seen_values:
+            raise ValueError(
+                f"{strategy_id}: {setting_id} duplicates another setting's "
+                "parameters")
+        seen_values.add(fingerprint)
+        seen_ids.add(setting_id)
+        out.append({
+            "setting_id": setting_id, "params": dict(params), "claim": claim,
+            "contract": dataclasses.replace(base, **params) if params else base,
+            "registered": not params,
+        })
+
+    if sum(1 for setting in out if setting["registered"]) != 1:
+        raise ValueError(
+            f"{strategy_id}: exactly one setting must have empty params - the "
+            "registered point every other setting is compared against")
+    return out
+
 
 def score_strategy(spec, frames, membership, cfg, cost_name: str,
                    exit_policy: str) -> dict:
@@ -104,12 +191,31 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
             "notes": spec.notes,
         }
 
-    contract = factory(cfg)
-    results = gate_mod.run_all(spec, frames, membership, contract,
-                              cost_name=cost_name, exit_policy=exit_policy,
-                              prereg=prereg)
-    tier, why = gate_mod.tier_from_gates(results)
+    try:
+        settings = axis_settings(spec.id, prereg, cfg)
+    except ValueError as exc:
+        return {
+            "strategy_id": spec.id, "version": spec.version,
+            "scored": False,
+            "reason": f"pre-registered settings are invalid: {exc}",
+            "registered_tier": spec.tier,
+        }
 
+    for setting in settings:
+        setting["results"] = gate_mod.run_all(
+            spec, frames, membership, setting["contract"],
+            cost_name=cost_name, exit_policy=exit_policy, prereg=prereg)
+        setting["tier"], setting["why"] = gate_mod.tier_from_gates(
+            setting["results"])
+        setting["headline"] = gate_mod.headline(
+            frames, membership, setting["contract"], cost_name, exit_policy)
+
+    # The unit of decision is the hypothesis, not the parameterisation that
+    # happened to be tried first.
+    tier, why, best = gate_mod.tier_from_settings(settings)
+    registered = next(setting for setting in settings if setting["registered"])
+    contract = registered["contract"]
+                   
     # Provenance cap. A hypothesis GENERATED by looking at the data it is
     # now scored on cannot be confirmed by that data, however clean the
     # gates come back - the gates measure the result, and the result is what
@@ -124,8 +230,12 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
             + str(prereg.get("what_would_change_the_verdict")
                   or "out-of-sample history or forward evidence").strip()
             .replace("\n", " ")[:200])
-    stats = gate_mod.headline(frames, membership, contract, cost_name,
-                              exit_policy)
+    # The headline stays the REGISTERED parameterisation's, not the best
+    # setting's. benchmark_check compares it against a stored expectation, so
+    # letting a better setting supply it would make the harness-reproduction
+    # check drift every time the settings list changed - and that check is the
+    # reason this is a tournament rather than a search.
+    stats = registered["headline"]
     # A tier registered above this battery's ceiling was granted by the
     # authoritative recorded-replay path, which this run cannot reproduce and
     # therefore cannot contradict. Measuring T2 against a registered T3 is not
@@ -148,7 +258,25 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
         "mechanism": spec.mechanism,
         "falsification": spec.falsification,
         "headline": stats,
-        "gates": [r.as_dict() for r in results],
+        # The registered point's gates, so the report's per-strategy gate table
+        # keeps describing the parameterisation the register names.
+        "gates": [r.as_dict() for r in registered["results"]],
+        "settings_tested": len(settings),
+        "best_setting": best["setting_id"],
+        "settings": [{
+            "setting_id": setting["setting_id"],
+            "params": setting["params"],
+            "claim": setting["claim"],
+            "registered": setting["registered"],
+            "tier": setting["tier"],
+            "why": setting["why"],
+            "trades": (setting["headline"] or {}).get("trades", 0),
+            "expectancy_pct": (setting["headline"] or {}).get("expectancy_pct"),
+            "expectancy_r": (setting["headline"] or {}).get("expectancy_r"),
+            "p_adjusted": setting.get("p_adjusted"),
+            "significant_corrected": setting.get("significant_corrected"),
+            "gates": [r.as_dict() for r in setting["results"]],
+        } for setting in settings],
     }
 
 
@@ -445,8 +573,38 @@ def write_report(path: Path, payload: dict) -> None:
                     f"evidence of success: update `agent/registry.py` with "
                     f"this report as the record.", ""]
         lines += ["**Mechanism.** " + row["mechanism"].strip(), "",
-                  "**Falsified by.** " + row["falsification"].strip(), "",
-                  "| Gate | Result | Detail |", "| --- | --- | --- |"]
+                  "**Falsified by.** " + row["falsification"].strip(), ""]
+
+        settings = row.get("settings") or []
+        if len(settings) > 1:
+            lines += [
+                f"**Pre-registered parameterisations ({len(settings)}).** The "
+                "tier above is a verdict on the hypothesis, not on one "
+                "threshold: rejection requires every setting to fail, and a "
+                "tier above T1 requires the best setting to survive a Holm "
+                "correction across them.", "",
+                "| Setting | Parameters | Trades | Expectancy % | Tier | "
+                "p_adj | Claim |",
+                "| --- | --- | ---: | ---: | --- | ---: | --- |"]
+            for setting in settings:
+                params = (", ".join(f"`{k}={v}`" for k, v in
+                                    sorted(setting["params"].items()))
+                          or "*registered*")
+                mark = ("**" if setting["setting_id"] == row.get("best_setting")
+                        else "")
+                p_adj = setting.get("p_adjusted")
+                lines.append(
+                    f"| {mark}{setting['setting_id']}{mark} | {params} "
+                    f"| {setting.get('trades', 0)} "
+                    f"| {_format_signed(setting.get('expectancy_pct'), '%')} "
+                    f"| {setting['tier']} "
+                    f"| {f'{float(p_adj):.3f}' if p_adj is not None else '-'} "
+                    f"| {setting['claim']} |")
+            lines += ["",
+                      f"Best setting: `{row.get('best_setting')}`. Gates below "
+                      "are the registered parameterisation's.", ""]
+
+        lines += ["| Gate | Result | Detail |", "| --- | --- | --- |"]
         for gate in row["gates"]:
             mark = "pass" if gate["passed"] else "FAIL"
             lines.append(
