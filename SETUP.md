@@ -432,8 +432,8 @@ defaults. Here's what each block controls, so you know where to change what:
 
 - **`mode`** — keep `demo` for now. `live` uses real money.
 - **`llm`** — which AI provider and model, and how creative it is
-  (`temperature`). Default is Anthropic Sonnet 4.6, which is a good balance
-  of cost and quality.
+  (`temperature`). The shipped default is OpenAI `gpt-5.6-terra`; change both
+  fields together when selecting another provider or model.
 - **`strategy`** — the isolated, versioned momentum contract. The LLM chooses
   whether a setup exists, its direction, label, invalidation anchor and exit
   policy. Code derives the numeric stop/target, enforces the no-chase limit,
@@ -444,10 +444,11 @@ defaults. Here's what each block controls, so you know where to change what:
   checks. `min_history_candles` sets the per-timeframe history minimum. An
   excluded symbol does not consume a slot; the next eligible ranked symbol is
   considered. Add symbols to `denylist` to ban them.
-- **`cycle`** — how often it thinks (`interval_seconds`, default 300 = every
-  5 minutes) and which candle timeframes it looks at. **Raising
-  `interval_seconds` is the biggest cost saver** (600 = every 10 min = half
-  the AI bill).
+- **`cycle`** — `interval_seconds` controls housekeeping, reconciliation and
+  safety checks (default 300 = every 5 minutes). The optional
+  `decision_interval_seconds` controls snapshot/LLM decisions independently;
+  setting it to 900 aligns decisions with the 15-minute signal bar without
+  slowing circuit breakers or position management.
 - **`risk`** — how aggressive it is (`entry_leverage`, risk per trade, how
   many positions, exposure caps) and its safety brakes (daily loss limit, max
   drawdown, margin guard). The LLM cannot choose leverage or position size.
@@ -649,8 +650,9 @@ The agent writes a complete research corpus as a side effect of running. None
 of it is useful on day one, and that is expected: the questions below need
 weeks of data, not hours.
 
-**Nothing in this step can place an order.** Every command is read-only
-against the journal.
+**Nothing in this step can place an exchange order.** Analysis commands read
+the journal; qualification and evidence-packet commands append only to the
+local research findings database. They never edit live configuration.
 
 ### The one command to remember
 
@@ -690,6 +692,9 @@ the command exits non-zero so the nightly run surfaces it.
 | ~2 weeks | `research.py funnel` | Which veto is actually binding? |
 | ~4–6 weeks | `research.py three-arm` | Does the LLM earn its keep? |
 | ~3 months | `research.py sweep research/sweeps/regime_conditioning.yaml` | Does the setup only work in one volatility regime? |
+| As real-time variant outcomes resolve | `research.py forward-qualify` | Does any preregistered parameter axis have a paired, held-out edge ready for an isolated local paper account? |
+| After a positive postqualification paper sample | `research.py t3-packet --variant momentum.rr.fixed_2_5` | Is the exact G2/forward/paper evidence complete and ready for manual registry review? |
+| Any time | `research.py report` | Regenerate variant scorecards with scheduler, shadow, paper, qualification and T3 status. |
 
 ### Run gate G2 before trusting anything else
 
@@ -797,21 +802,18 @@ makes real API calls even when the money is pretend.
 
 ### 1. The AI brain (the main cost)
 
-One call per cycle. At the default 5-minute cycle that's 288 calls/day. The
-static part of the prompt is cached (10% price on repeats), so each call is
-cheap, but they add up:
+One call per decision cycle. With `decision_interval_seconds` unset, decisions
+run on the default 5-minute housekeeping cadence: up to 288 calls/day. The
+shipped model is OpenAI `gpt-5.6-terra`; model prices and caching terms change,
+so estimate cost from the provider's current pricing and verify it in the
+usage dashboard.
 
-| Model (`config.yaml`) | Per call | Per day | Per month |
-| --- | --- | --- | --- |
-| `claude-sonnet-4-6` (default) | ~$0.010 | ~$2.90 | **~$85–95** |
-| `claude-haiku-4-5` (cheaper, less capable) | ~$0.006 | ~$1.65 | ~$50 |
-| `claude-opus-4-8` (stronger, pricier) | ~$0.027 | ~$7.80 | ~$230 |
-
-**The biggest cost lever is the cycle time.** `cycle.interval_seconds: 600`
-(10 min) halves the bill; 900 (15 min) cuts it to a third. Slower cycles also
-mean slower reactions — a trade-off you choose. Watch your actual spend on the
-provider's usage dashboard for the first few days rather than trusting
-estimates.
+**The cost lever is `cycle.decision_interval_seconds`, not
+`cycle.interval_seconds`.** Setting the decision interval to 900 seconds
+reduces the maximum decision-call rate to 96/day while housekeeping, drawdown
+checks, reconciliation and max-hold enforcement remain on the 5-minute cycle.
+Use `python research.py cadence` to measure the saving against your own
+journal before changing it.
 
 ### 2. The computer
 

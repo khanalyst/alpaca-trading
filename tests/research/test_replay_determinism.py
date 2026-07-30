@@ -247,6 +247,51 @@ class FunnelTests(unittest.TestCase):
 
 
 class PortfolioStateTests(unittest.TestCase):
+    def test_state_model_reports_modelled_and_unmodelled_transitions(self):
+        result = replay.Replay(valid_config(), mode="recorded_llm").run(
+            [cycle(0)], [model_output(0, [open_decision()])])
+
+        diagnostics = result.state_diagnostics
+        self.assertIn("equity_feedback", diagnostics["modelled_fields"])
+        self.assertIn("positions", diagnostics["modelled_fields"])
+        self.assertIn("exchange_fill_race", diagnostics["unmodelled_fields"])
+        self.assertIn("final_state", diagnostics)
+        self.assertGreaterEqual(
+            diagnostics["transitions"]["positions_opened"], 0)
+
+    def test_daily_stop_flattens_remaining_positions_when_configured(self):
+        class MixedExit:
+            @staticmethod
+            def bars(symbol, start_ms, end_ms):
+                from research.prices import Bar
+                if symbol.startswith("BTC/"):
+                    return [Bar(int(start_ms), 100.0, 100.5, 90.0, 95.0, 1.0)]
+                return [Bar(
+                    int(end_ms) - 60_000, 100.0, 100.2, 99.8, 100.0, 1.0)]
+
+        cfg = valid_config()
+        cfg["risk"]["daily_loss_limit_pct"] = 0.1
+        cfg["risk"]["max_hold_hours"] = 1
+        cfg["execution"]["flatten_on_daily_stop"] = True
+        symbols = ("BTC/USDT:USDT", "ETH/USDT:USDT")
+        cycles = [cycle(i, symbols=symbols) for i in range(3)]
+        outputs = [
+            model_output(i, [open_decision(symbol=symbol) for symbol in symbols])
+            for i in range(3)
+        ]
+
+        result = replay.Replay(
+            cfg, mode="recorded_llm", price_cache=MixedExit()).run(
+                cycles, outputs)
+
+        self.assertEqual(result.state_diagnostics["final_state"]["state"],
+                         "DAY_STOPPED")
+        self.assertEqual(result.state_diagnostics["final_state"]["positions"],
+                         0)
+        self.assertGreaterEqual(
+            result.state_diagnostics["transitions"]
+            ["circuit_positions_flattened"], 1)
+
     def test_positions_carry_forward_across_cycles(self):
         """Exposure caps must bind the way they do live."""
         cycles = [cycle(i, symbols=(f"S{j}/USDT:USDT" for j in range(6)))

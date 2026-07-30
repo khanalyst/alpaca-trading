@@ -30,7 +30,10 @@ never treated as USDT capital.
   hard caps the model cannot override, and circuit breakers that stop the
   bleeding on bad days.
 - Run `mode: demo` (OKX Demo Trading, paper money) for at least two weeks
-  before going live, and start live with money you can afford to lose.
+  before going live, and start live with money you can afford to lose. This
+  exchange-connected demo mode is distinct from the research workflow's
+  uppercase local `PAPER` stage, which is an isolated SQLite simulation and
+  never submits an OKX order.
 - API key hygiene: create keys with Read + Trade permissions only, never
   Withdraw. Bind keys to your server's IP. Demo and live keys are separate.
 - This is software, not investment advice. You own every parameter in
@@ -108,9 +111,11 @@ cp .env.example .env      # then fill in your keys
 ### LLM
 
 Set `llm.provider` and `llm.model` in `config.yaml` and the matching key in
-`.env`. The agent makes one model call per cycle (288 calls/day at the
-default 5-minute cycle), so pick a model whose per-call cost you are happy
-with and check current pricing on the provider's site.
+`.env`. The agent makes at most one model call per decision cycle. With
+`cycle.decision_interval_seconds` unset, decisions follow the default
+five-minute housekeeping cycle (up to 288 calls/day); setting it to 900 lowers
+that ceiling to 96 without slowing safety checks. Check current pricing on the
+provider's site.
 
 Token costs are kept down three ways: the static system prompt is cached
 (explicitly on Anthropic with a 1-hour TTL; automatically on OpenAI with a
@@ -122,8 +127,8 @@ cache-hit percentage to `runtime/<mode>/agent.log`. Total input includes
 cached tokens, so a 5,000-token total does not mean 5,000 freshly billed
 tokens. After the first call, `cache_read` should be a few thousand tokens;
 if it stays 0, caching isn't engaging (see the
-note in `config.yaml` about per-model cache minimums). Indicative monthly
-costs per model are in [SETUP.md](SETUP.md).
+note in `config.yaml` about per-model cache minimums). Use the provider's usage
+dashboard to verify actual spend and cache behavior.
 
 ---
 
@@ -220,6 +225,10 @@ You can add or remove funds at any time; the agent is designed for it.
   net transfer, so a deposit is not mistaken for profit and a withdrawal is
   not mistaken for a crash (neither will falsely trip the drawdown or daily
   stop, and profits are still tracked honestly).
+- Ledger rows are deduplicated by the durable OKX bill/transfer identifier
+  when one is supplied. A row without an identifier is never guessed away by
+  amount and timestamp: it is persisted under
+  `transfer_reconciliation_required` for explicit review.
 - If a withdrawal squeezes margin, the margin guard
   (`max_margin_usage_pct`, default 60%) closes the largest position(s) until
   usage is healthy again.
@@ -375,8 +384,8 @@ API keys; the mode must match the keys in `.env`.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `provider` | `anthropic` | `anthropic` or `openai` |
-| `model` | `claude-sonnet-4-6` | Any model from that provider (e.g. `claude-opus-4-8`, `gpt-4.1`) |
+| `provider` | `openai` | `anthropic` or `openai` |
+| `model` | `gpt-5.6-terra` | Any model supported by that provider (e.g. `claude-sonnet-4-6`, `gpt-4.1`) |
 | `temperature` | 0.2 | Creativity; auto-ignored on models that reject it |
 | `max_tokens` | 2000 | Cap on the model's reply length |
 
@@ -399,7 +408,8 @@ API keys; the mode must match the keys in `.env`.
 | `timeframes` | `[15m,1h,4h]` | Candle timeframes fed to the model |
 | `candles` | 120 | Candles per timeframe; also excludes coins lacking history |
 
-**The cost lever is `decision_interval_seconds`, not `interval_seconds`.**
+**The cost lever is `cycle.decision_interval_seconds`, not
+`cycle.interval_seconds`.**
 Measured over the corpus, 66.5% of cycles observe only signal bars that were
 already evaluated, and an LLM call on one of those cannot produce a fresh
 evaluation for any symbol — `strategy.evaluated_signal` blocks it. Aligning
@@ -468,16 +478,38 @@ demo-only regardless.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
-| `shadow_enabled` | `false` | Master switch. Absent or false is a complete no-op |
-| `shadow_variants` | `[]` | Variant ids from `research/variants.yaml` to evaluate each cycle |
-| `shadow_budget_ms` | 500 | Wall-clock budget; overrun abandons the rest and journals it |
-| `shadow_llm_variants` | `[]` | **Capped at 2.** Each costs a full extra model call per cycle (~288/day) |
+| `shadow_enabled` | `true` | Master switch. The shipped config starts isolated real-time learning; absent or false is a complete no-op |
+| `shadow_variants` | `["*"]` | Variant ids from `research/variants.yaml`; `"*"` enrolls every active candidate plus each strategy baseline |
+| `shadow_budget_ms` | 0 | `0` evaluates every variant; a positive budget skips only whole variants and prioritizes them next cycle |
+| `findings_store` | `research/cache/findings.db` | Migrated SQLite store for scheduler state, portfolios, trades, analyses, qualification and evidence packets |
+| `paper_initial_balance_usdt` | 10000 | Separate starting balance for every variant account |
+| `paper_max_failures` | 3 | Operational failures before that local research account is revoked for reconciliation |
+| `paper_min_closed_trades` | 100 | Minimum post-qualification paper sample for a reviewed T3 packet |
 
-The evaluator is constructed from configuration alone — it receives no
-`Exchange`, no state handle, no journal writer — and a test walks its
-attribute graph to assert no exchange is reachable from it. It runs after
-trading decisions are committed, inside `try/except`, and writes only
-`variant_shadow_decision` events.
+If `findings_store` is omitted while research is enabled, runtime uses the
+repository-relative persistent default `research/cache/findings.db`; it never
+falls back to a temporary database. Relative configured paths are resolved
+against the repository root. `research.py report` uses this same configured
+path unless `--store` explicitly overrides it.
+
+The evaluator has no `Exchange`, and a test walks its attribute graph to assert
+that no exchange is reachable from it. Each variant owns persisted cash,
+positions, exposure, cooldowns, circuit breakers and proposal history; the
+live account is neither copied into nor mutated by those portfolios. Every
+active parameter value therefore learns from the same real-time snapshots
+without sharing a balance or position book. Accounts mark and resolve before
+pause, day-stop, cadence and LLM-failure exits. When the cycle has an LLM
+response, every variant reuses those exact proposals and confidences without
+another model call. Every arm's accept or veto action is committed atomically
+to an immutable decision ledger beside any opened trade. A veto is an explicit
+zero-return action in paired inference, not missing data, so confidence,
+exposure-cap and discriminator hypotheses can measure the incremental trades
+they admit or suppress. Portfolios, decisions and trades carry immutable
+strategy/config/code/model provenance. The fingerprint and persisted
+secret-free config projection cover mode, LLM provider/model/sampling settings,
+universe selection, the full decision cadence and timeframe inputs, strategy,
+risk, execution and costs. API keys and credentials are excluded. A changed
+experiment must use a new variant id instead of silently extending the sample.
 
 **Passive entry (`execution.maker_first_*`)**
 
@@ -499,7 +531,9 @@ be pooled accidentally. Every implemented contract can collect raw firing
 evidence, but forward expectancy is emitted only when its registry entry has
 a validated outcome model; currently that is momentum only. This prevents a
 carry or multi-day mechanism from inheriting momentum's exit horizon and cost
-model. Shadowing costs no extra LLM call and places no orders.
+model. Parameter variants additionally run as independent local `SHADOW`
+portfolios in `findings.db`. Shadowing costs no extra LLM call and places no
+orders.
 
 The active strategy is shadowed too, which is the part that is easy to miss:
 comparing what the contract fired on against what the account actually opened
@@ -660,15 +694,38 @@ python research.py funnel                  # gate G4 — the veto distribution
 python research.py cadence                 # B9.2 evidence
 python research.py three-arm               # H-E: does the LLM earn its keep?
 python research.py sweep research/sweeps/regime_conditioning.yaml
+python research.py forward-qualify         # paired real-time axes -> local paper
+python research.py t3-packet --variant momentum.rr.fixed_2_5
 python research.py report                  # regenerate findings/ scorecards
 ```
 
-Nothing here touches the trading path or places an order. Commands read the
-journal and a local price cache; `replay --check-fidelity` appends a durable
-`research_gate_result` audit row, while sweeps append atomic run/metric/finding
-records to `findings.db`. Successful evaluations and `research.py report`
-also maintain `findings.db.backup`. No command calls an LLM or mutates trading
-state.
+Nothing here can reach the exchange or place an order. Commands read the
+journal, local price cache and findings store; `replay --check-fidelity`
+appends a durable `research_gate_result` audit row, while sweeps append atomic
+run/metric/finding records to `findings.db`. `forward-qualify` evaluates each
+override-path axis separately using matched real-time proposals and, only on a
+full pass, marks its winner eligible for an isolated local `PAPER` portfolio.
+The analysis embeds the exact pre-paper accept/veto decision rows, joins every
+accepted action to its resulting trade, includes model assumptions and
+experiment provenance, hashes that source corpus, and recomputes the protocol
+before qualification. It proves that the declared axis exactly matches every
+candidate's overrides, the baseline is the unmodified `<strategy>.baseline`
+for the same version, axis values are distinct, and all non-axis executable
+inputs are identical. Mislabeled/mixed axes and caller-authored forward claims
+are rejected. It does not change `agent/registry.py` or live configuration.
+Schema migration 7 starts a complete decision-ledger watermark and revokes
+legacy qualifications whose historical veto population cannot be recovered;
+old trades remain auditable but cannot be pooled into new edge evidence.
+Every arm is measured over one common window, from the latest complete-ledger
+watermark to the earliest qualification or paper start. Post-qualification
+actions cannot rewrite the qualifying sample, and any recorded operational
+failure inside that window invalidates the analysis instead of being treated
+as a random missing observation.
+`t3-packet`
+creates an immutable content-addressed evidence packet; it is `REVIEWED` only
+when every provenance, held-out, forward, paper and manual-review check passes.
+Successful evaluations and `research.py report` maintain
+`findings.db.backup`. No command calls an LLM.
 
 `research/nightly.sh` runs the whole sequence (authoritative path first) and
 is wired to `deploy/okx-research.timer`.
@@ -719,21 +776,37 @@ after a week of replay reporting no difference.
 
 Two kinds of axis, and only one divides the sample:
 
-- A **parameter axis** generates variants. Three settings at 100 round trips
-  each is 300 before it can conclude anything.
+- A **parameter axis** compares the explicit baseline plus at least two
+  preregistered alternatives. Every setting keeps its own persistent account;
+  values never self-mutate invisibly.
 - A **conditioning axis** partitions results. One replay produces every
   bucket and reuses trades that already exist, so it is affordable at samples
   where a parameter sweep is not. Buckets must be pre-registered.
 
 [`research/protocol.md`](research/protocol.md) is the comparison rule, applied
-by code. Selection occurs only on the 70% fit window; the 30% confirmation
-window cannot choose its own winner. Promotion needs all five criteria (≥100
-round trips **for every setting**, ≥3 settings, expectancy CI clearing the
-baseline, drawdown no worse, and a positive out-of-sample confirmation delta).
-Rejection also requires every setting to meet the sample floor — a hypothesis
-is never killed by one badly chosen or under-observed value. Exploratory OHLCV
-gates are capped at `T2_CANDIDATE`; no research command silently rewrites the
-static strategy tier in `agent/registry.py`.
+by code. Outcomes are paired by stable proposal identity; unmatched,
+unresolved and duplicate proposals are reported, and deltas use a paired
+six-hour cluster/block bootstrap so a market-wide episode is not counted as
+dozens of independent observations. Selection occurs only on the 70% fit
+window; one cutoff derived from the baseline proposal calendar is applied to
+every arm, so the 30% confirmation window cannot choose its own winner.
+Promotion needs ≥100 resolved pairs overall, at least 70 paired fit
+observations and at least 30 paired confirmation observations. The full, fit
+and confirmation populations each require ≥80% proposal coverage, no duplicate
+identities and the registered dependence-aware six-hour cluster/block
+bootstrap. It also needs at least three settings including the baseline, a
+positive fit interval, drawdown no worse, and a positive held-out confirmation
+interval. Rejection
+requires every alternative to meet the sample floor. Exploratory OHLCV gates
+are capped at `T2_CANDIDATE`; no research command silently rewrites the static
+strategy tier in `agent/registry.py`.
+
+When an axis earns `PROMOTE`, the winner does not inherit its shadow profits.
+After any open shadow positions resolve, it starts a clean, rebased `PAPER`
+account and continues beside other qualified edges. Paper results are stored
+separately from prequalification shadow outcomes. Live/T3 authority still
+requires the content-addressed reviewed packet and a deliberate registry
+change.
 
 **`INSUFFICIENT_SAMPLE` means the question is open, not answered in the
 negative.** It will be returned repeatedly and it is the most important
@@ -822,11 +895,12 @@ fails the gate immediately regardless of anything else.
 
 #### Known gaps, stated rather than hidden
 
-- **The replay does not simulate the loss cooldown.** It replays setup memory
-  — per-bar idempotency, semantic cooldown, failed-thesis re-entry — but the
-  live engine also cools a setup down after a losing exit, and the replay has
-  no PnL to mark with. Expect a small residual excess of replayed proposals
-  after a losing streak.
+- **Replay still cannot reproduce exchange-only state.** With a price cache it
+  now feeds resolved PnL back into equity, closes positions, starts the loss cooldown
+  after losing exits, tracks changing universes and applies daily-loss/max-drawdown
+  transitions. Fill races, exchange protection state, liquidation distance,
+  margin usage and transfer identifiers remain explicit `unmodelled_fields`
+  in the replay diagnostics; G2 remains the behavioral backstop.
 - **`select_universe` needs an authenticated account endpoint,** so it cannot
   be exercised without credentials.
 - **`research.py` and the `research/` package share a name.** Python resolves
@@ -856,8 +930,9 @@ Read these before running anything with real money.
 - **Demo results ≠ live results.** Demo fills are idealized. The live executor
   records actual fills, fees and partial fills, but real slippage and funding
   still make live outcomes different from demo.
-- **It costs money even in demo.** The LLM calls are real (~$50–95/month at
-  the default cycle). Only the trading is simulated in demo mode.
+- **It costs money even in demo.** The LLM calls are real; actual cost depends
+  on the selected provider/model, decision cadence, prompt cache and current
+  provider pricing. Only the trading is simulated in demo mode.
 - **One OKX account per running instance,** and it only sees the **Trading**
   account balance (not Funding). For multiple strategies, use OKX
   sub-accounts (see below).
@@ -931,7 +1006,10 @@ Plain-text logs are in `runtime/demo/agent.log` or `runtime/live/agent.log`.
 | --- | --- | --- |
 | `book_state` | Per symbol, per cycle — **including when the book is fine** | H-H. The entry guard already read depth but journalled it only on rejection, so every ordinary observation was discarded — and the ordinary readings are the baseline a cascade's collapse is measured against |
 | `snapshot_enrichment` | Per cycle | H-I, H-J, H-L. Realised-vol ratio, UTC hour, BTC reference returns. Deliberately **not** in `llm_input`, so the corpus loader joins it by `cycle_id` |
-| `variant_shadow_decision` | Per parameter variant, per symbol | Forward evidence for parameter variants that hold no capital |
+| `variant_shadow_decision` | Per parameter variant, per symbol | Attributable real-time decisions from independent local shadow/paper portfolios |
+| `variant_shadow_trade` | On local shadow open/close | Prequalification outcome history, excluded from paper-only metrics |
+| `variant_paper_trade` | On qualified local paper open/close | Postqualification evidence for a candidate edge; never an exchange order |
+| `shadow_coverage` | Per cycle | Fair-scheduler evaluated/skipped counts and cumulative coverage |
 | `strategy_shadow_decision` | Per strategy contract, per symbol | Cross-strategy forward signals; exported separately from parameter variants |
 | `strategy_shadow_summary` | Per strategy contract, per cycle | The scanned-instrument denominator needed to turn signals into rates |
 | `research_gate_result` | After every G2 fidelity check | Durable pass/fail/sample record tied to the exact proposal corpus |
@@ -943,14 +1021,29 @@ gained `variant_id` and `strategy_config_version`. Live trading writes
 `variant_id = "live"`; replayed and shadow records carry their own readable
 ids, so the two populations can never be pooled by accident.
 
-`strategy_config_version` fingerprints only the blocks that can change a
-decision — `strategy`, `risk`, `execution`, `trading_costs` and
-`cycle.timeframes`. The older whole-config `config_version` is still written
-beside it, but it changes when an alert timeout changes, which forks the
-attribution bucket and splits an already-small sample for no reason.
+`strategy_config_version` is the compatibility name for the executable
+experiment fingerprint. It covers mode; LLM provider, model and sampling
+settings; universe selection; the full cycle block including decision cadence,
+candles and timeframes; strategy; risk; execution; and trading costs. Its
+secret-free input projection is persisted with shadow evidence so comparisons
+can prove non-axis equality. Alerts, research storage/scheduling and API
+credentials are excluded. The older whole-config `config_version` remains
+beside it for historical continuity.
 
 Rows written before schema 4 keep `NULL` rather than being back-filled with
 `"live"` — back-filling would assert an attribution nobody recorded.
+
+The research findings database has its own forward-only schema migrations.
+Legacy core tables are rebuilt transactionally to acquire real constraints,
+and a database from a newer unsupported schema is refused rather than guessed
+at. The v5→v6 migration deterministically coalesces duplicate historical
+analysis payloads, rewrites qualification and evidence-packet references, and
+then installs immutable content hashes. The v6→v7 migration adds the immutable
+accept/veto decision ledger, starts a complete-ledger watermark, preserves
+legacy trades for audit, and revokes qualifications whose missing historical
+veto population cannot be reconstructed honestly. Scorecards include scheduler
+coverage, shadow/paper sample separation,
+qualification status and immutable T3 packet hashes.
 
 ## Historical backtest
 

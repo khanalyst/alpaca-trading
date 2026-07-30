@@ -43,9 +43,11 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent import strategy
+from agent.forward_models import require_validated
 from agent.risk import RiskEngine
 
 from . import corpus
@@ -89,6 +91,9 @@ class ReplayDecision:
     take_pct: float | None = None
     notional: float | None = None
     outcome: dict | None = None
+    # Stable cross-variant identity used by real-time shadow portfolios. Replay
+    # records created from older journals fall back to their signal identity.
+    proposal_id: str | None = None
     # True once the strategy contract has accepted the setup, whether or not
     # the risk engine later refused it. This is the stage the live engine
     # journals `setup_proposed` at - before vet_open, not after - so gate G2
@@ -102,6 +107,13 @@ class ReplayDecision:
     def key(self) -> tuple:
         return (self.cycle_id, self.symbol, self.direction, self.setup_type)
 
+    def proposal_key(self) -> tuple:
+        """Identity shared across arms, independent of replay execution."""
+        if self.proposal_id:
+            return ("proposal_id", self.proposal_id)
+        signal = self.signal_ts if self.signal_ts is not None else self.cycle_id
+        return (self.symbol, signal, self.direction, self.setup_type)
+
 
 @dataclass
 class ReplayResult:
@@ -112,6 +124,7 @@ class ReplayResult:
     cycles: int = 0
     corpus_from_ts: float = 0.0
     corpus_to_ts: float = 0.0
+    state_diagnostics: dict = field(default_factory=dict)
 
     def executed(self) -> list:
         return [d for d in self.decisions if d.stage == "executed"]
@@ -237,6 +250,8 @@ class Replay:
 
     def run(self, cycles: list, outputs: list,
             max_hold_hours: float | None = None) -> ReplayResult:
+        if self.price_cache is not None:
+            require_validated(str(self.cfg["strategy"]["id"]))
         recorded = _recorded_by_cycle(outputs)
         max_hold = (float(max_hold_hours) if max_hold_hours is not None
                     else float(self.cfg["risk"]["max_hold_hours"]))
@@ -261,15 +276,120 @@ class Replay:
         records: dict = {}
         cooldowns: dict = {}
         gross_notional = 0.0
-        equity = 10_000.0
+        try:
+            equity = float((cycles[0].portfolio if cycles else {}).get(
+                "equity_usdt") or 10_000.0)
+        except (TypeError, ValueError):
+            equity = 10_000.0
+        high_water = equity
+        day_start_equity = equity
+        current_day = None
+        circuit_state = "RUNNING"
+        previous_universe = None
+        diagnostics = {
+            "modelled_fields": [
+                "equity_feedback", "universe_membership", "cooldowns",
+                "positions", "gross_exposure", "open_risk",
+                "daily_loss_circuit", "max_drawdown_circuit",
+                "circuit_breaker_flattening",
+            ],
+            "unmodelled_fields": [
+                "exchange_fill_race", "exchange_protection_state",
+                "liquidation_distance", "margin_usage", "transfer_identifiers",
+            ],
+            "transitions": {
+                "positions_opened": 0, "positions_closed": 0,
+                "loss_cooldowns_started": 0, "universe_changes": 0,
+                "day_stops": 0, "drawdown_kills": 0,
+                "circuit_positions_flattened": 0,
+                "outcomes_unresolved": 0,
+            },
+            "recorded_mismatches": {
+                "state": 0, "position_count": 0, "cooldown_symbols": 0,
+            },
+        }
+        if self.price_cache is None:
+            diagnostics["unmodelled_fields"].extend([
+                "resolved_equity_feedback", "loss_cooldown_outcome",
+            ])
 
         for cycle in cycles:
             now = cycle.ts
-            positions, gross_notional = self._expire(
-                positions, now, max_hold)
+            positions, gross_notional, equity, closed, losses, unresolved = (
+                self._settle_positions(
+                    positions, now, max_hold, equity, cooldowns, records))
+            diagnostics["transitions"]["positions_closed"] += closed
+            diagnostics["transitions"]["loss_cooldowns_started"] += losses
+            diagnostics["transitions"]["outcomes_unresolved"] += unresolved
+            cooldowns = {
+                symbol: until for symbol, until in cooldowns.items()
+                if float(until) > now
+            }
             active_trades = {p["symbol"]: active_trades.get(p["symbol"])
                              or {"risk_usd": float(p.get("risk_usd") or 0)}
                              for p in positions}
+
+            day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+            if current_day != day:
+                current_day = day
+                day_start_equity = equity
+                if circuit_state == "DAY_STOPPED":
+                    circuit_state = "RUNNING"
+            high_water = max(high_water, equity)
+            drawdown = ((high_water - equity) / high_water * 100.0
+                        if high_water > 0 else 100.0)
+            day_pnl = ((equity - day_start_equity) / day_start_equity * 100.0
+                       if day_start_equity > 0 else -100.0)
+            kill_triggered = False
+            day_stop_triggered = False
+            if (circuit_state != "KILLED"
+                    and drawdown >= float(
+                        self.cfg["risk"]["max_drawdown_pct"])):
+                circuit_state = "KILLED"
+                kill_triggered = True
+                diagnostics["transitions"]["drawdown_kills"] += 1
+            elif (circuit_state == "RUNNING"
+                  and day_pnl <= -float(
+                      self.cfg["risk"]["daily_loss_limit_pct"])):
+                circuit_state = "DAY_STOPPED"
+                day_stop_triggered = True
+                diagnostics["transitions"]["day_stops"] += 1
+
+            flatten = kill_triggered or (
+                day_stop_triggered
+                and bool(self.cfg["execution"].get("flatten_on_daily_stop")))
+            if flatten and positions:
+                equity, flattened, unresolved = self._flatten_positions(
+                    positions, cycle, equity, records, now)
+                positions = []
+                active_trades = {}
+                gross_notional = 0.0
+                diagnostics["transitions"]["positions_closed"] += flattened
+                diagnostics["transitions"][
+                    "circuit_positions_flattened"] += flattened
+                diagnostics["transitions"]["outcomes_unresolved"] += unresolved
+
+            universe = tuple(sorted(cycle.symbols()))
+            if previous_universe is not None and universe != previous_universe:
+                diagnostics["transitions"]["universe_changes"] += 1
+            previous_universe = universe
+            recorded_state = cycle.portfolio or {}
+            if (recorded_state.get("state")
+                    and recorded_state.get("state") != circuit_state):
+                diagnostics["recorded_mismatches"]["state"] += 1
+            recorded_positions = recorded_state.get("open_positions")
+            if (isinstance(recorded_positions, list)
+                    and len(recorded_positions) != len(positions)):
+                diagnostics["recorded_mismatches"]["position_count"] += 1
+            recorded_cooldowns = {
+                str(item.get("symbol")) for item in
+                (recorded_state.get("post_loss_cooldowns") or [])
+                if isinstance(item, dict) and item.get("symbol")
+            }
+            if recorded_cooldowns != set(cooldowns):
+                diagnostics["recorded_mismatches"]["cooldown_symbols"] += 1
+            if circuit_state != "RUNNING":
+                continue
 
             for symbol in cycle.symbols():
                 row = dict(cycle.snapshot[symbol])
@@ -407,27 +527,80 @@ class Replay:
                     positions.append({
                         "symbol": symbol,
                         "side": decision["direction"],
+                        "entry_price": float(sized.get("price") or 0),
                         "notional": float(sized.get("notional") or 0),
                         "opened_ts": now,
                         "closes_at": closes_at,
                         "risk_usd": float(sized.get("risk_usd") or 0),
+                        "round_trip_cost_pct": float(
+                            sized.get("estimated_cost_pct") or 0),
+                        "outcome": record.outcome,
+                        "setup_id": plan.get("setup_id"),
                     })
+                    diagnostics["transitions"]["positions_opened"] += 1
                     active_trades[symbol] = {
                         "risk_usd": float(sized.get("risk_usd") or 0)}
                     gross_notional += abs(float(sized.get("notional") or 0))
 
         result.funnel = funnel
+        diagnostics["final_state"] = {
+            "equity_usdt": equity,
+            "high_water_mark": high_water,
+            "state": circuit_state,
+            "positions": len(positions),
+            "gross_notional": gross_notional,
+            "open_risk_usdt": sum(
+                float(position.get("risk_usd") or 0) for position in positions),
+            "cooldowns": dict(sorted(cooldowns.items())),
+            "universe": list(previous_universe or ()),
+        }
+        diagnostics["unmodelled_fields"] = sorted(set(
+            diagnostics["unmodelled_fields"]))
+        result.state_diagnostics = diagnostics
         return result
 
-    @staticmethod
-    def _expire(positions: list, now: float, max_hold_hours: float):
-        """Close positions whose exit has been reached.
+    def _flatten_positions(
+            self, positions: list, cycle, equity: float, records: dict,
+            now: float) -> tuple[float, int, int]:
+        """Model the production circuit breaker's immediate market flatten."""
+        unresolved = 0
+        for position in positions:
+            row = cycle.snapshot.get(position["symbol"]) or {}
+            try:
+                mark = float(row.get("price") or 0)
+                entry = float(position.get("entry_price") or 0)
+                notional = float(position.get("notional") or 0)
+            except (TypeError, ValueError):
+                mark = entry = notional = 0.0
+            if mark > 0 and entry > 0 and notional > 0:
+                sign = 1.0 if position.get("side") == "long" else -1.0
+                gross_pct = sign * (mark - entry) / entry * 100.0
+                net_pct = gross_pct - float(
+                    position.get("round_trip_cost_pct") or 0)
+                pnl = notional * net_pct / 100.0
+                equity += pnl
+            else:
+                pnl = 0.0
+                unresolved += 1
+            setup = records.get(position.get("setup_id"))
+            if isinstance(setup, dict):
+                strategy.mark_setup(
+                    setup, "closed", self.cfg, now=now,
+                    apply_cooldown=False, realized_pnl_usd=pnl)
+        return equity, len(positions), unresolved
+
+    def _settle_positions(
+            self, positions: list, now: float, max_hold_hours: float,
+            equity: float, cooldowns: dict, records: dict) -> tuple:
+        """Apply recorded forward outcomes to replay equity and cooldowns.
 
         ``closes_at`` is the resolved stop/target time when a price cache was
         available and the max-hold deadline otherwise, so a replay without
-        outcomes degrades to timer-only expiry rather than to nothing.
+        outcomes degrades to timer-only expiry and explicitly diagnoses the
+        missing equity/cooldown transition.
         """
         keep = []
+        closed = losses = unresolved = 0
         for position in positions:
             closes_at = position.get("closes_at")
             if closes_at is None:
@@ -435,7 +608,27 @@ class Replay:
                              + max_hold_hours * 3600)
             if now < float(closes_at):
                 keep.append(position)
-        return keep, sum(abs(float(p.get("notional") or 0)) for p in keep)
+                continue
+            closed += 1
+            outcome = position.get("outcome") or {}
+            if outcome.get("r_multiple") is None:
+                unresolved += 1
+                continue
+            pnl = (float(position.get("risk_usd") or 0)
+                   * float(outcome["r_multiple"]))
+            equity += pnl
+            if pnl < 0:
+                losses += 1
+                cooldowns[position["symbol"]] = (
+                    now + float(self.cfg["risk"]
+                                ["cooldown_minutes_after_loss"]) * 60)
+            setup = records.get(position.get("setup_id"))
+            if isinstance(setup, dict):
+                strategy.mark_setup(
+                    setup, "closed", self.cfg, now=now,
+                    apply_cooldown=pnl < 0, realized_pnl_usd=pnl)
+        gross = sum(abs(float(p.get("notional") or 0)) for p in keep)
+        return keep, gross, equity, closed, losses, unresolved
 
     def _resolve(self, symbol: str, row: dict, sized: dict,
                  decision: dict, max_hold_hours: float,
@@ -540,11 +733,10 @@ def fidelity(result: ReplayResult, db) -> dict:
     from 954 to 707 and revealed that a quarter of all vetoes were per-bar
     idempotency, which had been invisible.
 
-    What remains unsimulated is the *outcome* feedback: the live engine marks
-    a setup closed with a cooldown when a trade exits at a loss, and the
-    replay has no PnL to mark with unless a price cache is supplied. With one
-    supplied, the loss cooldown still is not applied. Expect a small residual
-    excess of proposals after a losing streak.
+    Outcome feedback is modelled when a price cache supplies a resolved exit:
+    equity changes, positions close, and losing symbols enter cooldown. Without
+    a price cache those transitions remain explicitly listed as unmodelled in
+    ``state_diagnostics`` rather than being silently assumed.
     """
     recorded = corpus.load_events(db, "setup_proposed")
     recorded_keys = {
@@ -581,4 +773,5 @@ def fidelity(result: ReplayResult, db) -> dict:
         # every downstream number ran on air. Callers gating on G2 must check
         # this and refuse to proceed, rather than reading the rate alone.
         "vacuous": total == 0,
+        "state_diagnostics": result.state_diagnostics,
     }

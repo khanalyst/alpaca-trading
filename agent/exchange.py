@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 
 import ccxt
 
@@ -29,6 +30,41 @@ CLOCK_SKEW_WARN_MS = 3_000
 CLOCK_RECHECK_SECONDS = 900
 ACCOUNT_RECHECK_SECONDS = 900
 OKX_CRYPTO_INSTRUMENT_CATEGORY = "1"
+
+
+@dataclass(frozen=True)
+class TransferRecord:
+    """One OKX ledger transfer with explicit identity quality."""
+
+    transfer_id: str | None
+    ts_ms: int
+    net_usdt: float
+    reconciliation_required: bool
+    reconciliation_key: str
+
+    def as_event(self) -> dict:
+        return {
+            "transfer_id": self.transfer_id,
+            "ledger_ts_ms": self.ts_ms,
+            "net_usdt": self.net_usdt,
+            "identity_status": (
+                "identified" if self.transfer_id
+                else "reconciliation_required"),
+            "reconciliation_required": self.reconciliation_required,
+            "reconciliation_key": self.reconciliation_key,
+        }
+
+
+@dataclass(frozen=True)
+class TransferBatch:
+    net_usdt: float
+    next_since_ms: int
+    records: tuple[TransferRecord, ...]
+
+    def __iter__(self):
+        """Preserve the historical two-value unpacking contract."""
+        yield self.net_usdt
+        yield self.next_since_ms
 
 
 class CredentialError(RuntimeError):
@@ -962,13 +998,16 @@ class Exchange:
         return float(
             self.account_risk_metrics()["initial_margin_usage_pct"])
 
-    def transfers_since(self, since_ms: int) -> tuple[float, int]:
+    def transfers_since(
+            self, since_ms: int,
+            seen_ids: set[str] | None = None) -> TransferBatch:
         """Net USDT transferred in/out of the trading account since since_ms.
 
         Used to rebase the drawdown and daily-loss benchmarks so a deposit is
         not counted as profit and a withdrawal is not counted as a crash.
 
-        Returns (net_usdt, next_since_ms). fetch_ledger treats `since` as
+        Returns a TransferBatch that still unpacks as
+        ``(net_usdt, next_since_ms)``. fetch_ledger treats `since` as
         inclusive, so the cursor advances one past the newest entry counted --
         otherwise the same transfer is re-counted every cycle until a newer
         ledger entry appears. On error the cursor stays put so transfers that
@@ -978,10 +1017,12 @@ class Exchange:
             entries = self.retry(self.x.fetch_ledger, "USDT", since_ms, 100)
         except Exception as e:
             log.debug("fetch_ledger unavailable: %s", e)
-            return 0.0, since_ms
+            return TransferBatch(0.0, since_ms, ())
+        already_seen = set(seen_ids or ())
         net = 0.0
         latest = since_ms - 1
-        for e in entries or []:
+        records = []
+        for index, e in enumerate(entries or []):
             ts = int(e.get("timestamp") or 0)
             if ts < since_ms:
                 continue
@@ -993,10 +1034,32 @@ class Exchange:
             amt = abs(float(e.get("amount") or 0))
             direction = e.get("direction")
             if direction == "in":
-                net += amt
+                signed = amt
             elif direction == "out":
-                net -= amt
-        return net, latest + 1
+                signed = -amt
+            else:
+                continue
+            info = e.get("info") or {}
+            raw_id = next((value for value in (
+                e.get("id"), info.get("billId"), info.get("id"),
+                info.get("tradeId"), info.get("ordId"), info.get("txId"))
+                if value not in (None, "")), None)
+            transfer_id = f"okx:{raw_id}" if raw_id is not None else None
+            # This key is for an operator's reconciliation queue only. It is
+            # deliberately not used as an idempotency key: equal legitimate
+            # transfers can share timestamp, direction and amount.
+            reconciliation_key = (
+                f"ledger:{ts}:{direction}:{amt:.12g}:{index}")
+            if transfer_id and transfer_id in already_seen:
+                continue
+            if transfer_id:
+                already_seen.add(transfer_id)
+            net += signed
+            records.append(TransferRecord(
+                transfer_id=transfer_id, ts_ms=ts, net_usdt=signed,
+                reconciliation_required=transfer_id is None,
+                reconciliation_key=reconciliation_key))
+        return TransferBatch(net, latest + 1, tuple(records))
 
     def funding_since(self, symbol: str, since_ms: int) -> float | None:
         """Return signed funding paid/received, or None if it cannot be read."""

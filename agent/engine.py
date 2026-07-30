@@ -112,7 +112,13 @@ class Engine:
             from pathlib import Path
             registry_path = (Path(__file__).resolve().parent.parent
                              / "research" / "variants.yaml")
-            return shadow.build(cfg, variants.load_registry(registry_path))
+            context = state.journal_context()
+            scope_key = (
+                f"{context.get('runtime_mode') or cfg.get('mode', 'unknown')}:"
+                f"{context.get('account_fingerprint') or 'unscoped'}")
+            return shadow.build(
+                cfg, variants.load_registry(registry_path),
+                scope_key=scope_key)
         except Exception as exc:                           # noqa: BLE001
             log.warning("Shadow evaluation disabled: %s", exc)
             return None
@@ -365,6 +371,63 @@ class Engine:
             "USDT (non-USDT assets are excluded)", equity)
         return True
 
+    def _sync_transfers(self, st: dict, now: float) -> None:
+        """Apply each external cash flow once, with honest identity status."""
+        since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
+        processed = dict(st.get("processed_transfer_ids") or {})
+        pending = dict(st.get("transfer_reconciliation_required") or {})
+        batch = self.ex.transfers_since(since, set(processed))
+        net_transfer, next_since = batch
+        records = getattr(batch, "records", None)
+
+        if records is None:
+            # Compatibility for exchange fakes and journals produced before
+            # ledger identity was exposed. The amount is applied, but the
+            # aggregate is explicitly not represented as exactly deduplicated.
+            if abs(float(net_transfer)) > 0.01:
+                key = f"legacy-aggregate:{since}:{next_since}"
+                payload = {
+                    "net_usdt": float(net_transfer),
+                    "identity_status": "legacy_aggregate",
+                    "reconciliation_required": True,
+                    "reconciliation_key": key,
+                }
+                pending[key] = payload
+                state.log_event("transfer", json.dumps(payload))
+        else:
+            for record in records:
+                payload = record.as_event()
+                transfer_id = payload.get("transfer_id")
+                if transfer_id:
+                    processed[str(transfer_id)] = float(
+                        payload.get("ledger_ts_ms") or 0)
+                else:
+                    pending[str(payload["reconciliation_key"])] = payload
+                    state.log_event(
+                        "warning", json.dumps({
+                            "kind": "transfer_reconciliation_required",
+                            **payload,
+                        }))
+                state.log_event("transfer", json.dumps(payload))
+
+        # Bound operational state without weakening database history.
+        st["processed_transfer_ids"] = dict(sorted(
+            processed.items(), key=lambda item: item[1], reverse=True)[:2000])
+        st["transfer_reconciliation_required"] = dict(
+            list(pending.items())[-200:])
+        st["last_ledger_ts"] = int(next_since)
+
+        if abs(float(net_transfer)) <= 0.01:
+            return
+        log.info("Net transfer detected: %+.2f USDT; rebasing benchmarks",
+                 net_transfer)
+        if st.get("high_water_mark"):
+            st["high_water_mark"] = max(
+                1e-9, float(st["high_water_mark"]) + float(net_transfer))
+        if st.get("day_start_equity"):
+            st["day_start_equity"] = max(
+                1e-9, float(st["day_start_equity"]) + float(net_transfer))
+
     def cycle(self, st: dict) -> None:
         now = time.time()
         state.set_journal_context(
@@ -466,19 +529,7 @@ class Engine:
             st.get("recent_setups") or {}, now)
 
         # --- deposits / withdrawals: rebase benchmarks, never trade on them
-        since = int(st.get("last_ledger_ts") or (now - 3600) * 1000)
-        net_transfer, next_since = self.ex.transfers_since(since)
-        if abs(net_transfer) > 0.01:
-            log.info("Net transfer detected: %+.2f USDT; rebasing benchmarks",
-                     net_transfer)
-            if st.get("high_water_mark"):
-                st["high_water_mark"] = max(
-                    1e-9, st["high_water_mark"] + net_transfer)
-            if st.get("day_start_equity"):
-                st["day_start_equity"] = max(
-                    1e-9, st["day_start_equity"] + net_transfer)
-            state.log_event("transfer", json.dumps({"net_usdt": net_transfer}))
-        st["last_ledger_ts"] = next_since
+        self._sync_transfers(st, now)
 
         # --- UTC day rollover
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -551,8 +602,34 @@ class Engine:
         # --- position housekeeping (runs in every state except KILLED)
         positions = self._manage_positions(positions, st, equity)
 
-        if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
-            return  # PAUSED: no LLM calls, no new trades
+        can_decide = st["state"] in (state.RUNNING, state.DAY_STOPPED)
+        decision_due = bool(
+            can_decide
+            and not (st["state"] == state.DAY_STOPPED and not positions)
+            and self._decision_due(now))
+
+        # Local SHADOW/PAPER accounts are independent of the exchange account.
+        # Refresh their held symbols even after the live universe reranks, and
+        # advance them before every pause/day-stop/cadence/LLM early return.
+        evaluator = getattr(self, "shadow", None)
+        shadow_symbols = []
+        if evaluator is not None:
+            try:
+                shadow_symbols = evaluator.held_symbols()
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("Could not inspect shadow held symbols: %s", exc)
+        if not decision_due and evaluator is None:
+            return
+
+        symbols = list(dict.fromkeys(
+            self.universe + [p["symbol"] for p in positions]
+            + shadow_symbols))
+        snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
+        if snapshot and evaluator is not None:
+            self._advance_shadow_variants(snapshot, now)
+
+        if not can_decide:
+            return  # PAUSED: shadow marks advance, but there is no LLM call
         if st["state"] == state.DAY_STOPPED and not positions:
             return  # opens blocked and nothing held: an LLM call cannot act
 
@@ -564,20 +641,19 @@ class Engine:
         # They keep running every interval_seconds, so safety reaction time
         # is unchanged.
         #
-        # What is skipped is the snapshot build and the LLM call. Measured
+        # What is skipped is the live-decision recording and LLM call. When
+        # shadow research is enabled, its local accounts still receive a
+        # market snapshot so held positions cannot go stale. Measured
         # over the corpus, 66.5% of cycles observe only signal bars that were
         # already evaluated, and an LLM call on one of those cannot produce a
         # fresh evaluation for any symbol - strategy.evaluated_signal blocks
         # it. Simply raising interval_seconds would also slow the margin
         # guard to 15 minutes, which is not an acceptable trade; this split
         # avoids that.
-        if not self._decision_due(now):
+        if not decision_due:
             return
 
-        # --- build snapshot and ask the brain
-        symbols = list(dict.fromkeys(
-            self.universe + [p["symbol"] for p in positions]))
-        snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
+        # --- ask the brain using the same snapshot every variant just marked
         if not snapshot:
             log.warning("Empty market snapshot; holding")
             return
@@ -619,6 +695,11 @@ class Engine:
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
+        # Reuse the exact parsed proposals and confidences. No second LLM call,
+        # and no deterministic confidence substitution.
+        self._run_shadow_variants(
+            snapshot, equity, positions, st, 0.0, decisions=decisions,
+            advance_accounts=False)
         # Pick up any pause/kill the CLI issued while the LLM call was running.
         state.commit(st)
         if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
@@ -724,19 +805,18 @@ class Engine:
                         st, plan["setup_id"], "execution_rejected")
         state.commit(st)
 
-        # After every trading decision is committed, so it cannot influence
-        # one. Wrapped, budgeted, and writing only variant shadow events.
-        self._run_shadow_variants(snapshot, equity, positions, st, gross)
-
     def _run_shadow_variants(self, snapshot: dict, equity: float,
                              positions: list, st: dict,
-                             gross_notional: float) -> None:
+                             gross_notional: float, *,
+                             decisions: list[dict] | None = None,
+                             advance_accounts: bool = True) -> None:
         """Evaluate registered parameter variants against this snapshot.
 
-        Three properties, each individually tested. It runs after
-        ``state.commit``, so it can never affect a decision. It is wrapped in
-        try/except, so a failure is journalled and swallowed. And it writes
-        only ``variant_shadow_decision`` events, never a key in
+        Three properties, each individually tested. It consumes only the
+        already-journalled model response and has no exchange, so it cannot
+        change the live decision. It is wrapped in try/except, so a failure is
+        journalled and swallowed. And it writes only
+        ``variant_shadow_decision`` events, never a key in
         ``state.LOOP_KEYS``, so it cannot corrupt trading state even if it
         is wrong. The distinct name prevents parameter-variant records from
         being pooled with cross-strategy shadow records, whose payload has a
@@ -748,32 +828,70 @@ class Engine:
         evaluator = getattr(self, "shadow", None)
         if evaluator is None:
             return
+        del equity, positions, st, gross_notional
         try:
-            portfolio = {
-                "equity_usdt": equity,
-                "positions": positions,
-                "cooldowns": dict(st.get("cooldowns") or {}),
-                "active_trades": dict(st.get("active_trades") or {}),
-                "gross_notional": gross_notional,
-            }
-            records = evaluator.evaluate(snapshot, portfolio, time.time())
+            records = evaluator.evaluate(
+                snapshot, now=time.time(),
+                cycle_id=state.journal_context().get("cycle_id"),
+                proposals=decisions,
+                advance_accounts=advance_accounts)
             for record in records:
                 state.log_event(
                     "variant_shadow_decision",
                     self._audit_json(record.as_event()),
                     variant_id=record.variant_id)
+                if record.paper_action:
+                    state.log_event(
+                        ("variant_paper_trade"
+                         if record.portfolio_status == "PAPER"
+                         else "variant_shadow_trade"),
+                        self._audit_json(record.as_event()),
+                        variant_id=record.variant_id)
+            coverage = getattr(evaluator, "last_coverage", None)
+            if coverage:
+                state.log_event(
+                    "shadow_coverage", self._audit_json(coverage))
             budget = getattr(evaluator, "last_budget", None)
             if budget is not None and budget.overran:
                 state.log_event("shadow_budget_overrun", self._audit_json({
                     "limit_ms": budget.limit_ms,
                     "spent_ms": round(budget.spent_ms(), 2),
                     "records": len(records),
+                    "coverage": getattr(evaluator, "last_coverage", {}),
                 }))
         except Exception as exc:                           # noqa: BLE001
             log.warning("Shadow variant evaluation failed: %s", exc)
             try:
                 state.log_event("shadow_failed", self._audit_json(
                     {"error": f"{type(exc).__name__}: {exc}"}))
+            except Exception:                              # noqa: BLE001
+                pass
+
+    def _advance_shadow_variants(self, snapshot: dict, now: float) -> None:
+        """Advance local accounts without scheduling any new proposal."""
+        evaluator = getattr(self, "shadow", None)
+        if evaluator is None:
+            return
+        try:
+            records = evaluator.advance(snapshot, now=now)
+            for record in records:
+                state.log_event(
+                    "variant_shadow_decision",
+                    self._audit_json(record.as_event()),
+                    variant_id=record.variant_id)
+                if record.paper_action:
+                    state.log_event(
+                        ("variant_paper_trade"
+                         if record.portfolio_status == "PAPER"
+                         else "variant_shadow_trade"),
+                        self._audit_json(record.as_event()),
+                        variant_id=record.variant_id)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Shadow portfolio advance failed: %s", exc)
+            try:
+                state.log_event("shadow_failed", self._audit_json(
+                    {"phase": "advance",
+                     "error": f"{type(exc).__name__}: {exc}"}))
             except Exception:                              # noqa: BLE001
                 pass
 

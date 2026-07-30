@@ -89,6 +89,58 @@ def bootstrap_difference(a: list, b: list, iterations: int = 2000,
                     min(len(clean_a), len(clean_b)))
 
 
+def cluster_block_bootstrap_difference(
+        pairs: list[tuple[float, float, float]], iterations: int = 2000,
+        confidence: float = 0.95, seed: int = 20260728,
+        cluster_seconds: int = 21_600) -> Interval:
+    """Paired delta interval preserving clustered, serially dependent data.
+
+    Each row is ``(timestamp, left_return, right_return)`` for the same
+    preregistered proposal. Rows first stay together in six-hour market
+    clusters; contiguous clusters are then sampled in blocks. This preserves
+    both cross-symbol dependence within a market episode and short-run serial
+    dependence instead of pretending every trade is independent.
+    """
+    clean = []
+    for ts, left, right in pairs:
+        try:
+            values = (float(ts), float(left), float(right))
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(value) for value in values):
+            clean.append((values[0], values[1] - values[2]))
+    if not clean:
+        return Interval(0.0, 0.0, 0.0, 0)
+    point = sum(delta for _, delta in clean) / len(clean)
+    clusters: dict[int, list[float]] = {}
+    for ts, delta in clean:
+        clusters.setdefault(int(ts // cluster_seconds), []).append(delta)
+    ordered = [clusters[key] for key in sorted(clusters)]
+    if len(ordered) == 1:
+        return Interval(point, point, point, len(clean))
+
+    block_size = max(1, min(len(ordered), int(round(math.sqrt(len(ordered))))))
+    rng = random.Random(seed)
+    means = []
+    for _ in range(iterations):
+        sampled: list[float] = []
+        selected = 0
+        while selected < len(ordered):
+            start = rng.randrange(len(ordered))
+            for offset in range(block_size):
+                sampled.extend(ordered[(start + offset) % len(ordered)])
+                selected += 1
+                if selected >= len(ordered):
+                    break
+        means.append(sum(sampled) / len(sampled))
+    means.sort()
+    tail = (1.0 - confidence) / 2.0
+    return Interval(
+        point, means[int(tail * len(means))],
+        means[min(len(means) - 1, int((1.0 - tail) * len(means)))],
+        len(clean))
+
+
 def stdev(values: list) -> float:
     clean = [float(v) for v in values
              if v is not None and math.isfinite(float(v))]

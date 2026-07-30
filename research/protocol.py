@@ -24,8 +24,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from agent.forward_models import require_validated
+
 from .score import score_returns
-from .stats import INSUFFICIENT_SAMPLE, bootstrap_difference, holm_bonferroni
+from .stats import (INSUFFICIENT_SAMPLE, cluster_block_bootstrap_difference,
+                    holm_bonferroni)
 
 
 PROMOTE = "PROMOTE"
@@ -35,6 +38,11 @@ CONTINUE = "CONTINUE"
 MIN_ROUND_TRIPS = 100
 MIN_AXIS_SETTINGS = 3
 OUT_OF_SAMPLE_FRACTION = 0.7
+MIN_PAIR_COVERAGE_PCT = 80.0
+MIN_PAIRED_FIT_OBSERVATIONS = 70
+MIN_PAIRED_CONFIRM_OBSERVATIONS = 30
+PAIR_BOOTSTRAP_KIND = "paired_cluster_block"
+PAIR_CLUSTER_SECONDS = 21_600
 
 
 @dataclass
@@ -70,6 +78,28 @@ def split_by_time(items: list, fraction: float = OUT_OF_SAMPLE_FRACTION,
     return ordered[:cut], ordered[cut:]
 
 
+def common_time_cutoff(
+        populations: list[list], fraction: float = OUT_OF_SAMPLE_FRACTION,
+        key=lambda item: getattr(item, "ts", 0.0)) -> float | None:
+    """Return one calendar boundary shared by every experimental arm."""
+    timestamps = sorted({float(key(item))
+                         for population in populations for item in population})
+    if len(timestamps) < 2:
+        return None
+    cut = int(len(timestamps) * fraction)
+    cut = min(max(cut, 1), len(timestamps) - 1)
+    return timestamps[cut]
+
+
+def split_at_time(
+        items: list, cutoff_ts: float,
+        key=lambda item: getattr(item, "ts", 0.0)) -> tuple[list, list]:
+    """Split at a fixed timestamp without leaking one episode across windows."""
+    ordered = sorted(items, key=key)
+    return ([item for item in ordered if float(key(item)) < cutoff_ts],
+            [item for item in ordered if float(key(item)) >= cutoff_ts])
+
+
 def regime_profile(decisions: list) -> dict:
     """Realised-volatility profile of a window, reported beside every split.
 
@@ -98,7 +128,8 @@ def regime_profile(decisions: list) -> dict:
 
 
 def out_of_sample(decisions: list,
-                  fraction: float = OUT_OF_SAMPLE_FRACTION) -> dict:
+                  fraction: float = OUT_OF_SAMPLE_FRACTION,
+                  cutoff_ts: float | None = None) -> dict:
     """Fit on the first 70% of the corpus, confirm on the last 30%.
 
     "Survives" means the confirm window's expectancy interval does not
@@ -107,7 +138,9 @@ def out_of_sample(decisions: list,
     deliberately weak bar, because at these samples a strict one would reject
     everything, and a bar nothing can pass carries no information.
     """
-    fit, confirm = split_by_time(decisions, fraction)
+    fit, confirm = (split_at_time(decisions, cutoff_ts)
+                    if cutoff_ts is not None
+                    else split_by_time(decisions, fraction))
     fit_returns = _returns(fit)
     confirm_returns = _returns(confirm)
     fit_score = score_returns(fit_returns, label="fit")
@@ -127,7 +160,8 @@ def out_of_sample(decisions: list,
     if not confirm_returns or not fit_returns:
         return {"survives": None, "reason": "one window is empty",
                 "fit": fit_score, "confirm": confirm_score,
-                "fit_regime": fit_profile, "confirm_regime": confirm_profile}
+                "fit_regime": fit_profile, "confirm_regime": confirm_profile,
+                "cutoff_ts": cutoff_ts}
 
     survives = confirm_score["ci_high"] >= fit_score["expectancy_r"]
     return {
@@ -138,6 +172,7 @@ def out_of_sample(decisions: list,
                    "fit window's point estimate"),
         "fit": fit_score, "confirm": confirm_score,
         "fit_regime": fit_profile, "confirm_regime": confirm_profile,
+        "cutoff_ts": cutoff_ts,
     }
 
 
@@ -147,10 +182,138 @@ def _returns(decisions: list) -> list:
             and d.outcome.get("r_multiple") is not None]
 
 
+def paper_trade_decisions(rows: list) -> list:
+    """Rebuild exact actions from persisted proposal or legacy trade rows.
+
+    A veto is an observed zero-return action, not missing data. This matters
+    for confidence, exposure and discriminator axes: their edge is precisely
+    whether accepting a proposal the baseline rejected adds value.
+    """
+    from .replay import ReplayDecision
+
+    decisions = []
+    for row in rows:
+        is_ledger = "decision_outcome" in row
+        decision_outcome = (str(row.get("decision_outcome") or "").upper()
+                            if is_ledger else "PROPOSED")
+        stage = "executed" if decision_outcome == "PROPOSED" else "vetoed"
+        decision = ReplayDecision(
+            cycle_id=row.get("cycle_id"),
+            ts=float(row["decision_ts"] if is_ledger else row["entry_ts"]),
+            symbol=str(row["symbol"]),
+            signal_ts=(int(row["signal_ts"])
+                       if row.get("signal_ts") is not None else None),
+            stage=stage, direction=row.get("direction"),
+            setup_type=row.get("setup_type"), contract_passed=True,
+            proposal_id=row.get("proposal_id"))
+        if decision_outcome == "VETOED":
+            decision.outcome = {"r_multiple": 0.0, "result": "vetoed"}
+        elif is_ledger and row.get("trade_status") == "CLOSED" \
+                and row.get("trade_r_multiple") is not None:
+            decision.outcome = {
+                "r_multiple": float(row["trade_r_multiple"]),
+                "result": row.get("trade_result"),
+            }
+        elif (not is_ledger and row.get("status") == "CLOSED"
+              and row.get("r_multiple") is not None):
+            decision.outcome = {
+                "r_multiple": float(row["r_multiple"]),
+                "result": row.get("result"),
+            }
+        decisions.append(decision)
+    return decisions
+
+
+def paired_arm_comparison(left: list, right: list) -> dict:
+    """Match two research arms on exact proposal identity before inference."""
+    def indexed(decisions: list) -> tuple[dict, set, list]:
+        resolved: dict = {}
+        proposed = set()
+        duplicates = []
+        for decision in decisions:
+            if (not getattr(decision, "contract_passed", False)
+                    and getattr(decision, "stage", None) != "executed"):
+                continue
+            key = decision.proposal_key()
+            proposed.add(key)
+            outcome = getattr(decision, "outcome", None) or {}
+            value = outcome.get("r_multiple")
+            if value is None:
+                continue
+            if key in resolved:
+                duplicates.append(key)
+                resolved.pop(key, None)
+                continue
+            resolved[key] = (float(decision.ts), float(value))
+        return resolved, proposed, duplicates
+
+    left_resolved, left_proposed, left_duplicates = indexed(left)
+    right_resolved, right_proposed, right_duplicates = indexed(right)
+    common = sorted(
+        set(left_resolved) & set(right_resolved), key=repr)
+    pairs = [
+        (max(left_resolved[key][0], right_resolved[key][0]),
+         left_resolved[key][1], right_resolved[key][1])
+        for key in common
+    ]
+    interval = cluster_block_bootstrap_difference(pairs)
+    union = left_proposed | right_proposed
+    return {
+        "interval": interval,
+        "paired_n": len(common),
+        "proposal_union_n": len(union),
+        "pair_coverage_pct": (len(common) / len(union) * 100.0
+                              if union else 100.0),
+        "left_only_proposals": len(left_proposed - right_proposed),
+        "right_only_proposals": len(right_proposed - left_proposed),
+        "left_unresolved": len(left_proposed - set(left_resolved)),
+        "right_unresolved": len(right_proposed - set(right_resolved)),
+        "left_duplicates": len(left_duplicates),
+        "right_duplicates": len(right_duplicates),
+        "mismatch_examples": {
+            "left_only": [list(key) for key in sorted(
+                left_proposed - right_proposed, key=repr)[:10]],
+            "right_only": [list(key) for key in sorted(
+                right_proposed - left_proposed, key=repr)[:10]],
+            "left_duplicates": [list(key) for key in left_duplicates[:10]],
+            "right_duplicates": [list(key) for key in right_duplicates[:10]],
+        },
+        "bootstrap": {
+            "kind": PAIR_BOOTSTRAP_KIND,
+            "cluster_seconds": PAIR_CLUSTER_SECONDS,
+            "seed": 20260728,
+        },
+    }
+
+
+def paired_window_adequate(comparison: dict, minimum: int) -> bool:
+    """Return whether one inference window has defensible paired evidence."""
+    bootstrap = comparison.get("bootstrap") or {}
+    interval = comparison.get("interval")
+    return bool(
+        int(comparison.get("paired_n") or 0) >= minimum
+        and float(comparison.get("pair_coverage_pct") or 0)
+        >= MIN_PAIR_COVERAGE_PCT
+        and not int(comparison.get("left_duplicates") or 0)
+        and not int(comparison.get("right_duplicates") or 0)
+        and bootstrap.get("kind") == PAIR_BOOTSTRAP_KIND
+        and int(bootstrap.get("cluster_seconds") or 0) == PAIR_CLUSTER_SECONDS
+        and interval is not None
+        and int(getattr(interval, "n", -1))
+        == int(comparison.get("paired_n") or 0)
+    )
+
+
+def _paired_evidence(comparison: dict) -> dict:
+    return {key: value for key, value in comparison.items()
+            if key != "interval"}
+
+
 # ------------------------------------------------------------- the rules
 
 def evaluate_axis(settings: list, baseline_decisions: list,
-                  structurally_invalid: str = "") -> Verdict:
+                  structurally_invalid: str = "",
+                  strategy_id: str = "momentum") -> Verdict:
     """Apply the promotion protocol to a whole parameter axis.
 
     ``settings`` is a list of ``(variant_id, decisions)`` pairs - every point
@@ -167,6 +330,8 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             structurally_invalid,
             {"settings": len(settings)})
 
+    require_validated(strategy_id)
+
     baseline = score_returns(_returns(baseline_decisions), label="baseline")
     scored = [(vid, score_returns(_returns(d), label=vid), d)
               for vid, d in settings]
@@ -180,19 +345,25 @@ def evaluate_axis(settings: list, baseline_decisions: list,
 
     # Checked before anything reduces over the settings, so an axis with
     # nothing on it yet is a verdict rather than an exception.
-    if len(scored) < MIN_AXIS_SETTINGS:
+    total_settings = len(scored) + 1  # the explicit baseline is one setting
+    if total_settings < MIN_AXIS_SETTINGS:
         return Verdict(
             CONTINUE, "too few settings on the axis",
-            f"{len(scored)} of {MIN_AXIS_SETTINGS} required settings "
+            f"{total_settings} of {MIN_AXIS_SETTINGS} required settings "
             "tested; a hypothesis is never decided on one parameter value",
-            {"settings": len(scored)})
+            {"settings": total_settings, "candidate_settings": len(scored)})
 
     # Select on the fit window only. Selecting on the full corpus and then
     # calling the last 30% "confirmation" lets that confirmation window pick
     # its own winner.
+    # The baseline is the shared proposal calendar. Deriving one boundary from
+    # it prevents a dense or delayed candidate arm from moving the date and
+    # then receiving a different market regime than its peers.
+    split_cutoff = common_time_cutoff([baseline_decisions])
     split_settings = []
     for vid, full_score, decisions in scored:
-        fit, confirm = split_by_time(decisions)
+        fit, confirm = (split_at_time(decisions, split_cutoff)
+                        if split_cutoff is not None else (decisions, []))
         split_settings.append((
             vid, full_score, decisions,
             score_returns(_returns(fit), label=f"{vid}:fit"),
@@ -232,16 +403,41 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             {"settings": len(scored),
              "baseline_expectancy_r": baseline["expectancy_r"]})
 
-    baseline_fit, baseline_confirm = split_by_time(baseline_decisions)
-    baseline_fit_score = score_returns(
-        _returns(baseline_fit), label="baseline:fit")
-    if best_fit_score["ci_low"] <= baseline_fit_score["expectancy_r"]:
+    baseline_fit, baseline_confirm = (
+        split_at_time(baseline_decisions, split_cutoff)
+        if split_cutoff is not None else (baseline_decisions, []))
+    full_pair = paired_arm_comparison(best_decisions, baseline_decisions)
+    if not paired_window_adequate(full_pair, MIN_ROUND_TRIPS):
+        return Verdict(
+            INSUFFICIENT_SAMPLE, "paired proposal coverage is inadequate",
+            f"fit-selected setting {best_id} has {full_pair['paired_n']} "
+            f"resolved pairs covering {full_pair['pair_coverage_pct']:.1f}% "
+            f"of the proposal union; promotion requires {MIN_ROUND_TRIPS} "
+            f"pairs, {MIN_PAIR_COVERAGE_PCT:.0f}% coverage, and no duplicate "
+            "proposal identities",
+            {"best": best_id, "paired": _paired_evidence(full_pair)})
+
+    fit_pair = paired_arm_comparison(best_fit, baseline_fit)
+    if not paired_window_adequate(
+            fit_pair, MIN_PAIRED_FIT_OBSERVATIONS):
+        return Verdict(
+            INSUFFICIENT_SAMPLE, "fit-window paired evidence is inadequate",
+            f"fit-selected setting {best_id} has {fit_pair['paired_n']} "
+            f"resolved fit pairs covering {fit_pair['pair_coverage_pct']:.1f}% "
+            f"of the fit proposal union; promotion requires "
+            f"{MIN_PAIRED_FIT_OBSERVATIONS} pairs, "
+            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, no duplicates, and the "
+            "registered dependence-aware bootstrap",
+            {"best": best_id, "fit_paired": _paired_evidence(fit_pair)})
+    fit_difference = fit_pair["interval"]
+    if fit_difference.n == 0 or fit_difference.low <= 0:
         return Verdict(
             CONTINUE, "fit-window delta is inside the interval",
-            f"fit-selected setting {best_id} has a fit lower bound of "
-            f"{best_fit_score['ci_low']:+.4f}R against the fit baseline point "
-            f"estimate of {baseline_fit_score['expectancy_r']:+.4f}R",
-            {"best": best_id, "fit_ci_low": best_fit_score["ci_low"]})
+            f"fit-selected setting {best_id} has paired fit delta "
+            f"{fit_difference}; the entire dependence-aware interval must "
+            "clear zero",
+            {"best": best_id, "fit_delta": str(fit_difference),
+             "fit_paired": _paired_evidence(fit_pair)})
 
     if best_score["max_drawdown_r"] > baseline["max_drawdown_r"]:
         return Verdict(
@@ -252,7 +448,7 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             "with a deeper hole is not an improvement",
             {"best": best_id})
 
-    split = out_of_sample(best_decisions)
+    split = out_of_sample(best_decisions, cutoff_ts=split_cutoff)
     if not split["survives"]:
         return Verdict(
             CONTINUE, "did not survive the out-of-sample split",
@@ -261,8 +457,22 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             f"{split['confirm_regime']['median_vol_ratio']}",
             {"best": best_id, "split": split})
 
-    confirm_difference = bootstrap_difference(
-        _returns(best_confirm), _returns(baseline_confirm))
+    confirm_pair = paired_arm_comparison(best_confirm, baseline_confirm)
+    if not paired_window_adequate(
+            confirm_pair, MIN_PAIRED_CONFIRM_OBSERVATIONS):
+        return Verdict(
+            INSUFFICIENT_SAMPLE,
+            "confirmation-window paired evidence is inadequate",
+            f"fit-selected setting {best_id} has {confirm_pair['paired_n']} "
+            f"resolved confirmation pairs covering "
+            f"{confirm_pair['pair_coverage_pct']:.1f}% of the confirmation "
+            f"proposal union; promotion requires "
+            f"{MIN_PAIRED_CONFIRM_OBSERVATIONS} pairs, "
+            f"{MIN_PAIR_COVERAGE_PCT:.0f}% coverage, no duplicates, and the "
+            "registered dependence-aware bootstrap",
+            {"best": best_id, "split": split,
+             "confirmation_paired": _paired_evidence(confirm_pair)})
+    confirm_difference = confirm_pair["interval"]
     if confirm_difference.n == 0 or confirm_difference.low <= 0:
         return Verdict(
             CONTINUE, "confirmation delta does not clear zero",
@@ -270,10 +480,43 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             f"baseline {confirm_difference}; promotion requires the entire "
             "confirmation interval to be positive",
             {"best": best_id, "split": split,
-             "confirm_delta": str(confirm_difference)})
+             "confirm_delta": str(confirm_difference),
+             "confirmation_paired": _paired_evidence(confirm_pair)})
 
-    difference = bootstrap_difference(
-        _returns(best_decisions), _returns(baseline_decisions))
+    difference = full_pair["interval"]
+    criteria = {
+        "min_round_trips": best_score["n"] >= MIN_ROUND_TRIPS,
+        "min_axis_settings": total_settings >= MIN_AXIS_SETTINGS,
+        "paired_sample": full_pair["paired_n"] >= MIN_ROUND_TRIPS,
+        "paired_coverage": (
+            full_pair["pair_coverage_pct"] >= MIN_PAIR_COVERAGE_PCT),
+        "no_duplicate_proposals": not (
+            full_pair["left_duplicates"] or full_pair["right_duplicates"]),
+        "paired_dependence_aware": paired_window_adequate(
+            full_pair, MIN_ROUND_TRIPS),
+        "fit_paired_sample": (
+            fit_pair["paired_n"] >= MIN_PAIRED_FIT_OBSERVATIONS),
+        "fit_paired_coverage": (
+            fit_pair["pair_coverage_pct"] >= MIN_PAIR_COVERAGE_PCT),
+        "fit_no_duplicate_proposals": not (
+            fit_pair["left_duplicates"] or fit_pair["right_duplicates"]),
+        "fit_dependence_aware": paired_window_adequate(
+            fit_pair, MIN_PAIRED_FIT_OBSERVATIONS),
+        "confirmation_paired_sample": (
+            confirm_pair["paired_n"] >= MIN_PAIRED_CONFIRM_OBSERVATIONS),
+        "confirmation_paired_coverage": (
+            confirm_pair["pair_coverage_pct"] >= MIN_PAIR_COVERAGE_PCT),
+        "confirmation_no_duplicate_proposals": not (
+            confirm_pair["left_duplicates"]
+            or confirm_pair["right_duplicates"]),
+        "confirmation_dependence_aware": paired_window_adequate(
+            confirm_pair, MIN_PAIRED_CONFIRM_OBSERVATIONS),
+        "fit_interval_positive": fit_difference.low > 0,
+        "drawdown_no_worse": (
+            best_score["max_drawdown_r"] <= baseline["max_drawdown_r"]),
+        "out_of_sample_survives": split["survives"] is True,
+        "confirmation_interval_positive": confirm_difference.low > 0,
+    }
     return Verdict(
         PROMOTE, "every promotion criterion holds",
         f"{best_id}: {best_score['n']} round trips, expectancy "
@@ -281,8 +524,19 @@ def evaluate_axis(settings: list, baseline_decisions: list,
         f"[{best_score['ci_low']:+.4f},{best_score['ci_high']:+.4f}], "
         f"delta vs baseline {difference}, survived the out-of-sample split",
         {"best": best_id, "n": best_score["n"], "split": split,
+         "axis_settings": total_settings, "criteria": criteria,
          "selection_window": "fit", "confirm_delta": str(confirm_difference),
-         "regime_comparable": split["fit_regime"].get("comparable")})
+         "split_cutoff_ts": split_cutoff,
+         "fit_interval": {
+             "point": fit_difference.point, "low": fit_difference.low,
+             "high": fit_difference.high, "n": fit_difference.n},
+         "confirmation_interval": {
+             "point": confirm_difference.point, "low": confirm_difference.low,
+             "high": confirm_difference.high, "n": confirm_difference.n},
+         "regime_comparable": split["fit_regime"].get("comparable"),
+         "paired": _paired_evidence(full_pair),
+         "fit_paired": _paired_evidence(fit_pair),
+         "confirmation_paired": _paired_evidence(confirm_pair)})
 
 
 def correct_family(results: dict, alpha: float = 0.05) -> dict:

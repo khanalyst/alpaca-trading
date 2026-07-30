@@ -92,6 +92,27 @@ def _proposal_snapshot(db: Path) -> tuple[int, float]:
     return int(row[0]), float(row[1])
 
 
+def _latest_g2_payload(db: Path) -> dict | None:
+    if not db.exists():
+        return None
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT payload FROM events WHERE kind='research_gate_result' "
+            "ORDER BY ts DESC").fetchall()
+    for (raw,) in rows:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("gate") == "G2":
+            return payload
+    return None
+
+
+def _paper_decisions(rows: list) -> list:
+    return protocol.paper_trade_decisions(rows)
+
+
 def _record_g2_result(
         db: Path, status: str, report: dict, result, cfg: dict) -> bool:
     """Append a durable G2 audit record to the journal being checked."""
@@ -264,14 +285,45 @@ def cmd_three_arm(args: argparse.Namespace) -> int:
         print(f"      executed {executed:>6,}   mean R {interval}")
         print(f"      MDE at this n: {mde:.4f}R\n")
 
+    comparisons = {}
     for left, right in (("recorded_llm", "deterministic"),
                         ("deterministic_vetoed", "deterministic"),
                         ("deterministic_vetoed", "recorded_llm")):
-        diff = stats.bootstrap_difference(
-            arms[left]["returns"], arms[right]["returns"])
+        comparison = protocol.paired_arm_comparison(
+            arms[left]["result"].decisions,
+            arms[right]["result"].decisions)
+        diff = comparison["interval"]
+        comparisons[f"{left}__minus__{right}"] = {
+            **{key: value for key, value in comparison.items()
+               if key != "interval"},
+            "interval": {
+                "point": diff.point, "low": diff.low,
+                "high": diff.high, "n": diff.n,
+            },
+        }
         verdict = ("differs" if diff.excludes_zero()
                    else stats.INSUFFICIENT_SAMPLE)
         print(f"  {left} - {right}: {diff}   {verdict}")
+        print(f"      paired {comparison['paired_n']:,}/"
+              f"{comparison['proposal_union_n']:,} proposals "
+              f"({comparison['pair_coverage_pct']:.1f}%); "
+              f"left-only {comparison['left_only_proposals']:,}, "
+              f"right-only {comparison['right_only_proposals']:,}, "
+              f"duplicates {comparison['left_duplicates'] + comparison['right_duplicates']:,}")
+
+    store = findings_mod.FindingsStore(
+        args.store or findings_mod.DEFAULT_STORE)
+    analysis_id = store.record_analysis("three_arm", "momentum", {
+        "journal": str(db),
+        "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+        "arms": {
+            mode: {"executed": data["result"].funnel["executed"],
+                   "resolved": len(data["returns"])}
+            for mode, data in arms.items()
+        },
+        "comparisons": comparisons,
+    })
+    print(f"\npersisted paired three-arm analysis {analysis_id} to {store.path}")
 
     print("\nIf all three intervals overlap at the sample available, the "
           "answer is\nINSUFFICIENT_SAMPLE, not 'the LLM is fine'.")
@@ -445,7 +497,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         variant_mod.apply(base_variant, cfg),
         variant_id=base_variant.variant_id, mode=args.replay_mode,
         price_cache=cache).run(cycles, outputs)
-    verdict = protocol.evaluate_axis(settings, baseline_result.executed())
+    verdict = protocol.evaluate_axis(
+        settings, baseline_result.executed(),
+        strategy_id=base_variant.strategy_id)
     print(f"\naxis verdict: {verdict.verdict}")
     print(f"  governing criterion: {verdict.governing_criterion}")
     print(f"  {verdict.detail}")
@@ -459,7 +513,186 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             result, row,
             f"{spec.name}: {verdict.verdict} — "
             f"{verdict.governing_criterion}. {verdict.detail}")
+    analysis_id = store.record_analysis("parameter_axis", spec.name, {
+        "journal": str(db), "verdict": verdict.verdict,
+        "governing_criterion": verdict.governing_criterion,
+        "detail": verdict.detail, "evidence": verdict.evidence,
+        "g2_fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+        "strategy_id": base_variant.strategy_id,
+    })
+    if verdict.verdict == protocol.PROMOTE:
+        print(f"{verdict.evidence['best']} is a replay candidate only; "
+              "real-time paired forward evidence is required before paper")
     print(f"\npersisted {len(evaluations)} variant result(s) to {store.path}")
+    return 0
+
+
+def cmd_forward_qualify(args: argparse.Namespace) -> int:
+    """Select an edge from paired real-time shadow outcomes, then paper it."""
+    from agent import variants as variant_mod
+
+    cfg = _load_config()
+    store = findings_mod.FindingsStore(
+        Path(args.store) if args.store else findings_mod.resolve_store_path(
+            (cfg.get("research") or {}).get("findings_store")))
+    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    for variant in registry.values():
+        store.register(variant)
+    scope = args.scope
+    if not scope:
+        scopes = store.paper_scopes()
+        if len(scopes) != 1:
+            print("--scope is required when findings.db contains zero or "
+                  "multiple paper scopes", file=sys.stderr)
+            return 2
+        scope = scopes[0]
+    strategy_id = args.strategy
+    baseline_id = f"{strategy_id}.baseline"
+    if baseline_id not in registry:
+        print(f"no registered baseline {baseline_id}", file=sys.stderr)
+        return 2
+
+    axes: dict[tuple[str, ...], list] = {}
+    for variant_id, variant in sorted(registry.items()):
+        if (variant.strategy_id != strategy_id or variant_id == baseline_id
+                or variant.status not in {"candidate", "testing"}):
+            continue
+        axis = tuple(sorted(str(path) for path in variant.overrides))
+        if not axis:
+            print(f"skipping {variant_id}: no parameter axis", file=sys.stderr)
+            continue
+        axes.setdefault(axis, []).append(variant)
+    if not axes:
+        print(f"no active parameter axes for {strategy_id}", file=sys.stderr)
+        return 2
+
+    for axis, axis_variants in sorted(axes.items()):
+        axis_id = "+".join(axis)
+        setting_ids = [variant.variant_id for variant in axis_variants]
+        try:
+            analysis_id, verdict = store.record_forward_analysis(
+                scope, strategy_id, list(axis), baseline_id, setting_ids)
+        except ValueError as exc:
+            print(f"forward axis {axis_id}: evidence invalid: {exc}",
+                  file=sys.stderr)
+            continue
+        analysis = store.analysis(analysis_id) or {}
+        portfolios = (analysis.get("payload") or {}).get(
+            "portfolio_statuses") or {}
+        print(f"forward axis {axis_id}: {verdict.verdict}")
+        print(f"  {verdict.governing_criterion}: {verdict.detail}")
+        if verdict.verdict != protocol.PROMOTE:
+            continue
+        best = str(verdict.evidence["best"])
+        if portfolios.get(best) == "REVOKED":
+            print(f"  {best} cannot enter paper: its shadow portfolio is "
+                  "revoked and requires reconciliation", file=sys.stderr)
+            continue
+        event_id = store.qualify_variant(
+            best, {
+                "source": "paired_real_time_forward",
+                "analysis_id": analysis_id,
+                "axis": list(axis),
+                "verdict": verdict.evidence,
+                "automatic_action": "start isolated local paper when flat",
+                "live_promotion": False,
+            }, source_analysis_id=analysis_id, scope_key=scope)
+        print(f"qualified {best} for isolated paper in {scope} "
+              f"(event {event_id}); live registry unchanged")
+    return 0
+
+
+def cmd_t3_packet(args: argparse.Namespace) -> int:
+    """Create a content-addressed, review-gated T3 evidence packet."""
+    from agent import state, variants as variant_mod
+
+    if bool(args.reviewed_by) != bool(args.registry_change_ref):
+        print("--reviewed-by and --registry-change-ref must be supplied "
+              "together", file=sys.stderr)
+        return 2
+    cfg = _load_config()
+    store = findings_mod.FindingsStore(
+        Path(args.store) if args.store else findings_mod.resolve_store_path(
+            (cfg.get("research") or {}).get("findings_store")))
+    registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
+    if args.variant not in registry:
+        print(f"unknown variant {args.variant}", file=sys.stderr)
+        return 2
+    store.register(registry[args.variant])
+    scopes = store.paper_scopes()
+    scope = args.scope or (scopes[0] if len(scopes) == 1 else None)
+    if not scope:
+        print("--scope is required when findings.db contains zero or multiple "
+              "paper scopes", file=sys.stderr)
+        return 2
+    qualification = store.qualification_status(args.variant, scope)
+    analysis = store.analysis(
+        str((qualification or {}).get("source_analysis_id") or ""))
+    paper = store.paper_summary(scope, args.variant, paper_only=True)
+    db = Path(args.db) if args.db else default_db(args.mode)
+    g2 = _latest_g2_payload(db)
+    proposal_count, max_proposal_ts = (
+        _proposal_snapshot(db) if db.exists() else (0, 0.0))
+    analysis_payload = (analysis or {}).get("payload") or {}
+    evidence = analysis_payload.get("evidence") or {}
+    min_paper = int((cfg.get("research") or {}).get(
+        "paper_min_closed_trades") or 100)
+    g2_current = bool(
+        g2 and g2.get("status") == "PASS"
+        and int(g2.get("proposal_count", -1)) == proposal_count
+        and float(g2.get("max_proposal_ts", -1)) == max_proposal_ts
+        and g2.get("strategy_config_version") == state.strategy_fingerprint(cfg)
+        and g2.get("fidelity_code_version")
+        == replay_mod.fidelity_code_fingerprint())
+    checklist = {
+        "current_g2_pass": g2_current,
+        "held_out_confirmation": bool(
+            analysis_payload.get("verdict") == protocol.PROMOTE
+            and evidence.get("selection_window") == "fit"
+            and evidence.get("confirm_delta")),
+        "corpus_provenance": all(
+            analysis_payload.get(key) is not None for key in
+            ("corpus_from_ts", "corpus_to_ts", "resolved_outcomes")),
+        "config_provenance": bool(
+            analysis_payload.get("strategy_config_version")),
+        "code_provenance": bool(analysis_payload.get("code_version")),
+        "forward_sample": bool(
+            qualification and qualification.get("status") == "QUALIFIED"
+            and analysis_payload.get("source")
+            == "real_time_shadow_portfolios"),
+        "paper_sample": int(paper.get("closed_trades") or 0) >= min_paper,
+        "paper_positive": bool(
+            paper.get("status") == "PAPER"
+            and paper.get("expectancy_r") is not None
+            and float(paper["expectancy_r"]) > 0
+            and not paper.get("revoked_reason")),
+        "manual_registry_review": bool(
+            args.reviewed_by and args.registry_change_ref),
+    }
+    payload = {
+        "variant_id": args.variant,
+        "scope_key": scope,
+        "created_from": "research.py t3-packet",
+        "checklist": checklist,
+        "g2": g2,
+        "qualification": qualification,
+        "forward_analysis": analysis,
+        "paper_result": paper,
+        "current_provenance": {
+            "strategy_config_version": state.strategy_fingerprint(cfg),
+            "code_version": state.code_fingerprint(),
+            "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+        },
+    }
+    packet_id = store.create_t3_packet(
+        args.variant, payload, reviewed_by=args.reviewed_by or "",
+        registry_change_ref=args.registry_change_ref or "")
+    packet = next(item for item in store.t3_packets_for(args.variant)
+                  if item["packet_id"] == packet_id)
+    print(f"T3 packet {packet_id}: {packet['review_status']}")
+    for name, passed in checklist.items():
+        print(f"  {'PASS' if passed else 'BLOCK'} {name}")
+    print("No registry tier or live configuration was changed.")
     return 0
 
 
@@ -467,8 +700,10 @@ def cmd_report(args: argparse.Namespace) -> int:
     """Regenerate every scorecard from the store, deterministically."""
     from agent import variants as variant_mod
 
+    cfg = _load_config()
     store = findings_mod.FindingsStore(
-        args.store or findings_mod.DEFAULT_STORE)
+        Path(args.store) if args.store else findings_mod.resolve_store_path(
+            (cfg.get("research") or {}).get("findings_store")))
     # Registered-but-unrun variants still get a card: "no sample yet" is a
     # state worth being able to see.
     for variant in variant_mod.load_registry(
@@ -606,6 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
     three.add_argument(
         "--prices", default=None,
         help="path to a 1m price cache; required to score any arm")
+    three.add_argument("--store", default=None,
+                       help="path to findings.db")
     three.set_defaults(func=cmd_three_arm)
 
     funnel = sub.add_parser(
@@ -634,6 +871,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="run an underpowered grid anyway, to record a null result")
     sweep_parser.set_defaults(func=cmd_sweep)
+
+    forward = sub.add_parser(
+        "forward-qualify",
+        help="select an edge from paired real-time shadow outcomes")
+    forward.add_argument("--strategy", default="momentum")
+    forward.add_argument("--scope", default=None,
+                         help="runtime/account scope; auto-detected if unique")
+    forward.add_argument("--store", default=None,
+                         help="findings.db path")
+    forward.set_defaults(func=cmd_forward_qualify)
+
+    t3 = sub.add_parser(
+        "t3-packet",
+        help="build a content-addressed reviewed T3 evidence packet")
+    t3.add_argument("--variant", required=True)
+    t3.add_argument("--scope", default=None,
+                    help="runtime/account scope; auto-detected if unique")
+    t3.add_argument("--store", default=None)
+    t3.add_argument("--db", default=None)
+    t3.add_argument("--mode", default="demo", choices=["demo", "live"])
+    t3.add_argument("--reviewed-by", default=None)
+    t3.add_argument("--registry-change-ref", default=None)
+    t3.set_defaults(func=cmd_t3_packet)
 
     report_parser = sub.add_parser(
         "report", help="regenerate the committed scorecards")

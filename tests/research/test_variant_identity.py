@@ -1,9 +1,7 @@
 """B0: variant identity, and the fingerprint that must not drift.
 
-Defect D4 in findings.md: the journal attributes results to a hash of the
-whole configuration, so editing an alert timeout forks the attribution bucket
-and splits a sample that is already too small to reject anything. The hash is
-also opaque - sixteen hex characters that say nothing about what differed.
+Defect D4 in findings.md: attribution must fork for every executable input,
+but not for alerts, persistence paths, or secrets that cannot affect an arm.
 
 Both halves are tested here. A variant has a readable name and a stated
 claim; the fingerprint that decides whether two runs may be pooled covers
@@ -20,30 +18,38 @@ from tests.helpers import valid_config
 class StrategyFingerprintTests(unittest.TestCase):
     """What may be pooled, and what may not."""
 
-    def test_irrelevant_edits_do_not_fork_attribution(self):
+    def test_non_executable_edits_do_not_fork_attribution(self):
         base = valid_config()
         before = state.strategy_fingerprint(base)
 
-        for path, value in (
-            (("alerts", "timeout_seconds"), 99),
-            (("llm", "max_tokens"), 4000),
-            (("llm", "model"), "some-other-model"),
-            (("universe", "refresh_minutes"), 30),
-        ):
+        for path, value in ((("alerts", "timeout_seconds"), 99),):
             cfg = valid_config()
             block, key = path
-            if block not in cfg or key not in cfg[block]:
-                continue                     # field absent in this schema
             cfg[block][key] = value
             self.assertEqual(
                 state.strategy_fingerprint(cfg), before,
                 f"{block}.{key} must not change the strategy fingerprint")
+        cfg = valid_config()
+        cfg["research"] = {
+            "shadow_enabled": True, "shadow_variants": [],
+            "shadow_budget_ms": 0,
+            "findings_store": "/secret/location/findings.db",
+        }
+        self.assertEqual(state.strategy_fingerprint(cfg), before)
 
-    def test_behaviour_changing_edits_do_fork_attribution(self):
+    def test_every_executable_input_forks_attribution(self):
         base = valid_config()
         before = state.strategy_fingerprint(base)
 
         for block, key, value in (
+            ("llm", "provider", "openai"),
+            ("llm", "model", "some-other-model"),
+            ("llm", "temperature", 0.7),
+            ("llm", "max_tokens", 4000),
+            ("universe", "top_n", 8),
+            ("universe", "refresh_minutes", 30),
+            ("cycle", "interval_seconds", 60),
+            ("cycle", "candles", 240),
             ("strategy", "fixed_reward_risk", 2.5),
             ("strategy", "min_stop_atr_multiple", 1.5),
             ("risk", "min_confidence", 0.5),
@@ -56,6 +62,26 @@ class StrategyFingerprintTests(unittest.TestCase):
             self.assertNotEqual(
                 state.strategy_fingerprint(cfg), before,
                 f"{block}.{key} must change the strategy fingerprint")
+        cfg = valid_config()
+        cfg["cycle"]["decision_interval_seconds"] = 900
+        self.assertNotEqual(state.strategy_fingerprint(cfg), before)
+
+    def test_persisted_material_is_allowlisted_and_secret_free(self):
+        cfg = valid_config()
+        cfg["alerts"]["webhook_url_env"] = "SUPER_SECRET_WEBHOOK"
+        cfg["llm"]["api_key"] = "DO_NOT_PERSIST"
+        cfg["research"] = {
+            "shadow_enabled": True, "shadow_variants": [],
+            "shadow_budget_ms": 0, "findings_store": "/private/store.db",
+        }
+
+        material = state.experiment_fingerprint_material(cfg)
+
+        self.assertNotIn("alerts", material)
+        self.assertNotIn("research", material)
+        self.assertNotIn("SUPER_SECRET_WEBHOOK", repr(material))
+        self.assertNotIn("DO_NOT_PERSIST", repr(material))
+        self.assertNotIn("/private/store.db", repr(material))
 
     def test_signal_timeframes_are_material(self):
         cfg = valid_config()

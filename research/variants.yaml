@@ -43,8 +43,18 @@ variants:
     overrides:
       strategy.fixed_reward_risk: 2.5
     hypothesis: >-
-      A 2.5R fixed target outperforms the default 2.0R because the default was
-      chosen by convention rather than measured.
+      A 2.5R fixed target improves hit rate against the shipped 3.0R target
+      without truncating enough of the right tail to lose expectancy.
+    status: candidate
+
+  - variant_id: momentum.rr.fixed_2_0
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.fixed_reward_risk: 2.0
+    hypothesis: >-
+      A 2.0R target converts more excursions into wins than the shipped 3.0R
+      target, and the higher hit rate outweighs the truncated right tail.
     status: candidate
 
   - variant_id: momentum.rr.fixed_3_0
@@ -53,13 +63,23 @@ variants:
     overrides:
       strategy.fixed_reward_risk: 3.0
     hypothesis: >-
-      A 3.0R target captures the tail that a 2R target truncates, and the tail
-      is where a momentum strategy's expectancy lives if it has any.
-    status: candidate
+      Historical identity for the 3.0R setting, now identical to the shipped
+      baseline and therefore not an independent experimental arm.
+    status: superseded
 
   # --- the noise floor ---------------------------------------------------
   # min_stop_atr_multiple sets how much ordinary movement counts as
   # invalidation, so it drives stop distance, position size and R together.
+  - variant_id: momentum.stop.atr_1_25
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      strategy.min_stop_atr_multiple: 1.25
+    hypothesis: >-
+      A modestly wider 1.25 ATR floor removes ordinary-noise stop-outs without
+      paying the full position-size and target-distance cost of a 1.5 ATR stop.
+    status: candidate
+
   - variant_id: momentum.stop.atr_1_5
     strategy_id: momentum
     base_version: phase1-v3
@@ -95,10 +115,29 @@ variants:
       independent trades.
     status: candidate
 
+  - variant_id: momentum.net_direction.80
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.max_net_direction_pct: 80
+    hypothesis: >-
+      An 80 percent net-direction cap removes the most correlated marginal
+      entry while retaining more independent opportunities than the 60 cap.
+    status: candidate
+
+  - variant_id: momentum.net_direction.120
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.max_net_direction_pct: 120
+    hypothesis: >-
+      A looser 120 percent cap reveals whether the shipped 100 percent ceiling
+      suppresses genuinely independent signals rather than correlated bets.
+    status: candidate
+
   # --- the confidence floor ----------------------------------------------
-  # H-F: the floor truncates the sample, so its own correctness is
-  # unobservable from live data. Replayable downward only, using the
-  # confidences the model actually recorded.
+  # H-F: every arm reuses the same recorded LLM proposal and confidence, so
+  # downward floors are observable in real time without another model call.
   - variant_id: momentum.conf.floor_0_50
     strategy_id: momentum
     base_version: phase1-v3
@@ -107,6 +146,26 @@ variants:
     hypothesis: >-
       The 0.65 floor rejects trades that are profitable in aggregate, which
       cannot be observed live because those trades are never taken.
+    status: candidate
+
+  - variant_id: momentum.conf.floor_0_55
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.55
+    hypothesis: >-
+      A 0.55 confidence floor recovers profitable lower-confidence trades while
+      filtering the weakest proposals admitted by the 0.50 setting.
+    status: candidate
+
+  - variant_id: momentum.conf.floor_0_60
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.60
+    hypothesis: >-
+      A 0.60 confidence floor improves sample size over 0.65 without admitting
+      enough weak proposals to erase the added observations' expectancy.
     status: candidate
 
   # --- batch 6.4: which variable separates breakout from continuation ------

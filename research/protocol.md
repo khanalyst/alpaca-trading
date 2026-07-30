@@ -14,7 +14,7 @@ it says the sample is too small.
 
 | Verdict | Meaning |
 | --- | --- |
-| `PROMOTE` | Every criterion below holds. Eligible for demo trading. |
+| `PROMOTE` | Every criterion below holds. Eligible for a fresh isolated local paper portfolio; not for live capital. |
 | `REJECT` | The whole axis underperforms, or the idea is structurally invalid. |
 | `CONTINUE` | Neither. Keep collecting; the question is open. |
 | `INSUFFICIENT_SAMPLE` | The sample cannot support any of the above. |
@@ -23,21 +23,32 @@ Every verdict names the single criterion that governed it. "Rejected" without
 "because the whole axis's upper bound sat below the baseline" is not a
 finding, it is an opinion with a timestamp.
 
-## Promotion — all five must hold
+## Promotion — every criterion must hold
 
-1. **≥ 100 matched round trips** on the best setting.
-2. **≥ 3 settings tested along the axis.** This is the rule that stops a good
-   idea being killed by one badly chosen parameter value.
-3. **Expectancy CI lower bound > the baseline's point estimate.** Not the
-   point estimates compared — the interval must clear the baseline outright.
-4. **Max drawdown ≤ the baseline's.** A better expectancy bought with a
+1. **At least three settings including the explicit baseline.** This is the
+   rule that stops a good idea being killed by one badly chosen value.
+2. **≥ 100 resolved proposal pairs** for the fit-selected setting and baseline.
+3. **≥ 80% pair coverage** of the proposal union, with no duplicate proposal
+   identities. Missing and unresolved proposals are reported, never dropped
+   silently.
+4. **The fit window contains ≥ 70 resolved pairs**, with ≥ 80% coverage, no
+   duplicate identities and the registered six-hour paired cluster/block
+   bootstrap. These are separate requirements from the full-sample floor.
+5. **The paired fit-window delta interval is entirely positive.** Point
+   estimates are not enough.
+6. **Max drawdown ≤ the baseline's.** A better expectancy bought with a
    deeper hole is not an improvement.
-5. **Survives the out-of-sample split.** Fit on the first 70% of the corpus
-   by time, confirm on the last 30%.
+7. **The setting survives the chronological 70/30 split.** One cutoff is
+   derived from the baseline proposal calendar and applied to every arm.
+   Selection occurs only before it; the later window cannot choose its winner.
+8. **The confirmation window contains ≥ 30 resolved pairs**, with ≥ 80%
+   coverage, no duplicate identities and the same registered dependence-aware
+   bootstrap.
+9. **The paired confirmation delta interval is entirely positive.**
 
 ## Rejection — either
 
-1. **≥ 3 settings tested, and every setting's CI upper bound is below the
+1. **≥ 3 settings including the baseline, and every alternative's CI upper bound is below the
    baseline's point estimate.** The whole axis has to be bad, not just the
    setting that happened to be tried first.
 2. **Structurally invalid on inspection.** No sample required. `findings.md`
@@ -45,6 +56,34 @@ finding, it is an opinion with a timestamp.
    finding row so the same idea does not return in three months.
 
 Everything else is `CONTINUE`.
+
+## Pairing and dependence
+
+Every local shadow/paper proposal has a stable identity derived from symbol,
+completed signal timestamp, direction and setup type. Variant names and wall
+clock are deliberately excluded, so the same market opportunity can be
+matched across parameter values after restarts.
+
+The store records one immutable action row for every arm and proposal, not
+only for proposals that opened a trade. An accepted action joins to its paper
+trade and inherits the resolved R multiple; a veto is paired as an explicit
+0R action. This is required for policy axes such as confidence floors,
+exposure caps and discriminators: the hypothesis is about the value of trades
+one arm admits while another suppresses. Treating that veto as a missing row
+would make those axes incapable of demonstrating an edge.
+
+Inference uses the return difference inside each exact pair. The bootstrap
+keeps observations together in six-hour market clusters and samples
+contiguous cluster blocks, preserving cross-symbol market episodes and
+short-run serial dependence. The output always carries paired count, proposal
+union count, coverage, left/right-only proposals, unresolved outcomes,
+duplicate identities and examples of mismatches.
+
+The minimums are fixed constants in `protocol.py`: 100 full pairs, 70 fit
+pairs, 30 confirmation pairs and 80% coverage in every relevant population.
+The natural 70/30 allocation of the 100-pair promotion floor therefore cannot
+be satisfied by accumulating nearly all evidence on only one side of the
+chronological cutoff.
 
 ## The out-of-sample split
 
@@ -100,3 +139,44 @@ Two things make that pressure survivable, and both are already built:
 
 A null result is a row in the findings store with the same weight as a
 positive one. A programme that records only what worked records only noise.
+
+## From edge to paper to reviewed evidence
+
+Every preregistered parameter value runs continuously in its own persisted
+`SHADOW` account. Every account advances on each available real-time snapshot,
+including pause/day-stop/cadence/LLM-failure paths. The cycle's one recorded
+LLM proposal set and confidences are reused by every arm; no extra LLM call is
+made. The shipped budget is unlimited (`0`). If an operator sets a positive
+budget, a durable least-observed-first scheduler skips only whole variants.
+Axes are grouped by their
+override path, so reward/risk, stop width, confidence, exposure and breakout
+classification can never be pooled into one winner search.
+
+Forward evidence starts only after every arm has the complete decision-ledger
+watermark. Schema migration 7 preserves legacy trades for audit but revokes
+qualifications based on the older executed-trades-only population, because
+historical vetoes cannot be reconstructed without inventing data.
+All arms use the same evidence window: the latest complete-ledger watermark
+through the earliest qualification or paper-start boundary. Decisions after
+that boundary cannot change the qualifying corpus. A recorded operational
+failure inside the window invalidates the analysis rather than becoming an
+unlabelled missing observation.
+
+`research.py forward-qualify` applies this protocol to prequalification
+real-time outcomes. It queries the exact decision-ledger rows, joins accepted
+actions to their resulting trades, enforces homogeneous strategy
+model/assumptions/provenance, embeds and hashes that source corpus,
+proves the baseline and candidate definitions describe one strategy version
+and exactly one declared axis, verifies all non-axis executable config is
+identical, and recomputes the protocol before qualification. Generic analysis
+insertion cannot create forward evidence. A winner becomes `PAPER_PENDING`
+while any
+shadow position is open, then starts a clean rebased `PAPER` account when flat. Shadow history
+stays stored but is excluded from paper-only metrics.
+
+Paper success does not edit the strategy registry. `research.py t3-packet`
+builds an immutable SHA-256-addressed packet containing current G2,
+configuration/code/corpus provenance, held-out forward evidence and the
+postqualification paper result. It remains `DRAFT_REVIEW_REQUIRED` unless the
+full checklist passes and a reviewer plus registry-change reference are
+supplied. Live authority is always a deliberate reviewed code change.

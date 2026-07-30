@@ -54,6 +54,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .forward_models import ForwardOutcomeModel, model_for
+
 
 # Ordered worst to best. A tier is a claim about evidence, so the ladder is
 # the same ladder research/tournament.py scores against.
@@ -108,6 +110,7 @@ class StrategySpec:
     # cost and holding model for this mechanism. Raw shadow signals may be
     # collected without it, but they must not be converted into expectancy.
     forward_model_ready: bool = False
+    forward_model_id: str = ""
     # Free-form note explaining a tier or an implementation gap.
     notes: str = ""
     evidence: tuple[str, ...] = field(default_factory=tuple)
@@ -136,6 +139,30 @@ class StrategySpec:
             if not text.strip():
                 raise ValueError(
                     f"strategy {self.id!r} must state a {label}")
+        # Ad-hoc specs used by tooling and tests may deliberately omit a
+        # forward model. Every entry in the authoritative REGISTRY binds one,
+        # and claiming readiness without that binding is always invalid.
+        if self.forward_model_id:
+            model = model_for(self.id)
+            if self.forward_model_id != model.model_id:
+                raise ValueError(
+                    f"strategy {self.id!r} must bind forward model "
+                    f"{model.model_id!r}")
+            if self.forward_model_ready != model.validated:
+                raise ValueError(
+                    f"strategy {self.id!r} forward_model_ready must reflect "
+                    f"the validation state of {model.model_id}")
+        elif self.forward_model_ready:
+            raise ValueError(
+                f"strategy {self.id!r} cannot be forward-model ready without "
+                "a forward_model_id")
+
+    @property
+    def forward_model(self) -> ForwardOutcomeModel:
+        if not self.forward_model_id:
+            raise ValueError(
+                f"strategy {self.id!r} has no forward outcome model")
+        return model_for(self.id)
 
     def tier_rank(self) -> int:
         return TIERS.index(self.tier)
@@ -199,6 +226,7 @@ REGISTRY: dict[str, StrategySpec] = {
             implemented=True,
             analyst_ready=True,
             forward_model_ready=True,
+            forward_model_id="momentum.fixed_rr.15m.v1",
             notes=(
                 "Runnable on demo as an operations rehearsal. Blocked from "
                 "live by LIVE_MIN_TIER, which is the intended behaviour. "
@@ -238,6 +266,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=24.0,
             execution_style="taker",
             setup_types=("flush_reversion",),
+            forward_model_id="flush_fade.reversion.15m.v1",
             implemented=True,
             contract_params={
                 "flush_min_move_atr": 1.5,
@@ -285,6 +314,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("carry",),
+            forward_model_id="funding_carry.interval.1h.v1",
             implemented=True,
             contract_params={
                 "funding_extreme_pct_per_8h": 0.01,
@@ -336,6 +366,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("positioning_unwind",),
+            forward_model_id="funding_unwind.reversion.1h.v1",
             implemented=True,
             contract_params={
                 "funding_extreme_pct_per_8h": 0.01,
@@ -371,6 +402,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=336.0,
             execution_style="taker",
             setup_types=("trend_follow",),
+            forward_model_id="trend_multiday.4h.v1",
             implemented=True,
             contract_params={
                 "trend_min_range_pos_pct": 55.0,
@@ -400,6 +432,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=72.0,
             execution_style="taker",
             setup_types=("positioning_fade",),
+            forward_model_id="ls_ratio_fade.1h.v1",
             implemented=True,
             contract_params={
                 "ls_high_percentile": 80.0,
@@ -432,6 +465,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=4.0,
             execution_style="maker",
             setup_types=("spread_capture",),
+            forward_model_id="scalp_maker.book.1m.v1",
             notes=(
                 "Hard-blocked on data, not on development. OKX never serves "
                 "historical order books, so fill quality cannot be simulated "

@@ -11,12 +11,15 @@ having the feature at all.
 """
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent import shadow, state, variants
 from agent.engine import Engine
 from agent.exchange import Exchange
+from research import findings
 from tests.helpers import valid_config
 from tests.research.test_enrichment_isolation import symbol_snapshot
 
@@ -39,6 +42,14 @@ def snapshot():
 def portfolio():
     return {"equity_usdt": 10_000.0, "positions": [], "cooldowns": {},
             "active_trades": {}, "gross_notional": 0.0}
+
+
+def proposal(confidence=0.8):
+    return {
+        "symbol": "BTC/USDT:USDT", "action": "open", "direction": "long",
+        "setup_type": "trend_continuation", "confidence": confidence,
+        "invalidation_anchor": "structure", "exit_policy": "fixed_rr",
+    }
 
 
 class TypeBoundaryTests(unittest.TestCase):
@@ -68,13 +79,14 @@ class TypeBoundaryTests(unittest.TestCase):
         import inspect
         parameters = set(
             inspect.signature(shadow.ShadowEvaluator.__init__).parameters)
-        self.assertEqual(parameters,
-                         {"self", "variants", "base_cfg", "budget_ms"})
+        self.assertNotIn("exchange", parameters)
 
     def test_evaluate_returns_records_and_touches_nothing(self):
         evaluator = shadow.ShadowEvaluator([variant()], valid_config())
 
-        records = evaluator.evaluate(snapshot(), portfolio(), 1_760_000_000.0)
+        records = evaluator.evaluate(
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertTrue(records)
         for record in records:
@@ -88,7 +100,9 @@ class TypeBoundaryTests(unittest.TestCase):
 
         with patch("agent.shadow.strategy.setup_evidence",
                    wraps=shadow.strategy.setup_evidence) as evidence:
-            evaluator.evaluate(snap, portfolio(), 1_760_000_000.0)
+            evaluator.evaluate(
+                snap, portfolio(), 1_760_000_000.0,
+                proposals=[proposal()])
 
         self.assertTrue(evidence.called)
 
@@ -107,20 +121,47 @@ class NoOpTests(unittest.TestCase):
             shadow.build(cfg, {"momentum.rr.fixed_2_5": variant()}))
 
     def test_an_empty_variant_list_builds_nothing(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         cfg = valid_config()
         cfg["research"] = {"shadow_enabled": True, "shadow_variants": []}
-        self.assertIsNone(shadow.build(cfg, {}))
+        with patch.object(
+                findings, "DEFAULT_STORE", Path(tmp.name) / "findings.db"):
+            self.assertIsNone(shadow.build(cfg, {}))
 
     def test_enabling_it_with_a_known_variant_builds_an_evaluator(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         cfg = valid_config()
         cfg["research"] = {"shadow_enabled": True,
                            "shadow_variants": ["momentum.rr.fixed_2_5"],
                            "shadow_budget_ms": 250}
         evaluator = shadow.build(
-            cfg, {"momentum.rr.fixed_2_5": variant()})
+            cfg, {"momentum.rr.fixed_2_5": variant()},
+            store=findings.FindingsStore(Path(tmp.name) / "findings.db"))
 
         self.assertIsNotNone(evaluator)
         self.assertEqual(evaluator.variant_ids, ["momentum.rr.fixed_2_5"])
+
+    def test_enabled_runtime_without_a_store_uses_the_durable_default(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        durable = Path(tmp.name) / "persistent" / "findings.db"
+        cfg = valid_config()
+        cfg["research"] = {
+            "shadow_enabled": True,
+            "shadow_variants": ["momentum.rr.fixed_2_5"],
+            "shadow_budget_ms": 0,
+        }
+
+        with patch.object(findings, "DEFAULT_STORE", durable):
+            evaluator = shadow.build(
+                cfg, {"momentum.rr.fixed_2_5": variant()})
+
+        self.assertIsNotNone(evaluator)
+        self.assertEqual(evaluator.store.path, durable)
+        self.assertIsNone(evaluator._temporary_store)
+        self.assertTrue(durable.exists())
 
 
 class ResilienceTests(unittest.TestCase):
@@ -141,7 +182,8 @@ class ResilienceTests(unittest.TestCase):
         with patch("agent.shadow.strategy.build_setup_plan",
                    side_effect=RuntimeError("boom")):
             records = evaluator.evaluate(
-                snapshot(), portfolio(), 1_760_000_000.0)
+                snapshot(), portfolio(), 1_760_000_000.0,
+                proposals=[proposal()])
 
         self.assertTrue(records)
         self.assertIn("shadow error", records[0].reason)
@@ -159,10 +201,28 @@ class BudgetTests(unittest.TestCase):
              for i in range(8)],
             valid_config(), budget_ms=0.0001)
 
-        records = evaluator.evaluate(snapshot(), portfolio(), 1.0)
+        records = evaluator.evaluate(
+            snapshot(), portfolio(), 1.0, proposals=[proposal()])
 
         self.assertTrue(evaluator.last_budget.overran)
         self.assertLess(len(records), 8)
+
+    def test_positive_budget_never_counts_a_partial_variant(self):
+        evaluator = shadow.ShadowEvaluator(
+            [variant(), variant("momentum.rr.fixed_3_0",
+                                overrides={"strategy.fixed_reward_risk": 3.0})],
+            valid_config(), budget_ms=1)
+
+        with patch.object(
+                shadow.ShadowBudget, "exhausted",
+                side_effect=[False, True]):
+            records = evaluator.evaluate(
+                snapshot(), portfolio(), 1.0,
+                proposals=[proposal(), proposal(confidence=0.9)])
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(len(evaluator.last_coverage["evaluated"]), 1)
+        self.assertEqual(len(evaluator.last_coverage["skipped"]), 1)
 
     def test_a_generous_budget_evaluates_everything(self):
         evaluator = shadow.ShadowEvaluator(
@@ -170,11 +230,72 @@ class BudgetTests(unittest.TestCase):
                                 overrides={"strategy.fixed_reward_risk": 3.0})],
             valid_config(), budget_ms=10_000)
 
-        records = evaluator.evaluate(snapshot(), portfolio(), 1.0)
+        records = evaluator.evaluate(
+            snapshot(), portfolio(), 1.0, proposals=[proposal()])
 
         self.assertFalse(evaluator.last_budget.overran)
         self.assertEqual({r.variant_id for r in records},
                          {"momentum.rr.fixed_2_5", "momentum.rr.fixed_3_0"})
+
+
+class RecordedProposalTests(unittest.TestCase):
+    def test_confidence_variants_use_the_recorded_model_confidence(self):
+        lower = variant(
+            "momentum.conf.floor_0_55", {"risk.min_confidence": 0.55})
+        baseline = variant("momentum.baseline", {})
+        evaluator = shadow.ShadowEvaluator(
+            [lower, baseline], valid_config(), budget_ms=0)
+
+        records = evaluator.evaluate(
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal(confidence=0.60)])
+        by_variant = {record.variant_id: record for record in records}
+
+        self.assertEqual(by_variant[lower.variant_id].outcome, "proposed")
+        self.assertEqual(by_variant[baseline.variant_id].outcome, "vetoed")
+        self.assertEqual(
+            by_variant[baseline.variant_id].reason,
+            "confidence below floor")
+        lower_decision = evaluator.store.paper_decisions_for(
+            evaluator.scope_key, lower.variant_id)[0]
+        baseline_decision = evaluator.store.paper_decisions_for(
+            evaluator.scope_key, baseline.variant_id)[0]
+        self.assertEqual(
+            lower_decision["proposal_id"], baseline_decision["proposal_id"])
+        self.assertEqual(lower_decision["decision_outcome"], "PROPOSED")
+        self.assertEqual(baseline_decision["decision_outcome"], "VETOED")
+        self.assertIsNotNone(lower_decision["paper_trade_id"])
+        self.assertIsNone(baseline_decision["paper_trade_id"])
+
+    def test_unlimited_budget_evaluates_every_variant(self):
+        evaluator = shadow.ShadowEvaluator(
+            [variant(f"momentum.v{i}",
+                     overrides={"strategy.fixed_reward_risk": 2.0})
+             for i in range(8)], valid_config(), budget_ms=0)
+
+        evaluator.evaluate(
+            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+
+        self.assertEqual(len(evaluator.last_coverage["evaluated"]), 8)
+
+    def test_overdue_position_closes_at_last_mark_when_symbol_disappears(self):
+        evaluator = shadow.ShadowEvaluator(
+            [variant()], valid_config(), budget_ms=0)
+        opened_at = 1_760_000_000.0
+        evaluator.evaluate(
+            snapshot(), portfolio(), opened_at, proposals=[proposal()])
+
+        self.assertEqual(evaluator.held_symbols(), ["BTC/USDT:USDT"])
+        evaluator.advance({}, now=opened_at + 48 * 3600 + 1)
+        state = evaluator.store.paper_portfolio_state(
+            evaluator.scope_key, variant().variant_id)
+        trades = evaluator.store.paper_trades_for(
+            evaluator.scope_key, variant().variant_id)
+
+        self.assertEqual(state["positions"], [])
+        self.assertEqual(trades[0]["status"], "CLOSED")
+        self.assertEqual(trades[0]["result"], "timeout")
+        self.assertEqual(trades[0]["exit_price"], trades[0]["entry_price"])
 
 
 class EngineHookTests(unittest.TestCase):
@@ -189,18 +310,23 @@ class EngineHookTests(unittest.TestCase):
     def test_records_are_journalled_as_variant_shadow_decisions(
             self, log_event):
         self.engine._run_shadow_variants(
-            snapshot(), 10_000.0, [], {}, 0.0)
+            snapshot(), 10_000.0, [], {}, 0.0,
+            decisions=[proposal()])
 
         kinds = [c.args[0] for c in log_event.call_args_list]
         self.assertTrue(kinds)
-        self.assertEqual(set(kinds), {"variant_shadow_decision"})
+        self.assertIn("variant_shadow_decision", kinds)
+        self.assertIn("shadow_coverage", kinds)
 
     @patch("agent.engine.state.log_event")
     def test_every_record_carries_its_own_variant_attribution(self, log_event):
         self.engine._run_shadow_variants(
-            snapshot(), 10_000.0, [], {}, 0.0)
+            snapshot(), 10_000.0, [], {}, 0.0,
+            decisions=[proposal()])
 
         for call in log_event.call_args_list:
+            if call.args[0] == "shadow_coverage":
+                continue
             self.assertEqual(call.kwargs.get("variant_id"),
                              "momentum.rr.fixed_2_5")
 
@@ -208,7 +334,8 @@ class EngineHookTests(unittest.TestCase):
     def test_shadow_never_writes_a_loop_key(self, log_event):
         """It cannot corrupt trading state even when it is wrong."""
         self.engine._run_shadow_variants(
-            snapshot(), 10_000.0, [], {}, 0.0)
+            snapshot(), 10_000.0, [], {}, 0.0,
+            decisions=[proposal()])
 
         for call in log_event.call_args_list:
             payload = call.args[1]
@@ -221,7 +348,9 @@ class EngineHookTests(unittest.TestCase):
         self.engine.shadow.evaluate.side_effect = RuntimeError("boom")
 
         # Must not raise: the cycle has already committed its decisions.
-        self.engine._run_shadow_variants(snapshot(), 10_000.0, [], {}, 0.0)
+        self.engine._run_shadow_variants(
+            snapshot(), 10_000.0, [], {}, 0.0,
+            decisions=[proposal()])
 
         kinds = [c.args[0] for c in log_event.call_args_list]
         self.assertIn("shadow_failed", kinds)
@@ -230,7 +359,9 @@ class EngineHookTests(unittest.TestCase):
     def test_no_evaluator_is_a_silent_no_op(self, log_event):
         self.engine.shadow = None
 
-        self.engine._run_shadow_variants(snapshot(), 10_000.0, [], {}, 0.0)
+        self.engine._run_shadow_variants(
+            snapshot(), 10_000.0, [], {}, 0.0,
+            decisions=[proposal()])
 
         log_event.assert_not_called()
 
@@ -240,7 +371,9 @@ class EngineHookTests(unittest.TestCase):
             [variant(f"momentum.v{i}") for i in range(6)],
             valid_config(), budget_ms=0.0001)
 
-        self.engine._run_shadow_variants(snapshot(), 10_000.0, [], {}, 0.0)
+        self.engine._run_shadow_variants(
+            snapshot(), 10_000.0, [], {}, 0.0,
+            decisions=[proposal()])
 
         kinds = [c.args[0] for c in log_event.call_args_list]
         self.assertIn("shadow_budget_overrun", kinds)
@@ -255,14 +388,13 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
-    def test_llm_variants_are_capped(self):
-        """Each entry costs a full extra model call every cycle."""
+    def test_removed_shadow_llm_variants_key_is_refused(self):
         from agent.config import ConfigError, validate_config
         cfg = valid_config()
         cfg["research"] = {
             "shadow_enabled": True, "shadow_budget_ms": 500,
             "shadow_variants": [],
-            "shadow_llm_variants": ["a", "b", "c"]}
+            "shadow_llm_variants": []}
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
@@ -274,7 +406,7 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
-    def test_the_shipped_config_is_a_no_op(self):
+    def test_the_shipped_config_enrolls_all_deterministic_variants(self):
         import yaml
         from agent.config import validate_config
         from pathlib import Path
@@ -282,8 +414,10 @@ class ConfigValidationTests(unittest.TestCase):
         cfg = validate_config(
             yaml.safe_load(Path("config.yaml").read_text()))
 
-        self.assertFalse(cfg["research"]["shadow_enabled"])
-        self.assertEqual(cfg["research"]["shadow_llm_variants"], [])
+        self.assertTrue(cfg["research"]["shadow_enabled"])
+        self.assertEqual(cfg["research"]["shadow_variants"], ["*"])
+        self.assertEqual(cfg["research"]["shadow_budget_ms"], 0)
+        self.assertNotIn("shadow_llm_variants", cfg["research"])
 
 
 if __name__ == "__main__":
@@ -301,7 +435,8 @@ class NonInterferenceTests(unittest.TestCase):
         snap = snapshot()
         before = json.dumps(snap, sort_keys=True, default=str)
 
-        evaluator.evaluate(snap, portfolio(), 1_760_000_000.0)
+        evaluator.evaluate(
+            snap, portfolio(), 1_760_000_000.0, proposals=[proposal()])
 
         self.assertEqual(
             json.dumps(snap, sort_keys=True, default=str), before)
@@ -311,7 +446,8 @@ class NonInterferenceTests(unittest.TestCase):
         book = portfolio()
         before = json.dumps(book, sort_keys=True, default=str)
 
-        evaluator.evaluate(snapshot(), book, 1_760_000_000.0)
+        evaluator.evaluate(
+            snapshot(), book, 1_760_000_000.0, proposals=[proposal()])
 
         self.assertEqual(
             json.dumps(book, sort_keys=True, default=str), before)
@@ -343,7 +479,8 @@ class NonInterferenceTests(unittest.TestCase):
         without = decide()
         shadow.ShadowEvaluator(
             [variant()], valid_config()).evaluate(
-                snap, portfolio(), 1_760_000_000.0)
+                snap, portfolio(), 1_760_000_000.0,
+                proposals=[proposal()])
         with_shadow = decide()
 
         self.assertEqual(without, with_shadow)
@@ -353,6 +490,6 @@ class NonInterferenceTests(unittest.TestCase):
         original = cfg["strategy"]["fixed_reward_risk"]
 
         shadow.ShadowEvaluator([variant()], cfg).evaluate(
-            snapshot(), portfolio(), 1.0)
+            snapshot(), portfolio(), 1.0, proposals=[proposal()])
 
         self.assertEqual(cfg["strategy"]["fixed_reward_risk"], original)

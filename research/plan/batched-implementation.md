@@ -68,10 +68,10 @@ class Variant:
 
 **0.3 Strategy-scoped config fingerprint** — `agent/state.py`
 
-Add `strategy_fingerprint(cfg)` covering **only** the blocks that change trading
-behaviour: `strategy`, `risk`, `execution`, `trading_costs`, and
-`cycle.timeframes`. Leave the existing whole-config `config_version` in place
-(don't break existing rows); add the new value as a separate field.
+Add `strategy_fingerprint(cfg)` as the compatibility name for a secret-free
+executable experiment fingerprint covering mode, LLM provider/model/settings,
+universe selection, the full cycle/cadence block, strategy, risk, execution and
+trading costs. Leave the existing whole-config `config_version` in place.
 
 **0.4 Journal schema additions** — `agent/state.py`
 
@@ -85,8 +85,8 @@ Live trading writes `variant_id = "live"`.
 - [ ] `state.configure_runtime(tmpdir)` fully redirects state, PID, lock and DB.
 - [ ] `tests/test_state.py` no longer reassigns module globals by hand and still passes.
 - [ ] `apply()` on an override that violates config bounds raises `ConfigError`.
-- [ ] `strategy_fingerprint` is **unchanged** by edits to `alerts.timeout_seconds`
-      or `llm.max_tokens`, and **changes** on `strategy.fixed_reward_risk`.
+- [ ] `strategy_fingerprint` is unchanged by alerts/research-store edits and
+      changes on LLM, universe, cadence, strategy, risk or execution edits.
 - [ ] An existing `journal.db` migrates in place with no row loss (extend
       `test_legacy_journal_is_migrated_in_place_without_losing_rows`).
 - [ ] Full existing suite: 170 passed, 1 skipped.
@@ -481,37 +481,54 @@ continuously, without trading.
 
 ```python
 class ShadowEvaluator:
-    """Evaluates variants against a live snapshot. Cannot trade, by construction."""
-    def __init__(self, variants: list[Variant], base_cfg: dict) -> None: ...
-    def evaluate(self, snapshot: dict, portfolio: dict,
-                 now: float) -> list[dict]: ...
+    """Advances isolated portfolios and evaluates recorded cycle proposals."""
+    def __init__(self, variants: list[Variant], base_cfg: dict,
+                 findings: FindingsStore) -> None: ...
+    def advance(self, snapshot: dict, now: float) -> list[dict]: ...
+    def evaluate(self, snapshot: dict, portfolio: dict, now: float,
+                 proposals: list[dict]) -> list[dict]: ...
 ```
 
-It receives **no `Exchange` instance and no state handle.** It takes dicts and
-returns records. The isolation is a type boundary, not a discipline, and a test
-asserts it.
+It receives **no `Exchange` instance and no live-trading state handle.** Its
+only persistence dependency is the research findings store, where each variant
+has a separate content-bound portfolio. The isolation is a type boundary, not
+a discipline, and a test asserts it.
 
-**7.2 Hook** — `agent/engine.py`, at the end of `cycle()` after `state.commit(st)`
+**7.2 Hooks** — `agent/engine.py`
 
 ```python
-self._run_shadow_variants(snapshot, portfolio, now)
+self._advance_shadow_variants(snapshot, now)
+self._run_shadow_variants(snapshot, portfolio, now,
+                          decisions=decisions, advance_accounts=False)
 ```
 
 Non-negotiable properties, each individually tested:
 
-- Runs **after** all trading decisions are committed — it can never affect them.
+- Every shipped variant advances on each available common real-time snapshot,
+  before pause, cadence, day-stop, LLM-failure, and execution early returns.
+- Evaluation reuses the cycle's already-recorded LLM proposals and confidence;
+  it never makes an extra LLM call.
 - Wrapped in `try/except Exception`; a shadow failure is journalled and swallowed.
-- Enforces a wall-clock budget (`research.shadow_budget_ms`); overrun abandons
-  the remaining variants for that cycle and journals the overrun.
-- Writes only `shadow_decision` events. It never touches `LOOP_KEYS`
-  (`state.py:394-398`) and therefore cannot corrupt trading state.
+- `research.shadow_budget_ms: 0` is unlimited. A positive budget is checked only
+  between variants, so an evaluated variant always receives the complete proposal
+  set; remaining whole variants are prioritized next cycle.
+- It never touches live-trading `LOOP_KEYS` and therefore cannot corrupt trading
+  state.
 
-**7.3 Deterministic variants only, by default**
+**7.3 Common proposals, variant-specific decisions**
 
-An LLM-driven variant costs a full extra call per cycle — 288/day, ~$50–95/month
-**each**. Ten LLM variants is ~$500–950/month. Deterministic variants (every
-parameter axis in batch 4) cost approximately nothing and cover intention #4
-completely. LLM/prompt variants are opt-in, individually budgeted, and rare.
+All variants consume the same LLM proposal stream, including the proposal's
+recorded confidence. Each arm independently recomputes deterministic setup,
+risk, sizing, and exit behavior under its own overrides. This makes confidence
+floors active without paying for divergent or untracked LLM calls. Prompt/model
+experiments require a new, explicit variant identity and provenance instead of a
+second hidden configuration path.
+
+Every arm persists the accept/veto action atomically with its portfolio and any
+opened trade. Paired inference assigns an explicit 0R to a veto and the resolved
+trade R to an acceptance. Without this complete action ledger, policy axes would
+compare only the trades both arms accepted and could never measure the edge in
+incremental proposals admitted by confidence, exposure, or discriminator rules.
 
 **7.4 Config** — `agent/config.py`
 
@@ -522,25 +539,27 @@ style (`_keys`, `_number`, `_boolean`):
 research:
   shadow_enabled: true
   shadow_variants: ["momentum.rr.fixed_2_5", "momentum.conf.floor_0_50"]
-  shadow_budget_ms: 500
-  shadow_llm_variants: []      # each entry costs a full extra LLM call per cycle
+  shadow_budget_ms: 0          # unlimited; positive values skip only whole variants
 ```
 
 **7.5 Scoring closes the loop**
 
-`shadow_decision` events feed the batch-2 resolver and batch-4 scorer exactly
-like replayed decisions, so shadow variants accumulate a live-data track record
-continuously. **This is intention #3, fully satisfied:** the parallel hypotheses
-learn from the same live market data and the same demo-trade outcomes as the
-main agent, because they are literally reading the same snapshot in the same
-cycle.
+Isolated shadow portfolios feed the batch-4 scorer, so variants accumulate a
+live-data track record continuously. Each portfolio is bound to immutable
+strategy/config/code/model provenance; changed experiment identity must use a
+new variant id and cannot silently inherit old evidence. **This is intention #3,
+fully satisfied:** the parallel hypotheses learn from the same proposal stream
+and the same real-time snapshots while retaining independent outcomes. Legacy
+executed-trades-only evidence remains auditable but cannot qualify an edge after
+schema migration 7, because its missing historical vetoes are unknowable.
 
 ### Acceptance criteria
 
 - [ ] `ShadowEvaluator` has no attribute reachable to an `Exchange` (asserted).
 - [ ] A variant that raises does not fail the cycle; the trading decisions of
       that cycle are byte-identical with and without shadow enabled.
-- [ ] Budget overrun is enforced and journalled.
+- [ ] Zero budget evaluates every variant; positive budget skips only complete
+      variants and rotates skipped variants forward next cycle.
 - [ ] Shadow never writes any key in `state.LOOP_KEYS`.
 - [ ] `shadow_enabled: false` (or an absent `research:` block) is a complete no-op.
 - [ ] Shadow decisions score through the same pipeline as replayed ones.
@@ -612,8 +631,9 @@ A variant may be **promoted** to demo trading only when all hold:
    rule that stops a good idea being killed by one bad value).
 3. Expectancy CI lower bound > baseline's point estimate.
 4. Max synthetic drawdown ≤ baseline's.
-5. Survives an out-of-sample split: fit on the first 70% of the corpus, confirm
-   on the last 30%.
+5. Survives one common chronological split with at least 70 valid paired fit
+   observations and 30 valid paired confirmation observations; each window
+   independently clears coverage, duplicate and dependence checks.
 
 A variant may be **rejected** only when:
 

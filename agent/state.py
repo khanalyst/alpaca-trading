@@ -156,6 +156,10 @@ DEFAULT = {
     # continuous equity segment. Reports never bridge returns across segments.
     "equity_basis_id": None,
     "last_ledger_ts": 0,
+    # Stable OKX ledger identifiers already applied to equity benchmarks.
+    "processed_transfer_ids": {},
+    # Unidentified ledger entries are never presented as exactly deduplicated.
+    "transfer_reconciliation_required": {},
     "cooldowns": {},   # symbol -> unix ts until which no new entries are allowed
     # Recent execution feedback. The LLM may reason about one smaller retry;
     # repeated depth failures acquire a deterministic temporary backoff.
@@ -200,7 +204,8 @@ def _validate(data: object) -> dict:
         raise ValueError(
             "state runtime mode and account fingerprint must be bound together")
     for key in ("cooldowns", "entry_feedback", "entry_failures", "opened_at",
-                "active_trades", "protection", "recent_setups"):
+                "active_trades", "protection", "recent_setups",
+                "processed_transfer_ids", "transfer_reconciliation_required"):
         if not isinstance(merged.get(key), dict):
             raise ValueError(f"state.{key} is not an object")
     for key in ("high_water_mark", "day_start_equity"):
@@ -214,6 +219,17 @@ def _validate(data: object) -> dict:
     if (isinstance(ledger, bool) or not isinstance(ledger, (int, float))
             or not math.isfinite(float(ledger)) or float(ledger) < 0):
         raise ValueError("state.last_ledger_ts is invalid")
+    for transfer_id, timestamp in merged["processed_transfer_ids"].items():
+        if (not isinstance(transfer_id, str) or not transfer_id
+                or len(transfer_id) > 200 or isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(float(timestamp)) or float(timestamp) < 0):
+            raise ValueError("state.processed_transfer_ids contains invalid data")
+    for key, record in merged["transfer_reconciliation_required"].items():
+        if (not isinstance(key, str) or not key or len(key) > 240
+                or not isinstance(record, dict)):
+            raise ValueError(
+                "state.transfer_reconciliation_required contains invalid data")
     day = merged.get("day")
     if day is not None and (not isinstance(day, str) or len(day) != 10):
         raise ValueError("state.day is invalid")
@@ -588,7 +604,8 @@ def bind_runtime_identity(mode: str, api_key: str) -> str:
 # state change (pause/kill) the CLI may have written while a cycle was running.
 LOOP_KEYS = ("high_water_mark", "day", "day_start_equity", "equity_basis",
              "equity_basis_id",
-             "last_ledger_ts", "cooldowns", "entry_feedback",
+             "last_ledger_ts", "processed_transfer_ids",
+             "transfer_reconciliation_required", "cooldowns", "entry_feedback",
              "entry_failures", "opened_at", "active_trades", "protection",
              "recent_setups")
 
@@ -711,35 +728,63 @@ def stable_fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-# The only configuration blocks that can change a trading decision. Anything
-# outside this set may be edited freely without splitting the corpus.
-STRATEGY_FINGERPRINT_BLOCKS = (
-    "strategy", "risk", "execution", "trading_costs",
+# Explicit allow-list of configuration that can change proposal generation,
+# market eligibility, evaluation, sizing, execution, or outcome accounting.
+# Secrets are environment variables and never appear here; alerts and research
+# storage/scheduling settings cannot change an individual arm's decision.
+EXPERIMENT_FINGERPRINT_BLOCKS = (
+    "llm", "strategy", "universe", "cycle", "risk", "execution",
+    "trading_costs",
 )
+SENSITIVE_CONFIG_KEYS = {
+    "api_key", "apikey", "secret", "client_secret", "password",
+    "credential", "credentials", "access_token", "refresh_token",
+    "webhook_url",
+}
+
+
+def _secret_free_config(value):
+    if isinstance(value, dict):
+        return {
+            key: _secret_free_config(item)
+            for key, item in value.items()
+            if str(key).lower() not in SENSITIVE_CONFIG_KEYS
+        }
+    if isinstance(value, list):
+        return [_secret_free_config(item) for item in value]
+    return deepcopy(value)
+
+
+def experiment_fingerprint_material(cfg: dict) -> dict:
+    """Return the secret-free executable inputs that define an experiment."""
+    return _secret_free_config({
+        "mode": cfg.get("mode"),
+        **{block: cfg.get(block) for block in EXPERIMENT_FINGERPRINT_BLOCKS},
+    })
+
+
+def experiment_fingerprint(cfg: dict) -> str:
+    """Fingerprint every configured input that can change an experiment."""
+    return stable_fingerprint(experiment_fingerprint_material(cfg))
 
 
 def strategy_fingerprint(cfg: dict) -> str:
-    """Fingerprint only what changes behaviour, so attribution survives edits.
+    """Compatibility name for the executable experiment fingerprint.
 
     ``stable_fingerprint`` hashes the whole config, which means raising
-    ``alerts.timeout_seconds`` or ``llm.max_tokens`` forks the attribution
-    bucket and fragments a sample that is already small - silently, because
-    the resulting identifier is a 16-hex string that says nothing about what
-    differed.
+    ``alerts.timeout_seconds`` or changing the findings-store path forks the
+    attribution bucket even though neither can alter an arm's decisions.
 
-    This narrower hash covers the strategy, risk, execution and cost blocks
-    plus ``cycle.timeframes``, which decides what the contract can see. Two
-    runs that agree here produced decisions from the same rules and their
-    results may be pooled. Two that disagree may not.
+    This allow-listed hash covers mode, LLM provider/model/sampling settings,
+    universe selection, the full cycle/cadence input, strategy, risk,
+    execution, costs and timeframes. Two runs may be pooled only when every
+    executable input agrees. API keys and alert credentials are environment
+    data and are never included or persisted.
 
     The whole-config ``config_version`` is still written alongside it. This
     is an addition, not a replacement: existing rows keep their meaning.
     """
-    material = {
-        block: cfg.get(block) for block in STRATEGY_FINGERPRINT_BLOCKS
-    }
-    material["cycle.timeframes"] = (cfg.get("cycle") or {}).get("timeframes")
-    return stable_fingerprint(material)
+    return experiment_fingerprint(cfg)
 
 
 def code_fingerprint() -> str:

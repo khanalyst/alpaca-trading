@@ -407,18 +407,33 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError("alerts.minimum_level must be warning, error, or critical")
     _number(alerts, "timeout_seconds", 1, 30, "alerts")
 
-    # Optional. Absent means shadow evaluation is off, which is a complete
-    # no-op rather than a default-on feature - a research block that had to
-    # be explicitly disabled would eventually be left on by accident.
+    # Optional. Absent means shadow evaluation is off. The shipped config
+    # explicitly enables isolated variants; custom deployments can omit
+    # the block for a complete no-op.
     research = cfg.get("research")
     if research is not None:
         research = _mapping(research, "research")
         _keys(research, {"shadow_enabled", "shadow_variants",
-                         "shadow_budget_ms", "shadow_llm_variants"},
+                         "shadow_budget_ms",
+                         "findings_store", "paper_initial_balance_usdt",
+                         "paper_max_failures", "paper_min_closed_trades"},
               "research")
         _boolean(research, "shadow_enabled", "research")
-        _number(research, "shadow_budget_ms", 1, 60_000, "research")
-        for key in ("shadow_variants", "shadow_llm_variants"):
+        _number(research, "shadow_budget_ms", 0, 60_000, "research")
+        if "paper_initial_balance_usdt" in research:
+            _number(research, "paper_initial_balance_usdt", 100,
+                    1_000_000_000, "research")
+        if "paper_max_failures" in research:
+            _integer(research, "paper_max_failures", 1, 1_000, "research")
+        if "paper_min_closed_trades" in research:
+            _integer(research, "paper_min_closed_trades", 1, 100_000,
+                     "research")
+        findings_store = research.get("findings_store")
+        if findings_store is not None and (
+                not isinstance(findings_store, str)
+                or not findings_store.strip()):
+            raise ConfigError("research.findings_store must be a path string")
+        for key in ("shadow_variants",):
             names = research.get(key)
             if names is None:
                 research[key] = []
@@ -427,14 +442,6 @@ def validate_config(raw: dict) -> dict:
                     isinstance(n, str) and n.strip() for n in names):
                 raise ConfigError(
                     f"research.{key} must be a list of variant id strings")
-        # Each LLM variant costs a full extra model call every cycle - about
-        # 288 a day. Ten of them is an order of magnitude more than the
-        # agent's entire current spend, so the ceiling is deliberately low
-        # and has to be raised on purpose.
-        if len(research["shadow_llm_variants"]) > 2:
-            raise ConfigError(
-                "research.shadow_llm_variants is capped at 2: each entry "
-                "costs a full extra LLM call per cycle")
         cfg["research"] = research
 
     return cfg

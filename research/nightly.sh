@@ -31,6 +31,7 @@ fi
 
 PRICES="${PRICE_CACHE:-$ROOT/research/cache/prices.db}"
 JOURNAL="${JOURNAL_DB:-$ROOT/runtime/$MODE/journal.db}"
+STORE="${FINDINGS_DB:-$ROOT/research/cache/findings.db}"
 
 # ---------------------------------------------------------------------------
 # Authoritative path: journal replay.
@@ -84,6 +85,10 @@ if [ -f "$JOURNAL" ]; then
 
   echo "=== $(date -u +%FT%TZ) three-arm H-E ==="
   "$PY" research.py three-arm --db "$JOURNAL" --prices "$PRICES" || true
+
+  echo "=== $(date -u +%FT%TZ) paired real-time variant qualification ==="
+  "$PY" research.py forward-qualify --store "$STORE" \
+    || echo "  (collecting, unscoped, or no promotable edge; see above)"
 
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
   "$PY" research.py report

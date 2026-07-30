@@ -102,6 +102,47 @@ class SplitTests(unittest.TestCase):
         self.assertTrue(fit)
         self.assertTrue(confirm)
 
+    def test_every_arm_uses_the_baseline_calendar_cutoff(self):
+        baseline = series([0.0] * 10, start=100)
+        dense = series([1.0] * 20, start=95)
+        sparse = series([1.0] * 4, start=104)
+
+        cutoff = protocol.common_time_cutoff([baseline])
+        dense_fit, dense_confirm = protocol.split_at_time(dense, cutoff)
+        sparse_fit, sparse_confirm = protocol.split_at_time(sparse, cutoff)
+
+        self.assertEqual(cutoff, 107.0)
+        self.assertTrue(all(item.ts < cutoff
+                            for item in dense_fit + sparse_fit))
+        self.assertTrue(all(item.ts >= cutoff
+                            for item in dense_confirm + sparse_confirm))
+
+
+class PersistedDecisionTests(unittest.TestCase):
+    def test_a_persisted_veto_is_a_paired_zero_return_action(self):
+        common = {
+            "proposal_id": "same-proposal", "cycle_id": "cycle-1",
+            "decision_ts": 100.0, "symbol": "BTC/USDT:USDT",
+            "signal_ts": 99, "direction": "long",
+            "setup_type": "trend_continuation",
+        }
+        veto = protocol.paper_trade_decisions([{
+            **common, "decision_outcome": "VETOED",
+            "trade_status": None, "trade_r_multiple": None,
+            "trade_result": None,
+        }])
+        accepted = protocol.paper_trade_decisions([{
+            **common, "decision_outcome": "PROPOSED",
+            "trade_status": "CLOSED", "trade_r_multiple": 1.25,
+            "trade_result": "target",
+        }])
+
+        comparison = protocol.paired_arm_comparison(accepted, veto)
+
+        self.assertEqual(veto[0].outcome["r_multiple"], 0.0)
+        self.assertEqual(comparison["paired_n"], 1)
+        self.assertEqual(comparison["interval"].point, 1.25)
+
 
 class OutOfSampleTests(unittest.TestCase):
     def test_a_consistent_variant_survives(self):
@@ -200,11 +241,16 @@ class PromotionTests(unittest.TestCase):
         self.assertIn("promotion floor", verdict.governing_criterion)
         self.assertIn("MDE", verdict.detail)
 
-    def test_two_settings_is_not_an_axis(self):
+    def test_two_candidates_plus_the_baseline_are_an_axis(self):
         baseline = flat(120)
         settings = [(f"v{i}", strong(120)) for i in range(2)]
 
         verdict = protocol.evaluate_axis(settings, baseline)
+
+        self.assertEqual(verdict.verdict, protocol.PROMOTE)
+
+    def test_one_candidate_plus_the_baseline_is_not_an_axis(self):
+        verdict = protocol.evaluate_axis([("v0", strong(120))], flat(120))
 
         self.assertEqual(verdict.verdict, protocol.CONTINUE)
         self.assertIn("too few settings", verdict.governing_criterion)
@@ -236,7 +282,8 @@ class PromotionTests(unittest.TestCase):
 
         verdict = protocol.evaluate_axis(settings, baseline)
 
-        self.assertEqual(verdict.verdict, protocol.CONTINUE)
+        self.assertEqual(verdict.verdict, stats.INSUFFICIENT_SAMPLE)
+        self.assertIn("paired proposal coverage", verdict.governing_criterion)
 
     def test_confirmation_window_cannot_select_its_own_winner(self):
         baseline = flat(200)
@@ -252,7 +299,7 @@ class PromotionTests(unittest.TestCase):
 
         verdict = protocol.evaluate_axis(settings, baseline)
 
-        self.assertEqual(verdict.verdict, protocol.CONTINUE)
+        self.assertEqual(verdict.verdict, stats.INSUFFICIENT_SAMPLE)
         self.assertEqual(verdict.evidence["best"], "fit-winner")
 
     def test_a_variant_meeting_every_criterion_promotes(self):
@@ -264,6 +311,53 @@ class PromotionTests(unittest.TestCase):
 
         self.assertEqual(verdict.verdict, protocol.PROMOTE)
         self.assertIn("round trips", verdict.detail)
+        self.assertTrue(all(verdict.evidence["criteria"].values()))
+        self.assertGreater(verdict.evidence["fit_interval"]["low"], 0)
+        self.assertGreater(
+            verdict.evidence["confirmation_interval"]["low"], 0)
+
+    def test_sparse_fit_window_cannot_borrow_from_confirmation(self):
+        baseline = series([
+            -0.2 if index % 2 else 0.1 for index in range(130)])
+        winner = [decision(1.0, ts=index)
+                  for index in [*range(69), *range(91, 130)]]
+
+        verdict = protocol.evaluate_axis(
+            [("winner", winner), ("control", list(winner))], baseline)
+
+        self.assertEqual(verdict.verdict, stats.INSUFFICIENT_SAMPLE)
+        self.assertIn("fit-window paired", verdict.governing_criterion)
+        self.assertEqual(verdict.evidence["fit_paired"]["paired_n"], 69)
+
+    def test_sparse_confirmation_cannot_pass_on_a_large_fit_sample(self):
+        baseline = series([
+            -0.2 if index % 2 else 0.1 for index in range(130)])
+        winner = [decision(1.0, ts=index)
+                  for index in range(120)]
+
+        verdict = protocol.evaluate_axis(
+            [("winner", winner), ("control", list(winner))], baseline)
+
+        self.assertEqual(verdict.verdict, stats.INSUFFICIENT_SAMPLE)
+        self.assertIn("confirmation-window paired",
+                      verdict.governing_criterion)
+        self.assertEqual(
+            verdict.evidence["confirmation_paired"]["paired_n"], 29)
+
+    def test_each_window_requires_clean_dependence_aware_pairs(self):
+        left = series([1.0] * 70)
+        right = series([0.0] * 70)
+        duplicate = decision(1.0, ts=0)
+        duplicate.cycle_id = left[0].cycle_id
+        comparison = protocol.paired_arm_comparison(
+            left + [duplicate], right)
+
+        self.assertFalse(protocol.paired_window_adequate(
+            comparison, protocol.MIN_PAIRED_FIT_OBSERVATIONS))
+        clean = protocol.paired_arm_comparison(left, right)
+        clean["bootstrap"]["cluster_seconds"] = 1
+        self.assertFalse(protocol.paired_window_adequate(
+            clean, protocol.MIN_PAIRED_FIT_OBSERVATIONS))
 
     def test_no_baseline_is_insufficient_not_a_promotion(self):
         verdict = protocol.evaluate_axis(

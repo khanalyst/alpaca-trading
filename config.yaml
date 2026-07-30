@@ -227,18 +227,31 @@ alerts:
   minimum_level: error            # warning | error | critical
   timeout_seconds: 5
 
-# Shadow evaluation. Absent or disabled is a complete no-op.
+# Shadow evaluation. The shipped configuration enrolls every active
+# deterministic parameter variant so learning starts with the agent.
 #
-# Deterministic variants only by default. Each LLM variant would cost a full
-# extra model call every cycle - roughly 288 a day - so shadow_llm_variants
-# is capped at 2 by config validation and starts empty. Every parameter axis
-# worth testing is deterministic and costs approximately nothing.
+# Every variant reuses the cycle's one recorded LLM proposal set and its exact
+# confidences. No variant makes an extra model call. The variant contract,
+# risk limits, sizing and forward account are then evaluated independently.
 #
-# shadow_variants names entries in research/variants.yaml. Nothing here can
-# place an order: the evaluator is constructed from configuration alone and
-# has no exchange to reach.
+# shadow_variants names entries in research/variants.yaml. Use ["*"] to enroll
+# every candidate/testing variant plus each strategy baseline. A durable
+# least-observed-first scheduler prevents a custom positive wall-clock budget
+# from starving later entries. Zero disables the budget so every shipped
+# variant receives every complete proposal set. Each variant has its own cash,
+# positions, exposure,
+# cooldowns and circuit breakers. Nothing here can place an order: the
+# evaluator has no exchange to reach.
+#
+# A parameter edge that passes paired real-time forward qualification starts a
+# fresh isolated PAPER stage when flat; prequalification SHADOW trades remain
+# stored but are excluded from paper-only metrics. T3/live authority still
+# requires a reviewed content-addressed evidence packet and a code review.
 research:
-  shadow_enabled: false
-  shadow_variants: []
-  shadow_budget_ms: 500
-  shadow_llm_variants: []
+  shadow_enabled: true
+  shadow_variants: ["*"]
+  shadow_budget_ms: 0
+  findings_store: research/cache/findings.db
+  paper_initial_balance_usdt: 10000
+  paper_max_failures: 3
+  paper_min_closed_trades: 100

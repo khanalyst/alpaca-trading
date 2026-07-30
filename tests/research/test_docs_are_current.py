@@ -26,6 +26,7 @@ SETUP = (REPO / "SETUP.md").read_text(encoding="utf-8")
 AZURE = (REPO / "AZURE_DEPLOYMENT.md").read_text(encoding="utf-8")
 BOTH = README + SETUP
 ALL_DOCS = README + SETUP + AZURE
+PROTOCOL = (REPO / "research" / "protocol.md").read_text(encoding="utf-8")
 
 
 class ReferencedPathsExistTests(unittest.TestCase):
@@ -94,12 +95,58 @@ class ConfigKeysAreDocumentedTests(unittest.TestCase):
     def test_new_config_keys_are_documented(self):
         for key in ("decision_interval_seconds", "maker_first_enabled",
                     "maker_first_wait_seconds", "shadow_enabled",
-                    "shadow_variants", "shadow_budget_ms",
-                    "shadow_llm_variants"):
+                    "shadow_variants", "shadow_budget_ms"):
             self.assertIn(key, BOTH, f"{key} is undocumented")
 
     def test_the_research_block_is_documented(self):
         self.assertIn("research:", README)
+
+    def test_shipped_llm_defaults_are_documented(self):
+        raw = yaml.safe_load((REPO / "config.yaml").read_text())
+        for doc, name in ((README, "README"), (SETUP, "SETUP")):
+            self.assertIn(raw["llm"]["provider"], doc,
+                          f"{name} omits the shipped LLM provider")
+            self.assertIn(raw["llm"]["model"], doc,
+                          f"{name} omits the shipped LLM model")
+
+    def test_cost_guidance_does_not_slow_safety_housekeeping(self):
+        self.assertNotIn("cycle.interval_seconds: 600", BOTH)
+        for doc, name in ((README, "README"), (SETUP, "SETUP")):
+            self.assertIn("cycle.decision_interval_seconds", doc,
+                          f"{name} omits the safe decision-cadence lever")
+
+    def test_removed_shadow_llm_setting_is_not_documented(self):
+        self.assertNotIn("shadow_llm_variants", BOTH)
+        self.assertNotIn(
+            "shadow_llm_variants",
+            (REPO / "research" / "plan" / "batched-implementation.md").read_text())
+
+
+class ResearchProtocolDocumentationTests(unittest.TestCase):
+    def test_held_out_pair_minimums_are_documented(self):
+        for phrase in ("100 full pairs", "70 fit", "30 confirmation",
+                       "80% coverage"):
+            self.assertIn(phrase, PROTOCOL)
+
+    def test_executable_fingerprint_scope_is_documented(self):
+        for phrase in ("LLM provider", "universe selection",
+                       "decision cadence", "credentials are excluded"):
+            self.assertIn(phrase, README)
+
+    def test_store_default_and_axis_proof_are_documented(self):
+        self.assertIn("never\nfalls back to a temporary database", README)
+        self.assertIn("non-axis executable", README)
+
+    def test_policy_vetoes_and_legacy_watermark_are_documented(self):
+        for phrase in ("immutable decision ledger", "zero-return action",
+                       "Schema migration 7"):
+            self.assertIn(phrase, README)
+        self.assertIn("explicit\n0R action", PROTOCOL)
+
+    def test_common_forward_window_and_schema_7_migration_are_documented(self):
+        for phrase in ("v6→v7 migration", "operational", "PAPER"):
+            self.assertIn(phrase, README)
+        self.assertIn("decision-ledger rows", PROTOCOL)
 
 
 class VersionClaimsTests(unittest.TestCase):
