@@ -47,7 +47,44 @@ reward_risk: 2.0
 max_hold_bars: 96          # 24 hours
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-hypotheses_tested: 1
+# --- the parameterisations that will be tested -----------------------------
+# Registered 2026-07-30, after the first verdict and stated as such. The
+# original test scored ONE point - the values above - and the register turned
+# that into T0_REJECTED while its own note said "the mechanism remains
+# plausible; this parameterisation of it does not survive". These three settings
+# exist so the next verdict is about the mechanism.
+#
+# Both alternatives are chosen from the mechanism, not from the result: if
+# forced liquidation is what pays, the effect must be stronger where the
+# forcing is more violent, and it must not require a threshold so strict that
+# nothing qualifies. Those are opposite failure directions, which is the point
+# of testing both.
+
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The originally pre-registered thresholds, kept as the comparison point so
+      the earlier -0.288% result stays reproducible.
+  - id: violent_only
+    params:
+      min_move_atr: 2.5
+      min_oi_drop_pct: 2.0
+    claim: >-
+      If price-insensitive forced selling is the payer, the overshoot should be
+      larger where the move and the open-interest drop are both more extreme.
+      A mechanism that works only at its own margin is not this mechanism.
+  - id: permissive
+    params:
+      min_move_atr: 1.0
+      min_oi_drop_pct: 0.5
+      min_relative_volume: 1.0
+    claim: >-
+      The 60-day open-interest window makes the registered thresholds an
+      underpowered test. Loosening all three buys sample; if expectancy is
+      unchanged the earlier result was not a power problem.
+
+hypotheses_tested: 3
 multiple_testing_note: |
   One parameter set, registered before the first run. Any variant tested
   later must increment this count, and the reported result must be
