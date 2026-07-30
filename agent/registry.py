@@ -51,7 +51,7 @@ exploratory evidence is the right way to be wrong. But a tier may only be
 """
 
 from __future__ import annotations
-
+import re
 from dataclasses import dataclass, field
 
 from .forward_models import ForwardOutcomeModel, model_for
@@ -72,6 +72,17 @@ TIERS = (
 # paper to rehearse the machinery is a legitimate and useful thing to do.
 LIVE_MIN_TIER = "T3_VALIDATED"
 
+# A tier at or above LIVE_MIN_TIER must name the evidence packet that
+# authorised it, by hash.
+#
+# ``research.py t3-packet`` already builds a content-addressed, review-gated
+# packet: a full checklist, the reviewer, the registry-change reference, and a
+# SHA-256 over the whole payload. Nothing joined that artifact to the tier it
+# exists to justify - ``evidence`` was free-form prose paths, so raising a tier
+# was one edited string, and the packet's immutability protected a document
+# nobody had to cite. Requiring the hash here makes the chain checkable in the
+# direction that matters: from the claim back to the evidence.
+PACKET_REFERENCE = re.compile(r"^t3-packet:[0-9a-f]{64}$")
 
 class UnknownStrategy(KeyError):
     """Raised when configuration names a strategy that is not registered."""
@@ -156,6 +167,15 @@ class StrategySpec:
             raise ValueError(
                 f"strategy {self.id!r} cannot be forward-model ready without "
                 "a forward_model_id")
+        if (self.tier_rank() >= TIERS.index(LIVE_MIN_TIER)
+            and not any(PACKET_REFERENCE.match(reference)
+                        for reference in self.evidence)):
+        raise ValueError(
+            f"strategy {self.id!r} claims {self.tier}, which authorises "
+            "live capital, without citing the evidence packet that "
+            "granted it. Add the packet hash from `research.py t3-packet` "
+            "to evidence as 't3-packet:<sha256>'. A tier that can be "
+            "raised by editing one string is not a gate.")
 
     @property
     def forward_model(self) -> ForwardOutcomeModel:
