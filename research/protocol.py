@@ -561,6 +561,105 @@ def evaluate_axis(settings: list, baseline_decisions: list,
          "confirmation_paired": _paired_evidence(confirm_pair)})
 
 
+
+
+def interval_pseudo_p(n: object, ci_low: object, ci_high: object) -> float:
+    """Approximate a p-value from a bootstrap interval.
+
+    Coarse, and the honest resolution available at this sample size: it is
+    used to rank and to correct, never quoted as a p-value in its own right.
+    One definition, shared by every family correction here, so two callers
+    cannot drift into correcting on different scales.
+    """
+    try:
+        count = int(n or 0)
+        low, high = float(ci_low), float(ci_high)
+    except (TypeError, ValueError):
+        return 1.0
+    if count < 2 or not (math.isfinite(low) and math.isfinite(high)):
+        return 1.0
+    width = abs(high - low)
+    if width <= 0:
+        return 1.0
+    if low <= 0 <= high:
+        return 1.0
+    # Distance of the interval from zero, in interval half-widths. Two
+    # half-widths out is roughly the 95% boundary.
+    margin = min(abs(low), abs(high))
+    return max(1e-6, 0.05 / (1.0 + 4.0 * margin / width))
+
+
+def correct_axis_family(verdicts: dict, alpha: float = 0.05) -> dict:
+    """Holm-correct across every axis evaluated in one qualification run.
+
+    Criterion 10, and the reason it exists: each axis is a separate chance to
+    promote something. Five axes are registered today and the count grows with
+    the registry, so "the entire confirmation interval is positive" is a 5%
+    test performed five times, and the axis that promotes is by construction
+    the one that looked best. Correcting per axis and stopping there leaves the
+    multiplicity that actually threatens the programme uncorrected.
+
+    The family is every axis evaluated in the run, not only the axes that
+    reached PROMOTE. An axis that failed earlier still consumed a chance, and
+    excluding it would shrink the family precisely when a candidate needs the
+    family to be small - which is the same error as reporting the best of
+    seventy-nine walk-forward variants without saying there were seventy-nine.
+
+    The corrected figure is taken from the CONFIRMATION interval, because that
+    is the criterion carrying the evidence: the fit-window interval is measured
+    on the same data that selected the setting.
+    """
+    pseudo_p = {}
+    for axis_id, verdict in verdicts.items():
+        interval = (getattr(verdict, "evidence", None) or {}).get(
+            "confirmation_interval") or {}
+        pseudo_p[axis_id] = (
+            interval_pseudo_p(interval.get("n"), interval.get("low"),
+                              interval.get("high"))
+            if getattr(verdict, "verdict", None) == PROMOTE else 1.0)
+    corrected = holm_bonferroni(pseudo_p, alpha=alpha)
+    return {
+        axis_id: {
+            "family_n": len(pseudo_p),
+            "alpha": alpha,
+            "axes": sorted(pseudo_p),
+            "p": row["p"],
+            "p_adjusted": row["p_adjusted"],
+            "significant": bool(row["significant"]),
+        }
+        for axis_id, row in corrected.items()
+    }
+
+
+def apply_axis_family_correction(verdicts: dict, alpha: float = 0.05) -> dict:
+    """Return the verdicts with criterion 10 applied.
+
+    A promotion that does not survive the correction becomes ``CONTINUE``: the
+    axis is not refuted, it simply has not cleared a bar that accounts for how
+    many axes were asked the same question. Every verdict carries the family
+    record either way, so the reason is legible in the persisted analysis
+    rather than reconstructed from the axis count later.
+    """
+    family = correct_axis_family(verdicts, alpha=alpha)
+    out = {}
+    for axis_id, verdict in verdicts.items():
+        record = family[axis_id]
+        evidence = dict(getattr(verdict, "evidence", None) or {})
+        evidence["family"] = record
+        if verdict.verdict == PROMOTE and not record["significant"]:
+            out[axis_id] = Verdict(
+                CONTINUE, "family-wise correction across the axes tested",
+                f"{verdict.detail} — but {record['family_n']} axes were "
+                f"evaluated in this run and the Holm-adjusted figure is "
+                f"{record['p_adjusted']:.3f} against alpha {alpha}; the "
+                "corrected figure is the only one a recommendation may quote",
+                evidence)
+            continue
+        out[axis_id] = Verdict(verdict.verdict, verdict.governing_criterion,
+                               verdict.detail, evidence)
+    return out
+
+
 def correct_family(results: dict, alpha: float = 0.05) -> dict:
     """Apply the family-wise correction across one batch of tests.
 
@@ -568,28 +667,14 @@ def correct_family(results: dict, alpha: float = 0.05) -> dict:
     hundred round trips: something will look significant. The corrected
     figure is the only one any recommendation may quote, so the correction is
     applied here rather than left to whoever writes the summary.
-
-    A p-value is approximated from each bucket's bootstrap interval, which is
-    coarse and is the honest resolution available at this sample size. It is
-    used to rank and to correct, never quoted as a p-value on its own.
     """
-    pseudo_p = {}
-    for name, scored in results.items():
-        n = scored.get("n") or 0
-        if n < 2:
-            pseudo_p[name] = 1.0
-            continue
-        width = abs(scored["ci_high"] - scored["ci_low"])
-        if width <= 0:
-            pseudo_p[name] = 1.0
-            continue
-        # Distance of the interval from zero, in interval half-widths. Two
-        # half-widths out is roughly the 95% boundary.
-        margin = min(abs(scored["ci_low"]), abs(scored["ci_high"]))
-        crosses_zero = scored["ci_low"] <= 0 <= scored["ci_high"]
-        pseudo_p[name] = 1.0 if crosses_zero else max(
-            1e-6, 0.05 / (1.0 + 4.0 * margin / width))
 
+    pseudo_p = {
+      name: interval_pseudo_p(
+          scored.get("n"), scored.get("ci_low"), scored.get("ci_high"))
+      for name, scored in results.items()
+    }
+  
     corrected = holm_bonferroni(pseudo_p, alpha=alpha)
     out = {}
     for name, scored in results.items():
