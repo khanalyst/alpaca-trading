@@ -565,7 +565,11 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
     if not axes:
         print(f"no active parameter axes for {strategy_id}", file=sys.stderr)
         return 2
-
+        
+    # Every axis is evaluated and persisted before any of them may qualify.
+    # Criterion 10 corrects across the axes tested in one run, and a family
+    # size cannot be known while still walking the family.
+    evaluated: dict[str, dict] = {}
     for axis, axis_variants in sorted(axes.items()):
         axis_id = "+".join(axis)
         setting_ids = [variant.variant_id for variant in axis_variants]
@@ -577,26 +581,60 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             continue
         analysis = store.analysis(analysis_id) or {}
-        portfolios = (analysis.get("payload") or {}).get(
-            "portfolio_statuses") or {}
+        evaluated[axis_id] = {
+            "axis": list(axis),
+            "analysis_id": analysis_id,
+            "verdict": verdict,
+            "portfolios": (analysis.get("payload") or {}).get(
+                "portfolio_statuses") or {},
+        }
+    if not evaluated:
+        print("no axis produced valid forward evidence", file=sys.stderr)
+        return 2
+
+    corrected = protocol.apply_axis_family_correction(
+        {axis_id: row["verdict"] for axis_id, row in evaluated.items()})
+    family_analysis_id = store.record_analysis(
+        "forward_axis_family", f"{strategy_id}:{scope}", {
+            "strategy_id": strategy_id, "scope_key": scope,
+            "axes": {axis_id: {
+                "analysis_id": row["analysis_id"],
+                "verdict_before_correction": row["verdict"].verdict,
+                "verdict": corrected[axis_id].verdict,
+                "governing_criterion": corrected[axis_id].governing_criterion,
+                "family": corrected[axis_id].evidence.get("family"),
+            } for axis_id, row in sorted(evaluated.items())},
+        })
+    print(f"family correction across {len(evaluated)} axis/axes "
+          f"(analysis {family_analysis_id})\n")
+
+    for axis_id, row in sorted(evaluated.items()):
+        verdict = corrected[axis_id]
+        family = verdict.evidence.get("family") or {}
+        
         print(f"forward axis {axis_id}: {verdict.verdict}")
         print(f"  {verdict.governing_criterion}: {verdict.detail}")
+        print(f"  family: {family.get('family_n')} axes, p_adj "
+              f"{float(family.get('p_adjusted', 1.0)):.3f}")
         if verdict.verdict != protocol.PROMOTE:
             continue
         best = str(verdict.evidence["best"])
-        if portfolios.get(best) == "REVOKED":
+        if row["portfolios"].get(best) == "REVOKED":
             print(f"  {best} cannot enter paper: its shadow portfolio is "
                   "revoked and requires reconciliation", file=sys.stderr)
             continue
         event_id = store.qualify_variant(
             best, {
                 "source": "paired_real_time_forward",
-                "analysis_id": analysis_id,
-                "axis": list(axis),
+                "analysis_id": row["analysis_id"],
+                "family_analysis_id": family_analysis_id,
+                "axis": row["axis"],
                 "verdict": verdict.evidence,
+                "family": family,
                 "automatic_action": "start isolated local paper when flat",
                 "live_promotion": False,
-            }, source_analysis_id=analysis_id, scope_key=scope)
+            }, source_analysis_id=row["analysis_id"], scope_key=scope)
+        
         print(f"qualified {best} for isolated paper in {scope} "
               f"(event {event_id}); live registry unchanged")
     return 0
@@ -660,6 +698,9 @@ def cmd_t3_packet(args: argparse.Namespace) -> int:
             qualification and qualification.get("status") == "QUALIFIED"
             and analysis_payload.get("source")
             == "real_time_shadow_portfolios"),
+        "axis_family_corrected": bool(
+            ((qualification or {}).get("detail") or {})
+            .get("family", {}).get("significant")),
         "paper_sample": int(paper.get("closed_trades") or 0) >= min_paper,
         "paper_positive": bool(
             paper.get("status") == "PAPER"
