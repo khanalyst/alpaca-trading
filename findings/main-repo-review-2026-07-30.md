@@ -189,7 +189,7 @@ in the findings below:
   showed funding contributed +0.039% and price +1.969%. The residual was sent
   back for its own pre-registration instead of being folded in.
 
-### R2-01 — no family-wise correction in the path that qualifies an edge · **Recommended**
+### R2-01 — no family-wise correction in the path that qualifies an edge · **Fixed**
 
 `protocol.correct_family` is applied in exactly one place: the conditioning
 branch of `cmd_sweep`. `cmd_forward_qualify` iterates axes independently, and
