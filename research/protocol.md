@@ -87,9 +87,9 @@ finding, it is an opinion with a timestamp.
 1. **≥ 3 settings including the baseline, and every alternative's CI upper bound is below the
    baseline's point estimate.** The whole axis has to be bad, not just the
    setting that happened to be tried first.
-2. **Structurally invalid on inspection.** No sample required. `findings.md`
-   §6 rejected three hypotheses this way, and the reasoning is recorded as a
-   finding row so the same idea does not return in three months.
+2. **Structurally invalid on inspection.** No sample required. The current
+   implementation plan records the pre-registered falsifier and the reasoning
+   as a finding row so the same idea does not return in three months.
 
 Everything else is `CONTINUE`.
 

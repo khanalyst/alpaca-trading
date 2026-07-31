@@ -31,10 +31,12 @@ The follow-up adds independent persisted variant accounts, durable fair
 scheduling, paired/dependence-aware inference, richer replay state feedback,
 forward-only findings migrations, transfer-ID deduplication with explicit
 reconciliation when an ID is absent, strategy-specific outcome contracts, and
-content-addressed review-gated T3 evidence packets. Schema 7 also persists
+content-addressed review-gated T3 evidence packets. Schema 8 now persists
 every accepted or vetoed proposal atomically, treats vetoes as explicit
 zero-return paired actions, freezes qualification at a common pre-paper
 evidence boundary, and invalidates windows containing operational failures.
+Schema migration 7 introduced the complete decision ledger and legacy
+watermark.
 Exchange/SQLite commits still cannot be one distributed transaction, and replay
 still cannot reproduce exchange-only state such as fill races or
 liquidation/margin details.
@@ -53,7 +55,7 @@ liquidation/margin details.
 | HYP-08 | P1 | Replay does not fully model equity feedback, loss cooldowns, universe-selection changes, and every circuit breaker. | **Substantially fixed; exchange-only gap remains** | Replay now feeds resolved PnL into equity, closes positions, starts loss cooldowns, tracks universe changes and applies daily-loss/max-drawdown transitions. Diagnostics enumerate modelled transitions, recorded mismatches and remaining exchange-only fields. |
 | HYP-09 | P1 | Three-arm comparison does not provide strict paired matching for all proposals/outcomes, and its bootstrap can overstate certainty when samples are structurally dependent. | **Fixed** | Comparisons match exact stable proposal identities, report mismatch/coverage diagnostics, require ≥80% coverage with no duplicates, and use a paired six-hour cluster/block bootstrap. |
 | HYP-10 | P2 | Research records could be compared across incompatible strategy, prompt, configuration, or code versions without a hard compatibility boundary. | **Mitigated** | G2 is tied to proposal-corpus state plus strategy/configuration and fidelity-code fingerprints. Reports group by account, strategy/version, prompt/config/code, parameter variant, and strategy configuration. A universal compatibility policy across every historical tool is still not enforced. |
-| HYP-11 | P0 | Policy-changing variants could persist only accepted trades, leaving no honest population for confidence, exposure, or discriminator vetoes. | **Fixed** | Schema 7 stores immutable accepted/vetoed decisions atomically with portfolio and trade state. Vetoes are explicit zero-return paired actions; qualification uses one common pre-paper window and rejects operational failures inside it. |
+| HYP-11 | P0 | Policy-changing variants could persist only accepted trades, leaving no honest population for confidence, exposure, or discriminator vetoes. | **Fixed** | Schema 8 stores immutable accepted/vetoed decisions atomically with portfolio and trade state. Vetoes are explicit zero-return paired actions; qualification uses one common pre-paper window and rejects operational failures inside it. |
 
 ## 2. Reporting, storage, and auditability findings
 

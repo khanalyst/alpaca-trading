@@ -1,5 +1,12 @@
 # Edge hypotheses — H-G through H-L
 
+> Preserved detailed hypothesis rationale. Current registered strategies,
+> settings, and implementation status are maintained in
+> [`../HYPOTHESES_AND_VARIANTS.md`](../HYPOTHESES_AND_VARIANTS.md) and
+> [`../../MAIN_REPO_REVIEW_PLAN.md`](../../MAIN_REPO_REVIEW_PLAN.md). The
+> analysis below is the original pre-registration/rationale record and should
+> not be read as evidence that every proposed hypothesis is currently active.
+
 **Companion to** [`findings.md`](findings.md) and
 [`batched-implementation.md`](batched-implementation.md).
 **Date:** 2026-07-28

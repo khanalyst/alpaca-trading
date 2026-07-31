@@ -1,5 +1,9 @@
 # Main repository review — 2026-07-30
 
+> Preserved detailed review record. The current implementation status is
+> maintained in [`../MAIN_REPO_REVIEW_PLAN.md`](../MAIN_REPO_REVIEW_PLAN.md);
+> this document retains the full findings and reasoning behind that plan.
+
 Reviewed at `4791dda` against four requirements. The status notes below also
 include subsequent changes now present on `main`.
 
