@@ -101,7 +101,7 @@ auto-shutdown. Bind the static IP in the OKX API-key restrictions.
 
 ```bash
 sudo apt update
-sudo apt install -y python3.12 python3.12-venv git sqlite3
+sudo apt install -y python3.12 python3.12-venv git sqlite3 parted
 sudo useradd -r -m -d /opt/okx-agent-crypto -s /usr/sbin/nologin okx
 sudo -u okx git clone <repository> /opt/okx-agent-crypto
 cd /opt/okx-agent-crypto
@@ -149,41 +149,146 @@ sudo journalctl -u okx-research -n 200 --no-pager
 The research oneshot is separate from the trader. A research failure does not
 restart the trader.
 
-## 6. Provision the external backup destination
+## 6. Provision the managed research-backup disk
 
-Repository code cannot create off-host storage. Provision and mount a separate
-disk/share before relying on the VM. The destination must already exist and
-its `st_dev` must differ from the repository and every included source.
+The Azure VM needs a persistent managed data disk in addition to its OS and
+temporary resource disks. Use `/srv/okx-agent-research-backup` as the permanent
+mount point. Do not use `/mnt`: on the deployed VM it is the Azure temporary
+resource disk and is not durable storage.
 
-Example service override:
+This is a one-time host setup. In Azure, create and attach an empty managed
+data disk sized for expected backup growth. Set its VM deletion behavior to
+**Detach**/disable **Delete with VM** so deleting the VM retains the disk.
+
+### 6.1 Identify the empty disk
 
 ```bash
-sudo systemctl edit okx-research.service
+lsblk -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS,MODEL,SERIAL
 ```
 
-```ini
+Before this disk was provisioned, the current VM's observed mapping was:
+
+```text
+/dev/sda   64G   OS disk; /dev/sda1 is mounted at /
+/dev/sdb   16G   Azure temporary resource disk; /dev/sdb1 is mounted at /mnt
+/dev/sdc   64G   new empty managed data disk
+```
+
+Resolve this mapping from `lsblk` every time. The commands below deliberately
+target `/dev/sdc`; stop if it has a filesystem, partitions, or a mount point,
+or if the VM's mapping differs. Never run them against `/dev/sda` or
+`/dev/sdb`.
+
+The following read-only check should show no existing signatures:
+
+```bash
+sudo wipefs --no-act /dev/sdc
+```
+
+### 6.2 Partition and format the disk
+
+These commands destroy existing contents on `/dev/sdc` and are run only once
+after the empty-disk check:
+
+```bash
+sudo parted --script /dev/sdc mklabel gpt
+sudo parted --script /dev/sdc mkpart primary ext4 0% 100%
+sudo partprobe /dev/sdc
+sudo udevadm settle
+lsblk -f /dev/sdc
+sudo mkfs.ext4 -L okxresearch /dev/sdc1
+```
+
+### 6.3 Create a persistent UUID mount
+
+```bash
+sudo mkdir -p /srv/okx-agent-research-backup
+
+backup_uuid="$(sudo blkid -s UUID -o value /dev/sdc1)"
+test -n "$backup_uuid"
+echo "$backup_uuid"
+
+sudo cp -a /etc/fstab /etc/fstab.before-okx-research-disk
+if ! grep -q "UUID=$backup_uuid " /etc/fstab; then
+  printf 'UUID=%s /srv/okx-agent-research-backup ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2\n' \
+    "$backup_uuid" | sudo tee -a /etc/fstab
+fi
+
+sudo findmnt --verify --verbose
+sudo mount -a
+sudo chown okx:okx /srv/okx-agent-research-backup
+sudo chmod 750 /srv/okx-agent-research-backup
+```
+
+If `findmnt --verify` or `mount -a` reports an error, fix `/etc/fstab` before
+continuing. Verify the mount, free space, device separation, and service-user
+write access:
+
+```bash
+findmnt --target /srv/okx-agent-research-backup
+df -h /srv/okx-agent-research-backup
+stat -c '%d %n' \
+  /opt/okx-agent-crypto \
+  /srv/okx-agent-research-backup
+sudo -u okx touch /srv/okx-agent-research-backup/.write-test
+sudo -u okx rm /srv/okx-agent-research-backup/.write-test
+```
+
+The two `stat` device numbers must differ.
+
+### 6.4 Require the mount in the nightly service
+
+```bash
+sudo mkdir -p /etc/systemd/system/okx-research.service.d
+sudo tee /etc/systemd/system/okx-research.service.d/backup.conf >/dev/null <<'EOF'
+[Unit]
+RequiresMountsFor=/srv/okx-agent-research-backup
+
 [Service]
-Environment=BACKUP_TARGET=/mnt/off-host/okx-agent-research
+Environment=BACKUP_TARGET=/srv/okx-agent-research-backup
 Environment=REQUIRE_EXTERNAL_BACKUP=1
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl cat okx-research.service
 ```
 
-Test it before enabling deletion/rebuild procedures:
+`RequiresMountsFor` prevents the research service from silently writing into
+the empty local mount-point directory when the managed disk is unavailable.
+The backup command independently requires different-`st_dev` evidence.
+
+### 6.5 Create and verify the first backup
 
 ```bash
 cd /opt/okx-agent-crypto
 sudo -u okx .venv/bin/python research.py backup \
-  --target /mnt/off-host/okx-agent-research \
+  --store research/cache/findings.db \
+  --journal runtime/demo/journal.db \
+  --mode demo \
+  --target /srv/okx-agent-research-backup \
   --require-external
 sudo -u okx .venv/bin/python research.py readiness \
   --db runtime/demo/journal.db
 ```
 
+The backup must report `target: external_mounted` and `EXTERNAL MOUNT
+VERIFIED`. Readiness must report `external backup PASS`; unrelated research
+gates may still report that they are collecting evidence.
+
+After the next reboot, repeat the `findmnt`, `df`, `stat`, write-access, and
+readiness checks before relying on unattended research runs.
+
 `local_default` and same-device `configured_local` backups do not make VM
-deletion safe. A path setting by itself is not external proof. The application
-never prunes prior backup directories, but an administrator or storage policy
-can still delete them. Different `st_dev` proves a separate mounted device, not
-that the storage is outside the VM's deletion domain; confirm location and
-retention separately.
+deletion safe. The application never prunes prior backup directories, so
+monitor capacity. Different `st_dev` proves a separate mounted device, not its
+Azure deletion policy; verify **Detach**/disabled **Delete with VM** in Azure.
+
+The managed disk is a backup destination, not the application's active data
+directory. The supported backup captures the findings database, active
+journal, `runtime/research/recorded`, research manifests and forward evidence,
+and `research/results`. It does not copy the complete downloaded
+`runtime/research/data` cache. See [OPERATIONS.md](OPERATIONS.md) before a
+zero-data-loss VM deletion or rebuild.
 
 ## 7. Deployment updates
 

@@ -13,7 +13,7 @@ seven isolated real-time research evaluators.
 | Nightly research | Manual | `okx-research.timer` |
 | Active journal | `runtime/demo/journal.db` | `/opt/okx-agent-crypto/runtime/demo/journal.db` |
 | Findings store | `research/cache/findings.db` | Same repository-relative path on the VM |
-| External backup | Optional mounted filesystem | Required for VM-loss protection |
+| External backup | Optional mounted filesystem | `/srv/okx-agent-research-backup` on the persistent managed data disk |
 
 `vm-import/2026-07-30/` is read-only imported evidence for development and
 tests. It is never a default runtime, findings, tournament, recorder, or backup
@@ -35,6 +35,8 @@ VM:
 
 ```bash
 sudo systemctl status okx-recorder okx-trader okx-research.timer
+findmnt --target /srv/okx-agent-research-backup
+df -h /srv/okx-agent-research-backup
 sudo journalctl -u okx-trader -n 100 --no-pager
 sudo journalctl -u okx-recorder -n 100 --no-pager
 sudo journalctl -u okx-research -n 200 --no-pager
@@ -46,6 +48,8 @@ sudo -u okx /opt/okx-agent-crypto/.venv/bin/python \
 `readiness` returns nonzero for a failed research gate or when no verified
 `external_mounted` backup exists. A default/configured-local backup is useful
 for recovery from a bad query, but it does not make deletion of the VM safe.
+The mount and capacity checks must succeed before the nightly research result
+is treated as durably backed up.
 
 ## 3. Nightly workflow and exit behavior
 
@@ -174,12 +178,20 @@ The default command creates a versioned `local_default` backup:
 ./.venv/bin/python research.py backup
 ```
 
-For VM-loss protection, provision and mount a separate destination first, then
-require positive different-device evidence:
+For VM-loss protection, provision the managed disk exactly as described in
+[SETUP.md](SETUP.md#6-provision-the-managed-research-backup-disk). The deployed
+mount is `/srv/okx-agent-research-backup`. Do not use `/mnt`, which is the
+Azure temporary resource disk on this VM.
+
+Create a required external backup manually:
 
 ```bash
-./.venv/bin/python research.py backup \
-  --target /mnt/off-host/okx-agent-research \
+cd /opt/okx-agent-crypto
+sudo -u okx .venv/bin/python research.py backup \
+  --store research/cache/findings.db \
+  --journal runtime/demo/journal.db \
+  --mode demo \
+  --target /srv/okx-agent-research-backup \
   --require-external
 ```
 
@@ -192,37 +204,98 @@ prunes older backup directories.
 Verify a captured backup later:
 
 ```bash
-./.venv/bin/python research.py verify-backup \
-  /mnt/off-host/okx-agent-research/<backup-directory>
+cd /opt/okx-agent-crypto
+sudo -u okx find /srv/okx-agent-research-backup \
+  -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+sudo -u okx .venv/bin/python research.py verify-backup \
+  /srv/okx-agent-research-backup/<backup-directory>
 ```
 
-To require the mounted destination in the systemd nightly service:
+The persistent systemd override must contain both the mount dependency and the
+strict backup settings:
 
 ```bash
-sudo systemctl edit okx-research.service
+sudo systemctl cat okx-research.service
+sudo systemctl show okx-research.service -p Environment
 ```
 
-Add:
+Expected override:
 
 ```ini
+[Unit]
+RequiresMountsFor=/srv/okx-agent-research-backup
+
 [Service]
-Environment=BACKUP_TARGET=/mnt/off-host/okx-agent-research
+Environment=BACKUP_TARGET=/srv/okx-agent-research-backup
 Environment=REQUIRE_EXTERNAL_BACKUP=1
 ```
 
-Then:
+### Backup health and capacity verification
+
+Run these after provisioning, after every reboot, after disk maintenance, and
+at least weekly:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl start okx-research.service
-sudo journalctl -u okx-research -n 200 --no-pager
+lsblk -f /dev/sdc
+grep -F '/srv/okx-agent-research-backup' /etc/fstab
+sudo findmnt --verify --verbose
+findmnt --target /srv/okx-agent-research-backup \
+  -o SOURCE,TARGET,FSTYPE,OPTIONS
+df -h /srv/okx-agent-research-backup
+sudo du -sh /srv/okx-agent-research-backup
+stat -c '%d %n' \
+  /opt/okx-agent-crypto \
+  /srv/okx-agent-research-backup
+sudo -u okx test -w /srv/okx-agent-research-backup \
+  && echo 'backup mount writable by okx'
+sudo systemctl status okx-research.timer --no-pager
+sudo -u okx .venv/bin/python research.py readiness \
+  --db runtime/demo/journal.db
 ```
+
+The `findmnt` source should be the managed-disk partition, normally
+`/dev/sdc1`; it must not be `/dev/sdb1`. The two `stat` device numbers must
+differ. Readiness must show `external backup PASS`. Because every backup is a
+new append-only directory and no automatic pruning occurs, investigate growth
+and expand the managed disk before it fills.
+
+Run and watch an immediate research cycle when validating a deployment:
+
+```bash
+sudo systemctl reset-failed okx-research.service
+sudo systemctl start --no-block okx-research.service
+sudo journalctl -fu okx-research.service
+```
+
+Press `Ctrl+C` to leave the journal follow; the service continues. A first run
+can still exit 4 because readiness is evaluated before that run creates its
+backup. Rerun readiness after the backup is verified.
 
 Configuration/path alone is not off-host proof. The mount must report an
 `st_dev` different from the repository and every included source. Schema 14
 reclassifies legacy unproven “external” records as `configured_local`.
 Different-device evidence does not prove remote retention; the operator must
-also confirm the destination survives loss/deletion of the VM.
+also confirm in Azure that the managed disk uses **Detach**/has **Delete with
+VM** disabled. A periodic Azure snapshot or recovery-VM attach test verifies
+that the backup survives independently of the original VM.
+
+### Backup scope
+
+The supported verified backup includes:
+
+- `research/cache/findings.db` through SQLite's online backup API;
+- the active `runtime/demo/journal.db` through the same API;
+- files under `runtime/research/recorded`;
+- research manifest JSON files and `forward_evidence.json`; and
+- all files under `research/results`.
+
+It does not include the complete downloaded `runtime/research/data` cache.
+That cache remains under `/opt/okx-agent-crypto` and is read there by the
+tournament. Much of it can be downloaded again, but exact short-retention
+market inputs may not be reproducible. If exact preservation of that cache is
+required before VM deletion, copy it to separately retained storage or extend
+the backup implementation and verify it before calling the procedure
+zero-data-loss.
 
 ## 7. Other research commands
 
@@ -266,8 +339,15 @@ run directories, and the backup manifest/checksum. The verified backup command
 captures these supported sources; committed `findings/` scorecards remain in
 Git.
 
-Before deleting or rebuilding the VM, require a recently verified
-`external_mounted` backup and confirm it is readable from outside the VM.
+Before deleting or rebuilding the VM:
+
+1. require a recent `external_mounted` backup and rerun `verify-backup`;
+2. confirm the managed disk mount, separate `st_dev`, free space, and Azure
+   **Detach** deletion behavior;
+3. preserve `runtime/research/data` separately when exact raw-cache retention
+   is required; and
+4. preferably verify an Azure snapshot or attach a retained copy to a recovery
+   VM and read its manifests there.
 
 ## 10. Troubleshooting
 
@@ -288,3 +368,24 @@ The optional B7.5 maker-first order primitive remains disabled by default.
 `research.shadow_variants`, and `research.shadow_budget_ms` are documented
 configuration controls; the shipped values/defaults are summarized in
 [README.md](README.md).
+
+
+## 11. Inspecting funding-unwind assignments
+
+Example inspection of the most recent funding-unwind assignments:
+
+```bash
+cd /opt/okx-agent-crypto
+
+sudo -u okx .venv/bin/python -c '
+from research.findings import FindingsStore
+store = FindingsStore("research/cache/findings.db")
+rows = store.experiment_assignments(strategy_id="funding-unwind")
+keys = (
+    "candidate_variant_id", "setting_id", "status",
+    "observed_count", "minimum_observations",
+    "duration_satisfied", "ready_to_complete"
+)
+print(*[{key: row.get(key) for key in keys} for row in rows[-5:]], sep="\n")
+'
+```
