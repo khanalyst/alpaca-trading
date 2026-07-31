@@ -24,8 +24,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
+import signal
+import shutil
 import sys
+import time
+import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from math import isfinite
@@ -40,17 +46,138 @@ import yaml  # noqa: E402
 from agent.registry import REGISTRY, TIERS  # noqa: E402
 try:  # support both `python -m research.tournament` and legacy imports
     from . import gates as gate_mod  # noqa: E402
+    from .findings import FindingsStore, _content_hash, resolve_store_path  # noqa: E402
     from .edge_lab import (Contract, FlushFadeContract,  # noqa: E402
                            FundingCarryContract, TrendMultidayContract,
                            load_dataset, universe_membership)
 except ImportError:  # tests and direct script execution
     import gates as gate_mod  # noqa: E402
+    from findings import FindingsStore, _content_hash, resolve_store_path  # noqa: E402
     from edge_lab import (Contract, FlushFadeContract,  # noqa: E402
                           FundingCarryContract, TrendMultidayContract,
                           load_dataset, universe_membership)
 
 
 HYPOTHESES = REPO / "research" / "hypotheses"
+
+
+class TournamentFailure(RuntimeError):
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _identity_name(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(REPO.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def _file_identities(paths: list[Path]) -> list[dict]:
+    identities = []
+    for path in sorted(set(paths), key=lambda item: str(item)):
+        item = {"path": _identity_name(path)}
+        try:
+            stat = path.stat()
+            item.update({
+                "size_bytes": stat.st_size,
+                "sha256": _sha256_file(path),
+            })
+        except OSError as exc:
+            item["error"] = str(exc)
+        identities.append(item)
+    return identities
+
+
+def _regular_files(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink())
+
+
+def _identity_payload(args: argparse.Namespace) -> dict:
+    code_paths = (
+        _regular_files(REPO / "agent")
+        + [path for path in _regular_files(REPO / "research")
+           if path.suffix == ".py"]
+        + [REPO / "research.py"])
+    code_paths = [path for path in code_paths if path.suffix == ".py"]
+    config_paths = [REPO / "config.yaml", REPO / "research" / "variants.yaml"]
+    config_paths += sorted(HYPOTHESES.glob("*.yaml"))
+    input_paths = _regular_files(args.data)
+    if args.forward and args.forward.is_file():
+        input_paths.append(args.forward)
+    manifest_paths = [
+        path for path in input_paths
+        if "manifest" in path.name.lower() and path.suffix.lower() == ".json"
+    ]
+    code_files = _file_identities(code_paths)
+    config_files = _file_identities(config_paths)
+    manifests = _file_identities(manifest_paths)
+    inputs = _file_identities(input_paths)
+    return {
+        "code_identity": {
+            "sha256": _content_hash(code_files),
+            "files": code_files,
+        },
+        "config_identity": {
+            "sha256": _content_hash(config_files),
+            "files": config_files,
+        },
+        "data_manifest_identity": {
+            "sha256": _content_hash(manifests),
+            "files": manifests,
+            "present": bool(manifests),
+        },
+        "input_hashes": {
+            "sha256": _content_hash(inputs),
+            "files": inputs,
+        },
+    }
+
+
+def _json_write_once(path: Path, payload: object) -> None:
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+        handle.write("\n")
+
+
+def _text_write_once(path: Path, text: str) -> None:
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _copy_latest(run_directory: Path, output: Path) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    for name in ("REPORT.md", "leaderboard.json"):
+        shutil.copyfile(run_directory / name, output / name)
+
+
+def _failure_report(run: dict, errors: list[dict]) -> str:
+    lines = [
+        "# Strategy tournament", "",
+        f"Run `{run['run_id']}` failed before scoring completed.", "",
+        f"- started: {run['started_utc']}",
+        f"- data root: `{run['options'].get('data')}`",
+        f"- durable run directory: `{run['run_directory']}`", "",
+        "## Errors", "",
+    ]
+    for error in errors:
+        lines.append(
+            f"- `{error.get('type', 'Error')}`: {error.get('message', '')}")
+    lines += ["", "No prior tournament run was overwritten.", ""]
+    return "\n".join(lines)
 
 # Which research contract implements each registered strategy. A strategy in
 # the register with no entry here is registered but not yet testable, which
@@ -543,6 +670,12 @@ def write_report(path: Path, payload: dict) -> None:
     rows = payload["strategies"]
     lines = [
         "# Strategy tournament", "",
+        f"Durable run: `{payload.get('run_id', 'legacy')}`.",
+        "",
+        "This file is immutable inside its run directory. A top-level copy "
+        "under `research/results/tournament/` is only the latest view; prior "
+        "runs remain under `runs/`.",
+        "",
         f"Generated {payload['generated_utc']} from `{payload['data_root']}`.",
         "",
         f"- instruments: {payload['instruments']}",
@@ -710,11 +843,14 @@ def write_report(path: Path, payload: dict) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--out", type=Path,
                         default=REPO / "research" / "results" / "tournament")
+    parser.add_argument(
+        "--store", type=Path, default=None,
+        help="findings.db path; defaults to research.findings_store")
     parser.add_argument("--cost", default="base",
                         help="cost scenario the gates score against")
     parser.add_argument("--exit-policy", default="fixed_rr")
@@ -729,103 +865,259 @@ def main() -> int:
                         default=REPO / "runtime" / "research"
                         / "forward_evidence.json",
                         help="output of research/export_live.py")
-    args = parser.parse_args()
+    return parser
 
-    frames = load_dataset(args.data, min_bars=args.min_bars)
-    if not frames:
-        print(f"No instrument in {args.data} has >= {args.min_bars} bars. "
-              f"Download more history, or lower --min-bars for a smoke test.",
-              file=sys.stderr)
-        return 2
-    membership = universe_membership(frames, top_n=args.top_n)
+
+def main(argv: list[str] | None = None) -> int:
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(cli_args)
+    options = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    command = [sys.executable, str(Path(__file__).resolve()), *cli_args]
 
     cfg = None
+    config_error = None
     try:
         from agent.config import validate_config
         cfg = validate_config(
             yaml.safe_load((REPO / "config.yaml").read_text()))
     except Exception as exc:                       # noqa: BLE001
+        config_error = str(exc)
         print(f"note: config.yaml not usable for contract parameters ({exc}); "
               f"falling back to research defaults", file=sys.stderr)
+    configured_store = (
+        (cfg.get("research") or {}).get("findings_store") if cfg else None)
+    store_path = args.store or resolve_store_path(configured_store)
 
-    wanted = {s.strip() for s in args.only.split(",") if s.strip()}
-    specs = [s for s in REGISTRY.values() if not wanted or s.id in wanted]
-    specs.sort(key=lambda s: (-TIERS.index(s.tier), s.id))
-
-    def score_one(spec):
-        print(f"scoring {spec.id}/{spec.version} ...", file=sys.stderr)
-        return score_strategy(spec, frames, membership, cfg,
-                              args.cost, args.exit_policy)
-
-    worker_count = max(1, min(int(args.workers), len(specs) or 1))
-    if worker_count == 1 or len(specs) < 2:
-        rows = [score_one(spec) for spec in specs]
-    else:
-        # Inputs are read-only and each strategy owns its settings list. The
-        # result order remains the registry order so reports stay deterministic.
-        with ThreadPoolExecutor(max_workers=worker_count,
-                                thread_name_prefix="tournament") as pool:
-            rows = list(pool.map(score_one, specs))
-
-    forward = {}
-    if args.forward and args.forward.exists():
-        try:
-            forward = json.loads(args.forward.read_text())
-        except (OSError, ValueError) as exc:               # noqa: BLE001
-            print(f"note: could not read forward evidence ({exc})",
-                  file=sys.stderr)
-    for row in rows:
-        apply_forward_evidence(row, forward)
-
-    scored = [r for r in rows if r.get("scored")]
-    scored.sort(key=lambda r: (-TIERS.index(r["measured_tier"]),
-                               -(r["headline"].get("expectancy_pct") or 0)))
-    unscored = [r for r in rows if not r.get("scored")]
-    ordered = scored + unscored
-
-    starts = [int(f.ts[0]) for f in frames.values()]
-    ends = [int(f.ts[-1]) for f in frames.values()]
-
-    def stamp(ms: int) -> str:
-        return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime(
-            "%Y-%m-%d")
-
-    payload = {
-        "generated_utc": datetime.now(timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%SZ"),
-        "data_root": str(args.data),
-        "instruments": len(frames),
-        "min_bars": min(len(f.df) for f in frames.values()),
-        "window_start": stamp(min(starts)),
-        "window_end": stamp(max(ends)),
-        "cost_scenario": args.cost,
-        "exit_policy": args.exit_policy,
-        "strategies": ordered,
+    started_ts = time.time()
+    started_utc = datetime.fromtimestamp(
+        started_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    identities = _identity_payload(args)
+    content_id = _content_hash({
+        "command": command,
+        "options": options,
+        **identities,
+    })
+    run_id = _content_hash({
+        "content_id": content_id,
+        "started_ns": time.time_ns(),
+        "nonce": uuid.uuid4().hex,
+    })
+    run_directory = args.out / "runs" / (
+        f"{datetime.fromtimestamp(started_ts, timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}"
+        f"-{run_id[:16]}")
+    run_directory.mkdir(parents=True, exist_ok=False)
+    run = {
+        "schema": "tournament-run.v1",
+        "run_id": run_id,
+        "content_id": content_id,
+        "started_ts": started_ts,
+        "started_utc": started_utc,
+        "run_directory": str(run_directory),
+        "command": command,
+        "options": options,
+        **identities,
     }
-    payload["benchmark_check"] = benchmark_check(ordered)
+    _json_write_once(run_directory / "RUN.json", {
+        "schema": run["schema"],
+        "run_id": run_id,
+        "content_id": content_id,
+        "started_ts": started_ts,
+        "started_utc": started_utc,
+        "run_directory": str(run_directory),
+        "status": "STARTED",
+    })
+    _json_write_once(run_directory / "INVOCATION.json", {
+        "command": command, "options": options,
+    })
+    _json_write_once(run_directory / "INPUTS.json", {
+        **identities,
+        "config_load_error": config_error,
+    })
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "leaderboard.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
-    write_report(args.out / "REPORT.md", payload)
+    store = FindingsStore(store_path)
+    start_recorded = False
+    if argv is None:
+        def interrupted(_signum, _frame):
+            raise TournamentFailure("tournament interrupted by SIGTERM", 143)
 
-    alert_on_tier_changes(ordered, payload)
+        signal.signal(signal.SIGTERM, interrupted)
+    try:
+        store.start_tournament_run(run)
+        start_recorded = True
 
-    check = payload["benchmark_check"]
-    print(f"\nharness check: {'PASS' if check['ok'] else 'FAIL'} - "
-          f"{check['reason']}")
-    for row in ordered:
-        if row.get("scored"):
-            head = row["headline"]
-            print(f"  {row['strategy_id']:<16} {row['measured_tier']:<15} "
-                  f"{head.get('trades', 0):>6} trades  "
-                  f"{_format_signed(head.get('expectancy_pct'), '%')}  "
-                  f"{recommendation(row)}")
+        frames = load_dataset(args.data, min_bars=args.min_bars)
+        if not frames:
+            raise TournamentFailure(
+                f"No instrument in {args.data} has >= {args.min_bars} bars. "
+                "Download more history, or lower --min-bars for a smoke test.",
+                exit_code=2)
+        membership = universe_membership(frames, top_n=args.top_n)
+
+        wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+        specs = [s for s in REGISTRY.values() if not wanted or s.id in wanted]
+        specs.sort(key=lambda s: (-TIERS.index(s.tier), s.id))
+
+        def score_one(spec):
+            print(f"scoring {spec.id}/{spec.version} ...", file=sys.stderr)
+            return score_strategy(spec, frames, membership, cfg,
+                                  args.cost, args.exit_policy)
+
+        worker_count = max(1, min(int(args.workers), len(specs) or 1))
+        if worker_count == 1 or len(specs) < 2:
+            rows = [score_one(spec) for spec in specs]
         else:
-            print(f"  {row['strategy_id']:<16} {'NOT SCORED':<15} "
-                  f"{row['reason'][:60]}")
-    print(f"\nwrote {args.out / 'REPORT.md'}")
-    return 0 if check["ok"] else 1
+            # Inputs are read-only and each strategy owns its settings list.
+            # Result order stays deterministic even though scoring is bounded.
+            with ThreadPoolExecutor(max_workers=worker_count,
+                                    thread_name_prefix="tournament") as pool:
+                rows = list(pool.map(score_one, specs))
+
+        forward = {}
+        if args.forward and args.forward.exists():
+            try:
+                forward = json.loads(args.forward.read_text())
+            except (OSError, ValueError) as exc:               # noqa: BLE001
+                print(f"note: could not read forward evidence ({exc})",
+                      file=sys.stderr)
+        for row in rows:
+            apply_forward_evidence(row, forward)
+
+        scored = [r for r in rows if r.get("scored")]
+        scored.sort(key=lambda r: (-TIERS.index(r["measured_tier"]),
+                                   -(r["headline"].get("expectancy_pct") or 0)))
+        unscored = [r for r in rows if not r.get("scored")]
+        ordered = scored + unscored
+
+        starts = [int(f.ts[0]) for f in frames.values()]
+        ends = [int(f.ts[-1]) for f in frames.values()]
+
+        def stamp(ms: int) -> str:
+            return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime(
+                "%Y-%m-%d")
+
+        payload = {
+            "schema": "tournament-leaderboard.v1",
+            "run_id": run_id,
+            "content_id": content_id,
+            "status": "SUCCEEDED",
+            "started_utc": started_utc,
+            "generated_utc": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%SZ"),
+            "run_directory": str(run_directory),
+            "data_root": str(args.data),
+            "instruments": len(frames),
+            "min_bars": min(len(f.df) for f in frames.values()),
+            "window_start": stamp(min(starts)),
+            "window_end": stamp(max(ends)),
+            "cost_scenario": args.cost,
+            "exit_policy": args.exit_policy,
+            "strategies": ordered,
+        }
+        payload["benchmark_check"] = benchmark_check(ordered)
+
+        alert_on_tier_changes(ordered, payload)
+
+        (run_directory / "leaderboard.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+        write_report(run_directory / "REPORT.md", payload)
+        _json_write_once(run_directory / "ERRORS.json", [])
+        ended_ts = time.time()
+        store.finish_tournament_run(
+            run_id, "SUCCEEDED", ended_ts=ended_ts, strategies=ordered,
+            detail={
+                "benchmark_check": payload["benchmark_check"],
+                "leaderboard_sha256": _sha256_file(
+                    run_directory / "leaderboard.json"),
+                "report_sha256": _sha256_file(run_directory / "REPORT.md"),
+            })
+        _json_write_once(run_directory / "COMPLETION.json", {
+            "run_id": run_id,
+            "status": "SUCCEEDED",
+            "ended_ts": ended_ts,
+            "ended_utc": datetime.fromtimestamp(
+                ended_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "exit_code": 0 if payload["benchmark_check"]["ok"] else 1,
+        })
+        _copy_latest(run_directory, args.out)
+
+        check = payload["benchmark_check"]
+        print(f"\nharness check: {'PASS' if check['ok'] else 'FAIL'} - "
+              f"{check['reason']}")
+        for row in ordered:
+            if row.get("scored"):
+                head = row["headline"]
+                print(f"  {row['strategy_id']:<16} "
+                      f"{row['measured_tier']:<15} "
+                      f"{head.get('trades', 0):>6} trades  "
+                      f"{_format_signed(head.get('expectancy_pct'), '%')}  "
+                      f"{recommendation(row)}")
+            else:
+                print(f"  {row['strategy_id']:<16} {'NOT SCORED':<15} "
+                      f"{row['reason'][:60]}")
+        print(f"\nwrote durable run {run_directory}")
+        print(f"latest view: {args.out / 'REPORT.md'}")
+        return 0 if check["ok"] else 1
+    except (Exception, KeyboardInterrupt) as exc:          # noqa: BLE001
+        ended_ts = time.time()
+        exit_code = (
+            exc.exit_code if isinstance(exc, TournamentFailure)
+            else 130 if isinstance(exc, KeyboardInterrupt) else 1)
+        error = {
+            "type": type(exc).__name__,
+            "message": str(exc) or type(exc).__name__,
+            "traceback": "".join(traceback.format_exception(exc)),
+        }
+        failure_payload = {
+            "schema": "tournament-leaderboard.v1",
+            "run_id": run_id,
+            "content_id": content_id,
+            "status": "FAILED",
+            "started_utc": started_utc,
+            "generated_utc": datetime.fromtimestamp(
+                ended_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "run_directory": str(run_directory),
+            "data_root": str(args.data),
+            "strategies": [],
+            "errors": [error],
+            "benchmark_check": {
+                "ok": False,
+                "reason": "tournament did not complete",
+            },
+        }
+        leaderboard = run_directory / "leaderboard.json"
+        report = run_directory / "REPORT.md"
+        errors = run_directory / "ERRORS.json"
+        if not leaderboard.exists():
+            _json_write_once(leaderboard, failure_payload)
+        if not report.exists():
+            _text_write_once(report, _failure_report(run, [error]))
+        if not errors.exists():
+            _json_write_once(errors, [error])
+        if start_recorded:
+            try:
+                store.finish_tournament_run(
+                    run_id, "FAILED", ended_ts=ended_ts,
+                    detail={"exit_code": exit_code, "errors": [error]})
+            except ValueError:
+                pass
+        completion = run_directory / "COMPLETION.json"
+        if not completion.exists():
+            _json_write_once(completion, {
+                "run_id": run_id,
+                "status": "FAILED",
+                "ended_ts": ended_ts,
+                "ended_utc": datetime.fromtimestamp(
+                    ended_ts, timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"),
+                "exit_code": exit_code,
+            })
+        _copy_latest(run_directory, args.out)
+        print(error["message"], file=sys.stderr)
+        print(f"failure evidence: {run_directory}", file=sys.stderr)
+        return exit_code
 
 
 if __name__ == "__main__":

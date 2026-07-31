@@ -1,5 +1,9 @@
 # Can selection or trade management produce better trades?
 
+> **Historical result snapshot.** These conclusions belong to the recorded
+> experiment below. They do not describe the current durable strategy rotation
+> or grant live authority.
+
 The entry signal has no measurable directional edge, so nothing here can
 create one. But the agent makes two other decisions every cycle that were
 never tested: **which** of the available candidates to take when there are

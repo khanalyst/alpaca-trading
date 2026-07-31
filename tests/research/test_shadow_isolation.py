@@ -141,7 +141,9 @@ class NoOpTests(unittest.TestCase):
             store=findings.FindingsStore(Path(tmp.name) / "findings.db"))
 
         self.assertIsNotNone(evaluator)
-        self.assertEqual(evaluator.variant_ids, ["momentum.rr.fixed_2_5"])
+        self.assertEqual(
+            evaluator.variant_ids,
+            ["momentum.baseline", "momentum.rr.fixed_2_5"])
 
     def test_enabled_runtime_without_a_store_uses_the_durable_default(self):
         tmp = tempfile.TemporaryDirectory()
@@ -406,7 +408,7 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
-    def test_the_shipped_config_enrolls_all_deterministic_variants(self):
+    def test_the_shipped_config_rotates_deterministic_variants(self):
         import yaml
         from agent.config import validate_config
         from pathlib import Path
@@ -417,6 +419,8 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertTrue(cfg["research"]["shadow_enabled"])
         self.assertEqual(cfg["research"]["shadow_variants"], ["*"])
         self.assertEqual(cfg["research"]["shadow_budget_ms"], 0)
+        self.assertEqual(cfg["research"]["experiment_min_duration_days"], 3)
+        self.assertEqual(cfg["research"]["experiment_min_observations"], 100)
         self.assertNotIn("shadow_llm_variants", cfg["research"])
 
 

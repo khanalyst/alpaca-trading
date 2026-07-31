@@ -31,9 +31,9 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
 
     funding = _finite(snapshot.get("funding_rate_pct"))
     interval = _finite(snapshot.get("funding_interval_hours"))
-    if interval is None or interval <= 0:
-        interval = 8.0
-    funding_8h = funding * (8.0 / interval) if funding is not None else None
+    funding_8h = (funding * (8.0 / interval)
+                  if funding is not None and interval is not None
+                  and interval > 0 else None)
     percentile = _finite(snapshot.get("funding_percentile_30"))
     samples = int(max(0.0, _finite(snapshot.get("funding_samples_30"), 0.0)
                       or 0.0))

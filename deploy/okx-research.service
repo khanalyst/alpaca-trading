@@ -7,6 +7,9 @@ Type=oneshot
 User=okx
 WorkingDirectory=/opt/okx-agent-crypto
 Environment=PYTHON=/opt/okx-agent-crypto/.venv/bin/python
+# Production operators should add BACKUP_TARGET and
+# REQUIRE_EXTERNAL_BACKUP=1 through `systemctl edit` after provisioning a
+# pre-existing different-device mount. A path alone is not external proof.
 ExecStart=/opt/okx-agent-crypto/research/nightly.sh
 # The tournament is the only CPU spike on the box; keep it out of the
 # trading loop's way.

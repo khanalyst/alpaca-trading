@@ -41,7 +41,7 @@ FAILED = "FAILED"
 # at n=10 a single mismatch reads as 90% and fails a replay that is fine.
 MIN_PROPOSALS_FOR_G2 = 100
 
-# H-G and H-H condition on cells, and the plan asks for 150 observations per
+# Positioning and book-state studies condition on cells, and require 150 observations per
 # cell before concluding rather than extending collection.
 MIN_OBSERVATIONS_PER_CELL = 150
 
@@ -200,18 +200,18 @@ def gate_g5(db, stats: dict) -> Gate:
 
 
 def gate_g6(db, stats: dict) -> Gate:
-    """H-G and H-H: months of collection, and no way to shorten it."""
+    """Positioning/book-state studies need months of unshortenable collection."""
     books = stats["book_state_events"]
     enrichment = stats["enrichment_events"]
     if books == 0 and enrichment == 0:
         return Gate(
-            "G6", "H-G / H-H sample sufficiency", COLLECTING,
+            "G6", "Positioning/book sample sufficiency", COLLECTING,
             "no book_state or snapshot_enrichment events yet. This is the "
             "clock B0.5 started and it cannot be shortened",
             "run the agent; these accrue every cycle")
     # A conditioning cell needs observations, and the plan's bar is per cell.
     return Gate(
-        "G6", "H-G / H-H sample sufficiency", COLLECTING,
+        "G6", "Positioning/book sample sufficiency", COLLECTING,
         f"{books:,} book_state and {enrichment:,} enrichment observations. "
         f"The bar is {MIN_OBSERVATIONS_PER_CELL} per conditioning cell, and "
         "cascades are infrequent by construction - expect roughly three "
@@ -280,7 +280,7 @@ def report(db: str | Path | None, cfg: dict) -> list:
             "G5", "Breakout discriminator chosen on evidence", COLLECTING,
             "no journal yet", "run the agent"),
         gate_g6(db, stats) if db and Path(db).exists() else Gate(
-            "G6", "H-G / H-H sample sufficiency", COLLECTING,
+            "G6", "Positioning/book sample sufficiency", COLLECTING,
             "no journal yet", "run the agent"),
         gate_b75(db if db and Path(db).exists() else None, cfg, g2),
     ], stats

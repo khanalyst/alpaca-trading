@@ -5,6 +5,9 @@ branch-by-branch reconciliation plan.
 
 ## Authority
 
+- Real-time strategy assignments first produce deterministic `WORKED`,
+  `FAILED`, or `INCONCLUSIVE` outcomes. `WORKED` is RESEARCH_ONLY and cannot
+  change capital or configuration.
 - Journal replay is authoritative only after a current G2 PASS.
 - The OHLCV tournament is exploratory. It may reject, rank, or withhold a
   strategy, but it awards no tier above `T2_CANDIDATE` and cannot promote live
@@ -28,6 +31,10 @@ backup, journal/research fingerprints, and the report generated from that
 export. On the receiving Mac, run the tournament against the extracted data;
 do not replace the repository runtime directory or treat the fixture as the VM
 authority.
+
+The supplied `vm-import/2026-07-30/` export is a read-only one-time fixture.
+Copy/extract it to a temporary directory before tests. It is never a runtime
+default.
 
 See [`../../MAIN_REPO_REVIEW_PLAN.md`](../../MAIN_REPO_REVIEW_PLAN.md) for
 status and [`../../OPERATIONS.md`](../../OPERATIONS.md) for commands.

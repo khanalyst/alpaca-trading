@@ -9,7 +9,7 @@ mode: demo            # demo | live
 
 llm:
   provider: openai          # anthropic | openai
-  model: gpt-5.6-terra     # e.g. claude-sonnet-4-6, claude-opus-4-8,
+  model: gpt-5.6-sol       # e.g. claude-sonnet-4-6, claude-opus-4-8,
                                #      gpt-4.1, gpt-4o, o4-mini
   temperature: 0.2             # ignored automatically on models that reject
                                # sampling params (Sonnet 5, Opus 4.7+, and
@@ -22,23 +22,16 @@ llm:
   # the marker is a harmless no-op and the prompt bills at the normal rate).
   # Check cache hits in runtime/agent.log: "tokens: ... cache_read=NNNN".
 
-# Momentum is one isolated, versioned strategy. Future strategies such as
-# scalping must get their own ID, prompt, risk budget and report rather than
-# changing these rules in place.
+# Momentum is the single strategy connected to the configured demo account.
+# Six other registered strategies run only through isolated deterministic
+# research evaluators; none of those evaluators has an exchange/order path.
 strategy:
   id: momentum
   version: phase1-v3
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
-  # Batch 6.3, interim. "other" bypasses the evidence contract entirely and
-  # pools every distinct experimental idea under one label, so report.py
-  # groups them into a single row and nothing can be learned from any of
-  # them. It is also demo-only, which means demo statistics are contaminated
-  # by a population of trades live will silently refuse.
-  #
-  # The replacement is a registered hypothesis id chosen from an explicit
-  # versioned list, each with its own contract and its own attribution. That
-  # changes the prompt, so it belongs with the 6.5 version bump rather than
-  # here. Until then this is false, so demo statistics mean something.
+  # The old free-form "other" bucket bypassed evidence attribution. It remains
+  # disabled. Experimental ideas now use explicit registered hypothesis IDs,
+  # bounded settings, separate contracts, and immutable attribution instead.
   allow_experimental_setups_in_demo: false
   setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
   setup_memory_hours: 72        # bounded operational idempotency history
@@ -227,32 +220,44 @@ alerts:
   minimum_level: error            # warning | error | critical
   timeout_seconds: 5
 
-# Shadow evaluation. The shipped configuration enrolls every active
-# deterministic parameter variant so learning starts with the agent.
+# Shadow evaluation. Each strategy keeps its stable baseline plus no more than
+# one active setting. Other declared settings wait in deterministic order.
 #
-# Every variant reuses the cycle's one recorded LLM proposal set and its exact
-# confidences. No variant makes an extra model call. The variant contract,
-# risk limits, sizing and forward account are then evaluated independently.
+# All seven strategies receive the same market snapshot and timestamp. The
+# active momentum analyst makes at most one live-path model call; non-active
+# strategy contracts and all baseline/candidate arms are deterministic and do
+# not make per-strategy model calls.
 #
-# shadow_variants names entries in research/variants.yaml. Use ["*"] to enroll
-# every candidate/testing variant plus each strategy baseline. A durable
-# least-observed-first scheduler prevents a custom positive wall-clock budget
-# from starving later entries. Zero disables the budget so every shipped
-# variant receives every complete proposal set. Each variant has its own cash,
+# shadow_variants filters eligible static/generated candidate identities. Use
+# ["*"] to allow every candidate/testing identity into durable serial rotation
+# against its strategy baseline. Each strategy/variant has its own cash,
 # positions, exposure,
 # cooldowns and circuit breakers. Nothing here can place an order: the
 # evaluator has no exchange to reach.
 #
-# A parameter edge that passes paired real-time forward qualification starts a
-# fresh isolated PAPER stage when flat; prequalification SHADOW trades remain
-# stored but are excluded from paper-only metrics. T3/live authority still
-# requires a reviewed content-addressed evidence packet and a code review.
+# A WORKED rotation outcome creates RESEARCH_ONLY edge evidence and never
+# changes live/demo configuration. The separate forward-qualification path can
+# start a fresh isolated PAPER stage when flat; even a reviewed T3 packet does
+# not automatically deploy capital.
 research:
   shadow_enabled: true
   shadow_variants: ["*"]
   shadow_budget_ms: 0
   shadow_workers: 2
   findings_store: research/cache/findings.db
+  # Optional pre-existing destination. It is external only when its mounted
+  # filesystem/device differs from every repository/source device; an explicit
+  # same-device path remains configured-local. The path is never auto-created.
+  # Without it, backups stay under runtime/backups/research as local-default.
+  # backup_target: /mnt/off-host/okx-agent-research
   paper_initial_balance_usdt: 10000
   paper_max_failures: 3
   paper_min_closed_trades: 100
+  # The executable all-strategy models fork paper evidence from the earlier
+  # feed scope without deleting or rewriting its historical rows.
+  forward_feed_version: 1
+  # Rotation requires BOTH 3 elapsed calendar days and 100 comparable paired
+  # decisions. Time alone never completes an assignment. The observation
+  # default deliberately matches the existing conservative paper sample floor.
+  experiment_min_duration_days: 3
+  experiment_min_observations: 100

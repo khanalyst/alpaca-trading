@@ -1,5 +1,9 @@
 # Edge search — day-trading horizons, OKX USDT perpetuals
 
+> **Historical result snapshot.** This report records its original corpus and
+> experiment. It does not describe the current seven-strategy real-time loop or
+> authorize an automatic configuration change.
+
 **Brief:** find a tradable edge at day-trading horizons (up to 48 hours, no
 longer), then set the parameters accordingly.
 

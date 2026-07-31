@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 DEFAULT_STORE = Path(__file__).resolve().parent / "cache" / "findings.db"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 14
 
 KINDS = ("observation", "recommendation", "decision")
 
@@ -56,6 +56,23 @@ def _json_safe(value: object):
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _positive_external_target_evidence(evidence: object) -> bool:
+    """Accept external classification only with coherent st_dev evidence."""
+    if not isinstance(evidence, dict):
+        return False
+    if (evidence.get("method") != "st_dev"
+            or evidence.get("external_proven") is not True):
+        return False
+    target_device = evidence.get("target_device")
+    source_devices = evidence.get("source_devices")
+    if not isinstance(target_device, int) or not isinstance(source_devices, list):
+        return False
+    if not source_devices or not all(
+            isinstance(device, int) for device in source_devices):
+        return False
+    return target_device not in source_devices
 
 
 def _canonical_json(value: object) -> str:
@@ -113,6 +130,23 @@ def _analysis_canonical(
         "payload": json.loads(payload_json),
     })
     return payload_json, digest
+
+
+def _insert_analysis_conn(
+        conn: sqlite3.Connection, kind: str, subject_id: str,
+        payload: dict) -> str:
+    canonical, payload_hash = _analysis_canonical(kind, subject_id, payload)
+    existing = conn.execute(
+        "SELECT analysis_id FROM analysis_runs WHERE payload_hash=?",
+        (payload_hash,)).fetchone()
+    if existing is not None:
+        return str(existing["analysis_id"])
+    analysis_id = payload_hash[:32]
+    conn.execute(
+        "INSERT INTO analysis_runs (analysis_id, kind, subject_id, ts, "
+        "payload_json, payload_hash) VALUES (?,?,?,?,?,?)",
+        (analysis_id, kind, subject_id, time.time(), canonical, payload_hash))
+    return analysis_id
 
 
 def _rewrite_analysis_references(value: object, remap: dict[str, str]):
@@ -209,6 +243,561 @@ def _forward_decision_evidence(row: dict | sqlite3.Row) -> dict:
     item["assumptions"] = assumptions
     item["proposal"] = proposal
     return json.loads(_canonical_json(item))
+
+
+def _finite_number(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _assignment_trade_costs(row: sqlite3.Row) -> tuple[dict, list[dict]]:
+    """Rebuild the modeled paper costs without relabeling them as fills."""
+    limitations = []
+    notional = _finite_number(row["notional"])
+    entry = _finite_number(row["entry_price"])
+    exit_price = _finite_number(row["exit_price"])
+    sign = 1.0 if str(row["direction"]) == "long" else -1.0
+    gross = (notional * sign * (exit_price - entry) / entry
+             if notional > 0 and entry > 0 and exit_price > 0 else 0.0)
+    net = _finite_number(row["net_pnl_usd"])
+    modeled_total = gross - net
+    try:
+        assumptions = json.loads(row["assumptions_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        assumptions = {}
+        limitations.append({
+            "code": "INVALID_COST_ASSUMPTIONS",
+            "detail": f"trade {row['trade_id']} has invalid assumptions JSON",
+        })
+    components = (assumptions.get("cost_components")
+                  if isinstance(assumptions, dict) else None)
+    if not isinstance(components, dict):
+        components = {}
+        limitations.append({
+            "code": "COST_BREAKDOWN_UNAVAILABLE",
+            "detail": (
+                f"trade {row['trade_id']} has net modeled costs but no "
+                "component breakdown"),
+        })
+    fee_pct = sum(_finite_number(components.get(key)) for key in (
+        "entry_fee_pct", "exit_fee_pct"))
+    execution_pct = sum(_finite_number(components.get(key)) for key in (
+        "spread_pct", "entry_slippage_pct"))
+    if str(row["result"]) == "stop":
+        execution_pct += _finite_number(components.get("stop_slippage_pct"))
+    rate = _finite_number(components.get("funding_rate_pct"))
+    interval = _finite_number(components.get("funding_interval_hours"))
+    next_minutes = _finite_number(components.get("next_funding_minutes"), -1.0)
+    funding_intervals = 0
+    if interval > 0 and next_minutes >= 0:
+        first = _finite_number(row["entry_ts"]) + next_minutes * 60.0
+        if _finite_number(row["exit_ts"]) >= first:
+            funding_intervals = 1 + math.floor(
+                max(0.0, _finite_number(row["exit_ts"]) - first)
+                / (interval * 3600.0))
+    funding_pct = sign * rate * funding_intervals
+    fees = notional * fee_pct / 100.0
+    execution = notional * execution_pct / 100.0
+    funding = notional * funding_pct / 100.0
+    unexplained = modeled_total - fees - execution - funding
+    if abs(unexplained) > max(0.01, abs(modeled_total) * 1e-6):
+        limitations.append({
+            "code": "COST_COMPONENT_RECONCILIATION_GAP",
+            "detail": (
+                f"trade {row['trade_id']} modeled cost components differ "
+                f"from gross-minus-net by {unexplained:+.6f} USDT"),
+        })
+    return ({
+        "gross_pnl_usdt": gross,
+        "fees_usdt": fees,
+        "execution_cost_usdt": execution,
+        "funding_cost_usdt": funding,
+        "modeled_total_cost_usdt": modeled_total,
+        "unexplained_cost_usdt": unexplained,
+        "funding_intervals": funding_intervals,
+    }, limitations)
+
+
+def _interval_payload(interval) -> dict:
+    return {
+        "point": _finite_number(getattr(interval, "point", 0.0)),
+        "low": _finite_number(getattr(interval, "low", 0.0)),
+        "high": _finite_number(getattr(interval, "high", 0.0)),
+        "n": int(getattr(interval, "n", 0) or 0),
+        "clusters": int(getattr(interval, "clusters", 0) or 0),
+    }
+
+
+def _paired_payload(comparison: dict) -> dict:
+    return {
+        **{key: value for key, value in comparison.items()
+           if key != "interval"},
+        "interval": _interval_payload(comparison.get("interval")),
+    }
+
+
+def _experiment_arm_evidence(
+        conn: sqlite3.Connection, scope_key: str, variant_id: str,
+        started_ts: float, ended_ts: float) -> dict:
+    from research import protocol
+    from research.score import score_returns
+
+    rows = conn.execute(
+        "SELECT d.*, t.proposal_id AS trade_proposal_id, "
+        "t.scope_key AS trade_scope_key, t.variant_id AS trade_variant_id, "
+        "t.model_id AS trade_model_id, t.entry_ts AS trade_entry_ts, "
+        "t.exit_ts AS trade_exit_ts, t.result AS trade_result, "
+        "t.r_multiple AS trade_r_multiple, t.status AS trade_status "
+        "FROM paper_decisions AS d LEFT JOIN paper_trades AS t "
+        "ON t.trade_id=d.paper_trade_id "
+        "WHERE d.scope_key=? AND d.variant_id=? "
+        "AND d.decision_ts>=? AND d.decision_ts<=? "
+        "ORDER BY d.decision_ts, d.decision_id",
+        (scope_key, variant_id, started_ts, ended_ts)).fetchall()
+    decisions = []
+    for row in rows:
+        evidence = _forward_decision_evidence(row)
+        exit_ts = evidence.get("trade_exit_ts")
+        if exit_ts is not None and float(exit_ts) > ended_ts:
+            evidence.update({
+                "trade_exit_ts": None, "trade_result": None,
+                "trade_r_multiple": None, "trade_status": "OPEN",
+            })
+        decisions.append(evidence)
+
+    trade_rows = conn.execute(
+        "SELECT DISTINCT t.* FROM paper_trades AS t "
+        "JOIN paper_decisions AS d ON d.paper_trade_id=t.trade_id "
+        "WHERE d.scope_key=? AND d.variant_id=? "
+        "AND d.decision_ts>=? AND d.decision_ts<=? "
+        "ORDER BY t.entry_ts, t.trade_id",
+        (scope_key, variant_id, started_ts, ended_ts)).fetchall()
+    closed = [row for row in trade_rows
+              if row["exit_ts"] is not None
+              and float(row["exit_ts"]) <= ended_ts
+              and row["r_multiple"] is not None]
+    unresolved = [row for row in trade_rows if row not in closed]
+    costs = {
+        "gross_pnl_usdt": 0.0, "fees_usdt": 0.0,
+        "execution_cost_usdt": 0.0, "funding_cost_usdt": 0.0,
+        "modeled_total_cost_usdt": 0.0, "unexplained_cost_usdt": 0.0,
+    }
+    cost_limitations = []
+    for trade in closed:
+        trade_costs, limitations = _assignment_trade_costs(trade)
+        for key in costs:
+            costs[key] += _finite_number(trade_costs.get(key))
+        cost_limitations.extend(limitations)
+    trade_returns = [_finite_number(row["r_multiple"]) for row in closed]
+    trade_score = score_returns(trade_returns, label=variant_id)
+    policy = protocol.paper_trade_decisions(decisions)
+    policy_returns = [
+        _finite_number(item.outcome.get("r_multiple"))
+        for item in policy if getattr(item, "outcome", None)
+        and item.outcome.get("r_multiple") is not None
+    ]
+    policy_score = score_returns(policy_returns, label=f"{variant_id}:policy")
+    net_pnl = sum(_finite_number(row["net_pnl_usd"]) for row in closed)
+    wins = sum(_finite_number(row["net_pnl_usd"]) > 0 for row in closed)
+    losses = sum(_finite_number(row["net_pnl_usd"]) < 0 for row in closed)
+    breakeven = len(closed) - wins - losses
+    cumulative = peak = max_drawdown_usdt = 0.0
+    for row in closed:
+        cumulative += _finite_number(row["net_pnl_usd"])
+        peak = max(peak, cumulative)
+        max_drawdown_usdt = max(max_drawdown_usdt, peak - cumulative)
+    model_ids = sorted({str(row["model_id"]) for row in rows
+                        if row["model_id"]})
+    provenances = []
+    for decision in decisions:
+        provenance = (decision.get("assumptions") or {}).get(
+            "experiment_provenance")
+        if isinstance(provenance, dict) and provenance not in provenances:
+            provenances.append(provenance)
+    failures = [dict(row) for row in conn.execute(
+        "SELECT ts, kind, detail_json FROM paper_failures "
+        "WHERE scope_key=? AND variant_id=? AND ts>=? AND ts<=? "
+        "ORDER BY ts, failure_id",
+        (scope_key, variant_id, started_ts, ended_ts)).fetchall()]
+    for failure in failures:
+        try:
+            failure["detail"] = json.loads(failure.pop("detail_json"))
+        except (TypeError, json.JSONDecodeError):
+            failure["detail"] = {"raw": failure.pop("detail_json", None)}
+    return {
+        "variant_id": variant_id,
+        "proposal_count": len({str(row["proposal_id"]) for row in rows}),
+        "decision_count": len(rows),
+        "proposed_decisions": sum(
+            str(row["decision_outcome"]) == "PROPOSED" for row in rows),
+        "vetoed_decisions": sum(
+            str(row["decision_outcome"]) == "VETOED" for row in rows),
+        "opens": len(trade_rows), "closes": len(closed),
+        "unresolved_opens": len(unresolved),
+        "wins": wins, "losses": losses, "breakeven": breakeven,
+        "win_rate_pct": (wins / len(closed) * 100.0 if closed else None),
+        "net_pnl_usdt": net_pnl,
+        "max_drawdown_usdt": max_drawdown_usdt,
+        "trade_r_metrics": trade_score,
+        "policy_r_metrics": policy_score,
+        "costs": costs,
+        "model_ids": model_ids,
+        "experiment_provenance": provenances,
+        "operational_failures": failures,
+        "cost_limitations": cost_limitations,
+        "decisions": decisions,
+        "policy_decisions": policy,
+    }
+
+
+def _deterministic_experiment_payload(
+        conn: sqlite3.Connection, assignment: sqlite3.Row,
+        terminal_event: sqlite3.Row) -> dict:
+    from research import protocol
+
+    assignment_id = str(assignment["assignment_id"])
+    scope_key = str(assignment["scope_key"])
+    started_ts = float(assignment["started_ts"])
+    ended_ts = float(terminal_event["event_ts"])
+    baseline_id = str(assignment["baseline_variant_id"])
+    candidate_id = str(assignment["candidate_variant_id"])
+    baseline_variant = conn.execute(
+        "SELECT * FROM variants WHERE variant_id=?", (baseline_id,)).fetchone()
+    candidate_variant = conn.execute(
+        "SELECT * FROM variants WHERE variant_id=?", (candidate_id,)).fetchone()
+    baseline = _experiment_arm_evidence(
+        conn, scope_key, baseline_id, started_ts, ended_ts)
+    candidate = _experiment_arm_evidence(
+        conn, scope_key, candidate_id, started_ts, ended_ts)
+    full = protocol.paired_arm_comparison(
+        candidate["policy_decisions"], baseline["policy_decisions"])
+    cutoff = protocol.common_time_cutoff([baseline["policy_decisions"]])
+    if cutoff is None:
+        candidate_fit, candidate_confirm = candidate["policy_decisions"], []
+        baseline_fit, baseline_confirm = baseline["policy_decisions"], []
+    else:
+        candidate_fit, candidate_confirm = protocol.split_at_time(
+            candidate["policy_decisions"], cutoff)
+        baseline_fit, baseline_confirm = protocol.split_at_time(
+            baseline["policy_decisions"], cutoff)
+    fit = protocol.paired_arm_comparison(candidate_fit, baseline_fit)
+    confirm = protocol.paired_arm_comparison(
+        candidate_confirm, baseline_confirm)
+
+    def policy_expectancy(items: list) -> float | None:
+        values = [
+            _finite_number(item.outcome.get("r_multiple"))
+            for item in items if getattr(item, "outcome", None)
+            and item.outcome.get("r_multiple") is not None
+        ]
+        return sum(values) / len(values) if values else None
+
+    reasons: list[dict] = []
+    limitations: list[dict] = [{
+        "code": "MODELED_PAPER_COSTS",
+        "detail": (
+            "fees, execution costs, funding, and PnL are deterministic paper "
+            "model outputs rather than exchange fills"),
+    }, {
+        "code": "ASSIGNMENT_WINDOW_DRAWDOWN",
+        "detail": (
+            "drawdown is reconstructed from assignment-window closed trades "
+            "in USDT/R; no isolated assignment equity curve is persisted"),
+    }]
+    limitations.extend(baseline["cost_limitations"])
+    limitations.extend(candidate["cost_limitations"])
+
+    def add(code: str, gate: str, detail: str) -> None:
+        reasons.append({"code": code, "gate": gate, "detail": detail})
+
+    status = str(terminal_event["status"])
+    if status == "REJECTED":
+        add("ASSIGNMENT_REJECTED", "terminal_status",
+            str(terminal_event["reason"] or "assignment rejected"))
+        verdict = "FAILED"
+    else:
+        verdict = "WORKED"
+        hard_limitations = []
+        for arm in (baseline, candidate):
+            if arm["decision_count"] == 0:
+                hard_limitations.append((
+                    "NO_DECISIONS", f"{arm['variant_id']} has no decisions"))
+            if arm["unresolved_opens"]:
+                hard_limitations.append((
+                    "UNRESOLVED_TRADES",
+                    f"{arm['variant_id']} has {arm['unresolved_opens']} "
+                    "assignment-window trade(s) unresolved at terminal time"))
+            if arm["closes"] < protocol.MIN_ROUND_TRIPS:
+                hard_limitations.append((
+                    "CLOSED_SAMPLE_BELOW_FLOOR",
+                    f"{arm['variant_id']} has {arm['closes']} closed trades; "
+                    f"{protocol.MIN_ROUND_TRIPS} required"))
+            if arm["operational_failures"]:
+                hard_limitations.append((
+                    "OPERATIONAL_FAILURE_IN_WINDOW",
+                    f"{arm['variant_id']} has persisted operational failures"))
+            expected_model = json.loads(
+                assignment["code_identity_json"] or "{}").get(
+                    "baseline" if arm is baseline else "candidate", {}).get(
+                        "forward_model_id")
+            if (len(arm["model_ids"]) != 1
+                    or (expected_model
+                        and arm["model_ids"] != [str(expected_model)])):
+                hard_limitations.append((
+                    "MODEL_IDENTITY_MISMATCH",
+                    f"{arm['variant_id']} model identities are "
+                    f"{arm['model_ids']}, expected {expected_model}"))
+            if len(arm["experiment_provenance"]) != 1:
+                hard_limitations.append((
+                    "MIXED_EXPERIMENT_PROVENANCE",
+                    f"{arm['variant_id']} has "
+                    f"{len(arm['experiment_provenance'])} provenance records"))
+        for comparison, minimum, label in (
+                (full, protocol.MIN_ROUND_TRIPS, "full"),
+                (fit, protocol.MIN_PAIRED_FIT_OBSERVATIONS, "fit"),
+                (confirm, protocol.MIN_PAIRED_CONFIRM_OBSERVATIONS, "confirm")):
+            if not protocol.paired_window_adequate(comparison, minimum):
+                hard_limitations.append((
+                    "PAIRED_EVIDENCE_INADEQUATE",
+                    f"{label} window has {comparison['paired_n']} pairs, "
+                    f"{comparison['pair_coverage_pct']:.1f}% coverage, and "
+                    f"{comparison['bootstrap']['clusters']} clusters"))
+        if cutoff is None:
+            hard_limitations.append((
+                "TWO_SEGMENTS_UNAVAILABLE",
+                "the persisted proposal calendar cannot form two time segments"))
+        if hard_limitations:
+            verdict = "INCONCLUSIVE"
+            for code, detail in hard_limitations:
+                add(code, "evidence_adequacy", detail)
+        else:
+            candidate_expectancy = _finite_number(
+                candidate["trade_r_metrics"].get("expectancy_r"))
+            baseline_expectancy = _finite_number(
+                baseline["trade_r_metrics"].get("expectancy_r"))
+            fit_candidate = policy_expectancy(candidate_fit)
+            fit_baseline = policy_expectancy(baseline_fit)
+            confirm_candidate = policy_expectancy(candidate_confirm)
+            confirm_baseline = policy_expectancy(baseline_confirm)
+            negative = []
+            uncertain = []
+            if candidate["net_pnl_usdt"] <= 0 or candidate_expectancy <= 0:
+                negative.append((
+                    "NONPOSITIVE_AFTER_COST_EXPECTANCY",
+                    "candidate net PnL and trade expectancy must both be positive"))
+            if candidate_expectancy <= baseline_expectancy:
+                negative.append((
+                    "NO_BASELINE_RELATIVE_IMPROVEMENT",
+                    "candidate trade expectancy does not exceed baseline"))
+            if candidate["max_drawdown_usdt"] > baseline["max_drawdown_usdt"]:
+                negative.append((
+                    "DRAWDOWN_WORSE_THAN_BASELINE",
+                    "candidate assignment-window drawdown exceeds baseline"))
+            for label, comparison, cand_exp, base_exp in (
+                    ("full", full, _finite_number(
+                        candidate["policy_r_metrics"].get("expectancy_r")),
+                     _finite_number(
+                         baseline["policy_r_metrics"].get("expectancy_r"))),
+                    ("fit", fit, fit_candidate, fit_baseline),
+                    ("confirm", confirm, confirm_candidate, confirm_baseline)):
+                interval = comparison["interval"]
+                if cand_exp is None or base_exp is None:
+                    uncertain.append((
+                        "SEGMENT_EXPECTANCY_UNAVAILABLE",
+                        f"{label} expectancy is unavailable"))
+                    continue
+                if cand_exp <= 0 or cand_exp <= base_exp:
+                    negative.append((
+                        "SEGMENT_INCONSISTENT",
+                        f"{label} candidate expectancy is not positive and "
+                        "above baseline"))
+                if interval.high <= 0:
+                    negative.append((
+                        "BASELINE_DELTA_NONPOSITIVE",
+                        f"{label} paired delta interval is wholly nonpositive"))
+                elif interval.low <= 0:
+                    uncertain.append((
+                        "BASELINE_DELTA_NOT_ESTABLISHED",
+                        f"{label} paired delta interval does not clear zero"))
+            qualification = conn.execute(
+                "SELECT status, detail_json FROM edge_qualification_events "
+                "WHERE variant_id=? AND scope_key IN ('*', ?) "
+                "ORDER BY ts DESC, rowid DESC LIMIT 1",
+                (candidate_id, scope_key)).fetchone()
+            if qualification is not None and qualification["status"] == "REVOKED":
+                negative.append((
+                    "EXISTING_DISQUALIFYING_GATE",
+                    "candidate has a persisted revoked qualification"))
+            if str(candidate_variant["status"]) in {"rejected", "superseded"}:
+                negative.append((
+                    "EXISTING_DISQUALIFYING_GATE",
+                    f"candidate variant status is {candidate_variant['status']}"))
+            portfolio = conn.execute(
+                "SELECT state_json FROM paper_portfolios "
+                "WHERE scope_key=? AND variant_id=?",
+                (scope_key, candidate_id)).fetchone()
+            if portfolio is not None:
+                try:
+                    portfolio_status = json.loads(
+                        portfolio["state_json"]).get("status")
+                except (TypeError, json.JSONDecodeError):
+                    portfolio_status = "INVALID"
+                if portfolio_status in {"REVOKED", "INVALID"}:
+                    negative.append((
+                        "EXISTING_DISQUALIFYING_GATE",
+                        f"candidate paper portfolio status is "
+                        f"{portfolio_status}"))
+            if negative:
+                verdict = "FAILED"
+                for code, detail in negative:
+                    add(code, "performance", detail)
+            elif uncertain:
+                verdict = "INCONCLUSIVE"
+                for code, detail in uncertain:
+                    add(code, "statistical_confidence", detail)
+            else:
+                add("ALL_CONSERVATIVE_GATES_PASSED", "edge_evidence",
+                    "sample, costs, baseline delta, two segments, drawdown, "
+                    "and disqualifying-gate checks all passed")
+
+    for limitation in limitations:
+        limitation.setdefault("severity", "disclosure")
+    for arm in (baseline, candidate):
+        arm.pop("policy_decisions", None)
+        arm.pop("decisions", None)
+        arm.pop("cost_limitations", None)
+    payload = {
+        "schema": "experiment_outcome.v1",
+        "assignment_id": assignment_id,
+        "terminal_status": status,
+        "verdict": verdict,
+        "reasons": reasons,
+        "scope_key": scope_key,
+        "strategy_id": str(assignment["strategy_id"]),
+        "axis": str(assignment["axis"]),
+        "setting_id": str(assignment["setting_id"]),
+        "setting": json.loads(assignment["setting_json"]),
+        "source": str(assignment["source"]),
+        "proposal_id": assignment["proposal_id"],
+        "data_window": {
+            "from_ts": started_ts, "to_ts": ended_ts,
+            "split_cutoff_ts": cutoff,
+            "elapsed_seconds": max(0.0, ended_ts - started_ts),
+        },
+        "feed_identity": {
+            "scope_key": scope_key,
+            "forward_feed_version": (
+                int(scope_key.rsplit(":feed-v", 1)[1])
+                if ":feed-v" in scope_key
+                and scope_key.rsplit(":feed-v", 1)[1].isdigit()
+                else None),
+        },
+        "code_identity": json.loads(assignment["code_identity_json"]),
+        "config_identity": json.loads(assignment["config_identity_json"]),
+        "baseline_variant": _variant_identity(baseline_variant),
+        "candidate_variant": _variant_identity(candidate_variant),
+        "baseline": baseline,
+        "candidate": candidate,
+        "paired": {
+            "full": _paired_payload(full),
+            "fit": _paired_payload(fit),
+            "confirm": _paired_payload(confirm),
+        },
+        "data_limitations": limitations,
+        "terminal_reason": terminal_event["reason"],
+    }
+    return json.loads(_canonical_json(payload))
+
+
+def _ensure_experiment_outcome_conn(
+        conn: sqlite3.Connection, assignment_id: str) -> tuple[dict, bool]:
+    existing = conn.execute(
+        "SELECT * FROM experiment_outcomes WHERE assignment_id=?",
+        (assignment_id,)).fetchone()
+    if existing is not None:
+        item = dict(existing)
+        item["payload"] = json.loads(item.pop("payload_json"))
+        return item, False
+    assignment = conn.execute(
+        "SELECT * FROM strategy_experiment_assignments WHERE assignment_id=?",
+        (assignment_id,)).fetchone()
+    if assignment is None:
+        raise ValueError(f"unknown assignment_id {assignment_id!r}")
+    terminal = conn.execute(
+        "SELECT * FROM strategy_experiment_assignment_events "
+        "WHERE assignment_id=? AND status IN ('COMPLETED','REJECTED') "
+        "ORDER BY event_ts DESC, rowid DESC LIMIT 1",
+        (assignment_id,)).fetchone()
+    if terminal is None:
+        raise ValueError("experiment outcome requires a terminal assignment")
+    payload = _deterministic_experiment_payload(conn, assignment, terminal)
+    payload_json = _canonical_json(payload)
+    payload_hash = _content_hash(payload)
+    outcome_id = _content_hash({
+        "assignment_id": assignment_id, "payload_hash": payload_hash,
+    })[:32]
+    analysis_id = _insert_analysis_conn(
+        conn, "experiment_outcome", assignment_id, payload)
+    finding = {
+        "type": "experiment_outcome",
+        "outcome_id": outcome_id,
+        "assignment_id": assignment_id,
+        "verdict": payload["verdict"],
+        "reasons": payload["reasons"],
+        "data_limitations": payload["data_limitations"],
+    }
+    cursor = conn.execute(
+        "INSERT INTO findings (variant_id, ts, author, kind, text, run_id) "
+        "VALUES (?,?,?,?,?,NULL)",
+        (assignment["candidate_variant_id"], float(terminal["event_ts"]),
+         "deterministic-research", "decision", _canonical_json(finding)))
+    finding_id = int(cursor.lastrowid)
+    conn.execute(
+        "INSERT INTO experiment_outcomes (outcome_id, assignment_id, "
+        "scope_key, strategy_id, baseline_variant_id, candidate_variant_id, "
+        "terminal_status, verdict, created_ts, payload_json, payload_hash, "
+        "analysis_id, finding_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (outcome_id, assignment_id, assignment["scope_key"],
+         assignment["strategy_id"], assignment["baseline_variant_id"],
+         assignment["candidate_variant_id"], terminal["status"],
+         payload["verdict"], float(terminal["event_ts"]), payload_json,
+         payload_hash, analysis_id, finding_id))
+    if payload["verdict"] == "WORKED":
+        edge_payload = {
+            "schema": "research_edge_evidence.v1",
+            "authority": "RESEARCH_ONLY",
+            "promotion_allowed": False,
+            "outcome_id": outcome_id,
+            "assignment_id": assignment_id,
+            "scope_key": assignment["scope_key"],
+            "strategy_id": assignment["strategy_id"],
+            "variant_id": assignment["candidate_variant_id"],
+            "data_window": payload["data_window"],
+            "feed_identity": payload["feed_identity"],
+            "code_identity": payload["code_identity"],
+            "config_identity": payload["config_identity"],
+            "model_ids": payload["candidate"]["model_ids"],
+            "criteria": payload["reasons"],
+        }
+        edge_id = _content_hash(edge_payload)[:32]
+        conn.execute(
+            "INSERT INTO research_edge_evidence (edge_id, outcome_id, "
+            "assignment_id, scope_key, strategy_id, variant_id, status, "
+            "created_ts, evidence_json, evidence_hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (edge_id, outcome_id, assignment_id, assignment["scope_key"],
+             assignment["strategy_id"], assignment["candidate_variant_id"],
+             "EDGE_CANDIDATE", float(terminal["event_ts"]),
+             _canonical_json(edge_payload), _content_hash(edge_payload)))
+    row = conn.execute(
+        "SELECT * FROM experiment_outcomes WHERE outcome_id=?",
+        (outcome_id,)).fetchone()
+    item = dict(row)
+    item["payload"] = json.loads(item.pop("payload_json"))
+    return item, True
 
 
 class MigrationError(RuntimeError):
@@ -958,6 +1547,709 @@ def _migration_8(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_9(conn: sqlite3.Connection) -> None:
+    """Make adaptive proposals exact, attributable, and lifecycle-complete."""
+    conn.execute("DROP TRIGGER IF EXISTS hypothesis_proposals_no_update")
+    conn.execute("DROP TRIGGER IF EXISTS hypothesis_proposals_no_delete")
+    conn.execute("ALTER TABLE hypothesis_proposals ADD COLUMN variant_id TEXT")
+    conn.execute(
+        "ALTER TABLE hypothesis_proposals ADD COLUMN target_parameter TEXT")
+    conn.execute(
+        "ALTER TABLE hypothesis_proposals ADD COLUMN minimum_json TEXT")
+    conn.execute(
+        "ALTER TABLE hypothesis_proposals ADD COLUMN maximum_json TEXT")
+    conn.execute("ALTER TABLE hypothesis_proposals ADD COLUMN reasoning TEXT")
+    try:
+        from agent import hypotheses as hypothesis_registry
+    except ImportError:
+        hypothesis_registry = None
+    for row in conn.execute(
+            "SELECT * FROM hypothesis_proposals "
+            "ORDER BY proposed_ts, proposal_id").fetchall():
+        metadata = None
+        if hypothesis_registry is not None:
+            try:
+                metadata = hypothesis_registry.numeric_setting_metadata(
+                    row["hypothesis_id"], row["setting_id"])
+            except ValueError:
+                metadata = None
+        if metadata is None:
+            target_parameter = f"legacy:{row['setting_id']}"
+            minimum_json = row["value_json"]
+            maximum_json = row["value_json"]
+            reasoning = (
+                "Legacy adaptive proposal migrated from schema 8; exact "
+                "target metadata was not persisted and is no longer "
+                "registered.")
+        else:
+            target_parameter = metadata["target_parameter"]
+            minimum_json = _canonical_json(metadata["minimum"])
+            maximum_json = _canonical_json(metadata["maximum"])
+            reasoning = (
+                "Legacy adaptive proposal migrated from schema 8; target "
+                "parameter and semantic bounds recovered from registered "
+                "hypothesis metadata.")
+        conn.execute(
+            "UPDATE hypothesis_proposals SET target_parameter=?, "
+            "minimum_json=?, maximum_json=?, reasoning=? WHERE proposal_id=?",
+            (target_parameter, minimum_json, maximum_json, reasoning,
+             row["proposal_id"]))
+    _execute_script(conn, """
+        CREATE TABLE hypothesis_proposal_events (
+            event_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('PROPOSED','OBSERVING','OBSERVED','REJECTED')),
+            event_ts REAL NOT NULL,
+            detail_json TEXT NOT NULL,
+            UNIQUE (proposal_id, status),
+            FOREIGN KEY (proposal_id)
+                REFERENCES hypothesis_proposals(proposal_id));
+        CREATE INDEX hypothesis_proposal_events_order
+            ON hypothesis_proposal_events(proposal_id, event_ts, event_id);
+        CREATE TABLE hypothesis_proposal_value_locks (
+            value_key TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE,
+            strategy_id TEXT NOT NULL,
+            hypothesis_id TEXT NOT NULL,
+            target_parameter TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            created_ts REAL NOT NULL,
+            FOREIGN KEY (proposal_id)
+                REFERENCES hypothesis_proposals(proposal_id));
+    """)
+    for row in conn.execute(
+            "SELECT * FROM hypothesis_proposals "
+            "ORDER BY proposed_ts, proposal_id"):
+        proposed_event_id = _content_hash({
+            "schema": 9, "proposal_id": row["proposal_id"],
+            "status": "PROPOSED",
+        })[:32]
+        conn.execute(
+            "INSERT INTO hypothesis_proposal_events "
+            "(event_id, proposal_id, status, event_ts, detail_json) "
+            "VALUES (?,?,?,?,?)",
+            (proposed_event_id, row["proposal_id"], "PROPOSED",
+             row["proposed_ts"], _canonical_json({
+                 "source": "schema_migration_9",
+                 "legacy_status": row["status"],
+             })))
+        if row["status"] in {"OBSERVED", "REJECTED"}:
+            terminal_event_id = _content_hash({
+                "schema": 9, "proposal_id": row["proposal_id"],
+                "status": row["status"],
+            })[:32]
+            conn.execute(
+                "INSERT INTO hypothesis_proposal_events "
+                "(event_id, proposal_id, status, event_ts, detail_json) "
+                "VALUES (?,?,?,?,?)",
+                (terminal_event_id, row["proposal_id"], row["status"],
+                 row["observation_until_ts"], _canonical_json({
+                     "source": "schema_migration_9",
+                     "reason": "legacy terminal status",
+                 })))
+        value_key = _content_hash({
+            "strategy_id": row["strategy_id"],
+            "hypothesis_id": row["hypothesis_id"],
+            "target_parameter": row["target_parameter"],
+            "value": json.loads(row["value_json"]),
+        })
+        conn.execute(
+            "INSERT OR IGNORE INTO hypothesis_proposal_value_locks "
+            "(value_key, proposal_id, strategy_id, hypothesis_id, "
+            "target_parameter, value_json, created_ts) VALUES (?,?,?,?,?,?,?)",
+            (value_key, row["proposal_id"], row["strategy_id"],
+             row["hypothesis_id"], row["target_parameter"],
+             row["value_json"], row["proposed_ts"]))
+    _execute_script(conn, """
+        CREATE TRIGGER hypothesis_proposals_require_registered_variant
+            BEFORE INSERT ON hypothesis_proposals
+            WHEN NEW.variant_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM variants
+                WHERE variant_id=NEW.variant_id
+                  AND strategy_id=NEW.strategy_id
+                  AND hypothesis_id=NEW.hypothesis_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'adaptive proposal requires its exact registered variant');
+            END;
+        CREATE TRIGGER hypothesis_proposals_no_update
+            BEFORE UPDATE ON hypothesis_proposals BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal history is immutable');
+            END;
+        CREATE TRIGGER hypothesis_proposals_no_delete
+            BEFORE DELETE ON hypothesis_proposals BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal history is immutable');
+            END;
+        CREATE TRIGGER hypothesis_proposal_events_no_update
+            BEFORE UPDATE ON hypothesis_proposal_events BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal events are immutable');
+            END;
+        CREATE TRIGGER hypothesis_proposal_events_no_delete
+            BEFORE DELETE ON hypothesis_proposal_events BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal events are immutable');
+            END;
+        CREATE TRIGGER hypothesis_proposal_value_locks_no_update
+            BEFORE UPDATE ON hypothesis_proposal_value_locks BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal value locks are immutable');
+            END;
+        CREATE TRIGGER hypothesis_proposal_value_locks_no_delete
+            BEFORE DELETE ON hypothesis_proposal_value_locks BEGIN
+                SELECT RAISE(ABORT, 'hypothesis proposal value locks are immutable');
+            END;
+    """)
+
+
+def _migration_10(conn: sqlite3.Connection) -> None:
+    """Add durable, append-only one-setting-per-strategy rotation."""
+    _execute_script(conn, """
+        CREATE TABLE strategy_experiment_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            baseline_variant_id TEXT NOT NULL,
+            candidate_variant_id TEXT NOT NULL,
+            candidate_key TEXT NOT NULL,
+            axis TEXT NOT NULL,
+            setting_id TEXT NOT NULL,
+            setting_json TEXT NOT NULL,
+            source TEXT NOT NULL CHECK (source IN ('static','adaptive')),
+            proposal_id TEXT,
+            started_ts REAL NOT NULL,
+            minimum_duration_seconds REAL NOT NULL CHECK (
+                minimum_duration_seconds >= 0),
+            minimum_observations INTEGER NOT NULL CHECK (
+                minimum_observations > 0),
+            code_identity_json TEXT NOT NULL,
+            config_identity_json TEXT NOT NULL,
+            FOREIGN KEY (baseline_variant_id)
+                REFERENCES variants(variant_id),
+            FOREIGN KEY (candidate_variant_id)
+                REFERENCES variants(variant_id),
+            FOREIGN KEY (proposal_id)
+                REFERENCES hypothesis_proposals(proposal_id));
+        CREATE INDEX strategy_experiment_assignments_scope
+            ON strategy_experiment_assignments(
+                scope_key, strategy_id, started_ts, assignment_id);
+        CREATE INDEX strategy_experiment_assignments_candidate
+            ON strategy_experiment_assignments(
+                scope_key, strategy_id, candidate_variant_id, candidate_key);
+
+        CREATE TABLE strategy_experiment_active_slots (
+            scope_key TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            assignment_id TEXT NOT NULL UNIQUE,
+            PRIMARY KEY (scope_key, strategy_id),
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id));
+
+        CREATE TABLE strategy_experiment_assignment_events (
+            event_id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('STARTED','OBSERVING','COMPLETED','REJECTED')),
+            event_ts REAL NOT NULL,
+            reason TEXT,
+            detail_json TEXT NOT NULL,
+            UNIQUE (assignment_id, status),
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id));
+        CREATE INDEX strategy_experiment_assignment_events_order
+            ON strategy_experiment_assignment_events(
+                assignment_id, event_ts, event_id);
+
+        CREATE TABLE strategy_experiment_observations (
+            observation_id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL,
+            observation_key TEXT NOT NULL,
+            observed_ts REAL NOT NULL,
+            detail_json TEXT NOT NULL,
+            UNIQUE (assignment_id, observation_key),
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id));
+        CREATE INDEX strategy_experiment_observations_order
+            ON strategy_experiment_observations(
+                assignment_id, observed_ts, observation_id);
+
+        CREATE TRIGGER strategy_experiment_assignments_no_update
+            BEFORE UPDATE ON strategy_experiment_assignments BEGIN
+                SELECT RAISE(ABORT, 'experiment assignments are immutable');
+            END;
+        CREATE TRIGGER strategy_experiment_assignments_no_delete
+            BEFORE DELETE ON strategy_experiment_assignments BEGIN
+                SELECT RAISE(ABORT, 'experiment assignments are immutable');
+            END;
+        CREATE TRIGGER strategy_experiment_assignment_events_no_update
+            BEFORE UPDATE ON strategy_experiment_assignment_events BEGIN
+                SELECT RAISE(ABORT, 'experiment assignment events are immutable');
+            END;
+        CREATE TRIGGER strategy_experiment_assignment_events_no_delete
+            BEFORE DELETE ON strategy_experiment_assignment_events BEGIN
+                SELECT RAISE(ABORT, 'experiment assignment events are immutable');
+            END;
+        CREATE TRIGGER strategy_experiment_observations_no_update
+            BEFORE UPDATE ON strategy_experiment_observations BEGIN
+                SELECT RAISE(ABORT, 'experiment observations are immutable');
+            END;
+        CREATE TRIGGER strategy_experiment_observations_no_delete
+            BEFORE DELETE ON strategy_experiment_observations BEGIN
+                SELECT RAISE(ABORT, 'experiment observations are immutable');
+            END;
+    """)
+    migration_ts = time.time()
+    for row in conn.execute(
+            "SELECT proposal.* FROM hypothesis_proposals AS proposal "
+            "WHERE proposal.variant_id IS NULL AND COALESCE(("
+            "SELECT event.status FROM hypothesis_proposal_events AS event "
+            "WHERE event.proposal_id=proposal.proposal_id "
+            "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1"
+            "), proposal.status) NOT IN ('OBSERVED','REJECTED') "
+            "ORDER BY proposal.proposed_ts, proposal.proposal_id"):
+        conn.execute(
+            "INSERT INTO hypothesis_proposal_events "
+            "(event_id, proposal_id, status, event_ts, detail_json) "
+            "VALUES (?,?,?,?,?)",
+            (_content_hash({
+                "schema": 10,
+                "proposal_id": row["proposal_id"],
+                "status": "REJECTED",
+            })[:32], row["proposal_id"], "REJECTED", migration_ts,
+             _canonical_json({
+                 "source": "schema_migration_10",
+                 "reason": (
+                     "legacy proposal has no exact registered variant and "
+                     "cannot enter durable experiment rotation"),
+             })))
+
+
+def _migration_11(conn: sqlite3.Connection) -> None:
+    """Add an append-only LLM research-selection and assignment ledger."""
+    _execute_script(conn, """
+        CREATE TABLE research_selections (
+            selection_id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            cycle_id TEXT,
+            model_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            requested_strategy_id TEXT NOT NULL,
+            requested_variant_id TEXT,
+            resolved_variant_id TEXT,
+            original_reasoning TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            requested_ts REAL NOT NULL,
+            FOREIGN KEY (resolved_variant_id) REFERENCES variants(variant_id));
+        CREATE INDEX research_selections_scope
+            ON research_selections(
+                scope_key, requested_strategy_id, requested_ts, selection_id);
+        CREATE INDEX research_selections_resolved
+            ON research_selections(
+                scope_key, requested_strategy_id, resolved_variant_id);
+
+        CREATE TABLE research_selection_events (
+            event_id TEXT PRIMARY KEY,
+            selection_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('ACCEPTED','ASSIGNED','TESTED','REJECTED')),
+            event_ts REAL NOT NULL,
+            reason TEXT,
+            assignment_id TEXT,
+            detail_json TEXT NOT NULL,
+            UNIQUE (selection_id, status),
+            FOREIGN KEY (selection_id)
+                REFERENCES research_selections(selection_id),
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id));
+        CREATE INDEX research_selection_events_order
+            ON research_selection_events(selection_id, event_ts, event_id);
+        CREATE INDEX research_selection_events_assignment
+            ON research_selection_events(assignment_id, status);
+
+        CREATE TRIGGER research_selections_no_update
+            BEFORE UPDATE ON research_selections BEGIN
+                SELECT RAISE(ABORT, 'research selections are immutable');
+            END;
+        CREATE TRIGGER research_selections_no_delete
+            BEFORE DELETE ON research_selections BEGIN
+                SELECT RAISE(ABORT, 'research selections are immutable');
+            END;
+        CREATE TRIGGER research_selection_events_no_update
+            BEFORE UPDATE ON research_selection_events BEGIN
+                SELECT RAISE(ABORT, 'research selection events are immutable');
+            END;
+        CREATE TRIGGER research_selection_events_no_delete
+            BEFORE DELETE ON research_selection_events BEGIN
+                SELECT RAISE(ABORT, 'research selection events are immutable');
+            END;
+    """)
+
+
+def _migration_12(conn: sqlite3.Connection) -> None:
+    """Close terminal experiments into outcomes, evidence, and LLM reviews."""
+    _execute_script(conn, """
+        CREATE TABLE experiment_outcomes (
+            outcome_id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL UNIQUE,
+            scope_key TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            baseline_variant_id TEXT NOT NULL,
+            candidate_variant_id TEXT NOT NULL,
+            terminal_status TEXT NOT NULL CHECK (
+                terminal_status IN ('COMPLETED','REJECTED')),
+            verdict TEXT NOT NULL CHECK (
+                verdict IN ('WORKED','FAILED','INCONCLUSIVE')),
+            created_ts REAL NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL UNIQUE,
+            analysis_id TEXT NOT NULL UNIQUE,
+            finding_id INTEGER NOT NULL UNIQUE,
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id),
+            FOREIGN KEY (baseline_variant_id) REFERENCES variants(variant_id),
+            FOREIGN KEY (candidate_variant_id) REFERENCES variants(variant_id),
+            FOREIGN KEY (analysis_id) REFERENCES analysis_runs(analysis_id),
+            FOREIGN KEY (finding_id) REFERENCES findings(finding_id));
+        CREATE INDEX experiment_outcomes_pending_review
+            ON experiment_outcomes(created_ts, outcome_id);
+
+        CREATE TABLE research_edge_evidence (
+            edge_id TEXT PRIMARY KEY,
+            outcome_id TEXT NOT NULL UNIQUE,
+            assignment_id TEXT NOT NULL UNIQUE,
+            scope_key TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            variant_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status='EDGE_CANDIDATE'),
+            created_ts REAL NOT NULL,
+            evidence_json TEXT NOT NULL,
+            evidence_hash TEXT NOT NULL UNIQUE,
+            FOREIGN KEY (outcome_id) REFERENCES experiment_outcomes(outcome_id),
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id),
+            FOREIGN KEY (variant_id) REFERENCES variants(variant_id));
+
+        CREATE TABLE experiment_review_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            outcome_id TEXT NOT NULL,
+            requested_ts REAL NOT NULL,
+            completed_ts REAL NOT NULL,
+            provider TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            raw_response TEXT,
+            response_json TEXT,
+            parse_error TEXT,
+            status TEXT NOT NULL CHECK (status IN ('SUCCEEDED','FAILED')),
+            FOREIGN KEY (outcome_id) REFERENCES experiment_outcomes(outcome_id));
+        CREATE INDEX experiment_review_attempts_outcome
+            ON experiment_review_attempts(outcome_id, requested_ts, attempt_id);
+
+        CREATE TABLE experiment_reviews (
+            review_id TEXT PRIMARY KEY,
+            outcome_id TEXT NOT NULL UNIQUE,
+            attempt_id TEXT NOT NULL UNIQUE,
+            created_ts REAL NOT NULL,
+            explanation TEXT NOT NULL,
+            limitations_json TEXT NOT NULL,
+            next_selection_json TEXT,
+            selection_id TEXT,
+            FOREIGN KEY (outcome_id) REFERENCES experiment_outcomes(outcome_id),
+            FOREIGN KEY (attempt_id)
+                REFERENCES experiment_review_attempts(attempt_id),
+            FOREIGN KEY (selection_id) REFERENCES research_selections(selection_id));
+
+        CREATE TRIGGER experiment_outcomes_no_update
+            BEFORE UPDATE ON experiment_outcomes BEGIN
+                SELECT RAISE(ABORT, 'experiment outcomes are immutable');
+            END;
+        CREATE TRIGGER experiment_outcomes_no_delete
+            BEFORE DELETE ON experiment_outcomes BEGIN
+                SELECT RAISE(ABORT, 'experiment outcomes are immutable');
+            END;
+        CREATE TRIGGER research_edge_evidence_no_update
+            BEFORE UPDATE ON research_edge_evidence BEGIN
+                SELECT RAISE(ABORT, 'research edge evidence is immutable');
+            END;
+        CREATE TRIGGER research_edge_evidence_no_delete
+            BEFORE DELETE ON research_edge_evidence BEGIN
+                SELECT RAISE(ABORT, 'research edge evidence is immutable');
+            END;
+        CREATE TRIGGER experiment_review_attempts_no_update
+            BEFORE UPDATE ON experiment_review_attempts BEGIN
+                SELECT RAISE(ABORT, 'experiment review attempts are immutable');
+            END;
+        CREATE TRIGGER experiment_review_attempts_no_delete
+            BEFORE DELETE ON experiment_review_attempts BEGIN
+                SELECT RAISE(ABORT, 'experiment review attempts are immutable');
+            END;
+        CREATE TRIGGER experiment_reviews_no_update
+            BEFORE UPDATE ON experiment_reviews BEGIN
+                SELECT RAISE(ABORT, 'experiment reviews are immutable');
+            END;
+        CREATE TRIGGER experiment_reviews_no_delete
+            BEFORE DELETE ON experiment_reviews BEGIN
+                SELECT RAISE(ABORT, 'experiment reviews are immutable');
+            END;
+    """)
+    terminal = conn.execute(
+        "SELECT assignment.assignment_id "
+        "FROM strategy_experiment_assignments AS assignment "
+        "WHERE (SELECT event.status "
+        "FROM strategy_experiment_assignment_events AS event "
+        "WHERE event.assignment_id=assignment.assignment_id "
+        "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) "
+        "IN ('COMPLETED','REJECTED') "
+        "ORDER BY assignment.started_ts, assignment.assignment_id"
+    ).fetchall()
+    for row in terminal:
+        _ensure_experiment_outcome_conn(conn, str(row["assignment_id"]))
+
+
+def _migration_13(conn: sqlite3.Connection) -> None:
+    """Add immutable tournament evidence and verified backup history."""
+    _execute_script(conn, """
+        CREATE TABLE tournament_runs (
+            run_id TEXT PRIMARY KEY,
+            content_id TEXT NOT NULL,
+            started_ts REAL NOT NULL,
+            run_directory TEXT NOT NULL UNIQUE,
+            command_json TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            code_identity_json TEXT NOT NULL,
+            config_identity_json TEXT NOT NULL,
+            data_manifest_identity_json TEXT NOT NULL,
+            input_hashes_json TEXT NOT NULL);
+        CREATE INDEX tournament_runs_content
+            ON tournament_runs(content_id, started_ts, run_id);
+
+        CREATE TABLE tournament_run_events (
+            event_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('STARTED','SUCCEEDED','FAILED')),
+            event_ts REAL NOT NULL,
+            detail_json TEXT NOT NULL,
+            UNIQUE (run_id, status),
+            FOREIGN KEY (run_id) REFERENCES tournament_runs(run_id));
+        CREATE INDEX tournament_run_events_order
+            ON tournament_run_events(run_id, event_ts, event_id);
+
+        CREATE TABLE tournament_strategy_results (
+            strategy_result_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            version TEXT,
+            scored INTEGER NOT NULL CHECK (scored IN (0,1)),
+            registered_tier TEXT,
+            measured_tier TEXT,
+            verdict TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            UNIQUE (run_id, strategy_id),
+            FOREIGN KEY (run_id) REFERENCES tournament_runs(run_id));
+        CREATE INDEX tournament_strategy_results_run
+            ON tournament_strategy_results(run_id, strategy_id);
+
+        CREATE TABLE tournament_setting_results (
+            setting_result_id TEXT PRIMARY KEY,
+            strategy_result_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            setting_id TEXT NOT NULL,
+            registered INTEGER NOT NULL CHECK (registered IN (0,1)),
+            verdict TEXT NOT NULL,
+            params_json TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            UNIQUE (run_id, strategy_id, setting_id),
+            FOREIGN KEY (strategy_result_id)
+                REFERENCES tournament_strategy_results(strategy_result_id),
+            FOREIGN KEY (run_id) REFERENCES tournament_runs(run_id));
+        CREATE INDEX tournament_setting_results_run
+            ON tournament_setting_results(run_id, strategy_id, setting_id);
+
+        CREATE TABLE backup_runs (
+            backup_id TEXT PRIMARY KEY,
+            request_content_id TEXT NOT NULL,
+            started_ts REAL NOT NULL,
+            target_root TEXT NOT NULL,
+            target_kind TEXT NOT NULL CHECK (
+                target_kind IN ('local_default','external_configured')),
+            require_external INTEGER NOT NULL CHECK (
+                require_external IN (0,1)),
+            command_json TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            source_paths_json TEXT NOT NULL);
+        CREATE INDEX backup_runs_target
+            ON backup_runs(target_kind, started_ts, backup_id);
+
+        CREATE TABLE backup_run_events (
+            event_id TEXT PRIMARY KEY,
+            backup_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('STARTED','VERIFIED','FAILED')),
+            event_ts REAL NOT NULL,
+            detail_json TEXT NOT NULL,
+            UNIQUE (backup_id, status),
+            FOREIGN KEY (backup_id) REFERENCES backup_runs(backup_id));
+        CREATE INDEX backup_run_events_order
+            ON backup_run_events(backup_id, event_ts, event_id);
+
+        CREATE TABLE backup_files (
+            backup_file_id TEXT PRIMARY KEY,
+            backup_id TEXT NOT NULL,
+            archive_path TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('sqlite','file')),
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            sha256 TEXT NOT NULL,
+            verification_json TEXT NOT NULL,
+            UNIQUE (backup_id, archive_path),
+            FOREIGN KEY (backup_id) REFERENCES backup_runs(backup_id));
+        CREATE INDEX backup_files_backup
+            ON backup_files(backup_id, archive_path);
+
+        CREATE TABLE backup_verifications (
+            verification_id TEXT PRIMARY KEY,
+            backup_id TEXT,
+            backup_path TEXT NOT NULL,
+            verified_ts REAL NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('VERIFIED','FAILED')),
+            detail_json TEXT NOT NULL,
+            FOREIGN KEY (backup_id) REFERENCES backup_runs(backup_id));
+        CREATE INDEX backup_verifications_backup
+            ON backup_verifications(backup_id, verified_ts, verification_id);
+
+        CREATE TRIGGER tournament_runs_no_update
+            BEFORE UPDATE ON tournament_runs BEGIN
+                SELECT RAISE(ABORT, 'tournament runs are immutable');
+            END;
+        CREATE TRIGGER tournament_runs_no_delete
+            BEFORE DELETE ON tournament_runs BEGIN
+                SELECT RAISE(ABORT, 'tournament runs are immutable');
+            END;
+        CREATE TRIGGER tournament_run_events_no_update
+            BEFORE UPDATE ON tournament_run_events BEGIN
+                SELECT RAISE(ABORT, 'tournament run events are immutable');
+            END;
+        CREATE TRIGGER tournament_run_events_no_delete
+            BEFORE DELETE ON tournament_run_events BEGIN
+                SELECT RAISE(ABORT, 'tournament run events are immutable');
+            END;
+        CREATE TRIGGER tournament_strategy_results_no_update
+            BEFORE UPDATE ON tournament_strategy_results BEGIN
+                SELECT RAISE(ABORT, 'tournament strategy results are immutable');
+            END;
+        CREATE TRIGGER tournament_strategy_results_no_delete
+            BEFORE DELETE ON tournament_strategy_results BEGIN
+                SELECT RAISE(ABORT, 'tournament strategy results are immutable');
+            END;
+        CREATE TRIGGER tournament_setting_results_no_update
+            BEFORE UPDATE ON tournament_setting_results BEGIN
+                SELECT RAISE(ABORT, 'tournament setting results are immutable');
+            END;
+        CREATE TRIGGER tournament_setting_results_no_delete
+            BEFORE DELETE ON tournament_setting_results BEGIN
+                SELECT RAISE(ABORT, 'tournament setting results are immutable');
+            END;
+        CREATE TRIGGER backup_runs_no_update
+            BEFORE UPDATE ON backup_runs BEGIN
+                SELECT RAISE(ABORT, 'backup runs are immutable');
+            END;
+        CREATE TRIGGER backup_runs_no_delete
+            BEFORE DELETE ON backup_runs BEGIN
+                SELECT RAISE(ABORT, 'backup runs are immutable');
+            END;
+        CREATE TRIGGER backup_run_events_no_update
+            BEFORE UPDATE ON backup_run_events BEGIN
+                SELECT RAISE(ABORT, 'backup run events are immutable');
+            END;
+        CREATE TRIGGER backup_run_events_no_delete
+            BEFORE DELETE ON backup_run_events BEGIN
+                SELECT RAISE(ABORT, 'backup run events are immutable');
+            END;
+        CREATE TRIGGER backup_files_no_update
+            BEFORE UPDATE ON backup_files BEGIN
+                SELECT RAISE(ABORT, 'backup files are immutable');
+            END;
+        CREATE TRIGGER backup_files_no_delete
+            BEFORE DELETE ON backup_files BEGIN
+                SELECT RAISE(ABORT, 'backup files are immutable');
+            END;
+        CREATE TRIGGER backup_verifications_no_update
+            BEFORE UPDATE ON backup_verifications BEGIN
+                SELECT RAISE(ABORT, 'backup verifications are immutable');
+            END;
+        CREATE TRIGGER backup_verifications_no_delete
+            BEFORE DELETE ON backup_verifications BEGIN
+                SELECT RAISE(ABORT, 'backup verifications are immutable');
+            END;
+    """)
+
+
+def _migration_14(conn: sqlite3.Connection) -> None:
+    """Only call a configured backup external with different-device proof."""
+    _execute_script(conn, """
+        DROP TRIGGER backup_runs_no_update;
+        DROP TRIGGER backup_runs_no_delete;
+        DROP INDEX backup_runs_target;
+
+        CREATE TABLE backup_runs_v14 (
+            backup_id TEXT PRIMARY KEY,
+            request_content_id TEXT NOT NULL,
+            started_ts REAL NOT NULL,
+            target_root TEXT NOT NULL,
+            target_kind TEXT NOT NULL CHECK (
+                target_kind IN (
+                    'local_default','configured_local','external_mounted')),
+            target_evidence_json TEXT NOT NULL,
+            require_external INTEGER NOT NULL CHECK (
+                require_external IN (0,1)),
+            command_json TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            source_paths_json TEXT NOT NULL);
+    """)
+    rows = conn.execute(
+        "SELECT * FROM backup_runs ORDER BY started_ts, backup_id").fetchall()
+    for row in rows:
+        legacy_kind = str(row["target_kind"])
+        target_kind = (
+            "local_default" if legacy_kind == "local_default"
+            else "configured_local")
+        evidence = {
+            "external_proven": False,
+            "method": "schema_migration_14",
+            "reason": (
+                "legacy configured targets had no different-device proof; "
+                "reclassified as configured_local"
+            ),
+        }
+        conn.execute(
+            "INSERT INTO backup_runs_v14 (backup_id, request_content_id, "
+            "started_ts, target_root, target_kind, target_evidence_json, "
+            "require_external, command_json, options_json, "
+            "source_paths_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (row["backup_id"], row["request_content_id"], row["started_ts"],
+             row["target_root"], target_kind, _canonical_json(evidence),
+             row["require_external"], row["command_json"],
+             row["options_json"], row["source_paths_json"]))
+    _execute_script(conn, """
+        DROP TABLE backup_runs;
+        ALTER TABLE backup_runs_v14 RENAME TO backup_runs;
+
+        CREATE INDEX backup_runs_target
+            ON backup_runs(target_kind, started_ts, backup_id);
+        CREATE TRIGGER backup_runs_no_update
+            BEFORE UPDATE ON backup_runs BEGIN
+                SELECT RAISE(ABORT, 'backup runs are immutable');
+            END;
+        CREATE TRIGGER backup_runs_no_delete
+            BEFORE DELETE ON backup_runs BEGIN
+                SELECT RAISE(ABORT, 'backup runs are immutable');
+            END;
+    """)
+
+
 MIGRATIONS = {
     1: ("create_initial_store", _migration_1),
     2: ("rebuild_legacy_constraints", _migration_2),
@@ -967,6 +2259,12 @@ MIGRATIONS = {
     6: ("content_addressed_analyses", _migration_6),
     7: ("complete_paper_decision_ledger", _migration_7),
     8: ("hypothesis_identity_and_adaptive_proposals", _migration_8),
+    9: ("exact_adaptive_proposal_lifecycle", _migration_9),
+    10: ("durable_strategy_experiment_rotation", _migration_10),
+    11: ("bounded_llm_research_selection", _migration_11),
+    12: ("deterministic_experiment_learning_loop", _migration_12),
+    13: ("durable_tournament_and_verified_backups", _migration_13),
+    14: ("verified_external_mount_classification", _migration_14),
 }
 
 
@@ -982,6 +2280,30 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
         required.add("paper_decisions")
     if _stored_version(conn) >= 8:
         required.add("hypothesis_proposals")
+    if _stored_version(conn) >= 9:
+        required.update({"hypothesis_proposal_events",
+                         "hypothesis_proposal_value_locks"})
+    if _stored_version(conn) >= 10:
+        required.update({
+            "strategy_experiment_assignments",
+            "strategy_experiment_active_slots",
+            "strategy_experiment_assignment_events",
+            "strategy_experiment_observations",
+        })
+    if _stored_version(conn) >= 11:
+        required.update({"research_selections", "research_selection_events"})
+    if _stored_version(conn) >= 12:
+        required.update({
+            "experiment_outcomes", "research_edge_evidence",
+            "experiment_review_attempts", "experiment_reviews",
+        })
+    if _stored_version(conn) >= 13:
+        required.update({
+            "tournament_runs", "tournament_run_events",
+            "tournament_strategy_results", "tournament_setting_results",
+            "backup_runs", "backup_run_events", "backup_files",
+            "backup_verifications",
+        })
     missing = sorted(table for table in required
                      if not _table_exists(conn, table))
     if missing:
@@ -1045,15 +2367,48 @@ class FindingsStore:
 
     @property
     def backup_path(self) -> Path:
+        root = self.path.with_name(f"{self.path.name}.snapshots")
+        snapshots = sorted(root.glob("*.db")) if root.is_dir() else []
+        if snapshots:
+            return snapshots[-1]
         return self.path.with_name(f"{self.path.name}.backup")
 
     def backup(self, destination: str | Path | None = None) -> Path:
-        """Write a transactionally consistent SQLite backup."""
-        target = Path(destination) if destination else self.backup_path
-        target.parent.mkdir(parents=True, exist_ok=True)
+        """Write one immutable findings-only online snapshot.
+
+        The full recorder/journal/results backup lives in ``research.backup``.
+        This compatibility method remains for call sites that want an
+        immediate findings snapshot, but it never overwrites an older one.
+        """
+        if destination is not None:
+            target = Path(destination)
+            if target.exists():
+                raise FileExistsError(f"backup destination exists: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging = target
+        else:
+            root = self.path.with_name(f"{self.path.name}.snapshots")
+            root.mkdir(parents=True, exist_ok=True)
+            staging = root / f".incomplete-{time.time_ns()}-{uuid.uuid4().hex}.db"
         with _connect(self.path) as source, sqlite3.connect(
-                target, factory=_ClosingConnection) as copy:
+                staging, factory=_ClosingConnection) as copy:
             source.backup(copy)
+        with sqlite3.connect(
+                f"file:{staging}?mode=ro", uri=True,
+                factory=_ClosingConnection) as check:
+            if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("findings snapshot failed integrity_check")
+            if check.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError("findings snapshot failed foreign_key_check")
+        if destination is None:
+            hasher = hashlib.sha256()
+            with staging.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            digest = hasher.hexdigest()
+            target = staging.with_name(
+                f"{time.time_ns()}-{digest[:16]}-{uuid.uuid4().hex[:12]}.db")
+            staging.rename(target)
         return target
 
     def schema_version(self) -> int:
@@ -1064,6 +2419,309 @@ class FindingsStore:
         with _connect(self.path) as conn:
             return [dict(row) for row in conn.execute(
                 "SELECT * FROM schema_migrations ORDER BY version")]
+
+    # ---------------------------------------- tournament and backup evidence
+
+    def start_tournament_run(self, run: dict) -> None:
+        """Append one immutable tournament invocation and its start event."""
+        with _connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO tournament_runs (run_id, content_id, started_ts, "
+                "run_directory, command_json, options_json, "
+                "code_identity_json, config_identity_json, "
+                "data_manifest_identity_json, input_hashes_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (str(run["run_id"]), str(run["content_id"]),
+                 float(run["started_ts"]), str(run["run_directory"]),
+                 _canonical_json(run.get("command") or []),
+                 _canonical_json(run.get("options") or {}),
+                 _canonical_json(run.get("code_identity") or {}),
+                 _canonical_json(run.get("config_identity") or {}),
+                 _canonical_json(run.get("data_manifest_identity") or {}),
+                 _canonical_json(run.get("input_hashes") or {})))
+            conn.execute(
+                "INSERT INTO tournament_run_events "
+                "(event_id, run_id, status, event_ts, detail_json) "
+                "VALUES (?,?,?,?,?)",
+                (uuid.uuid4().hex, str(run["run_id"]), "STARTED",
+                 float(run["started_ts"]), _canonical_json({
+                     "run_directory": str(run["run_directory"]),
+                 })))
+
+    def finish_tournament_run(
+            self, run_id: str, status: str, *, ended_ts: float,
+            strategies: list[dict] | None = None,
+            detail: dict | None = None) -> None:
+        """Atomically append a tournament's structured results and outcome."""
+        if status not in {"SUCCEEDED", "FAILED"}:
+            raise ValueError("tournament status must be SUCCEEDED or FAILED")
+        rows = list(strategies or [])
+        with _connect(self.path) as conn:
+            if conn.execute(
+                    "SELECT 1 FROM tournament_runs WHERE run_id=?",
+                    (run_id,)).fetchone() is None:
+                raise ValueError(f"unknown tournament run_id {run_id!r}")
+            if conn.execute(
+                    "SELECT 1 FROM tournament_run_events WHERE run_id=? "
+                    "AND status IN ('SUCCEEDED','FAILED')",
+                    (run_id,)).fetchone() is not None:
+                raise ValueError(f"tournament run {run_id!r} is already final")
+            for row in rows:
+                strategy_id = str(row.get("strategy_id") or "")
+                if not strategy_id:
+                    raise ValueError("tournament strategy result has no id")
+                strategy_result_id = _content_hash({
+                    "run_id": run_id, "strategy_id": strategy_id,
+                })[:32]
+                scored = bool(row.get("scored"))
+                headline = row.get("headline") or {}
+                metrics = {
+                    **headline,
+                    "settings_tested": row.get("settings_tested"),
+                    "best_setting": row.get("best_setting"),
+                    "tier_changed": row.get("tier_changed"),
+                    "benchmark_authority_ceiling": row.get(
+                        "exploratory_ceiling"),
+                }
+                verdict = str(
+                    row.get("measured_tier") if scored
+                    else row.get("reason") or "NOT_SCORED")
+                conn.execute(
+                    "INSERT INTO tournament_strategy_results "
+                    "(strategy_result_id, run_id, strategy_id, version, "
+                    "scored, registered_tier, measured_tier, verdict, "
+                    "metrics_json, result_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (strategy_result_id, run_id, strategy_id,
+                     str(row.get("version") or "") or None, int(scored),
+                     row.get("registered_tier"), row.get("measured_tier"),
+                     verdict, _canonical_json(metrics), _canonical_json(row)))
+                for setting in row.get("settings") or []:
+                    setting_id = str(setting.get("setting_id") or "")
+                    if not setting_id:
+                        raise ValueError(
+                            f"{strategy_id} tournament setting has no id")
+                    setting_result_id = _content_hash({
+                        "run_id": run_id, "strategy_id": strategy_id,
+                        "setting_id": setting_id,
+                    })[:32]
+                    setting_metrics = {
+                        key: setting.get(key) for key in (
+                            "trades", "expectancy_pct", "expectancy_r",
+                            "p_adjusted", "significant_corrected")
+                    }
+                    conn.execute(
+                        "INSERT INTO tournament_setting_results "
+                        "(setting_result_id, strategy_result_id, run_id, "
+                        "strategy_id, setting_id, registered, verdict, "
+                        "params_json, metrics_json, result_json) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (setting_result_id, strategy_result_id, run_id,
+                         strategy_id, setting_id,
+                         int(bool(setting.get("registered"))),
+                         str(setting.get("tier") or setting.get("why")
+                             or "UNSCORED"),
+                         _canonical_json(setting.get("params") or {}),
+                         _canonical_json(setting_metrics),
+                         _canonical_json(setting)))
+            conn.execute(
+                "INSERT INTO tournament_run_events "
+                "(event_id, run_id, status, event_ts, detail_json) "
+                "VALUES (?,?,?,?,?)",
+                (uuid.uuid4().hex, run_id, status, float(ended_ts),
+                 _canonical_json(detail or {})))
+
+    @staticmethod
+    def _decode_json_columns(item: dict, names: tuple[str, ...]) -> dict:
+        for name in names:
+            raw = item.pop(f"{name}_json", None)
+            item[name] = json.loads(raw) if raw is not None else None
+        return item
+
+    def tournament_runs(self) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT run.*, event.status, event.event_ts AS status_ts, "
+                "event.detail_json FROM tournament_runs AS run "
+                "JOIN tournament_run_events AS event ON event.event_id=("
+                "SELECT latest.event_id FROM tournament_run_events AS latest "
+                "WHERE latest.run_id=run.run_id "
+                "ORDER BY latest.event_ts DESC, latest.rowid DESC LIMIT 1) "
+                "ORDER BY run.started_ts, run.run_id").fetchall()
+        out = []
+        names = ("command", "options", "code_identity", "config_identity",
+                 "data_manifest_identity", "input_hashes", "detail")
+        for row in rows:
+            item = self._decode_json_columns(dict(row), names)
+            item["ended_ts"] = (
+                item["status_ts"] if item["status"] != "STARTED" else None)
+            out.append(item)
+        return out
+
+    def tournament_results(self, run_id: str) -> dict:
+        with _connect(self.path) as conn:
+            strategies = conn.execute(
+                "SELECT * FROM tournament_strategy_results WHERE run_id=? "
+                "ORDER BY strategy_id", (run_id,)).fetchall()
+            settings = conn.execute(
+                "SELECT * FROM tournament_setting_results WHERE run_id=? "
+                "ORDER BY strategy_id, setting_id", (run_id,)).fetchall()
+        return {
+            "strategies": [self._decode_json_columns(
+                dict(row), ("metrics", "result")) for row in strategies],
+            "settings": [self._decode_json_columns(
+                dict(row), ("params", "metrics", "result"))
+                for row in settings],
+        }
+
+    def start_backup_run(self, run: dict) -> None:
+        """Append a backup request before touching any destination files."""
+        with _connect(self.path) as conn:
+            conn.execute(
+                "INSERT INTO backup_runs (backup_id, request_content_id, "
+                "started_ts, target_root, target_kind, target_evidence_json, "
+                "require_external, command_json, options_json, "
+                "source_paths_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (str(run["backup_id"]), str(run["request_content_id"]),
+                 float(run["started_ts"]), str(run["target_root"]),
+                 str(run["target_kind"]),
+                 _canonical_json(run.get("target_evidence") or {}),
+                 int(bool(run.get("require_external"))),
+                 _canonical_json(run.get("command") or []),
+                 _canonical_json(run.get("options") or {}),
+                 _canonical_json(run.get("source_paths") or [])))
+            conn.execute(
+                "INSERT INTO backup_run_events "
+                "(event_id, backup_id, status, event_ts, detail_json) "
+                "VALUES (?,?,?,?,?)",
+                (uuid.uuid4().hex, str(run["backup_id"]), "STARTED",
+                 float(run["started_ts"]), _canonical_json({
+                     "target_root": str(run["target_root"]),
+                     "target_kind": str(run["target_kind"]),
+                     "target_evidence": run.get("target_evidence") or {},
+                 })))
+
+    def finish_backup_run(
+            self, backup_id: str, status: str, *, ended_ts: float,
+            backup_path: str | Path, files: list[dict] | None = None,
+            detail: dict | None = None) -> None:
+        if status not in {"VERIFIED", "FAILED"}:
+            raise ValueError("backup status must be VERIFIED or FAILED")
+        file_rows = list(files or [])
+        with _connect(self.path) as conn:
+            if conn.execute(
+                    "SELECT 1 FROM backup_runs WHERE backup_id=?",
+                    (backup_id,)).fetchone() is None:
+                raise ValueError(f"unknown backup_id {backup_id!r}")
+            if conn.execute(
+                    "SELECT 1 FROM backup_run_events WHERE backup_id=? "
+                    "AND status IN ('VERIFIED','FAILED')",
+                    (backup_id,)).fetchone() is not None:
+                raise ValueError(f"backup run {backup_id!r} is already final")
+            for item in file_rows:
+                archive_path = str(item["archive_path"])
+                conn.execute(
+                    "INSERT INTO backup_files (backup_file_id, backup_id, "
+                    "archive_path, source_path, kind, size_bytes, sha256, "
+                    "verification_json) VALUES (?,?,?,?,?,?,?,?)",
+                    (_content_hash({
+                        "backup_id": backup_id,
+                        "archive_path": archive_path,
+                    })[:32], backup_id, archive_path,
+                     str(item.get("source_path") or ""),
+                     str(item.get("kind") or "file"),
+                     int(item.get("size_bytes") or 0), str(item["sha256"]),
+                     _canonical_json(item.get("verification") or {})))
+            verification_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO backup_verifications (verification_id, "
+                "backup_id, backup_path, verified_ts, status, detail_json) "
+                "VALUES (?,?,?,?,?,?)",
+                (verification_id, backup_id, str(backup_path),
+                 float(ended_ts), status, _canonical_json(detail or {})))
+            conn.execute(
+                "INSERT INTO backup_run_events "
+                "(event_id, backup_id, status, event_ts, detail_json) "
+                "VALUES (?,?,?,?,?)",
+                (uuid.uuid4().hex, backup_id, status, float(ended_ts),
+                 _canonical_json({
+                     "backup_path": str(backup_path), **(detail or {}),
+                 })))
+
+    def record_backup_verification(
+            self, backup_id: str | None, backup_path: str | Path,
+            status: str, detail: dict, *, verified_ts: float | None = None
+            ) -> str:
+        if status not in {"VERIFIED", "FAILED"}:
+            raise ValueError("verification status must be VERIFIED or FAILED")
+        verification_id = uuid.uuid4().hex
+        with _connect(self.path) as conn:
+            if backup_id is not None and conn.execute(
+                    "SELECT 1 FROM backup_runs WHERE backup_id=?",
+                    (backup_id,)).fetchone() is None:
+                backup_id = None
+            conn.execute(
+                "INSERT INTO backup_verifications (verification_id, "
+                "backup_id, backup_path, verified_ts, status, detail_json) "
+                "VALUES (?,?,?,?,?,?)",
+                (verification_id, backup_id, str(backup_path),
+                 time.time() if verified_ts is None else float(verified_ts),
+                 status, _canonical_json(detail)))
+        return verification_id
+
+    def backup_runs(self) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT run.*, event.status, event.event_ts AS status_ts, "
+                "event.detail_json FROM backup_runs AS run "
+                "JOIN backup_run_events AS event ON event.event_id=("
+                "SELECT latest.event_id FROM backup_run_events AS latest "
+                "WHERE latest.backup_id=run.backup_id "
+                "ORDER BY latest.event_ts DESC, latest.rowid DESC LIMIT 1) "
+                "ORDER BY run.started_ts, run.backup_id").fetchall()
+        out = []
+        for row in rows:
+            item = self._decode_json_columns(
+                dict(row), ("target_evidence", "command", "options",
+                            "source_paths", "detail"))
+            item["ended_ts"] = (
+                item["status_ts"] if item["status"] != "STARTED" else None)
+            out.append(item)
+        return out
+
+    def backup_verifications(self, backup_id: str | None = None) -> list[dict]:
+        with _connect(self.path) as conn:
+            if backup_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM backup_verifications "
+                    "ORDER BY verified_ts, verification_id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM backup_verifications WHERE backup_id=? "
+                    "ORDER BY verified_ts, verification_id",
+                    (backup_id,)).fetchall()
+        return [self._decode_json_columns(dict(row), ("detail",))
+                for row in rows]
+
+    def latest_verified_external_backup(self) -> dict | None:
+        """Return a verified backup proven to use a different device."""
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT run.*, verification.backup_path, "
+                "verification.verified_ts, verification.detail_json "
+                "FROM backup_runs AS run JOIN backup_verifications AS "
+                "verification ON verification.verification_id=("
+                "SELECT latest.verification_id FROM backup_verifications AS "
+                "latest WHERE latest.backup_id=run.backup_id "
+                "ORDER BY latest.verified_ts DESC, latest.rowid DESC LIMIT 1) "
+                "WHERE run.target_kind='external_mounted' "
+                "AND verification.status='VERIFIED' "
+                "ORDER BY verification.verified_ts DESC").fetchall()
+        for row in rows:
+            item = self._decode_json_columns(
+                dict(row), ("target_evidence", "detail"))
+            if _positive_external_target_evidence(item["target_evidence"]):
+                return item
+        return None
 
     # ------------------------------------------------------- paper research
 
@@ -1565,7 +3223,7 @@ class FindingsStore:
                 seen_values.add(values)
             return canonical_axis
 
-        expected_baseline = f"{strategy_id}.baseline"
+        expected_baseline = f"{str(strategy_id).replace('-', '_')}.baseline"
         if baseline_id != expected_baseline:
             raise ValueError(
                 f"forward baseline must be {expected_baseline!r}, not "
@@ -2042,7 +3700,7 @@ class FindingsStore:
                 "strategy or scope")
 
         expected_axis_ids = set()
-        baseline_id = f"{strategy_id}.baseline"
+        baseline_id = f"{strategy_id.replace('-', '_')}.baseline"
         hypothesis_groups = {}
         for registered in conn.execute(
                 "SELECT variant_id, strategy_id, status, overrides_json, "
@@ -2251,20 +3909,7 @@ class FindingsStore:
     def _insert_analysis(
             conn: sqlite3.Connection, kind: str, subject_id: str,
             payload: dict) -> str:
-        canonical, payload_hash = _analysis_canonical(
-            kind, subject_id, payload)
-        existing = conn.execute(
-            "SELECT analysis_id FROM analysis_runs WHERE payload_hash=?",
-            (payload_hash,)).fetchone()
-        if existing is not None:
-            return str(existing["analysis_id"])
-        analysis_id = payload_hash[:32]
-        conn.execute(
-            "INSERT INTO analysis_runs (analysis_id, kind, subject_id, ts, "
-            "payload_json, payload_hash) VALUES (?,?,?,?,?,?)",
-            (analysis_id, kind, subject_id, time.time(), canonical,
-             payload_hash))
-        return analysis_id
+        return _insert_analysis_conn(conn, kind, subject_id, payload)
 
     def record_analysis(self, kind: str, subject_id: str, payload: dict) -> str:
         if kind == "forward_parameter_axis":
@@ -2409,6 +4054,47 @@ class FindingsStore:
 
     # ------------------------------------------------------------- variants
 
+    @staticmethod
+    def _register_variant(
+            conn: sqlite3.Connection, variant, now: float) -> None:
+        overrides = json.dumps(variant.overrides, sort_keys=True)
+        existing = conn.execute(
+            "SELECT * FROM variants WHERE variant_id=?",
+            (variant.variant_id,)).fetchone()
+        if existing is not None:
+            if _variant_identity(existing) != _variant_identity(variant):
+                raise ValueError(
+                    f"{variant.variant_id}: registered experiment identity "
+                    "is immutable; use a new variant_id for changes to "
+                    "strategy, version, overrides, or hypothesis")
+            if existing["status"] != variant.status:
+                conn.execute(
+                    "UPDATE variants SET status=?, updated_ts=? "
+                    "WHERE variant_id=?",
+                    (variant.status, now, variant.variant_id))
+            return
+        if "hypothesis_id" in {
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA table_info(variants)").fetchall()}:
+            conn.execute(
+                "INSERT INTO variants (variant_id, strategy_id, "
+                "base_version, overrides_json, hypothesis, status, "
+                "created_ts, updated_ts, hypothesis_id, hypothesis_params_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (variant.variant_id, variant.strategy_id,
+                 variant.base_version, overrides, variant.hypothesis,
+                 variant.status, now, now, getattr(variant, "hypothesis_id", None),
+                 _canonical_json(
+                     getattr(variant, "hypothesis_params", {}) or {})))
+        else:
+            conn.execute(
+                "INSERT INTO variants (variant_id, strategy_id, "
+                "base_version, overrides_json, hypothesis, status, "
+                "created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
+                (variant.variant_id, variant.strategy_id,
+                 variant.base_version, overrides, variant.hypothesis,
+                 variant.status, now, now))
+
     def register(self, variant) -> None:
         """Register immutable experiment identity; status alone may change.
 
@@ -2417,44 +4103,23 @@ class FindingsStore:
         was invoked - and a diff that always appears is a diff nobody reads.
         """
         now = time.time()
-        overrides = json.dumps(variant.overrides, sort_keys=True)
         with _connect(self.path) as conn:
-            existing = conn.execute(
-                "SELECT * FROM variants WHERE variant_id=?",
-                (variant.variant_id,)).fetchone()
-            if existing is not None:
-                if _variant_identity(existing) != _variant_identity(variant):
-                    raise ValueError(
-                        f"{variant.variant_id}: registered experiment identity "
-                        "is immutable; use a new variant_id for changes to "
-                        "strategy, version, overrides, or hypothesis")
-                if existing["status"] == variant.status:
-                    return
-                conn.execute(
-                    "UPDATE variants SET status=?, updated_ts=? "
-                    "WHERE variant_id=?",
-                    (variant.status, now, variant.variant_id))
-                return
-            if "hypothesis_id" in {
-                    str(row[1]) for row in conn.execute(
-                        "PRAGMA table_info(variants)").fetchall()}:
-                conn.execute(
-                    "INSERT INTO variants (variant_id, strategy_id, "
-                    "base_version, overrides_json, hypothesis, status, "
-                    "created_ts, updated_ts, hypothesis_id, hypothesis_params_json) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (variant.variant_id, variant.strategy_id,
-                     variant.base_version, overrides, variant.hypothesis,
-                     variant.status, now, now, getattr(variant, "hypothesis_id", None),
-                     _canonical_json(getattr(variant, "hypothesis_params", {}) or {})))
-            else:
-                conn.execute(
-                    "INSERT INTO variants (variant_id, strategy_id, "
-                    "base_version, overrides_json, hypothesis, status, "
-                    "created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
-                    (variant.variant_id, variant.strategy_id,
-                     variant.base_version, overrides, variant.hypothesis,
-                     variant.status, now, now))
+            self._register_variant(conn, variant, now)
+
+    @staticmethod
+    def _proposal_dict(
+            conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+        item = dict(row)
+        item["value"] = json.loads(item["value_json"])
+        item["minimum"] = json.loads(item["minimum_json"])
+        item["maximum"] = json.loads(item["maximum_json"])
+        latest = conn.execute(
+            "SELECT status FROM hypothesis_proposal_events "
+            "WHERE proposal_id=? ORDER BY event_ts DESC, rowid DESC LIMIT 1",
+            (item["proposal_id"],)).fetchone()
+        item["current_status"] = (
+            str(latest["status"]) if latest is not None else item["status"])
+        return item
 
     def hypothesis_proposals(self, strategy_id: str, hypothesis_id: str) -> list:
         with _connect(self.path) as conn:
@@ -2462,15 +4127,1144 @@ class FindingsStore:
                 "SELECT * FROM hypothesis_proposals WHERE strategy_id=? "
                 "AND hypothesis_id=? ORDER BY proposed_ts, proposal_id",
                 (strategy_id, hypothesis_id)).fetchall()
-        return [dict(row) for row in rows]
+            return [self._proposal_dict(conn, row) for row in rows]
+
+    def hypothesis_proposal(self, proposal_id: str) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM hypothesis_proposals WHERE proposal_id=?",
+                (proposal_id,)).fetchone()
+            return self._proposal_dict(conn, row) if row is not None else None
+
+    def proposal_events(self, proposal_id: str) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM hypothesis_proposal_events WHERE proposal_id=? "
+                "ORDER BY event_ts, rowid", (proposal_id,)).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["detail"] = json.loads(event.pop("detail_json"))
+            events.append(event)
+        return events
+
+    @staticmethod
+    def _append_proposal_event_conn(
+            conn: sqlite3.Connection, proposal_id: str, status: str,
+            detail: dict | None, timestamp: float) -> dict:
+        if conn.execute(
+                "SELECT 1 FROM hypothesis_proposals WHERE proposal_id=?",
+                (proposal_id,)).fetchone() is None:
+            raise ValueError(f"unknown proposal_id {proposal_id!r}")
+        latest = conn.execute(
+            "SELECT * FROM hypothesis_proposal_events "
+            "WHERE proposal_id=? ORDER BY event_ts DESC, rowid DESC LIMIT 1",
+            (proposal_id,)).fetchone()
+        if latest is None:
+            raise ValueError("proposal lifecycle has no initial event")
+        if latest["status"] == status:
+            event = dict(latest)
+            event["detail"] = json.loads(event.pop("detail_json"))
+            return event
+        if latest["status"] in {"OBSERVED", "REJECTED"}:
+            raise ValueError("proposal lifecycle is already terminal")
+        if status == "OBSERVED" and latest["status"] != "OBSERVING":
+            raise ValueError("proposal must be observing before it is observed")
+        event_id = uuid.uuid4().hex
+        detail_json = _canonical_json(detail or {})
+        conn.execute(
+            "INSERT INTO hypothesis_proposal_events "
+            "(event_id, proposal_id, status, event_ts, detail_json) "
+            "VALUES (?,?,?,?,?)",
+            (event_id, proposal_id, status, timestamp, detail_json))
+        return {
+            "event_id": event_id, "proposal_id": proposal_id,
+            "status": status, "event_ts": timestamp,
+            "detail": json.loads(detail_json),
+        }
+
+    def append_proposal_event(
+            self, proposal_id: str, status: str, detail: dict | None = None,
+            *, now: float | None = None) -> dict:
+        """Append one valid lifecycle transition without mutating history."""
+        status = str(status).upper()
+        if status not in {"OBSERVING", "OBSERVED", "REJECTED"}:
+            raise ValueError("proposal event status is invalid")
+        timestamp = time.time() if now is None else float(now)
+        with _connect(self.path) as conn:
+            return self._append_proposal_event_conn(
+                conn, proposal_id, status, detail, timestamp)
+
+    def pending_hypothesis_proposals(self, strategy_id: str) -> list[dict]:
+        """Return non-terminal exact adaptive proposals in queue order."""
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT proposal.* FROM hypothesis_proposals AS proposal "
+                "WHERE proposal.strategy_id=? AND COALESCE(("
+                "SELECT event.status FROM hypothesis_proposal_events AS event "
+                "WHERE event.proposal_id=proposal.proposal_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1"
+                "), proposal.status) NOT IN ('OBSERVED','REJECTED') "
+                "ORDER BY proposal.proposed_ts, proposal.proposal_id",
+                (strategy_id,)).fetchall()
+            return [self._proposal_dict(conn, row) for row in rows]
+
+    @staticmethod
+    def _research_selection_event(
+            conn: sqlite3.Connection, selection_id: str
+            ) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM research_selection_events WHERE selection_id=? "
+            "ORDER BY event_ts DESC, rowid DESC LIMIT 1",
+            (selection_id,)).fetchone()
+
+    @classmethod
+    def _research_selection_dict(
+            cls, conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+        item = dict(row)
+        item["request"] = json.loads(item.pop("request_json"))
+        latest = cls._research_selection_event(conn, item["selection_id"])
+        item["current_status"] = (
+            str(latest["status"]) if latest is not None else None)
+        item["status_reason"] = (
+            str(latest["reason"]) if latest is not None and latest["reason"]
+            else None)
+        item["assignment_id"] = (
+            str(latest["assignment_id"])
+            if latest is not None and latest["assignment_id"] else None)
+        return item
+
+    @classmethod
+    def _append_research_selection_event_conn(
+            cls, conn: sqlite3.Connection, selection_id: str, status: str,
+            *, reason: str | None = None, assignment_id: str | None = None,
+            detail: dict | None = None, timestamp: float) -> dict:
+        status = str(status).upper()
+        if status not in {"ACCEPTED", "ASSIGNED", "TESTED", "REJECTED"}:
+            raise ValueError("research selection event status is invalid")
+        selection = conn.execute(
+            "SELECT * FROM research_selections WHERE selection_id=?",
+            (selection_id,)).fetchone()
+        if selection is None:
+            raise ValueError(f"unknown research selection {selection_id!r}")
+        latest = cls._research_selection_event(conn, selection_id)
+        if latest is not None and latest["status"] == status:
+            event = dict(latest)
+            event["detail"] = json.loads(event.pop("detail_json"))
+            return event
+        if latest is None:
+            if status not in {"ACCEPTED", "REJECTED"}:
+                raise ValueError("research selection requires an initial status")
+        elif latest["status"] in {"TESTED", "REJECTED"}:
+            raise ValueError("research selection lifecycle is already terminal")
+        elif latest["status"] == "ACCEPTED" and status not in {
+                "ASSIGNED", "REJECTED"}:
+            raise ValueError("accepted research selection must be assigned first")
+        elif latest["status"] == "ASSIGNED" and status not in {
+                "TESTED", "REJECTED"}:
+            raise ValueError("assigned research selection has invalid transition")
+        if status == "REJECTED" and not str(reason or "").strip():
+            raise ValueError("research selection rejection reason is required")
+        if status in {"ASSIGNED", "TESTED"} and not assignment_id:
+            raise ValueError("research selection assignment link is required")
+        event_id = uuid.uuid4().hex
+        detail_json = _canonical_json(detail or {})
+        conn.execute(
+            "INSERT INTO research_selection_events "
+            "(event_id, selection_id, status, event_ts, reason, assignment_id, "
+            "detail_json) VALUES (?,?,?,?,?,?,?)",
+            (event_id, selection_id, status, timestamp,
+             str(reason).strip() if reason else None, assignment_id,
+             detail_json))
+        return {
+            "event_id": event_id, "selection_id": selection_id,
+            "status": status, "event_ts": timestamp,
+            "reason": str(reason).strip() if reason else None,
+            "assignment_id": assignment_id,
+            "detail": json.loads(detail_json),
+        }
+
+    def record_research_selection(
+            self, selection: dict, candidates: list[dict], *,
+            scope_key: str, run_id: str, cycle_id: str | None,
+            model_id: str, prompt_version: str,
+            validation_error: str | None = None,
+            now: float | None = None) -> dict:
+        """Resolve and append one accepted or rejected selector request."""
+        timestamp = time.time() if now is None else float(now)
+        requested_strategy = str(selection.get("strategy_id") or "").strip()
+        requested_variant = str(selection.get("variant_id") or "").strip()
+        reasoning_value = selection.get("reasoning")
+        reasoning = reasoning_value if isinstance(reasoning_value, str) else ""
+        request = selection.get("request", selection)
+        resolved_variant = None
+        rejection = str(validation_error or "").strip() or None
+
+        with _connect(self.path) as conn:
+            static_candidates = [
+                dict(candidate) for candidate in candidates
+                if str(candidate.get("source") or "static") == "static"
+            ]
+            by_variant = {
+                str(candidate.get("variant_id") or ""): candidate
+                for candidate in static_candidates
+                if candidate.get("variant_id")
+            }
+            active = conn.execute(
+                "SELECT assignment.candidate_variant_id "
+                "FROM strategy_experiment_active_slots AS slot "
+                "JOIN strategy_experiment_assignments AS assignment "
+                "ON assignment.assignment_id=slot.assignment_id "
+                "WHERE slot.scope_key=? AND slot.strategy_id=?",
+                (scope_key, requested_strategy)).fetchone()
+            active_variant = (
+                str(active["candidate_variant_id"]) if active is not None else None)
+            terminal_rows = conn.execute(
+                "SELECT assignment.candidate_variant_id, assignment.candidate_key "
+                "FROM strategy_experiment_assignments AS assignment "
+                "WHERE assignment.scope_key=? AND assignment.strategy_id=? "
+                "AND (SELECT event.status "
+                "FROM strategy_experiment_assignment_events AS event "
+                "WHERE event.assignment_id=assignment.assignment_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) "
+                "IN ('COMPLETED','REJECTED')",
+                (scope_key, requested_strategy)).fetchall()
+            terminal_variants = {
+                str(row["candidate_variant_id"]) for row in terminal_rows}
+            terminal_keys = {str(row["candidate_key"]) for row in terminal_rows}
+            pending_rows = conn.execute(
+                "SELECT selection.resolved_variant_id "
+                "FROM research_selections AS selection "
+                "WHERE selection.scope_key=? "
+                "AND selection.requested_strategy_id=? "
+                "AND (SELECT event.status FROM research_selection_events AS event "
+                "WHERE event.selection_id=selection.selection_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1)='ACCEPTED'",
+                (scope_key, requested_strategy)).fetchall()
+            pending_variants = {
+                str(row["resolved_variant_id"]) for row in pending_rows
+                if row["resolved_variant_id"]}
+
+            def eligible(candidate: dict) -> tuple[bool, str | None]:
+                variant_id = str(candidate.get("variant_id") or "")
+                candidate_key = str(candidate.get("candidate_key") or "")
+                if not variant_id or not candidate_key:
+                    return False, "candidate identity is incomplete"
+                registered = conn.execute(
+                    "SELECT status FROM variants WHERE variant_id=?",
+                    (variant_id,)).fetchone()
+                if registered is None:
+                    return False, "candidate is no longer registered"
+                if registered["status"] not in {"candidate", "testing"}:
+                    return False, (
+                        f"candidate status is {registered['status']}, not eligible")
+                if variant_id == active_variant:
+                    return False, "candidate is already the active assignment"
+                if variant_id in terminal_variants or candidate_key in terminal_keys:
+                    return False, (
+                        "exact candidate already completed or was rejected; "
+                        "silent retest refused")
+                if variant_id in pending_variants:
+                    return False, "exact candidate already has a pending selection"
+                return True, None
+
+            if rejection is None:
+                if requested_variant:
+                    candidate = by_variant.get(requested_variant)
+                    if candidate is None:
+                        rejection = (
+                            "requested variant is not an eligible registered "
+                            "single-axis setting for this strategy")
+                    else:
+                        is_eligible, why = eligible(candidate)
+                        if is_eligible:
+                            resolved_variant = requested_variant
+                        else:
+                            rejection = why
+                else:
+                    ordered = sorted(static_candidates, key=lambda item: (
+                        int(item.get("priority", 100)),
+                        str(item.get("order_key") or ""),
+                        str(item.get("variant_id") or ""),
+                    ))
+                    for candidate in ordered:
+                        is_eligible, _ = eligible(candidate)
+                        if is_eligible:
+                            resolved_variant = str(candidate["variant_id"])
+                            break
+                    if resolved_variant is None:
+                        rejection = (
+                            "no eligible untested single-axis setting remains "
+                            "for the requested strategy")
+
+            selection_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO research_selections "
+                "(selection_id, scope_key, run_id, cycle_id, model_id, "
+                "prompt_version, requested_strategy_id, requested_variant_id, "
+                "resolved_variant_id, original_reasoning, request_json, "
+                "requested_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (selection_id, str(scope_key), str(run_id),
+                 str(cycle_id) if cycle_id else None, str(model_id),
+                 str(prompt_version), requested_strategy,
+                 requested_variant or None, resolved_variant, reasoning,
+                 _canonical_json(request), timestamp))
+            if rejection is None:
+                self._append_research_selection_event_conn(
+                    conn, selection_id, "ACCEPTED", timestamp=timestamp,
+                    detail={"resolved_variant_id": resolved_variant})
+            else:
+                self._append_research_selection_event_conn(
+                    conn, selection_id, "REJECTED", reason=rejection,
+                    timestamp=timestamp,
+                    detail={"resolved_variant_id": resolved_variant})
+            row = conn.execute(
+                "SELECT * FROM research_selections WHERE selection_id=?",
+                (selection_id,)).fetchone()
+            return self._research_selection_dict(conn, row)
+
+    def research_selection(self, selection_id: str) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM research_selections WHERE selection_id=?",
+                (selection_id,)).fetchone()
+            return (self._research_selection_dict(conn, row)
+                    if row is not None else None)
+
+    def research_selections(
+            self, scope_key: str | None = None,
+            strategy_id: str | None = None) -> list[dict]:
+        clauses = []
+        params: list = []
+        if scope_key is not None:
+            clauses.append("scope_key=?")
+            params.append(str(scope_key))
+        if strategy_id is not None:
+            clauses.append("requested_strategy_id=?")
+            params.append(str(strategy_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_selections" + where +
+                " ORDER BY requested_ts, selection_id", params).fetchall()
+            return [self._research_selection_dict(conn, row) for row in rows]
+
+    def research_selection_events(self, selection_id: str) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_selection_events WHERE selection_id=? "
+                "ORDER BY event_ts, rowid", (selection_id,)).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["detail"] = json.loads(event.pop("detail_json"))
+            events.append(event)
+        return events
+
+    def prioritized_experiment_candidates(
+            self, scope_key: str, strategy_id: str,
+            candidates: list[dict], *, now: float | None = None) -> list[dict]:
+        """Apply durable selector priority and reject stale queued targets."""
+        timestamp = time.time() if now is None else float(now)
+        out = [dict(candidate) for candidate in candidates]
+        available = {
+            str(candidate.get("variant_id") or ""): candidate
+            for candidate in out
+            if (candidate.get("variant_id")
+                and str(candidate.get("source") or "static") == "static")
+        }
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT selection.* FROM research_selections AS selection "
+                "WHERE selection.scope_key=? "
+                "AND selection.requested_strategy_id=? "
+                "AND (SELECT event.status FROM research_selection_events AS event "
+                "WHERE event.selection_id=selection.selection_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1)='ACCEPTED' "
+                "ORDER BY selection.requested_ts, selection.selection_id",
+                (scope_key, strategy_id)).fetchall()
+            terminal = {
+                str(row["candidate_variant_id"])
+                for row in conn.execute(
+                    "SELECT assignment.candidate_variant_id "
+                    "FROM strategy_experiment_assignments AS assignment "
+                    "WHERE assignment.scope_key=? AND assignment.strategy_id=? "
+                    "AND (SELECT event.status "
+                    "FROM strategy_experiment_assignment_events AS event "
+                    "WHERE event.assignment_id=assignment.assignment_id "
+                    "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) "
+                    "IN ('COMPLETED','REJECTED')",
+                    (scope_key, strategy_id)).fetchall()
+            }
+            priority_by_variant = {}
+            for ordinal, row in enumerate(rows):
+                selection_id = str(row["selection_id"])
+                variant_id = str(row["resolved_variant_id"] or "")
+                candidate = available.get(variant_id)
+                registered = conn.execute(
+                    "SELECT status FROM variants WHERE variant_id=?",
+                    (variant_id,)).fetchone()
+                reason = None
+                if variant_id in terminal:
+                    reason = (
+                        "exact candidate became terminal before assignment; "
+                        "silent retest refused")
+                elif candidate is None:
+                    reason = "resolved exact candidate is no longer available"
+                elif (registered is None
+                      or registered["status"] not in {"candidate", "testing"}):
+                    reason = "resolved exact candidate is no longer eligible"
+                if reason:
+                    self._append_research_selection_event_conn(
+                        conn, selection_id, "REJECTED", reason=reason,
+                        timestamp=timestamp)
+                    continue
+                priority_by_variant[variant_id] = {
+                    "selection_id": selection_id,
+                    "priority": -100,
+                    "order_key": (
+                        f"{float(row['requested_ts']):020.6f}:"
+                        f"{ordinal:08d}:{selection_id}"),
+                }
+        for index, candidate in enumerate(out):
+            selected = priority_by_variant.get(
+                str(candidate.get("variant_id") or ""))
+            if selected:
+                out[index] = {**candidate, **selected}
+        return out
+
+    @staticmethod
+    def _assignment_event(
+            conn: sqlite3.Connection, assignment_id: str) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM strategy_experiment_assignment_events "
+            "WHERE assignment_id=? "
+            "ORDER BY event_ts DESC, rowid DESC LIMIT 1",
+            (assignment_id,)).fetchone()
+
+    @classmethod
+    def _assignment_dict(
+            cls, conn: sqlite3.Connection, row: sqlite3.Row,
+            now: float | None = None) -> dict:
+        item = dict(row)
+        item["setting"] = json.loads(item.pop("setting_json"))
+        item["code_identity"] = json.loads(item.pop("code_identity_json"))
+        item["config_identity"] = json.loads(item.pop("config_identity_json"))
+        latest = cls._assignment_event(conn, item["assignment_id"])
+        status = str(latest["status"]) if latest is not None else "STARTED"
+        observed_count = int(conn.execute(
+            "SELECT COUNT(*) FROM strategy_experiment_observations "
+            "WHERE assignment_id=?", (item["assignment_id"],)).fetchone()[0])
+        terminal = status in {"COMPLETED", "REJECTED"}
+        effective_now = (float(latest["event_ts"]) if terminal and latest
+                         else time.time() if now is None else float(now))
+        elapsed = max(0.0, effective_now - float(item["started_ts"]))
+        item.update({
+            "status": status,
+            "end_ts": (float(latest["event_ts"])
+                       if terminal and latest is not None else None),
+            "observed_count": observed_count,
+            "elapsed_seconds": elapsed,
+            "duration_satisfied": (
+                elapsed >= float(item["minimum_duration_seconds"])),
+            "observations_satisfied": (
+                observed_count >= int(item["minimum_observations"])),
+            "completion_reason": (
+                latest["reason"] if status == "COMPLETED" else None),
+            "rejection_reason": (
+                latest["reason"] if status == "REJECTED" else None),
+        })
+        item["ready_to_complete"] = (
+            not terminal and item["duration_satisfied"]
+            and item["observations_satisfied"])
+        return item
+
+    def experiment_assignment(
+            self, assignment_id: str, *, now: float | None = None) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM strategy_experiment_assignments "
+                "WHERE assignment_id=?", (assignment_id,)).fetchone()
+            return (self._assignment_dict(conn, row, now)
+                    if row is not None else None)
+
+    def experiment_assignments(
+            self, scope_key: str | None = None,
+            strategy_id: str | None = None, *,
+            now: float | None = None) -> list[dict]:
+        clauses = []
+        params: list = []
+        if scope_key is not None:
+            clauses.append("scope_key=?")
+            params.append(str(scope_key))
+        if strategy_id is not None:
+            clauses.append("strategy_id=?")
+            params.append(str(strategy_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategy_experiment_assignments" + where +
+                " ORDER BY started_ts, assignment_id", params).fetchall()
+            return [self._assignment_dict(conn, row, now) for row in rows]
+
+    def experiment_assignment_history(self, assignment_id: str) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategy_experiment_assignment_events "
+                "WHERE assignment_id=? ORDER BY event_ts, rowid",
+                (assignment_id,)).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["detail"] = json.loads(event.pop("detail_json"))
+            events.append(event)
+        return events
+
+    def experiment_rotation_report(
+            self, scope_key: str | None = None,
+            strategy_id: str | None = None, *,
+            now: float | None = None) -> dict:
+        """Return an operator/simulation-ready assignment and gate summary."""
+        assignments = self.experiment_assignments(
+            scope_key, strategy_id, now=now)
+        return {
+            "schema": "strategy_experiment_rotation.v1",
+            "scope_key": scope_key,
+            "strategy_id": strategy_id,
+            "active": [item for item in assignments
+                       if item["status"] not in {"COMPLETED", "REJECTED"}],
+            "terminal": [item for item in assignments
+                         if item["status"] in {"COMPLETED", "REJECTED"}],
+        }
+
+    def experiment_observations(self, assignment_id: str) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM strategy_experiment_observations "
+                "WHERE assignment_id=? ORDER BY observed_ts, observation_id",
+                (assignment_id,)).fetchall()
+        observations = []
+        for row in rows:
+            observation = dict(row)
+            observation["detail"] = json.loads(
+                observation.pop("detail_json"))
+            observations.append(observation)
+        return observations
+
+    def active_experiment_assignment(
+            self, scope_key: str, strategy_id: str, *,
+            now: float | None = None) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT assignment.* "
+                "FROM strategy_experiment_active_slots AS slot "
+                "JOIN strategy_experiment_assignments AS assignment "
+                "ON assignment.assignment_id=slot.assignment_id "
+                "WHERE slot.scope_key=? AND slot.strategy_id=?",
+                (scope_key, strategy_id)).fetchone()
+            if row is None:
+                return None
+            assignment = self._assignment_dict(conn, row, now)
+            if assignment["status"] in {"COMPLETED", "REJECTED"}:
+                raise MigrationError(
+                    f"{scope_key}:{strategy_id} active slot points to a "
+                    "terminal experiment")
+            return assignment
+
+    def next_experiment_candidate(
+            self, scope_key: str, strategy_id: str,
+            candidates: list[dict]) -> dict | None:
+        """Choose the next declared exact setting in deterministic order."""
+        with _connect(self.path) as conn:
+            terminal_rows = conn.execute(
+                "SELECT assignment.candidate_variant_id, "
+                "assignment.candidate_key "
+                "FROM strategy_experiment_assignments AS assignment "
+                "WHERE assignment.scope_key=? AND assignment.strategy_id=? "
+                "AND (SELECT event.status "
+                "FROM strategy_experiment_assignment_events AS event "
+                "WHERE event.assignment_id=assignment.assignment_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) "
+                "IN ('COMPLETED','REJECTED')",
+                (scope_key, strategy_id)).fetchall()
+            terminal_variants = {
+                str(row["candidate_variant_id"]) for row in terminal_rows}
+            terminal_keys = {str(row["candidate_key"]) for row in terminal_rows}
+            ordered = sorted(candidates, key=lambda item: (
+                int(item.get("priority", 100)),
+                str(item.get("order_key") or ""),
+                str(item.get("variant_id") or ""),
+            ))
+            for candidate in ordered:
+                variant_id = str(candidate.get("variant_id") or "")
+                candidate_key = str(candidate.get("candidate_key") or "")
+                if (not variant_id or not candidate_key
+                        or variant_id in terminal_variants
+                        or candidate_key in terminal_keys):
+                    continue
+                proposal_id = candidate.get("proposal_id")
+                if proposal_id:
+                    proposal = conn.execute(
+                        "SELECT * FROM hypothesis_proposals WHERE proposal_id=?",
+                        (proposal_id,)).fetchone()
+                    if proposal is None:
+                        continue
+                    current = self._proposal_dict(conn, proposal)["current_status"]
+                    if current in {"OBSERVED", "REJECTED"}:
+                        continue
+                return dict(candidate)
+        return None
+
+    def ensure_experiment_assignment(
+            self, scope_key: str, strategy_id: str,
+            baseline_variant_id: str, candidates: list[dict], *,
+            minimum_duration_seconds: float,
+            minimum_observations: int,
+            now: float | None = None) -> dict | None:
+        """Resume the active assignment or append the deterministic next one."""
+        timestamp = time.time() if now is None else float(now)
+        if float(minimum_duration_seconds) < 0:
+            raise ValueError("minimum_duration_seconds cannot be negative")
+        if int(minimum_observations) <= 0:
+            raise ValueError("minimum_observations must be positive")
+        active = self.active_experiment_assignment(
+            scope_key, strategy_id, now=timestamp)
+        if active is not None:
+            return active
+        candidate = self.next_experiment_candidate(
+            scope_key, strategy_id, candidates)
+        if candidate is None:
+            return None
+        variant_id = str(candidate["variant_id"])
+        candidate_key = str(candidate["candidate_key"])
+        axis = str(candidate.get("axis") or "").strip()
+        setting_id = str(candidate.get("setting_id") or "").strip()
+        source = str(candidate.get("source") or "static")
+        if not axis or not setting_id:
+            raise ValueError("experiment axis and setting_id are required")
+        if source not in {"static", "adaptive"}:
+            raise ValueError("experiment source must be static or adaptive")
+        setting_json = _canonical_json(candidate.get("setting") or {})
+        code_identity_json = _canonical_json(candidate.get("code_identity") or {})
+        config_identity_json = _canonical_json(
+            candidate.get("config_identity") or {})
+        proposal_id = candidate.get("proposal_id")
+        selection_id = candidate.get("selection_id")
+        assignment_id = _content_hash({
+            "scope_key": str(scope_key),
+            "strategy_id": str(strategy_id),
+            "baseline_variant_id": str(baseline_variant_id),
+            "candidate_variant_id": variant_id,
+            "candidate_key": candidate_key,
+            "code_identity": json.loads(code_identity_json),
+            "config_identity": json.loads(config_identity_json),
+        })[:32]
+        with _connect(self.path) as conn:
+            baseline = self._require_variant(conn, baseline_variant_id)
+            experiment = self._require_variant(conn, variant_id)
+            if (baseline["strategy_id"] != strategy_id
+                    or experiment["strategy_id"] != strategy_id):
+                raise ValueError("experiment variants must match strategy_id")
+            if baseline_variant_id == variant_id:
+                raise ValueError("experiment candidate cannot be its baseline")
+            if proposal_id:
+                proposal = conn.execute(
+                    "SELECT * FROM hypothesis_proposals WHERE proposal_id=?",
+                    (proposal_id,)).fetchone()
+                if (proposal is None or proposal["variant_id"] != variant_id
+                        or proposal["strategy_id"] != strategy_id):
+                    raise ValueError(
+                        "adaptive assignment does not match its exact proposal")
+                if self._proposal_dict(conn, proposal)["current_status"] in {
+                        "OBSERVED", "REJECTED"}:
+                    raise ValueError("adaptive proposal is already terminal")
+            if selection_id:
+                selection = conn.execute(
+                    "SELECT * FROM research_selections WHERE selection_id=?",
+                    (selection_id,)).fetchone()
+                if (selection is None
+                        or selection["scope_key"] != scope_key
+                        or selection["requested_strategy_id"] != strategy_id
+                        or selection["resolved_variant_id"] != variant_id):
+                    raise ValueError(
+                        "research selection does not match this assignment")
+                latest_selection = self._research_selection_event(
+                    conn, str(selection_id))
+                if (latest_selection is None
+                        or latest_selection["status"] != "ACCEPTED"):
+                    raise ValueError("research selection is not pending")
+            conn.execute(
+                "INSERT INTO strategy_experiment_assignments "
+                "(assignment_id, scope_key, strategy_id, baseline_variant_id, "
+                "candidate_variant_id, candidate_key, axis, setting_id, "
+                "setting_json, source, proposal_id, started_ts, "
+                "minimum_duration_seconds, minimum_observations, "
+                "code_identity_json, config_identity_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (assignment_id, scope_key, strategy_id, baseline_variant_id,
+                 variant_id, candidate_key, axis, setting_id, setting_json,
+                 source, proposal_id, timestamp,
+                 float(minimum_duration_seconds), int(minimum_observations),
+                 code_identity_json, config_identity_json))
+            for status in ("STARTED", "OBSERVING"):
+                conn.execute(
+                    "INSERT INTO strategy_experiment_assignment_events "
+                    "(event_id, assignment_id, status, event_ts, reason, "
+                    "detail_json) VALUES (?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, assignment_id, status, timestamp, None,
+                     _canonical_json({
+                         "baseline_variant_id": baseline_variant_id,
+                         "candidate_variant_id": variant_id,
+                         "axis": axis, "setting_id": setting_id,
+                     })))
+            conn.execute(
+                "INSERT INTO strategy_experiment_active_slots "
+                "(scope_key, strategy_id, assignment_id) VALUES (?,?,?)",
+                (scope_key, strategy_id, assignment_id))
+            if proposal_id:
+                self._append_proposal_event_conn(
+                    conn, str(proposal_id), "OBSERVING", {
+                        "assignment_id": assignment_id,
+                        "scope_key": scope_key,
+                        "variant_id": variant_id,
+                    }, timestamp)
+            if selection_id:
+                self._append_research_selection_event_conn(
+                    conn, str(selection_id), "ASSIGNED",
+                    assignment_id=assignment_id, timestamp=timestamp,
+                    detail={
+                        "scope_key": scope_key,
+                        "strategy_id": strategy_id,
+                        "variant_id": variant_id,
+                    })
+            row = conn.execute(
+                "SELECT * FROM strategy_experiment_assignments "
+                "WHERE assignment_id=?", (assignment_id,)).fetchone()
+            return self._assignment_dict(conn, row, timestamp)
+
+    def record_experiment_observations(
+            self, assignment_id: str, observations: list[dict], *,
+            now: float | None = None) -> dict:
+        """Append idempotent baseline/candidate-comparable observations."""
+        timestamp = time.time() if now is None else float(now)
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM strategy_experiment_assignments "
+                "WHERE assignment_id=?", (assignment_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown assignment_id {assignment_id!r}")
+            latest = self._assignment_event(conn, assignment_id)
+            if latest and latest["status"] in {"COMPLETED", "REJECTED"}:
+                raise ValueError("experiment assignment is already terminal")
+            for observation in observations:
+                key = str(observation.get("observation_key") or "").strip()
+                if not key:
+                    raise ValueError("experiment observation_key is required")
+                observation_id = _content_hash({
+                    "assignment_id": assignment_id,
+                    "observation_key": key,
+                })[:32]
+                conn.execute(
+                    "INSERT OR IGNORE INTO strategy_experiment_observations "
+                    "(observation_id, assignment_id, observation_key, "
+                    "observed_ts, detail_json) VALUES (?,?,?,?,?)",
+                    (observation_id, assignment_id, key,
+                     float(observation.get("observed_ts", timestamp)),
+                     _canonical_json(observation.get("detail") or {})))
+            return self._assignment_dict(conn, row, timestamp)
+
+    def maybe_complete_experiment_assignment(
+            self, assignment_id: str, *, now: float | None = None,
+            reason: str = (
+                "minimum duration and comparable observation gates satisfied"
+            )) -> dict:
+        timestamp = time.time() if now is None else float(now)
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM strategy_experiment_assignments "
+                "WHERE assignment_id=?", (assignment_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown assignment_id {assignment_id!r}")
+            assignment = self._assignment_dict(conn, row, timestamp)
+            if assignment["status"] in {"COMPLETED", "REJECTED"}:
+                if _table_exists(conn, "experiment_outcomes"):
+                    _ensure_experiment_outcome_conn(conn, assignment_id)
+                return assignment
+            if not assignment["ready_to_complete"]:
+                return assignment
+            conn.execute(
+                "INSERT INTO strategy_experiment_assignment_events "
+                "(event_id, assignment_id, status, event_ts, reason, "
+                "detail_json) VALUES (?,?,?,?,?,?)",
+                (uuid.uuid4().hex, assignment_id, "COMPLETED", timestamp,
+                 str(reason), _canonical_json({
+                     "observed_count": assignment["observed_count"],
+                     "elapsed_seconds": assignment["elapsed_seconds"],
+                 })))
+            conn.execute(
+                "DELETE FROM strategy_experiment_active_slots "
+                "WHERE assignment_id=?", (assignment_id,))
+            if row["proposal_id"]:
+                self._append_proposal_event_conn(
+                    conn, str(row["proposal_id"]), "OBSERVED", {
+                        "assignment_id": assignment_id,
+                        "observed_count": assignment["observed_count"],
+                        "elapsed_seconds": assignment["elapsed_seconds"],
+                    }, timestamp)
+            selected = conn.execute(
+                "SELECT selection_id FROM research_selection_events "
+                "WHERE assignment_id=? AND status='ASSIGNED'",
+                (assignment_id,)).fetchall()
+            for selection in selected:
+                self._append_research_selection_event_conn(
+                    conn, str(selection["selection_id"]), "TESTED",
+                    assignment_id=assignment_id, timestamp=timestamp,
+                    detail={
+                        "observed_count": assignment["observed_count"],
+                        "elapsed_seconds": assignment["elapsed_seconds"],
+                    })
+            if _table_exists(conn, "experiment_outcomes"):
+                _ensure_experiment_outcome_conn(conn, assignment_id)
+            return self._assignment_dict(conn, row, timestamp)
+
+    def reject_experiment_assignment(
+            self, assignment_id: str, reason: str, *,
+            detail: dict | None = None, now: float | None = None) -> dict:
+        timestamp = time.time() if now is None else float(now)
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ValueError("experiment rejection reason is required")
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM strategy_experiment_assignments "
+                "WHERE assignment_id=?", (assignment_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"unknown assignment_id {assignment_id!r}")
+            assignment = self._assignment_dict(conn, row, timestamp)
+            if assignment["status"] in {"COMPLETED", "REJECTED"}:
+                if _table_exists(conn, "experiment_outcomes"):
+                    _ensure_experiment_outcome_conn(conn, assignment_id)
+                return assignment
+            conn.execute(
+                "INSERT INTO strategy_experiment_assignment_events "
+                "(event_id, assignment_id, status, event_ts, reason, "
+                "detail_json) VALUES (?,?,?,?,?,?)",
+                (uuid.uuid4().hex, assignment_id, "REJECTED", timestamp,
+                 reason, _canonical_json(detail or {})))
+            conn.execute(
+                "DELETE FROM strategy_experiment_active_slots "
+                "WHERE assignment_id=?", (assignment_id,))
+            if row["proposal_id"]:
+                self._append_proposal_event_conn(
+                    conn, str(row["proposal_id"]), "REJECTED", {
+                        "assignment_id": assignment_id,
+                        "reason": reason,
+                        **(detail or {}),
+                    }, timestamp)
+            selected = conn.execute(
+                "SELECT selection_id FROM research_selection_events "
+                "WHERE assignment_id=? AND status='ASSIGNED'",
+                (assignment_id,)).fetchall()
+            for selection in selected:
+                self._append_research_selection_event_conn(
+                    conn, str(selection["selection_id"]), "REJECTED",
+                    reason=reason, assignment_id=assignment_id,
+                    timestamp=timestamp, detail=detail or {})
+            if _table_exists(conn, "experiment_outcomes"):
+                _ensure_experiment_outcome_conn(conn, assignment_id)
+            return self._assignment_dict(conn, row, timestamp)
+
+    # ------------------------------------------------ experiment learning
+
+    @staticmethod
+    def _outcome_dict(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        payload_json = item.pop("payload_json")
+        payload = json.loads(payload_json)
+        if (_canonical_json(payload) != payload_json
+                or _content_hash(payload) != item["payload_hash"]):
+            raise ValueError(
+                f"experiment outcome {item['outcome_id']} failed its hash")
+        item["payload"] = payload
+        return item
+
+    def ensure_terminal_experiment_outcomes(self) -> dict:
+        """Idempotently backfill any terminal assignment missing its outcome."""
+        created = []
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT assignment.assignment_id "
+                "FROM strategy_experiment_assignments AS assignment "
+                "WHERE (SELECT event.status "
+                "FROM strategy_experiment_assignment_events AS event "
+                "WHERE event.assignment_id=assignment.assignment_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) "
+                "IN ('COMPLETED','REJECTED') "
+                "ORDER BY assignment.started_ts, assignment.assignment_id"
+            ).fetchall()
+            for row in rows:
+                outcome, was_created = _ensure_experiment_outcome_conn(
+                    conn, str(row["assignment_id"]))
+                if was_created:
+                    created.append(outcome["outcome_id"])
+            total = int(conn.execute(
+                "SELECT COUNT(*) FROM experiment_outcomes").fetchone()[0])
+            pending = int(conn.execute(
+                "SELECT COUNT(*) FROM experiment_outcomes AS outcome "
+                "LEFT JOIN experiment_reviews AS review "
+                "ON review.outcome_id=outcome.outcome_id "
+                "WHERE review.outcome_id IS NULL").fetchone()[0])
+        return {"created": created, "total": total, "pending_reviews": pending}
+
+    def experiment_outcome(
+            self, assignment_id: str | None = None, *,
+            outcome_id: str | None = None) -> dict | None:
+        if bool(assignment_id) == bool(outcome_id):
+            raise ValueError("provide exactly one of assignment_id or outcome_id")
+        column, value = (("assignment_id", assignment_id)
+                         if assignment_id else ("outcome_id", outcome_id))
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                f"SELECT * FROM experiment_outcomes WHERE {column}=?",
+                (value,)).fetchone()
+        return self._outcome_dict(row) if row is not None else None
+
+    def experiment_outcomes(
+            self, scope_key: str | None = None,
+            strategy_id: str | None = None) -> list[dict]:
+        clauses = []
+        params = []
+        if scope_key is not None:
+            clauses.append("scope_key=?")
+            params.append(str(scope_key))
+        if strategy_id is not None:
+            clauses.append("strategy_id=?")
+            params.append(str(strategy_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM experiment_outcomes" + where
+                + " ORDER BY created_ts, outcome_id", params).fetchall()
+        return [self._outcome_dict(row) for row in rows]
+
+    def pending_experiment_outcome(self) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT outcome.* FROM experiment_outcomes AS outcome "
+                "LEFT JOIN experiment_reviews AS review "
+                "ON review.outcome_id=outcome.outcome_id "
+                "WHERE review.outcome_id IS NULL "
+                "ORDER BY outcome.created_ts, outcome.outcome_id LIMIT 1"
+            ).fetchone()
+        return self._outcome_dict(row) if row is not None else None
+
+    def edge_evidence(self, scope_key: str | None = None) -> list[dict]:
+        where = " WHERE scope_key=?" if scope_key is not None else ""
+        params = (str(scope_key),) if scope_key is not None else ()
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_edge_evidence" + where
+                + " ORDER BY created_ts, edge_id", params).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            raw = item.pop("evidence_json")
+            evidence = json.loads(raw)
+            if (_canonical_json(evidence) != raw
+                    or _content_hash(evidence) != item["evidence_hash"]):
+                raise ValueError(
+                    f"research edge evidence {item['edge_id']} failed its hash")
+            item["evidence"] = evidence
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _review_dict(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        item["limitations"] = json.loads(item.pop("limitations_json"))
+        raw_selection = item.pop("next_selection_json")
+        item["next_selection"] = (
+            json.loads(raw_selection) if raw_selection else None)
+        return item
+
+    def experiment_review(self, outcome_id: str) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM experiment_reviews WHERE outcome_id=?",
+                (outcome_id,)).fetchone()
+        return self._review_dict(row) if row is not None else None
+
+    def experiment_review_attempts(self, outcome_id: str) -> list[dict]:
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM experiment_review_attempts WHERE outcome_id=? "
+                "ORDER BY requested_ts, attempt_id", (outcome_id,)).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["request"] = json.loads(item.pop("request_json"))
+            raw_response = item.pop("response_json")
+            item["response"] = (
+                json.loads(raw_response) if raw_response else None)
+            out.append(item)
+        return out
+
+    def record_experiment_review_failure(
+            self, outcome_id: str, *, provider: str, model_id: str,
+            prompt_version: str, request: dict, parse_error: str,
+            raw_response: str | None = None,
+            requested_ts: float | None = None,
+            completed_ts: float | None = None) -> dict:
+        requested = time.time() if requested_ts is None else float(requested_ts)
+        completed = time.time() if completed_ts is None else float(completed_ts)
+        error = str(parse_error or "").strip()
+        if not error:
+            raise ValueError("failed review attempt requires parse_error")
+        with _connect(self.path) as conn:
+            if conn.execute(
+                    "SELECT 1 FROM experiment_outcomes WHERE outcome_id=?",
+                    (outcome_id,)).fetchone() is None:
+                raise ValueError(f"unknown outcome_id {outcome_id!r}")
+            if conn.execute(
+                    "SELECT 1 FROM experiment_reviews WHERE outcome_id=?",
+                    (outcome_id,)).fetchone() is not None:
+                return {"status": "ALREADY_REVIEWED", "outcome_id": outcome_id}
+            attempt_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO experiment_review_attempts (attempt_id, "
+                "outcome_id, requested_ts, completed_ts, provider, model_id, "
+                "prompt_version, request_json, raw_response, response_json, "
+                "parse_error, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,'FAILED')",
+                (attempt_id, outcome_id, requested, completed, provider,
+                 model_id, prompt_version, _canonical_json(request),
+                 (str(raw_response)[:16_000]
+                  if raw_response is not None else None), None,
+                 error[:4_000]))
+        return {"status": "FAILED", "outcome_id": outcome_id,
+                "attempt_id": attempt_id, "parse_error": error[:4_000]}
+
+    def record_experiment_review_success(
+            self, outcome_id: str, *, provider: str, model_id: str,
+            prompt_version: str, request: dict, raw_response: str,
+            response: dict, explanation: str, limitations: list,
+            next_selection: dict | None = None,
+            selection_id: str | None = None,
+            requested_ts: float | None = None,
+            completed_ts: float | None = None) -> dict:
+        requested = time.time() if requested_ts is None else float(requested_ts)
+        completed = time.time() if completed_ts is None else float(completed_ts)
+        explanation = str(explanation or "").strip()
+        if not explanation:
+            raise ValueError("research review explanation is required")
+        with _connect(self.path) as conn:
+            existing = conn.execute(
+                "SELECT * FROM experiment_reviews WHERE outcome_id=?",
+                (outcome_id,)).fetchone()
+            if existing is not None:
+                return self._review_dict(existing)
+            if conn.execute(
+                    "SELECT 1 FROM experiment_outcomes WHERE outcome_id=?",
+                    (outcome_id,)).fetchone() is None:
+                raise ValueError(f"unknown outcome_id {outcome_id!r}")
+            if selection_id and conn.execute(
+                    "SELECT 1 FROM research_selections WHERE selection_id=?",
+                    (selection_id,)).fetchone() is None:
+                raise ValueError("review selection_id is not persisted")
+            attempt_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO experiment_review_attempts (attempt_id, "
+                "outcome_id, requested_ts, completed_ts, provider, model_id, "
+                "prompt_version, request_json, raw_response, response_json, "
+                "parse_error, status) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'SUCCEEDED')",
+                (attempt_id, outcome_id, requested, completed, provider,
+                 model_id, prompt_version, _canonical_json(request),
+                 str(raw_response)[:16_000], _canonical_json(response)))
+            review_id = _content_hash({
+                "outcome_id": outcome_id, "attempt_id": attempt_id,
+                "response": response,
+            })[:32]
+            conn.execute(
+                "INSERT INTO experiment_reviews (review_id, outcome_id, "
+                "attempt_id, created_ts, explanation, limitations_json, "
+                "next_selection_json, selection_id) VALUES (?,?,?,?,?,?,?,?)",
+                (review_id, outcome_id, attempt_id, completed,
+                 explanation[:4_000], _canonical_json(limitations[:8]),
+                 (_canonical_json(next_selection)
+                  if next_selection is not None else None), selection_id))
+            row = conn.execute(
+                "SELECT * FROM experiment_reviews WHERE review_id=?",
+                (review_id,)).fetchone()
+        return self._review_dict(row)
+
+    def research_selection_by_attribution(
+            self, scope_key: str, run_id: str,
+            cycle_id: str | None) -> dict | None:
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM research_selections WHERE scope_key=? "
+                "AND run_id=? AND COALESCE(cycle_id,'')=COALESCE(?,'') "
+                "ORDER BY requested_ts, selection_id LIMIT 1",
+                (scope_key, run_id, cycle_id)).fetchone()
+            return (self._research_selection_dict(conn, row)
+                    if row is not None else None)
+
+    def research_history_context(
+            self, scope_key: str | None = None, *, limit: int = 20) -> dict:
+        """Concise research-only planner context; never used by live prompts."""
+        outcomes = self.experiment_outcomes(scope_key)[-max(1, int(limit)):]
+        assignments = self.experiment_assignments(scope_key)
+        selections = self.research_selections(scope_key)
+        edges = self.edge_evidence(scope_key)[-max(1, int(limit)):]
+        return {
+            "schema": "research_history_context.v1",
+            "completed_outcomes": [{
+                "outcome_id": item["outcome_id"],
+                "assignment_id": item["assignment_id"],
+                "strategy_id": item["strategy_id"],
+                "candidate_variant_id": item["candidate_variant_id"],
+                "verdict": item["verdict"],
+                "reasons": item["payload"]["reasons"],
+                "data_window": item["payload"]["data_window"],
+            } for item in outcomes],
+            "failed_exact_settings": [{
+                "strategy_id": item["strategy_id"],
+                "variant_id": item["candidate_variant_id"],
+                "assignment_id": item["assignment_id"],
+                "reasons": item["payload"]["reasons"],
+            } for item in outcomes if item["verdict"] == "FAILED"],
+            "edge_candidates": [{
+                "edge_id": item["edge_id"],
+                "strategy_id": item["strategy_id"],
+                "variant_id": item["variant_id"],
+                "authority": item["evidence"]["authority"],
+                "data_window": item["evidence"]["data_window"],
+            } for item in edges],
+            "active_assignments": [{
+                "assignment_id": item["assignment_id"],
+                "strategy_id": item["strategy_id"],
+                "candidate_variant_id": item["candidate_variant_id"],
+                "axis": item["axis"], "setting_id": item["setting_id"],
+                "observed_count": item["observed_count"],
+            } for item in assignments
+                if item["status"] not in {"COMPLETED", "REJECTED"}],
+            "pending_selections": [{
+                "selection_id": item["selection_id"],
+                "strategy_id": item["requested_strategy_id"],
+                "resolved_variant_id": item["resolved_variant_id"],
+                "status": item["current_status"],
+            } for item in selections
+                if item["current_status"] in {"ACCEPTED", "ASSIGNED"}],
+            "terminal_variant_ids": sorted({
+                item["candidate_variant_id"] for item in outcomes}),
+        }
 
     def propose_numeric_setting(
             self, strategy_id: str, hypothesis_id: str, setting_id: str,
             value, run_id: str, *, minimum: float, maximum: float,
-            reasoning: str = "",
+            target_parameter: str, variant, reasoning: str = "",
             observation_lock_seconds: float = 3600.0,
             now: float | None = None) -> dict:
-        """Append one validated adaptive proposal, never silently retrying it."""
+        """Atomically register, persist, explain, and lock an exact proposal."""
         try:
             number = float(value)
         except (TypeError, ValueError) as exc:
@@ -2479,29 +5273,69 @@ class FindingsStore:
             raise ValueError("adaptive proposal value is outside its registered bounds")
         if float(observation_lock_seconds) <= 0:
             raise ValueError("observation_lock_seconds must be positive")
-        reasoning = str(reasoning or "registered numeric hypothesis setting").strip()[:300]
+        target_parameter = str(target_parameter or "").strip()
+        if not target_parameter:
+            raise ValueError("adaptive proposal target_parameter is required")
+        if (str(variant.strategy_id) != str(strategy_id)
+                or str(getattr(variant, "hypothesis_id", ""))
+                != str(hypothesis_id)):
+            raise ValueError("adaptive variant does not match proposal identity")
+        try:
+            variant_value = float(variant.hypothesis_params[target_parameter])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "adaptive variant does not carry the exact target parameter") from exc
+        if variant_value != number:
+            raise ValueError("adaptive variant target value does not match proposal")
+        reasoning = str(reasoning or "").strip()[:300]
+        if len(reasoning) < 10:
+            raise ValueError("adaptive proposal reasoning is required")
         timestamp = time.time() if now is None else float(now)
+        value_json = _canonical_json(number)
+        minimum_json = _canonical_json(float(minimum))
+        maximum_json = _canonical_json(float(maximum))
+        value_key = _content_hash({
+            "strategy_id": str(strategy_id),
+            "hypothesis_id": str(hypothesis_id),
+            "target_parameter": target_parameter,
+            "value": number,
+        })
         proposal_id = _content_hash({
             "strategy_id": str(strategy_id), "hypothesis_id": str(hypothesis_id),
-            "setting_id": str(setting_id), "value": number, "run_id": str(run_id),
+            "setting_id": str(setting_id),
+            "target_parameter": target_parameter,
+            "value": number, "run_id": str(run_id),
         })[:32]
         row = {
             "proposal_id": proposal_id, "strategy_id": str(strategy_id),
             "hypothesis_id": str(hypothesis_id), "setting_id": str(setting_id),
+            "variant_id": str(variant.variant_id),
+            "target_parameter": target_parameter,
             "value": number, "run_id": str(run_id), "proposed_ts": timestamp,
             "observation_until_ts": timestamp + float(observation_lock_seconds),
-            "status": "PROPOSED",
+            "minimum": float(minimum), "maximum": float(maximum),
+            "status": "PROPOSED", "current_status": "PROPOSED",
             "reasoning": reasoning,
         }
         with _connect(self.path) as conn:
-            existing = conn.execute(
-                "SELECT * FROM hypothesis_proposals WHERE proposal_id=?",
-                (proposal_id,)).fetchone()
-            if existing is not None:
-                raise ValueError("duplicate adaptive hypothesis proposal")
+            if conn.execute(
+                    "SELECT 1 FROM hypothesis_proposals WHERE strategy_id=? "
+                    "AND hypothesis_id=? AND setting_id=? AND value_json=?",
+                    (strategy_id, hypothesis_id, setting_id,
+                     value_json)).fetchone():
+                raise ValueError("duplicate exact adaptive hypothesis value")
+            if conn.execute(
+                    "SELECT 1 FROM hypothesis_proposal_value_locks "
+                    "WHERE value_key=?", (value_key,)).fetchone():
+                raise ValueError("duplicate exact adaptive hypothesis value")
             locked = conn.execute(
-                "SELECT 1 FROM hypothesis_proposals WHERE strategy_id=? "
-                "AND proposed_ts<=? AND observation_until_ts>?",
+                "SELECT 1 FROM hypothesis_proposals AS proposal "
+                "WHERE proposal.strategy_id=? AND proposal.proposed_ts<=? "
+                "AND proposal.observation_until_ts>? AND COALESCE(("
+                "SELECT event.status FROM hypothesis_proposal_events AS event "
+                "WHERE event.proposal_id=proposal.proposal_id "
+                "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1"
+                "), proposal.status) NOT IN ('OBSERVED','REJECTED')",
                 (strategy_id, timestamp, timestamp)).fetchone()
             if locked:
                 raise ValueError("hypothesis observation lock is active")
@@ -2511,11 +5345,46 @@ class FindingsStore:
                 (strategy_id, hypothesis_id, setting_id, run_id)).fetchone()
             if duplicate:
                 raise ValueError("duplicate adaptive hypothesis proposal")
+            self._register_variant(conn, variant, timestamp)
             conn.execute(
-                "INSERT INTO hypothesis_proposals VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO hypothesis_proposals "
+                "(proposal_id, strategy_id, hypothesis_id, setting_id, "
+                "value_json, run_id, proposed_ts, observation_until_ts, status, "
+                "variant_id, target_parameter, minimum_json, maximum_json, "
+                "reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (proposal_id, strategy_id, hypothesis_id, setting_id,
-                 _canonical_json(number), run_id, timestamp,
-                 row["observation_until_ts"], "PROPOSED"))
+                 value_json, run_id, timestamp, row["observation_until_ts"],
+                 "PROPOSED", variant.variant_id, target_parameter,
+                 minimum_json, maximum_json, reasoning))
+            try:
+                conn.execute(
+                    "INSERT INTO hypothesis_proposal_value_locks "
+                    "(value_key, proposal_id, strategy_id, hypothesis_id, "
+                    "target_parameter, value_json, created_ts) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (value_key, proposal_id, strategy_id, hypothesis_id,
+                     target_parameter, value_json, timestamp))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    "duplicate exact adaptive hypothesis value") from exc
+            conn.execute(
+                "INSERT INTO hypothesis_proposal_events "
+                "(event_id, proposal_id, status, event_ts, detail_json) "
+                "VALUES (?,?,?,?,?)",
+                (uuid.uuid4().hex, proposal_id, "PROPOSED", timestamp,
+                 _canonical_json({
+                     "variant_id": variant.variant_id,
+                     "target_parameter": target_parameter,
+                     "minimum": float(minimum), "maximum": float(maximum),
+                     "reasoning": reasoning,
+                 })))
+            conn.execute(
+                "INSERT INTO findings (variant_id, ts, author, kind, text, "
+                "run_id) VALUES (?,?,?,?,?,NULL)",
+                (variant.variant_id, timestamp, "llm", "observation",
+                 _canonical_json({
+                     "type": "llm_numeric_proposal", "proposal": row,
+                 })))
         return row
 
     def set_status(self, variant_id: str, status: str) -> None:

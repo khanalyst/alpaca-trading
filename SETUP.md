@@ -1,26 +1,18 @@
 # Setup — Mac and Azure VM
 
-This is the current setup guide. It replaces the old split between the local
-setup guide and the Azure walkthrough. The two sections below cover the two
-supported operating locations; day-to-day monitoring and research procedures
-live in [`OPERATIONS.md`](OPERATIONS.md).
+This guide installs the shipped demo configuration. Day-to-day research,
+backup, and recovery procedures are in [OPERATIONS.md](OPERATIONS.md).
 
-The safe starting point is always OKX demo mode. Do not enable Withdraw on an
-API key. The shipped LLM is provider `openai`, model `gpt-5.6-terra`.
+Current defaults are OKX `demo`, strategy `momentum/phase1-v3`, LLM provider
+`openai`, and model/deployment identifier `gpt-5.6-sol`. No credential is
+stored in the repository. Use an OKX demo API key with Read and Trade only;
+never enable Withdraw.
 
-## Section 1 — Mac/local setup
+## 1. Mac/local setup
 
-### 1. Requirements
-
-- macOS with Python 3.12+ available;
-- Git;
-- an OKX demo account and demo API key with Read and Trade only;
-- an OpenAI-compatible model key, or Azure AI Foundry credentials routed by
-  `OPENAI_BASE_URL`;
-- enough disk for the journal, findings database, research cache, and any
-  downloaded corpus.
-
-### 2. Install
+Requirements: Python 3.12+, Git, an OKX demo account, a supported model key,
+and disk space for SQLite journals, recorder data, findings, tournament runs,
+and backups.
 
 ```bash
 git clone <repository> okx-agent-crypto
@@ -31,18 +23,17 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Fill `.env` with the OKX demo credentials and the selected model key. Keep
-secrets out of `config.yaml` and out of Git. For Azure AI Foundry, use the
-Azure key as `OPENAI_API_KEY` and set:
+Fill `.env` with the demo credentials and selected model key. For an
+OpenAI-compatible Azure AI Foundry endpoint, set the Azure key as
+`OPENAI_API_KEY` and add:
 
 ```dotenv
 OPENAI_BASE_URL=https://YOUR-RESOURCE.services.ai.azure.com/openai/v1
 ```
 
-The repository uses the standard OpenAI client and environment routing; it
-does not provision Azure resources or deploy containers.
+The repository does not provision Azure resources or deploy a model.
 
-### 3. Verify and run demo mode
+Validate and start:
 
 ```bash
 ./.venv/bin/python main.py check
@@ -55,65 +46,58 @@ In another terminal:
 ```bash
 ./.venv/bin/python main.py status
 ./.venv/bin/python research.py readiness
+./.venv/bin/python research.py replay --check-fidelity
 ```
 
-The current runtime is `momentum/phase1-v3`. Demo operation may be used to
-rehearse the controls even though its research tier is `T0_REJECTED`; live
-startup requires `T3_VALIDATED` or better.
+The configured momentum strategy is `T0_REJECTED`; demo use is an operations
+rehearsal and data-collection path, not a profitable-edge claim. G2 must pass
+before authoritative downstream research is trusted. `INSUFFICIENT_SAMPLE`
+means collection is still open.
 
-### 4. Local configuration
+## 2. Configuration summary
 
-The active configuration is in `config.yaml`. Important current values are:
-
-| Key | Current meaning |
+| Key | Shipped value/behavior |
 | --- | --- |
+| `mode` | `demo` |
 | `strategy.id` / `strategy.version` | `momentum` / `phase1-v3` |
-| `llm.provider` / `llm.model` | `openai` / `gpt-5.6-terra` |
-| `cycle.decision_interval_seconds` | Decision cadence; safety housekeeping remains separate |
-| `maker_first_enabled` | `false`; the maker entry path is not enabled |
-| `maker_first_wait_seconds` | Bounded maker wait when that path is enabled |
+| `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol` |
+| `cycle.interval_seconds` | `300` seconds for housekeeping and decisions |
+| `cycle.decision_interval_seconds` | Unset; optional slower decision cadence that does not slow safety housekeeping |
+| `execution.maker_first_enabled` | Omitted, validated default `false` (B7.5 disabled) |
+| `execution.maker_first_wait_seconds` | Omitted, validated default `20` seconds |
 | `research.shadow_enabled` | `true` |
 | `research.shadow_variants` | `[*]` |
-| `research.shadow_budget_ms` | `0`, so all scheduled variants are considered |
-| `research.shadow_workers` | `2`, bounded parallel computation |
+| `research.shadow_budget_ms` | `0` |
+| `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
+| `research.experiment_min_duration_days` | `3` |
+| `research.experiment_min_observations` | `100` |
+| `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |
 
-The removed legacy shadow setting is not accepted. The LLM is called once per
-cycle; shadow variants reuse its parsed decisions. The current B7.5 maker-first
-primitive is documented in `research/plan/B7.5-record.md` and remains disabled
-until its execution evidence and forward model are reviewed.
+All seven research strategies receive the same cycle snapshot/timestamp and
+keep independent paper accounts. Each strategy runs a baseline plus at most
+one candidate; both the duration and observation floors must be met before
+rotation. Only the configured main strategy can reach the demo exchange.
 
-### 5. Stop and restart
+The available exit policies are `fixed_rr` and `extended_rr`.
 
-Use `main.py pause` to stop opening new positions while leaving protection and
-housekeeping active. Use `main.py resume` to resume after the reason for the
-pause is understood. A process stop is not a substitute for checking the OKX
-account and the journal.
-
-### 6. Tests
+## 3. Local checks and tests
 
 ```bash
+./.venv/bin/python research.py corpus stats
+./.venv/bin/python research.py research-loop --no-review
+./.venv/bin/python research.py report
+./.venv/bin/python research.py backup
 ./.venv/bin/python -m pytest -q
 ```
 
-## Section 2 — Azure VM setup and deployment
+The default backup is `local_default`; it is not protection from loss of the
+machine.
 
-The VM is the always-on location for the trader, order-book recorder, and
-nightly research timer. A Mac is the development/inspection workstation. Code
-must be deliberately deployed to the VM; its runtime data must not be copied
-into the repository as a default.
+## 4. Azure VM host
 
-### 1. Create the VM
-
-Use an Ubuntu 24.04 x64 VM with a static public IP. A small two-vCPU/four-GB
-VM is sufficient for the trader and recorder; the nightly tournament is the
-main CPU spike. Disable Spot eviction and auto-shutdown. Bind the static IP in
-the OKX API-key restrictions before starting the agent.
-
-Azure portal creation is outside this repository. There are no ARM, Bicep,
-Terraform, container, or Azure provisioning files here.
-
-### 2. Install the host
+Use Ubuntu 24.04 x64 with a static public IP. Disable Spot eviction and
+auto-shutdown. Bind the static IP in the OKX API-key restrictions.
 
 ```bash
 sudo apt update
@@ -125,17 +109,22 @@ sudo -u okx python3.12 -m venv .venv
 sudo -u okx .venv/bin/pip install -r requirements.lock.txt
 ```
 
-Copy `.env` securely to the VM, then:
+Copy `.env` securely, then:
 
 ```bash
 sudo chown okx:okx /opt/okx-agent-crypto/.env
 sudo chmod 600 /opt/okx-agent-crypto/.env
-sudo -u okx .venv/bin/python main.py check
+sudo -u okx /opt/okx-agent-crypto/.venv/bin/python \
+  /opt/okx-agent-crypto/main.py check
 ```
 
-### 3. Install the services
+The service account is `nologin`. Do not use `sudo -iu okx`; run each command
+with `sudo -u okx` and an explicit working directory/path.
+
+## 5. Services
 
 ```bash
+cd /opt/okx-agent-crypto
 sudo cp deploy/okx-trader.service /etc/systemd/system/
 sudo cp deploy/okx-recorder.service /etc/systemd/system/
 sudo cp deploy/okx-research.service /etc/systemd/system/
@@ -146,66 +135,85 @@ sudo systemctl enable --now okx-trader
 sudo systemctl enable --now okx-research.timer
 ```
 
-Start the recorder before the trader. The recorder captures order-book depth
-and short-retention series that cannot be recovered from historical candles.
-The research timer runs at 03:00 UTC and is persistent across missed windows.
-
-### 4. VM service checks
+Start the recorder before the trader. The timer is scheduled for 03:00 UTC,
+has up to 10 minutes randomized delay, and is persistent across missed runs.
 
 ```bash
 sudo systemctl status okx-recorder okx-trader okx-research.timer
-sudo journalctl -u okx-trader -n 100
-sudo journalctl -u okx-recorder -n 100
-sudo journalctl -u okx-research -n 200
 sudo systemctl list-timers okx-research.timer
+sudo journalctl -u okx-trader -n 100 --no-pager
+sudo journalctl -u okx-recorder -n 100 --no-pager
+sudo journalctl -u okx-research -n 200 --no-pager
 ```
 
-The nightly service is red when G2 or readiness reports a real failure. A
-small corpus or `INSUFFICIENT_SAMPLE` is a collection state, not an edge and
-not a reason to promote anything.
+The research oneshot is separate from the trader. A research failure does not
+restart the trader.
 
-### 5. Backup the irreplaceable data
+## 6. Provision the external backup destination
 
-Back up before deleting or rebuilding the VM:
+Repository code cannot create off-host storage. Provision and mount a separate
+disk/share before relying on the VM. The destination must already exist and
+its `st_dev` must differ from the repository and every included source.
 
-- `runtime/demo/journal.db` or the active mode journal;
-- `runtime/research/recorded/`;
-- `runtime/research/data/` and its manifest;
-- `research/cache/findings.db` and `findings.db.backup`;
-- `research/results/` reports and leaderboard outputs.
-
-An Azure disk snapshot or an encrypted copy to separate storage is required.
-Selecting “Delete with VM” is acceptable only when a current snapshot exists;
-deleting the VM without a snapshot destroys the corpus.
-
-### 6. Azure model routing
-
-Azure AI Foundry is only a model endpoint choice. Set `OPENAI_API_KEY` to the
-Azure key and `OPENAI_BASE_URL` to the Azure `/openai/v1` endpoint. The code
-still uses `llm.provider: openai` and `llm.model: gpt-5.6-terra` unless the
-deployed model is intentionally changed and documented in the same change.
-
-### 7. Deploying code changes
-
-The VM does not see Mac changes automatically. Deploy a reviewed commit or
-working-tree export, then on the VM:
+Example service override:
 
 ```bash
-sudo -iu okx
+sudo systemctl edit okx-research.service
+```
+
+```ini
+[Service]
+Environment=BACKUP_TARGET=/mnt/off-host/okx-agent-research
+Environment=REQUIRE_EXTERNAL_BACKUP=1
+```
+
+Test it before enabling deletion/rebuild procedures:
+
+```bash
 cd /opt/okx-agent-crypto
-git pull --ff-only
-.venv/bin/python -m pytest -q
-exit
-sudo systemctl restart okx-recorder okx-trader
+sudo -u okx .venv/bin/python research.py backup \
+  --target /mnt/off-host/okx-agent-research \
+  --require-external
+sudo -u okx .venv/bin/python research.py readiness \
+  --db runtime/demo/journal.db
 ```
 
-Run the research workflow manually once after a deployment and inspect the
-report before relying on the timer:
+`local_default` and same-device `configured_local` backups do not make VM
+deletion safe. A path setting by itself is not external proof. The application
+never prunes prior backup directories, but an administrator or storage policy
+can still delete them. Different `st_dev` proves a separate mounted device, not
+that the storage is outside the VM's deletion domain; confirm location and
+retention separately.
+
+## 7. Deployment updates
+
+Deploy reviewed code deliberately; the VM does not receive Mac changes
+automatically.
 
 ```bash
-sudo -u okx .venv/bin/bash research/nightly.sh
+sudo -u okx git -C /opt/okx-agent-crypto pull --ff-only
+cd /opt/okx-agent-crypto
+sudo -u okx .venv/bin/python -m pytest -q
+sudo systemctl restart okx-recorder okx-trader
+sudo systemctl start okx-research.service
+sudo journalctl -u okx-research -n 200 --no-pager
 ```
 
-For the full operating and reporting sequence, use
-[`OPERATIONS.md`](OPERATIONS.md). For current hypothesis and variant identity,
-use [`research/HYPOTHESES_AND_VARIANTS.md`](research/HYPOTHESES_AND_VARIANTS.md).
+The first research run after provisioning an external mount can still finish
+with readiness exit 4 because readiness runs before that run's backup. Verify
+the backup, then rerun readiness or the service.
+
+## 8. One-time VM import
+
+`vm-import/2026-07-30/` contains a one-time journal, findings database, WAL
+files, and research archive imported for development. Treat it as read-only.
+Copy databases or extract the archive into a temporary directory before tests.
+Never point `research.findings_store`, `JOURNAL_DB`, `DATA_DIR`, recorder
+output, tournament output, or `BACKUP_TARGET` at this fixture.
+
+## 9. B7.5 boundary
+
+B7.5 is the optional maker-first order primitive, not the `scalp-maker` shadow
+strategy. How it completes: deliberately enable it in demo and validate its
+fill/cancel/timeout evidence. Why it waits: the shipped default is disabled and
+exchange-only passive-order races are not proven by historical data.

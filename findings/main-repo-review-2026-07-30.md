@@ -1,5 +1,11 @@
 # Main repository review — 2026-07-30
 
+> **Historical snapshot.** This document preserves the code and evidence state
+> observed on July 30, 2026. Statements about the then-current schema, missing variants, or
+> partially implemented items are not current operating claims. The reconciled
+> implementation is schema 14 and is documented in `README.md`,
+> `OPERATIONS.md`, and `MAIN_REPO_REVIEW_PLAN.md`.
+
 > Preserved detailed review record. The current implementation status is
 > maintained in [`../MAIN_REPO_REVIEW_PLAN.md`](../MAIN_REPO_REVIEW_PLAN.md);
 > this document retains the full findings and reasoning behind that plan.
@@ -81,7 +87,7 @@ The pipeline exists end to end and is unusually well sequenced:
 | --- | --- |
 | Fidelity gate | `research.py replay --check-fidelity` (G2) must reproduce the agent's own recorded decisions; result journalled as `research_gate_result`; `sweep`, `funnel` and `three-arm` all refuse without a current PASS |
 | Discovery | `protocol.evaluate_axis` — selection on the fit window only, paired proposal identity, cluster-block bootstrap, verdict names its governing criterion |
-| Documentation | `findings.db`, append-only with history triggers, schema 8; `write_scorecards` regenerates one markdown card per variant into `findings/` |
+| Documentation | At review time, `findings.db` used the then-current findings schema and `write_scorecards` regenerated one markdown card per variant into `findings/` |
 | Forward confirmation | `forward-qualify` re-derives the verdict from the immutable decision ledger, proving one strategy version, one declared axis, and identical non-axis config |
 | Paper | `qualify_variant` → `PAPER_PENDING` while a shadow position is open → clean rebased `PAPER` account when flat |
 | Lock | `t3-packet` builds a SHA-256 content-addressed packet, `DRAFT_REVIEW_REQUIRED` unless the full checklist passes **and** a reviewer plus a registry-change reference are supplied |
@@ -366,7 +372,7 @@ The best instance of requirement 4 done right is `momentum.discriminator.*`:
 two registered variants for an argument about which variable separates breakout
 from continuation, so the corpus decides instead of the argument.
 
-### R4-01 — six of seven hypotheses have no variants at all · **Partially implemented (highest value)**
+### R4-01 — at review time, most registered hypotheses had no variants · **Partially implemented then**
 
 > Historical finding: this conclusion describes the July 28 pre-settings
 > tournament output; the checked-in July 28 report and leaderboard are

@@ -35,21 +35,40 @@ class HypothesisVariantTests(unittest.TestCase):
             self.assertEqual(row["hypothesis_id"], variant.hypothesis_id)
             self.assertIn("hypothesis_params_json", row)
 
+            exact = adaptive_hypothesis_variant(
+                "momentum", "phase1-v3", "volume-thrust", "registered", 1.7)
             store.propose_numeric_setting(
-                "momentum", "volume-thrust", "adaptive", 1.7, "run-1",
-                minimum=1.0, maximum=3.0, now=10.0)
+                "momentum", "volume-thrust", "registered", 1.7, "run-1",
+                minimum=1.0, maximum=5.0,
+                target_parameter="min_relative_volume", variant=exact,
+                reasoning="Test the exact participation threshold.", now=10.0)
             with self.assertRaisesRegex(ValueError, "lock"):
+                other = adaptive_hypothesis_variant(
+                    "momentum", "phase1-v3", "volume-thrust", "registered", 1.8)
                 store.propose_numeric_setting(
-                    "momentum", "volume-thrust", "adaptive", 1.8,
-                    "run-2", minimum=1.0, maximum=3.0, now=11.0)
+                    "momentum", "volume-thrust", "registered", 1.8,
+                    "run-2", minimum=1.0, maximum=5.0,
+                    target_parameter="min_relative_volume", variant=other,
+                    reasoning="Test another exact participation threshold.",
+                    now=11.0)
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 store.propose_numeric_setting(
-                    "momentum", "volume-thrust", "adaptive", 1.7, "run-1",
-                    minimum=1.0, maximum=3.0, now=20.0)
+                    "momentum", "volume-thrust", "registered", 1.7, "run-2",
+                    minimum=1.0, maximum=5.0,
+                    target_parameter="min_relative_volume", variant=exact,
+                    reasoning="Do not silently retry this exact value.",
+                    now=20.0)
             with self.assertRaisesRegex(ValueError, "lock"):
+                other_setting = adaptive_hypothesis_variant(
+                    "momentum", "phase1-v3", "volume-thrust",
+                    "lower_participation", 2.1)
                 store.propose_numeric_setting(
-                    "momentum", "volume-thrust", "another_setting", 2.1,
-                    "run-1", minimum=1.0, maximum=3.0, now=21.0)
+                    "momentum", "volume-thrust", "lower_participation", 2.1,
+                    "run-1", minimum=1.0, maximum=5.0,
+                    target_parameter="min_relative_volume",
+                    variant=other_setting,
+                    reasoning="Test the lower-participation setting exactly.",
+                    now=21.0)
 
     def test_forward_axis_accepts_hypothesis_metadata_and_rejects_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:

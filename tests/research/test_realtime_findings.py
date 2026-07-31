@@ -1182,7 +1182,8 @@ class ForwardQualificationCommandTests(StoreFixture):
 
         self.assertEqual(result, 0)
         self.assertTrue(configured.exists())
-        self.assertTrue(configured.with_name("findings.db.backup").exists())
+        snapshots = configured.with_name("findings.db.snapshots")
+        self.assertTrue(any(snapshots.glob("*.db")))
 
     def test_relative_configured_store_is_repo_relative(self):
         self.assertEqual(

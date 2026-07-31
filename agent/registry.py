@@ -287,6 +287,7 @@ REGISTRY: dict[str, StrategySpec] = {
             execution_style="taker",
             setup_types=("flush_reversion",),
             forward_model_id="flush_fade.reversion.15m.v1",
+            forward_model_ready=True,
             implemented=True,
             contract_params={
                 "flush_min_move_atr": 1.5,
@@ -335,6 +336,7 @@ REGISTRY: dict[str, StrategySpec] = {
             execution_style="taker",
             setup_types=("carry",),
             forward_model_id="funding_carry.interval.1h.v1",
+            forward_model_ready=True,
             implemented=True,
             contract_params={
                 "funding_extreme_pct_per_8h": 0.01,
@@ -387,6 +389,7 @@ REGISTRY: dict[str, StrategySpec] = {
             execution_style="taker",
             setup_types=("positioning_unwind",),
             forward_model_id="funding_unwind.reversion.1h.v1",
+            forward_model_ready=True,
             implemented=True,
             contract_params={
                 "funding_extreme_pct_per_8h": 0.01,
@@ -423,6 +426,7 @@ REGISTRY: dict[str, StrategySpec] = {
             execution_style="taker",
             setup_types=("trend_follow",),
             forward_model_id="trend_multiday.4h.v1",
+            forward_model_ready=True,
             implemented=True,
             contract_params={
                 "trend_min_range_pos_pct": 55.0,
@@ -453,6 +457,7 @@ REGISTRY: dict[str, StrategySpec] = {
             execution_style="taker",
             setup_types=("positioning_fade",),
             forward_model_id="ls_ratio_fade.1h.v1",
+            forward_model_ready=True,
             implemented=True,
             contract_params={
                 "ls_high_percentile": 80.0,
@@ -486,14 +491,20 @@ REGISTRY: dict[str, StrategySpec] = {
             execution_style="maker",
             setup_types=("spread_capture",),
             forward_model_id="scalp_maker.book.1m.v1",
+            forward_model_ready=True,
+            implemented=True,
+            contract_params={
+                "scalp_max_spread_pct": 0.02,
+                "scalp_min_abs_imbalance": 0.15,
+                "scalp_min_depth_usd": 10_000.0,
+                "hard_max_entry_extension_atr": 10.0,
+            },
             notes=(
-                "Hard-blocked on data, not on development. OKX never serves "
-                "historical order books, so fill quality cannot be simulated "
-                "until research/record_flow.py has collected it. First "
-                "honest result is roughly three months after recording "
-                "starts. Spread varies ~90x across the universe (BTC 0.015 "
-                "bps, DOGE 1.39 bps), so this is a tight-spread majors-only "
-                "design."),
+                "Historical validation remains blocked because OKX never "
+                "serves historical order books. The real-time forward model "
+                "uses only an observed two-sided book and records a data-"
+                "missing veto when it is absent. Spread varies ~90x across "
+                "the universe, so this remains a tight-spread design."),
         ),
     )
 }

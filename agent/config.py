@@ -61,7 +61,7 @@ def _boolean(block: dict, key: str, path: str) -> bool:
     return value
 
 
-def validate_config(raw: dict) -> dict:
+def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
     """Return a validated defensive copy of *raw* or raise ``ConfigError``."""
     cfg = deepcopy(_mapping(raw, "config"))
     _keys(cfg, {"mode", "llm", "strategy", "universe", "cycle", "risk",
@@ -90,7 +90,14 @@ def validate_config(raw: dict) -> dict:
         "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
         "breakout_range_threshold_pct", "breakout_min_relative_volume",
         "funding_extreme_pct_per_8h", "fixed_reward_risk",
-        "extended_reward_risk",
+        "extended_reward_risk", "forward_horizon_hours",
+        "flush_min_move_atr", "flush_min_oi_drop_pct",
+        "flush_min_relative_volume", "carry_percentile",
+        "carry_min_samples", "unwind_percentile", "unwind_min_samples",
+        "trend_min_range_pos_pct", "trend_max_atr_ratio",
+        "ls_high_percentile", "ls_low_percentile",
+        "scalp_max_spread_pct", "scalp_min_abs_imbalance",
+        "scalp_min_depth_usd",
     }, "strategy")
     for key in ("id", "version", "signal_timeframe"):
         if (not isinstance(strategy.get(key), str)
@@ -113,10 +120,11 @@ def validate_config(raw: dict) -> dict:
             f"strategy.id {spec.id!r} is registered for research but has no "
             f"live contract implementation. Runnable strategies: "
             f"{', '.join(runnable_ids())}")
-    if not spec.analyst_ready:
+    if not spec.analyst_ready and not allow_shadow_strategy:
         raise ConfigError(
-            f"strategy.id {spec.id!r} has a deterministic shadow contract "
-            "but its analyst prompt/schema is not implemented. Runnable "
+            f"strategy.id {spec.id!r} has no live contract implementation; "
+            "its deterministic shadow contract is research-only because the "
+            "analyst prompt/schema is not implemented. Runnable "
             f"strategies: {', '.join(runnable_ids())}")
     # Demo is an operations rehearsal, but it still needs a complete analyst
     # contract. Live capital additionally requires a strategy that has
@@ -168,6 +176,44 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError(
             "strategy.extended_reward_risk cannot be below "
             "fixed_reward_risk")
+    if "forward_horizon_hours" in strategy:
+        horizon = _number(
+            strategy, "forward_horizon_hours", 0.01,
+            spec.max_hold_hours_ceiling, "strategy")
+        if horizon > spec.max_hold_hours_ceiling:
+            raise ConfigError(
+                "strategy.forward_horizon_hours exceeds the registry ceiling")
+    for key in ("flush_min_move_atr", "flush_min_relative_volume"):
+        if key in strategy:
+            _number(strategy, key, 0.01, 20, "strategy")
+    if "flush_min_oi_drop_pct" in strategy:
+        _number(strategy, "flush_min_oi_drop_pct", 0, 100, "strategy")
+    for key in ("carry_percentile", "unwind_percentile"):
+        if key in strategy:
+            _number(strategy, key, 50, 100, "strategy")
+    for key in ("carry_min_samples", "unwind_min_samples"):
+        if key in strategy:
+            _integer(strategy, key, 1, 10_000, "strategy")
+    if "trend_min_range_pos_pct" in strategy:
+        _number(strategy, "trend_min_range_pos_pct", 50, 100, "strategy")
+    if "trend_max_atr_ratio" in strategy:
+        _number(strategy, "trend_max_atr_ratio", 0.01, 20, "strategy")
+    if "ls_high_percentile" in strategy:
+        _number(strategy, "ls_high_percentile", 50, 100, "strategy")
+    if "ls_low_percentile" in strategy:
+        _number(strategy, "ls_low_percentile", 0, 50, "strategy")
+    if ("ls_high_percentile" in strategy and "ls_low_percentile" in strategy
+            and float(strategy["ls_low_percentile"])
+            >= float(strategy["ls_high_percentile"])):
+        raise ConfigError(
+            "strategy.ls_low_percentile must be below ls_high_percentile")
+    if "scalp_max_spread_pct" in strategy:
+        _number(strategy, "scalp_max_spread_pct", 0.000001, 2, "strategy")
+    if "scalp_min_abs_imbalance" in strategy:
+        _number(strategy, "scalp_min_abs_imbalance", 0, 1, "strategy")
+    if "scalp_min_depth_usd" in strategy:
+        _number(strategy, "scalp_min_depth_usd", 0, 1_000_000_000,
+                "strategy")
     if (float(strategy["setup_memory_hours"]) * 60
             < float(strategy["setup_cooldown_minutes"])):
         raise ConfigError(
@@ -205,7 +251,7 @@ def validate_config(raw: dict) -> dict:
             isinstance(x, str) and x for x in timeframes):
         raise ConfigError("cycle.timeframes must be a non-empty list of strings")
     missing = [tf for tf in spec.required_timeframes if tf not in timeframes]
-    if missing:
+    if missing and not allow_shadow_strategy:
         raise ConfigError(
             f"cycle.timeframes must include {', '.join(spec.required_timeframes)} "
             f"for strategy.id {spec.id!r} (missing: {', '.join(missing)})")
@@ -216,7 +262,8 @@ def validate_config(raw: dict) -> dict:
         raise ConfigError(
             f"strategy.signal_timeframe must be exactly "
             f"{spec.signal_timeframe!r} for strategy.id {spec.id!r}")
-    if strategy["signal_timeframe"] not in timeframes:
+    if (strategy["signal_timeframe"] not in timeframes
+            and not allow_shadow_strategy):
         raise ConfigError(
             "strategy.signal_timeframe must appear in cycle.timeframes")
 
@@ -339,7 +386,7 @@ def validate_config(raw: dict) -> dict:
                       "entry_failure_backoff_max_minutes",
                       "entry_failure_ttl_minutes"},
           "execution")
-    # B7.5 / H-K(ii). Off unless set: this is the only research feature that
+    # B7.5 maker-first path. Off unless set: this is the only research feature that
     # modifies the entry path, so it must be turned on deliberately.
     if execution.get("maker_first_enabled") is not None:
         _boolean(execution, "maker_first_enabled", "execution")
@@ -416,8 +463,12 @@ def validate_config(raw: dict) -> dict:
         _keys(research, {"shadow_enabled", "shadow_variants",
                          "shadow_budget_ms",
                          "shadow_workers",
-                         "findings_store", "paper_initial_balance_usdt",
-                         "paper_max_failures", "paper_min_closed_trades"},
+                         "findings_store", "backup_target",
+                         "paper_initial_balance_usdt",
+                         "paper_max_failures", "paper_min_closed_trades",
+                         "experiment_min_duration_days",
+                         "experiment_min_observations",
+                         "forward_feed_version"},
               "research")
         _boolean(research, "shadow_enabled", "research")
         _number(research, "shadow_budget_ms", 0, 60_000, "research")
@@ -431,11 +482,25 @@ def validate_config(raw: dict) -> dict:
         if "paper_min_closed_trades" in research:
             _integer(research, "paper_min_closed_trades", 1, 100_000,
                      "research")
+        if "experiment_min_duration_days" in research:
+            _integer(research, "experiment_min_duration_days", 1, 365,
+                     "research")
+        if "experiment_min_observations" in research:
+            _integer(research, "experiment_min_observations", 1, 100_000,
+                     "research")
+        if "forward_feed_version" in research:
+            _integer(research, "forward_feed_version", 1, 1_000,
+                     "research")
         findings_store = research.get("findings_store")
         if findings_store is not None and (
                 not isinstance(findings_store, str)
                 or not findings_store.strip()):
             raise ConfigError("research.findings_store must be a path string")
+        backup_target = research.get("backup_target")
+        if backup_target is not None and (
+                not isinstance(backup_target, str)
+                or not backup_target.strip()):
+            raise ConfigError("research.backup_target must be a path string")
         for key in ("shadow_variants",):
             names = research.get(key)
             if names is None:

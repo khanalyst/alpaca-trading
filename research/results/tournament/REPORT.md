@@ -1,5 +1,10 @@
 # Strategy tournament
 
+> **Historical top-level latest view.** This committed report predates the
+> current schema-14 per-run artifact ledger. New tournament invocations retain
+> immutable evidence under `research/results/tournament/runs/`; the top-level
+> report is only a latest-view copy and never live authority.
+
 Generated 2026-07-28 12:12:46Z from `runtime/research/data`.
 
 > Historical/pre-settings evidence: this report was generated on July 28,

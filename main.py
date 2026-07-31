@@ -404,8 +404,10 @@ def cmd_strategies(args, cfg) -> int:
     if not args.verbose:
         print("Use --verbose for each strategy's mechanism and "
               "falsification criterion.")
-    print("To switch: set strategy.id and strategy.version in config.yaml, "
-          "then restart the loop.")
+    print("Only entries marked runnable may be configured for the order path; "
+          "shadow-only/research-only entries remain isolated research. Any "
+          "strategy change is a deliberate reviewed config change followed "
+          "by a restart, never a research-side automatic switch.")
     return 0
 
 

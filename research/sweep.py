@@ -10,7 +10,7 @@ A **conditioning axis** partitions results. It carries no config override, so
 one replay produces every bucket, and it reuses trades that already exist
 rather than requiring new ones. It also *increases* effective power when the
 partition is real, because it separates populations whose averaging was
-destroying the signal - the exact failure H-I describes, where a contract
+destroying the signal - the exact volatility-regime failure where a contract
 with positive expectancy in compression and negative expectancy in expansion
 reports a pooled figure near zero and gets correctly rejected on a
 hypothesis that was true in half the sample.

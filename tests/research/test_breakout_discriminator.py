@@ -7,7 +7,7 @@ chose. Attributing performance by `setup_type` then splits one phenomenon
 across two rows and draws conclusions from the split.
 
 What they should be separated *by* is genuinely open. The implementation plan
-says trend alignment; edge-hypotheses H-I says the real partition is
+says trend alignment; the competing rationale says the real partition is
 volatility regime and trend alignment is a correlated proxy for it.
 
 Baking either one in would filter the population the other one needs, which
@@ -110,7 +110,7 @@ class TrendAlignmentDiscriminatorTests(unittest.TestCase):
 
 
 class VolatilityRegimeDiscriminatorTests(unittest.TestCase):
-    """H-I: the partition is compression versus expansion."""
+    """The volatility partition is compression versus expansion."""
 
     def test_a_compressed_base_still_breaks_out(self):
         cfg = cfg_with("volatility_regime")

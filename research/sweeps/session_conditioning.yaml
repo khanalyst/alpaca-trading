@@ -1,6 +1,6 @@
-# H-L. Three economic windows, not twenty-four hourly buckets.
+# Session conditioning: three economic windows, not twenty-four hourly buckets.
 #
-# edge-hypotheses.md is explicit that this is the test most likely to produce
+# The strategy rationale is explicit that this test is most likely to produce
 # a false positive that survives scrutiny it has not earned: a session filter
 # feels intuitive, so it will be believed. Twenty-four buckets against a few
 # hundred trades will always produce a "significant" hour.

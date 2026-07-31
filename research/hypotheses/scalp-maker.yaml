@@ -1,12 +1,12 @@
 # Pre-registration: scalp-maker / v1
 #
-# Registered so the tournament reports WHY it is unscored rather than
-# silently skipping it. It is blocked on data that does not exist yet, not
-# on development effort, and that distinction should be visible.
+# Registered so the tournament reports WHY historical scoring is unavailable
+# rather than silently skipping it. Real-time forward simulation is active;
+# historical queue/fill evidence still does not exist.
 
 strategy_id: scalp-maker
 version: v1
-status: registered_blocked_on_data
+status: registered_forward_only
 
 mechanism: |
   A maker is paid the spread for supplying liquidity; the payer is the
@@ -26,6 +26,32 @@ falsification: |
   saving and the strategy is negative by construction. The existing maker
   study puts the crossover between 5 and 15 bps.
 
+signal_timeframe: 1m
+scalp_max_spread_pct: 0.02
+scalp_min_abs_imbalance: 0.15
+scalp_min_depth_usd: 10000
+stop_atr_multiple: 0.5
+reward_risk: 1.0
+max_hold_hours: 4
+
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The shipped real-time book thresholds are the comparison point.
+  - id: stronger_imbalance
+    params:
+      scalp_min_abs_imbalance: 0.25
+    claim: >-
+      Requiring a stronger depth imbalance should reduce adverse selection if
+      imbalance is useful rather than merely descriptive.
+  - id: tighter_spread
+    params:
+      scalp_max_spread_pct: 0.01
+    claim: >-
+      A tighter maximum spread tests whether only the most liquid books can
+      support a passive-entry inventory trade.
+
 backtestable: false
 why_not_backtestable: |
   Maker profitability is decided by fill quality, fill quality is decided by
@@ -37,10 +63,14 @@ why_not_backtestable: |
   three months after that point. Any number produced before then is a guess
   wearing a backtest's clothes.
 
-hypotheses_tested: 0
+  The forward evaluator can still paper-simulate the declared passive entry
+  at an observed best quote. That is implementation evidence, not proof that
+  a real resting order would have obtained queue priority or a fill.
+
+hypotheses_tested: 3
 multiple_testing_note: |
-  Zero, because nothing has been tested. The count starts when the data
-  does.
+  Three parameterisations are declared before forward outcomes are observed.
+  No setting has completed the evidence window yet.
 
 design_constraints_already_measured: |
   - Spread varies ~90x across the tradable universe (BTC 0.015 bps, DOGE

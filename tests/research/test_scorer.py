@@ -108,7 +108,7 @@ class FunnelTests(unittest.TestCase):
         self.assertAlmostEqual(share, 66.667, 2)
 
     def test_gate_g4_threshold_is_readable_from_the_share(self):
-        """G4: over 30% and H-J is promoted to first priority."""
+        """G4: over 30% promotes BTC-residual analysis to first priority."""
         funnel = score.funnel_from_replay(self._result(
             100, 90, 10, {"net directional cap": 40, "other": 50}))
 

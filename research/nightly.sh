@@ -13,8 +13,9 @@
 # producing a report that looks fine. That is the plan's instruction: treat a
 # G2 failure as a full stop, not a debugging task to work around.
 #
-# Idempotent and safe to kill: downloads resume, and every step rewrites its
-# output rather than appending.
+# Downloads resume. Durable findings, tournament runs and backup histories are
+# append-only; only documented top-level latest views are refreshed. A killed
+# run retains its recorded STARTED/FAILED evidence instead of replacing history.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,6 +43,12 @@ echo "=== $(date -u +%FT%TZ) readiness ==="
 # because it is the one command that fails loudly when a passive order may
 # have been left resting. Non-zero here is a real problem, not a delay.
 "$PY" research.py readiness --db "$JOURNAL" || readiness_failed=1
+
+echo "=== $(date -u +%FT%TZ) research learning loop ==="
+# One invocation reviews at most one completed outcome. Provider or parse
+# failures are persisted for retry and must not abort the wider nightly run.
+"$PY" research.py research-loop --store "$STORE" \
+  || echo "WARNING: research review deferred; deterministic outcomes remain stored" >&2
 
 if [ -f "$JOURNAL" ]; then
   echo "=== $(date -u +%FT%TZ) corpus ==="
@@ -91,7 +98,7 @@ if [ -f "$JOURNAL" ]; then
     || echo "  (collecting, unscoped, or no promotable edge; see above)"
 
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
-  "$PY" research.py report
+  "$PY" research.py report --store "$STORE"
 else
   echo "=== no journal at $JOURNAL; skipping the authoritative path ==="
   echo "The corpus is written by the running agent. Until it exists, only" >&2
@@ -114,8 +121,29 @@ echo "=== $(date -u +%FT%TZ) resolving forward evidence from the journal ==="
   || echo "WARNING: no forward evidence resolved this run" >&2
 
 echo "=== $(date -u +%FT%TZ) scoring the tournament ==="
-"$PY" research/tournament.py --data "$DATA"
+set +e
+"$PY" research/tournament.py --data "$DATA" --store "$STORE"
 status=$?
+set -e
+
+echo "=== $(date -u +%FT%TZ) verified append-only backup ==="
+backup_args=(backup --store "$STORE" --journal "$JOURNAL" --mode "$MODE")
+if [ -n "${BACKUP_TARGET:-}" ]; then
+  backup_args+=(--target "$BACKUP_TARGET")
+fi
+if [ "${REQUIRE_EXTERNAL_BACKUP:-0}" = "1" ]; then
+  backup_args+=(--require-external)
+fi
+set +e
+"$PY" research.py "${backup_args[@]}"
+backup_status=$?
+set -e
+if [ "$backup_status" -ne 0 ]; then
+  echo "=== backup FAILED; research service will exit nonzero ===" >&2
+  # This oneshot service is separate from okx-trader.service. Its failure is
+  # visible to systemd without stopping or restarting the trading engine.
+  status=5
+fi
 
 if [ "${readiness_failed:-0}" = "1" ]; then
   echo "=== readiness reported a FAILED gate; see the top of this log ===" >&2

@@ -1202,7 +1202,8 @@ class Exchange:
 
         ``guarded_entry_limit`` reads the same book but only journals when it
         rejects, so every passing observation is discarded. That is precisely
-        backwards for H-H, which claims the tradeable moment in a liquidation
+        backwards for the depth-restoration hypothesis, which claims the
+        tradeable moment in a liquidation
         cascade is the depth *restoration* rather than the impulse: spread
         spikes then normalises, top-of-book depth collapses then refills, and
         price is still near the extreme when the refill happens. That
@@ -1213,7 +1214,8 @@ class Exchange:
         nulls carrying the reason.
         """
         blank = {
-            "symbol": symbol, "mid": None, "spread_pct": None,
+            "symbol": symbol, "mid": None, "best_bid": None,
+            "best_ask": None, "spread_pct": None,
             "bid_depth_usd": None, "ask_depth_usd": None,
             "top_bid_size": None, "top_ask_size": None,
             "band_pct": float(band_pct), "book_ts": None, "error": None,
@@ -1252,6 +1254,8 @@ class Exchange:
 
             blank.update({
                 "mid": round(mid, 10),
+                "best_bid": best_bid,
+                "best_ask": best_ask,
                 "spread_pct": round((best_ask - best_bid) / mid * 100, 6),
                 "bid_depth_usd": depth(bids, lambda p: p >= floor),
                 "ask_depth_usd": depth(asks, lambda p: p <= ceiling),
@@ -1571,7 +1575,7 @@ class Exchange:
                           reference_price: float) -> dict:
         """Post passively for ``wait_seconds``, then get out of the way.
 
-        H-K(ii). Every IOC entry crosses the spread and accepts adverse
+        Maker-first entry study. Every IOC entry crosses the spread and accepts adverse
         selection: you buy at the moment a seller wants to sell to you. At a
         2% stop, round-trip friction is roughly 10% of the risk unit, so
         converting the filled fraction from taker to maker moves expectancy

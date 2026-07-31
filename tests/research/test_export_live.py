@@ -48,7 +48,7 @@ class JournalSchemaTests(unittest.TestCase):
 
 
 class OutcomeModelTests(unittest.TestCase):
-    def test_unvalidated_strategy_is_not_scored_with_momentum_exits(self):
+    def test_validated_strategy_still_refuses_absent_bar_data(self):
         decisions = pd.DataFrame([{
             "strategy_id": "funding-carry", "symbol": "BTC",
             "direction": "long", "signal_ts": 1,
@@ -61,7 +61,7 @@ class OutcomeModelTests(unittest.TestCase):
         self.assertTrue(resolved.empty)
         self.assertEqual(
             resolved.attrs["unresolved"],
-            {"funding-carry: no validated forward outcome model": 1})
+            {"BTC: no bar data": 1})
 
 
 if __name__ == "__main__":

@@ -35,23 +35,24 @@ class ShadowParallelTests(unittest.TestCase):
         self.assertGreaterEqual(states[0][1], 1)
 
     def test_adaptive_cycle_selects_one_setting_per_strategy(self):
-        first = variants.Variant(
-            "momentum.hyp.volume_thrust.first", "momentum", "phase1-v3",
-            hypothesis="The first setting improves the strategy outcome.",
-            hypothesis_id="volume-thrust")
-        second = variants.Variant(
-            "momentum.hyp.volume_thrust.second", "momentum", "phase1-v3",
-            hypothesis="The second setting improves the strategy outcome.",
-            hypothesis_id="volume-thrust")
-        evaluator = shadow.ShadowEvaluator([first, second], valid_config())
+        static = next(
+            item for item in variants.hypothesis_variants(
+                "momentum", "phase1-v3")
+            if item.variant_id.endswith(".lower_participation"))
+        exact = variants.adaptive_hypothesis_variant(
+            "momentum", "phase1-v3", "volume-thrust",
+            "lower_participation", 1.3)
+        evaluator = shadow.ShadowEvaluator([static, exact], valid_config())
 
         selected = evaluator._scheduled_variant_ids([{
             "action": "research_proposal",
             "hypothesis_id": "volume-thrust",
-            "setting_id": "first",
+            "setting_id": "lower_participation",
+            "value": 1.3,
+            "variant_id": exact.variant_id,
         }])
 
-        self.assertEqual(selected, ["momentum.hyp.volume_thrust.first"])
+        self.assertEqual(selected, [exact.variant_id])
 
     def test_default_remains_serial_and_compatible(self):
         evaluator = shadow.ShadowEvaluator([variant()], valid_config())

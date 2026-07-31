@@ -1,5 +1,11 @@
 # Orchestrated strategy audit — 2026-07-29
 
+> **Historical snapshot.** This audit records the repository as reviewed on
+> July 29, 2026. Its older-schema and single-backup descriptions are retained as
+> historical findings, not current instructions. See `README.md` and
+> `OPERATIONS.md` for the schema-14 seven-strategy pipeline and versioned
+> verified backups.
+
 This is the missing consolidated record of the repository review performed on
 the isolated branch `codex/orchestrated-strategy-audit` in
 `/private/tmp/okx-agent-crypto-orchestrated`. The original checkout was not
@@ -31,7 +37,7 @@ The follow-up adds independent persisted variant accounts, durable fair
 scheduling, paired/dependence-aware inference, richer replay state feedback,
 forward-only findings migrations, transfer-ID deduplication with explicit
 reconciliation when an ID is absent, strategy-specific outcome contracts, and
-content-addressed review-gated T3 evidence packets. Schema 8 now persists
+content-addressed review-gated T3 evidence packets. The then-current schema persisted
 every accepted or vetoed proposal atomically, treats vetoes as explicit
 zero-return paired actions, freezes qualification at a common pre-paper
 evidence boundary, and invalidates windows containing operational failures.
@@ -55,7 +61,7 @@ liquidation/margin details.
 | HYP-08 | P1 | Replay does not fully model equity feedback, loss cooldowns, universe-selection changes, and every circuit breaker. | **Substantially fixed; exchange-only gap remains** | Replay now feeds resolved PnL into equity, closes positions, starts loss cooldowns, tracks universe changes and applies daily-loss/max-drawdown transitions. Diagnostics enumerate modelled transitions, recorded mismatches and remaining exchange-only fields. |
 | HYP-09 | P1 | Three-arm comparison does not provide strict paired matching for all proposals/outcomes, and its bootstrap can overstate certainty when samples are structurally dependent. | **Fixed** | Comparisons match exact stable proposal identities, report mismatch/coverage diagnostics, require ≥80% coverage with no duplicates, and use a paired six-hour cluster/block bootstrap. |
 | HYP-10 | P2 | Research records could be compared across incompatible strategy, prompt, configuration, or code versions without a hard compatibility boundary. | **Mitigated** | G2 is tied to proposal-corpus state plus strategy/configuration and fidelity-code fingerprints. Reports group by account, strategy/version, prompt/config/code, parameter variant, and strategy configuration. A universal compatibility policy across every historical tool is still not enforced. |
-| HYP-11 | P0 | Policy-changing variants could persist only accepted trades, leaving no honest population for confidence, exposure, or discriminator vetoes. | **Fixed** | Schema 8 stores immutable accepted/vetoed decisions atomically with portfolio and trade state. Vetoes are explicit zero-return paired actions; qualification uses one common pre-paper window and rejects operational failures inside it. |
+| HYP-11 | P0 | Policy-changing variants could persist only accepted trades, leaving no honest population for confidence, exposure, or discriminator vetoes. | **Fixed at review time** | The then-current store persisted accepted/vetoed decisions atomically with portfolio and trade state. Vetoes were explicit zero-return paired actions; qualification used one common pre-paper window and rejected operational failures inside it. |
 
 ## 2. Reporting, storage, and auditability findings
 
@@ -67,7 +73,7 @@ liquidation/margin details.
 | REP-04 | P1 | An exchange fill and the subsequent local journal write cannot be one atomic transaction. A database failure after a fill can leave incomplete attribution. | **Open external-transaction risk** | Existing fail-closed/emergency reconciliation behavior remains, but no local change can make an exchange and SQLite commit atomic. Operational reconciliation is still required. |
 | REP-05 | P1 | Transfer events lack a durable exchange transfer identifier, so identical legitimate transfers cannot be safely distinguished from duplicates. | **Fixed where OKX supplies identity; explicit reconciliation otherwise** | Bill/transfer IDs are persisted and deduplicated exactly. Rows without identity are never heuristically collapsed; they enter `transfer_reconciliation_required`. |
 | REP-06 | P1 | Findings were append-only by convention rather than protected against update/delete through the application database. | **Fixed within the SQLite store** | New immutability triggers protect runs, results, and findings; uniqueness and foreign-key protections were strengthened. Direct filesystem replacement by an operator remains outside the database's threat model. |
-| REP-07 | P1 | There was no automatic backup of the research findings database. | **Fixed** | Successful evaluations and report generation maintain `findings.db.backup`. |
+| REP-07 | P1 | There was no automatic backup of the research findings database. | **Fixed at review time; later superseded** | The reviewed version maintained one local findings snapshot. Schema 14 now uses versioned verified backups and never treats that historical snapshot as off-host protection. |
 | REP-08 | P2 | Schema-version handling could regress, and existing databases cannot acquire every new foreign-key constraint without a table rebuild. | **Fixed** | The findings store has numbered forward-only transactional migrations, rebuilds legacy core tables, records migration history, validates the current schema and refuses newer unsupported versions. |
 | REP-09 | P0 | Reporting could not show the full action population because vetoes were not durable evidence. | **Fixed** | Scorecards now include accept/veto counts, decision-ledger watermarks and content-addressed forward evidence linked to exact accepted trade outcomes. Legacy executed-trades-only qualifications are revoked rather than blended with invented veto history. |
 

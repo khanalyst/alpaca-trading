@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from . import (brain, contracts, market, registry, shadow, state,
+from . import (brain, contracts, hypotheses, market, registry, shadow, state,
                strategy, variants)
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
@@ -105,31 +105,91 @@ class Engine:
         self._startup_reconciled = False
         self._credential_failures = 0
 
-    def _record_research_proposals(self, decisions: list[dict]) -> None:
+    def _record_research_proposals(
+            self, decisions: list[dict]) -> list[dict]:
+        trading_decisions = [
+            decision for decision in decisions
+            if decision.get("action") not in {
+                "research_proposal", "research_selection"}]
         proposal = next((d for d in decisions
                          if d.get("action") == "research_proposal"), None)
-        if proposal is None or self.shadow is None:
-            return
-        store = self.shadow.store
-        try:
-            from .variants import adaptive_hypothesis_variant
-            adaptive = adaptive_hypothesis_variant(
-                self.strategy_id, self.strategy_version,
-                proposal["hypothesis_id"], proposal["setting_id"],
-                float(proposal["value"]))
-            variant_id = adaptive.variant_id
-            stored = store.propose_numeric_setting(
-                self.strategy_id, proposal["hypothesis_id"],
-                proposal["setting_id"], proposal["value"], self.run_id,
-                minimum=-1000.0, maximum=1000.0,
-                reasoning=proposal["reasoning"])
-            store.add_finding(
-                variant_id, "observation", json.dumps({
-                    "type": "llm_numeric_proposal", "proposal": stored,
-                    "reasoning": proposal["reasoning"],
-                }, sort_keys=True), author="llm")
-        except (StopIteration, ValueError) as exc:
-            log.warning("research proposal rejected: %s", exc)
+        selection = next((d for d in decisions
+                          if d.get("action") == "research_selection"), None)
+        accepted = list(trading_decisions)
+        if proposal is not None and self.shadow is not None:
+            store = self.shadow.store
+            try:
+                metadata = hypotheses.numeric_setting_metadata(
+                    proposal["hypothesis_id"], proposal["setting_id"])
+                if metadata is None:
+                    raise ValueError("adaptive proposal is not registered")
+                adaptive = variants.adaptive_hypothesis_variant(
+                    self.strategy_id, self.strategy_version,
+                    proposal["hypothesis_id"], proposal["setting_id"],
+                    float(proposal["value"]))
+                stored = store.propose_numeric_setting(
+                    self.strategy_id, proposal["hypothesis_id"],
+                    proposal["setting_id"], proposal["value"], self.run_id,
+                    minimum=metadata["minimum"], maximum=metadata["maximum"],
+                    target_parameter=metadata["target_parameter"],
+                    variant=adaptive, reasoning=proposal["reasoning"],
+                    observation_lock_seconds=metadata["observation_seconds"])
+                accepted.append({
+                    "action": "research_proposal", **proposal, **stored,
+                })
+            except Exception as exc:                       # noqa: BLE001
+                log.warning("research proposal rejected: %s", exc)
+        if selection is not None:
+            context = state.journal_context()
+            llm_cfg = (getattr(self, "cfg", {}).get("llm") or {})
+            attribution = {
+                "run_id": getattr(self, "run_id", None)
+                or context.get("run_id") or "unknown-run",
+                "cycle_id": context.get("cycle_id"),
+                "model_id": llm_cfg.get("model") or "unknown-model",
+                "prompt_version": getattr(self, "prompt_version", None)
+                or context.get("prompt_version") or "unknown-prompt",
+            }
+            if self.shadow is None:
+                try:
+                    from research.findings import (FindingsStore,
+                                                   resolve_store_path)
+                    research_cfg = getattr(self, "cfg", {}).get("research") or {}
+                    scope_key = (
+                        f"{context.get('runtime_mode') or self.cfg.get('mode', 'unknown')}:"
+                        f"{context.get('account_fingerprint') or 'unscoped'}:"
+                        "selector-unavailable")
+                    persisted = FindingsStore(resolve_store_path(
+                        research_cfg.get("findings_store"))).record_research_selection(
+                            selection, [], scope_key=scope_key,
+                            run_id=attribution["run_id"],
+                            cycle_id=attribution["cycle_id"],
+                            model_id=attribution["model_id"],
+                            prompt_version=attribution["prompt_version"],
+                            validation_error=(
+                                selection.get("rejection_reason")
+                                or "research coordinator is unavailable"))
+                    log.warning(
+                        "research selection %s: research coordinator is "
+                        "unavailable", persisted["current_status"])
+                except Exception as exc:                   # noqa: BLE001
+                    log.warning(
+                        "research selection could not be persisted while the "
+                        "coordinator was unavailable: %s", exc)
+            else:
+                try:
+                    persisted = self.shadow.record_research_selection(
+                        selection, attribution)
+                    log.info(
+                        "research selection %s: strategy=%s requested=%s "
+                        "resolved=%s",
+                        persisted["current_status"],
+                        persisted["requested_strategy_id"],
+                        persisted.get("requested_variant_id"),
+                        persisted.get("resolved_variant_id"))
+                except Exception as exc:                   # noqa: BLE001
+                    log.warning("research selection persistence failed: %s", exc)
+        return accepted
 
     @staticmethod
     def _build_shadow(cfg: dict):
@@ -694,6 +754,12 @@ class Engine:
             log.warning("Empty market snapshot; holding")
             return
 
+        # One observed book read is shared by every deterministic research
+        # strategy and withheld from the active LLM prompt.  Missing book
+        # data remains explicit nulls, allowing scalp-maker to persist a
+        # data-missing veto without changing the demo strategy's input.
+        self._attach_research_book_state(live_snapshot)
+
         # Every registered contract is evaluated on this snapshot, not just
         # the one that is trading. Costs no LLM call and places no order.
         # Restricted like the live path: a cross-strategy population whose
@@ -726,6 +792,9 @@ class Engine:
             self._journal_llm_output()
             log.error("LLM call failed; holding this cycle: %s", e)
             state.log_event("error", f"llm: {e}")
+            self._run_shadow_variants(
+                live_snapshot, equity, positions, st, 0.0, decisions=[],
+                advance_accounts=False)
             self.alerts.send(
                 "error", "llm_call_failed",
                 "LLM call failed; holding this cycle", {"error": str(e)})
@@ -734,11 +803,11 @@ class Engine:
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
-        self._record_research_proposals(decisions)
+        decisions = self._record_research_proposals(decisions)
         # Reuse the exact parsed proposals and confidences. No second LLM call,
         # and no deterministic confidence substitution.
         self._run_shadow_variants(
-            snapshot, equity, positions, st, 0.0, decisions=decisions,
+            live_snapshot, equity, positions, st, 0.0, decisions=decisions,
             advance_accounts=False)
         # Pick up any pause/kill the CLI issued while the LLM call was running.
         state.commit(st)
@@ -1477,7 +1546,7 @@ class Engine:
                              tp_price: float, reference: float):
         """Try passively first. Returns a settled execution, or None to cross.
 
-        H-K(ii). Every IOC entry crosses the spread and accepts adverse
+        Maker-first entry study. Every IOC entry crosses the spread and accepts adverse
         selection, and at a 2% stop round-trip friction is roughly 10% of the
         risk unit - so converting the filled fraction from taker to maker
         moves expectancy by more than most of the parameter axes queued for
@@ -1529,7 +1598,8 @@ class Engine:
 
         # A partial fill is NOT topped up by crossing the remainder. Splitting
         # one setup across two prices would make the recorded entry an average
-        # of two decisions, and entry price is exactly what H-K(ii) measures.
+        # of two decisions, and entry price is exactly what the maker-first
+        # counterfactual measures.
         # The position is smaller than planned, which is journalled and is the
         # conservative direction.
         return attempt.get("execution")
@@ -1622,7 +1692,7 @@ class Engine:
             log.info("Control state changed before order; skipping %s", symbol)
             return False
 
-        # B7.5 / H-K(ii): post passively first when enabled, then cross.
+        # B7.5 maker-first path: post passively first when enabled, then cross.
         # A passive fill returns a settled execution shaped exactly like
         # open_position's, so the bookkeeping below is identical either way -
         # same trade row, same liquidation check, same protection audit.
@@ -2167,7 +2237,8 @@ class Engine:
         """Journal the enrichment fields and the per-cycle book state.
 
         Two events, both write-only for now, and deliberately so. Nothing in
-        this repository reads them today; H-G and H-H cannot be tested for
+        this repository reads them today; positioning/book-state conditioning
+        cannot be tested for
         roughly three months because the sample does not exist yet. Waiting
         until the analysis is ready to write the collection would mean
         starting the three-month clock three months late.
@@ -2200,17 +2271,74 @@ class Engine:
 
         for symbol in symbols:
             try:
+                enrichment = snapshot[symbol].get(brain.ENRICHMENT_KEY)
+                enrichment = enrichment if isinstance(enrichment, dict) else {}
+                if "book_observation_error" in enrichment:
+                    observed = {
+                        "symbol": symbol,
+                        "mid": enrichment.get("book_mid"),
+                        "best_bid": enrichment.get("book_best_bid"),
+                        "best_ask": enrichment.get("book_best_ask"),
+                        "spread_pct": enrichment.get("book_spread_pct"),
+                        "bid_depth_usd": enrichment.get(
+                            "book_bid_depth_usd"),
+                        "ask_depth_usd": enrichment.get(
+                            "book_ask_depth_usd"),
+                        "top_bid_size": enrichment.get("book_top_bid_size"),
+                        "top_ask_size": enrichment.get("book_top_ask_size"),
+                        "band_pct": enrichment.get("book_band_pct"),
+                        "book_ts": enrichment.get("book_ts"),
+                        "error": enrichment.get("book_observation_error"),
+                    }
+                else:
+                    observed = self.ex.book_state(symbol)
                 state.log_event(
                     "book_state",
                     self._audit_json({
                         "signal_ts": self._plain(
                             snapshot[symbol].get("signal_ts")),
-                        **self.ex.book_state(symbol),
+                        **observed,
                     }),
                 )
             except Exception as exc:                       # noqa: BLE001
                 log.warning("Book state journalling failed for %s: %s",
                             symbol, exc)
+
+    def _attach_research_book_state(self, snapshot: dict) -> None:
+        """Attach one hidden real-time book reading per visible symbol."""
+        for symbol, row in snapshot.items():
+            if symbol.startswith("_") or not isinstance(row, dict):
+                continue
+            try:
+                observed = self.ex.book_state(symbol)
+            except Exception as exc:                       # noqa: BLE001
+                observed = {
+                    "mid": None, "best_bid": None, "best_ask": None,
+                    "spread_pct": None, "bid_depth_usd": None,
+                    "ask_depth_usd": None, "top_bid_size": None,
+                    "top_ask_size": None, "band_pct": None,
+                    "book_ts": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            enrichment = dict(row.get(brain.ENRICHMENT_KEY) or {})
+            enrichment.update({
+                "book_mid": self._plain(observed.get("mid")),
+                "book_best_bid": self._plain(observed.get("best_bid")),
+                "book_best_ask": self._plain(observed.get("best_ask")),
+                "book_spread_pct": self._plain(observed.get("spread_pct")),
+                "book_bid_depth_usd": self._plain(
+                    observed.get("bid_depth_usd")),
+                "book_ask_depth_usd": self._plain(
+                    observed.get("ask_depth_usd")),
+                "book_top_bid_size": self._plain(
+                    observed.get("top_bid_size")),
+                "book_top_ask_size": self._plain(
+                    observed.get("top_ask_size")),
+                "book_band_pct": self._plain(observed.get("band_pct")),
+                "book_ts": self._plain(observed.get("book_ts")),
+                "book_observation_error": observed.get("error"),
+            })
+            row[brain.ENRICHMENT_KEY] = enrichment
 
     def _too_young_to_close(self, pos: dict, decision: dict,
                             st: dict) -> bool:

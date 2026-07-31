@@ -555,6 +555,8 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     df_fast = frames.get("15m", frames[tfs[0]])
     snap["signal_ts"] = int(df_fast["ts"].iloc[-1])
     snap["signal_1h_ts"] = int(df_1h["ts"].iloc[-1])
+    df_4h = frames.get("4h", frames[tfs[-1]])
+    snap["signal_4h_ts"] = int(df_4h["ts"].iloc[-1])
     snap["mom_1h_pct"] = round(
         float(df_fast["close"].pct_change(4).iloc[-1] * 100), 2
     )
@@ -706,7 +708,7 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
         log.warning("benchmark snapshot failed: %s", e)
 
     # B0.5.3: BTC reference returns, recorded so the residual computation
-    # H-J needs does not depend on the 1m price cache being complete for
+    # the BTC-residual study needs does not depend on the 1m price cache being complete for
     # every symbol-day. Costs one OHLCV call per cycle and is withheld from
     # the prompt like the rest of the enrichment.
     context[brain.ENRICHMENT_KEY] = _btc_reference_returns(ex, benchmark, cfg)
@@ -752,7 +754,8 @@ def restrict_snapshot(snapshot: dict, symbols: list[str]) -> dict:
 def _btc_reference_returns(ex, benchmark: str, cfg: dict) -> dict:
     """BTC 15m return over 1, 4 and 24 bars.
 
-    H-J claims a meaningful fraction of the variance in trade outcomes is
+    The BTC-residual hypothesis claims a meaningful fraction of the variance
+    in trade outcomes is
     explained by contemporaneous BTC return rather than by the setup - that a
     long breakout on three correlated perpetuals is one levered BTC bet
     paying three sets of fees. Testing that needs the market factor at
@@ -790,7 +793,7 @@ def _btc_reference_returns(ex, benchmark: str, cfg: dict) -> dict:
 def realised_vol_enrichment(closes, utc_hour: int) -> dict:
     """Realised volatility over a fast and a slow window, plus their ratio.
 
-    The ratio is the regime variable H-I is built on: the claim is that
+    The ratio is the volatility-regime variable: the claim is that
     ``range_breakout`` has positive expectancy when volatility is expanding
     from a compressed base and negative expectancy when volatility is already
     elevated, so that the pooled figure is the average of two populations of

@@ -188,10 +188,16 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # bounded registered numeric research-proposal schema, then
         # 8790863bfadaf741 -> 913e4bb0572a6e4e when proposal reasoning became
         # required and persisted with the adaptive setting history.
+        # 913e4bb0572a6e4e -> 59f873815ffd3646 when each adaptive setting began
+        # naming its exact target parameter and semantic bounds in the prompt.
+        # 59f873815ffd3646 -> 2e6c312ae9d80316 when the bounded research
+        # selector enumerated only registered single-axis strategy settings
+        # and made its no-live-execution authority explicit.
+        # That changes the model's proposal domain, so attribution must fork.
         # This constant moves only in a batch that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "913e4bb0572a6e4e",
+            "2e6c312ae9d80316",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

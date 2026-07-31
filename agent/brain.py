@@ -28,9 +28,10 @@ import json
 import logging
 import math
 import os
+import re
 from copy import deepcopy
 
-from . import hypotheses
+from . import hypotheses, variants
 from .registry import spec_for
 
 log = logging.getLogger("brain")
@@ -78,8 +79,21 @@ You may include at most one proposal object when a registered hypothesis has
 a numeric setting worth testing: {"hypothesis_id":"...","setting_id":"...",
 "value":0.0,"reasoning":"..."}. The id and setting must be registered,
 reasoning must explain why this exact value tests the registered mechanism,
-and value must be a finite number in the bounded research range -1000 to 1000.
+and value must be a finite number inside that setting's registered semantic bounds.
 This proposal is research metadata only; it never changes live risk or configuration.
+
+RESEARCH STRATEGY SELECTOR
+You may include at most one root-level research_selection object:
+{"strategy_id":"...","variant_id":"...","reasoning":"..."}. Omit
+variant_id to ask the durable coordinator to resolve that strategy's exact
+next eligible untested single-axis setting deterministically. If variant_id is
+present it must be one exact identifier listed below for the same strategy.
+This metadata cannot switch the live strategy, alter live/demo configuration,
+risk, leverage or capital, and cannot place, close or modify an order. Never
+encode any execution instruction in it. It only prioritizes a future isolated
+research assignment and never preempts an assignment already in progress.
+Valid research strategy and exact setting identifiers:
+__RESEARCH_SELECTION_LIST__
 
 MARKET SNAPSHOT FIELD REFERENCE
 The special _market_context object summarizes BTC as the market benchmark: \
@@ -306,6 +320,8 @@ no markdown fences, no comments. Schema:
    "reasoning": "one sentence"},
   {"action": "hold", "symbol": "SOL/USDT:USDT"}
 ]}
+Optional root metadata may additionally contain the registered numeric
+proposal described above and/or one research_selection object described above.
 Rules: setup_type must be trend_continuation, range_breakout, funding_squeeze \
 or other. other is experimental, demo-only, and REQUIRES a hypothesis_id \
 chosen from the REGISTERED HYPOTHESES list below - an experimental setup \
@@ -373,6 +389,19 @@ _ARCHETYPE_MARKER = "__SETUP_ARCHETYPES__"
 _HYPOTHESIS_MARKER = "__HYPOTHESIS_LIST__"
 
 
+_RESEARCH_SELECTION_MARKER = "__RESEARCH_SELECTION_LIST__"
+
+
+def research_selection_prompt_fragment(
+        catalog: dict[str, tuple[dict, ...]] | None = None) -> str:
+    catalog = catalog or variants.research_selection_catalog()
+    lines = []
+    for strategy_id, settings in catalog.items():
+        identifiers = ", ".join(str(item["variant_id"]) for item in settings)
+        lines.append(f"- {strategy_id}: {identifiers}")
+    return "\n".join(lines) or "- none"
+
+
 def build_system(cfg: dict) -> str:
     """Assemble the system prompt for the configured strategy.
 
@@ -391,7 +420,9 @@ def build_system(cfg: dict) -> str:
     # The experimental list is versioned into the prompt rather than left
     # open-ended, so every experimental trade is attributable to a claim
     # registered before it was taken.
-    return system.replace(_HYPOTHESIS_MARKER, hypotheses.prompt_fragment())
+    system = system.replace(_HYPOTHESIS_MARKER, hypotheses.prompt_fragment())
+    return system.replace(
+        _RESEARCH_SELECTION_MARKER, research_selection_prompt_fragment())
 
 
 def prompt_version(system: str) -> str:
@@ -441,6 +472,7 @@ class LLM:
         # which is what both providers' prompt caches require.
         self.system = build_system(cfg)
         self.prompt_version = prompt_version(self.system)
+        self.research_selection_catalog = variants.research_selection_catalog()
         provider = self.cfg["provider"]
         self.provider = provider
         if provider == "anthropic":
@@ -672,7 +704,8 @@ class LLM:
         self._last_usage_audit = None
         self._last_response_id = None
         text = self._call(self.system, user)
-        decisions = parse_decisions(text)
+        decisions = parse_decisions(
+            text, getattr(self, "research_selection_catalog", None))
         self._last_response_audit = {
             "id": self._last_response_id,
             "raw_text": text,
@@ -693,7 +726,83 @@ def _num(value, default=0.0) -> float:
         return default
 
 
-def parse_decisions(text: str) -> list[dict]:
+_RESEARCH_SELECTION_FIELDS = {"strategy_id", "variant_id", "reasoning"}
+_LIVE_RESEARCH_CHANGE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\b(?:switch|set|change|alter|override|update)\s+(?:the\s+)?"
+    r"(?:live|demo)\s+(?:strategy|configuration|config|risk|leverage|capital)\b",
+    r"\b(?:place|submit|send|execute|cancel|close|modify)\s+(?:an?\s+)?"
+    r"(?:live\s+|demo\s+)?order\b",
+))
+
+
+def _parse_research_selection(
+        raw, catalog: dict[str, tuple[dict, ...]]) -> dict:
+    requested = raw
+    item = {
+        "action": "research_selection",
+        "validation_status": "REJECTED",
+        "strategy_id": "",
+        "variant_id": "",
+        "reasoning": "",
+        "request": requested,
+    }
+
+    def reject(reason: str) -> dict:
+        item["rejection_reason"] = reason
+        return item
+
+    if not isinstance(raw, dict):
+        return reject("research_selection must be an object")
+    strategy_value = raw.get("strategy_id")
+    variant_value = raw.get("variant_id")
+    reasoning_value = raw.get("reasoning")
+    if isinstance(strategy_value, str):
+        item["strategy_id"] = strategy_value.strip()
+    if isinstance(variant_value, str):
+        item["variant_id"] = variant_value.strip()
+    if isinstance(reasoning_value, str):
+        item["reasoning"] = reasoning_value
+    unknown = sorted(set(raw) - _RESEARCH_SELECTION_FIELDS)
+    if unknown:
+        return reject(
+            "research_selection contains forbidden field(s): "
+            + ", ".join(unknown))
+    if not isinstance(strategy_value, str) or not item["strategy_id"]:
+        return reject("research_selection strategy_id is required")
+    if item["strategy_id"] not in catalog:
+        return reject("research_selection strategy_id is not registered")
+    if variant_value is not None and not isinstance(variant_value, str):
+        return reject("research_selection variant_id must be a string")
+    if not isinstance(reasoning_value, str):
+        return reject("research_selection reasoning must be a string")
+    normalized_reasoning = reasoning_value.strip()
+    if len(normalized_reasoning) < 10 or len(normalized_reasoning) > 1000:
+        return reject(
+            "research_selection reasoning must be 10 to 1000 characters")
+    if any(pattern.search(normalized_reasoning)
+           for pattern in _LIVE_RESEARCH_CHANGE):
+        return reject(
+            "research_selection reasoning attempts a live/demo execution change")
+    variant_id = item["variant_id"]
+    if variant_id:
+        if variant_id == variants.baseline_variant_id(item["strategy_id"]):
+            return reject("research_selection cannot select the baseline")
+        eligible = {
+            str(candidate["variant_id"])
+            for candidate in catalog[item["strategy_id"]]
+        }
+        if variant_id not in eligible:
+            return reject(
+                "research_selection variant_id is unknown, multi-axis, "
+                "terminal-status, or otherwise ineligible")
+    item["validation_status"] = "ACCEPTED"
+    return item
+
+
+def parse_decisions(
+        text: str,
+        research_catalog: dict[str, tuple[dict, ...]] | None = None
+        ) -> list[dict]:
     if not text:
         return []
     t = text.strip()
@@ -706,6 +815,12 @@ def parse_decisions(text: str) -> list[dict]:
     except Exception as e:
         log.warning("Model output was not valid JSON: %s", e)
         return []
+
+    parsed_selection = None
+    if "research_selection" in obj:
+        parsed_selection = _parse_research_selection(
+            obj.get("research_selection"),
+            research_catalog or variants.research_selection_catalog())
 
     proposal = obj.get("proposal")
     parsed_proposal = None
@@ -721,15 +836,18 @@ def parse_decisions(text: str) -> list[dict]:
             number = float(proposal.get("value"))
         except (TypeError, ValueError):
             return []
-        spec = hypotheses.spec_for(hypothesis_id)
-        valid_setting = any(str(s.get("id")) == setting_id
-                            for s in (spec.settings if spec else ()))
-        if (spec is None or not valid_setting or not math.isfinite(number)
-                or number < -1000.0 or number > 1000.0):
+        try:
+            metadata = hypotheses.numeric_setting_metadata(
+                hypothesis_id, setting_id)
+        except ValueError:
+            return []
+        if (metadata is None or not math.isfinite(number)
+                or number < metadata["minimum"]
+                or number > metadata["maximum"]):
             return []
         parsed_proposal = {"hypothesis_id": hypothesis_id,
                            "setting_id": setting_id, "value": number,
-                           "reasoning": reasoning}
+                           "reasoning": reasoning, **metadata}
     out = []
     for d in obj.get("decisions", []) or []:
         if not isinstance(d, dict):
@@ -784,4 +902,6 @@ def parse_decisions(text: str) -> list[dict]:
         out.append(item)
     if parsed_proposal is not None:
         out.append({"action": "research_proposal", **parsed_proposal})
+    if parsed_selection is not None:
+        out.append(parsed_selection)
     return out

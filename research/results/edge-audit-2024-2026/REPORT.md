@@ -1,5 +1,10 @@
 # Independent edge audit — phase1-v2 momentum strategy
 
+> **Historical result snapshot.** This report evaluates the named historical
+> strategy/corpus, not the current schema-14 real-time seven-strategy pipeline.
+> It remains evidence about that experiment and cannot automatically change
+> current configuration or capital.
+
 **Question asked:** is there a tradable edge in this strategy, and is the
 system ready to be run forward on an OKX demo account?
 

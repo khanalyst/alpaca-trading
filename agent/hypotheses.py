@@ -29,6 +29,7 @@ experiment and a guess.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from .contracts import finite
@@ -142,13 +143,22 @@ REGISTRY: dict = {
             contract_params={"min_relative_volume": 1.5},
             settings=(
                 {"id": "registered", "params": {},
+                 "numeric": {"parameter": "min_relative_volume",
+                             "minimum": 1.0, "maximum": 5.0,
+                             "observation_seconds": 3600.0},
                  "claim": "The registered participation threshold."},
                 {"id": "lower_participation", "params": {
                     "min_relative_volume": 1.2},
+                 "numeric": {"parameter": "min_relative_volume",
+                             "minimum": 1.0, "maximum": 5.0,
+                             "observation_seconds": 3600.0},
                  "claim": "A lower participation threshold captures more "
                           "impulses without changing the mechanism."},
                 {"id": "higher_participation", "params": {
                     "min_relative_volume": 2.0},
+                 "numeric": {"parameter": "min_relative_volume",
+                             "minimum": 1.0, "maximum": 5.0,
+                             "observation_seconds": 3600.0},
                  "claim": "A higher participation threshold isolates only "
                           "the strongest impulses."},
             ),
@@ -172,13 +182,22 @@ REGISTRY: dict = {
             contract_params={"max_oi_change_4h_pct": -1.0},
             settings=(
                 {"id": "registered", "params": {},
+                 "numeric": {"parameter": "max_oi_change_4h_pct",
+                             "minimum": -25.0, "maximum": -0.01,
+                             "observation_seconds": 3600.0},
                  "claim": "The registered open-interest decline threshold."},
                 {"id": "milder_decline", "params": {
                     "max_oi_change_4h_pct": -0.5},
+                 "numeric": {"parameter": "max_oi_change_4h_pct",
+                             "minimum": -25.0, "maximum": -0.01,
+                             "observation_seconds": 3600.0},
                  "claim": "A milder open-interest decline captures more "
                           "position-closing events."},
                 {"id": "deeper_decline", "params": {
                     "max_oi_change_4h_pct": -2.0},
+                 "numeric": {"parameter": "max_oi_change_4h_pct",
+                             "minimum": -25.0, "maximum": -0.01,
+                             "observation_seconds": 3600.0},
                  "claim": "A deeper open-interest decline isolates more "
                           "forced-deleveraging events."},
             ),
@@ -207,13 +226,22 @@ REGISTRY: dict = {
             },
             settings=(
                 {"id": "registered", "params": {},
+                 "numeric": {"parameter": "basis_threshold_pct",
+                             "minimum": 0.001, "maximum": 1.0,
+                             "observation_seconds": 3600.0},
                  "claim": "The registered basis and funding tail thresholds."},
                 {"id": "narrower_stretch", "params": {
                     "basis_threshold_pct": 0.03},
+                 "numeric": {"parameter": "basis_threshold_pct",
+                             "minimum": 0.001, "maximum": 1.0,
+                             "observation_seconds": 3600.0},
                  "claim": "A narrower basis stretch tests a more frequent "
                           "crowding signal."},
                 {"id": "wider_stretch", "params": {
                     "basis_threshold_pct": 0.10},
+                 "numeric": {"parameter": "basis_threshold_pct",
+                             "minimum": 0.001, "maximum": 1.0,
+                             "observation_seconds": 3600.0},
                  "claim": "A wider basis stretch tests only extreme "
                           "crowding conditions."},
             ),
@@ -246,6 +274,47 @@ def settings_for(hypothesis_id: str) -> tuple[dict, ...]:
     return spec.settings if spec is not None else ()
 
 
+def numeric_setting_metadata(
+        hypothesis_id: str, setting_id: str) -> dict | None:
+    """Return the explicit numeric axis registered for one setting."""
+    spec = spec_for(hypothesis_id)
+    setting = next((item for item in (spec.settings if spec else ())
+                    if str(item.get("id")) == str(setting_id)), None)
+    if setting is None:
+        return None
+    numeric = setting.get("numeric")
+    if not isinstance(numeric, dict):
+        raise ValueError(
+            f"{hypothesis_id}/{setting_id}: numeric metadata is required")
+    parameter = str(numeric.get("parameter") or "").strip()
+    try:
+        minimum = float(numeric["minimum"])
+        maximum = float(numeric["maximum"])
+        observation_seconds = float(numeric["observation_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{hypothesis_id}/{setting_id}: invalid numeric metadata") from exc
+    if (not parameter or not math.isfinite(minimum)
+            or not math.isfinite(maximum) or minimum >= maximum
+            or not math.isfinite(observation_seconds)
+            or observation_seconds <= 0):
+        raise ValueError(
+            f"{hypothesis_id}/{setting_id}: invalid numeric metadata")
+    if parameter not in spec.contract_params and parameter not in (
+            setting.get("params") or {}):
+        raise ValueError(
+            f"{hypothesis_id}/{setting_id}: numeric parameter {parameter!r} "
+            "is not part of the registered contract")
+    return {
+        "hypothesis_id": spec.id,
+        "setting_id": str(setting["id"]),
+        "target_parameter": parameter,
+        "minimum": minimum,
+        "maximum": maximum,
+        "observation_seconds": observation_seconds,
+    }
+
+
 def prompt_fragment() -> str:
     """The versioned list injected into the prompt.
 
@@ -253,6 +322,14 @@ def prompt_fragment() -> str:
     written here, so every experimental trade is attributable to a named
     claim that was registered before it was taken.
     """
-    lines = [f"- {spec.prompt_line}"
-             for _, spec in sorted(REGISTRY.items())]
+    lines = []
+    for _, spec in sorted(REGISTRY.items()):
+        settings = []
+        for setting in spec.settings:
+            metadata = numeric_setting_metadata(spec.id, str(setting["id"]))
+            settings.append(
+                f"{setting['id']} -> {metadata['target_parameter']} "
+                f"[{metadata['minimum']:g}, {metadata['maximum']:g}]")
+        lines.append(
+            f"- {spec.prompt_line} Numeric settings: {'; '.join(settings)}.")
     return "\n".join(lines)

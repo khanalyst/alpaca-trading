@@ -19,16 +19,20 @@ The VM contains data that cannot be recreated from the repository. Preserve:
 
 - `runtime/research/recorded`;
 - the active `journal.db`;
-- `research/cache/findings.db` and its backup;
+- `research/cache/findings.db` and the versioned verified backup set;
 - the corpus manifest and research reports.
 
-Before selecting **Delete with VM**, take an Azure disk **snapshot** or an
-encrypted external copy. Deleting the VM without one destroys the corpus.
+Use the versioned `research.py backup` workflow. A local-default or same-device
+configured-local copy is not VM-loss protection. Before selecting **Delete with
+VM**, require a verified `external_mounted` backup on a separately provisioned
+different-device mount and confirm it is readable outside the VM. An Azure disk
+**snapshot** may be an additional control, but configuration/path alone is not
+proof. Deleting the VM without a separate verified copy destroys the corpus.
 
 ## Service order
 
-The service user is deliberately `nologin`; use `sudo -iu okx` only for an
-operator shell when required. Install and enable the units from `deploy/`,
+The service user is deliberately `nologin`; do not use `sudo -iu okx`. Run
+commands with `sudo -u okx` and explicit paths. Install and enable the units from `deploy/`,
 starting the recorder before the trader:
 
 ```bash
@@ -41,6 +45,10 @@ sudo systemctl enable --now okx-recorder
 sudo systemctl enable --now okx-trader
 sudo systemctl enable --now okx-research.timer
 ```
+
+After provisioning the external mount, add `BACKUP_TARGET` and
+`REQUIRE_EXTERNAL_BACKUP=1` with `systemctl edit okx-research.service`; see
+`SETUP.md` for the exact override and verification commands.
 
 Azure resource creation is outside this repository. There is no provisioning
 code here; Azure AI Foundry is only an OpenAI-compatible model endpoint choice.

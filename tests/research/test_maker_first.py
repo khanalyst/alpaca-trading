@@ -1,4 +1,4 @@
-"""B7.5 / H-K(ii): the passive-entry primitive, and its one hard guarantee.
+"""B7.5 maker-first: the passive-entry primitive and its hard guarantee.
 
 The guarantee is that the order is never left resting. Every exit from
 ``maker_first_entry`` either reports a fill or has cancelled, and when the
@@ -159,7 +159,7 @@ class PassivePricingTests(unittest.TestCase):
 
 
 class CounterfactualTests(unittest.TestCase):
-    """The measurement H-K(ii) exists to produce."""
+    """The measurement the maker-first counterfactual exists to produce."""
 
     def test_a_buy_below_the_reference_is_a_saving(self):
         ex = exchange([{"id": "o1", "filled": 10, "average": 99.0}])

@@ -24,8 +24,11 @@ REPO = Path(__file__).resolve().parents[2]
 README = (REPO / "README.md").read_text(encoding="utf-8")
 SETUP = (REPO / "SETUP.md").read_text(encoding="utf-8")
 AZURE = (REPO / "AZURE_DEPLOYMENT.md").read_text(encoding="utf-8")
+OPERATIONS = (REPO / "OPERATIONS.md").read_text(encoding="utf-8")
+HYPOTHESES = (REPO / "research" / "HYPOTHESES_AND_VARIANTS.md").read_text(
+    encoding="utf-8")
 BOTH = README + SETUP
-ALL_DOCS = README + SETUP + AZURE
+ALL_DOCS = README + SETUP + AZURE + OPERATIONS + HYPOTHESES
 PROTOCOL = (REPO / "research" / "protocol.md").read_text(encoding="utf-8")
 
 
@@ -58,6 +61,33 @@ class ReferencedPathsExistTests(unittest.TestCase):
 
     def test_the_research_cli_exists(self):
         self.assertTrue((REPO / "research.py").exists())
+
+    def test_readme_indexes_every_maintained_markdown_document(self):
+        documents = []
+        for path in REPO.rglob("*.md"):
+            relative = path.relative_to(REPO)
+            if any(part in {".git", ".venv", "vm-import"}
+                   for part in relative.parts):
+                continue
+            documents.append(relative.as_posix())
+        missing = sorted(
+            path for path in documents if f"({path})" not in README)
+        self.assertEqual(
+            missing, [],
+            f"README documentation index omits: {missing}")
+
+    def test_retired_letter_taxonomy_is_not_used(self):
+        pattern = re.compile(r"\bH-[G-M](?:\([iv]+\))?\b")
+        offenders = []
+        for root in (REPO / "agent", REPO / "research", REPO / "tests"):
+            for path in root.rglob("*"):
+                if path.suffix not in {".py", ".md", ".yaml"}:
+                    continue
+                if pattern.search(path.read_text(encoding="utf-8")):
+                    offenders.append(path.relative_to(REPO).as_posix())
+        self.assertEqual(
+            offenders, [],
+            f"retired letter taxonomy remains in: {offenders}")
 
 
 class DocumentedCommandsExistTests(unittest.TestCase):
@@ -169,10 +199,11 @@ class ResearchProtocolDocumentationTests(unittest.TestCase):
     def test_executable_fingerprint_scope_is_documented(self):
         for phrase in ("LLM provider", "universe selection",
                        "decision cadence", "credentials are excluded"):
-            self.assertIn(phrase, README)
+            self.assertIn(phrase, README_FLOWED)
 
     def test_store_default_and_axis_proof_are_documented(self):
-        self.assertIn("never\nfalls back to a temporary database", README)
+        self.assertIn("never falls back to a temporary database",
+                      README_FLOWED)
         self.assertIn("non-axis executable", README)
 
     def test_policy_vetoes_and_legacy_watermark_are_documented(self):
@@ -210,7 +241,73 @@ class VersionClaimsTests(unittest.TestCase):
 
         self.assertNotIn("structure_target", strategy.EXIT_POLICIES)
         for policy in strategy.EXIT_POLICIES:
-            self.assertIn(policy, BOTH, f"exit policy {policy} undocumented")
+                self.assertIn(policy, BOTH, f"exit policy {policy} undocumented")
+
+
+class CurrentPipelineClaimsTests(unittest.TestCase):
+    def test_shipped_account_strategy_cadence_and_paths_are_exact(self):
+        raw = yaml.safe_load((REPO / "config.yaml").read_text())
+        claims = (
+            raw["mode"], raw["strategy"]["id"],
+            raw["strategy"]["version"], str(raw["cycle"]["interval_seconds"]),
+            raw["research"]["findings_store"],
+        )
+        for claim in claims:
+            self.assertIn(claim, README)
+
+    def test_strategy_and_variant_inventory_matches_code(self):
+        from agent import registry, variants
+
+        raw = yaml.safe_load((REPO / "config.yaml").read_text())
+        named = variants.load_registry(REPO / "research" / "variants.yaml")
+        materialized = dict(named)
+        for strategy_id, spec in registry.REGISTRY.items():
+            for variant in variants.preregistered_variants(
+                    strategy_id, spec.version):
+                materialized.setdefault(variant.variant_id, variant)
+            if strategy_id == "momentum":
+                for variant in variants.hypothesis_variants(
+                        strategy_id, spec.version):
+                    materialized.setdefault(variant.variant_id, variant)
+            materialized.setdefault(
+                variants.baseline_variant_id(strategy_id),
+                variants.baseline(strategy_id, spec.version))
+        selector_count = sum(
+            len(items) for items in variants.research_selection_catalog().values())
+        tournament_settings = 0
+        for path in (REPO / "research" / "hypotheses").glob("*.yaml"):
+            tournament_settings += len(
+                (yaml.safe_load(path.read_text()) or {}).get("settings") or [])
+
+        for value in (len(registry.REGISTRY), len(named), len(materialized),
+                      selector_count, tournament_settings):
+            self.assertIn(str(value), HYPOTHESES)
+        for strategy_id in registry.REGISTRY:
+            self.assertIn(f"`{strategy_id}`", HYPOTHESES)
+        self.assertEqual(raw["research"]["experiment_min_duration_days"], 3)
+        self.assertEqual(raw["research"]["experiment_min_observations"], 100)
+        self.assertIn("14 maximum", HYPOTHESES)
+        self.assertIn("5 strategies and 16 applicable setting results",
+                      HYPOTHESES)
+        self.assertIn("`NOT SCORED`", HYPOTHESES)
+
+    def test_current_findings_schema_is_documented(self):
+        from research.findings import SCHEMA_VERSION
+
+        self.assertEqual(SCHEMA_VERSION, 14)
+        for doc in (README, OPERATIONS, HYPOTHESES):
+            self.assertIn(f"schema {SCHEMA_VERSION}", doc.lower())
+
+    def test_nightly_order_and_failure_semantics_are_documented(self):
+        for phrase in ("research-loop", "G2", "exit 3", "exit 4", "exit 5",
+                       "tournament", "verified backup"):
+            self.assertIn(phrase, OPERATIONS)
+
+    def test_external_classification_does_not_claim_path_is_proof(self):
+        flowed_ops = flowed(OPERATIONS)
+        self.assertIn("Configuration/path alone is not off-host proof",
+                      flowed_ops)
+        self.assertIn("different-device", flowed_ops)
 
 
 class ResearchLayerIsDocumentedTests(unittest.TestCase):
@@ -226,16 +323,41 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
     def test_insufficient_sample_is_explained(self):
         self.assertIn("INSUFFICIENT_SAMPLE", BOTH)
 
-    def test_pending_work_is_documented_in_both(self):
-        """An undocumented blocker becomes a surprise three weeks in."""
+    def test_current_boundaries_are_documented_in_both(self):
+        """Data gates and dormant execution paths must remain visible."""
         for doc, name in ((README, "README"), (SETUP, "SETUP")):
             self.assertIn("readiness", doc, f"{name} omits the readiness cmd")
             self.assertIn("G2", doc, f"{name} omits gate G2")
             self.assertIn("B7.5", doc, f"{name} omits B7.5")
 
-    def test_each_pending_item_says_how_it_completes(self):
+    def test_environment_boundary_says_how_it_completes(self):
         self.assertIn("How it completes", README)
         self.assertIn("Why it waits", README)
+
+    def test_current_pipeline_and_schema_are_not_hidden(self):
+        for phrase in ("all seven", "baseline", "at most one candidate",
+                       "WORKED", "FAILED", "INCONCLUSIVE", "schema 14"):
+            self.assertIn(phrase.lower(), README_FLOWED.lower())
+
+    def test_research_results_never_claim_live_authority(self):
+        for phrase in ("RESEARCH_ONLY", "promotion_allowed", "no automatic"):
+            self.assertIn(phrase.lower(), README.lower())
+
+    def test_backup_classification_is_fail_closed(self):
+        for phrase in ("local_default", "configured_local",
+                       "external_mounted", "--require-external", "st_dev"):
+            self.assertIn(phrase, BOTH)
+
+    def test_vm_fixture_is_documented_as_read_only_and_not_default(self):
+        for doc, name in ((README, "README"), (SETUP, "SETUP")):
+            self.assertIn("vm-import/2026-07-30", doc,
+                          f"{name} omits the supplied VM fixture")
+            self.assertIn("read-only", doc,
+                          f"{name} does not mark the fixture read-only")
+
+    def test_tournament_latest_view_is_not_described_as_history(self):
+        for phrase in ("runs/<timestamp>-<run-id>", "latest view"):
+            self.assertIn(phrase, README_FLOWED)
 
     def test_the_known_gaps_are_stated_rather_than_hidden(self):
         for gap in ("loss cooldown", "select_universe"):
@@ -348,13 +470,14 @@ class DeploymentDocTests(unittest.TestCase):
 
     def test_it_warns_that_deleting_the_vm_destroys_the_corpus(self):
         """The doc itself recommends "Delete with VM: Checked"."""
-        self.assertIn("Delete with VM", AZURE)
+        self.assertIn("Delete with VM", flowed(AZURE))
         self.assertIn("snapshot", AZURE.lower())
 
     def test_it_warns_against_becoming_the_service_user(self):
         """The first thing that bites: sudo prompting for a password."""
         self.assertIn("nologin", AZURE)
-        self.assertIn("sudo -iu okx", AZURE)
+        self.assertIn("do not use `sudo -iu okx`", AZURE)
+        self.assertIn("sudo -u okx", AZURE)
 
     def test_every_service_unit_it_names_exists(self):
         import re

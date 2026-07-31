@@ -7,13 +7,13 @@ historical planning file.
 
 The current system now has:
 
-- isolated hypothesis variants and bounded adaptive proposals;
-- persisted proposal/lock/history and exact values in FindingsStore schema 8;
-- immutable decision-ledger evidence, forward qualification, and family
-  correction;
-- content-addressed T3 packets that require review and do not edit the
-  strategy registry.
+- all seven strategies evaluated from one live snapshot with isolated state;
+- persisted baseline-plus-one assignments, bounded proposals/selections, and
+  exact values in FindingsStore schema 14;
+- immutable deterministic outcomes, reasons, reviews, and research-only edge
+  candidates;
+- append-only tournament and verified-backup history.
 
-The remaining operational work is the approved-corpus tournament re-score,
-targeted exploratory fixtures, packet-to-strategy hash resolution, and an
-explicit reviewed approval command. See [`../../OPERATIONS.md`](../../OPERATIONS.md).
+No result automatically edits the strategy registry. The environment-only
+deployment action is provisioning a different-device external mount. See
+[`../../OPERATIONS.md`](../../OPERATIONS.md).

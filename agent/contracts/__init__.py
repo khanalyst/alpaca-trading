@@ -46,4 +46,5 @@ def register(strategy_id: str, builder) -> None:
 
 from . import (flush_fade, funding_carry,  # noqa: E402,F401
                funding_unwind, ls_ratio_fade,
-               momentum_phase1v2, trend_multiday)         # (register on import)
+               momentum_phase1v2, scalp_maker,
+               trend_multiday)                            # (register on import)

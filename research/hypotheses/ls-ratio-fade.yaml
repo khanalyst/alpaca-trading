@@ -33,7 +33,25 @@ ls_high_percentile: 80.0
 ls_low_percentile: 20.0
 cost_scenarios: [base]
 
-hypotheses_tested: 1
+settings:
+  - id: registered
+    params: {}
+    claim: >-
+      The registered 80th/20th percentile tails are the comparison point.
+  - id: higher_long_tail
+    params:
+      ls_high_percentile: 90.0
+    claim: >-
+      If relative positioning is informative, the long-side effect should be
+      stronger in the top decile than at the registered 80th percentile.
+  - id: lower_short_tail
+    params:
+      ls_low_percentile: 10.0
+    claim: >-
+      The mirrored short-side test isolates only the bottom decile without
+      changing the long threshold.
+
+hypotheses_tested: 3
 
 backtestable: false
 why_not_backtestable: |

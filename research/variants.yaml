@@ -187,7 +187,7 @@ variants:
   # plan and the edge hypotheses give different answers. Registering both as
   # variants is what lets the corpus decide instead of the argument.
   #
-  # Gate G5 previously blocked 6.4 on H-I. Making the discriminator a
+  # Gate G5 previously blocked 6.4 on the volatility-regime question. Making the discriminator a
   # parameter dissolves that gate: neither answer is baked in, so neither
   # filters the population the other one needs.
   - variant_id: momentum.discriminator.trend_alignment

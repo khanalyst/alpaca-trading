@@ -1,7 +1,18 @@
-# Promotion protocol
+# Research evidence protocol
 
-Written before results are inspected, applied by `protocol.py`, and allowed
-to return an answer nobody wants.
+Written before results are inspected, applied mechanically, and allowed to
+return an answer nobody wants. Nothing in this protocol automatically promotes
+an edge to live trading.
+
+There are two verdict layers:
+
+1. the current baseline-plus-one real-time experiment loop produces immutable
+   `WORKED`, `FAILED`, or `INCONCLUSIVE` outcomes; and
+2. the older multi-setting `forward-qualify` path produces `PROMOTE`, `REJECT`,
+   `CONTINUE`, or `INSUFFICIENT_SAMPLE` as research qualification verdicts.
+
+`PROMOTE` in the second layer means eligible for isolated local PAPER evidence,
+not for an account or registry change.
 
 At a few dozen round trips per variant, deciding after looking at the numbers
 is p-hacking with extra steps. The only defence is a rule fixed in advance
@@ -20,10 +31,14 @@ amendment, it is a result being negotiated.
 | Date | Amendment | Reason |
 | --- | --- | --- |
 | 2026-07-30 | **Criterion 10 added**: a Holm correction across every axis evaluated in one qualification run. **Criterion 5 reclassified** as a selection screen rather than an independent test. | The correction existed only for conditioning cells, so the path that actually qualifies an edge corrected nothing while this document claimed the corrected figure was the only quotable one. Five axes are registered and the count grows with the registry. No variant had forward evidence at the time, so nothing was pending on either criterion. |
+| 2026-07-31 | **Real-time rotation outcomes documented separately.** Every strategy now keeps one baseline and at most one candidate; inadequacy is checked before performance and terminal outcomes are immutable. | The previous text said every setting ran continuously, which no longer matched the durable per-strategy rotation or the closed learning loop. |
 
 ---
 
 ## The verdicts
+
+These are the `forward-qualify` research verdicts, not the terminal assignment
+outcomes described in the next section.
 
 | Verdict | Meaning |
 | --- | --- |
@@ -35,6 +50,42 @@ amendment, it is a result being negotiated.
 Every verdict names the single criterion that governed it. "Rejected" without
 "because the whole axis's upper bound sat below the baseline" is not a
 finding, it is an opinion with a timestamp.
+
+## Real-time assignment outcomes
+
+All seven strategies advance from the same cycle snapshot/timestamp. Each
+strategy keeps its stable baseline and tests no more than one candidate at a
+time. Strategies continue together while candidates rotate serially within
+each strategy.
+
+An assignment becomes terminal only after both configured collection floors
+are met (three days and 100 comparable paired observations by default), or it
+is explicitly rejected. The deterministic evaluator then checks evidence
+adequacy before any performance claim:
+
+- both arms contain decisions and at least 100 closed trades;
+- no unresolved assignment-window opens or operational failures exist;
+- one validated forward model and one experiment provenance apply per arm;
+- full, 70/30 fit, and confirmation comparisons meet 100/70/30 pair floors,
+  80% coverage, no duplicates, and at least 8 distinct six-hour episodes;
+- two chronological segments can be formed.
+
+Inadequate evidence is `INCONCLUSIVE`. Adequate evidence is then tested for
+positive after-cost candidate PnL/expectancy, improvement over baseline,
+drawdown no worse than baseline, positive and baseline-beating fit/confirmation
+segments, intervals that establish the paired delta, and absence of revoked or
+otherwise disqualifying variant/portfolio status.
+
+- `WORKED` means all conservative gates passed.
+- `FAILED` means adequate evidence failed a performance/disqualification gate,
+  or the assignment itself was rejected.
+- `INCONCLUSIVE` means adequacy or statistical confidence was not established.
+
+Every outcome stores reasons and limitations. `WORKED` creates only an
+`EDGE_CANDIDATE` with `authority: RESEARCH_ONLY` and
+`promotion_allowed: false`. A separate LLM reviewer may explain the immutable
+result and nominate one registered next setting; it cannot revise the verdict
+or authorize execution.
 
 ## Promotion — every criterion must hold
 
@@ -108,6 +159,9 @@ exposure caps and discriminators: the hypothesis is about the value of trades
 one arm admits while another suppresses. Treating that veto as a missing row
 would make those axes incapable of demonstrating an edge.
 
+Those immutable action records are the decision-ledger rows used by both the
+terminal experiment outcome and the stricter forward-qualification path.
+
 Inference uses the return difference inside each exact pair. The bootstrap
 keeps observations together in six-hour market clusters and samples
 contiguous cluster blocks, preserving cross-symbol market episodes and
@@ -154,8 +208,8 @@ between the windows marks the comparison as not comparable.
 
 ## Multiple comparisons
 
-Six hypotheses, several conditioning cells each, against a few hundred round
-trips. Something will look significant.
+Many hypotheses and conditioning cells against a limited sample create many
+chances for something to look significant.
 
 **The corrected figure is the only one any recommendation may quote.** The
 uncorrected significance flag is deliberately not carried forward into any
@@ -205,43 +259,33 @@ Two things make that pressure survivable, and both are already built:
 A null result is a row in the findings store with the same weight as a
 positive one. A programme that records only what worked records only noise.
 
-## From edge to paper to reviewed evidence
+## From collection to reviewed evidence
 
-Every preregistered parameter value runs continuously in its own persisted
-`SHADOW` account. Every account advances on each available real-time snapshot,
-including pause/day-stop/cadence/LLM-failure paths. The cycle's one recorded
-LLM proposal set and confidences are reused by every arm; no extra LLM call is
-made. The shipped budget is unlimited (`0`). If an operator sets a positive
-budget, a durable least-observed-first scheduler skips only whole variants.
-Axes are grouped by their
-override path, so reward/risk, stop width, confidence, exposure and breakout
-classification can never be pooled into one winner search.
+The current real-time path is baseline plus one candidate for each strategy,
+not every setting at once. All seven strategy evaluators advance on every
+available shared snapshot. The active momentum analyst is called at most once
+per eligible decision cycle; non-active strategies use deterministic contracts
+and no per-strategy LLM calls. Durable writes remain serialized.
 
-Forward evidence starts only after every arm has the complete decision-ledger
-watermark. Schema migration 7 preserves legacy trades for audit but revokes
-qualifications based on the older executed-trades-only population, because
-historical vetoes cannot be reconstructed without inventing data.
-All arms use the same evidence window: the latest complete-ledger watermark
-through the earliest qualification or paper-start boundary. Decisions after
-that boundary cannot change the qualifying corpus. A recorded operational
-failure inside the window invalidates the analysis rather than becoming an
-unlabelled missing observation.
+Selections and adaptive values are first-class immutable identities. An
+accepted selection waits behind the active assignment. Terminal assignment
+evidence, outcomes, findings, review attempts, explanations, and any
+research-only edge candidate remain append-only in schema 14.
 
-`research.py forward-qualify` applies this protocol to prequalification
-real-time outcomes. It queries the exact decision-ledger rows, joins accepted
-actions to their resulting trades, enforces homogeneous strategy
-model/assumptions/provenance, embeds and hashes that source corpus,
-proves the baseline and candidate definitions describe one strategy version
-and exactly one declared axis, verifies all non-axis executable config is
-identical, and recomputes the protocol before qualification. Generic analysis
-insertion cannot create forward evidence. A winner becomes `PAPER_PENDING`
-while any
-shadow position is open, then starts a clean rebased `PAPER` account when flat. Shadow history
-stays stored but is excluded from paper-only metrics.
+The separate `research.py forward-qualify` path continues to apply the
+multi-setting criteria above to complete prequalification decision-ledger
+evidence. Schema migration 7 preserves legacy trades for audit but prevents
+executed-trades-only populations from silently qualifying an edge. All arms
+use one common evidence window; an operational failure invalidates it rather
+than becoming missing data.
 
-Paper success does not edit the strategy registry. `research.py t3-packet`
-builds an immutable SHA-256-addressed packet containing current G2,
-configuration/code/corpus provenance, held-out forward evidence and the
-postqualification paper result. It remains `DRAFT_REVIEW_REQUIRED` unless the
-full checklist passes and a reviewer plus registry-change reference are
-supplied. Live authority is always a deliberate reviewed code change.
+Forward qualification proves one strategy version and one declared axis,
+verifies identical non-axis executable inputs, persists family correction, and
+recomputes claims from embedded source evidence. A qualifying result can begin
+a clean isolated local PAPER account only when flat.
+
+PAPER success still does not edit the strategy registry. `research.py
+t3-packet` builds an immutable SHA-256-addressed review bundle containing G2,
+configuration/code/corpus provenance, held-out forward evidence, and the paper
+result. Neither a packet nor any other research artifact automatically changes
+the configured strategy, registry tier, account mode, risk, or capital.

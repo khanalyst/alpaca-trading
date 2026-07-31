@@ -3,9 +3,10 @@
 
 Nothing here touches the trading path. Commands read ``journal.db`` and, from
 batch 2 onward, a local price cache. A G2 check appends its pass/fail audit
-record to that journal; sweeps append results to ``findings.db`` and maintain
-a consistent backup. No command places an order, calls an LLM, or mutates
-trading state.
+record to that journal; research evidence is persisted in schema 14. The
+dedicated ``research-loop`` command may call the LLM with a research-only
+prompt, and ``backup`` creates a new verified versioned snapshot. No command
+places an order or mutates trading state.
 
     python research.py corpus stats
     python research.py corpus stats --db runtime/demo/journal.db
@@ -25,10 +26,12 @@ REPO = Path(__file__).resolve().parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from research import (corpus, findings as findings_mod,         # noqa: E402
+from research import (backup as backup_mod, corpus,             # noqa: E402
+                      findings as findings_mod,
                       prices as prices_mod, protocol,
                       readiness as readiness_mod,
-                      replay as replay_mod, score, stats, sweep)
+                      replay as replay_mod, review as review_mod,
+                      score, stats, sweep)
 
 
 def default_db(mode: str = "demo") -> Path:
@@ -832,11 +835,87 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configured_store(cfg: dict, requested: str | Path | None) -> Path:
+    if requested:
+        return Path(requested)
+    return findings_mod.resolve_store_path(
+        (cfg.get("research") or {}).get("findings_store"))
+
+
+def _configured_backup_target(
+        cfg: dict, requested: str | Path | None) -> tuple[Path | None, bool]:
+    configured = requested or (cfg.get("research") or {}).get("backup_target")
+    if not configured:
+        return None, False
+    path = Path(configured)
+    return (path if path.is_absolute() else REPO / path), True
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Create one versioned, immediately verified research backup."""
+    cfg = _load_config()
+    store_path = _configured_store(cfg, args.store)
+    target, target_configured = _configured_backup_target(cfg, args.target)
+    journal = Path(args.journal) if args.journal else default_db(args.mode)
+    options = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items() if not key.startswith("_")
+    }
+    try:
+        result = backup_mod.create_backup(
+            store_path=store_path,
+            target=target,
+            target_configured=target_configured,
+            journal_path=journal,
+            runtime_research_root=Path(args.runtime_research),
+            results_root=Path(args.results),
+            require_external=args.require_external,
+            command=getattr(args, "_command", []),
+            options=options)
+    except backup_mod.BackupError as exc:
+        print(f"backup FAILED: {exc}", file=sys.stderr)
+        for error in exc.result.get("errors") or []:
+            print(f"  {error}", file=sys.stderr)
+        return 1
+    print(f"backup VERIFIED: {result['backup_path']}")
+    print(f"  files: {result['files_verified']}")
+    print(f"  content: {result['content_id']}")
+    print(f"  target: {result['target_kind']}")
+    if result["target_kind"] == "external_mounted":
+        print("  EXTERNAL MOUNT VERIFIED: target st_dev differs from all "
+              "repository/source devices.")
+    elif result["target_kind"] == "configured_local":
+        print("  CONFIGURED LOCAL: this explicit target shares a source "
+              "filesystem/device and does not make VM deletion safe.")
+    else:
+        print("  LOCAL DEFAULT: this backup does not make VM deletion safe.")
+    return 0
+
+
+def cmd_verify_backup(args: argparse.Namespace) -> int:
+    """Re-verify a backup and append the result to FindingsStore."""
+    cfg = _load_config()
+    store_path = _configured_store(cfg, args.store)
+    result = backup_mod.verify_and_record(args.path, store_path=store_path)
+    label = "VERIFIED" if result["ok"] else "FAILED"
+    print(f"backup verification {label}: {args.path}")
+    print(f"  files: {result['files_verified']}")
+    for error in result["errors"]:
+        print(f"  {error}", file=sys.stderr)
+    if result.get("target_kind") != "external_mounted":
+        print("  LOCAL ONLY: no verified different-device mounted copy is "
+              "proven; off-host retention is a separate operator check.")
+    else:
+        print("  EXTERNAL MOUNT VERIFIED: manifest records different-device "
+              "classification evidence.")
+    return 0 if result["ok"] else 1
+
+
 def cmd_cadence(args: argparse.Namespace) -> int:
     """B9.2 evidence: how much LLM spend buys a re-evaluation of nothing?
 
     The plan requires this published before the cadence split merges, and
-    reframed per H-M: if expectancy also decays with latency from the bar
+    reframed as signal-decay evidence: if expectancy also decays with latency from the bar
     close, aligning the decision cadence is an alpha fix and the cost saving
     is incidental.
     """
@@ -899,9 +978,39 @@ def cmd_readiness(args: argparse.Namespace) -> int:
     gates, stats = readiness_mod.report(db if db.exists() else None, cfg)
     print(readiness_mod.format_report(
         gates, stats, db if db.exists() else f"{db} (absent)"))
+    store_path = _configured_store(cfg, None)
+    external = findings_mod.FindingsStore(
+        store_path).latest_verified_external_backup()
+    if external:
+        print("\nexternal backup  PASS       latest different-device mounted "
+              f"backup verified at {external['verified_ts']:.0f}")
+    else:
+        print("\nexternal backup  BLOCKED    no verified different-device "
+              "mounted backup is recorded")
+        print("                         default and configured-local backups "
+              "do not make this VM safe to delete")
 
-    if any(g.status == readiness_mod.FAILED for g in gates):
+    if external is None or any(
+            g.status == readiness_mod.FAILED for g in gates):
         return 2
+    return 0
+
+
+def cmd_research_loop(args: argparse.Namespace) -> int:
+    """Backfill deterministic outcomes and review at most one pending result."""
+    cfg = _load_config()
+    store = findings_mod.FindingsStore(
+        findings_mod.resolve_store_path(args.store))
+    if args.no_review:
+        result = {
+            "status": "OUTCOMES_ONLY",
+            "outcomes": store.ensure_terminal_experiment_outcomes(),
+        }
+    else:
+        result = review_mod.process_pending_review(store, cfg)
+    print(json.dumps(result, sort_keys=True, default=str))
+    # Provider and parse failures are persisted and deliberately nonfatal so
+    # a nightly invocation can retry without losing the deterministic result.
     return 0
 
 
@@ -1012,6 +1121,36 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--out", default=None)
     report_parser.set_defaults(func=cmd_report)
 
+    backup_parser = sub.add_parser(
+        "backup", help="create a versioned, verified research backup")
+    backup_parser.add_argument("--store", default=None,
+                               help="findings.db path")
+    backup_parser.add_argument("--journal", default=None,
+                               help="journal.db path")
+    backup_parser.add_argument("--mode", default="demo",
+                               choices=["demo", "live"])
+    backup_parser.add_argument(
+        "--target", default=None,
+        help="pre-existing configured destination; a different st_dev is "
+             "required for external classification")
+    backup_parser.add_argument(
+        "--require-external", action="store_true",
+        help="fail unless the target is proven on a different mounted device")
+    backup_parser.add_argument(
+        "--runtime-research", default=str(backup_mod.DEFAULT_RUNTIME_RESEARCH),
+        help="recorder/manifests root")
+    backup_parser.add_argument(
+        "--results", default=str(backup_mod.DEFAULT_RESULTS),
+        help="durable research result root")
+    backup_parser.set_defaults(func=cmd_backup)
+
+    verify_backup_parser = sub.add_parser(
+        "verify-backup", help="verify a backup and append the result")
+    verify_backup_parser.add_argument("path", help="backup directory")
+    verify_backup_parser.add_argument("--store", default=None,
+                                      help="findings.db path")
+    verify_backup_parser.set_defaults(func=cmd_verify_backup)
+
     cadence = sub.add_parser(
         "cadence",
         help="B9.2 evidence: share of cycles that re-observe evaluated bars")
@@ -1026,11 +1165,23 @@ def build_parser() -> argparse.ArgumentParser:
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
 
+    learning = sub.add_parser(
+        "research-loop",
+        help="backfill terminal outcomes and review one pending result")
+    learning.add_argument("--store", default=None,
+                          help="findings.db path")
+    learning.add_argument(
+        "--no-review", action="store_true",
+        help="only create missing deterministic outcomes; do not call an LLM")
+    learning.set_defaults(func=cmd_research_loop)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(cli_args)
+    args._command = [sys.executable, str(Path(__file__).resolve()), *cli_args]
     return args.func(args)
 
 

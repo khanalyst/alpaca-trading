@@ -238,8 +238,8 @@ class TournamentEndToEndTests(DatasetFixture):
         row = self.score("flush-fade")
 
         self.assertTrue(row["scored"])
-        self.assertEqual(row["settings_tested"], 3)
-        self.assertEqual(len(row["settings"]), 3)
+        self.assertEqual(row["settings_tested"], 4)
+        self.assertEqual(len(row["settings"]), 4)
         self.assertEqual(
             sum(1 for s in row["settings"] if s["registered"]), 1)
 

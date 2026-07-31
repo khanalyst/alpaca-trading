@@ -66,3 +66,5 @@
  "total_fees_usd": 3269.81,
  "avg_hold_hours": 13.2
 }
+HISTORICAL RESULT SNAPSHOT — retained for reproduction of the named study;
+not current runtime, rotation, or live-promotion guidance.

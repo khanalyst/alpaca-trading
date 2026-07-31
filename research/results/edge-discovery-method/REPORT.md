@@ -1,5 +1,9 @@
 # How to infer an edge, and where to look for one
 
+> **Historical research snapshot.** The methods and measured results below are
+> preserved evidence from their original run. Current executable strategy,
+> rotation, outcome, and backup behavior is documented elsewhere.
+
 Two questions: how would we *recognise* an edge in this strategy, and how do
 we *find* one. The first has a concrete answer that this project has already
 paid for. The second has a ranked list, and the top item is not a smarter

@@ -26,6 +26,8 @@ Live trading writes ``variant_id = "live"``.
 from __future__ import annotations
 
 import copy
+import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -104,7 +106,17 @@ def _is_variant_id(value: object) -> bool:
     )
 
 
-def apply(variant: Variant, base_cfg: dict) -> dict:
+def strategy_variant_prefix(strategy_id: str) -> str:
+    """Return the stable dotted-ID-safe prefix for a strategy."""
+    return str(strategy_id).replace("-", "_")
+
+
+def baseline_variant_id(strategy_id: str) -> str:
+    return f"{strategy_variant_prefix(strategy_id)}.baseline"
+
+
+def apply(variant: Variant, base_cfg: dict, *,
+          allow_shadow_strategy: bool = False) -> dict:
     """Return ``base_cfg`` with the variant's overrides applied and validated.
 
     Deep-copies first: a variant that mutated the base configuration would
@@ -116,7 +128,8 @@ def apply(variant: Variant, base_cfg: dict) -> dict:
     for path, value in variant.overrides.items():
         _set_dotted(cfg, path, value, variant.variant_id)
     try:
-        validated = validate_config(cfg)
+        validated = validate_config(
+            cfg, allow_shadow_strategy=allow_shadow_strategy)
     except ConfigError as exc:
         raise ConfigError(
             f"variant {variant.variant_id} produces an invalid config: {exc}"
@@ -151,7 +164,7 @@ def _set_dotted(cfg: dict, path: str, value, variant_id: str) -> None:
 def baseline(strategy_id: str, base_version: str) -> Variant:
     """The unmodified configuration, as a variant, so it can be compared."""
     return Variant(
-        variant_id=f"{strategy_id}.baseline",
+        variant_id=baseline_variant_id(strategy_id),
         strategy_id=strategy_id,
         base_version=base_version,
         overrides={},
@@ -197,21 +210,95 @@ def adaptive_hypothesis_variant(strategy_id: str, base_version: str,
     """Materialize one exact, auditable numeric proposal as a variant."""
     from . import hypotheses
     spec = hypotheses.spec_for(hypothesis_id)
-    if spec is None or not any(str(s.get("id")) == str(setting_id)
-                               for s in spec.settings):
+    metadata = hypotheses.numeric_setting_metadata(hypothesis_id, setting_id)
+    if spec is None or metadata is None:
         raise ConfigError("adaptive proposal is not registered")
+    number = float(value)
+    if (not math.isfinite(number) or number < metadata["minimum"]
+            or number > metadata["maximum"]):
+        raise ConfigError("adaptive proposal is outside registered bounds")
     params = dict(spec.contract_params)
     setting = next(s for s in spec.settings if str(s.get("id")) == str(setting_id))
     params.update(setting.get("params") or {})
-    params[str(next(iter(setting.get("params") or params), "value"))] = value
+    params[metadata["target_parameter"]] = number
     safe = str(hypothesis_id).replace("-", "_")
-    value_id = format(float(value), ".15g").replace("-", "m").replace(".", "_")
+    value_id = format(number, ".15g").replace("-", "m").replace(".", "_")
     return Variant(
         variant_id=f"{strategy_id}.hyp.{safe}.{setting_id}.adaptive_{value_id}",
         strategy_id=strategy_id, base_version=base_version,
-        hypothesis=(f"Adaptive value {value} for {hypothesis_id}/{setting_id}: "
+        hypothesis=(f"Adaptive value {number:g} for {hypothesis_id}/{setting_id}: "
                     "test the registered mechanism at this exact point."),
         hypothesis_id=hypothesis_id, hypothesis_params=params)
+
+
+def declared_research_setting(
+        variant: Variant, proposal: dict | None = None) -> dict | None:
+    """Return the one registered axis represented by an eligible candidate.
+
+    This is the shared eligibility boundary for durable rotation, the LLM
+    selector prompt, and selector validation.  A bundle that changes more
+    than one executable setting is deliberately absent rather than being
+    mislabeled as a single-axis experiment.
+    """
+    if proposal is not None:
+        parameter = str(proposal.get("target_parameter") or "").strip()
+        if not parameter:
+            return None
+        return {
+            "axis": f"hypothesis.{variant.hypothesis_id}.{parameter}",
+            "setting_id": str(proposal.get("setting_id") or "adaptive"),
+            "setting": {parameter: proposal.get("value")},
+        }
+
+    from . import hypotheses
+
+    spec = hypotheses.spec_for(str(variant.hypothesis_id or ""))
+    if spec is not None:
+        for setting in sorted(
+                spec.settings, key=lambda item: str(item.get("id") or "")):
+            expected = dict(spec.contract_params)
+            expected.update(setting.get("params") or {})
+            if expected != variant.hypothesis_params:
+                continue
+            metadata = hypotheses.numeric_setting_metadata(
+                spec.id, str(setting["id"]))
+            if metadata is None:
+                return None
+            parameter = metadata["target_parameter"]
+            return {
+                "axis": f"hypothesis.{spec.id}.{parameter}",
+                "setting_id": str(setting["id"]),
+                "setting": {parameter: expected[parameter]},
+            }
+    if len(variant.overrides) != 1:
+        return None
+    axis, value = next(iter(variant.overrides.items()))
+    return {
+        "axis": str(axis),
+        "setting_id": variant.variant_id.rsplit(".", 1)[-1],
+        "setting": {str(axis): value},
+    }
+
+
+def from_record(record: dict) -> Variant:
+    """Rebuild an immutable Variant from its persisted findings row."""
+    overrides = record.get("overrides", record.get("overrides_json", {}))
+    hypothesis_params = record.get(
+        "hypothesis_params", record.get("hypothesis_params_json", {}))
+    if isinstance(overrides, str):
+        overrides = json.loads(overrides)
+    if isinstance(hypothesis_params, str):
+        hypothesis_params = json.loads(hypothesis_params)
+    return Variant(
+        variant_id=str(record["variant_id"]),
+        strategy_id=str(record["strategy_id"]),
+        base_version=str(record["base_version"]),
+        overrides=dict(overrides or {}),
+        hypothesis=str(record["hypothesis"]),
+        status=str(record.get("status") or "candidate"),
+        hypothesis_id=record.get("hypothesis_id"),
+        hypothesis_params=dict(hypothesis_params or {}),
+    )
 
 
 def preregistered_variants(
@@ -235,20 +322,49 @@ def preregistered_variants(
     if not isinstance(settings, list):
         raise ConfigError(f"{source}: settings must be a list")
     out = []
+    aliases = {
+        "flush-fade": {
+            "min_move_atr": "flush_min_move_atr",
+            "min_oi_drop_pct": "flush_min_oi_drop_pct",
+            "min_relative_volume": "flush_min_relative_volume",
+        },
+        "funding-carry": {
+            "percentile": "carry_percentile",
+            "min_samples": "carry_min_samples",
+        },
+        "funding-unwind": {
+            "percentile": "unwind_percentile",
+            "min_samples": "unwind_min_samples",
+        },
+        "trend-multiday": {
+            "min_range_pos_pct": "trend_min_range_pos_pct",
+            "max_atr_ratio": "trend_max_atr_ratio",
+            "max_hold_bars": "forward_horizon_hours",
+        },
+    }
     for entry in settings:
         if not isinstance(entry, dict) or not entry.get("id"):
             raise ConfigError(f"{source}: each setting requires an id")
         setting_id = str(entry["id"])
         params = dict(entry.get("params") or {})
+        normalized = {}
+        for key, value in params.items():
+            target = aliases.get(strategy_id, {}).get(key, key)
+            # Tournament bars are 15 minutes; the forward evaluator stores
+            # the same declared horizon in hours.
+            if strategy_id == "trend-multiday" and key == "max_hold_bars":
+                value = float(value) * 0.25
+            normalized[target] = value
         overrides = {
             (key if "." in key else f"strategy.{key}"): value
-            for key, value in params.items()
+            for key, value in normalized.items()
         }
         out.append(Variant(
-            variant_id=f"{strategy_id}.prereg.{setting_id}",
+            variant_id=(
+                f"{strategy_variant_prefix(strategy_id)}.prereg.{setting_id}"),
             strategy_id=strategy_id,
             base_version=base_version,
-            overrides=(overrides if strategy_id == "momentum" else {}),
+            overrides=overrides,
             hypothesis=str(entry.get("claim") or raw.get("prediction") or ""),
             status="candidate",
             hypothesis_id=f"{strategy_id}:{setting_id}",
@@ -301,6 +417,39 @@ def load_registry(path: str | Path) -> dict[str, Variant]:
                 f"{path}: duplicate variant_id {variant.variant_id!r}")
         out[variant.variant_id] = variant
     return out
+
+
+def research_selection_catalog() -> dict[str, tuple[dict, ...]]:
+    """Enumerate registered, single-axis, non-baseline selector targets."""
+    from . import registry as strategy_registry
+
+    registry_path = (
+        Path(__file__).resolve().parents[1] / "research" / "variants.yaml")
+    registered = load_registry(registry_path)
+    for strategy_id in sorted(strategy_registry.REGISTRY):
+        spec = strategy_registry.spec_for(strategy_id)
+        generated = []
+        if strategy_id == "momentum":
+            generated.extend(hypothesis_variants(strategy_id, spec.version))
+        generated.extend(preregistered_variants(strategy_id, spec.version))
+        for variant in generated:
+            registered.setdefault(variant.variant_id, variant)
+
+    catalog: dict[str, list[dict]] = {}
+    for variant in registered.values():
+        if (variant.status not in {"candidate", "testing"}
+                or variant.variant_id == baseline_variant_id(variant.strategy_id)):
+            continue
+        declared = declared_research_setting(variant)
+        if declared is None:
+            continue
+        catalog.setdefault(variant.strategy_id, []).append({
+            "strategy_id": variant.strategy_id,
+            "variant_id": variant.variant_id,
+            **declared,
+        })
+    return {strategy_id: tuple(items)
+            for strategy_id, items in sorted(catalog.items()) if items}
 
 
 def save_registry(path: str | Path, variants: dict[str, Variant]) -> None:

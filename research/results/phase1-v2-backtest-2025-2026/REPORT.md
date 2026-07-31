@@ -1,5 +1,8 @@
 # Phase1-v2 deterministic edge backtest (commit 6528626)
 
+> **Historical result snapshot.** This commit/corpus result is retained for
+> reproducibility and is not current operating guidance.
+
 ## Scope
 
 - Period: 2025-01-21T00:45:00+00:00 to 2026-07-01T00:00:00+00:00 UTC

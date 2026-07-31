@@ -51,8 +51,9 @@ cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 # Registered 2026-07-30, after the first verdict and stated as such. The
 # original test scored ONE point - the values above - and the register turned
 # that into T0_REJECTED while its own note said "the mechanism remains
-# plausible; this parameterisation of it does not survive". These three settings
-# exist so the next verdict is about the mechanism.
+# plausible; this parameterisation of it does not survive". These four settings
+# include a one-axis forward-rotation candidate while preserving the two
+# broader historical robustness checks.
 #
 # Both alternatives are chosen from the mechanism, not from the result: if
 # forced liquidation is what pays, the effect must be stronger where the
@@ -66,6 +67,12 @@ settings:
     claim: >-
       The originally pre-registered thresholds, kept as the comparison point so
       the earlier -0.288% result stays reproducible.
+  - id: move_2_atr
+    params:
+      min_move_atr: 2.0
+    claim: >-
+      A two-ATR price flush is a single-axis test of whether more violent
+      forced flow produces more reversion without changing the OI definition.
   - id: violent_only
     params:
       min_move_atr: 2.5
@@ -84,11 +91,11 @@ settings:
       underpowered test. Loosening all three buys sample; if expectancy is
       unchanged the earlier result was not a power problem.
 
-hypotheses_tested: 3
+hypotheses_tested: 4
 multiple_testing_note: |
-  One parameter set, registered before the first run. Any variant tested
-  later must increment this count, and the reported result must be
-  discounted accordingly.
+  Four declared parameterisations now exist. Any variant tested later must
+  increment this count, and the reported result must be discounted
+  accordingly.
 
 data_limitation: |
   OKX serves roughly 60 days of open-interest history. At a 4-24h horizon

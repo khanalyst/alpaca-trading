@@ -1,5 +1,8 @@
 # Phase1-v2 deterministic edge backtest
 
+> **Historical result snapshot.** This legacy cross-check is preserved for
+> reproducibility. It is not current runtime or promotion documentation.
+
 ## Scope
 
 - Period: 2024-08-16T09:30:00+00:00 to 2026-07-27T09:00:00+00:00 UTC

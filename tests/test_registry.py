@@ -89,9 +89,10 @@ class RegisterContentTests(unittest.TestCase):
         self.assertEqual(runnable_ids(), ("momentum",))
         self.assertNotIn("flush-fade", runnable_ids())
 
-    def test_unvalidated_outcome_models_cannot_emit_expectancy(self):
-        self.assertFalse(spec_for("funding-carry").forward_model_ready)
-        self.assertFalse(spec_for("trend-multiday").forward_model_ready)
+    def test_every_registered_strategy_has_a_forward_model(self):
+        for strategy_id in REGISTRY:
+            with self.subTest(strategy=strategy_id):
+                self.assertTrue(spec_for(strategy_id).forward_model_ready)
 
     def test_every_implemented_strategy_declares_shadow_parameters(self):
         # A strategy shadowed with whatever the live config happens to hold
@@ -100,9 +101,9 @@ class RegisterContentTests(unittest.TestCase):
             with self.subTest(strategy=strategy_id):
                 self.assertTrue(spec_for(strategy_id).contract_params)
 
-    def test_scalp_maker_stays_unimplemented(self):
-        # Blocked on recorded order-book data, not on development effort.
-        self.assertNotIn("scalp-maker", implemented_ids())
+    def test_scalp_maker_is_forward_only_not_analyst_runnable(self):
+        self.assertIn("scalp-maker", implemented_ids())
+        self.assertNotIn("scalp-maker", runnable_ids())
 
     def test_nothing_is_live_eligible_yet(self):
         # If this ever fails, a strategy has been promoted to T3 and the
@@ -209,14 +210,11 @@ class ForwardModelEvidenceTests(unittest.TestCase):
                         (repo / reference).exists(),
                         f"{model.model_id} cites {reference}, which is gone")
 
-    def test_an_unvalidated_model_needs_no_evidence(self):
+    def test_every_registered_model_is_implementation_validated(self):
         from agent.forward_models import MODELS
 
         unvalidated = [m for m in MODELS.values() if not m.validated]
-        self.assertTrue(unvalidated)
-        for model in unvalidated:
-            with self.subTest(model=model.model_id):
-                self.assertEqual(model.validation_evidence, ())
+        self.assertEqual(unvalidated, [])
 
 
 if __name__ == "__main__":

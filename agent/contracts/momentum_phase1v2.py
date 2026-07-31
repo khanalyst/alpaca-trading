@@ -67,7 +67,7 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
     #   trend_alignment    6.4 as originally specified. A breakout is a
     #                      transition OUT of chop, so it requires the absence
     #                      of prior multi-timeframe alignment.
-    #   volatility_regime  H-I. The real partition is compression versus
+    #   volatility_regime  The real partition is compression versus
     #                      expansion, and trend alignment is a correlated
     #                      proxy for it. A breakout from a compressed base is
     #                      a real event; a "break" when volatility is already

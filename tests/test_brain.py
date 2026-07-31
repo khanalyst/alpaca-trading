@@ -77,7 +77,7 @@ class OpenAITemperatureFallbackTests(unittest.TestCase):
 
     def test_gpt5_family_omits_temperature_before_first_request(self):
         llm = self._llm()
-        llm.cfg["model"] = "gpt-5.6-terra"
+        llm.cfg["model"] = "gpt-5.6-sol"
         llm._no_temperature = LLM._sampling_unsupported(
             llm.cfg["model"])
         params = llm._openai_params("sys", "user")
