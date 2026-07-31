@@ -1,99 +1,129 @@
-# Work-in-progress handoff — 2026-07-31
+# Final implementation handoff — 2026-08-01
 
 Branch: `codex/platform-correctness-docker`
 
-Base commit: `94d10e1`
+Original assessed main commit: `94d10e1`
 
-This is an explicit checkpoint, not a deployment-ready release. Work stopped
-during the final execution-correctness audit at the user's request.
+Implementation checkpoint commit: `d03798d`
 
-## Implemented in this checkpoint
+Status: the assessed code-correctness work is implemented. The repository is
+still demo/research-first: no current edge is eligible for live capital, and
+fresh data, forward evidence, human review, and an explicit registry/config
+change remain operational prerequisites.
 
-- Durable strategy experiment assignments now have a draining phase, immutable
-  retry lineage, fresh equal-balance baseline/candidate accounts, and strict
-  current-provenance/family-corrected promotion evidence.
-- The seven strategy lanes run from one recorded market snapshot; each active
-  assignment locks an exact baseline/candidate configuration. Variant work
-  inside a lane can use configured worker threads while durable writes remain
-  serialized.
-- Paper entries use observed OKX order-book depth, persist fill evidence, model
-  passive maker orders as pending/full-or-unfilled, use observed 1-minute bars
-  for exits, refuse stale persisted marks as timeout fills, and exclude invalid
-  outcomes from inference.
-- Live order submission uses client order IDs and read-only recovery after an
-  ambiguous response; it does not blindly resubmit. Maker-first crossing is
-  blocked while the maker order state is ambiguous.
-- Runtime recorder output separates funding forecasts from realized funding
-  history. Forecast revisions retain observation and settlement timestamps.
-- Historical download snapshots are exclusive, immutable, fully manifested,
-  and hash/row/range validated before tournament use. Non-finite report values
-  are serialized as JSON `null`.
-- Legacy VM export parsing is read-only and horizon-censored. The supplied VM
-  files were not modified. Its 3,520 historical shadow decisions are unresolved
-  under the required horizons rather than being assigned fabricated outcomes.
-- Docker/Compose deployment, non-root services, health checks, scheduler,
-  dashboard, persistent volumes, external-backup override, CI, and operator
-  documentation were added.
-- The runtime cycle is 60 seconds for marks/reconciliation and 300 seconds for
-  LLM decisions.
+## Assessment reconciliation
 
-## Validation completed before this checkpoint
+The consolidated assessment correctly identified material gaps in assignment
+draining, baseline/candidate equivalence, paper execution, evidence provenance,
+statistical qualification, backups, and deployment observability. Those gaps
+were treated as correctness issues and repaired without redesigning the whole
+platform.
 
-- Focused integration set: 124 tests passed.
-- Experiment lifecycle suite passed in its implementation lane.
-- VM export/provenance/recorder suite: 79 passed, 1 skipped.
-- Docker/deployment/documentation suite: 67 passed.
-- Compose configuration renders successfully.
-- `git diff --check` passes.
-- Docker image build was not run locally because no Docker daemon was available;
-  CI is configured to build it.
+One recommendation is intentionally narrower than the assessment proposed.
+All seven research lanes receive the same market snapshot and timestamp and
+keep isolated accounts/assignments, but the coordinator evaluates lanes in a
+bounded sequence and serializes durable writes. They are logically concurrent
+experiments, not seven simultaneous SQLite writers. Physical wall-clock
+concurrency is not needed for causal comparability or correctness, and was not
+added merely to satisfy an architectural preference.
 
-The latest complete suite run executed 1,017 tests and exposed four integration
-fixture/documentation-index failures. Those checkpoint-only fixture problems
-were corrected immediately afterward and the affected 141-test focused set
-passed. A complete-suite rerun after that final fixture correction is still
-pending, so this branch does not claim a clean complete suite.
+## Implemented correctness work
 
-## Known unfinished correctness work
+- Assignments use fresh equivalent baseline/candidate accounts, stop opening
+  new positions at the collection boundary, drain existing positions, preserve
+  immutable retry lineage, and freeze one terminal outcome only after evidence
+  is resolved or explicitly invalid.
+- Paper execution rechecks ticker/book freshness, requires continuous one-minute
+  execution-bar coverage, accepts maker fills only from full candle intervals
+  contained before expiry, and uses a 120-second paper maker TTL so one fully
+  observed later one-minute candle can qualify before cancellation. It records
+  observed execution-bar timestamps while preserving unknown intra-bar
+  chronology with conservative fill/stop ordering, charges spread once, and
+  rebases filled notional/risk to observed depth without exceeding the original
+  cap.
+- Runtime funding history accepts explicit realized settlements only; forecast
+  rates remain context and cannot be booked as realized cash flow.
+- Current v3 forward qualification reconstructs all eligible completed attempts
+  for each setting with that assignment's contemporaneous baseline. Missing,
+  active, rejected, mixed-provenance, or invalid evidence fails closed.
+- Family correction uses a calibrated paired six-hour-cluster sign-flip
+  p-value. It is valid only under cluster-delta sign exchangeability under a
+  null distribution symmetric about zero. That assumption is persisted and
+  validated; the test is not described as assumption-free.
+- Complete manifest-bearing immutable snapshot trees are included in verified
+  backups. In-progress or non-manifested directories are excluded, and every
+  captured file is size- and SHA-256-checked.
+- The Compose research scheduler refreshes durable `RUNNING` health every 30
+  seconds, inside the existing 180-second stale window.
 
-These items were found during the interrupted final audit and must be resolved
-before treating paper results as reliable or deploying live:
+## Edge and promotion boundary
 
-1. `agent/market.py::_funding_history_context` still reads the unified
-   `fundingRate` field as a realized settlement. Align it with
-   `research/record_flow.py`: accept only OKX `realizedRate` as realized money.
-2. `agent/shadow.py::_execution_exit` can currently accept a valid timeout when
-   the execution-bar list is empty. Require continuous one-minute coverage from
-   the last processed bar through the exit observation; otherwise keep the
-   position unresolved or close it as invalid evidence.
-3. Recheck order-book and ticker timestamps at evaluation/exit time, not only
-   when each API response is acquired. Sequential symbol collection can age an
-   early book before the common evaluation starts.
-4. A maker fill bar is skipped for stop/target evaluation. A stop crossed in
-   the same later bar that proves the maker fill must be handled
-   conservatively; ambiguous same-bar paths must not become optimistic trades.
-5. Timeout exits use an executable directional bid/ask and paper PnL also
-   subtracts half a spread. Remove that double charge or use a non-executable
-   midpoint consistently with the documented spread model.
-6. Depth VWAP changes actual filled notional, but stored `risk_usd` is still
-   based on pre-fill sizing. Rebase risk/margin attribution to the exact fill
-   without exceeding the original risk cap.
-7. Strategy lanes are logically parallel on the same timestamp/snapshot, but
-   `StrategyShadowCoordinator` currently iterates lanes sequentially. Only
-   configurations within a lane use worker threads. Decide whether wall-clock
-   parallel strategy execution is required and, if so, add it without allowing
-   concurrent SQLite writes.
-8. Add focused regressions for the six execution cases above, then rerun the
-   complete test suite, compilation, Compose validation, and Docker build.
-9. Complete the interrupted independent adversarial audit of execution,
-   inference validity, docs, and deployment claims.
-10. The supplied VM history is a legacy, non-manifested export and is correctly
-    refused by the new tournament gate. A fresh immutable OKX snapshot must be
-    downloaded (or a separately provenance-preserving import tool designed)
-    before running a representative tournament under the new rules.
+The end-to-end lifecycle is deliberately split:
 
-## Recommended exact continuation
+1. A terminal `WORKED` assignment saves immutable
+   `research_edge_evidence.v1` as a `RESEARCH_ONLY` `EDGE_CANDIDATE` lead with
+   `promotion_allowed: false` and `forward_qualification_required: true`.
+2. `research.py forward-qualify` must separately produce current v3
+   qualification from the complete paired assignment evidence and corrected
+   axis family.
+3. `./.venv/bin/python research.py prepare-review-artifacts` considers only
+   qualified variants. It fails closed unless persisted edge evidence and all
+   non-manual checks validate, then idempotently creates an immutable,
+   content-addressed `DRAFT_REVIEW_REQUIRED` T3 artifact.
+4. Draft preparation cannot mark manual review complete, edit
+   `agent/registry.py` or `config.yaml`, change the active strategy, or enable
+   live trading. Human review, a reviewed T3 record, and the actual
+   registry/configuration/deployment change remain explicit manual actions.
 
-Start at item 1 above, add one regression per behavior before changing code,
-run `python -m unittest discover -v`, then build and start Compose on a machine
-with Docker. Do not promote or reuse legacy findings as current edge evidence.
+`research/nightly.sh` performs qualification and draft preparation, but never
+crosses this live-capital boundary.
+
+## Imported VM evidence
+
+The supplied `vm-import/2026-07-30/` export was inspected read-only. Its 3,520
+legacy shadow decisions have no stored outcomes satisfying the current
+horizons and no current manifest/provenance chain. The files remain useful
+audit history, but the tournament and promotion paths correctly reject them as
+current evidence. No edge was inferred or fabricated from the export.
+
+## Remaining operational prerequisites
+
+These are environment/evidence requirements, not unfinished application-code
+defects:
+
+- collect a fresh manifest-bearing OKX snapshot and retain it in a verified
+  backup;
+- run new chronological forward assignments under current feed/model/code
+  identities until the sample, coverage, resolution, and regime floors are met;
+- obtain current G2 fidelity and v3 qualification before preparing a draft T3
+  artifact;
+- complete human review and explicitly edit/review registry/configuration before
+  any strategy could become live-eligible;
+- provision credentials and a genuinely external backup mount in the target
+  environment; and
+- build/run the image on a host with a Docker daemon before deployment.
+
+Until those prerequisites are satisfied, the correct state is collection and
+research—not promotion.
+
+## Verification status
+
+Verification completed on 2026-08-01:
+
+- `./.venv/bin/python -m pytest -q tests/research/test_docs_are_current.py`:
+  52 passed, 50 subtests passed.
+- `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q
+  -p no:cacheprovider`: 1,046 passed, 1 skipped, 274 subtests passed in 91.42
+  seconds.
+- Production-source `compileall`: passed.
+- `bash -n research/nightly.sh`: passed.
+- `docker compose config`: passed and rendered all four services. This command
+  validates Compose configuration but does not build images or contact the
+  Docker daemon.
+- `git diff --check`: passed.
+
+The cache provider was disabled because the sandbox would not allow its cache
+file under `/Users/talhakhan/.pytest_cache`; test execution and results were
+unaffected. The final audits repaired the maker-expiry candle boundary and
+aligned the shipped paper TTL with its full-candle evidence granularity; the
+complete suite above includes regressions for both.

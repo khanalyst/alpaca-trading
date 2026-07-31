@@ -205,7 +205,8 @@ class BudgetTests(unittest.TestCase):
             valid_config(), budget_ms=0.0001)
 
         records = evaluator.evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertTrue(evaluator.last_budget.overran)
         self.assertLess(len(records), 8)
@@ -220,7 +221,7 @@ class BudgetTests(unittest.TestCase):
                 shadow.ShadowBudget, "exhausted",
                 side_effect=[False, True]):
             records = evaluator.evaluate(
-                snapshot(), portfolio(), 1.0,
+                snapshot(), portfolio(), 1_760_000_000.0,
                 proposals=[proposal(), proposal(confidence=0.9)])
 
         self.assertEqual(len(records), 2)
@@ -234,7 +235,8 @@ class BudgetTests(unittest.TestCase):
             valid_config(), budget_ms=10_000)
 
         records = evaluator.evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertFalse(evaluator.last_budget.overran)
         self.assertEqual({r.variant_id for r in records},
@@ -277,7 +279,8 @@ class RecordedProposalTests(unittest.TestCase):
              for i in range(8)], valid_config(), budget_ms=0)
 
         evaluator.evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertEqual(len(evaluator.last_coverage["evaluated"]), 8)
 
@@ -623,6 +626,7 @@ class NonInterferenceTests(unittest.TestCase):
         original = cfg["strategy"]["fixed_reward_risk"]
 
         shadow.ShadowEvaluator([variant()], cfg).evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertEqual(cfg["strategy"]["fixed_reward_risk"], original)

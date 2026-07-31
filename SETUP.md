@@ -87,6 +87,7 @@ The available exit policies are `fixed_rr` and `extended_rr`.
 ```bash
 ./.venv/bin/python research.py corpus stats
 ./.venv/bin/python research.py research-loop --no-review
+./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py report
 ./.venv/bin/python research.py backup
 ./.venv/bin/python -m pytest -q
@@ -120,8 +121,9 @@ The recorder must become healthy before Compose starts the single trader. The
 research scheduler runs at 03:00 UTC and performs one missed run after a
 restart. Each run downloads a fresh immutable market snapshot under
 `runtime/research/snapshots/<UTC timestamp>`; it never appends to yesterday's
-universe. Runtime state, these snapshots, findings, tournament output, and
-generated reports use named volumes; `docker compose down` preserves them,
+universe. During a long run the scheduler refreshes its durable health status
+every 30 seconds. Runtime state, these snapshots, findings, tournament output,
+and generated reports use named volumes; `docker compose down` preserves them,
 while `down -v` deletes them and must not be used as an ordinary update command.
 
 The dashboard is deliberately bound only to the VM loopback interface. From a
@@ -372,9 +374,10 @@ Azure deletion policy; verify **Detach**/disabled **Delete with VM** in Azure.
 The managed disk is a backup destination, not the application's active data
 directory. The supported backup captures the findings database, active
 journal, `runtime/research/recorded`, research manifests and forward evidence,
-and `research/results`. It does not copy the complete immutable CSV trees under
-`runtime/research/snapshots/`. See [OPERATIONS.md](OPERATIONS.md) before a
-zero-data-loss VM deletion or rebuild.
+complete manifest-bearing immutable trees under
+`runtime/research/snapshots/`, and `research/results`. `verify-backup` checks
+the size and SHA-256 of every captured raw snapshot file. See
+[OPERATIONS.md](OPERATIONS.md) before a zero-data-loss VM deletion or rebuild.
 
 ## 7. Deployment updates
 

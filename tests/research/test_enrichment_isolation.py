@@ -66,6 +66,10 @@ def execution_enriched(snap: dict) -> dict:
     """Add the executable fields required by current paper outcome models."""
     out = enriched(snap)
     out["_enrichment"].update({
+        "ticker_ts": 1_760_000_000_000,
+        "ticker_best_bid": 99.99,
+        "ticker_best_ask": 100.01,
+        "ticker_age_seconds": 0.1,
         "book_ts": 1_760_000_000_000,
         "book_best_bid": 99.99,
         "book_best_ask": 100.01,

@@ -71,7 +71,7 @@ VALID_CONFIG = {
         "max_order_book_slippage_pct": 0.35,
         "max_market_data_age_seconds": 10,
         "paper_maker_fill_penetration_bps": 1,
-        "paper_maker_order_ttl_seconds": 60,
+        "paper_maker_order_ttl_seconds": 120,
         "fill_timeout_seconds": 1,
         "liquidity_feedback_ttl_minutes": 30,
         "liquidity_retries_before_backoff": 1,

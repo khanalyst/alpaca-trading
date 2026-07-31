@@ -2,11 +2,13 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import main
@@ -134,6 +136,68 @@ class SchedulerTests(unittest.TestCase):
             with patch.dict(os.environ, {"AGENT_MODE": "demo"}, clear=True):
                 self.assertEqual(scheduler.configured_mode(path), "live")
                 self.assertEqual(os.environ["AGENT_MODE"], "live")
+
+    def test_long_child_heartbeats_stay_healthy_and_then_go_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            child = Mock(pid=4321)
+            child.wait.side_effect = [
+                subprocess.TimeoutExpired("nightly", 30),
+                subprocess.TimeoutExpired("nightly", 30),
+                7,
+            ]
+            with patch.object(
+                    scheduler.time, "time", side_effect=[100.0, 200.0]):
+                exit_code = scheduler._wait_for_child_with_heartbeats(
+                    child, path, heartbeat_seconds=30,
+                    started_ts=50.0, run_date="2026-08-01",
+                    child_pid=child.pid, last_run_date="2026-07-31",
+                    last_exit_code=0)
+
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 7)
+            self.assertEqual(child.wait.call_count, 3)
+            self.assertEqual(stored["status"], "running")
+            self.assertEqual(stored["updated_ts"], 200.0)
+            self.assertEqual(stored["started_ts"], 50.0)
+            self.assertEqual(stored["child_pid"], 4321)
+            self.assertTrue(health.research(path, 180, now=379.0)["ok"])
+            stale = health.research(path, 180, now=381.0)
+            self.assertFalse(stale["ok"])
+            self.assertFalse(stale["fresh"])
+
+    def test_scheduler_preserves_child_exit_code_in_final_status(self):
+        child = Mock(pid=4321)
+        statuses = []
+
+        def finish_child(*_args, **_kwargs):
+            scheduler._running = False
+            return 5
+
+        def capture_status(_path, status, **detail):
+            statuses.append((status, detail))
+            return {"status": status, **detail}
+
+        args = SimpleNamespace(
+            config="config.yaml", status_file="research.json",
+            hour=3, minute=0, script="research/nightly.sh", root=".")
+        with patch.object(scheduler, "_running", True), \
+                patch.object(scheduler, "configured_mode", return_value="demo"), \
+                patch("main.load_secrets"), \
+                patch.object(scheduler.signal, "signal"), \
+                patch.object(scheduler, "next_run", side_effect=lambda now, *_: now), \
+                patch.object(scheduler.subprocess, "Popen", return_value=child), \
+                patch.object(
+                    scheduler, "_wait_for_child_with_heartbeats",
+                    side_effect=finish_child), \
+                patch.object(
+                    scheduler, "write_status", side_effect=capture_status):
+            self.assertEqual(scheduler.run_scheduler(args), 0)
+
+        self.assertEqual([status for status, _ in statuses],
+                         ["running", "failed", "stopped"])
+        self.assertEqual(statuses[1][1]["last_exit_code"], 5)
+        self.assertEqual(statuses[2][1]["last_exit_code"], 5)
 
 
 class DashboardTests(unittest.TestCase):

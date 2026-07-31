@@ -1,5 +1,6 @@
 """Executable evidence for every real-time forward outcome model."""
 
+import time
 import unittest
 
 from agent import shadow, strategy
@@ -8,6 +9,7 @@ from tests.helpers import valid_config
 
 
 def market_row(**overrides):
+    observed_ms = int(time.time() * 1000)
     row = {
         "price": 100.0,
         "spread_pct": 0.02,
@@ -45,7 +47,11 @@ def market_row(**overrides):
         "corr_btc_samples": 0,
         "beta_btc_1h_72": None,
         "_enrichment": {
-            "book_ts": 1_760_000_010_000,
+            "ticker_ts": observed_ms,
+            "ticker_best_bid": 99.99,
+            "ticker_best_ask": 100.01,
+            "ticker_age_seconds": 0.0,
+            "book_ts": observed_ms,
             "book_mid": 100.0,
             "book_best_bid": 99.99,
             "book_best_ask": 100.01,

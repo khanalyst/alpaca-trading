@@ -245,6 +245,26 @@ class BackupTests(unittest.TestCase):
         self.data_manifest = data / "manifest.json"
         self.data_manifest.write_text('{"window":"test"}\n', encoding="utf-8")
 
+        self.snapshot = (
+            self.runtime_research / "snapshots" / "20260731T030000Z")
+        self.snapshot_csv = self.snapshot / "swap" / "BTC-USDT-SWAP.csv"
+        self.snapshot_csv.parent.mkdir(parents=True)
+        self.snapshot_csv.write_text(
+            "timestamp_ms,open,high,low,close,volume,quote_volume\n"
+            "1000,100.0,102.0,99.0,101.0,12.0,1212.0\n",
+            encoding="utf-8")
+        self.snapshot_manifest = self.snapshot / "manifest.json"
+        self.snapshot_manifest.write_text(json.dumps({
+            "schema": tournament.DATA_MANIFEST_SCHEMA,
+            "files": [{
+                "path": "swap/BTC-USDT-SWAP.csv",
+                "sha256": sha256(self.snapshot_csv),
+                "rows": 1,
+                "first_timestamp_ms": 1000,
+                "last_timestamp_ms": 1000,
+            }],
+        }, sort_keys=True) + "\n", encoding="utf-8")
+
         self.results = self.root / "results"
         result_run = self.results / "tournament" / "runs" / "run-a"
         result_run.mkdir(parents=True)
@@ -285,7 +305,8 @@ class BackupTests(unittest.TestCase):
     def test_wal_consistent_verified_backup_and_two_histories(self):
         source_hashes = {
             path: sha256(path) for path in (
-                self.recorder, self.data_manifest, self.result_report)
+                self.recorder, self.data_manifest, self.snapshot_csv,
+                self.snapshot_manifest, self.result_report)
         }
         first = self.create()
         second = self.create()
@@ -324,6 +345,70 @@ class BackupTests(unittest.TestCase):
                 conn.execute(
                     "UPDATE backup_runs SET target_kind='local_default' "
                     "WHERE backup_id=?", (first["backup_id"],))
+
+    def test_completed_raw_snapshot_is_preserved_and_restorable(self):
+        partial = self.runtime_research / "snapshots" / "incomplete"
+        partial.mkdir()
+        (partial / ".download-in-progress").write_text(
+            "download in progress\n", encoding="utf-8")
+        (partial / "partial.csv").write_text(
+            "timestamp_ms,close\n1000,1\n", encoding="utf-8")
+        cache = self.runtime_research / "cache" / "derived.bin"
+        cache.parent.mkdir()
+        cache.write_bytes(b"rebuildable cache")
+        result = self.create()
+        archived = Path(result["backup_path"]) / (
+            "files/runtime/research/snapshots/20260731T030000Z")
+        restored = self.root / "restored-snapshot"
+
+        self.assertEqual(
+            (archived / "swap/BTC-USDT-SWAP.csv").read_bytes(),
+            self.snapshot_csv.read_bytes())
+        shutil.copytree(archived, restored)
+        restored_manifest = tournament.validate_data_snapshot(restored)
+
+        self.assertEqual(
+            restored_manifest["schema"], tournament.DATA_MANIFEST_SCHEMA)
+        self.assertTrue(backup.verify_backup(result["backup_path"])["ok"])
+        manifest = json.loads((
+            Path(result["backup_path"]) / backup.MANIFEST_NAME).read_text())
+        archived_paths = {item["archive_path"] for item in manifest["files"]}
+        self.assertIn(
+            "files/runtime/research/snapshots/20260731T030000Z/"
+            "swap/BTC-USDT-SWAP.csv", archived_paths)
+        self.assertFalse(any("/snapshots/incomplete/" in path
+                             for path in archived_paths))
+        self.assertFalse(any("/cache/" in path for path in archived_paths))
+
+    def test_missing_or_tampered_raw_snapshot_fails_verification(self):
+        missing_result = self.create()
+        missing_path = Path(missing_result["backup_path"]) / (
+            "files/runtime/research/snapshots/20260731T030000Z/"
+            "swap/BTC-USDT-SWAP.csv")
+        missing_path.unlink()
+        missing = backup.verify_backup(missing_result["backup_path"])
+
+        self.assertFalse(missing["ok"])
+        self.assertTrue(any(
+            "missing backup file" in error
+            and "BTC-USDT-SWAP.csv" in error
+            for error in missing["errors"]))
+
+        tampered_result = self.create()
+        tampered_path = Path(tampered_result["backup_path"]) / (
+            "files/runtime/research/snapshots/20260731T030000Z/"
+            "swap/BTC-USDT-SWAP.csv")
+        tampered_path.write_text(
+            tampered_path.read_text(encoding="utf-8").replace(
+                "100.0", "103.0", 1),
+            encoding="utf-8")
+        tampered = backup.verify_backup(tampered_result["backup_path"])
+
+        self.assertFalse(tampered["ok"])
+        self.assertTrue(any(
+            "checksum mismatch" in error
+            and "BTC-USDT-SWAP.csv" in error
+            for error in tampered["errors"]))
 
     def test_tamper_and_manifest_checksum_failures_are_recorded(self):
         first = self.create()

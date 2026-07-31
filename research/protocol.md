@@ -32,6 +32,7 @@ amendment, it is a result being negotiated.
 | --- | --- | --- |
 | 2026-07-30 | **Criterion 10 added**: a Holm correction across every axis evaluated in one qualification run. **Criterion 5 reclassified** as a selection screen rather than an independent test. | The correction existed only for conditioning cells, so the path that actually qualifies an edge corrected nothing while this document claimed the corrected figure was the only quotable one. Five axes are registered and the count grows with the registry. No variant had forward evidence at the time, so nothing was pending on either criterion. |
 | 2026-07-31 | **Real-time rotation outcomes documented separately.** Every strategy now keeps one baseline and at most one candidate; inadequacy is checked before performance and terminal outcomes are immutable. | The previous text said every setting ran continuously, which no longer matched the durable per-strategy rotation or the closed learning loop. |
+| 2026-07-31 | **Forward qualification now reconstructs every setting from all eligible completed assignment attempts and its own contemporaneous baseline. Axis correction uses a calibrated paired six-hour-cluster sign-flip p-value.** | A common latest-ledger watermark erased earlier serial settings, and interval geometry is not a p-value. Existing v2 analyses remain readable but cannot authorize a new qualification. |
 
 ---
 
@@ -110,15 +111,21 @@ or authorize execution.
    criterion 9 is what the claim rests on.
 6. **Max drawdown ≤ the baseline's.** A better expectancy bought with a
    deeper hole is not an improvement.
-7. **The setting survives the chronological 70/30 split.** One cutoff is
-   derived from the baseline proposal calendar and applied to every arm.
-   Selection occurs only before it; the later window cannot choose its winner.
+7. **The setting survives the chronological 70/30 split.** Each serial setting
+   uses the proposal calendar of its own assignment-matched baseline. Selection
+   compares paired fit-window deltas only; the later window cannot choose its
+   winner.
 8. **The confirmation window contains ≥ 30 resolved pairs**, with ≥ 80%
    coverage, no duplicate identities and the same registered dependence-aware
    bootstrap.
-9. **The paired confirmation delta interval is entirely positive.** This is
-   the criterion the claim rests on: the window is held out, it did not choose
-   the winner, and it is the interval criterion 10 corrects.
+9. **The paired confirmation delta interval is entirely positive.** The held-out
+   pairs also receive a one-sided cluster sign-flip randomization test, with all
+   trades in one six-hour episode flipped together. This test requires cluster
+   aggregate delta signs to be exchangeable under a null distribution symmetric
+   about zero; it is not assumption-free, and that assumption label is persisted
+   and validated. Small cluster families enumerate every sign assignment exactly
+   conditional on that null assumption; larger ones use a fixed-seed Monte Carlo
+   estimate whose method, seed and resample count are persisted.
 10. **The confirmation result survives a Holm correction across every axis
    evaluated in the same qualification run.** Each axis is a separate chance
    to promote something, so a 5% test performed across five axes is not a 5%
@@ -126,7 +133,8 @@ or authorize execution.
    including the axes that failed earlier — an axis that failed still consumed
    a chance, and dropping it would shrink the family exactly when a candidate
    needs the family small. `correct_axis_family()` records the family size, the
-   adjusted figure and the axis list on every verdict, promoted or not, and
+   calibrated raw p-value, adjusted figure and axis list on every verdict,
+   promoted or not, and
    `research.py forward-qualify` persists one `forward_axis_family` analysis
    per run so the count that governed the decision is auditable afterwards.
    A promotion that fails the correction becomes `CONTINUE`: the axis is not
@@ -161,6 +169,11 @@ would make those axes incapable of demonstrating an edge.
 
 Those immutable action records are the decision-ledger rows used by both the
 terminal experiment outcome and the stricter forward-qualification path.
+Forward qualification groups them by immutable completed assignment. Every
+eligible current-code/current-model/current-config attempt is retained, with
+its assignment boundaries, retry lineage, provenance hashes, candidate actions
+and that attempt's own baseline actions. Baseline rows from another assignment
+are never pooled into a candidate's comparison.
 
 Inference uses the return difference inside each exact pair. The bootstrap
 keeps observations together in six-hour market clusters and samples
@@ -168,6 +181,15 @@ contiguous cluster blocks, preserving cross-symbol market episodes and
 short-run serial dependence. The output always carries paired count, proposal
 union count, coverage, left/right-only proposals, unresolved outcomes,
 duplicate identities and examples of mismatches.
+
+The family-wise test uses the same exact pairs and six-hour clusters but a
+different operation: it flips whole-cluster delta signs under the null. It is
+valid only when cluster aggregate delta signs are exchangeable under a null
+distribution symmetric about zero; the evidence records this assumption as
+`cluster_delta_sign_exchangeability_under_symmetric_null`. Exact enumeration
+is labeled exact only for enumeration of the sign assignments conditional on
+that assumption. Fixed-seed Monte Carlo output is labeled as an estimate and
+records its resample count and seed.
 
 The minimums are fixed constants in `protocol.py`: 100 full pairs, 70 fit
 pairs, 30 confirmation pairs and 80% coverage in every relevant population.
@@ -234,9 +256,10 @@ fit interval, because correcting a screen and then testing on held-out data
 would charge the same multiplicity twice. Criterion 5 is therefore explicitly
 labelled a screen.
 
-The p-values are approximated from each bucket's bootstrap interval. That is
-coarse, and it is the honest resolution available at this sample size — it is
-used to rank and to correct, and never quoted as a p-value in its own right.
+Holm correction accepts only a supplied calibrated raw p-value. The forward
+axis path supplies the paired cluster sign-flip value above. Generic callers
+that only have a confidence interval fail closed at p=1; interval width or
+distance from zero is never converted into a pseudo-p-value.
 
 ## What `INSUFFICIENT_SAMPLE` means, and what it does not
 
@@ -275,9 +298,10 @@ research-only edge candidate remain append-only in schema 16.
 The separate `research.py forward-qualify` path continues to apply the
 multi-setting criteria above to complete prequalification decision-ledger
 evidence. Schema migration 7 preserves legacy trades for audit but prevents
-executed-trades-only populations from silently qualifying an edge. All arms
-use one common evidence window; an operational failure invalidates it rather
-than becoming missing data.
+executed-trades-only populations from silently qualifying an edge. Each
+setting uses all eligible completed assignment windows and the baseline from
+those same windows; an operational failure invalidates its assignment evidence
+rather than becoming missing data.
 
 Forward qualification proves one strategy version and one declared axis,
 verifies identical non-axis executable inputs, persists family correction, and

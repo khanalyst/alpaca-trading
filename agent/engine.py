@@ -802,7 +802,7 @@ class Engine:
         symbols = list(dict.fromkeys(live_symbols + shadow_symbols))
         snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
         if snapshot and evaluator is not None:
-            self._advance_shadow_variants(snapshot, now)
+            self._advance_shadow_variants(snapshot, time.time())
         # Everything below this line runs on the restricted view, so the live
         # decision is byte-identical to the one taken with shadow disabled.
         live_snapshot = market.restrict_snapshot(snapshot, live_symbols)

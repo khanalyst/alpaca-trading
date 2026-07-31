@@ -71,8 +71,10 @@ def _funding_history_context(ex, symbol: str,
     """Summarize funding and retain realized settlements for paper PnL.
 
     The current/predicted funding endpoint is not settlement evidence. Only
-    rows returned by OKX's funding-rate-history endpoint are exposed to the
-    simulator as realized events; the raw events remain hidden from the LLM.
+    an explicit OKX ``realizedRate`` is exposed to the simulator as settled
+    money. Historical ``fundingRate`` values remain forecast context for the
+    percentile features and are never relabelled as realized events. The raw
+    events remain hidden from the LLM.
     """
     empty = {
         "funding_samples_30": 0,
@@ -91,29 +93,40 @@ def _funding_history_context(ex, symbol: str,
     rates = []
     events = []
     for row in rows[-100:]:
-        value = row.get("fundingRate")
-        if value in (None, ""):
-            value = (row.get("info") or {}).get("fundingRate")
+        info = row.get("info") or {}
+        forecast_value = row.get("fundingRate")
+        if forecast_value in (None, ""):
+            forecast_value = info.get("fundingRate")
         try:
-            number = float(value) * 100
+            forecast_number = float(forecast_value) * 100
+        except (TypeError, ValueError):
+            forecast_number = None
+        if forecast_number is not None and math.isfinite(forecast_number):
+            rates.append(forecast_number)
+
+        realized_value = row.get("realizedRate")
+        if realized_value in (None, ""):
+            realized_value = info.get("realizedRate")
+        try:
+            realized_number = float(realized_value) * 100
         except (TypeError, ValueError):
             continue
-        if math.isfinite(number):
-            rates.append(number)
-            raw_ts = row.get("timestamp")
-            if raw_ts in (None, ""):
-                raw_ts = (row.get("info") or {}).get("fundingTime")
-            try:
-                timestamp_ms = int(float(raw_ts))
-            except (TypeError, ValueError):
-                continue
-            if timestamp_ms > 0:
-                events.append({
-                    "timestamp_ms": timestamp_ms,
-                    "rate_pct": round(number, 8),
-                    "source": "okx_funding_rate_history",
-                    "status": "realized",
-                })
+        if not math.isfinite(realized_number):
+            continue
+        raw_ts = row.get("timestamp")
+        if raw_ts in (None, ""):
+            raw_ts = info.get("fundingTime")
+        try:
+            timestamp_ms = int(float(raw_ts))
+        except (TypeError, ValueError):
+            continue
+        if timestamp_ms > 0:
+            events.append({
+                "timestamp_ms": timestamp_ms,
+                "rate_pct": round(realized_number, 8),
+                "source": "okx_funding_rate_history.realizedRate",
+                "status": "realized",
+            })
     deduped = {event["timestamp_ms"]: event for event in events}
     empty["_realized_funding_events"] = [
         deduped[key] for key in sorted(deduped)]

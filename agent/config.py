@@ -413,10 +413,10 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
     if execution.get("paper_maker_fill_penetration_bps") is None:
         execution["paper_maker_fill_penetration_bps"] = 1.0
     if execution.get("paper_maker_order_ttl_seconds") is None:
-        execution["paper_maker_order_ttl_seconds"] = 60.0
+        execution["paper_maker_order_ttl_seconds"] = 120.0
     _number(execution, "paper_maker_fill_penetration_bps", 0.01, 100,
             "execution")
-    _number(execution, "paper_maker_order_ttl_seconds", 10, 300,
+    _number(execution, "paper_maker_order_ttl_seconds", 120, 300,
             "execution")
     _number(execution, "fill_timeout_seconds", 1, 60, "execution")
     _number(execution, "liquidity_feedback_ttl_minutes", 5, 1440,

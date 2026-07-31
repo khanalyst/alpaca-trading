@@ -37,6 +37,21 @@ SCHEMA_VERSION = 16
 
 KINDS = ("observation", "recommendation", "decision")
 
+T3_MANUAL_CHECK = "manual_registry_review"
+T3_REQUIRED_CHECKS = frozenset({
+    "current_g2_pass",
+    "held_out_confirmation",
+    "corpus_provenance",
+    "config_provenance",
+    "code_provenance",
+    "forward_sample",
+    "axis_family_corrected",
+    "saved_edge_candidate",
+    "paper_sample",
+    "paper_positive",
+    T3_MANUAL_CHECK,
+})
+
 
 def resolve_store_path(configured: str | Path | None = None) -> Path:
     """Resolve configured storage deterministically against the repository."""
@@ -319,15 +334,18 @@ def _assignment_trade_costs(row: sqlite3.Row) -> tuple[dict, list[dict]]:
     else:
         fee_pct = sum(_finite_number(components.get(key)) for key in (
             "entry_fee_pct", "exit_fee_pct"))
-        execution_pct = sum(_finite_number(components.get(key)) for key in (
-            "spread_pct", "entry_slippage_pct"))
-        if str(row["result"]) in {"stop", "paper_insolvency"}:
-            execution_pct += _finite_number(
-                components.get("stop_slippage_pct"))
         try:
             execution_evidence = json.loads(row["execution_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             execution_evidence = {}
+        exit_evidence = execution_evidence.get("exit") or {}
+        execution_pct = _finite_number(components.get("entry_slippage_pct"))
+        if not (isinstance(exit_evidence, dict)
+                and exit_evidence.get("spread_in_exit_price")):
+            execution_pct += _finite_number(components.get("spread_pct"))
+        if str(row["result"]) in {"stop", "paper_insolvency"}:
+            execution_pct += _finite_number(
+                components.get("stop_slippage_pct"))
         events = execution_evidence.get("funding_events") or []
         realized_rates = [
             _finite_number(event.get("rate_pct")) for event in events
@@ -687,49 +705,6 @@ def _deterministic_experiment_payload(
                 "WHERE variant_id=? AND scope_key IN ('*', ?) "
                 "ORDER BY ts DESC, rowid DESC LIMIT 1",
                 (candidate_id, scope_key)).fetchone()
-            if qualification is None or qualification["status"] != "QUALIFIED":
-                uncertain.append((
-                    "AXIS_FAMILY_EVIDENCE_REQUIRED",
-                    "a per-assignment result cannot establish an edge until "
-                    "the candidate has a persisted qualified forward-axis "
-                    "analysis that survived the complete family correction"))
-            elif qualification["source_analysis_id"]:
-                analysis = conn.execute(
-                    "SELECT payload_json FROM analysis_runs WHERE analysis_id=?",
-                    (qualification["source_analysis_id"],)).fetchone()
-                try:
-                    qualified_payload = json.loads(
-                        analysis["payload_json"] if analysis is not None else "null")
-                except (TypeError, json.JSONDecodeError):
-                    qualified_payload = None
-                expected_code = json.loads(
-                    assignment["code_identity_json"] or "{}").get(
-                        "candidate", {})
-                expected_config = json.loads(
-                    assignment["config_identity_json"] or "{}").get(
-                        "candidate", {})
-                qualified_provenance = (
-                    (qualified_payload.get("experiment_provenance") or {}).get(
-                        candidate_id, {})
-                    if isinstance(qualified_payload, dict) else {})
-                identity_matches = bool(
-                    isinstance(qualified_payload, dict)
-                    and qualified_payload.get("code_version")
-                    == expected_code.get("code_version")
-                    and qualified_payload.get("forward_model_id")
-                    == expected_code.get("forward_model_id")
-                    and qualified_provenance.get("strategy_config_version")
-                    == expected_config.get("strategy_config_version"))
-                if not identity_matches:
-                    uncertain.append((
-                        "AXIS_FAMILY_IDENTITY_MISMATCH",
-                        "the qualified axis-family evidence does not match "
-                        "this assignment's code, forward model, and executable "
-                        "strategy configuration"))
-            else:
-                uncertain.append((
-                    "AXIS_FAMILY_EVIDENCE_REQUIRED",
-                    "the qualification has no persisted forward-axis analysis"))
             if qualification is not None and qualification["status"] == "REVOKED":
                 negative.append((
                     "EXISTING_DISQUALIFYING_GATE",
@@ -762,10 +737,18 @@ def _deterministic_experiment_payload(
                 for code, detail in uncertain:
                     add(code, "statistical_confidence", detail)
             else:
+                limitations.append({
+                    "code": "FORWARD_AXIS_QUALIFICATION_REQUIRED",
+                    "detail": (
+                        "WORKED is an assignment-level research result. A "
+                        "current v3 forward-axis analysis, complete family "
+                        "correction, and isolated PAPER stage remain required "
+                        "before a reviewed T3 packet can be created."),
+                })
                 add("ALL_CONSERVATIVE_GATES_PASSED", "edge_evidence",
-                    "sample, costs, baseline delta, two segments, drawdown, "
-                    "axis-family correction, and disqualifying-gate checks "
-                    "all passed")
+                    "assignment-level sample, costs, baseline delta, two "
+                    "segments, drawdown, and disqualifying-gate checks all "
+                    "passed")
 
     for limitation in limitations:
         limitation.setdefault("severity", "disclosure")
@@ -874,11 +857,14 @@ def _ensure_experiment_outcome_conn(
             "schema": "research_edge_evidence.v1",
             "authority": "RESEARCH_ONLY",
             "promotion_allowed": False,
+            "forward_qualification_required": True,
             "outcome_id": outcome_id,
+            "outcome_hash": payload_hash,
             "assignment_id": assignment_id,
             "scope_key": assignment["scope_key"],
             "strategy_id": assignment["strategy_id"],
             "variant_id": assignment["candidate_variant_id"],
+            "variant_identity": payload["candidate_variant"],
             "data_window": payload["data_window"],
             "feed_identity": payload["feed_identity"],
             "code_identity": payload["code_identity"],
@@ -3592,6 +3578,242 @@ class FindingsStore:
             seen_values.add(values)
         return canonical_axis
 
+    @staticmethod
+    def _forward_v3_source_hash(source: dict) -> str:
+        unsigned = dict(source)
+        unsigned.pop("sha256", None)
+        return _content_hash(unsigned)
+
+    @staticmethod
+    def _forward_assignment_rows(
+            conn: sqlite3.Connection, scope_key: str, strategy_id: str,
+            baseline_id: str, candidate_id: str,
+            completed_through_ts: float | None = None) -> list[sqlite3.Row]:
+        event_cutoff = ""
+        assignment_cutoff = ""
+        params: list = []
+        if completed_through_ts is not None:
+            params.append(float(completed_through_ts))
+            event_cutoff = " AND event.event_ts<=?"
+            assignment_cutoff = " AND assignment.started_ts<=?"
+        params.extend([scope_key, strategy_id, baseline_id, candidate_id])
+        if completed_through_ts is not None:
+            params.append(float(completed_through_ts))
+        return conn.execute(
+            "SELECT assignment.*, terminal.event_id AS terminal_event_id, "
+            "COALESCE(terminal.status, 'STARTED') AS terminal_status, "
+            "COALESCE(terminal.event_ts, assignment.started_ts) AS ended_ts, "
+            "terminal.reason AS terminal_reason "
+            "FROM strategy_experiment_assignments AS assignment "
+            "LEFT JOIN strategy_experiment_assignment_events AS terminal "
+            "ON terminal.rowid=(SELECT event.rowid FROM "
+            "strategy_experiment_assignment_events AS event "
+            "WHERE event.assignment_id=assignment.assignment_id "
+            + event_cutoff + " "
+            "ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) "
+            "WHERE assignment.scope_key=? AND assignment.strategy_id=? "
+            "AND assignment.baseline_variant_id=? "
+            "AND assignment.candidate_variant_id=? "
+            + assignment_cutoff + " "
+            "ORDER BY assignment.started_ts, assignment.attempt, "
+            "assignment.assignment_id", params).fetchall()
+
+    @classmethod
+    def _assignment_provenances(
+            cls, conn: sqlite3.Connection,
+            assignment: sqlite3.Row) -> tuple[dict, dict, dict, dict]:
+        try:
+            code_identity = json.loads(assignment["code_identity_json"])
+            config_identity = json.loads(assignment["config_identity_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"assignment {assignment['assignment_id']} has invalid identity "
+                "JSON") from exc
+        if not isinstance(code_identity, dict) or not isinstance(
+                config_identity, dict):
+            raise ValueError("forward assignment identities must be mappings")
+        provenances = []
+        for lane, variant_id in (
+                ("baseline", assignment["baseline_variant_id"]),
+                ("candidate", assignment["candidate_variant_id"])):
+            code = code_identity.get(lane)
+            config = config_identity.get(lane)
+            if not isinstance(code, dict) or not isinstance(config, dict):
+                raise ValueError(
+                    f"assignment {assignment['assignment_id']} has incomplete "
+                    f"{lane} identity")
+            variant = cls._require_variant(conn, str(variant_id))
+            provenances.append(cls._validate_experiment_provenance(
+                variant, {**config, **code}))
+        return (json.loads(_canonical_json(code_identity)),
+                json.loads(_canonical_json(config_identity)),
+                provenances[0], provenances[1])
+
+    @staticmethod
+    def _forward_assignment_decisions(
+            conn: sqlite3.Connection, scope_key: str, variant_id: str,
+            started_ts: float, ended_ts: float) -> list[dict]:
+        rows = conn.execute(
+            "SELECT d.*, t.proposal_id AS trade_proposal_id, "
+            "t.scope_key AS trade_scope_key, "
+            "t.variant_id AS trade_variant_id, "
+            "t.model_id AS trade_model_id, "
+            "t.entry_ts AS trade_entry_ts, t.exit_ts AS trade_exit_ts, "
+            "t.result AS trade_result, t.r_multiple AS trade_r_multiple, "
+            "t.status AS trade_status, "
+            "t.valid_for_inference AS trade_valid_for_inference "
+            "FROM paper_decisions AS d LEFT JOIN paper_trades AS t "
+            "ON t.trade_id=d.paper_trade_id "
+            "WHERE d.scope_key=? AND d.variant_id=? "
+            "AND d.decision_ts>=? AND d.decision_ts<=? "
+            "ORDER BY d.decision_ts, d.decision_id",
+            (scope_key, variant_id, started_ts, ended_ts)).fetchall()
+        decisions = []
+        for row in rows:
+            evidence = _forward_decision_evidence(row)
+            exit_ts = evidence.get("trade_exit_ts")
+            if exit_ts is not None and float(exit_ts) > ended_ts:
+                evidence.update({
+                    "trade_exit_ts": None, "trade_result": None,
+                    "trade_r_multiple": None, "trade_status": "OPEN",
+                })
+            decisions.append(evidence)
+        return decisions
+
+    @classmethod
+    def _forward_assignment_record(
+            cls, conn: sqlite3.Connection,
+            assignment: sqlite3.Row) -> dict:
+        code_identity, config_identity, baseline_provenance, candidate_provenance = (
+            cls._assignment_provenances(conn, assignment))
+        started_ts = float(assignment["started_ts"])
+        ended_ts = float(assignment["ended_ts"])
+        for variant_id in (
+                str(assignment["baseline_variant_id"]),
+                str(assignment["candidate_variant_id"])):
+            failure = conn.execute(
+                "SELECT kind, ts FROM paper_failures WHERE scope_key=? "
+                "AND variant_id=? AND ts>=? AND ts<=? ORDER BY ts LIMIT 1",
+                (assignment["scope_key"], variant_id,
+                 started_ts, ended_ts)).fetchone()
+            if failure is not None:
+                raise ValueError(
+                    f"{variant_id}: operational failure {failure['kind']} "
+                    f"occurred inside assignment {assignment['assignment_id']}")
+        try:
+            setting = json.loads(assignment["setting_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"assignment {assignment['assignment_id']} has invalid setting") \
+                from exc
+        return {
+            "assignment_id": str(assignment["assignment_id"]),
+            "attempt": int(assignment["attempt"] or 1),
+            "retry_of_assignment_id": assignment["retry_of_assignment_id"],
+            "candidate_key": str(assignment["candidate_key"]),
+            "axis": str(assignment["axis"]),
+            "setting_id": str(assignment["setting_id"]),
+            "setting": setting,
+            "source": str(assignment["source"]),
+            "proposal_id": assignment["proposal_id"],
+            "started_ts": started_ts,
+            "ended_ts": ended_ts,
+            "terminal_event_id": str(assignment["terminal_event_id"]),
+            "terminal_status": str(assignment["terminal_status"]),
+            "terminal_reason": assignment["terminal_reason"],
+            "code_identity": code_identity,
+            "code_identity_hash": _content_hash(code_identity),
+            "config_identity": config_identity,
+            "config_identity_hash": _content_hash(config_identity),
+            "baseline": {
+                "variant_id": str(assignment["baseline_variant_id"]),
+                "experiment_provenance": baseline_provenance,
+                "provenance_hash": _content_hash(baseline_provenance),
+                "decisions": cls._forward_assignment_decisions(
+                    conn, str(assignment["scope_key"]),
+                    str(assignment["baseline_variant_id"]),
+                    started_ts, ended_ts),
+            },
+            "candidate": {
+                "variant_id": str(assignment["candidate_variant_id"]),
+                "experiment_provenance": candidate_provenance,
+                "provenance_hash": _content_hash(candidate_provenance),
+                "decisions": cls._forward_assignment_decisions(
+                    conn, str(assignment["scope_key"]),
+                    str(assignment["candidate_variant_id"]),
+                    started_ts, ended_ts),
+            },
+        }
+
+    @classmethod
+    def _eligible_forward_assignment_records(
+            cls, conn: sqlite3.Connection, scope_key: str, strategy_id: str,
+            baseline_id: str, candidate_id: str,
+            baseline_provenance: dict, candidate_provenance: dict,
+            completed_through_ts: float | None = None) -> list[dict]:
+        records = []
+        for assignment in cls._forward_assignment_rows(
+                conn, scope_key, strategy_id, baseline_id, candidate_id,
+                completed_through_ts):
+            _, _, observed_baseline, observed_candidate = (
+                cls._assignment_provenances(conn, assignment))
+            if (observed_baseline != baseline_provenance
+                    or observed_candidate != candidate_provenance):
+                continue
+            assignment_id = str(assignment["assignment_id"])
+            status = str(assignment["terminal_status"])
+            if status in {"STARTED", "OBSERVING", "DRAINING"}:
+                raise ValueError(
+                    f"{candidate_id}: matching assignment {assignment_id} is "
+                    f"unfinished at status {status}")
+            if status == "REJECTED":
+                reason = str(assignment["terminal_reason"] or
+                             "no rejection reason recorded")
+                raise ValueError(
+                    f"{candidate_id}: matching assignment {assignment_id} "
+                    f"was REJECTED: {reason}")
+            if status != "COMPLETED":
+                raise ValueError(
+                    f"{candidate_id}: matching assignment {assignment_id} "
+                    f"has unsupported status {status}")
+            records.append(cls._forward_assignment_record(conn, assignment))
+        return records
+
+    @classmethod
+    def _validate_forward_arm_decisions(
+            cls, payload: dict, variant_id: str, provenance: dict,
+            decisions: object, model) -> None:
+        if not isinstance(decisions, list):
+            raise ValueError("forward decision corpus is invalid")
+        for decision in decisions:
+            assumptions = decision.get("assumptions") or {}
+            outcome = str(decision.get("decision_outcome") or "")
+            proposed = outcome == "PROPOSED"
+            vetoed = outcome == "VETOED"
+            if (decision.get("scope_key") != payload.get("scope_key")
+                    or decision.get("variant_id") != variant_id
+                    or decision.get("model_id") != model.model_id
+                    or assumptions.get("forward_model") != json.loads(
+                        _canonical_json(model.as_dict()))
+                    or assumptions.get("experiment_provenance") != provenance
+                    or not (proposed or vetoed)
+                    or (proposed and not decision.get("paper_trade_id"))
+                    or (proposed and (
+                        decision.get("trade_proposal_id")
+                        != decision.get("proposal_id")
+                        or decision.get("trade_scope_key")
+                        != decision.get("scope_key")
+                        or decision.get("trade_variant_id") != variant_id
+                        or decision.get("trade_model_id") != model.model_id
+                        or decision.get("trade_status")
+                        not in {"OPEN", "CLOSED"}))
+                    or (vetoed and (
+                        decision.get("paper_trade_id")
+                        or decision.get("trade_status") is not None))):
+                raise ValueError(
+                    "forward evidence contains mixed model, assumptions, "
+                    "scope, experiment provenance, or decision linkage")
+
     @classmethod
     def _forward_verdict_from_payload(
             cls, conn: sqlite3.Connection, payload: dict):
@@ -3599,89 +3821,184 @@ class FindingsStore:
         from research import protocol
 
         source = payload.get("source_evidence") or {}
-        arms = source.get("arms")
-        if (source.get("schema") != "paper_decision_evidence.v2"
-                or not isinstance(arms, dict)
-                or source.get("sha256") != _content_hash(arms)):
-            raise ValueError("forward source evidence failed its content hash")
         strategy_id = str(payload.get("strategy_id") or "")
         model = require_validated(strategy_id)
         baseline_id = str(source.get("baseline_id") or "")
         setting_ids = [str(value) for value in source.get("setting_ids") or []]
         if (not baseline_id or len(setting_ids) < 1
-                or len(set(setting_ids)) != len(setting_ids)
-                or set(arms) != {baseline_id, *setting_ids}
-                or not all(isinstance(arm, dict) for arm in arms.values())):
+                or len(set(setting_ids)) != len(setting_ids)):
             raise ValueError("forward source evidence has inconsistent arms")
+        schema = source.get("schema")
+        if schema == "paper_decision_evidence.v2":
+            arms = source.get("arms")
+            if (not isinstance(arms, dict)
+                    or source.get("sha256") != _content_hash(arms)
+                    or set(arms) != {baseline_id, *setting_ids}
+                    or not all(isinstance(arm, dict)
+                               for arm in arms.values())):
+                raise ValueError(
+                    "forward source evidence failed its content hash")
+            cls._validate_forward_axis(
+                conn, strategy_id, payload.get("axis"), baseline_id,
+                setting_ids, arms)
+            common_code_versions = set()
+            for variant_id, arm in arms.items():
+                variant = cls._require_variant(conn, variant_id)
+                if variant["strategy_id"] != strategy_id:
+                    raise ValueError("forward evidence mixes strategies")
+                provenance = cls._validate_experiment_provenance(
+                    variant, arm.get("experiment_provenance") or {})
+                common_code_versions.add(provenance["code_version"])
+                if provenance["forward_model_id"] != model.model_id:
+                    raise ValueError("forward evidence mixes outcome models")
+                if provenance["forward_model_assumptions_hash"] != _content_hash(
+                        model.as_dict()):
+                    raise ValueError("forward model assumptions changed")
+                cls._validate_forward_arm_decisions(
+                    payload, variant_id, provenance, arm.get("decisions"), model)
+            if len(common_code_versions) != 1:
+                raise ValueError("forward evidence mixes code versions")
+            baseline = protocol.paper_trade_decisions(
+                arms[baseline_id]["decisions"])
+            settings = [
+                (variant_id, protocol.paper_trade_decisions(
+                    arms[variant_id]["decisions"]))
+                for variant_id in setting_ids]
+            return protocol.evaluate_axis(
+                settings, baseline, strategy_id=strategy_id,
+                calibrated_confirmation=False)
+
+        if (schema != "paper_decision_evidence.v3"
+                or source.get("sha256")
+                != cls._forward_v3_source_hash(source)):
+            raise ValueError("forward source evidence failed its content hash")
+        settings_source = source.get("settings")
+        eligibility = source.get("eligibility")
+        if (not isinstance(settings_source, dict)
+                or set(settings_source) != set(setting_ids)
+                or not isinstance(eligibility, dict)):
+            raise ValueError("forward source evidence has inconsistent settings")
+        try:
+            completed_through_ts = float(source["completed_through_ts"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "forward source evidence has no assignment cutoff") from exc
+        if not math.isfinite(completed_through_ts):
+            raise ValueError("forward assignment cutoff is not finite")
+
+        baseline_provenance = eligibility.get("baseline_provenance")
+        setting_provenances = eligibility.get("setting_provenances")
+        setting_hashes = eligibility.get("setting_provenance_hashes")
+        if (not isinstance(baseline_provenance, dict)
+                or not isinstance(setting_provenances, dict)
+                or set(setting_provenances) != set(setting_ids)
+                or not isinstance(setting_hashes, dict)
+                or set(setting_hashes) != set(setting_ids)
+                or eligibility.get("baseline_provenance_hash")
+                != _content_hash(baseline_provenance)):
+            raise ValueError("forward eligibility provenance is inconsistent")
+        expected_model_hash = _content_hash(model.as_dict())
+        if (eligibility.get("forward_model_id") != model.model_id
+                or eligibility.get("forward_model_assumptions_hash")
+                != expected_model_hash):
+            raise ValueError("forward model assumptions changed")
+
+        axis_arms = {
+            baseline_id: {"experiment_provenance": baseline_provenance}}
+        settings = []
+        assignment_ids = set()
+        for variant_id in setting_ids:
+            candidate_provenance = setting_provenances.get(variant_id)
+            if (not isinstance(candidate_provenance, dict)
+                    or setting_hashes.get(variant_id)
+                    != _content_hash(candidate_provenance)):
+                raise ValueError(
+                    f"{variant_id}: forward eligibility provenance is invalid")
+            for provenance in (baseline_provenance, candidate_provenance):
+                if (provenance.get("code_version")
+                        != eligibility.get("code_version")
+                        or provenance.get("forward_model_id") != model.model_id
+                        or provenance.get("forward_model_assumptions_hash")
+                        != expected_model_hash):
+                    raise ValueError(
+                        "forward evidence mixes code or outcome-model versions")
+            variant = cls._require_variant(conn, variant_id)
+            cls._validate_experiment_provenance(
+                variant, candidate_provenance)
+            setting_source = settings_source.get(variant_id)
+            if (not isinstance(setting_source, dict)
+                    or setting_source.get("candidate_variant_id") != variant_id
+                    or not isinstance(setting_source.get("assignments"), list)):
+                raise ValueError(
+                    f"{variant_id}: forward assignment evidence is invalid")
+            expected_assignments = cls._eligible_forward_assignment_records(
+                conn, str(payload.get("scope_key") or ""), strategy_id,
+                baseline_id, variant_id, baseline_provenance,
+                candidate_provenance, completed_through_ts)
+            supplied_assignments = setting_source["assignments"]
+            if not expected_assignments:
+                raise ValueError(
+                    f"{variant_id}: no eligible completed assignment evidence")
+            if (_canonical_json(supplied_assignments)
+                    != _canonical_json(expected_assignments)):
+                raise ValueError(
+                    f"{variant_id}: forward evidence does not contain every "
+                    "eligible assignment attempt")
+
+            candidate_decisions = []
+            baseline_decisions = []
+            for assignment in supplied_assignments:
+                assignment_id = str(assignment.get("assignment_id") or "")
+                if not assignment_id or assignment_id in assignment_ids:
+                    raise ValueError(
+                        "forward evidence contains duplicate assignments")
+                assignment_ids.add(assignment_id)
+                if (assignment.get("terminal_status") != "COMPLETED"
+                        or assignment.get("candidate", {}).get("variant_id")
+                        != variant_id
+                        or assignment.get("baseline", {}).get("variant_id")
+                        != baseline_id):
+                    raise ValueError(
+                        "forward evidence contains a mismatched assignment")
+                baseline_arm = assignment["baseline"]
+                candidate_arm = assignment["candidate"]
+                if (baseline_arm.get("experiment_provenance")
+                        != baseline_provenance
+                        or candidate_arm.get("experiment_provenance")
+                        != candidate_provenance):
+                    raise ValueError(
+                        "forward evidence mixes assignment provenance")
+                cls._validate_forward_arm_decisions(
+                    payload, baseline_id, baseline_provenance,
+                    baseline_arm.get("decisions"), model)
+                cls._validate_forward_arm_decisions(
+                    payload, variant_id, candidate_provenance,
+                    candidate_arm.get("decisions"), model)
+                baseline_decisions.extend(baseline_arm["decisions"])
+                candidate_decisions.extend(candidate_arm["decisions"])
+            axis_arms[variant_id] = {
+                "experiment_provenance": candidate_provenance}
+            settings.append((
+                variant_id,
+                protocol.paper_trade_decisions(candidate_decisions),
+                protocol.paper_trade_decisions(baseline_decisions)))
+
+        baseline_variant = cls._require_variant(conn, baseline_id)
+        cls._validate_experiment_provenance(
+            baseline_variant, baseline_provenance)
         cls._validate_forward_axis(
             conn, strategy_id, payload.get("axis"), baseline_id,
-            setting_ids, arms)
-
-        common_code_versions = set()
-        for variant_id, arm in arms.items():
-            variant = cls._require_variant(conn, variant_id)
-            if variant["strategy_id"] != strategy_id:
-                raise ValueError("forward evidence mixes strategies")
-            provenance = cls._validate_experiment_provenance(
-                variant, arm.get("experiment_provenance") or {})
-            common_code_versions.add(provenance["code_version"])
-            if provenance["forward_model_id"] != model.model_id:
-                raise ValueError("forward evidence mixes outcome models")
-            if provenance["forward_model_assumptions_hash"] != _content_hash(
-                    model.as_dict()):
-                raise ValueError("forward model assumptions changed")
-            decisions = arm.get("decisions")
-            if not isinstance(decisions, list):
-                raise ValueError("forward decision corpus is invalid")
-            for decision in decisions:
-                assumptions = decision.get("assumptions") or {}
-                outcome = str(decision.get("decision_outcome") or "")
-                proposed = outcome == "PROPOSED"
-                vetoed = outcome == "VETOED"
-                if (decision.get("scope_key") != payload.get("scope_key")
-                        or decision.get("variant_id") != variant_id
-                        or decision.get("model_id") != model.model_id
-                        or assumptions.get("forward_model") != json.loads(
-                            _canonical_json(model.as_dict()))
-                        or assumptions.get("experiment_provenance")
-                        != provenance
-                        or not (proposed or vetoed)
-                        or (proposed and not decision.get("paper_trade_id"))
-                        or (proposed and (
-                            decision.get("trade_proposal_id")
-                            != decision.get("proposal_id")
-                            or decision.get("trade_scope_key")
-                            != decision.get("scope_key")
-                            or decision.get("trade_variant_id") != variant_id
-                            or decision.get("trade_model_id") != model.model_id
-                            or decision.get("trade_status")
-                            not in {"OPEN", "CLOSED"}))
-                        or (vetoed and (
-                            decision.get("paper_trade_id")
-                            or decision.get("trade_status") is not None))):
-                    raise ValueError(
-                        "forward evidence contains mixed model, assumptions, "
-                        "scope, experiment provenance, or decision linkage")
-        if len(common_code_versions) != 1:
-            raise ValueError("forward evidence mixes code versions")
-
-        baseline = protocol.paper_trade_decisions(
-            arms[baseline_id]["decisions"])
-        settings = [
-            (variant_id,
-             protocol.paper_trade_decisions(arms[variant_id]["decisions"]))
-            for variant_id in setting_ids
-        ]
+            setting_ids, axis_arms)
         return protocol.evaluate_axis(
-            settings, baseline, strategy_id=strategy_id)
+            settings, strategy_id=strategy_id,
+            calibrated_confirmation=True)
 
     def record_forward_analysis(
             self, scope_key: str, strategy_id: str, axis: list[str],
             baseline_id: str, setting_ids: list[str]) -> tuple[str, object]:
-        """Create forward evidence from the complete persisted decision ledger."""
+        """Create assignment-scoped evidence from every eligible completed try."""
         from agent import state as runtime_state
         from agent.forward_models import require_validated
-        from research import protocol
 
         model = require_validated(strategy_id)
         axis = _canonical_axis(axis)
@@ -3689,11 +4006,9 @@ class FindingsStore:
         ordered_ids = [str(baseline_id)] + [str(value) for value in setting_ids]
         if len(set(ordered_ids)) != len(ordered_ids):
             raise ValueError("forward analysis arms must be unique")
-        arms = {}
         statuses = {}
         with _connect(self.path) as conn:
-            enrolled = {}
-            evidence_ends = []
+            provenances = {}
             for variant_id in ordered_ids:
                 variant = self._require_variant(conn, variant_id)
                 if variant["strategy_id"] != strategy_id:
@@ -3714,87 +4029,68 @@ class FindingsStore:
                 if provenance["forward_model_id"] != model.model_id:
                     raise ValueError(
                         f"{variant_id}: evidence outcome model is not current")
-                ledger_started = state.get("decision_ledger_started_ts")
-                if ledger_started is None:
+                if provenance["forward_model_assumptions_hash"] != _content_hash(
+                        model.as_dict()):
                     raise ValueError(
-                        f"{variant_id}: complete paper decision ledger has "
-                        "not started")
+                        f"{variant_id}: forward model assumptions are not current")
                 if state.get("status") == "REVOKED":
                     raise ValueError(
                         f"{variant_id}: revoked portfolio cannot contribute "
                         "forward evidence")
-                qualification = conn.execute(
-                    "SELECT MIN(ts) FROM edge_qualification_events WHERE "
-                    "variant_id=? AND scope_key IN ('*', ?) "
-                    "AND status='QUALIFIED'",
-                    (variant_id, scope_key)).fetchone()[0]
-                for cutoff in (qualification, state.get("paper_started_ts")):
-                    if cutoff is not None:
-                        evidence_ends.append(float(cutoff))
-                enrolled[variant_id] = (state, provenance)
+                provenances[variant_id] = provenance
                 statuses[variant_id] = state.get("status")
 
-            common_ledger_start = max(
-                float(state["decision_ledger_started_ts"])
-                for state, _ in enrolled.values())
-            common_evidence_end = min(evidence_ends) if evidence_ends else None
-            if (common_evidence_end is not None
-                    and common_evidence_end <= common_ledger_start):
-                raise ValueError(
-                    "forward evidence window ends before the common decision "
-                    "ledger starts")
-            for variant_id in ordered_ids:
-                state, provenance = enrolled[variant_id]
-                params = [scope_key, variant_id, common_ledger_start]
-                before_end = ""
-                if common_evidence_end is not None:
-                    before_end = " AND d.decision_ts<?"
-                    params.append(common_evidence_end)
-                failure_params = [scope_key, variant_id, common_ledger_start]
-                failure_end = ""
-                if common_evidence_end is not None:
-                    failure_end = " AND ts<?"
-                    failure_params.append(common_evidence_end)
-                failure = conn.execute(
-                    "SELECT kind, ts FROM paper_failures WHERE scope_key=? "
-                    "AND variant_id=? AND ts>=?" + failure_end
-                    + " ORDER BY ts LIMIT 1", failure_params).fetchone()
-                if failure is not None:
-                    raise ValueError(
-                        f"{variant_id}: operational failure "
-                        f"{failure['kind']} occurred inside the forward "
-                        "evidence window")
-                rows = conn.execute(
-                    "SELECT d.*, t.proposal_id AS trade_proposal_id, "
-                    "t.scope_key AS trade_scope_key, "
-                    "t.variant_id AS trade_variant_id, "
-                    "t.model_id AS trade_model_id, "
-                    "t.entry_ts AS trade_entry_ts, "
-                    "t.exit_ts AS trade_exit_ts, t.result AS trade_result, "
-                    "t.r_multiple AS trade_r_multiple, "
-                    "t.status AS trade_status, "
-                    "t.valid_for_inference AS trade_valid_for_inference "
-                    "FROM paper_decisions d "
-                    "LEFT JOIN paper_trades t ON t.trade_id=d.paper_trade_id "
-                    "WHERE d.scope_key=? AND d.variant_id=? "
-                    "AND d.decision_ts>=?" + before_end
-                    + " ORDER BY d.decision_ts, d.decision_id", params
-                ).fetchall()
-                arms[variant_id] = {
-                    "experiment_provenance": provenance,
-                    "decisions": [
-                        _forward_decision_evidence(row) for row in rows],
-                }
+            axis_arms = {
+                variant_id: {"experiment_provenance": provenance}
+                for variant_id, provenance in provenances.items()}
+            self._validate_forward_axis(
+                conn, strategy_id, axis, str(baseline_id),
+                [str(value) for value in setting_ids], axis_arms)
 
-            source = {
-                "schema": "paper_decision_evidence.v2",
-                "baseline_id": baseline_id,
-                "setting_ids": list(setting_ids),
-                "decision_ledger_from_ts": common_ledger_start,
-                "decision_ledger_to_ts": common_evidence_end,
-                "arms": arms,
-                "sha256": _content_hash(arms),
+            settings_source = {}
+            completed_records = []
+            for variant_id in map(str, setting_ids):
+                assignments = self._eligible_forward_assignment_records(
+                    conn, scope_key, strategy_id, str(baseline_id), variant_id,
+                    provenances[str(baseline_id)], provenances[variant_id])
+                if not assignments:
+                    raise ValueError(
+                        f"{variant_id}: no eligible completed assignment evidence")
+                if any(record["axis"] not in axis for record in assignments):
+                    raise ValueError(
+                        f"{variant_id}: completed assignment does not match the "
+                        "declared axis")
+                settings_source[variant_id] = {
+                    "candidate_variant_id": variant_id,
+                    "assignments": assignments,
+                }
+                completed_records.extend(assignments)
+
+            completed_through_ts = max(
+                float(record["ended_ts"]) for record in completed_records)
+            eligibility = {
+                "code_version": current_code,
+                "forward_model_id": model.model_id,
+                "forward_model_assumptions_hash": _content_hash(model.as_dict()),
+                "baseline_provenance": provenances[str(baseline_id)],
+                "baseline_provenance_hash": _content_hash(
+                    provenances[str(baseline_id)]),
+                "setting_provenances": {
+                    variant_id: provenances[variant_id]
+                    for variant_id in map(str, setting_ids)},
+                "setting_provenance_hashes": {
+                    variant_id: _content_hash(provenances[variant_id])
+                    for variant_id in map(str, setting_ids)},
             }
+            source = {
+                "schema": "paper_decision_evidence.v3",
+                "baseline_id": str(baseline_id),
+                "setting_ids": [str(value) for value in setting_ids],
+                "completed_through_ts": completed_through_ts,
+                "eligibility": eligibility,
+                "settings": settings_source,
+            }
+            source["sha256"] = self._forward_v3_source_hash(source)
             provisional = {
                 "source": "real_time_shadow_portfolios",
                 "source_evidence": source,
@@ -3803,8 +4099,11 @@ class FindingsStore:
                 "axis": list(axis),
             }
             verdict = self._forward_verdict_from_payload(conn, provisional)
-            corpus = [decision for arm in arms.values()
-                      for decision in arm["decisions"]]
+            corpus = [
+                decision
+                for record in completed_records
+                for arm in (record["baseline"], record["candidate"])
+                for decision in arm["decisions"]]
             resolved = [row for row in corpus
                         if row.get("decision_outcome") == "VETOED"
                         or (row.get("trade_status") == "CLOSED"
@@ -3825,9 +4124,7 @@ class FindingsStore:
                 "resolved_outcomes": len(resolved),
                 "code_version": current_code,
                 "forward_model_id": model.model_id,
-                "experiment_provenance": {
-                    variant_id: arm["experiment_provenance"]
-                    for variant_id, arm in arms.items()},
+                "experiment_provenance": provenances,
             }
             subject = (
                 f"{scope_key}:{strategy_id}:{'+'.join(map(str, axis))}")
@@ -3849,6 +4146,8 @@ class FindingsStore:
     def _validated_forward_analysis(
             cls, conn: sqlite3.Connection, variant_id: str,
             source_analysis_id: str | None, scope_key: str) -> dict:
+        from agent import state as runtime_state
+        from agent.forward_models import require_validated
         from research import protocol
 
         if not source_analysis_id:
@@ -3862,6 +4161,39 @@ class FindingsStore:
             raise ValueError(
                 f"unknown forward analysis {source_analysis_id!r}")
         payload = cls._analysis_payload(row)
+        source = payload.get("source_evidence") or {}
+        if source.get("schema") != "paper_decision_evidence.v3":
+            raise ValueError(
+                "edge qualification requires assignment-scoped forward "
+                "evidence v3")
+        eligibility = source.get("eligibility") or {}
+        model = require_validated(str(variant["strategy_id"]))
+        if (eligibility.get("code_version")
+                != runtime_state.code_fingerprint()
+                or eligibility.get("forward_model_id") != model.model_id
+                or eligibility.get("forward_model_assumptions_hash")
+                != _content_hash(model.as_dict())):
+            raise ValueError(
+                "forward analysis is not current-code/current-model evidence")
+        current_provenances = {
+            str(source.get("baseline_id") or ""):
+                eligibility.get("baseline_provenance"),
+            **dict(eligibility.get("setting_provenances") or {}),
+        }
+        for current_variant_id, expected_provenance in current_provenances.items():
+            portfolio = conn.execute(
+                "SELECT state_json FROM paper_portfolios WHERE scope_key=? "
+                "AND variant_id=?", (scope_key, current_variant_id)).fetchone()
+            if portfolio is None:
+                raise ValueError(
+                    "forward analysis portfolio provenance is unavailable")
+            state = json.loads(portfolio["state_json"])
+            current_variant = cls._require_variant(conn, current_variant_id)
+            observed = cls._validate_experiment_provenance(
+                current_variant, state.get("experiment_provenance") or {})
+            if observed != expected_provenance or state.get("status") == "REVOKED":
+                raise ValueError(
+                    "forward analysis is not current-config portfolio evidence")
         recomputed = cls._forward_verdict_from_payload(conn, payload)
         stored_claim = {
             "verdict": payload.get("verdict"),
@@ -3894,6 +4226,7 @@ class FindingsStore:
             "confirmation_dependence_aware",
             "fit_interval_positive", "drawdown_no_worse",
             "out_of_sample_survives", "confirmation_interval_positive",
+            "confirmation_randomization_valid",
         }
 
         def evidence_pair_ok(pair: dict, minimum: int) -> bool:
@@ -3942,6 +4275,8 @@ class FindingsStore:
             "confirmation interval": float(
                 (evidence.get("confirmation_interval") or {}).get("low") or 0)
             > 0,
+            "calibrated confirmation test": protocol.calibrated_p_value(
+                evidence.get("confirmation_test")) is not None,
             "criteria": required_criteria.issubset(criteria)
             and all(criteria.get(name) is True for name in required_criteria),
         }
@@ -4120,7 +4455,7 @@ class FindingsStore:
         if expected.verdict != protocol.PROMOTE or not family.get("significant"):
             raise ValueError(
                 "selected forward axis did not survive the family correction")
-        return family_payload
+        return json.loads(_canonical_json(family))
 
     def qualify_variant(
             self, variant_id: str, detail: dict, *,
@@ -4133,10 +4468,11 @@ class FindingsStore:
             require_validated(str(variant["strategy_id"]))
             source_payload = self._validated_forward_analysis(
                 conn, variant_id, source_analysis_id, scope_key)
-            self._validated_family_correction(
+            family = self._validated_family_correction(
                 conn, variant_id, str(source_analysis_id or ""), scope_key,
                 detail, source_payload)
             detail = dict(detail)
+            detail["family"] = family
             detail.setdefault("variant_id", variant_id)
             detail.setdefault("hypothesis_id", variant["hypothesis_id"])
             detail.setdefault(
@@ -4250,6 +4586,26 @@ class FindingsStore:
             supplied_analysis = payload.get("forward_analysis") or {}
             if supplied_analysis.get("analysis_id") != analysis_id:
                 return False
+            source_evidence = source_payload.get("source_evidence") or {}
+            selected_setting = (
+                (source_evidence.get("settings") or {}).get(variant_id) or {})
+            assignment_ids = {
+                str(item.get("assignment_id") or "")
+                for item in selected_setting.get("assignments") or []
+                if isinstance(item, dict) and item.get("assignment_id")}
+            if not assignment_ids:
+                return False
+            placeholders = ",".join("?" for _ in assignment_ids)
+            edge_rows = conn.execute(
+                "SELECT * FROM research_edge_evidence WHERE scope_key=? "
+                "AND variant_id=? AND assignment_id IN (" + placeholders + ") "
+                "ORDER BY created_ts, edge_id",
+                (scope_key, variant_id, *sorted(assignment_ids))).fetchall()
+            expected_edges = [cls._edge_candidate_dict(row) for row in edge_rows]
+            if (not expected_edges
+                    or _canonical_json(payload.get("edge_candidates") or [])
+                    != _canonical_json(expected_edges)):
+                return False
 
             portfolio = conn.execute(
                 "SELECT state_json FROM paper_portfolios "
@@ -4290,18 +4646,12 @@ class FindingsStore:
     def create_t3_packet(
             self, variant_id: str, payload: dict, *, reviewed_by: str = "",
             registry_change_ref: str = "") -> str:
-        required = {
-            "current_g2_pass", "held_out_confirmation", "corpus_provenance",
-            "config_provenance", "code_provenance", "forward_sample",
-            "axis_family_corrected", "paper_sample", "paper_positive",
-            "manual_registry_review",
-        }
         with _connect(self.path) as conn:
             self._require_variant(conn, variant_id)
             checklist = payload.get("checklist") or {}
             complete = (
-                required.issubset(checklist)
-                and all(bool(checklist[key]) for key in required)
+                T3_REQUIRED_CHECKS.issubset(checklist)
+                and all(bool(checklist[key]) for key in T3_REQUIRED_CHECKS)
                 and self._t3_evidence_is_backed_by_store(
                     conn, variant_id, payload))
             status = (
@@ -4326,6 +4676,13 @@ class FindingsStore:
                  canonical, payload_hash))
         self.backup()
         return packet_id
+
+    def t3_evidence_is_backed(self, variant_id: str, payload: dict) -> bool:
+        """Return whether a review payload recomputes from persisted evidence."""
+        with _connect(self.path) as conn:
+            self._require_variant(conn, variant_id)
+            return self._t3_evidence_is_backed_by_store(
+                conn, variant_id, payload)
 
     def t3_packets_for(self, variant_id: str) -> list:
         with _connect(self.path) as conn:
@@ -5559,34 +5916,53 @@ class FindingsStore:
         return self._outcome_dict(row) if row is not None else None
 
     def edge_evidence(self, scope_key: str | None = None) -> list[dict]:
-        where = " WHERE scope_key=?" if scope_key is not None else ""
-        params = (str(scope_key),) if scope_key is not None else ()
+        candidates = self.edge_candidates_for(scope_key=scope_key)
         with _connect(self.path) as conn:
-            rows = conn.execute(
-                "SELECT * FROM research_edge_evidence" + where
-                + " ORDER BY created_ts, edge_id", params).fetchall()
             out = []
-            for row in rows:
-                item = dict(row)
-                raw = item.pop("evidence_json")
-                evidence = json.loads(raw)
-                if (_canonical_json(evidence) != raw
-                        or _content_hash(evidence) != item["evidence_hash"]):
-                    raise ValueError(
-                        f"research edge evidence {item['edge_id']} failed its hash")
+            for item in candidates:
                 qualification = self._latest_qualification(
                     conn, str(item["variant_id"]), str(item["scope_key"]))
                 item["protocol_satisfied"] = bool(
                     qualification is not None
                     and qualification["status"] == "QUALIFIED")
+                item["qualification_status"] = (
+                    str(qualification["status"])
+                    if qualification is not None else None)
                 item["current_status"] = (
-                    "EDGE_CANDIDATE" if item["protocol_satisfied"]
-                    else "REVOKED" if qualification is not None
-                    and qualification["status"] == "REVOKED"
-                    else "LEGACY_UNQUALIFIED")
-                item["evidence"] = evidence
+                    "REVOKED" if item["qualification_status"] == "REVOKED"
+                    else "EDGE_CANDIDATE")
                 out.append(item)
         return out
+
+    @staticmethod
+    def _edge_candidate_dict(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        raw = item.pop("evidence_json")
+        evidence = json.loads(raw)
+        if (_canonical_json(evidence) != raw
+                or _content_hash(evidence) != item["evidence_hash"]):
+            raise ValueError(
+                f"research edge evidence {item['edge_id']} failed its hash")
+        item["evidence"] = evidence
+        return item
+
+    def edge_candidates_for(
+            self, variant_id: str | None = None,
+            scope_key: str | None = None) -> list[dict]:
+        clauses = []
+        params = []
+        if variant_id is not None:
+            clauses.append("variant_id=?")
+            params.append(str(variant_id))
+        if scope_key is not None:
+            clauses.append("scope_key=?")
+            params.append(str(scope_key))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_edge_evidence" + where
+                + " ORDER BY created_ts, edge_id", tuple(params)).fetchall()
+        return [self._edge_candidate_dict(row) for row in rows]
 
     @staticmethod
     def _review_dict(row: sqlite3.Row) -> dict:
@@ -5724,9 +6100,7 @@ class FindingsStore:
         outcomes = self.experiment_outcomes(scope_key)[-max(1, int(limit)):]
         assignments = self.experiment_assignments(scope_key)
         selections = self.research_selections(scope_key)
-        edges = [
-            item for item in self.edge_evidence(scope_key)
-            if item["protocol_satisfied"]][-max(1, int(limit)):]
+        edges = self.edge_evidence(scope_key)[-max(1, int(limit)):]
         return {
             "schema": "research_history_context.v1",
             "completed_outcomes": [{
@@ -5750,6 +6124,9 @@ class FindingsStore:
                 "variant_id": item["variant_id"],
                 "authority": item["evidence"]["authority"],
                 "data_window": item["evidence"]["data_window"],
+                "protocol_satisfied": item["protocol_satisfied"],
+                "qualification_status": item["qualification_status"],
+                "current_status": item["current_status"],
             } for item in edges],
             "active_assignments": [{
                 "assignment_id": item["assignment_id"],

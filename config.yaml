@@ -188,7 +188,7 @@ execution:
   max_order_book_slippage_pct: 0.35  # IOC cap vs mid; reserved in risk sizing
   max_market_data_age_seconds: 10    # reject stale exchange order books
   paper_maker_fill_penetration_bps: 1 # require later trade-through, never touch=fill
-  paper_maker_order_ttl_seconds: 60   # unresolved passive probes are cancelled
+  paper_maker_order_ttl_seconds: 120  # permits one fully observed later 1m candle before cancellation
   fill_timeout_seconds: 12       # wait for market orders to reach a terminal fill state
   # A depth rejection is fed back to the LLM instead of becoming an immediate
   # hard ban. It may make one explicit smaller-size retry on a later cycle.

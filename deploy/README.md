@@ -26,9 +26,9 @@ VPN, not a public firewall rule.
 The market downloader refuses non-empty snapshot directories. The tournament
 then requires an `okx-history-snapshot.v1` manifest and verifies exact file
 membership, hashes, row counts, and timestamp ranges before scoring. The
-verified research backup retains manifests but not every raw snapshot CSV, so
-copy any irreplaceable timestamped snapshot to separately retained storage
-before deleting its VM or runtime volume.
+verified research backup retains every regular file in complete,
+manifest-bearing immutable snapshot trees and checks each file's size and
+SHA-256. In-progress or non-manifested snapshot directories are excluded.
 
 For local use, `.env` is the default read-only Compose secret. Set host variable
 `OKX_AGENT_SECRET_FILE` to use another dotenv-format secret file. Inside the

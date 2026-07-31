@@ -73,8 +73,8 @@ is treated as durably backed up.
 2. `research-loop`, which creates missing deterministic outcomes and reviews
    at most one pending result;
 3. corpus statistics and G2 replay when the journal exists;
-4. funnel, cadence, sweeps, three-arm analysis, forward qualification, and
-   scorecard regeneration;
+4. funnel, cadence, sweeps, three-arm analysis, forward qualification,
+   fail-closed draft review-artifact preparation, and scorecard regeneration;
 5. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
@@ -96,6 +96,10 @@ Exact exit behavior:
 The research service is separate from `okx-trader.service`/the `trader`
 container. Its failure is visible in systemd or the Compose health/dashboard
 state and does not authorize trading or disappear into trader logs.
+While the nightly child is running, the scheduler atomically refreshes
+`runtime/health/research.json` every 30 seconds. The 180-second health window
+therefore remains green for a legitimate long run and turns stale only when
+the scheduler can no longer supervise and refresh the child.
 
 Run manually:
 
@@ -107,7 +111,10 @@ Run manually:
 
 All seven strategies receive the same cycle snapshot and timestamp. Each has
 an isolated paper account and durable assignment state. The configured two
-workers bound computation; they do not reduce the strategy set.
+workers bound computation; they do not reduce the strategy set. The lanes are
+logically isolated but intentionally evaluated in a bounded sequence with
+serialized durable writes. Seven simultaneous SQLite writers are not required
+for correctness.
 
 The active simulator identity is `forward_feed_version: 2`; all registered
 forward-model IDs end in `.v2`. Evidence recorded under feed/model v1 remains
@@ -129,6 +136,14 @@ Adequacy is evaluated before performance. An assignment can meet the rotation
 clock/count and still be `INCONCLUSIVE` because trades are unresolved, paired
 coverage is insufficient, two time segments cannot be formed, provenance is
 mixed, or a model/operational check failed.
+
+A `WORKED` outcome saves an immutable `RESEARCH_ONLY` `EDGE_CANDIDATE` lead
+with `promotion_allowed: false`; it does not satisfy the current v3
+forward-qualification protocol by itself. Qualification still requires the
+eligible completed assignment attempts, their contemporaneous baselines,
+held-out confirmation, and family correction. The paired cluster sign-flip
+test is conditional on cluster-delta sign exchangeability under a symmetric
+null, as documented in `research/protocol.md`.
 
 Run the deterministic closure without an LLM call:
 
@@ -314,17 +329,17 @@ The supported verified backup includes:
 - `research/cache/findings.db` through SQLite's online backup API;
 - the active `runtime/demo/journal.db` through the same API;
 - files under `runtime/research/recorded`;
+- every regular file in each completed immutable tree under
+  `runtime/research/snapshots` (manifest present and no in-progress marker);
 - research manifest JSON files and `forward_evidence.json`; and
 - all files under `research/results`.
 
-It includes snapshot manifests but not the complete CSV trees beneath
-`runtime/research/snapshots/`. Those immutable raw snapshots remain on the
-runtime volume/VM and are read there by the tournament. Much of the history can
-be downloaded again, but exact short-retention inputs and universe membership
-may not be reproducible. If exact snapshot preservation is required before VM
-deletion, copy the required timestamped directories to separately retained
-storage or extend and verify the backup implementation before calling the
-procedure zero-data-loss.
+Snapshot CSVs and their manifests retain the same path beneath
+`files/runtime/research/snapshots/` in the backup. `verify-backup` size- and
+SHA-256-checks each one, so a missing or changed raw input invalidates the
+backup. A directory still carrying `.download-in-progress`, or lacking a final
+manifest, is an incomplete download rather than immutable evidence and is not
+included.
 
 ## 7. Other research commands
 
@@ -337,15 +352,20 @@ procedure zero-data-loss.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify --scope <scope>
+./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet \
   --variant <qualified-variant-id> --scope <scope> \
   --reviewed-by <reviewer> --registry-change-ref <change-reference>
 ./.venv/bin/python research.py report
 ```
 
-`forward-qualify` and T3 packets remain evidence tooling. They do not edit
-`agent/registry.py`, change `config.yaml`, switch the demo strategy, or deploy
-an edge to live trading.
+`prepare-review-artifacts` considers only variants with current v3
+qualification. It fails closed unless persisted edge evidence and every
+non-manual T3 checklist item validate, and it creates only an idempotent,
+immutable/content-addressed `DRAFT_REVIEW_REQUIRED` artifact. It cannot mark
+manual review complete, edit `agent/registry.py` or `config.yaml`, switch the
+demo strategy, or deploy an edge to live trading. The reviewed `t3-packet`
+record and any registry/configuration change remain explicit operator actions.
 
 ## 8. Interpreting results
 
@@ -354,7 +374,7 @@ an edge to live trading.
   `RESEARCH_ONLY` edge evidence.
 - `FAILED`: adequate evidence or a persisted gate showed failure.
 - `INCONCLUSIVE`: evidence cannot support success or failure.
-- `QUALIFIED`: older forward-axis research event, not an order instruction.
+- `QUALIFIED`: current v3 forward-axis research event, not an order instruction.
 - `REVOKED`: that evidence/account window is invalid and must not be reused.
 
 Both positive and negative findings remain in the store. Never infer an edge
@@ -363,18 +383,18 @@ from a point estimate, a tournament rank, or an LLM explanation.
 ## 9. Recovery and handoff
 
 Copy data; do not relocate the authoritative VM files. Preserve the active
-journal, findings DB, recorder data, manifests/forward evidence, all tournament
-run directories, and the backup manifest/checksum. The verified backup command
-captures these supported sources; committed `findings/` scorecards remain in
-Git.
+journal, findings DB, recorder data, immutable raw snapshots,
+manifests/forward evidence, all tournament run directories, and the backup
+manifest/checksum. The verified backup command captures these supported
+sources; committed `findings/` scorecards remain in Git.
 
 Before deleting or rebuilding the VM:
 
 1. require a recent `external_mounted` backup and rerun `verify-backup`;
 2. confirm the managed disk mount, separate `st_dev`, free space, and Azure
    **Detach** deletion behavior;
-3. preserve required `runtime/research/snapshots/<UTC timestamp>` directories
-   separately when exact raw-input retention is required; and
+3. inspect the backup manifest for required
+   `files/runtime/research/snapshots/<UTC timestamp>` inputs; and
 4. preferably verify an Azure snapshot or attach a retained copy to a recovery
    VM and read its manifests there.
 

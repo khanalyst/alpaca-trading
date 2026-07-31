@@ -630,7 +630,8 @@ class ShadowEvaluator:
                         and record.reason != "proposal already evaluated"):
                     pending_decisions.append(self._paper_decision(
                         variant_id, cycle_id, decision, record, timestamp))
-            self._refresh_metrics(state, snapshot, timestamp)
+            self._refresh_metrics(
+                state, snapshot, timestamp, self._configs[variant_id])
             self._apply_circuit_breakers(
                 state, self._configs[variant_id], timestamp)
             return (state, version, variant_records, pending_opens,
@@ -644,13 +645,64 @@ class ShadowEvaluator:
                 if isinstance(row, dict) else {})
 
     @classmethod
+    def _observation_age(
+            cls, row: dict, timestamp_key: str, now: float, cfg: dict,
+            label: str) -> tuple[float | None, str | None]:
+        enrichment = cls._execution_enrichment(row)
+        raw = enrichment.get(timestamp_key)
+        try:
+            timestamp_ms = int(float(raw))
+        except (TypeError, ValueError):
+            return None, f"{label} has no valid exchange timestamp"
+        now_ms = float(now) * 1000.0
+        if timestamp_ms <= 0:
+            return None, f"{label} exchange timestamp is invalid"
+        if timestamp_ms > now_ms + 5_000:
+            return None, f"{label} exchange timestamp is in the future"
+        age_seconds = max(0.0, (now_ms - timestamp_ms) / 1000.0)
+        max_age = float(cfg["execution"]["max_market_data_age_seconds"])
+        if age_seconds > max_age:
+            return age_seconds, (
+                f"{label} is {age_seconds:.1f}s old at evaluation; limit is "
+                f"{max_age:.1f}s")
+        return age_seconds, None
+
+    @classmethod
+    def _fresh_directional_quote(
+            cls, position: dict, row: dict, now: float,
+            cfg: dict) -> tuple[float, dict] | None:
+        age_seconds, error = cls._observation_age(
+            row, "ticker_ts", now, cfg, "ticker")
+        if error:
+            return None
+        enrichment = cls._execution_enrichment(row)
+        key = ("ticker_best_bid" if position["direction"] == "long"
+               else "ticker_best_ask")
+        try:
+            price = float(enrichment[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(price) or price <= 0:
+            return None
+        return price, {
+            "ticker_ts": enrichment.get("ticker_ts"),
+            "ticker_age_seconds_at_evaluation": age_seconds,
+            "quote_side": key,
+            "spread_in_exit_price": True,
+        }
+
+    @classmethod
     def _depth_entry_fill(
             cls, row: dict, direction: str, notional: float,
-            cfg: dict) -> tuple[dict | None, str | None]:
+            cfg: dict, now: float) -> tuple[dict | None, str | None]:
         """Walk one observed OKX book; require a complete bounded fill."""
         enrichment = cls._execution_enrichment(row)
         if enrichment.get("book_observation_error"):
             return None, str(enrichment["book_observation_error"])
+        book_age, freshness_error = cls._observation_age(
+            row, "book_ts", now, cfg, "order book")
+        if freshness_error:
+            return None, freshness_error
         buying = direction == "long"
         levels = enrichment.get(
             "book_ask_levels" if buying else "book_bid_levels") or []
@@ -703,7 +755,7 @@ class ShadowEvaluator:
             "order_type": "marketable_ioc_full_or_reject",
             "status": "filled",
             "book_ts": enrichment.get("book_ts"),
-            "book_age_seconds": enrichment.get("book_age_seconds"),
+            "book_age_seconds": book_age,
             "requested_contracts": requested,
             "filled_contracts": filled,
             "contract_size": contract_size,
@@ -719,11 +771,15 @@ class ShadowEvaluator:
     @classmethod
     def _maker_entry_order(
             cls, row: dict, direction: str, notional: float,
-            cfg: dict) -> tuple[dict | None, str | None]:
+            cfg: dict, now: float) -> tuple[dict | None, str | None]:
         """Register a passive probe; no same-snapshot fill is possible."""
         enrichment = cls._execution_enrichment(row)
         if enrichment.get("book_observation_error"):
             return None, str(enrichment["book_observation_error"])
+        book_age, freshness_error = cls._observation_age(
+            row, "book_ts", now, cfg, "order book")
+        if freshness_error:
+            return None, freshness_error
         buying = direction == "long"
         try:
             price = float(enrichment[
@@ -746,7 +802,7 @@ class ShadowEvaluator:
             "order_type": "post_only_full_or_unfilled",
             "status": "pending",
             "book_ts": book_ts,
-            "book_age_seconds": enrichment.get("book_age_seconds"),
+            "book_age_seconds": book_age,
             "limit_price": price,
             "requested_contracts": requested,
             "top_size_at_submission": top_size,
@@ -757,7 +813,9 @@ class ShadowEvaluator:
             "ttl_seconds": float(
                 cfg["execution"]["paper_maker_order_ttl_seconds"]),
             "fill_rule": (
-                "a later 1m bar must penetrate beyond the submitted quote; "
+                "a 1m candle must open strictly after submission and the book "
+                "observation, its full one-minute interval must end by order "
+                "expiry, and it must penetrate beyond the submitted quote; "
                 "touching the quote is not a fill"),
             "partial_fill_policy": "full_or_unfilled",
         }, None
@@ -765,10 +823,49 @@ class ShadowEvaluator:
     @classmethod
     def _entry_execution(
             cls, model, row: dict, direction: str, notional: float,
-            cfg: dict) -> tuple[dict | None, str | None]:
+            cfg: dict, now: float) -> tuple[dict | None, str | None]:
         if model.entry_style == "top_book_maker":
-            return cls._maker_entry_order(row, direction, notional, cfg)
-        return cls._depth_entry_fill(row, direction, notional, cfg)
+            return cls._maker_entry_order(row, direction, notional, cfg, now)
+        return cls._depth_entry_fill(row, direction, notional, cfg, now)
+
+    @staticmethod
+    def _rebase_entry_execution(
+            execution: dict, model, row: dict, sized: dict,
+            cfg: dict) -> tuple[dict | None, str | None]:
+        """Attribute the exact observed fill without breaching its risk cap."""
+        try:
+            notional = float(execution["filled_notional"])
+            leverage = float(sized["leverage"])
+            allowed_risk = float(sized["risk_usd"])
+            stop_pct = float(sized["sl_pct"])
+            adverse_funding = float(sized.get("adverse_funding_pct") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            return None, "exact fill risk metadata is unavailable"
+        components = model.cost_components(row, sized, cfg)
+        exact_loss_pct = stop_pct + adverse_funding + sum(
+            float(components.get(key) or 0.0) for key in (
+                "entry_fee_pct", "exit_fee_pct", "spread_pct",
+                "entry_slippage_pct", "stop_slippage_pct"))
+        exact_risk = notional * exact_loss_pct / 100.0
+        if (not all(math.isfinite(value) and value > 0 for value in (
+                notional, leverage, allowed_risk, exact_loss_pct, exact_risk))):
+            return None, "exact fill risk attribution is invalid"
+        tolerance = max(1e-9, allowed_risk * 1e-9)
+        if exact_risk > allowed_risk + tolerance:
+            return None, (
+                f"exact depth-VWAP risk ${exact_risk:.4f} exceeds the "
+                f"allowed ${allowed_risk:.4f} cap")
+        rebased = dict(execution)
+        rebased.update({
+            "filled_notional": notional,
+            "margin_usd": notional / leverage,
+            "risk_usd": exact_risk,
+            "risk_loss_pct": exact_loss_pct,
+            "original_risk_cap_usd": allowed_risk,
+            "sized_notional_usd": float(sized["notional"]),
+            "cost_components": components,
+        })
+        return rebased, None
 
     @classmethod
     def _capture_funding_events(
@@ -778,10 +875,13 @@ class ShadowEvaluator:
             int(event["timestamp_ms"]): event
             for event in position.get("funding_events") or []
             if isinstance(event, dict) and event.get("timestamp_ms") is not None
+            and int(event["timestamp_ms"]) <= int(now * 1000)
         }
         entry_ms = int(float(
             position.get("fill_ts") or position["entry_ts"]) * 1000)
         for event in enrichment.get("realized_funding_events") or []:
+            if event.get("status") != "realized":
+                continue
             try:
                 timestamp_ms = int(event["timestamp_ms"])
                 rate_pct = float(event["rate_pct"])
@@ -803,13 +903,19 @@ class ShadowEvaluator:
             cls, position: dict, row: dict) -> dict | None:
         order = position.get("entry_execution") or {}
         book_ts = int(order.get("book_ts") or 0)
+        submitted_ms = int(float(position.get("entry_ts") or 0) * 1000)
+        expires_ms = int(float(position.get("order_expires_ts") or 0) * 1000)
         quote = float(order["limit_price"])
         penetration = float(order.get("penetration_bps") or 0) / 10_000.0
         bars = cls._execution_enrichment(row).get("execution_bars") or []
+        if expires_ms <= 0:
+            return None
         for bar in sorted(bars, key=lambda item: int(item["timestamp_ms"])):
             ts = int(bar["timestamp_ms"])
-            if ts <= book_ts:
+            if ts <= max(book_ts, submitted_ms):
                 continue
+            if ts + 60_000 > expires_ms:
+                break
             if position["direction"] == "long":
                 filled = float(bar["low"]) < quote * (1 - penetration)
             else:
@@ -820,8 +926,8 @@ class ShadowEvaluator:
 
     @classmethod
     def _execution_exit(
-            cls, position: dict, row: dict, now: float
-            ) -> tuple[str, float, dict, bool] | None:
+            cls, position: dict, row: dict, now: float, cfg: dict
+            ) -> tuple[str, float, dict, bool, float] | None:
         """Resolve from observed 1m paths; stop wins an ambiguous bar."""
         enrichment = cls._execution_enrichment(row)
         bars = sorted(
@@ -833,37 +939,24 @@ class ShadowEvaluator:
                        or position["entry_ts"]) / 60.0) * 60_000))
         last_bar = int(position.get("last_execution_bar_ts_ms") or entry_bar)
         eligible = [bar for bar in bars
-                    if int(bar["timestamp_ms"]) > entry_bar
-                    and int(bar["timestamp_ms"]) >= last_bar]
+                    if int(bar["timestamp_ms"]) > last_bar
+                    and int(bar["timestamp_ms"]) >= entry_bar]
         expected = last_bar + 60_000
-        gap_bar = None
-        previous = last_bar
-        for bar in eligible:
-            timestamp_ms = int(bar["timestamp_ms"])
-            if timestamp_ms > previous + 60_000:
-                expected = previous + 60_000
-                gap_bar = bar
-                break
-            previous = max(previous, timestamp_ms)
-        if gap_bar is not None:
-            mark_key = (
-                "ticker_best_bid" if position["direction"] == "long"
-                else "ticker_best_ask")
-            try:
-                mark = float(enrichment[mark_key])
-            except (KeyError, TypeError, ValueError):
+
+        def invalid_coverage_close(detail: dict):
+            quote = cls._fresh_directional_quote(position, row, now, cfg)
+            if quote is None:
+                position["data_status"] = "awaiting_fresh_market_data"
                 return None
-            if math.isfinite(mark) and mark > 0:
-                return (
-                    "execution_data_gap", mark,
-                    {
-                        "valid_for_inference": False,
-                        "reason": "1m execution coverage gap",
-                        "expected_next_bar_ms": expected,
-                        "first_available_bar_ms": int(
-                            gap_bar["timestamp_ms"]),
-                    }, False,
-                )
+            price, quote_evidence = quote
+            evidence = {
+                "valid_for_inference": False,
+                "reason": "1m execution coverage gap",
+                "exit_ts": now,
+                **detail,
+                **quote_evidence,
+            }
+            return "execution_data_gap", price, evidence, False, now
 
         stop = float(position["stop_price"])
         target = float(position["take_price"])
@@ -872,58 +965,89 @@ class ShadowEvaluator:
         insolvency = (entry * (1 - 1 / leverage)
                       if position["direction"] == "long"
                       else entry * (1 + 1 / leverage))
+        observed_through = last_bar
+        fill_bar_pending = bool(position.get("maker_fill_bar_pending"))
         for bar in eligible:
             ts = int(bar["timestamp_ms"])
+            if ts > expected:
+                return invalid_coverage_close({
+                    "expected_next_bar_ms": expected,
+                    "first_available_bar_ms": ts,
+                    "coverage_kind": "internal_gap",
+                })
+            if ts < expected:
+                continue
             open_ = float(bar["open"])
             high = float(bar["high"])
             low = float(bar["low"])
+            is_fill_bar = fill_bar_pending and ts == entry_bar
+            complete = bool(bar.get(
+                "complete", ts + 60_000 <= int(now * 1000)))
+            # OHLCV identifies the minute, not the intra-bar touch. Persist
+            # the observed bar timestamp rather than the later polling cycle;
+            # this is the conservative chronology available from the feed.
+            exit_ts = ts / 1000.0
             evidence = {
                 "bar": bar,
                 "bar_conflict_policy": "stop_before_target",
                 "gap_policy": "adverse_bar_open_when_beyond_stop",
+                "exit_bar_timestamp_ms": ts,
+                "exit_time_policy": "observed_bar_timestamp",
+                "exit_ts": exit_ts,
             }
+            if is_fill_bar:
+                evidence["maker_fill_bar_policy"] = (
+                    "stop touch is adverse; target-only touch is not credited")
             if position["direction"] == "long":
                 if open_ <= insolvency:
                     position["last_execution_bar_ts_ms"] = ts
-                    return "paper_insolvency", open_, evidence, False
+                    return "paper_insolvency", open_, evidence, False, exit_ts
                 stop_hit, target_hit = low <= stop, high >= target
                 if stop_hit:
                     position["last_execution_bar_ts_ms"] = ts
-                    return "stop", min(stop, open_), evidence, True
-                if target_hit:
+                    return "stop", min(stop, open_), evidence, True, exit_ts
+                if target_hit and not is_fill_bar:
                     position["last_execution_bar_ts_ms"] = ts
-                    return "target", target, evidence, True
+                    return "target", target, evidence, True, exit_ts
             else:
                 if open_ >= insolvency:
                     position["last_execution_bar_ts_ms"] = ts
-                    return "paper_insolvency", open_, evidence, False
+                    return "paper_insolvency", open_, evidence, False, exit_ts
                 stop_hit, target_hit = high >= stop, low <= target
                 if stop_hit:
                     position["last_execution_bar_ts_ms"] = ts
-                    return "stop", max(stop, open_), evidence, True
-                if target_hit:
+                    return "stop", max(stop, open_), evidence, True, exit_ts
+                if target_hit and not is_fill_bar:
                     position["last_execution_bar_ts_ms"] = ts
-                    return "target", target, evidence, True
+                    return "target", target, evidence, True, exit_ts
+            observed_through = ts
+            if not complete:
+                break
             position["last_execution_bar_ts_ms"] = ts
+            expected = ts + 60_000
+            if is_fill_bar:
+                position["maker_fill_bar_pending"] = False
+                fill_bar_pending = False
 
         if now < float(position["deadline_ts"]):
             return None
-        # A timeout is executable only at a fresh directional quote. Missing
-        # data leaves the trade unresolved; a persisted stale mark is evidence,
-        # not a fill.
-        key = ("ticker_best_bid" if position["direction"] == "long"
-               else "ticker_best_ask")
-        try:
-            price = float(enrichment[key])
-        except (KeyError, TypeError, ValueError):
+        observation_bar = math.floor(now / 60.0) * 60_000
+        if observed_through < observation_bar:
+            return invalid_coverage_close({
+                "expected_next_bar_ms": observed_through + 60_000,
+                "coverage_observation_bar_ms": observation_bar,
+                "coverage_kind": "empty_or_trailing_gap",
+            })
+        quote = cls._fresh_directional_quote(position, row, now, cfg)
+        if quote is None:
+            position["data_status"] = "awaiting_fresh_market_data"
             return None
-        if not math.isfinite(price) or price <= 0:
-            return None
+        price, quote_evidence = quote
         return "timeout", price, {
-            "ticker_ts": enrichment.get("ticker_ts"),
-            "quote_side": key,
+            **quote_evidence,
+            "exit_ts": now,
             "timeout_after_complete_execution_path": True,
-        }, True
+        }, True, now
 
     def _advance_account(
             self, variant_id: str, snapshot: dict, now: float,
@@ -954,13 +1078,7 @@ class ShadowEvaluator:
         resolved_records: list[ShadowRecord] = []
         for position in list(state.get("positions") or []):
             row = snapshot.get(position["symbol"])
-            observed = isinstance(row, dict)
-            try:
-                price = float((row or {}).get("price") or 0)
-            except (TypeError, ValueError):
-                price = 0.0
-            if not math.isfinite(price) or price <= 0:
-                observed = False
+            if not isinstance(row, dict):
                 state["unpriced_positions"] = int(
                     state.get("unpriced_positions") or 0) + 1
                 # Never turn an old persisted mark into a fabricated timeout
@@ -969,22 +1087,29 @@ class ShadowEvaluator:
                 kept.append(position)
                 continue
 
-            position["mark_price"] = price
+            result = None
+            exit_ts = now
             if position.get("order_status") == "pending":
                 fill_bar = self._maker_fill_bar(position, row)
                 if fill_bar is not None:
+                    fill_bar_ts = int(fill_bar["timestamp_ms"])
+                    fill_ts = fill_bar_ts / 1000.0
                     position["order_status"] = "filled"
-                    position["fill_ts"] = now
-                    position["entry_bar_ts_ms"] = int(
-                        fill_bar["timestamp_ms"])
-                    position["last_execution_bar_ts_ms"] = int(
-                        fill_bar["timestamp_ms"])
+                    position["fill_ts"] = fill_ts
+                    position["entry_bar_ts_ms"] = fill_bar_ts
+                    # The fill bar is outcome evidence too. Keep it pending
+                    # for one conservative pass instead of skipping directly
+                    # to the following minute.
+                    position["last_execution_bar_ts_ms"] = fill_bar_ts - 60_000
+                    position["maker_fill_bar_pending"] = True
                     position["deadline_ts"] = (
-                        now + float(position["horizon_hours"]) * 3600.0)
+                        fill_ts + float(position["horizon_hours"]) * 3600.0)
                     execution = dict(position.get("entry_execution") or {})
                     execution.update({
                         "status": "filled",
-                        "fill_observed_ts": now,
+                        "fill_ts": fill_ts,
+                        "fill_observed_ts": fill_ts,
+                        "fill_detection_ts": now,
                         "fill_price": float(position["entry_price"]),
                         "fill_evidence_bar": fill_bar,
                     })
@@ -1000,30 +1125,39 @@ class ShadowEvaluator:
                         proposal_id=position.get("proposal_id"),
                         paper_trade_id=position.get("trade_id"),
                         paper_action="fill"))
+                elif now < float(position["order_expires_ts"]):
                     kept.append(position)
                     continue
-                if now < float(position["order_expires_ts"]):
-                    kept.append(position)
-                    continue
-                result = "unfilled"
-                exit_price = float(position["entry_price"])
-                net_pnl = r_multiple = 0.0
-                valid_for_inference = True
-                exit_evidence = {
-                    "entry_execution": position.get("entry_execution"),
-                    "cancelled_at_ts": now,
-                    "reason": "passive quote did not meet the fill rule",
-                }
-            else:
-                self._capture_funding_events(position, row, now)
-                resolved = self._execution_exit(position, row, now)
+                else:
+                    result = "unfilled"
+                    exit_price = float(position["entry_price"])
+                    net_pnl = r_multiple = 0.0
+                    valid_for_inference = True
+                    exit_evidence = {
+                        "entry_execution": position.get("entry_execution"),
+                        "cancelled_at_ts": now,
+                        "exit_ts": now,
+                        "reason": "passive quote did not meet the fill rule",
+                    }
+            if result is None:
+                resolved = self._execution_exit(position, row, now, cfg)
                 if resolved is None:
-                    position["data_status"] = "observed"
+                    self._capture_funding_events(position, row, now)
+                    if position.get("data_status") != "awaiting_fresh_market_data":
+                        position["data_status"] = (
+                            "observed"
+                            if self._fresh_directional_quote(
+                                position, row, now, cfg) is not None
+                            else "awaiting_fresh_market_data")
                     kept.append(position)
                     continue
-                result, exit_price, exit_evidence, valid_for_inference = resolved
+                (result, exit_price, exit_evidence,
+                 valid_for_inference, exit_ts) = resolved
+                self._capture_funding_events(position, row, exit_ts)
                 net_pnl, r_multiple = self._paper_pnl(
-                    position, exit_price, result, now)
+                    position, exit_price, result, exit_ts,
+                    spread_in_exit_price=bool(
+                        exit_evidence.get("spread_in_exit_price")))
 
             if result == "unfilled":
                 state["unfilled_count"] = int(
@@ -1037,7 +1171,7 @@ class ShadowEvaluator:
                     state.get("consecutive_losses") or 0) + 1
                 cooldown = float(cfg["risk"]["cooldown_minutes_after_loss"])
                 state.setdefault("cooldowns", {})[position["symbol"]] = (
-                    now + cooldown * 60)
+                    exit_ts + cooldown * 60)
             else:
                 state["win_count"] = int(state.get("win_count") or 0) + 1
                 state["consecutive_losses"] = 0
@@ -1049,7 +1183,7 @@ class ShadowEvaluator:
                 "exit": exit_evidence,
             }
             closed_trades.append({
-                "trade_id": position["trade_id"], "exit_ts": now,
+                "trade_id": position["trade_id"], "exit_ts": exit_ts,
                 "exit_price": exit_price, "result": result,
                 "net_pnl_usd": net_pnl, "r_multiple": r_multiple,
                 "valid_for_inference": valid_for_inference,
@@ -1069,7 +1203,7 @@ class ShadowEvaluator:
                 paper_action="close"))
         state["positions"] = kept
         self._sync_qualification_stage(variant_id, state, now)
-        self._refresh_metrics(state, snapshot, now)
+        self._refresh_metrics(state, snapshot, now, cfg)
         self._apply_circuit_breakers(state, cfg, now)
         version = self.store.commit_paper_portfolio(
             self.scope_key, variant_id, state, version,
@@ -1104,15 +1238,17 @@ class ShadowEvaluator:
     @staticmethod
     def _paper_pnl(
             position: dict, exit_price: float, result: str,
-            exit_ts: float) -> tuple[float, float]:
+            exit_ts: float, *,
+            spread_in_exit_price: bool = False) -> tuple[float, float]:
         entry = float(position["entry_price"])
         sign = 1.0 if position["direction"] == "long" else -1.0
         gross_pct = sign * (float(exit_price) - entry) / entry * 100.0
         components = position.get("cost_components")
         if isinstance(components, dict):
             cost_pct = sum(float(components.get(key) or 0.0) for key in (
-                "entry_fee_pct", "exit_fee_pct", "spread_pct",
-                "entry_slippage_pct"))
+                "entry_fee_pct", "exit_fee_pct", "entry_slippage_pct"))
+            if not spread_in_exit_price:
+                cost_pct += float(components.get("spread_pct") or 0.0)
             if result in {"stop", "paper_insolvency"}:
                 cost_pct += float(components.get("stop_slippage_pct") or 0.0)
             # Positive realized funding is paid by longs and received by
@@ -1224,8 +1360,26 @@ class ShadowEvaluator:
                 direction, setup_type, veto,
                 plan.get("stop_loss_pct"), plan.get("take_profit_pct"),
                 proposal_id=proposal_id)
+        _, ticker_error = self._observation_age(
+            row, "ticker_ts", now, cfg, "ticker")
+        if ticker_error:
+            return self._record(
+                variant_id, symbol, signal_ts, state, "vetoed",
+                direction, setup_type,
+                f"simulated order rejected: {ticker_error}",
+                plan.get("stop_loss_pct"), plan.get("take_profit_pct"),
+                proposal_id=proposal_id)
         entry_execution, execution_veto = self._entry_execution(
-            model, row, str(direction), float(sized["notional"]), cfg)
+            model, row, str(direction), float(sized["notional"]), cfg, now)
+        if entry_execution is None:
+            return self._record(
+                variant_id, symbol, signal_ts, state, "vetoed",
+                direction, setup_type,
+                f"simulated order rejected: {execution_veto}",
+                plan.get("stop_loss_pct"), plan.get("take_profit_pct"),
+                proposal_id=proposal_id)
+        entry_execution, execution_veto = self._rebase_entry_execution(
+            entry_execution, model, row, sized, cfg)
         if entry_execution is None:
             return self._record(
                 variant_id, symbol, signal_ts, state, "vetoed",
@@ -1235,8 +1389,7 @@ class ShadowEvaluator:
                 proposal_id=proposal_id)
         current_margin = sum(float(position.get("margin_usd") or 0.0)
                              for position in state.get("positions") or [])
-        proposed_margin = float(entry_execution["filled_notional"]) / float(
-            sized["leverage"])
+        proposed_margin = float(entry_execution["margin_usd"])
         margin_limit = (
             float(state.get("equity_usdt") or 0)
             * float(cfg["risk"]["max_margin_usage_pct"]) / 100.0)
@@ -1256,7 +1409,7 @@ class ShadowEvaluator:
             direction, setup_type,
             ("passive order submitted; fill is unresolved"
              if pending_maker else None), sized.get("sl_pct"),
-            sized.get("tp_pct"), sized.get("notional"), proposal_id,
+            sized.get("tp_pct"), entry_execution.get("filled_notional"), proposal_id,
             trade_id, "submit" if pending_maker else "open")
 
     def _open_paper_trade(
@@ -1276,8 +1429,10 @@ class ShadowEvaluator:
         if float(sized["sl_pct"]) >= insolvency_distance_pct:
             raise ValueError(
                 "paper stop is not inside the conservative insolvency proxy")
-        cost_components = model.cost_components(
-            source_row, sized, self._configs[variant_id])
+        cost_components = dict(entry_execution.get("cost_components") or
+                               model.cost_components(
+                                   source_row, sized,
+                                   self._configs[variant_id]))
         entry_bar_ts = math.floor(now / 60.0) * 60_000
         horizon_hours = model.horizon_for(self._configs[variant_id])
         position = {
@@ -1293,9 +1448,9 @@ class ShadowEvaluator:
             "entry_price": entry,
             "mark_price": entry,
             "notional": notional,
-            "risk_usd": float(sized["risk_usd"]),
+            "risk_usd": float(entry_execution["risk_usd"]),
             "leverage": leverage,
-            "margin_usd": notional / leverage,
+            "margin_usd": float(entry_execution["margin_usd"]),
             "stop_price": entry - stop_move if long else entry + stop_move,
             "take_price": entry + take_move if long else entry - take_move,
             "horizon_hours": horizon_hours,
@@ -1444,18 +1599,18 @@ class ShadowEvaluator:
             "revoked_reason": None,
         })
 
-    @staticmethod
-    def _refresh_metrics(state: dict, snapshot: dict, now: float) -> None:
+    @classmethod
+    def _refresh_metrics(
+            cls, state: dict, snapshot: dict, now: float, cfg: dict) -> None:
         unrealized = gross = net = open_risk = reserved_margin = 0.0
+        fresh_mark_seen = False
         for position in state.get("positions") or []:
             row = snapshot.get(position["symbol"])
-            enrichment = ((row or {}).get(brain.ENRICHMENT_KEY) or {})
-            quote_key = ("ticker_best_bid"
-                         if position["direction"] == "long"
-                         else "ticker_best_ask")
-            mark = float(enrichment.get(quote_key)
-                         or (row or {}).get("price")
-                         or position["mark_price"])
+            quote = (cls._fresh_directional_quote(
+                position, row, now, cfg) if isinstance(row, dict) else None)
+            fresh_mark_seen = fresh_mark_seen or quote is not None
+            mark = float(quote[0] if quote is not None else
+                         position.get("mark_price") or position["entry_price"])
             position["mark_price"] = mark
             entry = float(position["entry_price"])
             sign = 1.0 if position["direction"] == "long" else -1.0
@@ -1477,7 +1632,8 @@ class ShadowEvaluator:
         state["margin_usage_pct"] = (
             reserved_margin / float(state["equity_usdt"]) * 100.0
             if float(state["equity_usdt"]) > 0 else 100.0)
-        state["last_mark_ts"] = now
+        if fresh_mark_seen or not state.get("positions"):
+            state["last_mark_ts"] = now
 
     @staticmethod
     def _apply_circuit_breakers(state: dict, cfg: dict, now: float) -> None:

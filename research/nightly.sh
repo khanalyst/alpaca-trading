@@ -102,6 +102,13 @@ if [ -f "$JOURNAL" ]; then
   "$PY" research.py forward-qualify --store "$STORE" \
     || echo "  (collecting, unscoped, or no promotable edge; see above)"
 
+  echo "=== $(date -u +%FT%TZ) preparing operator review artifacts ==="
+  # Only a draft, content-addressed T3 packet is created automatically, and
+  # only after every non-manual evidence check passes. Registry/config review
+  # and any capital-enabling change remain explicit operator actions.
+  "$PY" research.py prepare-review-artifacts --store "$STORE" --db "$JOURNAL" \
+    || echo "WARNING: review artifact preparation deferred" >&2
+
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
   "$PY" research.py report --store "$STORE"
 else

@@ -23,6 +23,7 @@ if str(REPO) not in sys.path:
 
 _running = True
 _child: subprocess.Popen | None = None
+RUNNING_HEARTBEAT_SECONDS = 30.0
 
 
 def _stop(_signum, _frame) -> None:
@@ -85,6 +86,21 @@ def configured_mode(path: Path) -> str:
     return mode
 
 
+def _wait_for_child_with_heartbeats(
+        child: subprocess.Popen, status_path: Path, *,
+        heartbeat_seconds: float = RUNNING_HEARTBEAT_SECONDS,
+        **running_detail) -> int:
+    """Wait without threads and durably refresh RUNNING while the child lives."""
+    interval = float(heartbeat_seconds)
+    if interval <= 0:
+        raise ValueError("heartbeat_seconds must be positive")
+    while True:
+        try:
+            return int(child.wait(timeout=interval))
+        except subprocess.TimeoutExpired:
+            write_status(status_path, "running", **running_detail)
+
+
 def run_scheduler(args) -> int:
     global _child
     from main import load_secrets
@@ -112,15 +128,24 @@ def run_scheduler(args) -> int:
             continue
 
         run_date = now.date().isoformat()
-        write_status(
-            status_path, "running", started_ts=time.time(),
-            last_run_date=last_date, last_exit_code=last_exit)
+        started_ts = time.time()
         _child = subprocess.Popen(
             [str(Path(args.script).resolve())],
             cwd=Path(args.root).resolve(), env=os.environ.copy(),
             start_new_session=True)
-        last_exit = int(_child.wait())
-        _child = None
+        running_detail = {
+            "started_ts": started_ts,
+            "run_date": run_date,
+            "child_pid": _child.pid,
+            "last_run_date": last_date,
+            "last_exit_code": last_exit,
+        }
+        write_status(status_path, "running", **running_detail)
+        try:
+            last_exit = _wait_for_child_with_heartbeats(
+                _child, status_path, **running_detail)
+        finally:
+            _child = None
         last_date = run_date
         write_status(
             status_path, "completed" if last_exit == 0 else "failed",

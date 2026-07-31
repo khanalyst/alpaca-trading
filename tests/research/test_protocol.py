@@ -160,6 +160,45 @@ class PersistedDecisionTests(unittest.TestCase):
         self.assertEqual(comparison["interval"].point, 1.25)
 
 
+class ClusterRandomizationTests(unittest.TestCase):
+    def test_null_or_weak_clustered_deltas_are_not_significant(self):
+        baseline = series([0.0] * 12)
+        weak = series([0.20, -0.19] * 6)
+
+        test = protocol.paired_arm_comparison(
+            weak, baseline)["randomization"]
+
+        self.assertTrue(test["exact"])
+        self.assertEqual(
+            test["null_assumption"],
+            protocol.PAIR_RANDOMIZATION_NULL_ASSUMPTION)
+        self.assertGreater(test["p_value"], 0.05)
+
+    def test_a_strong_paired_clustered_effect_can_survive(self):
+        baseline = series([0.0] * 8)
+        strong_effect = series([1.0] * 8)
+
+        test = protocol.paired_arm_comparison(
+            strong_effect, baseline)["randomization"]
+
+        self.assertEqual(test["method"], "exact_enumeration")
+        self.assertEqual(test["resamples"], 256)
+        self.assertLess(test["p_value"], 0.05)
+
+    def test_monte_carlo_evidence_is_recorded_as_an_estimate(self):
+        baseline = series([0.0] * 20)
+        strong_effect = series([1.0] * 20)
+
+        test = protocol.paired_arm_comparison(
+            strong_effect, baseline)["randomization"]
+
+        self.assertEqual(test["method"], "monte_carlo")
+        self.assertFalse(test["exact"])
+        self.assertEqual(test["seed"], protocol.PAIR_RANDOMIZATION_SEED)
+        self.assertEqual(test["resamples"],
+                         protocol.PAIR_RANDOMIZATION_RESAMPLES)
+
+
 class OutOfSampleTests(unittest.TestCase):
     def test_a_consistent_variant_survives(self):
         result = protocol.out_of_sample(strong())
@@ -264,6 +303,20 @@ class PromotionTests(unittest.TestCase):
         verdict = protocol.evaluate_axis(settings, baseline)
 
         self.assertEqual(verdict.verdict, protocol.PROMOTE)
+
+    def test_serial_settings_use_their_own_baseline_for_fit_selection(self):
+        first_baseline = series([0.0] * 120)
+        first_candidate = series([1.0] * 120)
+        later_baseline = series([2.0] * 120, start=1_000)
+        later_candidate = series([2.2] * 120, start=1_000)
+
+        verdict = protocol.evaluate_axis([
+            ("larger-delta", first_candidate, first_baseline),
+            ("larger-absolute-return", later_candidate, later_baseline),
+        ])
+
+        self.assertEqual(verdict.verdict, protocol.PROMOTE)
+        self.assertEqual(verdict.evidence["best"], "larger-delta")
 
     def test_one_candidate_plus_the_baseline_is_not_an_axis(self):
         verdict = protocol.evaluate_axis([("v0", strong(120))], flat(120))
@@ -463,10 +516,12 @@ class FamilyCorrectionTests(unittest.TestCase):
         self.assertFalse(corrected["a"]["significant_corrected"])
 
     def test_correction_raises_p_as_the_family_grows(self):
-        one = protocol.correct_family(
-            {"a": score.score_returns([1.0, 0.9] * 60, label="a")})
+        scored = score.score_returns([1.0, 0.9] * 60, label="a")
+        scored["p_value"] = 0.01
+        one = protocol.correct_family({"a": scored})
         many = protocol.correct_family({
-            name: score.score_returns([1.0, 0.9] * 60, label=name)
+            name: {**score.score_returns([1.0, 0.9] * 60, label=name),
+                   "p_value": 0.01}
             for name in "abcdefgh"})
 
         self.assertGreaterEqual(many["a"]["p_adjusted"],
@@ -479,15 +534,33 @@ class FamilyCorrectionTests(unittest.TestCase):
 
         self.assertEqual(corrected["a"]["verdict"],
                          stats.INSUFFICIENT_SAMPLE)
+
+    def test_missing_calibrated_p_value_fails_closed(self):
+        scored = score.score_returns([1.0] * 120, label="a")
+
+        corrected = protocol.correct_family({"a": scored})
+
+        self.assertEqual(corrected["a"]["p_uncorrected"], 1.0)
+        self.assertFalse(corrected["a"]["significant_corrected"])
         
-def promoted(axis_id, low, high, n=120):
-    """A PROMOTE verdict carrying one confirmation interval."""
+def promoted(axis_id, low, high, n=120, p_value=0.01):
+    """A PROMOTE verdict carrying one calibrated confirmation test."""
     return protocol.Verdict(
         protocol.PROMOTE, "every promotion criterion holds",
         f"{axis_id} cleared every criterion",
         {"best": f"{axis_id}.best",
          "confirmation_interval": {"point": (low + high) / 2, "low": low,
-                                   "high": high, "n": n}})
+                                   "high": high, "n": n},
+         "confirmation_test": {
+             "kind": protocol.PAIR_RANDOMIZATION_KIND,
+             "null_assumption":
+                 protocol.PAIR_RANDOMIZATION_NULL_ASSUMPTION,
+             "method": "exact_enumeration", "alternative": "greater",
+             "cluster_seconds": protocol.PAIR_CLUSTER_SECONDS,
+             "clusters": 8, "paired_n": n, "observed_mean": 0.5,
+             "resamples": 256, "seed": None, "exact": True,
+             "p_value": p_value,
+         }})
 
 
 class AxisFamilyCorrectionTests(unittest.TestCase):
@@ -501,6 +574,17 @@ class AxisFamilyCorrectionTests(unittest.TestCase):
         self.assertEqual(verdict.verdict, protocol.PROMOTE)
         self.assertTrue(verdict.evidence["family"]["significant"])
         self.assertEqual(verdict.evidence["family"]["family_n"], 1)
+
+    def test_an_unrecognized_null_assumption_fails_closed(self):
+        verdict = promoted("a", 0.40, 0.60)
+        verdict.evidence["confirmation_test"]["null_assumption"] = (
+            "assumption_free")
+
+        corrected = protocol.apply_axis_family_correction({"a": verdict})["a"]
+
+        self.assertEqual(corrected.verdict, protocol.CONTINUE)
+        self.assertFalse(corrected.evidence["family"]["calibrated"])
+        self.assertEqual(corrected.evidence["family"]["p"], 1.0)
 
     def test_a_marginal_axis_stops_promoting_once_the_family_grows(self):
         """The same evidence, judged against how many axes were asked."""
@@ -543,19 +627,21 @@ class AxisFamilyCorrectionTests(unittest.TestCase):
             with self.subTest(axis=axis_id):
                 self.assertIn("family", corrected[axis_id].evidence)
 
-    def test_an_axis_that_never_promoted_is_never_significant(self):
+    def test_statistical_significance_does_not_override_other_failed_gates(self):
         corrected = protocol.apply_axis_family_correction(
             {"a": protocol.Verdict(protocol.CONTINUE, "x", "y", {
-                "confirmation_interval": {"low": 0.4, "high": 0.6, "n": 120}})})
+                "confirmation_test": promoted(
+                    "a", 0.4, 0.6).evidence["confirmation_test"]})})
 
-        self.assertFalse(corrected["a"].evidence["family"]["significant"])
+        self.assertEqual(corrected["a"].verdict, protocol.CONTINUE)
+        self.assertTrue(corrected["a"].evidence["family"]["significant"])
 
-    def test_correction_reads_the_confirmation_not_the_fit_interval(self):
+    def test_correction_reads_the_confirmation_test_not_interval_geometry(self):
         """Criterion 5 is a screen; the held-out window is the test."""
-        verdict = promoted("a", 0.40, 0.60)
+        verdict = promoted("a", 0.40, 0.60, p_value=0.01)
         verdict.evidence["fit_interval"] = {
             "low": 5.0, "high": 6.0, "n": 500}
-        wide_confirmation = promoted("a", -0.10, 0.90)
+        wide_confirmation = promoted("a", 0.40, 0.60, p_value=0.50)
         wide_confirmation.evidence["fit_interval"] = verdict.evidence[
             "fit_interval"]
 

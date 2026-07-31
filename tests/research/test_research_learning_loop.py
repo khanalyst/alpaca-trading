@@ -242,7 +242,7 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
                 migrated.experiment_assignment(
                     assignment["assignment_id"])["status"], "REJECTED")
 
-    def test_positive_assignment_refuses_edge_without_axis_family_evidence(self):
+    def test_positive_assignment_saves_research_only_edge_before_qualification(self):
         assignment, candidate = self._assignment()
         self._seed(assignment, 100, "worked")
 
@@ -250,9 +250,9 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         outcome = self.store.experiment_outcome(assignment["assignment_id"])
 
         self.assertEqual(terminal["status"], "COMPLETED")
-        self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
+        self.assertEqual(outcome["verdict"], "WORKED")
         self.assertIn(
-            "AXIS_FAMILY_EVIDENCE_REQUIRED",
+            "ALL_CONSERVATIVE_GATES_PASSED",
             {item["code"] for item in outcome["payload"]["reasons"]})
         self.assertEqual(outcome["payload"]["candidate"]["closes"], 100)
         self.assertGreater(
@@ -263,16 +263,23 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         self.assertEqual(
             outcome["payload"]["feed_identity"]["forward_feed_version"], 1)
         edges = self.store.edge_evidence(assignment["scope_key"])
-        self.assertEqual(edges, [])
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["current_status"], "EDGE_CANDIDATE")
+        self.assertFalse(edges[0]["protocol_satisfied"])
+        self.assertEqual(edges[0]["evidence"]["authority"], "RESEARCH_ONLY")
+        self.assertFalse(edges[0]["evidence"]["promotion_allowed"])
+        self.assertEqual(
+            edges[0]["evidence"]["variant_identity"]["variant_id"],
+            candidate.variant_id)
         context = self.store.research_history_context(assignment["scope_key"])
-        self.assertEqual(context["edge_candidates"], [])
+        self.assertEqual(len(context["edge_candidates"]), 1)
         self.assertEqual(context["retryable_inconclusive_assignments"], [])
         self.assertIn(candidate.variant_id, context["terminal_variant_ids"])
         self.assertEqual(self.store.variant(candidate.variant_id)["status"],
                          candidate.status)
         finding = self.store.findings_for(candidate.variant_id)[-1]
         self.assertEqual(
-            json.loads(finding["text"])["verdict"], "INCONCLUSIVE")
+            json.loads(finding["text"])["verdict"], "WORKED")
         self.assertIsNotNone(self.store.analysis(outcome["analysis_id"]))
 
     def test_failed_and_inconclusive_results_are_persisted_without_edges(self):
@@ -350,7 +357,7 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
 
         self.assertEqual(summary["created"], [])
         self.assertEqual(len(reopened.experiment_outcomes()), 1)
-        self.assertEqual(len(reopened.edge_evidence()), 0)
+        self.assertEqual(len(reopened.edge_evidence()), 1)
         outcome_findings = [
             row for row in reopened.findings_for(candidate.variant_id)
             if json.loads(row["text"]).get("type") == "experiment_outcome"]

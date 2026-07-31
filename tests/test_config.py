@@ -113,6 +113,22 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "must be an integer"):
             validate_config(cfg)
 
+    def test_missing_paper_maker_ttl_defaults_to_full_candle_window(self):
+        cfg = valid_config()
+        del cfg["execution"]["paper_maker_order_ttl_seconds"]
+
+        self.assertEqual(
+            validate_config(cfg)["execution"]
+            ["paper_maker_order_ttl_seconds"],
+            120.0)
+
+    def test_paper_maker_ttl_cannot_be_below_full_candle_window(self):
+        cfg = valid_config()
+        cfg["execution"]["paper_maker_order_ttl_seconds"] = 119
+
+        with self.assertRaisesRegex(ConfigError, "between 120 and 300"):
+            validate_config(cfg)
+
     def test_history_requirement_cannot_exceed_snapshot_candles(self):
         cfg = valid_config()
         cfg["universe"]["min_history_candles"] = 121
