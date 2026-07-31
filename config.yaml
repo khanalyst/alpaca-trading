@@ -104,7 +104,7 @@ universe:
   refresh_minutes: 60                # how often the volume ranking is rebuilt
 
 cycle:
-  interval_seconds: 300              # housekeeping, breakers, reconciliation
+  interval_seconds: 60               # marks, shadow fills, breakers, reconciliation
   # B9.2. Uncomment to align decisions to the 15m signal bar. Measured over
   # the corpus, 66.5% of cycles observe only bars that were already
   # evaluated, and an LLM call on one of those cannot produce a fresh
@@ -118,7 +118,7 @@ cycle:
   #
   # Left commented so this batch changes nothing until it is turned on
   # deliberately. Verify with: python research.py cadence
-  # decision_interval_seconds: 900
+  decision_interval_seconds: 300     # no extra LLM call on the 60s mark cycles
   timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model.
                                      # NOTE: the model's field reference in
                                      # agent/brain.py describes these defaults
@@ -187,6 +187,8 @@ execution:
   max_spread_pct: 0.15           # reject entries when the live bid/ask is wider
   max_order_book_slippage_pct: 0.35  # IOC cap vs mid; reserved in risk sizing
   max_market_data_age_seconds: 10    # reject stale exchange order books
+  paper_maker_fill_penetration_bps: 1 # require later trade-through, never touch=fill
+  paper_maker_order_ttl_seconds: 60   # unresolved passive probes are cancelled
   fill_timeout_seconds: 12       # wait for market orders to reach a terminal fill state
   # A depth rejection is fed back to the LLM instead of becoming an immediate
   # hard ban. It may make one explicit smaller-size retry on a later cycle.
@@ -255,7 +257,7 @@ research:
   paper_min_closed_trades: 100
   # The executable all-strategy models fork paper evidence from the earlier
   # feed scope without deleting or rewriting its historical rows.
-  forward_feed_version: 1
+  forward_feed_version: 2
   # Rotation requires BOTH 3 elapsed calendar days and 100 comparable paired
   # decisions. Time alone never completes an assignment. The observation
   # default deliberately matches the existing conservative paper sample floor.

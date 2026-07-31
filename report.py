@@ -14,6 +14,8 @@ realized-USDT value are shown as excluded rather than guessed.
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import sqlite3
 import sys
 from collections import defaultdict
@@ -75,6 +77,22 @@ def _number(value, default: float = 0.0) -> float:
         return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _json_safe(value: object) -> object:
+    """Return standards-compliant report data, using null for infinities."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _columns(db: sqlite3.Connection, table: str) -> set[str]:
@@ -540,7 +558,8 @@ def main(path: Path | None = None, as_json: bool = False) -> int:
     db = sqlite3.connect(db_path)
     if as_json:
         try:
-            print(json.dumps(json_report(db), indent=2, default=str))
+            print(json.dumps(_json_safe(json_report(db)), indent=2,
+                             default=str, allow_nan=False))
         finally:
             db.close()
         return 0

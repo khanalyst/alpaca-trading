@@ -28,7 +28,11 @@ The executable sources remain authoritative when prose and code disagree:
 | Bounded LLM selector candidates | 33 eligible single-axis candidates |
 | Active real-time arms | 14 maximum: baseline plus at most one candidate per strategy |
 | Historical tournament coverage | 5 strategies and 16 applicable setting results; 2 remain `NOT SCORED` |
-| Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 14 |
+| Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
+
+The active real-time simulator identity is `forward_feed_version: 2`, and each
+registered forward-model ID ends in `.v2`. Earlier v1 rows remain immutable and
+must not be pooled with current outcomes.
 
 All seven strategies receive the same market snapshot and timestamp. Each has
 independent paper cash, positions, risk state, decisions, and trades. Only

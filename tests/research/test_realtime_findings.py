@@ -12,7 +12,8 @@ from unittest.mock import Mock, patch
 from agent import shadow, variants
 from research import findings, protocol
 from tests.helpers import valid_config
-from tests.research.test_enrichment_isolation import symbol_snapshot
+from tests.research.test_enrichment_isolation import (execution_enriched,
+                                                      symbol_snapshot)
 
 
 _CLI_SPEC = importlib.util.spec_from_file_location(
@@ -44,7 +45,7 @@ def trade(scope, variant_id, proposal_id, entry_ts):
         "direction": "long",
         "setup_type": "trend_continuation",
         "signal_ts": entry_ts * 1000,
-        "model_id": "momentum.fixed_rr.15m.v1",
+        "model_id": "momentum.fixed_rr.15m.v2",
         "assumptions": {"horizon_hours": 48},
         "entry_ts": entry_ts,
         "entry_price": 100.0,
@@ -77,7 +78,7 @@ def promotion_analysis_payload(scope, variant_id):
         "resolved_outcomes": 200,
         "strategy_config_version": "cfg",
         "code_version": "code",
-        "forward_model_id": "momentum.fixed_rr.15m.v1",
+        "forward_model_id": "momentum.fixed_rr.15m.v2",
         "evidence": {
             "best": variant_id,
             "n": 120,
@@ -363,7 +364,7 @@ class SchedulerAndPortfolioTests(StoreFixture):
         evaluator = shadow.ShadowEvaluator(
             [self.a], valid_config(), store=self.store, scope_key=scope)
         evaluator.evaluate(
-            {"BTC/USDT:USDT": symbol_snapshot()},
+            {"BTC/USDT:USDT": execution_enriched(symbol_snapshot())},
             now=1_760_000_000.0,
             proposals=[{
                 "symbol": "BTC/USDT:USDT", "action": "open",
@@ -387,7 +388,7 @@ class SchedulerAndPortfolioTests(StoreFixture):
         evaluator = shadow.ShadowEvaluator(
             [self.a], valid_config(), store=self.store, scope_key=scope)
         evaluator.evaluate(
-            {"BTC/USDT:USDT": symbol_snapshot()},
+            {"BTC/USDT:USDT": execution_enriched(symbol_snapshot())},
             now=1_760_000_000.0,
             proposals=[{
                 "symbol": "BTC/USDT:USDT", "action": "open",
@@ -622,7 +623,7 @@ class QualificationAndPacketTests(StoreFixture):
                     "direction": "long",
                     "setup_type": "trend_continuation",
                     "signal_ts": index,
-                    "model_id": "momentum.fixed_rr.15m.v1",
+                    "model_id": "momentum.fixed_rr.15m.v2",
                     "assumptions_json": assumptions,
                     "entry_ts": decision_ts,
                     "entry_price": 100.0,
@@ -732,7 +733,7 @@ class QualificationAndPacketTests(StoreFixture):
                     "decision_outcome": "PROPOSED" if proposed else "VETOED",
                     "reason": None if proposed else "confidence below floor",
                     "paper_trade_id": trade_id,
-                    "model_id": "momentum.fixed_rr.15m.v1",
+                    "model_id": "momentum.fixed_rr.15m.v2",
                     "assumptions_json": assumptions,
                     "proposal_json": '{"confidence":0.55}',
                     "decision_ts": decision_ts,
@@ -983,7 +984,7 @@ class QualificationAndPacketTests(StoreFixture):
                 "direction": "long",
                 "setup_type": "trend_continuation",
                 "signal_ts": index,
-                "model_id": "momentum.fixed_rr.15m.v1",
+                "model_id": "momentum.fixed_rr.15m.v2",
                 "assumptions_json": "{}",
                 "entry_ts": 11 + index,
                 "entry_price": 100.0,

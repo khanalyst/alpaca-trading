@@ -16,6 +16,7 @@
 import argparse
 import logging
 import os
+import signal
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -47,6 +48,7 @@ def setup_logging() -> None:
 
 
 ENV_FILE = ROOT / ".env"
+SECRETS_FILE_ENV = "OKX_AGENT_SECRETS_FILE"
 SECRET_VARS = ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE",
                "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALERT_WEBHOOK_URL")
 # Credentials that were already in the process environment before .env was
@@ -54,30 +56,77 @@ SECRET_VARS = ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE",
 SHELL_SOURCED: list[str] = []
 
 
-def load_secrets(mode: str = "demo") -> None:
-    """Load every credential from .env, and only from .env.
+def secrets_file() -> Path:
+    """Resolve the one credential file without exposing its contents."""
+    configured = os.getenv(SECRETS_FILE_ENV)
+    return Path(configured).expanduser() if configured else ENV_FILE
 
-    .env is the single source of truth by design: override=True so a stale
-    `export OKX_API_KEY=...` left in a shell profile cannot silently shadow
-    the file and point a live run at the wrong account. Nothing in this repo
-    reads a credential from anywhere else, and .env is gitignored.
+
+def load_secrets(mode: str = "demo") -> None:
+    """Load every credential from one explicit file.
+
+    ``.env`` remains the local default. Containers may set
+    ``OKX_AGENT_SECRETS_FILE`` to a read-only Docker secret containing the
+    same dotenv syntax. ``override=True`` and the explicit environment clear
+    ensure a stale shell export cannot silently point a run at another account.
     """
-    if not ENV_FILE.exists():
+    source = secrets_file()
+    if not source.is_file():
         raise FileNotFoundError(
-            f"No .env file at {ENV_FILE}. Copy .env.example to .env and fill "
-            "it in; credentials are read from that file only."
+            f"No credential file at {source}. Copy .env.example to .env or "
+            f"set {SECRETS_FILE_ENV} to a Docker/configured secret file."
         )
-    file_mode = ENV_FILE.stat().st_mode
+    file_mode = source.stat().st_mode
     if file_mode & 0o077:
-        message = (f"{ENV_FILE} is readable by other users on this host. "
-                   f"Run: chmod 600 {ENV_FILE}")
-        if mode == "live":
+        # Docker Compose implementations commonly expose a container secret
+        # as root-owned 0444 even when the compose target requests 0400. It is
+        # still isolated to this non-root, single-purpose container and mounted
+        # read-only. Ordinary host files retain the stricter check.
+        docker_secret = source.is_absolute() and source.parent == Path("/run/secrets")
+        message = (f"{source} is readable by other users on this host. "
+                   f"Run: chmod 600 {source}")
+        if mode == "live" and not docker_secret:
             raise PermissionError(message)
-        print(f"WARNING: {message}", file=sys.stderr)
+        if not docker_secret:
+            print(f"WARNING: {message}", file=sys.stderr)
     SHELL_SOURCED[:] = [v for v in SECRET_VARS if os.getenv(v)]
     for variable in SECRET_VARS:
         os.environ.pop(variable, None)
-    load_dotenv(ENV_FILE, override=True)
+    load_dotenv(source, override=True)
+
+
+class _ShutdownSignals:
+    """Translate container termination into the engine's safe pause path."""
+
+    def __init__(self) -> None:
+        self.reason: str | None = None
+        self.engine = None
+        self.previous: dict[int, object] = {}
+
+    def install(self) -> None:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            self.previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle)
+
+    def attach(self, engine) -> None:
+        self.engine = engine
+        if self.reason:
+            engine.request_shutdown(self.reason)
+
+    def _handle(self, signum, _frame) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        self.reason = name
+        logging.getLogger("main").warning(
+            "%s received; requesting a safe pause", name)
+        if self.engine is not None:
+            self.engine.request_shutdown(name)
+
+    def restore(self) -> None:
+        for signum, handler in self.previous.items():
+            signal.signal(signum, handler)
 
 
 def load_cfg(path: str) -> dict:
@@ -151,9 +200,15 @@ def cmd_run(args, cfg) -> int:
             st["flatten_on_kill"] = True
             st["operator_pause"] = False
             state.save_state(st)
-        from agent.engine import Engine
-        engine = Engine(cfg)
-        engine.run(run_lock)
+        shutdown = _ShutdownSignals()
+        shutdown.install()
+        try:
+            from agent.engine import Engine
+            engine = Engine(cfg)
+            shutdown.attach(engine)
+            engine.run(run_lock)
+        finally:
+            shutdown.restore()
         return 0
     finally:
         state.release_run_lock(run_lock)
@@ -279,7 +334,7 @@ def cmd_check(args, cfg) -> int:
     ok = True
     print(f"Mode: {cfg['mode']}")
     print(f"LLM:  {cfg['llm']['provider']} / {cfg['llm']['model']}")
-    print(f"Secrets: {ENV_FILE}")
+    print(f"Secrets: {secrets_file()}")
     if SHELL_SOURCED:
         print(f"  NOTE {', '.join(SHELL_SOURCED)} also set in the shell "
               "environment; .env takes precedence. Unset the shell copies so "

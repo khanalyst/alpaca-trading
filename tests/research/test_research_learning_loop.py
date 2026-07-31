@@ -236,13 +236,13 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
             self.assertEqual(migrated.schema_version(), findings.SCHEMA_VERSION)
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-                "verified_external_mount_classification")
+                "paper_execution_evidence_and_validity")
             self.assertEqual(outcome["verdict"], "FAILED")
             self.assertEqual(
                 migrated.experiment_assignment(
                     assignment["assignment_id"])["status"], "REJECTED")
 
-    def test_worked_outcome_records_positive_finding_and_research_edge(self):
+    def test_positive_assignment_refuses_edge_without_axis_family_evidence(self):
         assignment, candidate = self._assignment()
         self._seed(assignment, 100, "worked")
 
@@ -250,7 +250,10 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         outcome = self.store.experiment_outcome(assignment["assignment_id"])
 
         self.assertEqual(terminal["status"], "COMPLETED")
-        self.assertEqual(outcome["verdict"], "WORKED")
+        self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
+        self.assertIn(
+            "AXIS_FAMILY_EVIDENCE_REQUIRED",
+            {item["code"] for item in outcome["payload"]["reasons"]})
         self.assertEqual(outcome["payload"]["candidate"]["closes"], 100)
         self.assertGreater(
             outcome["payload"]["candidate"]["costs"]["fees_usdt"], 0)
@@ -260,16 +263,16 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         self.assertEqual(
             outcome["payload"]["feed_identity"]["forward_feed_version"], 1)
         edges = self.store.edge_evidence(assignment["scope_key"])
-        self.assertEqual(len(edges), 1)
-        self.assertEqual(edges[0]["evidence"]["authority"], "RESEARCH_ONLY")
-        self.assertFalse(edges[0]["evidence"]["promotion_allowed"])
+        self.assertEqual(edges, [])
         context = self.store.research_history_context(assignment["scope_key"])
-        self.assertEqual(context["edge_candidates"][0]["variant_id"],
-                         candidate.variant_id)
+        self.assertEqual(context["edge_candidates"], [])
+        self.assertEqual(context["retryable_inconclusive_assignments"], [])
+        self.assertIn(candidate.variant_id, context["terminal_variant_ids"])
         self.assertEqual(self.store.variant(candidate.variant_id)["status"],
                          candidate.status)
         finding = self.store.findings_for(candidate.variant_id)[-1]
-        self.assertEqual(json.loads(finding["text"])["verdict"], "WORKED")
+        self.assertEqual(
+            json.loads(finding["text"])["verdict"], "INCONCLUSIVE")
         self.assertIsNotNone(self.store.analysis(outcome["analysis_id"]))
 
     def test_failed_and_inconclusive_results_are_persisted_without_edges(self):
@@ -347,7 +350,7 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
 
         self.assertEqual(summary["created"], [])
         self.assertEqual(len(reopened.experiment_outcomes()), 1)
-        self.assertEqual(len(reopened.edge_evidence()), 1)
+        self.assertEqual(len(reopened.edge_evidence()), 0)
         outcome_findings = [
             row for row in reopened.findings_for(candidate.variant_id)
             if json.loads(row["text"]).get("type") == "experiment_outcome"]
@@ -479,8 +482,11 @@ class ResearchReviewTests(ResearchLearningFixture):
         self.assertEqual(
             context["completed_outcomes"][0]["outcome_id"],
             outcome["outcome_id"])
-        self.assertIn(outcome["candidate_variant_id"],
-                      context["terminal_variant_ids"])
+        self.assertNotIn(outcome["candidate_variant_id"],
+                         context["terminal_variant_ids"])
+        self.assertEqual(
+            context["retryable_inconclusive_assignments"][0]
+            ["assignment_id"], outcome["assignment_id"])
         self.assertEqual(len(context["pending_selections"]), 1)
         self.assertEqual(cfg["strategy"]["id"], "momentum")
 

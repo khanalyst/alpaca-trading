@@ -51,7 +51,7 @@ class ForwardOutcomeModel:
     charge_spread: bool = True
     entry_slippage_pct: float | None = None
     stop_slippage_pct: float | None = None
-    funding_treatment: str = "entry_rate_actual_schedule"
+    funding_treatment: str = "observed_realized_settlements"
     validated: bool = False
     validation_evidence: tuple[str, ...] = ()
 
@@ -120,6 +120,8 @@ class ForwardOutcomeModel:
                 continue
             row = snapshot[symbol]
             missing = self.missing_fields(row)
+            observation_error = str(_field(
+                row, "_enrichment.book_observation_error") or "").strip()
             signal_ts = _finite(_field(row, self.signal_timestamp_field))
             for setup_type in spec.setup_types:
                 for direction in ("long", "short"):
@@ -137,18 +139,25 @@ class ForwardOutcomeModel:
                         "model_id": self.model_id,
                         "signal_ts": signal_ts,
                     }
-                    if missing:
+                    if observation_error:
+                        proposal["research_refusal_reason"] = (
+                            "market data invalid: " + observation_error)
+                    elif missing:
                         proposal["research_refusal_reason"] = (
                             "data missing: " + ", ".join(missing))
                     out.append(proposal)
         return out
 
     def entry_price(self, row: dict, direction: str) -> float | None:
+        if _field(row, "_enrichment.book_observation_error"):
+            return None
         if self.entry_style == "observed_taker":
-            value = _finite(row.get("price"))
+            # A marketable long consumes asks and a marketable short consumes
+            # bids. Last trade/mark is not an executable entry price.
+            key = "book_best_ask" if direction == "long" else "book_best_bid"
         else:
             key = "book_best_bid" if direction == "long" else "book_best_ask"
-            value = _finite(_field(row, f"_enrichment.{key}"))
+        value = _finite(_field(row, f"_enrichment.{key}"))
         return value if value is not None and value > 0 else None
 
     def risk_row(self, row: dict, direction: str) -> dict:
@@ -157,6 +166,13 @@ class ForwardOutcomeModel:
         entry = self.entry_price(row, direction)
         if entry is not None:
             out["price"] = entry
+        observed_spread = _finite(_field(
+            row, "_enrichment.book_spread_pct"))
+        if observed_spread is not None:
+            # Entry is already priced at its observed touch. Reserve only the
+            # opposite-side crossing on exit instead of charging the full
+            # spread a second time.
+            out["spread_pct"] = max(0.0, observed_spread) / 2.0
         if self.entry_style == "top_book_maker":
             # A passive entry joins the book, so it does not cross the spread
             # or consume the IOC slippage budget.  The exit remains taker.
@@ -164,7 +180,6 @@ class ForwardOutcomeModel:
             if exit_fee is not None:
                 out["taker_fee_pct_per_side"] = (
                     float(self.maker_entry_fee_pct) + exit_fee) / 2.0
-            out["spread_pct"] = 0.0
         return out
 
     def cost_components(self, row: dict, sized: dict, cfg: dict) -> dict:
@@ -173,16 +188,17 @@ class ForwardOutcomeModel:
             exit_fee = float(cfg["trading_costs"]["taker_fee_pct_per_side"])
         if self.entry_style == "top_book_maker":
             entry_fee = float(self.maker_entry_fee_pct)
-            spread = 0.0
             entry_slippage = 0.0
         else:
             entry_fee = exit_fee
-            spread = (max(0.0, _finite(row.get("spread_pct")) or 0.0)
-                      if self.charge_spread else 0.0)
-            entry_slippage = (
-                float(self.entry_slippage_pct)
-                if self.entry_slippage_pct is not None
-                else float(cfg["execution"]["max_order_book_slippage_pct"]))
+            # The simulator walks observed depth and persists its VWAP. Do not
+            # add a second hypothetical entry-slippage charge to that fill.
+            entry_slippage = 0.0
+        spread = (
+            max(0.0, _finite(_field(
+                row, "_enrichment.book_spread_pct")) or 0.0) / 2.0
+            if self.charge_spread or self.entry_style == "top_book_maker"
+            else 0.0)
         stop_slippage = (
             float(self.stop_slippage_pct)
             if self.stop_slippage_pct is not None
@@ -193,10 +209,11 @@ class ForwardOutcomeModel:
             "spread_pct": spread,
             "entry_slippage_pct": entry_slippage,
             "stop_slippage_pct": stop_slippage,
-            "funding_rate_pct": _finite(row.get("funding_rate_pct")),
-            "funding_interval_hours": _finite(
+            "sizing_funding_rate_pct": _finite(row.get("funding_rate_pct")),
+            "sizing_funding_interval_hours": _finite(
                 row.get("funding_interval_hours")),
-            "next_funding_minutes": _finite(row.get("next_funding_minutes")),
+            "sizing_next_funding_minutes": _finite(
+                row.get("next_funding_minutes")),
             "funding_treatment": self.funding_treatment,
             "sizing_estimated_cost_pct": float(
                 sized.get("estimated_cost_pct") or 0.0),
@@ -207,20 +224,24 @@ _COMMON_COST_FIELDS = (
     "price", "spread_pct", "funding_rate_pct", "funding_interval_hours",
     "next_funding_minutes", "taker_fee_pct_per_side", "atr_1h_pct",
     "ema20_1h_dist_pct",
+    "_enrichment.book_ts", "_enrichment.book_best_bid",
+    "_enrichment.book_best_ask", "_enrichment.book_spread_pct",
+    "_enrichment.book_bid_levels", "_enrichment.book_ask_levels",
+    "_enrichment.book_contract_size",
 )
 
 
 MODELS: dict[str, ForwardOutcomeModel] = {
     model.model_id: model for model in (
         ForwardOutcomeModel(
-            model_id="momentum.fixed_rr.15m.v1",
+            model_id="momentum.fixed_rr.15m.v2",
             strategy_id="momentum", signal_timeframe="15m",
             horizon_hours=48.0,
             entry_assumption="first observed snapshot price after decision",
             stop_assumption="structure stop with a one-ATR minimum",
             target_assumption="registered fixed reward/risk target",
-            cost_assumption="observed taker fees and spread, bounded entry and "
-                            "stop slippage, entry-rate funding settlements",
+            cost_assumption="observed depth-VWAP taker entry, fee and exit "
+                            "spread/stop slippage, realized funding events",
             holding_assumption="stop/target first, otherwise 48h timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_ts", "swing_low_pct", "swing_high_pct"),
@@ -234,14 +255,14 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             ),
         ),
         ForwardOutcomeModel(
-            model_id="flush_fade.reversion.15m.v1",
+            model_id="flush_fade.reversion.15m.v2",
             strategy_id="flush-fade", signal_timeframe="15m",
             horizon_hours=24.0,
             entry_assumption="first observed post-signal snapshot price",
             stop_assumption="structure distance with a 1.5 ATR minimum",
             target_assumption="fixed 2R reversion target",
-            cost_assumption="observed taker fees and spread, bounded entry and "
-                            "stop slippage, entry-rate funding settlements",
+            cost_assumption="observed depth-VWAP taker entry, fee and exit "
+                            "spread/stop slippage, realized funding events",
             holding_assumption="stop/target first, otherwise 24h timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_ts", "oi_change_4h_pct", "relative_volume_1h",
@@ -255,14 +276,14 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             ),
         ),
         ForwardOutcomeModel(
-            model_id="funding_carry.interval.1h.v1",
+            model_id="funding_carry.interval.1h.v2",
             strategy_id="funding-carry", signal_timeframe="1h",
             horizon_hours=240.0,
             entry_assumption="first observed snapshot after the 1h signal",
             stop_assumption="structure distance with a 3 ATR minimum",
             target_assumption="fixed 2R price exit while funding is credited",
-            cost_assumption="perpetual only: observed taker costs and actual "
-                            "entry-rate funding schedule; no invented borrow",
+            cost_assumption="perpetual only: observed depth/fees and realized "
+                            "funding settlements; no invented borrow",
             holding_assumption="stop/target first, otherwise ten-day timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_1h_ts", "funding_percentile_30",
@@ -277,14 +298,14 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             ),
         ),
         ForwardOutcomeModel(
-            model_id="funding_unwind.reversion.1h.v1",
+            model_id="funding_unwind.reversion.1h.v2",
             strategy_id="funding-unwind", signal_timeframe="1h",
             horizon_hours=240.0,
             entry_assumption="first observed snapshot after the 1h crowding signal",
             stop_assumption="structure distance with a 3 ATR minimum",
             target_assumption="fixed 2R positioning-unwind target",
-            cost_assumption="observed taker costs plus actual entry-rate "
-                            "funding settlements, including credits",
+            cost_assumption="observed depth/fees plus realized funding "
+                            "settlements, including credits",
             holding_assumption="stop/target first, otherwise ten-day timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_1h_ts", "funding_percentile_30",
@@ -299,14 +320,14 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             ),
         ),
         ForwardOutcomeModel(
-            model_id="trend_multiday.4h.v1",
+            model_id="trend_multiday.4h.v2",
             strategy_id="trend-multiday", signal_timeframe="4h",
             horizon_hours=336.0,
             entry_assumption="first observed snapshot after the completed 4h bar",
             stop_assumption="structure distance with a 2 ATR minimum",
             target_assumption="fixed 3R continuation target",
-            cost_assumption="observed taker costs and all entry-rate funding "
-                            "settlements over the multi-day hold",
+            cost_assumption="observed depth/fees and every realized funding "
+                            "event available over the multi-day hold",
             holding_assumption="stop/target first, otherwise 14-day timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_4h_ts", "trend_1h", "trend_4h", "mom_1h_pct",
@@ -321,14 +342,13 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             ),
         ),
         ForwardOutcomeModel(
-            model_id="ls_ratio_fade.1h.v1",
+            model_id="ls_ratio_fade.1h.v2",
             strategy_id="ls-ratio-fade", signal_timeframe="1h",
             horizon_hours=48.0,
             entry_assumption="first observed snapshot after the 1h ratio signal",
             stop_assumption="structure distance with a 2 ATR minimum",
             target_assumption="fixed 2R positioning-reversion target",
-            cost_assumption="observed taker costs plus actual entry-rate "
-                            "funding settlements",
+            cost_assumption="observed depth/fees plus realized funding events",
             holding_assumption="stop/target first, otherwise 48h timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_1h_ts", "long_short_ratio",
@@ -343,15 +363,15 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             ),
         ),
         ForwardOutcomeModel(
-            model_id="scalp_maker.book.1m.v1",
+            model_id="scalp_maker.book.1m.v2",
             strategy_id="scalp-maker", signal_timeframe="1m",
             horizon_hours=4.0,
-            entry_assumption="join best bid for long or best ask for short",
+            entry_assumption="join the observed touch; fill only after a later "
+                             "one-minute bar penetrates the quote",
             stop_assumption="ATR stop with a 0.5 ATR minimum",
             target_assumption="fixed 1R inventory exit",
-            cost_assumption="0.02% configured maker entry fee from the maker "
-                            "study, observed taker exit fee, no crossed spread "
-                            "or entry slippage, stop slippage and funding",
+            cost_assumption="configured maker entry fee, observed taker exit "
+                            "fee/half-spread, stop slippage and realized funding",
             holding_assumption="stop/target first, otherwise four-hour timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "_enrichment.book_ts", "_enrichment.book_best_bid",

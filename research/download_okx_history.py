@@ -13,13 +13,15 @@ applies the contract multiplier) so that relative-volume indicators match the
 live agent. `quote_volume` is OKX ``volCcyQuote`` and lets a backtest rebuild
 the historical 24h turnover ranking the live universe filter uses.
 
-Only public endpoints are used; no API key is required. Downloads are
-resumable: a symbol whose CSV already covers the requested window is skipped.
+Only public endpoints are used; no API key is required. Each invocation writes
+one fresh immutable snapshot and refuses a non-empty output directory, so old
+and new membership can never be mixed accidentally.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import threading
@@ -37,6 +39,8 @@ BAR_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 # window asked for. Used to decide whether a cached file is complete for the
 # span that can actually be served.
 OI_RETENTION_MS = 60 * 86_400_000
+MANIFEST_SCHEMA = "okx-history-snapshot.v1"
+DOWNLOAD_LOCK = ".download-in-progress"
 
 # OKX publishes per-endpoint IP rate limits. Stay comfortably inside them so a
 # long download never trips a ban: history-candles is 20 requests / 2s.
@@ -46,6 +50,81 @@ OTHER_SLEEP = 0.0
 _RATE_LOCK = threading.Lock()
 _RATE_STATE = {"next": 0.0}
 _MIN_INTERVAL = 1.0 / 9.0   # 9 req/s, inside OKX's 20 req / 2s IP budget
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def require_clean_output(root: Path) -> None:
+    """Refuse to mix a new download with an existing corpus.
+
+    A completed manifest is an immutable description of one snapshot. Reusing
+    that directory would make its membership depend on whatever files a prior
+    run happened to leave behind. Callers must choose a fresh directory; an
+    existing empty directory is safe.
+    """
+    if root.exists() and not root.is_dir():
+        raise RuntimeError(f"output path is not a directory: {root}")
+    if root.is_dir():
+        existing = sorted(path.name for path in root.iterdir())
+        if existing:
+            preview = ", ".join(existing[:5])
+            if len(existing) > 5:
+                preview += ", ..."
+            raise RuntimeError(
+                f"refusing dirty output directory {root}: {preview}; "
+                "choose a new directory so the prior snapshot stays immutable")
+
+
+def claim_output(root: Path) -> Path:
+    """Claim a clean snapshot directory against concurrent downloaders."""
+    require_clean_output(root)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / DOWNLOAD_LOCK
+    try:
+        with lock.open("x", encoding="utf-8") as handle:
+            handle.write("download in progress\n")
+    except FileExistsError as exc:
+        raise RuntimeError(f"snapshot download already owns {root}") from exc
+    return lock
+
+
+def snapshot_file_manifest(root: Path) -> list[dict]:
+    """Return exact identities and observed ranges for every snapshot CSV."""
+    entries = []
+    manifest_path = root / "manifest.json"
+    actual_files = sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and path != manifest_path)
+    unsupported = [
+        path.relative_to(root).as_posix() for path in actual_files
+        if path.suffix != ".csv" or path.is_symlink()]
+    if unsupported:
+        raise RuntimeError(
+            "snapshot contains unsupported or linked files: "
+            + ", ".join(unsupported))
+    for path in actual_files:
+        frame = pd.read_csv(path)
+        if "timestamp_ms" not in frame.columns:
+            raise RuntimeError(f"snapshot CSV has no timestamp_ms: {path}")
+        timestamps = pd.to_numeric(frame["timestamp_ms"], errors="coerce")
+        if timestamps.isna().any():
+            raise RuntimeError(f"snapshot CSV has invalid timestamps: {path}")
+        entries.append({
+            "path": path.relative_to(root).as_posix(),
+            "sha256": _sha256_file(path),
+            "rows": int(len(frame)),
+            "first_timestamp_ms": (
+                int(timestamps.min()) if not frame.empty else None),
+            "last_timestamp_ms": (
+                int(timestamps.max()) if not frame.empty else None),
+        })
+    return entries
 
 
 def rate_limit() -> None:
@@ -358,6 +437,12 @@ def main() -> int:
     parser.add_argument("--no-oi", action="store_true")
     args = parser.parse_args()
 
+    try:
+        download_lock = claim_output(args.out)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     end_ms = int(time.time() * 1000) // BAR_MS["15m"] * BAR_MS["15m"]
     start_ms = end_ms - args.days * 86_400_000
 
@@ -401,7 +486,11 @@ def main() -> int:
             print(f"  {row['inst_id']}: {row['error'][:120]}", flush=True)
 
     usable = [r for r in results if r.get("swap_bars", 0) > 5000]
+    # Removing the exclusive in-progress marker is the final transition from
+    # a partial directory to a manifestable immutable snapshot.
+    download_lock.unlink()
     manifest = {
+        "schema": MANIFEST_SCHEMA,
         "source": "OKX public v5 REST (market/history-candles, "
                   "public/funding-rate-history, "
                   "rubik/stat/contracts/open-interest-history)",
@@ -411,6 +500,7 @@ def main() -> int:
         "bar": "15m",
         "symbols": sorted(r["symbol"] for r in usable),
         "all_results": results,
+        "files": snapshot_file_manifest(args.out),
         "note": (
             "Symbol discovery used the CURRENT live instrument list, so "
             "instruments delisted before the download date are absent. "
@@ -419,7 +509,7 @@ def main() -> int:
         ),
     }
     (args.out / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n")
     print(json.dumps(
         {"symbols_usable": len(usable), "out": str(args.out)}, indent=2))
     return 0

@@ -245,6 +245,11 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                 "cycle.decision_interval_seconds cannot be below "
                 "cycle.interval_seconds: the decision cadence is a multiple "
                 "of the housekeeping cadence, never a fraction of it")
+        if (int(cycle["decision_interval_seconds"])
+                % int(cycle["interval_seconds"]) != 0):
+            raise ConfigError(
+                "cycle.decision_interval_seconds must be an exact multiple "
+                "of cycle.interval_seconds")
     _integer(cycle, "candles", 60, 1000, "cycle")
     timeframes = cycle.get("timeframes")
     if not isinstance(timeframes, list) or not all(
@@ -378,6 +383,8 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                       "slippage_guard_pct", "max_spread_pct",
                       "max_order_book_slippage_pct",
                       "max_market_data_age_seconds", "fill_timeout_seconds",
+                      "paper_maker_fill_penetration_bps",
+                      "paper_maker_order_ttl_seconds",
                       "liquidity_feedback_ttl_minutes",
                       "liquidity_retries_before_backoff",
                       "liquidity_backoff_minutes",
@@ -403,6 +410,14 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
     _number(execution, "max_spread_pct", 0.001, 2, "execution")
     _number(execution, "max_order_book_slippage_pct", 0.001, 5, "execution")
     _number(execution, "max_market_data_age_seconds", 1, 60, "execution")
+    if execution.get("paper_maker_fill_penetration_bps") is None:
+        execution["paper_maker_fill_penetration_bps"] = 1.0
+    if execution.get("paper_maker_order_ttl_seconds") is None:
+        execution["paper_maker_order_ttl_seconds"] = 60.0
+    _number(execution, "paper_maker_fill_penetration_bps", 0.01, 100,
+            "execution")
+    _number(execution, "paper_maker_order_ttl_seconds", 10, 300,
+            "execution")
     _number(execution, "fill_timeout_seconds", 1, 60, "execution")
     _number(execution, "liquidity_feedback_ttl_minutes", 5, 1440,
             "execution")

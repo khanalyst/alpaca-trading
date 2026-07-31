@@ -1,0 +1,32 @@
+name: test-and-container
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: Install the locked runtime
+        run: python -m pip install --disable-pip-version-check -r requirements.lock.txt
+      - name: Compile and run the complete test suite
+        run: |
+          python -m compileall -q agent research deploy main.py report.py research.py
+          python -m unittest discover -v
+      - name: Validate and build the Compose deployment
+        run: |
+          cp .env.example .env
+          chmod 600 .env
+          docker compose config --quiet
+          docker build --build-arg PYTHON_IMAGE=python:3.13.5-slim-bookworm -t okx-agent-crypto:ci .

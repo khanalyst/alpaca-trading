@@ -52,8 +52,12 @@ def market_row(**overrides):
             "book_spread_pct": 0.02,
             "book_bid_depth_usd": 80_000.0,
             "book_ask_depth_usd": 20_000.0,
-            "book_top_bid_size": 12.0,
-            "book_top_ask_size": 4.0,
+            "book_top_bid_size": 100.0,
+            "book_top_ask_size": 50.0,
+            "book_bid_levels": [[99.99, 100.0], [99.98, 100.0]],
+            "book_ask_levels": [[100.01, 100.0], [100.02, 100.0]],
+            "book_contract_size": 1.0,
+            "book_age_seconds": 0.1,
             "book_observation_error": None,
         },
     }
@@ -146,7 +150,7 @@ class ContractExecutionTests(unittest.TestCase):
                 self.assertFalse(evidence[setup]["long"])
                 self.assertFalse(evidence[setup]["short"])
 
-    def test_favourable_funding_is_credited_on_the_observed_schedule(self):
+    def test_only_realized_funding_events_are_credited(self):
         position = {
             "entry_price": 100.0, "direction": "short", "notional": 1000.0,
             "risk_usd": 10.0, "entry_ts": 0.0,
@@ -156,12 +160,18 @@ class ContractExecutionTests(unittest.TestCase):
                 "stop_slippage_pct": 0.0, "funding_rate_pct": 0.02,
                 "funding_interval_hours": 8.0, "next_funding_minutes": 60.0,
             },
+            "funding_events": [
+                {"timestamp_ms": 3_600_000, "rate_pct": 0.02,
+                 "status": "realized"},
+                {"timestamp_ms": 9 * 3_600_000, "rate_pct": 0.02,
+                 "status": "realized"},
+            ],
         }
 
         pnl, _ = shadow.ShadowEvaluator._paper_pnl(
             position, 100.0, "timeout", 9 * 3600.0)
 
-        # Settlements occur at +1h and +9h, both at or before the exit.
+        # Both events came from funding-rate-history, not a repeated forecast.
         self.assertAlmostEqual(pnl, 0.4, 8)
 
 

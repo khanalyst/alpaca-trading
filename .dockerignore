@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.venv
+venv
+runtime
+research/cache
+__pycache__
+*.py[cod]
+.DS_Store
+vm-import
+work

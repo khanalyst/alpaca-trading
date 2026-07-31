@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from collections import defaultdict
@@ -50,8 +51,9 @@ def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
 
     New journals use event names whose schema is explicit. Legacy
     ``shadow_decision`` rows are accepted only when they have strategy
-    attribution and no variant attribution; this deliberately excludes the
-    parameter-variant rows that historically shared the same event name.
+    attribution and either no variant attribution or the legacy ``live``
+    sentinel. This deliberately excludes the parameter-variant rows that
+    historically shared the same event name.
     """
     if not db_path.exists():
         raise SystemExit(
@@ -83,7 +85,9 @@ def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
         selected = events[events["kind"].isin(kinds)]
         for row in selected.itertuples(index=False):
             if decisions and row.kind == "shadow_decision":
-                if (not pd.isna(row.variant_id)
+                variant_id = ("" if pd.isna(row.variant_id)
+                              else str(row.variant_id).strip())
+                if (variant_id not in {"", "live"}
                         or pd.isna(row.strategy_id)):
                     continue
             try:
@@ -126,22 +130,55 @@ def derive_levels(row, min_stop_atr: float, buffer_atr: float,
     return round(stop, 6), round(stop * reward_risk, 6)
 
 
-def resolve(decisions: pd.DataFrame, frames: dict, costs, max_hold_bars: int,
+def _registered_horizon_bars(strategy_id: str) -> int:
+    """Return the immutable forward model's horizon on the 15-minute grid."""
+    hours = float(spec_for(strategy_id).forward_model.horizon_hours)
+    return int(math.ceil(hours * 3_600_000 / BAR_MS))
+
+
+def _registered_horizons(strategy_ids) -> dict[str, int]:
+    """Describe known, scoreable strategies without trusting journal IDs."""
+    horizons = {}
+    for strategy_id in sorted({str(item) for item in strategy_ids
+                               if not pd.isna(item)}):
+        try:
+            if spec_for(strategy_id).forward_model_ready:
+                horizons[strategy_id] = _registered_horizon_bars(strategy_id)
+        except Exception:  # stale or foreign journal strategy IDs are ignored
+            continue
+    return horizons
+
+
+def resolve(decisions: pd.DataFrame, frames: dict, costs,
+            max_hold_bars: int | None,
             min_stop_atr: float, buffer_atr: float,
             reward_risk: float) -> pd.DataFrame:
-    """Resolve each shadow decision against the bars that followed it."""
+    """Resolve only decisions with their complete registered outcome window.
+
+    ``max_hold_bars`` is retained as a unit-test hook for small synthetic
+    frames. Production callers pass ``None`` so every strategy uses the
+    horizon bound to its registered forward outcome model.
+    """
     resolved = []
     unresolved = defaultdict(int)
     for (strategy_id, symbol, direction), group in decisions.groupby(
             ["strategy_id", "symbol", "direction"]):
         try:
-            scoring_ready = spec_for(str(strategy_id)).forward_model_ready
+            spec = spec_for(str(strategy_id))
+            scoring_ready = spec.forward_model_ready
+            strategy_hold_bars = (
+                int(max_hold_bars) if max_hold_bars is not None
+                else _registered_horizon_bars(str(strategy_id)))
         except Exception:                                  # noqa: BLE001
             scoring_ready = False
+            strategy_hold_bars = 0
         if not scoring_ready:
             unresolved[
                 f"{strategy_id}: no validated forward outcome model"] += len(
                     group)
+            continue
+        if strategy_hold_bars <= 0:
+            unresolved[f"{strategy_id}: invalid outcome horizon"] += len(group)
             continue
         frame = frames.get(symbol)
         if frame is None:
@@ -161,6 +198,12 @@ def resolve(decisions: pd.DataFrame, frames: dict, costs, max_hold_bars: int,
             if position < 0 or position >= len(frame.ts) - 2:
                 unresolved[f"{symbol}: signal outside downloaded bars"] += 1
                 continue
+            entry_position = position + 1
+            if entry_position + strategy_hold_bars > len(frame.ts):
+                unresolved[
+                    f"{strategy_id}/{symbol}: incomplete "
+                    f"{strategy_hold_bars}-bar outcome window"] += 1
+                continue
             stop, take = derive_levels(row, min_stop_atr, buffer_atr,
                                        reward_risk)
             if not np.isfinite(stop) or stop <= 0:
@@ -173,7 +216,7 @@ def resolve(decisions: pd.DataFrame, frames: dict, costs, max_hold_bars: int,
             continue
         chunk = simulate(frame, np.array(idx), direction,
                          np.array(stops), np.array(takes), costs,
-                         max_hold_bars)
+                         strategy_hold_bars)
         if chunk.empty:
             continue
         chunk["strategy_id"] = strategy_id
@@ -249,7 +292,6 @@ def main() -> int:
                         default=REPO / "runtime" / "research"
                         / "forward_evidence.json")
     parser.add_argument("--cost", default="base")
-    parser.add_argument("--max-hold-bars", type=int, default=192)
     parser.add_argument("--min-stop-atr", type=float, default=1.0)
     parser.add_argument("--structure-buffer-atr", type=float, default=0.15)
     parser.add_argument("--reward-risk", type=float, default=3.0)
@@ -267,7 +309,7 @@ def main() -> int:
     resolved = pd.DataFrame()
     if not decisions.empty and frames:
         resolved = resolve(decisions, frames, COST_SCENARIOS[args.cost],
-                           args.max_hold_bars, args.min_stop_atr,
+                           None, args.min_stop_atr,
                            args.structure_buffer_atr, args.reward_risk)
     elif not frames:
         print(f"No bar data in {args.data}; shadow outcomes cannot be "
@@ -281,11 +323,12 @@ def main() -> int:
             "min_stop_atr": args.min_stop_atr,
             "structure_buffer_atr": args.structure_buffer_atr,
             "reward_risk": args.reward_risk,
-            "max_hold_bars": args.max_hold_bars,
+            "holding_model": "registered_per_strategy",
+            "max_hold_bars_by_strategy": _registered_horizons(
+                decisions.get("strategy_id", pd.Series(dtype=str))),
         },
         "shadow_decisions_recorded": int(len(decisions)),
-        "unresolved": resolved.attrs.get("unresolved", {})
-        if not resolved.empty else {},
+        "unresolved": resolved.attrs.get("unresolved", {}),
         "strategies": summarise(resolved, summaries, trades),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

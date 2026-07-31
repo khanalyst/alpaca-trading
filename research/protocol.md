@@ -270,7 +270,7 @@ and no per-strategy LLM calls. Durable writes remain serialized.
 Selections and adaptive values are first-class immutable identities. An
 accepted selection waits behind the active assignment. Terminal assignment
 evidence, outcomes, findings, review attempts, explanations, and any
-research-only edge candidate remain append-only in schema 14.
+research-only edge candidate remain append-only in schema 16.
 
 The separate `research.py forward-qualify` path continues to apply the
 multi-setting criteria above to complete prequalification decision-ledger

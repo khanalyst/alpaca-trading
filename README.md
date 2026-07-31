@@ -26,11 +26,11 @@ research:
 | Order-executing strategy | `momentum/phase1-v3` |
 | Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol` |
-| Housekeeping cadence | `cycle.interval_seconds: 300` |
-| Decision cadence | `cycle.decision_interval_seconds` is unset, so decisions use the 300-second cadence |
+| Housekeeping cadence | `cycle.interval_seconds: 60` |
+| Decision cadence | `cycle.decision_interval_seconds: 300`; safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
-| Findings store | `research/cache/findings.db`, SQLite schema 14 |
-| Research feed | `forward_feed_version: 1` |
+| Findings store | `research/cache/findings.db`, SQLite schema 16 |
+| Research feed | `forward_feed_version: 2`; prior simulator evidence remains isolated |
 | Active research arms | 14: one baseline and at most one candidate for each of 7 strategies |
 | Shadow workers | `2`; all seven strategies still advance on the same cycle snapshot |
 | Experiment floor | both 3 elapsed days and 100 comparable paired observations |
@@ -156,7 +156,7 @@ its settings/results in the findings store, and writes completion or failure
 evidence. The top-level `REPORT.md` and `leaderboard.json` are only a latest
 view copied from the newest run; they are not the historical record.
 
-Research evidence tables in schema 14 use append-only rows and immutability
+Research evidence tables in schema 16 use append-only rows and immutability
 triggers where implemented. That protects against accidental SQL updates or
 deletes; it does not make the filesystem undeletable.
 
@@ -249,6 +249,7 @@ external evidence, not a maintained documentation source.
 | [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) | Short compatibility pointer for Azure deployment. It directs operators to setup/operations and lists data that must survive VM loss. |
 | [MAIN_REPO_REVIEW_PLAN.md](MAIN_REPO_REVIEW_PLAN.md) | Reconciled closure record for the seven implementation topics and remaining environment-only actions. It is a status summary, not a second runbook. |
 | [V2_HARDENING_PLAN.md](V2_HARDENING_PLAN.md) | Concise record of the hardened foundations now present and the safety boundaries that remain intentional. |
+| [WIP_HANDOFF.md](WIP_HANDOFF.md) | Exact checkpoint of completed work, interrupted validation, and known correctness items that must be finished before deployment. |
 | [deploy/README.md](deploy/README.md) | Purpose and ordering of the systemd trader, recorder, research service, and timer units. It also points to external-backup configuration. |
 
 ### Strategy and research documentation

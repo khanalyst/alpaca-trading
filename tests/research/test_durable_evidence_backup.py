@@ -79,7 +79,11 @@ class TournamentHistoryTests(unittest.TestCase):
         self.data = self.root / "data"
         self.data.mkdir()
         (self.data / "manifest.json").write_text(
-            json.dumps({"fixture": True}) + "\n", encoding="utf-8")
+            json.dumps({
+                "schema": tournament.DATA_MANIFEST_SCHEMA,
+                "files": [],
+                "fixture": True,
+            }) + "\n", encoding="utf-8")
         self.out = self.root / "tournament"
         self.store_path = self.root / "findings.db"
         self.frame = SimpleNamespace(

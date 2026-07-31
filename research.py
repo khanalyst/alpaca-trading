@@ -3,7 +3,8 @@
 
 Nothing here touches the trading path. Commands read ``journal.db`` and, from
 batch 2 onward, a local price cache. A G2 check appends its pass/fail audit
-record to that journal; research evidence is persisted in schema 14. The
+record to that journal unless ``--no-persist`` is supplied; research evidence
+is persisted in schema 16. The
 dedicated ``research-loop`` command may call the LLM with a research-only
 prompt, and ``backup`` creates a new verified versioned snapshot. No command
 places an order or mutates trading state.
@@ -251,6 +252,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print(f"  {count:>6,}  {reason}")
 
     if args.check_fidelity:
+        persist_fidelity = not bool(getattr(args, "no_persist", False))
         if (args.variant not in ("live", "momentum.baseline")
                 or args.replay_mode != "recorded_llm"):
             print("G2 must use momentum.baseline in recorded_llm mode.",
@@ -260,8 +262,11 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print(f"\nG2 fidelity: {report['reproduction_rate']:.4%} "
               f"({report['matched']}/{report['recorded']} recorded "
               f"decisions reproduced)")
+        if not persist_fidelity:
+            print("G2 audit persistence disabled (--no-persist).")
         if report["vacuous"]:
-            _record_g2_result(db, "VACUOUS", report, result, cfg)
+            if persist_fidelity:
+                _record_g2_result(db, "VACUOUS", report, result, cfg)
             print("G2 VACUOUS: the corpus contains no recorded decisions, so "
                   "the replay\nreproduced 100% of nothing. That is not "
                   "evidence of fidelity. Run the agent\nuntil it has "
@@ -269,20 +274,23 @@ def cmd_replay(args: argparse.Namespace) -> int:
                   "number\ndownstream of this replay.", file=sys.stderr)
             return 4
         if report["recorded"] < readiness_mod.MIN_PROPOSALS_FOR_G2:
-            _record_g2_result(
-                db, "INSUFFICIENT_SAMPLE", report, result, cfg)
+            if persist_fidelity:
+                _record_g2_result(
+                    db, "INSUFFICIENT_SAMPLE", report, result, cfg)
             print(
                 f"G2 COLLECTING: {report['recorded']} recorded proposals; "
                 f"{readiness_mod.MIN_PROPOSALS_FOR_G2} are required before "
                 "this ratio can pass the gate.", file=sys.stderr)
             return 4
         if not report["passes_g2"]:
-            _record_g2_result(db, "FAILED", report, result, cfg)
+            if persist_fidelity:
+                _record_g2_result(db, "FAILED", report, result, cfg)
             print("G2 FAILED. Every number downstream of this replay is "
                   "worthless until it is explained. This is a full stop, "
                   "not a debugging task to work around.", file=sys.stderr)
             return 2
-        if not _record_g2_result(db, "PASS", report, result, cfg):
+        if (persist_fidelity
+                and not _record_g2_result(db, "PASS", report, result, cfg)):
             return 5
     return 0
 
@@ -842,6 +850,48 @@ def _configured_store(cfg: dict, requested: str | Path | None) -> Path:
         (cfg.get("research") or {}).get("findings_store"))
 
 
+def _latest_verified_external_backup_readonly(
+        store_path: str | Path) -> dict | None:
+    """Inspect backup evidence without creating or migrating a findings DB."""
+    path = Path(store_path)
+    if not path.is_file():
+        return None
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        tables = {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not {"backup_runs", "backup_verifications"}.issubset(tables):
+            return None
+        rows = conn.execute(
+            "SELECT run.*, verification.backup_path, "
+            "verification.verified_ts, verification.detail_json "
+            "FROM backup_runs AS run JOIN backup_verifications AS "
+            "verification ON verification.verification_id=("
+            "SELECT latest.verification_id FROM backup_verifications AS "
+            "latest WHERE latest.backup_id=run.backup_id "
+            "ORDER BY latest.verified_ts DESC, latest.rowid DESC LIMIT 1) "
+            "WHERE run.target_kind='external_mounted' "
+            "AND verification.status='VERIFIED' "
+            "ORDER BY verification.verified_ts DESC").fetchall()
+    for row in rows:
+        item = dict(row)
+        try:
+            target_evidence = json.loads(
+                item.get("target_evidence_json") or "{}")
+            detail = json.loads(item.get("detail_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if findings_mod._positive_external_target_evidence(target_evidence):
+            item["target_evidence"] = target_evidence
+            item["detail"] = detail
+            return item
+    return None
+
+
 def _configured_backup_target(
         cfg: dict, requested: str | Path | None) -> tuple[Path | None, bool]:
     configured = requested or (cfg.get("research") or {}).get("backup_target")
@@ -978,9 +1028,8 @@ def cmd_readiness(args: argparse.Namespace) -> int:
     gates, stats = readiness_mod.report(db if db.exists() else None, cfg)
     print(readiness_mod.format_report(
         gates, stats, db if db.exists() else f"{db} (absent)"))
-    store_path = _configured_store(cfg, None)
-    external = findings_mod.FindingsStore(
-        store_path).latest_verified_external_backup()
+    store_path = _configured_store(cfg, getattr(args, "store", None))
+    external = _latest_verified_external_backup_readonly(store_path)
     if external:
         print("\nexternal backup  PASS       latest different-device mounted "
               f"backup verified at {external['verified_ts']:.0f}")
@@ -1051,6 +1100,9 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument(
         "--check-fidelity", action="store_true",
         help="gate G2: assert the baseline reproduces recorded decisions")
+    replay_parser.add_argument(
+        "--no-persist", action="store_true",
+        help="run a fidelity check without appending its G2 audit event")
     replay_parser.set_defaults(func=cmd_replay)
 
     three = sub.add_parser(
@@ -1162,6 +1214,9 @@ def build_parser() -> argparse.ArgumentParser:
         "readiness",
         help="which gates are open, blocked, or still collecting")
     ready.add_argument("--db", default=None)
+    ready.add_argument(
+        "--store", default=None,
+        help="findings.db to inspect read-only; absent stores are not created")
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
 

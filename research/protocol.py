@@ -217,12 +217,14 @@ def paper_trade_decisions(rows: list) -> list:
         if decision_outcome == "VETOED":
             decision.outcome = {"r_multiple": 0.0, "result": "vetoed"}
         elif is_ledger and row.get("trade_status") == "CLOSED" \
+                and int(row.get("trade_valid_for_inference", 1) or 0) == 1 \
                 and row.get("trade_r_multiple") is not None:
             decision.outcome = {
                 "r_multiple": float(row["trade_r_multiple"]),
                 "result": row.get("trade_result"),
             }
         elif (not is_ledger and row.get("status") == "CLOSED"
+              and int(row.get("valid_for_inference", 1) or 0) == 1
               and row.get("r_multiple") is not None):
             decision.outcome = {
                 "r_multiple": float(row["r_multiple"]),

@@ -39,7 +39,7 @@ The tournament recomputes contracts against an explicitly supplied historical
 corpus. It scores every declared setting for strategies with an implemented
 historical tournament contract and required inputs; other registered
 strategies are retained as `NOT SCORED` rather than silently omitted. It
-records every run and failure in schema 14 and writes immutable artifacts beneath
+records every run and failure in schema 16 and writes immutable artifacts beneath
 `research/results/tournament/runs/`. Top-level tournament files are latest-view
 copies only. The tournament awards no tier above `T2_CANDIDATE` and cannot
 promote capital.

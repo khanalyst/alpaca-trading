@@ -61,8 +61,8 @@ means collection is still open.
 | `mode` | `demo` |
 | `strategy.id` / `strategy.version` | `momentum` / `phase1-v3` |
 | `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol` |
-| `cycle.interval_seconds` | `300` seconds for housekeeping and decisions |
-| `cycle.decision_interval_seconds` | Unset; optional slower decision cadence that does not slow safety housekeeping |
+| `cycle.interval_seconds` | `60` seconds for marks, paper exits, housekeeping, and reconciliation |
+| `cycle.decision_interval_seconds` | `300` seconds; model decisions remain slower than safety/mark cycles |
 | `execution.maker_first_enabled` | Omitted, validated default `false` (B7.5 disabled) |
 | `execution.maker_first_wait_seconds` | Omitted, validated default `20` seconds |
 | `research.shadow_enabled` | `true` |
@@ -70,6 +70,7 @@ means collection is still open.
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
+| `research.forward_feed_version` | `2`; v1 simulator evidence is not pooled with current execution semantics |
 | `research.experiment_min_duration_days` | `3` |
 | `research.experiment_min_observations` | `100` |
 | `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |
@@ -93,6 +94,91 @@ The available exit policies are `fixed_rr` and `extended_rr`.
 
 The default backup is `local_default`; it is not protection from loss of the
 machine.
+
+## Docker Compose on an Ubuntu VM
+
+Docker Engine with the Compose v2 plugin is the shortest deployment path. It
+does not change the safety boundary: the shipped account remains demo and no
+strategy is made live-eligible by running it in a container.
+
+```bash
+git clone <repository> okx-agent-crypto
+cd okx-agent-crypto
+sudo install -d -o 10001 -g 10001 -m 0700 /etc/okx-agent-crypto
+sudo install -o 10001 -g 10001 -m 0400 .env.example \
+  /etc/okx-agent-crypto/agent.env
+sudoedit /etc/okx-agent-crypto/agent.env
+export OKX_AGENT_SECRET_FILE=/etc/okx-agent-crypto/agent.env
+# Build the one image used by all four long-running services.
+docker compose build
+docker compose run --rm --no-deps trader python main.py check
+docker compose up -d
+docker compose ps
+```
+
+The recorder must become healthy before Compose starts the single trader. The
+research scheduler runs at 03:00 UTC and performs one missed run after a
+restart. Each run downloads a fresh immutable market snapshot under
+`runtime/research/snapshots/<UTC timestamp>`; it never appends to yesterday's
+universe. Runtime state, these snapshots, findings, tournament output, and
+generated reports use named volumes; `docker compose down` preserves them,
+while `down -v` deletes them and must not be used as an ordinary update command.
+
+The dashboard is deliberately bound only to the VM loopback interface. From a
+workstation, use an SSH tunnel and open `http://127.0.0.1:8080` locally:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 <vm-user>@<vm-address>
+```
+
+The dashboard has no write endpoint and receives no API-key/LLM secret. It is
+an operational view, not an administration console. Container health, bounded
+logs, CPU/memory limits, and the exact mounted volumes are visible with:
+
+```bash
+docker compose ps
+docker compose logs --tail=200 trader recorder research dashboard
+docker compose config
+```
+
+For a secret file outside the checkout, set
+`OKX_AGENT_SECRET_FILE=/secure/path/agent.env` when invoking Compose. The file
+uses the same format as `.env`; the container receives it read-only under
+`/run/secrets`, not as a list of inspectable Compose environment variables.
+Compose file-backed secrets are bind mounts, so Docker Compose does not apply
+the requested target UID/GID/mode. On Linux, keep the source in a dedicated
+directory and make it readable only by container UID/GID 10001, as in the
+quickstart above; never relax it to a world-readable credential file. Keep
+`OKX_AGENT_SECRET_FILE` set for subsequent Compose commands (or put only
+that non-secret path setting in the shell/service environment). The application
+preflight remains authoritative.
+
+Docker sends `SIGTERM` during updates. The trader finishes its current bounded
+operation, persists `PAUSED` with `operator_pause=true`, leaves exchange-side
+protection in place, and exits. After rebuilding, explicitly validate and
+resume:
+
+```bash
+docker compose stop trader
+docker compose build
+docker compose up -d
+docker compose exec trader python main.py check
+docker compose exec trader python main.py resume
+```
+
+For an independently retained backup mount, first provision and verify it on
+the host, make it writable by UID/GID 10001, then opt in explicitly:
+
+```bash
+OKX_EXTERNAL_BACKUP_PATH=/srv/okx-agent-research-backup \
+  docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml up -d research
+```
+
+Neither a named volume nor a normal bind-mounted directory on the VM OS disk
+survives VM deletion. A container-visible different device is still not proof
+of off-host retention; verify the cloud disk's detach/retain setting and test a
+snapshot or restore outside the source VM.
 
 ## 4. Azure VM host
 
@@ -286,8 +372,8 @@ Azure deletion policy; verify **Detach**/disabled **Delete with VM** in Azure.
 The managed disk is a backup destination, not the application's active data
 directory. The supported backup captures the findings database, active
 journal, `runtime/research/recorded`, research manifests and forward evidence,
-and `research/results`. It does not copy the complete downloaded
-`runtime/research/data` cache. See [OPERATIONS.md](OPERATIONS.md) before a
+and `research/results`. It does not copy the complete immutable CSV trees under
+`runtime/research/snapshots/`. See [OPERATIONS.md](OPERATIONS.md) before a
 zero-data-loss VM deletion or rebuild.
 
 ## 7. Deployment updates
@@ -315,6 +401,11 @@ files, and research archive imported for development. Treat it as read-only.
 Copy databases or extract the archive into a temporary directory before tests.
 Never point `research.findings_store`, `JOURNAL_DB`, `DATA_DIR`, recorder
 output, tournament output, or `BACKUP_TARGET` at this fixture.
+
+For current nightly operation, an explicit `DATA_DIR` must name one absent or
+empty snapshot directory. The downloader refuses non-empty output, and the
+tournament accepts only an `okx-history-snapshot.v1` manifest whose exact file
+identities still match the directory.
 
 ## 9. B7.5 boundary
 

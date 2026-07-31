@@ -62,6 +62,24 @@ def enriched(snap: dict) -> dict:
     return out
 
 
+def execution_enriched(snap: dict) -> dict:
+    """Add the executable fields required by current paper outcome models."""
+    out = enriched(snap)
+    out["_enrichment"].update({
+        "book_ts": 1_760_000_000_000,
+        "book_best_bid": 99.99,
+        "book_best_ask": 100.01,
+        "book_top_bid_size": 5_000.0,
+        "book_top_ask_size": 5_000.0,
+        "book_bid_levels": [[99.99, 5_000.0], [99.98, 5_000.0]],
+        "book_ask_levels": [[100.01, 5_000.0], [100.02, 5_000.0]],
+        "book_contract_size": 1.0,
+        "book_age_seconds": 0.1,
+        "book_observation_error": None,
+    })
+    return out
+
+
 class EnrichmentNeverReachesThePrompt(unittest.TestCase):
     """D1, asserted on the exact bytes the provider receives."""
 

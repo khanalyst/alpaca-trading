@@ -18,7 +18,7 @@ journal snapshots
 The older replay/G2 → forward qualification → reviewed T3 packet path remains
 available as stricter evidence tooling. Neither path silently switches the
 configured strategy or authorizes live capital. Durable findings are stored in
-schema 14.
+schema 16.
 
 Use [`../../OPERATIONS.md`](../../OPERATIONS.md) for commands and
 [`../HYPOTHESES_AND_VARIANTS.md`](../HYPOTHESES_AND_VARIANTS.md) for current
