@@ -49,10 +49,17 @@ sudo -u okx /opt/okx-agent-crypto/.venv/bin/python \
 Docker VM:
 
 ```bash
-docker compose ps
-docker compose logs --tail=100 trader recorder research
-docker compose exec trader python main.py status
-docker compose exec trader python research.py readiness
+cd /opt/okx-agent-crypto
+export OKX_AGENT_SECRET_FILE=/etc/okx-agent-crypto/agent.env
+export OKX_EXTERNAL_BACKUP_PATH=/srv/okx-agent-research-backup
+sudo -E docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml ps
+sudo -E docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml \
+  logs --tail=100 trader recorder research dashboard
+sudo -E docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml \
+  exec -T trader python main.py status
 ```
 
 The dashboard is available only through host loopback. Use an SSH tunnel to
@@ -413,6 +420,13 @@ Before deleting or rebuilding the VM:
 | Trader stopped after Compose update | Expected safe `SIGTERM` pause; run `main.py check`, then explicitly `main.py resume` |
 | Recorder unhealthy | Trader startup remains blocked until a fresh recorder CSV exists |
 | Dashboard unreachable remotely | Expected loopback binding; use an SSH tunnel or private VPN |
+| VM `curl /healthz` works but Mac dashboard does not | The dashboard container is healthy; repair/restart the Mac SSH `LocalForward` tunnel and check whether local port 8080 is occupied. |
+| Dashboard scheduler is `missing` | The legacy systemd timer does not maintain the Compose scheduler heartbeat. Under Compose inspect the `research` container and `runtime/health/research.json`. |
+| SSH reports `Broken pipe` | The transport expired; VM services continue. Configure `ServerAliveInterval 30` and `ServerAliveCountMax 6` on the Mac. |
+| SSH reports `Permission denied (publickey)` | Repair `azureuser`'s public key and `.ssh` ownership/modes through Azure VMAccess or Run Command. Never copy the private key to the VM. |
+| `/opt/...` command fails on the Mac | `/opt/okx-agent-crypto` is a VM path. SSH to the VM and run it there. |
+| Migration cannot read systemd runtime files | Stop the services, grant temporary `u:10001:rX` ACL access, copy as UID 10001, then remove the ACL. |
+| Migration `chown` is not permitted | Do not force ownership changes. Copy as UID/GID 10001 without `cp -a`; `findings/` is initialized from the image and regenerated. |
 | Docker backup says different device | This is not off-host proof; verify host/cloud retention separately |
 
 The optional B7.5 maker-first order primitive remains disabled by default.

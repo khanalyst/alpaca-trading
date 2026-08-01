@@ -6,6 +6,12 @@ lanes are supported.
 
 ## Docker Compose (recommended for a new Ubuntu VM)
 
+Production Compose runs on the Ubuntu VM. Docker Desktop on a Mac is a
+separate local engine; use an SSH Docker context for remote inspection rather
+than starting a second trader locally. The complete systemd migration,
+temporary ACL procedure, SSH tunnel setup, and update helper are documented in
+[`../SETUP.md`](../SETUP.md).
+
 [`../compose.yaml`](../compose.yaml) runs four services from the exact same
 image and locked Python dependency set:
 
