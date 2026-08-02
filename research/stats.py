@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 
 INSUFFICIENT_SAMPLE = "INSUFFICIENT_SAMPLE"
+PAIRED_SIGN_FLIP_NULL_ASSUMPTION = (
+    "cluster_delta_sign_exchangeability_under_symmetric_null")
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,83 @@ def cluster_block_bootstrap_difference(
         point, means[int(tail * len(means))],
         means[min(len(means) - 1, int((1.0 - tail) * len(means)))],
         len(clean), len(ordered))
+
+
+def paired_cluster_sign_flip(
+        pairs: list[tuple[float, float, float]], *,
+        cluster_seconds: int = 21_600, exact_max_clusters: int = 16,
+        iterations: int = 20_000, seed: int = 20260728) -> dict:
+    """One-sided paired randomization test with six-hour cluster sign flips.
+
+    Every row is ``(timestamp, candidate_return, baseline_return)`` for one
+    exact proposal pair. All deltas in the same market cluster receive the
+    same random sign, so correlated trades are not treated as independent
+    tests. Validity requires cluster-level delta signs to be exchangeable under
+    a null distribution symmetric about zero; this is not assumption-free.
+    Small cluster families enumerate every sign assignment exactly conditional
+    on that assumption. Larger families use a fixed-seed Monte Carlo estimate
+    with the standard plus-one correction.
+    """
+    clean = []
+    for ts, left, right in pairs:
+        try:
+            values = (float(ts), float(left), float(right))
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(value) for value in values):
+            clean.append((values[0], values[1] - values[2]))
+
+    clusters: dict[int, list[float]] = {}
+    for ts, delta in clean:
+        clusters.setdefault(int(ts // cluster_seconds), []).append(delta)
+    contributions = [sum(clusters[key]) for key in sorted(clusters)]
+    cluster_count = len(contributions)
+    observed_sum = sum(contributions)
+    common = {
+        "kind": "paired_cluster_sign_flip",
+        "null_assumption": PAIRED_SIGN_FLIP_NULL_ASSUMPTION,
+        "alternative": "greater",
+        "cluster_seconds": int(cluster_seconds),
+        "clusters": cluster_count,
+        "paired_n": len(clean),
+        "observed_mean": (observed_sum / len(clean) if clean else 0.0),
+    }
+    if not clean or not contributions:
+        return {
+            **common, "method": "unavailable", "exact": False,
+            "resamples": 0, "seed": None, "p_value": 1.0,
+        }
+
+    tolerance = 1e-15 * max(1.0, abs(observed_sum))
+    if cluster_count <= max(0, int(exact_max_clusters)):
+        resamples = 1 << cluster_count
+        extreme = 0
+        for mask in range(resamples):
+            randomized = sum(
+                value if mask & (1 << index) else -value
+                for index, value in enumerate(contributions))
+            if randomized >= observed_sum - tolerance:
+                extreme += 1
+        return {
+            **common, "method": "exact_enumeration", "exact": True,
+            "resamples": resamples, "seed": None,
+            "p_value": extreme / resamples,
+        }
+
+    resamples = max(1, int(iterations))
+    rng = random.Random(seed)
+    extreme = 0
+    for _ in range(resamples):
+        randomized = sum(
+            value if rng.getrandbits(1) else -value
+            for value in contributions)
+        if randomized >= observed_sum - tolerance:
+            extreme += 1
+    return {
+        **common, "method": "monte_carlo", "exact": False,
+        "resamples": resamples, "seed": int(seed),
+        "p_value": (extreme + 1) / (resamples + 1),
+    }
 
 
 def stdev(values: list) -> float:

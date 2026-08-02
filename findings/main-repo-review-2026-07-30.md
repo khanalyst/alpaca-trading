@@ -3,7 +3,7 @@
 > **Historical snapshot.** This document preserves the code and evidence state
 > observed on July 30, 2026. Statements about the then-current schema, missing variants, or
 > partially implemented items are not current operating claims. The reconciled
-> implementation is schema 14 and is documented in `README.md`,
+> implementation is schema 16 and is documented in `README.md`,
 > `OPERATIONS.md`, and `MAIN_REPO_REVIEW_PLAN.md`.
 
 > Preserved detailed review record. The current implementation status is

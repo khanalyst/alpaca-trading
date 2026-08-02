@@ -12,7 +12,7 @@ Implemented foundations now include:
 - deterministic `WORKED`/`FAILED`/`INCONCLUSIVE` outcomes and separate review;
 - `RESEARCH_ONLY` edge candidates with no automatic promotion;
 - append-only tournament runs and immutable per-run artifacts;
-- FindingsStore schema 14;
+- FindingsStore schema 16;
 - versioned SQLite-online backups with checksums, integrity verification, and
   fail-closed `external_mounted` classification.
 

@@ -27,8 +27,10 @@ from dataclasses import dataclass, field
 from agent.forward_models import require_validated
 
 from .score import score_returns
-from .stats import (INSUFFICIENT_SAMPLE, cluster_block_bootstrap_difference,
-                    holm_bonferroni)
+from .stats import (INSUFFICIENT_SAMPLE,
+                    PAIRED_SIGN_FLIP_NULL_ASSUMPTION,
+                    cluster_block_bootstrap_difference, holm_bonferroni,
+                    paired_cluster_sign_flip)
 
 
 PROMOTE = "PROMOTE"
@@ -43,6 +45,11 @@ MIN_PAIRED_FIT_OBSERVATIONS = 70
 MIN_PAIRED_CONFIRM_OBSERVATIONS = 30
 PAIR_BOOTSTRAP_KIND = "paired_cluster_block"
 PAIR_CLUSTER_SECONDS = 21_600
+PAIR_RANDOMIZATION_KIND = "paired_cluster_sign_flip"
+PAIR_RANDOMIZATION_NULL_ASSUMPTION = PAIRED_SIGN_FLIP_NULL_ASSUMPTION
+PAIR_RANDOMIZATION_SEED = 20260728
+PAIR_RANDOMIZATION_RESAMPLES = 20_000
+PAIR_RANDOMIZATION_EXACT_MAX_CLUSTERS = 16
 # Independent six-hour market episodes required before a clustered interval is
 # allowed to decide anything. The pair minimums above count trades, and trades
 # inside one episode are close to one observation: a hundred of them would
@@ -217,12 +224,14 @@ def paper_trade_decisions(rows: list) -> list:
         if decision_outcome == "VETOED":
             decision.outcome = {"r_multiple": 0.0, "result": "vetoed"}
         elif is_ledger and row.get("trade_status") == "CLOSED" \
+                and int(row.get("trade_valid_for_inference", 1) or 0) == 1 \
                 and row.get("trade_r_multiple") is not None:
             decision.outcome = {
                 "r_multiple": float(row["trade_r_multiple"]),
                 "result": row.get("trade_result"),
             }
         elif (not is_ledger and row.get("status") == "CLOSED"
+              and int(row.get("valid_for_inference", 1) or 0) == 1
               and row.get("r_multiple") is not None):
             decision.outcome = {
                 "r_multiple": float(row["r_multiple"]),
@@ -232,7 +241,8 @@ def paper_trade_decisions(rows: list) -> list:
     return decisions
 
 
-def paired_arm_comparison(left: list, right: list) -> dict:
+def paired_arm_comparison(
+        left: list, right: list, *, include_randomization: bool = True) -> dict:
     """Match two research arms on exact proposal identity before inference."""
     def indexed(decisions: list) -> tuple[dict, set, list]:
         resolved: dict = {}
@@ -266,7 +276,7 @@ def paired_arm_comparison(left: list, right: list) -> dict:
     ]
     interval = cluster_block_bootstrap_difference(pairs)
     union = left_proposed | right_proposed
-    return {
+    result = {
         "interval": interval,
         "paired_n": len(common),
         "proposal_union_n": len(union),
@@ -294,6 +304,46 @@ def paired_arm_comparison(left: list, right: list) -> dict:
             "min_clusters": MIN_BOOTSTRAP_CLUSTERS,
         },
     }
+    if include_randomization:
+        result["randomization"] = paired_cluster_sign_flip(
+            pairs, cluster_seconds=PAIR_CLUSTER_SECONDS,
+            exact_max_clusters=PAIR_RANDOMIZATION_EXACT_MAX_CLUSTERS,
+            iterations=PAIR_RANDOMIZATION_RESAMPLES,
+            seed=PAIR_RANDOMIZATION_SEED)
+    return result
+
+
+def calibrated_p_value(record: object) -> float | None:
+    """Return a validated raw p-value, or ``None`` when evidence is absent."""
+    if not isinstance(record, dict):
+        return None
+    if (record.get("kind") != PAIR_RANDOMIZATION_KIND
+            or record.get("null_assumption")
+            != PAIR_RANDOMIZATION_NULL_ASSUMPTION
+            or record.get("alternative") != "greater"
+            or int(record.get("cluster_seconds") or 0)
+            != PAIR_CLUSTER_SECONDS
+            or int(record.get("clusters") or 0) < MIN_BOOTSTRAP_CLUSTERS
+            or int(record.get("paired_n") or 0)
+            < MIN_PAIRED_CONFIRM_OBSERVATIONS):
+        return None
+    method = record.get("method")
+    exact = record.get("exact")
+    resamples = int(record.get("resamples") or 0)
+    seed = record.get("seed")
+    if method == "exact_enumeration":
+        if exact is not True or seed is not None or resamples <= 0:
+            return None
+    elif method == "monte_carlo":
+        if exact is not False or resamples <= 0 or seed != PAIR_RANDOMIZATION_SEED:
+            return None
+    else:
+        return None
+    try:
+        value = float(record["p_value"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
 
 
 def paired_window_adequate(comparison: dict, minimum: int) -> bool:
@@ -326,15 +376,15 @@ def _paired_evidence(comparison: dict) -> dict:
 
 # ------------------------------------------------------------- the rules
 
-def evaluate_axis(settings: list, baseline_decisions: list,
+def evaluate_axis(settings: list, baseline_decisions: list | None = None,
                   structurally_invalid: str = "",
-                  strategy_id: str = "momentum") -> Verdict:
+                  strategy_id: str = "momentum", *,
+                  calibrated_confirmation: bool = True) -> Verdict:
     """Apply the promotion protocol to a whole parameter axis.
 
-    ``settings`` is a list of ``(variant_id, decisions)`` pairs - every point
-    tested along one axis. The axis is the unit of decision, not the
-    individual setting, because intention #4 is that a hypothesis is never
-    rejected on one parameter value.
+    New evidence supplies ``(variant_id, decisions, baseline_decisions)`` so
+    every serially rotated setting is compared only with its contemporaneous
+    baseline. The legacy two-item form remains for immutable v2 analyses.
     """
     # Structural invalidity needs no sample at all. An idea that cannot work
     # for a stated reason is rejected on inspection and the reasoning is the
@@ -347,44 +397,103 @@ def evaluate_axis(settings: list, baseline_decisions: list,
 
     require_validated(strategy_id)
 
-    baseline = score_returns(_returns(baseline_decisions), label="baseline")
-    scored = [(vid, score_returns(_returns(d), label=vid), d)
-              for vid, d in settings]
+    normalized = []
+    per_setting_baselines = False
+    for setting in settings:
+        if len(setting) == 2:
+            variant_id, decisions = setting
+            setting_baseline = baseline_decisions or []
+        elif len(setting) == 3:
+            variant_id, decisions, setting_baseline = setting
+            per_setting_baselines = True
+        else:
+            raise ValueError(
+                "axis settings must contain variant, decisions, and optional "
+                "contemporaneous baseline")
+        normalized.append({
+            "variant_id": variant_id,
+            "decisions": decisions,
+            "baseline_decisions": setting_baseline,
+            "score": score_returns(_returns(decisions), label=variant_id),
+            "baseline_score": score_returns(
+                _returns(setting_baseline), label=f"{variant_id}:baseline"),
+        })
 
-    if baseline["n"] == 0:
-        return Verdict(
-            INSUFFICIENT_SAMPLE, "no baseline",
-            "the baseline variant has no resolved round trips, so there is "
-            "nothing to compare against",
-            {"baseline_n": 0})
+    if per_setting_baselines:
+        missing = [row["variant_id"] for row in normalized
+                   if row["baseline_score"]["n"] == 0]
+        if missing:
+            return Verdict(
+                INSUFFICIENT_SAMPLE, "no contemporaneous baseline",
+                "one or more settings have no resolved baseline round trips "
+                "from their own assignment windows",
+                {"settings_without_baseline": missing})
+    else:
+        baseline = score_returns(
+            _returns(baseline_decisions or []), label="baseline")
+        if baseline["n"] == 0:
+            return Verdict(
+                INSUFFICIENT_SAMPLE, "no baseline",
+                "the baseline variant has no resolved round trips, so there is "
+                "nothing to compare against",
+                {"baseline_n": 0})
 
     # Checked before anything reduces over the settings, so an axis with
     # nothing on it yet is a verdict rather than an exception.
-    total_settings = len(scored) + 1  # the explicit baseline is one setting
+    total_settings = len(normalized) + 1  # the explicit baseline is one setting
     if total_settings < MIN_AXIS_SETTINGS:
         return Verdict(
             CONTINUE, "too few settings on the axis",
             f"{total_settings} of {MIN_AXIS_SETTINGS} required settings "
             "tested; a hypothesis is never decided on one parameter value",
-            {"settings": total_settings, "candidate_settings": len(scored)})
+            {"settings": total_settings,
+             "candidate_settings": len(normalized)})
 
     # Select on the fit window only. Selecting on the full corpus and then
     # calling the last 30% "confirmation" lets that confirmation window pick
     # its own winner.
-    # The baseline is the shared proposal calendar. Deriving one boundary from
-    # it prevents a dense or delayed candidate arm from moving the date and
-    # then receiving a different market regime than its peers.
-    split_cutoff = common_time_cutoff([baseline_decisions])
+    # Each serial setting owns a distinct assignment calendar. Its fit/confirm
+    # boundary therefore comes from its own contemporaneous baseline. Legacy
+    # v2 populations retain their one shared baseline boundary.
+    shared_cutoff = (None if per_setting_baselines else
+                     common_time_cutoff([baseline_decisions or []]))
     split_settings = []
-    for vid, full_score, decisions in scored:
+    for row in normalized:
+        vid = row["variant_id"]
+        decisions = row["decisions"]
+        setting_baseline = row["baseline_decisions"]
+        split_cutoff = (common_time_cutoff([setting_baseline])
+                        if per_setting_baselines else shared_cutoff)
         fit, confirm = (split_at_time(decisions, split_cutoff)
                         if split_cutoff is not None else (decisions, []))
-        split_settings.append((
-            vid, full_score, decisions,
-            score_returns(_returns(fit), label=f"{vid}:fit"),
-            fit, confirm))
-    best_id, best_score, best_decisions, best_fit_score, best_fit, best_confirm = max(
-        split_settings, key=lambda row: row[3]["expectancy_r"])
+        baseline_fit, baseline_confirm = (
+            split_at_time(setting_baseline, split_cutoff)
+            if split_cutoff is not None else (setting_baseline, []))
+        fit_pair = paired_arm_comparison(
+            fit, baseline_fit,
+            include_randomization=calibrated_confirmation)
+        row = {
+            **row, "fit": fit, "confirm": confirm,
+            "baseline_fit": baseline_fit,
+            "baseline_confirm": baseline_confirm,
+            "fit_score": score_returns(_returns(fit), label=f"{vid}:fit"),
+            "fit_pair": fit_pair, "split_cutoff": split_cutoff,
+        }
+        row["selection_score"] = (
+            fit_pair["interval"].point if per_setting_baselines
+            else row["fit_score"]["expectancy_r"])
+        split_settings.append(row)
+    best = max(split_settings, key=lambda row: row["selection_score"])
+    best_id = best["variant_id"]
+    best_score = best["score"]
+    best_decisions = best["decisions"]
+    best_fit = best["fit"]
+    best_confirm = best["confirm"]
+    baseline = best["baseline_score"]
+    baseline_decisions = best["baseline_decisions"]
+    baseline_fit = best["baseline_fit"]
+    baseline_confirm = best["baseline_confirm"]
+    split_cutoff = best["split_cutoff"]
 
     if best_score["n"] < MIN_ROUND_TRIPS:
         return Verdict(
@@ -400,28 +509,35 @@ def evaluate_axis(settings: list, baseline_decisions: list,
     # nearly empty grid point is an open question, not evidence against the
     # whole axis.
     all_underperform = all(
-        row[1]["ci_high"] < baseline["expectancy_r"] for row in scored)
+        row["score"]["ci_high"]
+        < row["baseline_score"]["expectancy_r"]
+        for row in normalized)
     if all_underperform and any(
-            row[1]["n"] < MIN_ROUND_TRIPS for row in scored):
+            row["score"]["n"] < MIN_ROUND_TRIPS for row in normalized):
         return Verdict(
             INSUFFICIENT_SAMPLE, "axis settings below the rejection floor",
             "every setting currently underperforms, but at least one has "
             f"fewer than {MIN_ROUND_TRIPS} resolved round trips; the whole "
             "axis cannot be rejected on an under-observed setting",
-            {"settings": {vid: row["n"] for vid, row, _ in scored}})
+            {"settings": {row["variant_id"]: row["score"]["n"]
+                          for row in normalized}})
     if all_underperform:
+        baseline_detail = (
+            "their contemporaneous baseline point estimates"
+            if per_setting_baselines else
+            f"the baseline point estimate ({baseline['expectancy_r']:+.4f}R)")
         return Verdict(
             REJECT, "whole axis underperforms the baseline",
-            f"all {len(scored)} settings have an expectancy interval whose "
-            f"upper bound is below the baseline point estimate "
-            f"({baseline['expectancy_r']:+.4f}R)",
-            {"settings": len(scored),
-             "baseline_expectancy_r": baseline["expectancy_r"]})
+            f"all {len(normalized)} settings have an expectancy interval whose "
+            f"upper bound is below {baseline_detail}",
+            {"settings": len(normalized),
+             "baseline_expectancy_r": (
+                 None if per_setting_baselines
+                 else baseline["expectancy_r"])})
 
-    baseline_fit, baseline_confirm = (
-        split_at_time(baseline_decisions, split_cutoff)
-        if split_cutoff is not None else (baseline_decisions, []))
-    full_pair = paired_arm_comparison(best_decisions, baseline_decisions)
+    full_pair = paired_arm_comparison(
+        best_decisions, baseline_decisions,
+        include_randomization=calibrated_confirmation)
     if not paired_window_adequate(full_pair, MIN_ROUND_TRIPS):
         return Verdict(
             INSUFFICIENT_SAMPLE, "paired proposal coverage is inadequate",
@@ -435,7 +551,7 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             "identities",
             {"best": best_id, "paired": _paired_evidence(full_pair)})
 
-    fit_pair = paired_arm_comparison(best_fit, baseline_fit)
+    fit_pair = best["fit_pair"]
     if not paired_window_adequate(
             fit_pair, MIN_PAIRED_FIT_OBSERVATIONS):
         return Verdict(
@@ -477,7 +593,9 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             f"{split['confirm_regime']['median_vol_ratio']}",
             {"best": best_id, "split": split})
 
-    confirm_pair = paired_arm_comparison(best_confirm, baseline_confirm)
+    confirm_pair = paired_arm_comparison(
+        best_confirm, baseline_confirm,
+        include_randomization=calibrated_confirmation)
     if not paired_window_adequate(
             confirm_pair, MIN_PAIRED_CONFIRM_OBSERVATIONS):
         return Verdict(
@@ -495,7 +613,10 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             {"best": best_id, "split": split,
              "confirmation_paired": _paired_evidence(confirm_pair)})
     confirm_difference = confirm_pair["interval"]
+    confirmation_test = confirm_pair.get("randomization")
     if confirm_difference.n == 0 or confirm_difference.low <= 0:
+        statistical = ({"confirmation_test": confirmation_test}
+                       if calibrated_confirmation else {})
         return Verdict(
             CONTINUE, "confirmation delta does not clear zero",
             f"fit-selected setting {best_id} has confirmation delta vs "
@@ -503,7 +624,8 @@ def evaluate_axis(settings: list, baseline_decisions: list,
             "confirmation interval to be positive",
             {"best": best_id, "split": split,
              "confirm_delta": str(confirm_difference),
-             "confirmation_paired": _paired_evidence(confirm_pair)})
+             "confirmation_paired": _paired_evidence(confirm_pair),
+             **statistical})
 
     difference = full_pair["interval"]
     criteria = {
@@ -539,6 +661,11 @@ def evaluate_axis(settings: list, baseline_decisions: list,
         "out_of_sample_survives": split["survives"] is True,
         "confirmation_interval_positive": confirm_difference.low > 0,
     }
+    if calibrated_confirmation:
+        criteria["confirmation_randomization_valid"] = (
+            calibrated_p_value(confirmation_test) is not None)
+    statistical = ({"confirmation_test": confirmation_test}
+                   if calibrated_confirmation else {})
     return Verdict(
         PROMOTE, "every promotion criterion holds",
         f"{best_id}: {best_score['n']} round trips, expectancy "
@@ -558,37 +685,8 @@ def evaluate_axis(settings: list, baseline_decisions: list,
          "regime_comparable": split["fit_regime"].get("comparable"),
          "paired": _paired_evidence(full_pair),
          "fit_paired": _paired_evidence(fit_pair),
-         "confirmation_paired": _paired_evidence(confirm_pair)})
-
-
-
-
-def interval_pseudo_p(n: object, ci_low: object, ci_high: object) -> float:
-    """Approximate a p-value from a bootstrap interval.
-
-    Coarse, and the honest resolution available at this sample size: it is
-    used to rank and to correct, never quoted as a p-value in its own right.
-    One definition, shared by every family correction here, so two callers
-    cannot drift into correcting on different scales.
-    """
-    try:
-        count = int(n or 0)
-        low, high = float(ci_low), float(ci_high)
-    except (TypeError, ValueError):
-        return 1.0
-    if count < 2 or not (math.isfinite(low) and math.isfinite(high)):
-        return 1.0
-    width = abs(high - low)
-    if width <= 0:
-        return 1.0
-    if low <= 0 <= high:
-        return 1.0
-    # Distance of the interval from zero, in interval half-widths. Two
-    # half-widths out is roughly the 95% boundary.
-    margin = min(abs(low), abs(high))
-    return max(1e-6, 0.05 / (1.0 + 4.0 * margin / width))
-
-
+         "confirmation_paired": _paired_evidence(confirm_pair),
+         **statistical})
 def correct_axis_family(verdicts: dict, alpha: float = 0.05) -> dict:
     """Holm-correct across every axis evaluated in one qualification run.
 
@@ -605,27 +703,34 @@ def correct_axis_family(verdicts: dict, alpha: float = 0.05) -> dict:
     family to be small - which is the same error as reporting the best of
     seventy-nine walk-forward variants without saying there were seventy-nine.
 
-    The corrected figure is taken from the CONFIRMATION interval, because that
-    is the criterion carrying the evidence: the fit-window interval is measured
-    on the same data that selected the setting.
+    The corrected figure is the calibrated one-sided cluster sign-flip p-value
+    from the confirmation window. A missing or malformed test fails closed at
+    p=1; confidence-interval geometry is never converted into a p-value.
     """
-    pseudo_p = {}
+    raw_p = {}
+    records = {}
     for axis_id, verdict in verdicts.items():
-        interval = (getattr(verdict, "evidence", None) or {}).get(
-            "confirmation_interval") or {}
-        pseudo_p[axis_id] = (
-            interval_pseudo_p(interval.get("n"), interval.get("low"),
-                              interval.get("high"))
-            if getattr(verdict, "verdict", None) == PROMOTE else 1.0)
-    corrected = holm_bonferroni(pseudo_p, alpha=alpha)
+        record = (getattr(verdict, "evidence", None) or {}).get(
+            "confirmation_test")
+        value = calibrated_p_value(record)
+        raw_p[axis_id] = 1.0 if value is None else value
+        records[axis_id] = record if value is not None else None
+    corrected = holm_bonferroni(raw_p, alpha=alpha)
     return {
         axis_id: {
-            "family_n": len(pseudo_p),
+            "family_n": len(raw_p),
             "alpha": alpha,
-            "axes": sorted(pseudo_p),
+            "axes": sorted(raw_p),
             "p": row["p"],
             "p_adjusted": row["p_adjusted"],
             "significant": bool(row["significant"]),
+            "calibrated": records[axis_id] is not None,
+            "method": ((records[axis_id] or {}).get("method")
+                       or "missing_or_invalid"),
+            "null_assumption": ((records[axis_id] or {}).get(
+                "null_assumption") if records[axis_id] is not None else None),
+            "exact": ((records[axis_id] or {}).get("exact")
+                      if records[axis_id] is not None else None),
         }
         for axis_id, row in corrected.items()
     }
@@ -663,19 +768,19 @@ def apply_axis_family_correction(verdicts: dict, alpha: float = 0.05) -> dict:
 def correct_family(results: dict, alpha: float = 0.05) -> dict:
     """Apply the family-wise correction across one batch of tests.
 
-    Six hypotheses with several conditioning cells each, against a few
-    hundred round trips: something will look significant. The corrected
-    figure is the only one any recommendation may quote, so the correction is
-    applied here rather than left to whoever writes the summary.
+    Callers must provide a calibrated ``p_value``. A score summary or interval
+    alone is not a test and therefore fails closed at p=1.
     """
 
-    pseudo_p = {
-      name: interval_pseudo_p(
-          scored.get("n"), scored.get("ci_low"), scored.get("ci_high"))
-      for name, scored in results.items()
-    }
-  
-    corrected = holm_bonferroni(pseudo_p, alpha=alpha)
+    raw_p = {}
+    for name, scored in results.items():
+        try:
+            value = float(scored.get("p_value"))
+        except (TypeError, ValueError):
+            value = 1.0
+        raw_p[name] = value if math.isfinite(value) and 0 <= value <= 1 else 1.0
+
+    corrected = holm_bonferroni(raw_p, alpha=alpha)
     out = {}
     for name, scored in results.items():
         row = dict(scored)

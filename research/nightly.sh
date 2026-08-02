@@ -13,15 +13,20 @@
 # producing a report that looks fine. That is the plan's instruction: treat a
 # G2 failure as a full stop, not a debugging task to work around.
 #
-# Downloads resume. Durable findings, tournament runs and backup histories are
-# append-only; only documented top-level latest views are refreshed. A killed
-# run retains its recorded STARTED/FAILED evidence instead of replacing history.
+# Historical downloads, durable findings, tournament runs and backup histories
+# are append-only; only documented top-level latest views are refreshed. A
+# killed run retains its evidence instead of replacing prior history.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 PY="${PYTHON:-$ROOT/.venv/bin/python}"
-DATA="${DATA_DIR:-$ROOT/runtime/research/data}"
+if [ -n "${DATA_DIR:-}" ]; then
+  # Explicit override names the exact fresh snapshot directory.
+  DATA="$DATA_DIR"
+else
+  DATA="$ROOT/runtime/research/snapshots/$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 MODE="${AGENT_MODE:-demo}"
 DAYS="${HISTORY_DAYS:-730}"
 
@@ -97,6 +102,13 @@ if [ -f "$JOURNAL" ]; then
   "$PY" research.py forward-qualify --store "$STORE" \
     || echo "  (collecting, unscoped, or no promotable edge; see above)"
 
+  echo "=== $(date -u +%FT%TZ) preparing operator review artifacts ==="
+  # Only a draft, content-addressed T3 packet is created automatically, and
+  # only after every non-manual evidence check passes. Registry/config review
+  # and any capital-enabling change remain explicit operator actions.
+  "$PY" research.py prepare-review-artifacts --store "$STORE" --db "$JOURNAL" \
+    || echo "WARNING: review artifact preparation deferred" >&2
+
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
   "$PY" research.py report --store "$STORE"
 else
@@ -110,11 +122,12 @@ fi
 # ---------------------------------------------------------------------------
 
 echo "=== $(date -u +%FT%TZ) refreshing market history ==="
-# Open interest and funding have short retention, so this re-fetches the
-# recent window every night. Candles resume and are skipped when covered.
+# A fresh directory makes file membership immutable and prevents a stale symbol
+# from an older universe contaminating this run. Open interest and funding have
+# short retention, so they are fetched again with the new snapshot.
 "$PY" research/download_okx_history.py \
   --out "$DATA" --days "$DAYS" --min-volume-usd 30000000 --max-symbols 26 \
-  || echo "WARNING: history refresh incomplete; scoring the data on disk" >&2
+  || echo "WARNING: history snapshot incomplete; tournament will refuse it" >&2
 
 echo "=== $(date -u +%FT%TZ) resolving forward evidence from the journal ==="
 "$PY" research/export_live.py --mode "$MODE" --data "$DATA" \

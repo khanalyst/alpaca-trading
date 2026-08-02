@@ -1,9 +1,9 @@
 """Append-only, verified research backups.
 
 SQLite sources are always captured with SQLite's online backup API. Regular
-recorder, manifest, and durable result files are copied into a new versioned
-directory and covered by a SHA-256 manifest. Nothing here prunes or replaces a
-prior backup.
+recorder, immutable market-snapshot, manifest, and durable result files are
+copied into a new versioned directory and covered by a SHA-256 manifest.
+Nothing here prunes or replaces a prior backup.
 """
 
 from __future__ import annotations
@@ -138,6 +138,28 @@ def _regular_files(root: Path) -> list[Path]:
         and not path.name.endswith(("-wal", "-shm", "-journal")))
 
 
+def _immutable_snapshot_files(root: Path) -> list[Path]:
+    """Return files from completed downloader snapshots only.
+
+    The downloader makes a timestamped directory immutable by removing its
+    in-progress marker and writing ``manifest.json`` last. Partial downloads
+    are intentionally excluded so a retry cannot turn an incomplete tree into
+    apparently durable tournament input.
+    """
+    if not root.is_dir():
+        return []
+    files: list[Path] = []
+    for snapshot in sorted(root.iterdir()):
+        manifest = snapshot / "manifest.json"
+        in_progress = snapshot / ".download-in-progress"
+        if (not snapshot.is_dir() or snapshot.is_symlink()
+                or not manifest.is_file() or manifest.is_symlink()
+                or in_progress.exists()):
+            continue
+        files.extend(_regular_files(snapshot))
+    return sorted(files)
+
+
 def _source_entries(
         store_path: Path, journal_path: Path | None,
         runtime_research_root: Path, results_root: Path) -> list[tuple[Path, Path]]:
@@ -153,9 +175,17 @@ def _source_entries(
             path, Path("files/runtime/research/recorded")
             / path.relative_to(recorded)))
 
+    snapshots = runtime_research_root / "snapshots"
+    for path in _immutable_snapshot_files(snapshots):
+        entries.append((
+            path, Path("files/runtime/research/snapshots")
+            / path.relative_to(snapshots)))
+
     if runtime_research_root.is_dir():
         for path in _regular_files(runtime_research_root):
             relative = path.relative_to(runtime_research_root)
+            if relative.parts and relative.parts[0] == "snapshots":
+                continue
             name = path.name.lower()
             if ("manifest" in name and path.suffix.lower() == ".json") \
                     or relative == Path("forward_evidence.json"):

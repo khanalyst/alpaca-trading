@@ -27,7 +27,7 @@ implementation stages completed on July 31, 2026. Current operation belongs in
   qualification event, or packet automatically changes live configuration or
   deploys capital.
 - Both successes and failures remain persistent research evidence.
-- Schema 14 is the current findings-store schema.
+- Schema 16 is the current findings-store schema.
 
 ## Environment-only action
 

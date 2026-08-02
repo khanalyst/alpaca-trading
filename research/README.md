@@ -10,10 +10,12 @@ paper evaluators for `momentum`, `flush-fade`, `funding-carry`,
 Only the configured main strategy can reach the demo exchange.
 
 Each strategy continuously keeps its baseline and at most one candidate
-setting. Candidate rotation is serial per strategy but all strategies remain
-active in parallel. The default assignment floor is both three elapsed days
-and 100 comparable paired observations. State survives restart in the schema-14
-findings store.
+setting. All seven lanes use one snapshot/timestamp and are logically isolated,
+but the coordinator intentionally evaluates them in a bounded sequence and
+serializes durable writes rather than creating seven simultaneous SQLite
+writers. Candidate rotation is serial per strategy. The default assignment
+floor is both three elapsed days and 100 comparable paired observations. State
+survives restart in the schema-16 findings store.
 
 The LLM can submit one bounded research-only selection. Invalid selections and
 their reasons persist. Accepted selections queue and never preempt an active
@@ -23,15 +25,23 @@ verdict or authorize execution.
 
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
-creates only a `RESEARCH_ONLY` edge candidate; there is no automatic live
-promotion.
+creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
+current v3 forward qualification is still required and there is no automatic
+live promotion.
 
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
 used. Replay/G2 must reproduce the recorded decisions before downstream
-authoritative evidence is trusted. The older `forward-qualify` and T3 packet
-path is a strict reviewed evidence path, not an automatic strategy switch.
+authoritative evidence is trusted. The current v3 `forward-qualify` path uses
+eligible completed assignments and each setting's contemporaneous baseline.
+Its paired cluster sign-flip result is valid only under the documented
+cluster-delta sign-exchangeability/symmetric-null assumption.
+
+`research.py prepare-review-artifacts` runs after qualification and fails
+closed unless persisted edge evidence and every non-manual T3 check validate.
+It creates only an immutable/content-addressed draft: it cannot complete manual
+review, edit registry/configuration, or enable live trading.
 
 ## Exploratory tournament path
 
@@ -39,7 +49,7 @@ The tournament recomputes contracts against an explicitly supplied historical
 corpus. It scores every declared setting for strategies with an implemented
 historical tournament contract and required inputs; other registered
 strategies are retained as `NOT SCORED` rather than silently omitted. It
-records every run and failure in schema 14 and writes immutable artifacts beneath
+records every run and failure in schema 16 and writes immutable artifacts beneath
 `research/results/tournament/runs/`. Top-level tournament files are latest-view
 copies only. The tournament awards no tier above `T2_CANDIDATE` and cannot
 promote capital.
@@ -51,7 +61,9 @@ so their three settings each remain declared and are reported `NOT SCORED`.
 
 The one-time export at `vm-import/2026-07-30/` is read-only development/test
 evidence. Copy/extract it to a temporary directory. It is never a runtime data
-root or findings-store default.
+root or findings-store default. Its 3,520 legacy shadow decisions lack current
+stored outcomes and current provenance, so they are preserved for audit and
+rejected for promotion rather than converted into an invented edge.
 
 ## Commands
 
@@ -66,6 +78,7 @@ root or findings-store default.
 ./.venv/bin/python research.py forward-qualify
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
+./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet --variant <qualified-variant-id>
 ./.venv/bin/python research.py report
 ./.venv/bin/python research.py backup
@@ -76,7 +89,9 @@ root or findings-store default.
 Backups are versioned, checksummed, immediately verified, and never pruned by
 the application. `local_default` and `configured_local` are not VM-loss
 protection. `external_mounted` requires positive different-`st_dev` evidence;
-the mount must be provisioned outside this repository.
+the mount must be provisioned outside this repository. Complete
+manifest-bearing immutable snapshot trees are included; incomplete or
+in-progress snapshot directories are excluded.
 
 See [../OPERATIONS.md](../OPERATIONS.md) for the exact VM workflow and exit
 codes, [HYPOTHESES_AND_VARIANTS.md](HYPOTHESES_AND_VARIANTS.md) for identity

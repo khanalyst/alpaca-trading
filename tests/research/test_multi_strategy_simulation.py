@@ -26,7 +26,7 @@ def config():
         "paper_min_closed_trades": 100,
         "experiment_min_duration_days": 3,
         "experiment_min_observations": 1,
-        "forward_feed_version": 1,
+        "forward_feed_version": 2,
     }
     return cfg
 
@@ -178,9 +178,10 @@ class SameFeedCoordinatorTests(unittest.TestCase):
                 "observed_ts": now,
                 "detail": {"strategy_id": "flush-fade"},
             }], now=now)
-        completed = self.store.maybe_complete_experiment_assignment(
+        draining = self.store.maybe_complete_experiment_assignment(
             flush["assignment_id"], now=now + 3 * 86_400)
-        self.assertEqual(completed["status"], "COMPLETED")
+        self.assertEqual(draining["status"], "DRAINING")
+        self.assertGreater(draining["unresolved_actions"]["total"], 0)
         still_scalp = self.store.active_experiment_assignment(
             restarted.scope_key, "scalp-maker", now=now + 3 * 86_400)
         self.assertEqual(still_scalp["assignment_id"], scalp_assignment_id)
@@ -215,8 +216,43 @@ class ExecutableTradeLifecycleTests(unittest.TestCase):
                               if opened["direction"] == "long"
                               else float(opened["take_price"]) * 0.99)
 
+                entry_bar = int(now // 60 * 60_000)
+                if opened["direction"] == "long":
+                    bar_low = max(
+                        float(opened["stop_price"]) * 1.001,
+                        float(opened["entry_price"]) * 0.9998)
+                    bar_high = float(opened["take_price"]) * 1.01
+                else:
+                    bar_low = float(opened["take_price"]) * 0.99
+                    bar_high = min(
+                        float(opened["stop_price"]) * 0.999,
+                        float(opened["entry_price"]) * 1.0002)
+                fill_bar = {
+                    "timestamp_ms": entry_bar + 60_000,
+                    "open": float(opened["entry_price"]),
+                    "high": bar_high, "low": bar_low, "close": exit_price,
+                    "volume": 1_000.0, "complete": True,
+                }
+                enrichment = {
+                    **row["_enrichment"],
+                    "ticker_best_bid": exit_price,
+                    "ticker_best_ask": exit_price,
+                    "execution_bars": [fill_bar],
+                }
                 evaluator.advance(
-                    {SYMBOL: {**row, "price": exit_price}}, now=now + 60)
+                    {SYMBOL: {**row, "price": exit_price,
+                              "_enrichment": enrichment}}, now=now + 60)
+                if strategy_id == "scalp-maker":
+                    exit_bar = {
+                        **fill_bar, "timestamp_ms": entry_bar + 120_000,
+                    }
+                    evaluator.advance(
+                        {SYMBOL: {**row, "price": exit_price,
+                                  "_enrichment": {
+                                      **enrichment,
+                                      "execution_bars": [fill_bar, exit_bar],
+                                  }}},
+                        now=now + 120)
 
                 closed = store.paper_trades_for(
                     evaluator.scope_key, baseline.variant_id)

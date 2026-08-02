@@ -23,6 +23,7 @@ is suspect. That check is the reason this is a tournament and not a search.
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import hashlib
 import json
@@ -35,6 +36,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from math import isfinite
+from numbers import Integral, Real
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -59,6 +61,7 @@ except ImportError:  # tests and direct script execution
 
 
 HYPOTHESES = REPO / "research" / "hypotheses"
+DATA_MANIFEST_SCHEMA = "okx-history-snapshot.v1"
 
 
 class TournamentFailure(RuntimeError):
@@ -67,12 +70,141 @@ class TournamentFailure(RuntimeError):
         self.exit_code = exit_code
 
 
+def _strict_json(path: Path) -> object:
+    def reject_constant(token: str):
+        raise ValueError(f"non-finite JSON constant {token}")
+
+    return json.loads(
+        path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _csv_identity(path: Path) -> dict:
+    rows = 0
+    first = None
+    last = None
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames or "timestamp_ms" not in reader.fieldnames:
+            raise ValueError("missing timestamp_ms column")
+        for row in reader:
+            try:
+                timestamp = int(row["timestamp_ms"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid timestamp_ms value") from exc
+            rows += 1
+            first = timestamp if first is None else min(first, timestamp)
+            last = timestamp if last is None else max(last, timestamp)
+    return {
+        "sha256": _sha256_file(path),
+        "rows": rows,
+        "first_timestamp_ms": first,
+        "last_timestamp_ms": last,
+    }
+
+
+def validate_data_snapshot(root: Path) -> dict:
+    """Require an exact, untampered downloader snapshot before scoring."""
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise TournamentFailure(
+            f"data snapshot has no manifest.json: {root}", exit_code=2)
+    try:
+        manifest = _strict_json(manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise TournamentFailure(
+            f"data manifest is unreadable or non-standard JSON: {exc}",
+            exit_code=2) from exc
+    if not isinstance(manifest, dict):
+        raise TournamentFailure("data manifest must be a JSON object", 2)
+    if manifest.get("schema") != DATA_MANIFEST_SCHEMA:
+        raise TournamentFailure(
+            f"data manifest schema must be {DATA_MANIFEST_SCHEMA!r}; "
+            "legacy exports remain preserved but are not provenance-safe "
+            "tournament inputs", 2)
+    declared_rows = manifest.get("files")
+    if not isinstance(declared_rows, list):
+        raise TournamentFailure("data manifest files must be a list", 2)
+
+    linked = sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*")
+        if path.is_symlink())
+    if linked:
+        raise TournamentFailure(
+            "data snapshot contains symbolic links: " + ", ".join(linked), 2)
+    actual = {
+        path.relative_to(root).as_posix(): path
+        for path in root.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    declared: dict[str, dict] = {}
+    for item in declared_rows:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise TournamentFailure("data manifest has an invalid file entry", 2)
+        name = item["path"]
+        relative = Path(name)
+        if (relative.is_absolute() or ".." in relative.parts
+                or relative.as_posix() != name or name == "manifest.json"):
+            raise TournamentFailure(
+                f"data manifest has an unsafe file path: {name!r}", 2)
+        if name in declared:
+            raise TournamentFailure(
+                f"data manifest declares {name!r} more than once", 2)
+        declared[name] = item
+
+    missing = sorted(set(declared) - set(actual))
+    extra = sorted(set(actual) - set(declared))
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if extra:
+            details.append("extra: " + ", ".join(extra))
+        raise TournamentFailure(
+            "data snapshot membership mismatch (" + "; ".join(details) + ")",
+            2)
+
+    for name, expected in declared.items():
+        path = actual[name]
+        if path.suffix != ".csv":
+            raise TournamentFailure(
+                f"data snapshot contains unsupported file {name!r}", 2)
+        try:
+            observed = _csv_identity(path)
+        except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+            raise TournamentFailure(
+                f"data snapshot file {name!r} is invalid: {exc}", 2) from exc
+        for field in ("sha256", "rows", "first_timestamp_ms",
+                      "last_timestamp_ms"):
+            if expected.get(field) != observed[field]:
+                raise TournamentFailure(
+                    f"data snapshot {field} mismatch for {name!r}: "
+                    f"manifest={expected.get(field)!r}, "
+                    f"observed={observed[field]!r}", 2)
+    return manifest
+
+
+def _json_safe(value: object) -> object:
+    """Convert non-finite numeric output to JSON null recursively."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        number = float(value)
+        return number if isfinite(number) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _identity_name(path: Path) -> str:
@@ -149,7 +281,8 @@ def _identity_payload(args: argparse.Namespace) -> dict:
 
 def _json_write_once(path: Path, payload: object) -> None:
     with path.open("x", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+        json.dump(_json_safe(payload), handle, indent=2, sort_keys=True,
+                  default=str, allow_nan=False)
         handle.write("\n")
 
 
@@ -948,6 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
         store.start_tournament_run(run)
         start_recorded = True
 
+        validate_data_snapshot(args.data)
         frames = load_dataset(args.data, min_bars=args.min_bars)
         if not frames:
             raise TournamentFailure(
@@ -1020,8 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
 
         alert_on_tier_changes(ordered, payload)
 
-        (run_directory / "leaderboard.json").write_text(
-            json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+        _json_write_once(run_directory / "leaderboard.json", payload)
         write_report(run_directory / "REPORT.md", payload)
         _json_write_once(run_directory / "ERRORS.json", [])
         ended_ts = time.time()

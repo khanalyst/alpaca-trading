@@ -62,13 +62,27 @@ HOURLY_FIELDS = {
     "long_short_ratio": ["ts", "ccy", "long_short_ratio"],
     "taker_volume": ["ts", "ccy", "sell_vol", "buy_vol"],
     "open_interest": ["ts", "inst_id", "oi_contracts", "oi_ccy", "oi_usd"],
-    "funding": ["ts", "inst_id", "funding_rate", "next_funding_time"],
     # Actual filled liquidations: the DIRECT observation of the forced-flow
     # mechanism, rather than the open-interest proxy that flush-fade v1 used
     # and that was falsified. OKX serves only a short recent window, so this
     # exists only if it is recorded.
     "liquidations": ["ts", "inst_id", "side", "pos_side", "bk_px", "sz"],
 }
+
+# Keep these four columns first and unchanged: existing exports and readers
+# use them.  The additional columns distinguish a forecast observed before a
+# settlement from the rate OKX later says was actually settled.
+LEGACY_FUNDING_FIELDS = [
+    "ts", "inst_id", "funding_rate", "next_funding_time",
+]
+FUNDING_FIELDS = [
+    *LEGACY_FUNDING_FIELDS,
+    "observed_at", "settlement_time", "source", "status",
+    "forecast_rate", "realized_rate",
+]
+FUNDING_FORECAST_SOURCE = "/api/v5/public/funding-rate"
+FUNDING_REALIZED_SOURCE = "/api/v5/public/funding-rate-history"
+HOURLY_FIELDS["funding"] = FUNDING_FIELDS
 
 _running = True
 
@@ -122,6 +136,51 @@ class Recorder:
                 time.sleep(0.5 * (attempt + 1))
         return None
 
+    @staticmethod
+    def _row_key(series: str, row: dict) -> tuple[str, ...]:
+        instrument = str(row.get("inst_id") or row.get("ccy"))
+        if series != "funding":
+            return str(row.get("ts")), instrument
+
+        # A forecast changes as its settlement approaches.  Its settlement
+        # timestamp therefore cannot be its identity: doing that retained the
+        # first estimate and silently discarded every later observation.
+        status = str(row.get("status") or "legacy")
+        source = str(row.get("source") or "legacy")
+        settlement = str(row.get("settlement_time") or row.get("ts"))
+        if status == "forecast":
+            return (source, status, str(row.get("observed_at")), settlement,
+                    instrument)
+        # A realized history row is one immutable result per settlement.
+        return source, status, settlement, instrument
+
+    @staticmethod
+    def _upgrade_legacy_funding_header(path: Path, fields: list[str]) -> None:
+        """Add provenance columns without discarding an existing day file."""
+        if not path.exists():
+            return
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            existing = reader.fieldnames or []
+            if existing == fields:
+                return
+            if existing != LEGACY_FUNDING_FIELDS:
+                raise ValueError(
+                    f"unsupported funding CSV header in {path}: {existing}")
+            rows = list(reader)
+
+        temporary = path.with_suffix(path.suffix + ".schema.tmp")
+        try:
+            with temporary.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields,
+                                        extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            temporary.replace(path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
     def append(self, series: str, fields: list[str], rows: list[dict]) -> int:
         """Append rows to a per-day CSV, skipping ones already written.
 
@@ -133,19 +192,30 @@ class Recorder:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = self.out / series / f"{day}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
-        key_set = self.seen.setdefault(f"{series}:{day}", set())
-        if not key_set and path.exists():
-            try:
-                with path.open() as handle:
-                    for row in csv.DictReader(handle):
-                        key_set.add((row.get("ts"),
-                                     row.get("inst_id") or row.get("ccy")))
-            except Exception:
-                pass
+        if series == "funding":
+            self._upgrade_legacy_funding_header(path, fields)
+        # History returns the latest settlements on every poll.  Funding
+        # identity must therefore span day partitions or every new UTC day
+        # would write the same realized rows again.
+        seen_name = series if series == "funding" else f"{series}:{day}"
+        key_set = self.seen.setdefault(seen_name, set())
+        if not key_set:
+            existing_paths = (
+                sorted((self.out / series).glob("*.csv"))
+                if series == "funding" else [path]
+            )
+            for existing_path in existing_paths:
+                if not existing_path.exists():
+                    continue
+                try:
+                    with existing_path.open() as handle:
+                        for row in csv.DictReader(handle):
+                            key_set.add(self._row_key(series, row))
+                except Exception:
+                    pass
         fresh = []
         for row in rows:
-            key = (str(row.get("ts")),
-                   str(row.get("inst_id") or row.get("ccy")))
+            key = self._row_key(series, row)
             if key in key_set:
                 continue
             key_set.add(key)
@@ -260,14 +330,61 @@ class Recorder:
 
         rows = []
         for inst_id in instruments:
-            data = self.get("/api/v5/public/funding-rate",
+            data = self.get(FUNDING_FORECAST_SOURCE,
                             {"instId": inst_id}) or []
+            # Record when this process actually received the snapshot.  The
+            # endpoint's `ts` is an upstream update time, not our observation.
+            observed_at = int(time.time() * 1000)
             for item in data:
+                try:
+                    settlement_time = int(item["fundingTime"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                forecast_rate = item.get("fundingRate")
+                if forecast_rate in (None, ""):
+                    continue
                 rows.append({
-                    "ts": int(item.get("fundingTime") or time.time() * 1000),
+                    # `ts` and `funding_rate` remain compatibility aliases.
+                    "ts": settlement_time,
                     "inst_id": inst_id,
-                    "funding_rate": item.get("fundingRate"),
+                    "funding_rate": forecast_rate,
                     "next_funding_time": item.get("nextFundingTime"),
+                    "observed_at": observed_at,
+                    "settlement_time": settlement_time,
+                    "source": FUNDING_FORECAST_SOURCE,
+                    "status": "forecast",
+                    "forecast_rate": forecast_rate,
+                    "realized_rate": "",
+                })
+
+            # The current-rate endpoint is a moving forecast.  Poll history
+            # separately so settled rates are not inferred from that forecast.
+            history = self.get(
+                FUNDING_REALIZED_SOURCE,
+                {"instId": inst_id, "limit": "100"}) or []
+            observed_at = int(time.time() * 1000)
+            for item in history:
+                try:
+                    settlement_time = int(item["fundingTime"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                realized_rate = item.get("realizedRate")
+                if realized_rate in (None, ""):
+                    # Never infer a settled value from another response field.
+                    continue
+                rows.append({
+                    "ts": settlement_time,
+                    "inst_id": item.get("instId") or inst_id,
+                    "funding_rate": realized_rate,
+                    "next_funding_time": "",
+                    "observed_at": observed_at,
+                    "settlement_time": settlement_time,
+                    "source": FUNDING_REALIZED_SOURCE,
+                    "status": "realized",
+                    # A history row is not the forecast snapshot observed
+                    # before settlement. Keep that evidence in forecast rows.
+                    "forecast_rate": "",
+                    "realized_rate": realized_rate,
                 })
         written["funding"] = self.append(
             "funding", HOURLY_FIELDS["funding"], rows)
@@ -351,8 +468,11 @@ def main() -> int:
         "long_short_ratio/ retail positioning; ~30 day retention upstream\n"
         "taker_volume/     aggressor flow;    ~30 day retention upstream\n"
         "open_interest/    ~60 day retention upstream\n"
-        "funding/          ~97 day retention upstream\n"
-        "\nFiles are day-partitioned CSVs, deduplicated on (ts, instrument).\n")
+        "funding/          forecasts plus separately polled realized rates; "
+        "~97 day retention upstream\n"
+        "\nFiles are day-partitioned CSVs. Forecast identity includes "
+        "observed_at and settlement_time; realized rows are deduplicated by "
+        "settlement and instrument.\n")
 
     log.info("recording to %s", args.out)
     while _running:

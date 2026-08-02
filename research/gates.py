@@ -568,11 +568,12 @@ def tier_from_settings(settings: list[dict],
 
 
 def _significance_row(setting: dict) -> dict:
-    """The interval ``correct_family`` corrects, from one scored setting."""
+    """Return a calibrated test when one exists; otherwise correction refuses."""
     headline = setting.get("headline") or {}
     interval = headline.get("expectancy_r_ci95") or (float("nan"),) * 2
     return {"n": int(headline.get("trades") or 0),
-            "ci_low": interval[0], "ci_high": interval[1]}
+            "ci_low": interval[0], "ci_high": interval[1],
+            "p_value": headline.get("p_value")}
 
 
 def _finite_or(value, fallback: float) -> float:

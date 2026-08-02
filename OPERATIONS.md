@@ -5,15 +5,16 @@ seven isolated real-time research evaluators.
 
 ## 1. Runtime locations
 
-| Operation | Mac | Azure VM |
-| --- | --- | --- |
-| Development/tests | Primary | Optional pre-deployment check |
-| Demo trader | Foreground `main.py run` | `okx-trader.service` |
-| Market recorder | Foreground/manual | `okx-recorder.service` |
-| Nightly research | Manual | `okx-research.timer` |
-| Active journal | `runtime/demo/journal.db` | `/opt/okx-agent-crypto/runtime/demo/journal.db` |
-| Findings store | `research/cache/findings.db` | Same repository-relative path on the VM |
-| External backup | Optional mounted filesystem | `/srv/okx-agent-research-backup` on the persistent managed data disk |
+| Operation | Mac | systemd VM | Docker VM |
+| --- | --- | --- | --- |
+| Development/tests | Primary | Optional check | Image/CI build |
+| Demo trader | Foreground `main.py run` | `okx-trader.service` | `trader` (one replica) |
+| Market recorder | Foreground/manual | `okx-recorder.service` | `recorder` |
+| Nightly research | Manual | `okx-research.timer` | `research` scheduler |
+| Active journal | `runtime/demo/journal.db` | Repository runtime path | `runtime-data` volume |
+| Findings store | `research/cache/findings.db` | Repository cache path | `research-cache` volume |
+| Dashboard | None | CLI/reports | Loopback-only `dashboard` |
+| External backup | Optional mount | Managed data disk | Explicit verified host bind override |
 
 `vm-import/2026-07-30/` is read-only imported evidence for development and
 tests. It is never a default runtime, findings, tournament, recorder, or backup
@@ -45,6 +46,26 @@ sudo -u okx /opt/okx-agent-crypto/.venv/bin/python \
   --db /opt/okx-agent-crypto/runtime/demo/journal.db
 ```
 
+Docker VM:
+
+```bash
+cd /opt/okx-agent-crypto
+export OKX_AGENT_SECRET_FILE=/etc/okx-agent-crypto/agent.env
+export OKX_EXTERNAL_BACKUP_PATH=/srv/okx-agent-research-backup
+sudo -E docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml ps
+sudo -E docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml \
+  logs --tail=100 trader recorder research dashboard
+sudo -E docker compose -f compose.yaml \
+  -f deploy/compose.external-backup.yaml \
+  exec -T trader python main.py status
+```
+
+The dashboard is available only through host loopback. Use an SSH tunnel to
+`127.0.0.1:8080`; do not publish port 8080 on a public interface. It exposes
+only GET health/state/report APIs and is not given the Compose secret.
+
 `readiness` returns nonzero for a failed research gate or when no verified
 `external_mounted` backup exists. A default/configured-local backup is useful
 for recovery from a bad query, but it does not make deletion of the VM safe.
@@ -59,9 +80,11 @@ is treated as durably backed up.
 2. `research-loop`, which creates missing deterministic outcomes and reviews
    at most one pending result;
 3. corpus statistics and G2 replay when the journal exists;
-4. funnel, cadence, sweeps, three-arm analysis, forward qualification, and
-   scorecard regeneration;
-5. market-history refresh and journal forward-evidence export;
+4. funnel, cadence, sweeps, three-arm analysis, forward qualification,
+   fail-closed draft review-artifact preparation, and scorecard regeneration;
+5. one fresh immutable market-history snapshot under
+   `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
+   export;
 6. the exploratory tournament, with immutable per-run artifacts;
 7. one new verified backup.
 
@@ -77,8 +100,13 @@ Exact exit behavior:
 - a remembered readiness failure produces final exit 4 after the backup;
 - otherwise the tournament's exit status is returned.
 
-The research service is separate from `okx-trader.service`. Its failure is
-visible in systemd and does not restart or stop the trader.
+The research service is separate from `okx-trader.service`/the `trader`
+container. Its failure is visible in systemd or the Compose health/dashboard
+state and does not authorize trading or disappear into trader logs.
+While the nightly child is running, the scheduler atomically refreshes
+`runtime/health/research.json` every 30 seconds. The 180-second health window
+therefore remains green for a legitimate long run and turns stale only when
+the scheduler can no longer supervise and refresh the child.
 
 Run manually:
 
@@ -90,7 +118,14 @@ Run manually:
 
 All seven strategies receive the same cycle snapshot and timestamp. Each has
 an isolated paper account and durable assignment state. The configured two
-workers bound computation; they do not reduce the strategy set.
+workers bound computation; they do not reduce the strategy set. The lanes are
+logically isolated but intentionally evaluated in a bounded sequence with
+serialized durable writes. Seven simultaneous SQLite writers are not required
+for correctness.
+
+The active simulator identity is `forward_feed_version: 2`; all registered
+forward-model IDs end in `.v2`. Evidence recorded under feed/model v1 remains
+immutable history and is not pooled with the corrected execution semantics.
 
 Within each strategy:
 
@@ -100,7 +135,7 @@ Within each strategy:
    comparable paired observations are recorded (unless configuration raises
    those floors);
 4. accepted LLM selections queue without preempting the active assignment;
-5. restart reconstructs the same active assignment from schema 14;
+5. restart reconstructs the same active assignment from schema 16;
 6. terminal assignments produce one immutable `WORKED`, `FAILED`, or
    `INCONCLUSIVE` outcome with reasons and limitations.
 
@@ -108,6 +143,14 @@ Adequacy is evaluated before performance. An assignment can meet the rotation
 clock/count and still be `INCONCLUSIVE` because trades are unresolved, paired
 coverage is insufficient, two time segments cannot be formed, provenance is
 mixed, or a model/operational check failed.
+
+A `WORKED` outcome saves an immutable `RESEARCH_ONLY` `EDGE_CANDIDATE` lead
+with `promotion_allowed: false`; it does not satisfy the current v3
+forward-qualification protocol by itself. Qualification still requires the
+eligible completed assignment attempts, their contemporaneous baselines,
+held-out confirmation, and family correction. The paired cluster sign-flip
+test is conditional on cluster-delta sign exchangeability under a symmetric
+null, as documented in `research/protocol.md`.
 
 Run the deterministic closure without an LLM call:
 
@@ -124,14 +167,17 @@ Run closure plus one research-only LLM review:
 ## 5. Tournament
 
 The tournament needs an extracted research data directory containing the
-historical files and manifest, not a journal database.
+historical files and manifest, not a journal database. Current inputs must have
+an `okx-history-snapshot.v1` manifest that records every CSV's relative path,
+SHA-256, row count, and timestamp range. Missing, extra, changed, linked, or
+legacy files are refused before scoring.
 
 On the VM:
 
 ```bash
 cd /opt/okx-agent-crypto
 sudo -u okx .venv/bin/python research/tournament.py \
-  --data runtime/research/data \
+  --data runtime/research/snapshots/<UTC-timestamp> \
   --store research/cache/findings.db \
   --out research/results/tournament \
   --top-n 5 --workers 2
@@ -153,17 +199,21 @@ research/results/tournament/runs/<timestamp>-<run-id>/
 Success and failure runs are both retained. The top-level `REPORT.md` and
 `leaderboard.json` are latest-view copies only.
 
-Against the supplied one-time fixture, never write into the fixture itself:
+Each nightly run creates a new timestamped directory. `DATA_DIR`, when set,
+names that run's exact output directory; it must be absent or empty. The
+downloader refuses a non-empty directory instead of mixing old membership with
+a new universe. A partial failed download remains failure evidence and is not a
+valid tournament input; the next run uses another fresh directory.
+
+The supplied one-time fixture remains read-only historical evidence. Its legacy
+manifest is deliberately not accepted by the current tournament because it
+does not prove exact file membership and identities. It may be extracted for
+audit without treating it as current provenance-safe scoring input:
 
 ```bash
 fixture=$(mktemp -d)
 tar -xzf vm-import/2026-07-30/okx-research-files-2026-07-30.tgz \
   -C "$fixture"
-./.venv/bin/python research/tournament.py \
-  --data "$fixture/runtime/research/data" \
-  --store "$fixture/findings.db" \
-  --out "$fixture/tournament" \
-  --top-n 5 --workers 2
 ```
 
 Copy `vm-import/2026-07-30/okx-findings-2026-07-30.db` to the temporary
@@ -286,16 +336,17 @@ The supported verified backup includes:
 - `research/cache/findings.db` through SQLite's online backup API;
 - the active `runtime/demo/journal.db` through the same API;
 - files under `runtime/research/recorded`;
+- every regular file in each completed immutable tree under
+  `runtime/research/snapshots` (manifest present and no in-progress marker);
 - research manifest JSON files and `forward_evidence.json`; and
 - all files under `research/results`.
 
-It does not include the complete downloaded `runtime/research/data` cache.
-That cache remains under `/opt/okx-agent-crypto` and is read there by the
-tournament. Much of it can be downloaded again, but exact short-retention
-market inputs may not be reproducible. If exact preservation of that cache is
-required before VM deletion, copy it to separately retained storage or extend
-the backup implementation and verify it before calling the procedure
-zero-data-loss.
+Snapshot CSVs and their manifests retain the same path beneath
+`files/runtime/research/snapshots/` in the backup. `verify-backup` size- and
+SHA-256-checks each one, so a missing or changed raw input invalidates the
+backup. A directory still carrying `.download-in-progress`, or lacking a final
+manifest, is an incomplete download rather than immutable evidence and is not
+included.
 
 ## 7. Other research commands
 
@@ -308,15 +359,20 @@ zero-data-loss.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify --scope <scope>
+./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet \
   --variant <qualified-variant-id> --scope <scope> \
   --reviewed-by <reviewer> --registry-change-ref <change-reference>
 ./.venv/bin/python research.py report
 ```
 
-`forward-qualify` and T3 packets remain evidence tooling. They do not edit
-`agent/registry.py`, change `config.yaml`, switch the demo strategy, or deploy
-an edge to live trading.
+`prepare-review-artifacts` considers only variants with current v3
+qualification. It fails closed unless persisted edge evidence and every
+non-manual T3 checklist item validate, and it creates only an idempotent,
+immutable/content-addressed `DRAFT_REVIEW_REQUIRED` artifact. It cannot mark
+manual review complete, edit `agent/registry.py` or `config.yaml`, switch the
+demo strategy, or deploy an edge to live trading. The reviewed `t3-packet`
+record and any registry/configuration change remain explicit operator actions.
 
 ## 8. Interpreting results
 
@@ -325,7 +381,7 @@ an edge to live trading.
   `RESEARCH_ONLY` edge evidence.
 - `FAILED`: adequate evidence or a persisted gate showed failure.
 - `INCONCLUSIVE`: evidence cannot support success or failure.
-- `QUALIFIED`: older forward-axis research event, not an order instruction.
+- `QUALIFIED`: current v3 forward-axis research event, not an order instruction.
 - `REVOKED`: that evidence/account window is invalid and must not be reused.
 
 Both positive and negative findings remain in the store. Never infer an edge
@@ -334,18 +390,18 @@ from a point estimate, a tournament rank, or an LLM explanation.
 ## 9. Recovery and handoff
 
 Copy data; do not relocate the authoritative VM files. Preserve the active
-journal, findings DB, recorder data, manifests/forward evidence, all tournament
-run directories, and the backup manifest/checksum. The verified backup command
-captures these supported sources; committed `findings/` scorecards remain in
-Git.
+journal, findings DB, recorder data, immutable raw snapshots,
+manifests/forward evidence, all tournament run directories, and the backup
+manifest/checksum. The verified backup command captures these supported
+sources; committed `findings/` scorecards remain in Git.
 
 Before deleting or rebuilding the VM:
 
 1. require a recent `external_mounted` backup and rerun `verify-backup`;
 2. confirm the managed disk mount, separate `st_dev`, free space, and Azure
    **Detach** deletion behavior;
-3. preserve `runtime/research/data` separately when exact raw-cache retention
-   is required; and
+3. inspect the backup manifest for required
+   `files/runtime/research/snapshots/<UTC timestamp>` inputs; and
 4. preferably verify an Azure snapshot or attach a retained copy to a recovery
    VM and read its manifests there.
 
@@ -361,6 +417,17 @@ Before deleting or rebuilding the VM:
 | Review deferred | Deterministic outcome is safe; retry `research-loop` later |
 | Tournament benchmark failed | Keep the run as failure evidence; do not interpret rankings |
 | Findings DB missing | Check `research.findings_store`; there is no temporary fallback |
+| Trader stopped after Compose update | Expected safe `SIGTERM` pause; run `main.py check`, then explicitly `main.py resume` |
+| Recorder unhealthy | Trader startup remains blocked until a fresh recorder CSV exists |
+| Dashboard unreachable remotely | Expected loopback binding; use an SSH tunnel or private VPN |
+| VM `curl /healthz` works but Mac dashboard does not | The dashboard container is healthy; repair/restart the Mac SSH `LocalForward` tunnel and check whether local port 8080 is occupied. |
+| Dashboard scheduler is `missing` | The legacy systemd timer does not maintain the Compose scheduler heartbeat. Under Compose inspect the `research` container and `runtime/health/research.json`. |
+| SSH reports `Broken pipe` | The transport expired; VM services continue. Configure `ServerAliveInterval 30` and `ServerAliveCountMax 6` on the Mac. |
+| SSH reports `Permission denied (publickey)` | Repair `azureuser`'s public key and `.ssh` ownership/modes through Azure VMAccess or Run Command. Never copy the private key to the VM. |
+| `/opt/...` command fails on the Mac | `/opt/okx-agent-crypto` is a VM path. SSH to the VM and run it there. |
+| Migration cannot read systemd runtime files | Stop the services, grant temporary `u:10001:rX` ACL access, copy as UID 10001, then remove the ACL. |
+| Migration `chown` is not permitted | Do not force ownership changes. Copy as UID/GID 10001 without `cp -a`; `findings/` is initialized from the image and regenerated. |
+| Docker backup says different device | This is not off-host proof; verify host/cloud retention separately |
 
 The optional B7.5 maker-first order primitive remains disabled by default.
 `cycle.decision_interval_seconds`, `maker_first_enabled`,

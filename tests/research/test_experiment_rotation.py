@@ -373,7 +373,7 @@ class RotationMigrationTests(unittest.TestCase):
                 [row["name"] for row in migrated.migration_history()])
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-                "verified_external_mount_classification")
+                "paper_execution_evidence_and_validity")
             self.assertEqual(
                 migrated.pending_hypothesis_proposals("momentum")[0][
                     "proposal_id"], proposal["proposal_id"])

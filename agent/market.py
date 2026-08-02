@@ -68,44 +68,79 @@ def _funding_interval_hours(rate: dict) -> float | None:
 
 def _funding_history_context(ex, symbol: str,
                              current_rate_pct: float | None) -> dict:
-    """Summarize recent funding without sending raw history to the model."""
+    """Summarize funding and retain realized settlements for paper PnL.
+
+    The current/predicted funding endpoint is not settlement evidence. Only
+    an explicit OKX ``realizedRate`` is exposed to the simulator as settled
+    money. Historical ``fundingRate`` values remain forecast context for the
+    percentile features and are never relabelled as realized events. The raw
+    events remain hidden from the LLM.
+    """
+    empty = {
+        "funding_samples_30": 0,
+        "funding_mean_30_pct": None,
+        "funding_percentile_30": None,
+        "funding_change_pct": None,
+        "_realized_funding_events": [],
+    }
     fetcher = getattr(ex.x, "fetch_funding_rate_history", None)
-    if not callable(fetcher) or current_rate_pct is None:
-        return {
-            "funding_samples_30": 0,
-            "funding_mean_30_pct": None,
-            "funding_percentile_30": None,
-            "funding_change_pct": None,
-        }
-    try:
-        rows = ex.retry(fetcher, symbol, None, 30) or []
-    except Exception:
-        rows = []
+    if not callable(fetcher):
+        return empty
+    rows = _cached_series(
+        "funding_rate_history", symbol,
+        lambda: ex.retry(fetcher, symbol, None, 100),
+    ) or []
     rates = []
-    for row in rows[-30:]:
-        value = row.get("fundingRate")
-        if value in (None, ""):
-            value = (row.get("info") or {}).get("fundingRate")
+    events = []
+    for row in rows[-100:]:
+        info = row.get("info") or {}
+        forecast_value = row.get("fundingRate")
+        if forecast_value in (None, ""):
+            forecast_value = info.get("fundingRate")
         try:
-            number = float(value) * 100
+            forecast_number = float(forecast_value) * 100
+        except (TypeError, ValueError):
+            forecast_number = None
+        if forecast_number is not None and math.isfinite(forecast_number):
+            rates.append(forecast_number)
+
+        realized_value = row.get("realizedRate")
+        if realized_value in (None, ""):
+            realized_value = info.get("realizedRate")
+        try:
+            realized_number = float(realized_value) * 100
         except (TypeError, ValueError):
             continue
-        if math.isfinite(number):
-            rates.append(number)
-    if not rates:
-        return {
-            "funding_samples_30": 0,
-            "funding_mean_30_pct": None,
-            "funding_percentile_30": None,
-            "funding_change_pct": None,
-        }
+        if not math.isfinite(realized_number):
+            continue
+        raw_ts = row.get("timestamp")
+        if raw_ts in (None, ""):
+            raw_ts = info.get("fundingTime")
+        try:
+            timestamp_ms = int(float(raw_ts))
+        except (TypeError, ValueError):
+            continue
+        if timestamp_ms > 0:
+            events.append({
+                "timestamp_ms": timestamp_ms,
+                "rate_pct": round(realized_number, 8),
+                "source": "okx_funding_rate_history.realizedRate",
+                "status": "realized",
+            })
+    deduped = {event["timestamp_ms"]: event for event in events}
+    empty["_realized_funding_events"] = [
+        deduped[key] for key in sorted(deduped)]
+    if not rates or current_rate_pct is None:
+        return empty
+    recent = rates[-30:]
     percentile = (
-        sum(rate <= current_rate_pct for rate in rates) / len(rates) * 100)
+        sum(rate <= current_rate_pct for rate in recent) / len(recent) * 100)
     return {
-        "funding_samples_30": len(rates),
-        "funding_mean_30_pct": round(float(np.mean(rates)), 4),
+        "funding_samples_30": len(recent),
+        "funding_mean_30_pct": round(float(np.mean(recent)), 4),
         "funding_percentile_30": round(percentile, 1),
-        "funding_change_pct": round(current_rate_pct - rates[-1], 4),
+        "funding_change_pct": round(current_rate_pct - recent[-1], 4),
+        "_realized_funding_events": empty["_realized_funding_events"],
     }
 
 
@@ -321,6 +356,63 @@ def _closed_ohlcv(ex, symbol: str, timeframe: str, limit: int) -> list:
     return raw[-limit:]
 
 
+def _execution_bars(ex, symbol: str, limit: int = 30) -> list[dict]:
+    """Return observed 1m OHLCV bars, including the currently forming bar.
+
+    These bars are execution evidence, not signal features. They remain in
+    hidden enrichment so the paper engine can detect barrier crossings between
+    decision cycles without leaking an incomplete candle into the LLM.
+    """
+    raw = ex.retry(ex.x.fetch_ohlcv, symbol, "1m", None, limit) or []
+    bars: dict[int, dict] = {}
+    now_ms = int(time.time() * 1000)
+    for item in raw[-limit:]:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            raise ValueError(f"invalid 1m execution bar for {symbol}")
+        try:
+            ts = int(float(item[0]))
+            open_, high, low, close, volume = map(float, item[1:6])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"non-numeric 1m execution bar for {symbol}") from exc
+        values = (open_, high, low, close, volume)
+        if (ts <= 0 or ts > now_ms + 60_000
+                or not all(math.isfinite(value) for value in values)
+                or min(open_, high, low, close) <= 0
+                or high < max(open_, low, close)
+                or low > min(open_, high, close)
+                or volume < 0):
+            raise ValueError(f"invalid 1m execution bar for {symbol}")
+        bars[ts] = {
+            "timestamp_ms": ts,
+            "open": open_, "high": high, "low": low, "close": close,
+            "volume": volume,
+            "complete": ts + 60_000 <= now_ms,
+        }
+    return [bars[key] for key in sorted(bars)]
+
+
+def _ticker_timestamp(ticker: dict, symbol: str,
+                      max_age_seconds: float) -> tuple[int, float]:
+    raw = ticker.get("timestamp")
+    if raw in (None, ""):
+        raw = (ticker.get("info") or {}).get("ts")
+    try:
+        timestamp_ms = int(float(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{symbol} ticker has no exchange timestamp") from exc
+    if timestamp_ms <= 0:
+        raise ValueError(f"{symbol} ticker timestamp is invalid")
+    if timestamp_ms > time.time() * 1000 + 5_000:
+        raise ValueError(f"{symbol} ticker timestamp is in the future")
+    age_seconds = max(0.0, (time.time() * 1000 - timestamp_ms) / 1000)
+    if age_seconds > float(max_age_seconds):
+        raise ValueError(
+            f"{symbol} ticker is {age_seconds:.1f}s old; limit is "
+            f"{float(max_age_seconds):.1f}s")
+    return timestamp_ms, age_seconds
+
+
 def classify_regime(snap: dict) -> str:
     """Describe current conditions without deciding whether to trade them."""
     atr_ratio = float(snap.get("atr_1h_ratio") or 0)
@@ -449,6 +541,8 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     n = cfg["cycle"]["candles"]
     minimum = int(cfg["universe"]["min_history_candles"])
     ticker = ex.retry(ex.x.fetch_ticker, symbol)
+    ticker_ts, ticker_age = _ticker_timestamp(
+        ticker, symbol, cfg["execution"]["max_market_data_age_seconds"])
 
     frames: dict[str, pd.DataFrame] = {}
     for tf in tfs:
@@ -662,6 +756,9 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     lo = float(ticker.get("low") or 0)
     if hi > lo > 0:
         snap["range_pos_pct"] = round((last - lo) / (hi - lo) * 100, 0)
+    realized_funding_events = snap.pop("_realized_funding_events", [])
+    execution_bars = _execution_bars(ex, symbol)
+
     # Sanitize every field, not just indicators with known edge cases. Ticker,
     # funding and OHLCV adapters can all surface non-finite numeric values.
     snap = _json_safe(snap)
@@ -671,14 +768,92 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     # that deliberately tests it. Added after enrich_snapshot so it can never
     # reach a contract, and after _json_safe so it is sanitized in its own
     # right rather than by a pass that ran before it existed.
-    snap[brain.ENRICHMENT_KEY] = _json_safe(realised_vol_enrichment(
+    enrichment = realised_vol_enrichment(
         list(df_fast["close"]),
         utc_hour=int(time.gmtime(int(snap["signal_ts"]) / 1000).tm_hour),
-    ))
+    )
+    enrichment.update({
+        "ticker_ts": ticker_ts,
+        "ticker_age_seconds": round(ticker_age, 3),
+        "execution_bars": execution_bars,
+        "execution_bar_coverage_start_ms": (
+            execution_bars[0]["timestamp_ms"] if execution_bars else None),
+        "execution_bar_coverage_end_ms": (
+            execution_bars[-1]["timestamp_ms"] if execution_bars else None),
+        "realized_funding_events": realized_funding_events,
+    })
+    snap[brain.ENRICHMENT_KEY] = _json_safe(enrichment)
     return snap
 
 
+def _apply_ticker_refresh(ex, symbol: str, row: dict, ticker: dict,
+                          cfg: dict) -> None:
+    """Apply one final batch-observed ticker immediately before evaluation."""
+    timestamp_ms, age_seconds = _ticker_timestamp(
+        ticker, symbol, cfg["execution"]["max_market_data_age_seconds"])
+    last = float(ticker.get("last") or ticker.get("close") or 0)
+    if not math.isfinite(last) or last <= 0:
+        raise ValueError(f"{symbol} ticker price is invalid")
+    market = ex.x.market(symbol)
+    row["price"] = last
+    row["chg_24h_pct"] = round(float(ticker.get("percentage") or 0), 2)
+    row["vol_24h_musd"] = round(
+        quote_volume_usd(ticker, market) / 1e6, 1)
+    bid = float(ticker.get("bid") or 0)
+    ask = float(ticker.get("ask") or 0)
+    row["spread_pct"] = (
+        round((ask - bid) / ((ask + bid) / 2) * 100, 4)
+        if ask >= bid > 0 else None)
+    high = float(ticker.get("high") or 0)
+    low = float(ticker.get("low") or 0)
+    row["range_pos_pct"] = (
+        round((last - low) / (high - low) * 100, 0)
+        if high > low > 0 else None)
+    enrichment = dict(row.get(brain.ENRICHMENT_KEY) or {})
+    enrichment.update({
+        "ticker_ts": timestamp_ms,
+        "ticker_age_seconds": round(age_seconds, 3),
+        "ticker_best_bid": bid if bid > 0 else None,
+        "ticker_best_ask": ask if ask > 0 else None,
+    })
+    row[brain.ENRICHMENT_KEY] = _json_safe(enrichment)
+    row.update(_json_safe({
+        "price": row["price"], "chg_24h_pct": row["chg_24h_pct"],
+        "vol_24h_musd": row["vol_24h_musd"],
+        "spread_pct": row["spread_pct"], "range_pos_pct": row["range_pos_pct"],
+    }))
+    row["regime"] = classify_regime(row)
+    strategy.enrich_snapshot(row, cfg)
+
+
+def _refresh_batch_tickers(ex, snapshot: dict, cfg: dict) -> None:
+    """Refresh all executable prices together and drop any stale symbol."""
+    symbols = [symbol for symbol, row in snapshot.items()
+               if not symbol.startswith("_") and isinstance(row, dict)]
+    if not symbols:
+        return
+    try:
+        tickers = ex.retry(ex.x.fetch_tickers, symbols) or {}
+    except TypeError:
+        # Test adapters and older CCXT shims may not accept the symbols arg.
+        tickers = {
+            symbol: ex.retry(ex.x.fetch_ticker, symbol) for symbol in symbols}
+    except Exception as exc:
+        log.warning("batch ticker refresh failed: %s", exc)
+        tickers = {}
+    for symbol in symbols:
+        try:
+            ticker = tickers.get(symbol)
+            if not isinstance(ticker, dict):
+                raise ValueError(f"{symbol} missing from batch ticker response")
+            _apply_ticker_refresh(ex, symbol, snapshot[symbol], ticker, cfg)
+        except Exception as exc:
+            log.warning("final ticker validation failed for %s: %s", symbol, exc)
+            snapshot.pop(symbol, None)
+
+
 def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
+    capture_started_ms = int(time.time() * 1000)
     benchmark = "BTC/USDT:USDT"
     benchmark_returns = None
     context = {"benchmark": benchmark, "regime": None}
@@ -722,6 +897,26 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
                 out[sym] = symbol_snapshot(ex, sym, cfg, benchmark_returns)
         except Exception as e:
             log.warning("snapshot failed for %s: %s", sym, e)
+    # Slow indicator/statistics calls happen before this single final price
+    # refresh. Every strategy and configuration therefore evaluates the same
+    # near-atomic executable ticker batch rather than sequential stale marks.
+    _refresh_batch_tickers(ex, out, cfg)
+    capture_completed_ms = int(time.time() * 1000)
+    ticker_timestamps = [
+        int((row.get(brain.ENRICHMENT_KEY) or {}).get("ticker_ts"))
+        for symbol, row in out.items()
+        if not symbol.startswith("_") and isinstance(row, dict)
+        and (row.get(brain.ENRICHMENT_KEY) or {}).get("ticker_ts") is not None
+    ]
+    context.update({
+        "snapshot_started_at_ms": capture_started_ms,
+        "snapshot_completed_at_ms": capture_completed_ms,
+        "snapshot_capture_duration_ms": (
+            capture_completed_ms - capture_started_ms),
+        "ticker_timestamp_skew_ms": (
+            max(ticker_timestamps) - min(ticker_timestamps)
+            if ticker_timestamps else None),
+    })
     if len(out) > 1:
         context.update(_setup_crowding(out))
     return out if len(out) > 1 else {}

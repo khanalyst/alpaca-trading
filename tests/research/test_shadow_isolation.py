@@ -21,7 +21,8 @@ from agent.engine import Engine
 from agent.exchange import Exchange
 from research import findings
 from tests.helpers import valid_config
-from tests.research.test_enrichment_isolation import symbol_snapshot
+from tests.research.test_enrichment_isolation import (execution_enriched,
+                                                      symbol_snapshot)
 
 
 def variant(variant_id="momentum.rr.fixed_2_5", overrides=None):
@@ -35,7 +36,7 @@ def variant(variant_id="momentum.rr.fixed_2_5", overrides=None):
 
 
 def snapshot():
-    return {"BTC/USDT:USDT": symbol_snapshot(),
+    return {"BTC/USDT:USDT": execution_enriched(symbol_snapshot()),
             "_market_context": {"benchmark": "BTC/USDT:USDT"}}
 
 
@@ -204,7 +205,8 @@ class BudgetTests(unittest.TestCase):
             valid_config(), budget_ms=0.0001)
 
         records = evaluator.evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertTrue(evaluator.last_budget.overran)
         self.assertLess(len(records), 8)
@@ -219,7 +221,7 @@ class BudgetTests(unittest.TestCase):
                 shadow.ShadowBudget, "exhausted",
                 side_effect=[False, True]):
             records = evaluator.evaluate(
-                snapshot(), portfolio(), 1.0,
+                snapshot(), portfolio(), 1_760_000_000.0,
                 proposals=[proposal(), proposal(confidence=0.9)])
 
         self.assertEqual(len(records), 2)
@@ -233,7 +235,8 @@ class BudgetTests(unittest.TestCase):
             valid_config(), budget_ms=10_000)
 
         records = evaluator.evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertFalse(evaluator.last_budget.overran)
         self.assertEqual({r.variant_id for r in records},
@@ -276,11 +279,12 @@ class RecordedProposalTests(unittest.TestCase):
              for i in range(8)], valid_config(), budget_ms=0)
 
         evaluator.evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertEqual(len(evaluator.last_coverage["evaluated"]), 8)
 
-    def test_overdue_position_closes_at_last_mark_when_symbol_disappears(self):
+    def test_overdue_position_waits_for_fresh_market_data(self):
         evaluator = shadow.ShadowEvaluator(
             [variant()], valid_config(), budget_ms=0)
         opened_at = 1_760_000_000.0
@@ -294,10 +298,8 @@ class RecordedProposalTests(unittest.TestCase):
         trades = evaluator.store.paper_trades_for(
             evaluator.scope_key, variant().variant_id)
 
-        self.assertEqual(state["positions"], [])
-        self.assertEqual(trades[0]["status"], "CLOSED")
-        self.assertEqual(trades[0]["result"], "timeout")
-        self.assertEqual(trades[0]["exit_price"], trades[0]["entry_price"])
+        self.assertEqual(len(state["positions"]), 1)
+        self.assertEqual(trades[0]["status"], "OPEN")
 
 
 class EngineHookTests(unittest.TestCase):
@@ -624,6 +626,7 @@ class NonInterferenceTests(unittest.TestCase):
         original = cfg["strategy"]["fixed_reward_risk"]
 
         shadow.ShadowEvaluator([variant()], cfg).evaluate(
-            snapshot(), portfolio(), 1.0, proposals=[proposal()])
+            snapshot(), portfolio(), 1_760_000_000.0,
+            proposals=[proposal()])
 
         self.assertEqual(cfg["strategy"]["fixed_reward_risk"], original)

@@ -28,7 +28,7 @@ class FakeMarketClient:
 
     @staticmethod
     def parse_timeframe(timeframe):
-        return {"15m": 900, "1h": 3600, "4h": 14400}[timeframe]
+        return {"1m": 60, "15m": 900, "1h": 3600, "4h": 14400}[timeframe]
 
     def fetch_ohlcv(self, symbol, timeframe, since, limit):
         duration = self.parse_timeframe(timeframe) * 1000
@@ -50,6 +50,7 @@ class FakeMarketClient:
             "last": price, "percentage": 4.2, "quoteVolume": 100_000_000,
             "bid": price - 0.05, "ask": price + 0.05,
             "high": price + 5, "low": price - 5,
+            "timestamp": int(time.time() * 1000),
         }
 
     @staticmethod
@@ -63,8 +64,10 @@ class FakeMarketClient:
 
     @staticmethod
     def fetch_funding_rate_history(symbol, since, limit):
+        now = int(time.time() * 1000)
         return [
-            {"fundingRate": 0.00005 + index * 0.000001}
+            {"fundingRate": 0.00005 + index * 0.000001,
+             "timestamp": now - (limit - index) * 8 * 3_600_000}
             for index in range(limit)
         ]
 

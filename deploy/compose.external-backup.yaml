@@ -1,0 +1,12 @@
+# Optional override. OKX_EXTERNAL_BACKUP_PATH must already be a host mount
+# backed by storage that survives VM deletion; a normal host directory is not
+# off-host protection. See deploy/README.md before enabling this file.
+services:
+  research:
+    environment:
+      BACKUP_TARGET: /external-backup
+      REQUIRE_EXTERNAL_BACKUP: "1"
+    volumes:
+      - type: bind
+        source: ${OKX_EXTERNAL_BACKUP_PATH:?set OKX_EXTERNAL_BACKUP_PATH to a verified host mount}
+        target: /external-backup

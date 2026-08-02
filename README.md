@@ -26,11 +26,11 @@ research:
 | Order-executing strategy | `momentum/phase1-v3` |
 | Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol` |
-| Housekeeping cadence | `cycle.interval_seconds: 300` |
-| Decision cadence | `cycle.decision_interval_seconds` is unset, so decisions use the 300-second cadence |
+| Housekeeping cadence | `cycle.interval_seconds: 60` |
+| Decision cadence | `cycle.decision_interval_seconds: 300`; safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
-| Findings store | `research/cache/findings.db`, SQLite schema 14 |
-| Research feed | `forward_feed_version: 1` |
+| Findings store | `research/cache/findings.db`, SQLite schema 16 |
+| Research feed | `forward_feed_version: 2`; prior simulator evidence remains isolated |
 | Active research arms | 14: one baseline and at most one candidate for each of 7 strategies |
 | Shadow workers | `2`; all seven strategies still advance on the same cycle snapshot |
 | Experiment floor | both 3 elapsed days and 100 comparable paired observations |
@@ -61,8 +61,12 @@ On each eligible decision cycle:
    circuit breakers, decisions, and trades. `shadow_decision` rows include
    accepted actions and policy vetoes as explicit zero-return actions.
 6. Every strategy keeps its stable baseline running and tests at most one
-   candidate setting at a time. Strategies run logically in parallel; settings
-   rotate serially within each strategy and survive process restarts.
+   candidate setting at a time. The seven lanes are logically isolated over
+   the same frozen input, but the coordinator intentionally evaluates them in
+   a bounded sequence and serializes durable writes rather than creating seven
+   simultaneous SQLite writers. Physical wall-clock concurrency is not a
+   correctness requirement. Settings rotate serially within each strategy and
+   survive process restarts.
 
 Isolation runs both ways: research state and decisions are withheld from
 everything on the live path, while live account positions do not leak into a
@@ -119,12 +123,23 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion.
+promotion. It is an immutable research lead, and current v3 forward
+qualification is still required.
 
-The older `forward-qualify`/T3 path remains a stricter research evidence path.
-It proves one declared axis from the immutable decision ledger, including the
-non-axis executable configuration, held-out confirmation, and family
-correction. A T3 packet is a review artifact, not an execution instruction.
+The current `forward-qualify` path reconstructs v3 evidence from eligible
+completed assignments and each setting's contemporaneous baseline. It proves
+one declared axis from the immutable decision ledger, including the non-axis executable
+configuration, held-out confirmation, and family correction. Its
+paired cluster sign-flip test is valid only under the persisted
+cluster-delta sign-exchangeability/symmetric-null assumption; it is not an
+assumption-free p-value.
+
+`research.py prepare-review-artifacts` runs only after v3 qualification. It
+fails closed unless the saved edge evidence and every non-manual T3 check
+validate, then idempotently creates an immutable, content-addressed draft
+review artifact. It cannot complete manual review, edit the registry or
+configuration, switch strategies, or enable live trading. A reviewed T3 packet
+and any registry/configuration change remain explicit human actions.
 
 ## Evidence paths
 
@@ -137,7 +152,7 @@ correction. A T3 packet is a review artifact, not an execution instruction.
 
 The v6→v7 migration introduced the complete immutable decision ledger and its
 legacy watermark. Schema migration 7 therefore remains relevant to evidence
-validity even though the current findings store schema is 14.
+validity even though the current findings store schema is 16.
 
 Executable fingerprints cover the LLM provider/model, prompt, strategy and
 configuration, code, universe selection, and decision cadence; credentials are
@@ -156,7 +171,7 @@ its settings/results in the findings store, and writes completion or failure
 evidence. The top-level `REPORT.md` and `leaderboard.json` are only a latest
 view copied from the newest run; they are not the historical record.
 
-Research evidence tables in schema 14 use append-only rows and immutability
+Research evidence tables in schema 16 use append-only rows and immutability
 triggers where implemented. That protects against accidental SQL updates or
 deletes; it does not make the filesystem undeletable.
 
@@ -180,6 +195,11 @@ mounted device, not remote retention by itself.
 Legacy backup records without positive device evidence migrate conservatively
 to `configured_local` in schema 14.
 
+Complete manifest-bearing immutable trees under
+`runtime/research/snapshots/` are included in backups. In-progress directories
+and directories without a final manifest are excluded; every captured raw
+snapshot file is size- and SHA-256-verified.
+
 ## Commands
 
 ```bash
@@ -198,6 +218,7 @@ to `configured_local` in schema 14.
 ./.venv/bin/python research.py forward-qualify
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
+./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet --variant <qualified-variant-id>
 ./.venv/bin/python research.py report
 ./.venv/bin/python research.py backup
@@ -214,7 +235,9 @@ configured path cannot be used, the operation fails.
 development and tests. Copy its databases or extract its archive into a
 temporary directory before using them. Never configure the trader, findings
 store, recorder, tournament, or backup system to use this fixture as a default
-runtime location.
+runtime location. Its 3,520 legacy shadow decisions have no current stored
+outcomes or current provenance manifest, so they remain audit history and are
+rejected for promotion. Do not infer or manufacture an edge from them.
 
 ## B7.5 and current boundaries
 
@@ -249,6 +272,7 @@ external evidence, not a maintained documentation source.
 | [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) | Short compatibility pointer for Azure deployment. It directs operators to setup/operations and lists data that must survive VM loss. |
 | [MAIN_REPO_REVIEW_PLAN.md](MAIN_REPO_REVIEW_PLAN.md) | Reconciled closure record for the seven implementation topics and remaining environment-only actions. It is a status summary, not a second runbook. |
 | [V2_HARDENING_PLAN.md](V2_HARDENING_PLAN.md) | Concise record of the hardened foundations now present and the safety boundaries that remain intentional. |
+| [WIP_HANDOFF.md](WIP_HANDOFF.md) | Final implementation handoff, assessment reconciliation, validation record, and remaining environment/operator prerequisites. |
 | [deploy/README.md](deploy/README.md) | Purpose and ordering of the systemd trader, recorder, research service, and timer units. It also points to external-backup configuration. |
 
 ### Strategy and research documentation

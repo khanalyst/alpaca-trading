@@ -18,6 +18,7 @@ the documentation checks still refer to it.
 The VM contains data that cannot be recreated from the repository. Preserve:
 
 - `runtime/research/recorded`;
+- completed immutable trees under `runtime/research/snapshots`;
 - the active `journal.db`;
 - `research/cache/findings.db` and the versioned verified backup set;
 - the corpus manifest and research reports.

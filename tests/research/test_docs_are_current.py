@@ -294,7 +294,7 @@ class CurrentPipelineClaimsTests(unittest.TestCase):
     def test_current_findings_schema_is_documented(self):
         from research.findings import SCHEMA_VERSION
 
-        self.assertEqual(SCHEMA_VERSION, 14)
+        self.assertEqual(SCHEMA_VERSION, 16)
         for doc in (README, OPERATIONS, HYPOTHESES):
             self.assertIn(f"schema {SCHEMA_VERSION}", doc.lower())
 
@@ -336,7 +336,7 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
 
     def test_current_pipeline_and_schema_are_not_hidden(self):
         for phrase in ("all seven", "baseline", "at most one candidate",
-                       "WORKED", "FAILED", "INCONCLUSIVE", "schema 14"):
+                       "WORKED", "FAILED", "INCONCLUSIVE", "schema 16"):
             self.assertIn(phrase.lower(), README_FLOWED.lower())
 
     def test_research_results_never_claim_live_authority(self):

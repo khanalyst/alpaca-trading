@@ -29,6 +29,7 @@ STATE_FILE = RUNTIME / "state.json"
 PID_FILE = RUNTIME / "agent.pid"
 DB_FILE = RUNTIME / "journal.db"
 STATE_LOCK_FILE = RUNTIME / "state.lock"
+HEARTBEAT_FILE = RUNTIME / "heartbeat.json"
 
 log = logging.getLogger("state")
 
@@ -49,13 +50,14 @@ class RuntimeIdentityError(RuntimeError):
 
 def _set_runtime_paths(runtime: Path, scope: str) -> Path:
     global RUNTIME_SCOPE, RUNTIME, STATE_FILE, PID_FILE, DB_FILE
-    global STATE_LOCK_FILE
+    global STATE_LOCK_FILE, HEARTBEAT_FILE
     RUNTIME_SCOPE = scope
     RUNTIME = runtime
     STATE_FILE = runtime / "state.json"
     PID_FILE = runtime / "agent.pid"
     DB_FILE = runtime / "journal.db"
     STATE_LOCK_FILE = runtime / "state.lock"
+    HEARTBEAT_FILE = runtime / "heartbeat.json"
     _JOURNAL_CONTEXT.clear()
     return runtime
 
@@ -573,6 +575,46 @@ def set_state(name: str, reason: str | None = None, **extra) -> dict:
         st.update(extra)
         _write_atomic(_validate(st))
         return st
+
+
+def write_heartbeat(status: str, **detail) -> dict:
+    """Atomically publish a small, non-secret process-health record.
+
+    The heartbeat is deliberately separate from ``state.json``: health
+    polling must not contend with the operator control channel or make a
+    trading-state transition. Callers must pass only bounded operational
+    metadata, never credentials, request headers, or raw provider errors.
+    """
+    if status not in {
+            "starting", "running", "degraded", "pausing", "paused",
+            "killed", "stopped"}:
+        raise ValueError(f"unsupported heartbeat status {status!r}")
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": 1,
+        "status": status,
+        "updated_ts": time.time(),
+        "pid": os.getpid(),
+        "runtime_mode": (
+            RUNTIME_SCOPE if RUNTIME_SCOPE in {"demo", "live"} else None),
+        **detail,
+    }
+    tmp = HEARTBEAT_FILE.with_name(
+        f"{HEARTBEAT_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, HEARTBEAT_FILE)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    return payload
 
 
 def bind_runtime_identity(mode: str, api_key: str) -> str:

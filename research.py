@@ -3,7 +3,8 @@
 
 Nothing here touches the trading path. Commands read ``journal.db`` and, from
 batch 2 onward, a local price cache. A G2 check appends its pass/fail audit
-record to that journal; research evidence is persisted in schema 14. The
+record to that journal unless ``--no-persist`` is supplied; research evidence
+is persisted in schema 16. The
 dedicated ``research-loop`` command may call the LLM with a research-only
 prompt, and ``backup`` creates a new verified versioned snapshot. No command
 places an order or mutates trading state.
@@ -251,6 +252,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print(f"  {count:>6,}  {reason}")
 
     if args.check_fidelity:
+        persist_fidelity = not bool(getattr(args, "no_persist", False))
         if (args.variant not in ("live", "momentum.baseline")
                 or args.replay_mode != "recorded_llm"):
             print("G2 must use momentum.baseline in recorded_llm mode.",
@@ -260,8 +262,11 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print(f"\nG2 fidelity: {report['reproduction_rate']:.4%} "
               f"({report['matched']}/{report['recorded']} recorded "
               f"decisions reproduced)")
+        if not persist_fidelity:
+            print("G2 audit persistence disabled (--no-persist).")
         if report["vacuous"]:
-            _record_g2_result(db, "VACUOUS", report, result, cfg)
+            if persist_fidelity:
+                _record_g2_result(db, "VACUOUS", report, result, cfg)
             print("G2 VACUOUS: the corpus contains no recorded decisions, so "
                   "the replay\nreproduced 100% of nothing. That is not "
                   "evidence of fidelity. Run the agent\nuntil it has "
@@ -269,20 +274,23 @@ def cmd_replay(args: argparse.Namespace) -> int:
                   "number\ndownstream of this replay.", file=sys.stderr)
             return 4
         if report["recorded"] < readiness_mod.MIN_PROPOSALS_FOR_G2:
-            _record_g2_result(
-                db, "INSUFFICIENT_SAMPLE", report, result, cfg)
+            if persist_fidelity:
+                _record_g2_result(
+                    db, "INSUFFICIENT_SAMPLE", report, result, cfg)
             print(
                 f"G2 COLLECTING: {report['recorded']} recorded proposals; "
                 f"{readiness_mod.MIN_PROPOSALS_FOR_G2} are required before "
                 "this ratio can pass the gate.", file=sys.stderr)
             return 4
         if not report["passes_g2"]:
-            _record_g2_result(db, "FAILED", report, result, cfg)
+            if persist_fidelity:
+                _record_g2_result(db, "FAILED", report, result, cfg)
             print("G2 FAILED. Every number downstream of this replay is "
                   "worthless until it is explained. This is a full stop, "
                   "not a debugging task to work around.", file=sys.stderr)
             return 2
-        if not _record_g2_result(db, "PASS", report, result, cfg):
+        if (persist_fidelity
+                and not _record_g2_result(db, "PASS", report, result, cfg)):
             return 5
     return 0
 
@@ -715,10 +723,103 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_t3_packet(args: argparse.Namespace) -> int:
-    """Create a content-addressed, review-gated T3 evidence packet."""
+def _forward_assignment_ids(analysis: dict | None, variant_id: str) -> set[str]:
+    payload = (analysis or {}).get("payload") or {}
+    source = payload.get("source_evidence") or {}
+    setting = (source.get("settings") or {}).get(variant_id) or {}
+    return {
+        str(item.get("assignment_id") or "")
+        for item in setting.get("assignments") or []
+        if isinstance(item, dict) and item.get("assignment_id")}
+
+
+def _build_t3_payload(
+        cfg: dict, store: findings_mod.FindingsStore, variant_id: str,
+        scope: str, db: Path, *, manual_registry_review: bool,
+        created_from: str) -> dict:
+    """Build one review payload entirely from persisted, recomputable state."""
     from agent import state
 
+    qualification = store.qualification_status(variant_id, scope)
+    analysis = store.analysis(
+        str((qualification or {}).get("source_analysis_id") or ""))
+    paper = store.paper_summary(scope, variant_id, paper_only=True)
+    g2 = _latest_g2_payload(db)
+    proposal_count, max_proposal_ts = (
+        _proposal_snapshot(db) if db.exists() else (0, 0.0))
+    analysis_payload = (analysis or {}).get("payload") or {}
+    evidence = analysis_payload.get("evidence") or {}
+    eligibility = (
+        (analysis_payload.get("source_evidence") or {}).get("eligibility") or {})
+    experiment_provenances = [
+        eligibility.get("baseline_provenance"),
+        *list((eligibility.get("setting_provenances") or {}).values()),
+    ]
+    min_paper = int((cfg.get("research") or {}).get(
+        "paper_min_closed_trades") or 100)
+    g2_current = bool(
+        g2 and g2.get("status") == "PASS"
+        and int(g2.get("proposal_count", -1)) == proposal_count
+        and float(g2.get("max_proposal_ts", -1)) == max_proposal_ts
+        and g2.get("strategy_config_version") == state.strategy_fingerprint(cfg)
+        and g2.get("fidelity_code_version")
+        == replay_mod.fidelity_code_fingerprint())
+    assignment_ids = _forward_assignment_ids(analysis, variant_id)
+    edge_candidates = [
+        item for item in store.edge_candidates_for(
+            variant_id=variant_id, scope_key=scope)
+        if str(item["assignment_id"]) in assignment_ids]
+    checklist = {
+        "current_g2_pass": g2_current,
+        "held_out_confirmation": bool(
+            analysis_payload.get("verdict") == protocol.PROMOTE
+            and evidence.get("selection_window") == "fit"
+            and evidence.get("confirm_delta")),
+        "corpus_provenance": all(
+            analysis_payload.get(key) is not None for key in
+            ("corpus_from_ts", "corpus_to_ts", "resolved_outcomes")),
+        "config_provenance": bool(
+            experiment_provenances
+            and all(isinstance(item, dict)
+                    and item.get("strategy_config_version")
+                    for item in experiment_provenances)),
+        "code_provenance": bool(analysis_payload.get("code_version")),
+        "forward_sample": bool(
+            qualification and qualification.get("status") == "QUALIFIED"
+            and analysis_payload.get("source")
+            == "real_time_shadow_portfolios"),
+        "axis_family_corrected": bool(
+            ((qualification or {}).get("detail") or {})
+            .get("family", {}).get("significant")),
+        "saved_edge_candidate": bool(edge_candidates),
+        "paper_sample": int(paper.get("closed_trades") or 0) >= min_paper,
+        "paper_positive": bool(
+            paper.get("status") == "PAPER"
+            and paper.get("expectancy_r") is not None
+            and float(paper["expectancy_r"]) > 0
+            and not paper.get("revoked_reason")),
+        findings_mod.T3_MANUAL_CHECK: bool(manual_registry_review),
+    }
+    return {
+        "variant_id": variant_id,
+        "scope_key": scope,
+        "created_from": created_from,
+        "checklist": checklist,
+        "g2": g2,
+        "edge_candidates": edge_candidates,
+        "qualification": qualification,
+        "forward_analysis": analysis,
+        "paper_result": paper,
+        "current_provenance": {
+            "strategy_config_version": state.strategy_fingerprint(cfg),
+            "code_version": state.code_fingerprint(),
+            "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+        },
+    }
+
+
+def cmd_t3_packet(args: argparse.Namespace) -> int:
+    """Create a content-addressed, review-gated T3 evidence packet."""
     if bool(args.reviewed_by) != bool(args.registry_change_ref):
         print("--reviewed-by and --registry-change-ref must be supplied "
               "together", file=sys.stderr)
@@ -738,77 +839,78 @@ def cmd_t3_packet(args: argparse.Namespace) -> int:
         print("--scope is required when findings.db contains zero or multiple "
               "paper scopes", file=sys.stderr)
         return 2
-    qualification = store.qualification_status(args.variant, scope)
-    analysis = store.analysis(
-        str((qualification or {}).get("source_analysis_id") or ""))
-    paper = store.paper_summary(scope, args.variant, paper_only=True)
     db = Path(args.db) if args.db else default_db(args.mode)
-    g2 = _latest_g2_payload(db)
-    proposal_count, max_proposal_ts = (
-        _proposal_snapshot(db) if db.exists() else (0, 0.0))
-    analysis_payload = (analysis or {}).get("payload") or {}
-    evidence = analysis_payload.get("evidence") or {}
-    min_paper = int((cfg.get("research") or {}).get(
-        "paper_min_closed_trades") or 100)
-    g2_current = bool(
-        g2 and g2.get("status") == "PASS"
-        and int(g2.get("proposal_count", -1)) == proposal_count
-        and float(g2.get("max_proposal_ts", -1)) == max_proposal_ts
-        and g2.get("strategy_config_version") == state.strategy_fingerprint(cfg)
-        and g2.get("fidelity_code_version")
-        == replay_mod.fidelity_code_fingerprint())
-    checklist = {
-        "current_g2_pass": g2_current,
-        "held_out_confirmation": bool(
-            analysis_payload.get("verdict") == protocol.PROMOTE
-            and evidence.get("selection_window") == "fit"
-            and evidence.get("confirm_delta")),
-        "corpus_provenance": all(
-            analysis_payload.get(key) is not None for key in
-            ("corpus_from_ts", "corpus_to_ts", "resolved_outcomes")),
-        "config_provenance": bool(
-            analysis_payload.get("strategy_config_version")),
-        "code_provenance": bool(analysis_payload.get("code_version")),
-        "forward_sample": bool(
-            qualification and qualification.get("status") == "QUALIFIED"
-            and analysis_payload.get("source")
-            == "real_time_shadow_portfolios"),
-        "axis_family_corrected": bool(
-            ((qualification or {}).get("detail") or {})
-            .get("family", {}).get("significant")),
-        "paper_sample": int(paper.get("closed_trades") or 0) >= min_paper,
-        "paper_positive": bool(
-            paper.get("status") == "PAPER"
-            and paper.get("expectancy_r") is not None
-            and float(paper["expectancy_r"]) > 0
-            and not paper.get("revoked_reason")),
-        "manual_registry_review": bool(
+    payload = _build_t3_payload(
+        cfg, store, args.variant, scope, db,
+        manual_registry_review=bool(
             args.reviewed_by and args.registry_change_ref),
-    }
-    payload = {
-        "variant_id": args.variant,
-        "scope_key": scope,
-        "created_from": "research.py t3-packet",
-        "checklist": checklist,
-        "g2": g2,
-        "qualification": qualification,
-        "forward_analysis": analysis,
-        "paper_result": paper,
-        "current_provenance": {
-            "strategy_config_version": state.strategy_fingerprint(cfg),
-            "code_version": state.code_fingerprint(),
-            "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
-        },
-    }
+        created_from="research.py t3-packet")
     packet_id = store.create_t3_packet(
         args.variant, payload, reviewed_by=args.reviewed_by or "",
         registry_change_ref=args.registry_change_ref or "")
     packet = next(item for item in store.t3_packets_for(args.variant)
                   if item["packet_id"] == packet_id)
     print(f"T3 packet {packet_id}: {packet['review_status']}")
-    for name, passed in checklist.items():
+    print(f"  SHA-256 {packet['payload_hash']}")
+    print(f"  registry evidence reference: t3-packet:{packet['payload_hash']}")
+    for name, passed in payload["checklist"].items():
         print(f"  {'PASS' if passed else 'BLOCK'} {name}")
     print("No registry tier or live configuration was changed.")
+    return 0
+
+
+def cmd_prepare_review_artifacts(args: argparse.Namespace) -> int:
+    """Idempotently persist a draft T3 artifact for each ready evidence state."""
+    cfg = _load_config()
+    store = findings_mod.FindingsStore(
+        Path(args.store) if args.store else findings_mod.resolve_store_path(
+            (cfg.get("research") or {}).get("findings_store")))
+    db = Path(args.db) if args.db else default_db(args.mode)
+    scopes = [args.scope] if args.scope else sorted(store.paper_scopes())
+    non_manual = findings_mod.T3_REQUIRED_CHECKS - {
+        findings_mod.T3_MANUAL_CHECK}
+    created = existing = collecting = 0
+    for scope in scopes:
+        for variant_id in store.qualified_variant_ids(scope):
+            payload = _build_t3_payload(
+                cfg, store, variant_id, scope, db,
+                manual_registry_review=False,
+                created_from="research.py prepare-review-artifacts")
+            checklist = payload["checklist"]
+            blocked = sorted(
+                name for name in non_manual if not bool(checklist.get(name)))
+            if blocked:
+                collecting += 1
+                print(f"review artifact collecting for {variant_id} in "
+                      f"{scope}: {', '.join(blocked)}")
+                continue
+            if not store.t3_evidence_is_backed(variant_id, payload):
+                collecting += 1
+                print(f"review artifact collecting for {variant_id} in "
+                      f"{scope}: persisted evidence validation failed")
+                continue
+            prior_ids = {
+                packet["packet_id"]
+                for packet in store.t3_packets_for(variant_id)}
+            packet_id = store.create_t3_packet(variant_id, payload)
+            packet = next(
+                item for item in store.t3_packets_for(variant_id)
+                if item["packet_id"] == packet_id)
+            if packet_id in prior_ids:
+                existing += 1
+                print(f"review artifact already exists for {variant_id} in "
+                      f"{scope}: {packet_id}")
+            else:
+                created += 1
+                print(f"draft T3 review artifact {packet_id} for {variant_id} "
+                      f"in {scope}")
+            print(f"  SHA-256 {packet['payload_hash']}")
+    print(json.dumps({
+        "created": created,
+        "existing": existing,
+        "collecting": collecting,
+        "live_promotion": False,
+    }, sort_keys=True))
     return 0
 
 
@@ -840,6 +942,48 @@ def _configured_store(cfg: dict, requested: str | Path | None) -> Path:
         return Path(requested)
     return findings_mod.resolve_store_path(
         (cfg.get("research") or {}).get("findings_store"))
+
+
+def _latest_verified_external_backup_readonly(
+        store_path: str | Path) -> dict | None:
+    """Inspect backup evidence without creating or migrating a findings DB."""
+    path = Path(store_path)
+    if not path.is_file():
+        return None
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        tables = {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not {"backup_runs", "backup_verifications"}.issubset(tables):
+            return None
+        rows = conn.execute(
+            "SELECT run.*, verification.backup_path, "
+            "verification.verified_ts, verification.detail_json "
+            "FROM backup_runs AS run JOIN backup_verifications AS "
+            "verification ON verification.verification_id=("
+            "SELECT latest.verification_id FROM backup_verifications AS "
+            "latest WHERE latest.backup_id=run.backup_id "
+            "ORDER BY latest.verified_ts DESC, latest.rowid DESC LIMIT 1) "
+            "WHERE run.target_kind='external_mounted' "
+            "AND verification.status='VERIFIED' "
+            "ORDER BY verification.verified_ts DESC").fetchall()
+    for row in rows:
+        item = dict(row)
+        try:
+            target_evidence = json.loads(
+                item.get("target_evidence_json") or "{}")
+            detail = json.loads(item.get("detail_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if findings_mod._positive_external_target_evidence(target_evidence):
+            item["target_evidence"] = target_evidence
+            item["detail"] = detail
+            return item
+    return None
 
 
 def _configured_backup_target(
@@ -978,9 +1122,8 @@ def cmd_readiness(args: argparse.Namespace) -> int:
     gates, stats = readiness_mod.report(db if db.exists() else None, cfg)
     print(readiness_mod.format_report(
         gates, stats, db if db.exists() else f"{db} (absent)"))
-    store_path = _configured_store(cfg, None)
-    external = findings_mod.FindingsStore(
-        store_path).latest_verified_external_backup()
+    store_path = _configured_store(cfg, getattr(args, "store", None))
+    external = _latest_verified_external_backup_readonly(store_path)
     if external:
         print("\nexternal backup  PASS       latest different-device mounted "
               f"backup verified at {external['verified_ts']:.0f}")
@@ -1051,6 +1194,9 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument(
         "--check-fidelity", action="store_true",
         help="gate G2: assert the baseline reproduces recorded decisions")
+    replay_parser.add_argument(
+        "--no-persist", action="store_true",
+        help="run a fidelity check without appending its G2 audit event")
     replay_parser.set_defaults(func=cmd_replay)
 
     three = sub.add_parser(
@@ -1101,6 +1247,18 @@ def build_parser() -> argparse.ArgumentParser:
     forward.add_argument("--store", default=None,
                          help="findings.db path")
     forward.set_defaults(func=cmd_forward_qualify)
+
+    prepare = sub.add_parser(
+        "prepare-review-artifacts",
+        help="create draft T3 artifacts for fully ready paper evidence")
+    prepare.add_argument("--scope", default=None,
+                         help="runtime/account scope; all scopes by default")
+    prepare.add_argument("--store", default=None,
+                         help="findings.db path")
+    prepare.add_argument("--db", default=None,
+                         help="journal.db path used for current G2 evidence")
+    prepare.add_argument("--mode", default="demo", choices=["demo", "live"])
+    prepare.set_defaults(func=cmd_prepare_review_artifacts)
 
     t3 = sub.add_parser(
         "t3-packet",
@@ -1162,6 +1320,9 @@ def build_parser() -> argparse.ArgumentParser:
         "readiness",
         help="which gates are open, blocked, or still collecting")
     ready.add_argument("--db", default=None)
+    ready.add_argument(
+        "--store", default=None,
+        help="findings.db to inspect read-only; absent stores are not created")
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
 

@@ -99,11 +99,16 @@ class Engine:
         # Built once from the research block. None when shadow evaluation
         # is off, which makes the whole feature a no-op rather than a
         # default-on cost.
+        self._research_failure_count = 0
+        self._research_consecutive_failures = 0
+        self._research_last_failure: dict | None = None
+        self._research_last_success_ts: float | None = None
         self.shadow = self._build_shadow(cfg)
         self.universe: list[str] = []
         self.universe_ts = 0.0
         self._startup_reconciled = False
         self._credential_failures = 0
+        self._shutdown_reason: str | None = None
 
     def _record_research_proposals(
             self, decisions: list[dict]) -> list[dict]:
@@ -211,6 +216,55 @@ class Engine:
 
     # ------------------------------------------------------------ lifecycle
 
+    def request_shutdown(self, reason: str = "process shutdown") -> None:
+        """Ask the loop to pause safely after its current bounded operation."""
+        self._shutdown_reason = str(reason)[:80] or "process shutdown"
+
+    def _heartbeat(self, status: str, **detail) -> None:
+        """Publish health without ever turning observability into an order path."""
+        research_cfg = self.cfg.get("research") or {}
+        expected = bool(research_cfg.get("shadow_enabled"))
+        available = getattr(self, "shadow", None) is not None
+        failures = int(getattr(self, "_research_consecutive_failures", 0))
+        try:
+            state.write_heartbeat(
+                status,
+                run_id=getattr(self, "run_id", None),
+                strategy_id=getattr(self, "strategy_id", None),
+                strategy_version=getattr(self, "strategy_version", None),
+                research_expected=expected,
+                research_available=available,
+                research_status=(
+                    "disabled" if not expected else
+                    "unavailable" if not available else
+                    "degraded" if failures else "healthy"),
+                research_failure_count=int(getattr(
+                    self, "_research_failure_count", 0)),
+                research_consecutive_failures=failures,
+                research_last_failure=getattr(
+                    self, "_research_last_failure", None),
+                research_last_success_ts=getattr(
+                    self, "_research_last_success_ts", None),
+                **detail,
+            )
+        except Exception as exc:                           # noqa: BLE001
+            # A stale/missing heartbeat is itself an unhealthy signal. Do not
+            # let an auxiliary JSON file interrupt position protection.
+            log.error("Could not publish process heartbeat: %s", type(exc).__name__)
+
+    def _pause_for_shutdown(self) -> None:
+        reason = self._shutdown_reason or "process shutdown"
+        current = state.load_state()
+        if current["state"] == state.KILLED:
+            self._heartbeat("killed", stop_reason=reason)
+            return
+        log.warning(
+            "%s requested. State set to PAUSED; open positions retain their "
+            "exchange-side protection.", reason)
+        self._heartbeat("pausing", stop_reason=reason)
+        state.set_state(state.PAUSED, operator_pause=True)
+        self._heartbeat("paused", stop_reason=reason)
+
     def run(self, run_lock=None) -> None:
         owns_lock = run_lock is None
         if run_lock is None:
@@ -271,8 +325,20 @@ class Engine:
         log.info("Agent loop started | mode=%s | state=%s | llm=%s/%s",
                  self.cfg["mode"].upper(), st["state"],
                  self.cfg["llm"]["provider"], self.cfg["llm"]["model"])
+        initial_health = (
+            "degraded" if (self.cfg.get("research") or {}).get(
+                "shadow_enabled") and (
+                    getattr(self, "shadow", None) is None
+                    or self._research_consecutive_failures)
+            else "starting")
+        self._heartbeat(initial_health, trading_state=st["state"])
+        final_health = "stopped"
         try:
             while True:
+                if getattr(self, "_shutdown_reason", None):
+                    self._pause_for_shutdown()
+                    final_health = "stopped"
+                    break
                 st = state.load_state()
                 if st["state"] == state.KILLED:
                     if st.get("flatten_on_kill", True):
@@ -283,10 +349,20 @@ class Engine:
                         log.warning(
                             "Kill flag detected with keep-positions; exiting "
                             "without touching positions or protective orders.")
+                    final_health = "killed"
                     break
                 try:
                     self.cycle(st)
                     self._credential_failures = 0
+                    health = (
+                        "degraded" if (self.cfg.get("research") or {}).get(
+                            "shadow_enabled") and (
+                                getattr(self, "shadow", None) is None
+                                or self._research_consecutive_failures)
+                        else "running")
+                    self._heartbeat(
+                        health, trading_state=state.load_state()["state"],
+                        last_cycle_ts=time.time())
                 except SystemExit:
                     raise
                 except state.JournalError:
@@ -297,6 +373,9 @@ class Engine:
                 except Exception as e:
                     log.exception("Cycle error (agent continues): %s", e)
                     state.log_event("error", str(e))
+                    self._heartbeat(
+                        "degraded", trading_state=st["state"],
+                        last_cycle_error=type(e).__name__)
                     self.alerts.send(
                         "error", "cycle_error", "Trading cycle failed",
                         {"error": str(e)})
@@ -314,6 +393,7 @@ class Engine:
                 "critical", "journal_failure_stop",
                 "Agent stopped because its durable audit journal failed",
                 {"error": str(exc)})
+            final_health = "stopped"
         except KeyboardInterrupt:
             if state.load_state()["state"] == state.KILLED:
                 log.warning("Interrupted during a kill; state stays KILLED.")
@@ -322,7 +402,9 @@ class Engine:
                             "keep their exchange-side stop-loss/take-profit "
                             "orders on OKX.")
                 state.set_state(state.PAUSED)
+            final_health = "stopped"
         finally:
+            self._heartbeat(final_health)
             if owns_lock:
                 state.release_run_lock(run_lock)
 
@@ -362,7 +444,8 @@ class Engine:
         deadline = time.monotonic() + int(
             self.cfg["cycle"]["interval_seconds"])
         while time.monotonic() < deadline:
-            if state.load_state()["state"] == state.KILLED:
+            if (getattr(self, "_shutdown_reason", None)
+                    or state.load_state()["state"] == state.KILLED):
                 return
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
@@ -719,7 +802,7 @@ class Engine:
         symbols = list(dict.fromkeys(live_symbols + shadow_symbols))
         snapshot = market.market_snapshot(self.ex, symbols, self.cfg)
         if snapshot and evaluator is not None:
-            self._advance_shadow_variants(snapshot, now)
+            self._advance_shadow_variants(snapshot, time.time())
         # Everything below this line runs on the restricted view, so the live
         # decision is byte-identical to the one taken with shadow disabled.
         live_snapshot = market.restrict_snapshot(snapshot, live_symbols)
@@ -968,7 +1051,17 @@ class Engine:
                     "records": len(records),
                     "coverage": getattr(evaluator, "last_coverage", {}),
                 }))
+            self._research_consecutive_failures = 0
+            self._research_last_success_ts = time.time()
         except Exception as exc:                           # noqa: BLE001
+            self._research_failure_count = int(getattr(
+                self, "_research_failure_count", 0)) + 1
+            self._research_consecutive_failures = int(getattr(
+                self, "_research_consecutive_failures", 0)) + 1
+            self._research_last_failure = {
+                "phase": "evaluate", "type": type(exc).__name__,
+                "ts": time.time(),
+            }
             log.warning("Shadow variant evaluation failed: %s", exc)
             try:
                 state.log_event("shadow_failed", self._audit_json(
@@ -995,7 +1088,17 @@ class Engine:
                          else "variant_shadow_trade"),
                         self._audit_json(record.as_event()),
                         variant_id=record.variant_id)
+            self._research_consecutive_failures = 0
+            self._research_last_success_ts = time.time()
         except Exception as exc:                           # noqa: BLE001
+            self._research_failure_count = int(getattr(
+                self, "_research_failure_count", 0)) + 1
+            self._research_consecutive_failures = int(getattr(
+                self, "_research_consecutive_failures", 0)) + 1
+            self._research_last_failure = {
+                "phase": "advance", "type": type(exc).__name__,
+                "ts": time.time(),
+            }
             log.warning("Shadow portfolio advance failed: %s", exc)
             try:
                 state.log_event("shadow_failed", self._audit_json(
@@ -1569,11 +1672,29 @@ class Engine:
         except CredentialError:
             raise
         except Exception as exc:                           # noqa: BLE001
-            log.warning("maker-first attempt failed for %s, crossing: %s",
-                        symbol, exc)
+            audit = getattr(exc, "_order_audit", None) or {}
+            ambiguous = str(audit.get("outcome") or "").startswith(
+                "ambiguous")
+            log.warning(
+                "maker-first attempt failed for %s (%s): %s", symbol,
+                "crossing blocked" if ambiguous else "crossing allowed", exc)
             state.log_event("maker_attempt", self._audit_json({
                 "symbol": symbol, "outcome": "error",
-                "error": f"{type(exc).__name__}: {exc}"}))
+                "error": f"{type(exc).__name__}: {exc}",
+                "submission_audit": audit or None,
+                "crossing_fallback_allowed": not ambiguous,
+            }))
+            if ambiguous:
+                log.error(
+                    "maker-first result for %s is ambiguous; refusing the "
+                    "crossing fallback to prevent duplicate exposure", symbol)
+                self.alerts.send(
+                    "critical", "maker_order_ambiguous",
+                    f"Maker-first order state for {symbol} is ambiguous; "
+                    "the crossing fallback was blocked",
+                    {"symbol": symbol,
+                     "client_order_id": audit.get("client_order_id")})
+                return False
             return None
 
         journalled = {k: v for k, v in attempt.items() if k != "execution"}
@@ -2310,14 +2431,20 @@ class Engine:
             if symbol.startswith("_") or not isinstance(row, dict):
                 continue
             try:
-                observed = self.ex.book_state(symbol)
+                observed = self.ex.book_state(
+                    symbol,
+                    max_age_seconds=float(
+                        self.cfg["execution"]["max_market_data_age_seconds"]),
+                )
             except Exception as exc:                       # noqa: BLE001
                 observed = {
                     "mid": None, "best_bid": None, "best_ask": None,
                     "spread_pct": None, "bid_depth_usd": None,
                     "ask_depth_usd": None, "top_bid_size": None,
-                    "top_ask_size": None, "band_pct": None,
-                    "book_ts": None,
+                    "top_ask_size": None, "bid_levels": [],
+                    "ask_levels": [], "contract_size": None,
+                    "band_pct": None, "book_ts": None,
+                    "age_seconds": None,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             enrichment = dict(row.get(brain.ENRICHMENT_KEY) or {})
@@ -2334,8 +2461,16 @@ class Engine:
                     observed.get("top_bid_size")),
                 "book_top_ask_size": self._plain(
                     observed.get("top_ask_size")),
+                "book_bid_levels": self._plain(
+                    observed.get("bid_levels") or []),
+                "book_ask_levels": self._plain(
+                    observed.get("ask_levels") or []),
+                "book_contract_size": self._plain(
+                    observed.get("contract_size")),
                 "book_band_pct": self._plain(observed.get("band_pct")),
                 "book_ts": self._plain(observed.get("book_ts")),
+                "book_age_seconds": self._plain(
+                    observed.get("age_seconds")),
                 "book_observation_error": observed.get("error"),
             })
             row[brain.ENRICHMENT_KEY] = enrichment

@@ -37,7 +37,8 @@ def all_passing():
 
 
 def setting(setting_id, tier, *, expectancy_r=0.1, trades=400,
-            ci=(0.05, 0.15), gates_list=None, registered=False):
+            ci=(0.05, 0.15), p_value=None, gates_list=None,
+            registered=False):
     """One scored parameterisation, as tier_from_settings receives it."""
     return {
         "setting_id": setting_id, "params": {} if registered else {"x": 1},
@@ -46,7 +47,7 @@ def setting(setting_id, tier, *, expectancy_r=0.1, trades=400,
         "results": gates_list if gates_list is not None else all_passing(),
         "headline": {"trades": trades, "expectancy_r": expectancy_r,
                      "expectancy_pct": expectancy_r * 0.5,
-                     "expectancy_r_ci95": list(ci)},
+                     "expectancy_r_ci95": list(ci), "p_value": p_value},
     }
 
 
@@ -472,7 +473,7 @@ class SettingsAxisTests(unittest.TestCase):
             setting("registered", "T0_REJECTED", registered=True,
                     ci=(-0.3, -0.1), expectancy_r=-0.2),
             setting("violent_only", "T2_CANDIDATE", ci=(0.20, 0.30),
-                    expectancy_r=0.25),
+                    expectancy_r=0.25, p_value=0.001),
             setting("permissive", "T0_REJECTED", ci=(-0.2, -0.05),
                     expectancy_r=-0.1)])
 
@@ -498,7 +499,7 @@ class SettingsAxisTests(unittest.TestCase):
     def test_a_lone_setting_is_not_charged_for_a_search(self):
         tier, _, _ = gates.tier_from_settings(
             [setting("registered", "T2_CANDIDATE", registered=True,
-                     ci=(0.001, 0.400))])
+                     ci=(0.001, 0.400), p_value=0.04)])
 
         self.assertEqual(tier, "T2_CANDIDATE")
 

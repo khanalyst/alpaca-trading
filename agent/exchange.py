@@ -1197,7 +1197,8 @@ class Exchange:
             return 0.0
         return amt
 
-    def book_state(self, symbol: str, band_pct: float = 0.35) -> dict:
+    def book_state(self, symbol: str, band_pct: float = 0.35,
+                   max_age_seconds: float | None = None) -> dict:
         """Observe the order book without judging it.
 
         ``guarded_entry_limit`` reads the same book but only journals when it
@@ -1218,7 +1219,9 @@ class Exchange:
             "best_ask": None, "spread_pct": None,
             "bid_depth_usd": None, "ask_depth_usd": None,
             "top_bid_size": None, "top_ask_size": None,
-            "band_pct": float(band_pct), "book_ts": None, "error": None,
+            "bid_levels": [], "ask_levels": [], "contract_size": None,
+            "band_pct": float(band_pct), "book_ts": None,
+            "age_seconds": None, "error": None,
         }
         try:
             book = self.retry(self.x.fetch_order_book, symbol, 50)
@@ -1237,6 +1240,9 @@ class Exchange:
             mid = (best_bid + best_ask) / 2
             contract_size = float(
                 self.x.market(symbol).get("contractSize") or 1)
+            if not math.isfinite(contract_size) or contract_size <= 0:
+                blank["error"] = "invalid contract size"
+                return blank
             floor = mid * (1 - float(band_pct) / 100)
             ceiling = mid * (1 + float(band_pct) / 100)
 
@@ -1245,13 +1251,24 @@ class Exchange:
                 for level in levels:
                     price = float(level[0])
                     amount = float(level[1])
-                    if not (math.isfinite(price) and math.isfinite(amount)):
-                        continue
+                    if (not math.isfinite(price) or not math.isfinite(amount)
+                            or price <= 0 or amount < 0):
+                        raise ValueError("invalid order-book level")
                     if not inside(price):
                         break
                     total += price * amount * contract_size
                 return round(total, 2)
 
+            timestamp = book.get("timestamp")
+            age_seconds = None
+            if timestamp not in (None, ""):
+                timestamp = float(timestamp)
+                if math.isfinite(timestamp) and timestamp > 0:
+                    if timestamp > time.time() * 1000 + 5_000:
+                        blank["error"] = "order book timestamp is in the future"
+                        return blank
+                    age_seconds = max(
+                        0.0, (time.time() * 1000 - timestamp) / 1000)
             blank.update({
                 "mid": round(mid, 10),
                 "best_bid": best_bid,
@@ -1261,8 +1278,23 @@ class Exchange:
                 "ask_depth_usd": depth(asks, lambda p: p <= ceiling),
                 "top_bid_size": float(bids[0][1]),
                 "top_ask_size": float(asks[0][1]),
-                "book_ts": book.get("timestamp"),
+                # Preserve only the executable depth the simulator actually
+                # consumes. Amounts are contracts, matching OKX/CCXT.
+                "bid_levels": [[float(level[0]), float(level[1])]
+                               for level in bids[:50]],
+                "ask_levels": [[float(level[0]), float(level[1])]
+                               for level in asks[:50]],
+                "contract_size": contract_size,
+                "book_ts": timestamp,
+                "age_seconds": age_seconds,
             })
+            if timestamp in (None, "") or age_seconds is None:
+                blank["error"] = "order book has no valid exchange timestamp"
+            elif (max_age_seconds is not None
+                  and age_seconds > float(max_age_seconds)):
+                blank["error"] = (
+                    f"order book is {age_seconds:.1f}s old; limit is "
+                    f"{float(max_age_seconds):.1f}s")
             return blank
         except Exception as e:                      # observation, never a gate
             blank["error"] = f"{type(e).__name__}: {e}"
@@ -1286,6 +1318,8 @@ class Exchange:
         timestamp = float(timestamp)
         if not math.isfinite(timestamp) or timestamp <= 0:
             raise RuntimeError(f"{symbol} order book timestamp is invalid")
+        if timestamp > time.time() * 1000 + 5_000:
+            raise RuntimeError(f"{symbol} order book timestamp is in the future")
         age_seconds = max(0.0, (time.time() * 1000 - timestamp) / 1000)
         if age_seconds > float(max_age_seconds):
             raise RuntimeError(
@@ -1618,9 +1652,33 @@ class Exchange:
             # silently becoming the taker order this method exists to avoid.
             "postOnly": True,
         }
-        order = self.retry(self.x.create_order, symbol, "limit", side,
-                           contracts, limit, params)
+        # Order creation is deliberately single-shot. A generic retry can
+        # submit the same passive order twice after an ambiguous timeout,
+        # leaving duplicate exposure when the crossing fallback runs.
+        order = self._create_order_once(
+            symbol, "limit", side, contracts, limit, params, "okxmk")
         order_id = order.get("id")
+        if not order_id:
+            audit = dict(order.get("_submission_audit") or {})
+            recovered = self._recover_order(
+                symbol, str(audit.get("client_order_id") or ""))
+            if recovered:
+                recovered["_submission_audit"] = {
+                    **audit, "outcome": "recovered_missing_order_id",
+                    "recovery_attempted": True,
+                }
+                order = recovered
+                order_id = order.get("id")
+        if not order_id:
+            audit = dict(order.get("_submission_audit") or {})
+            audit.update({
+                "outcome": "ambiguous_unrecovered",
+                "recovery_attempted": True,
+            })
+            error = RuntimeError(
+                "maker-first order acknowledgement has no exchange order id")
+            setattr(error, "_order_audit", audit)
+            raise error
 
         deadline = time.time() + max(0.0, float(wait_seconds))
         filled = float(order.get("filled") or 0)

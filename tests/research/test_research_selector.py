@@ -247,8 +247,10 @@ class ResearchSelectorLifecycleTests(unittest.TestCase):
         duplicate = restarted.record_research_selection(
             parsed_selection(strategy_id, selected_variant),
             {**self.attribution, "cycle_id": "cycle-terminal-retry"})
-        self.assertEqual(duplicate["current_status"], "REJECTED")
-        self.assertIn("silent retest refused", duplicate["status_reason"])
+        self.assertEqual(duplicate["current_status"], "ACCEPTED")
+        self.assertEqual(
+            self.store.research_selection_events(duplicate["selection_id"])[0]
+            ["detail"]["retry_of_assignment_id"], assigned["assignment_id"])
 
     def test_parser_rejection_is_persisted_append_only(self):
         rejected = self.coordinator.record_research_selection(
@@ -395,7 +397,7 @@ class ResearchSelectorMigrationTests(unittest.TestCase):
             self.assertEqual(migrated.schema_version(), findings.SCHEMA_VERSION)
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-                "verified_external_mount_classification")
+                "paper_execution_evidence_and_validity")
             self.assertEqual(migrated.research_selections(), [])
             self.assertEqual(
                 migrated.active_experiment_assignment(

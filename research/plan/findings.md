@@ -9,7 +9,7 @@ The current system now has:
 
 - all seven strategies evaluated from one live snapshot with isolated state;
 - persisted baseline-plus-one assignments, bounded proposals/selections, and
-  exact values in FindingsStore schema 14;
+  exact values in FindingsStore schema 16;
 - immutable deterministic outcomes, reasons, reviews, and research-only edge
   candidates;
 - append-only tournament and verified-backup history.

@@ -240,7 +240,7 @@
               -0.19283969680860424
             ],
             "placebo_mean_pct": -0.2150509724696854,
-            "ratio": NaN
+            "ratio": null
           },
           "passed": false,
           "summary": "candidate expectancy is not positive; placebo not decisive"
@@ -681,7 +681,7 @@
               -0.20862965200023115
             ],
             "placebo_mean_pct": -0.2719416615312452,
-            "ratio": NaN
+            "ratio": null
           },
           "passed": false,
           "summary": "candidate expectancy is not positive; placebo not decisive"

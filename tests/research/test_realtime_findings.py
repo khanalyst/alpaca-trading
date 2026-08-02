@@ -9,10 +9,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agent import shadow, variants
-from research import findings, protocol
+from agent import shadow, state, variants
+from research import findings, protocol, replay
 from tests.helpers import valid_config
-from tests.research.test_enrichment_isolation import symbol_snapshot
+from tests.research.test_enrichment_isolation import (execution_enriched,
+                                                      symbol_snapshot)
 
 
 _CLI_SPEC = importlib.util.spec_from_file_location(
@@ -44,7 +45,7 @@ def trade(scope, variant_id, proposal_id, entry_ts):
         "direction": "long",
         "setup_type": "trend_continuation",
         "signal_ts": entry_ts * 1000,
-        "model_id": "momentum.fixed_rr.15m.v1",
+        "model_id": "momentum.fixed_rr.15m.v2",
         "assumptions": {"horizon_hours": 48},
         "entry_ts": entry_ts,
         "entry_price": 100.0,
@@ -77,7 +78,7 @@ def promotion_analysis_payload(scope, variant_id):
         "resolved_outcomes": 200,
         "strategy_config_version": "cfg",
         "code_version": "code",
-        "forward_model_id": "momentum.fixed_rr.15m.v1",
+        "forward_model_id": "momentum.fixed_rr.15m.v2",
         "evidence": {
             "best": variant_id,
             "n": 120,
@@ -363,7 +364,7 @@ class SchedulerAndPortfolioTests(StoreFixture):
         evaluator = shadow.ShadowEvaluator(
             [self.a], valid_config(), store=self.store, scope_key=scope)
         evaluator.evaluate(
-            {"BTC/USDT:USDT": symbol_snapshot()},
+            {"BTC/USDT:USDT": execution_enriched(symbol_snapshot())},
             now=1_760_000_000.0,
             proposals=[{
                 "symbol": "BTC/USDT:USDT", "action": "open",
@@ -387,7 +388,7 @@ class SchedulerAndPortfolioTests(StoreFixture):
         evaluator = shadow.ShadowEvaluator(
             [self.a], valid_config(), store=self.store, scope_key=scope)
         evaluator.evaluate(
-            {"BTC/USDT:USDT": symbol_snapshot()},
+            {"BTC/USDT:USDT": execution_enriched(symbol_snapshot())},
             now=1_760_000_000.0,
             proposals=[{
                 "symbol": "BTC/USDT:USDT", "action": "open",
@@ -577,65 +578,94 @@ class QualificationAndPacketTests(StoreFixture):
             "code_provenance": True,
             "forward_sample": True,
             "axis_family_corrected": True,
+            "saved_edge_candidate": True,
             "paper_sample": True,
             "paper_positive": True,
             "manual_registry_review": True,
         }
 
-    def qualifying_analysis(self, scope):
+    def assignment_fixture(self, scope, candidates):
         evaluator = shadow.ShadowEvaluator(
-            [self.v, self.baseline, self.control], valid_config(),
+            [self.baseline, *candidates], valid_config(),
             store=self.store, scope_key=scope)
-        for variant_id in evaluator.variant_ids:
-            state, version = self.store.load_paper_portfolio(
-                scope, variant_id)
-            state["decision_ledger_started_ts"] = 0.0
-            self.store.save_paper_portfolio(
-                scope, variant_id, state, version, now=0)
-        returns = {
-            self.baseline.variant_id: [
-                -0.2 if index % 2 else 0.1
-                for index in range(protocol.MIN_ROUND_TRIPS)],
-            self.v.variant_id: [
-                1.0 if index % 3 else 0.8
-                for index in range(protocol.MIN_ROUND_TRIPS)],
-            self.control.variant_id: [
-                0.2 if index % 2 else 0.1
-                for index in range(protocol.MIN_ROUND_TRIPS)],
-        }
-        rows = []
-        base_ts = 1_000.0
-        for variant_id, outcomes in returns.items():
+        descriptors = {}
+        for order, candidate in enumerate(candidates):
+            declared = variants.declared_research_setting(candidate)
+            code_identity, config_identity = shadow._identity_bundle(
+                evaluator._provenance[self.baseline.variant_id],
+                evaluator._provenance[candidate.variant_id])
+            descriptor = {
+                **declared,
+                "variant_id": candidate.variant_id,
+                "source": "static", "priority": order,
+                "order_key": f"{order:04d}:{candidate.variant_id}",
+                "code_identity": code_identity,
+                "config_identity": config_identity,
+            }
+            descriptor["candidate_key"] = findings._content_hash({
+                key: descriptor[key] for key in (
+                    "variant_id", "axis", "setting_id", "setting", "source",
+                    "code_identity", "config_identity")})
+            descriptors[candidate.variant_id] = descriptor
+        return evaluator, descriptors
+
+    def start_assignment(
+            self, scope, evaluator, descriptor, now,
+            retry_of_assignment_id=None):
+        del evaluator
+        return self.store.ensure_experiment_assignment(
+            scope, "momentum", self.baseline.variant_id, [descriptor],
+            minimum_duration_seconds=0, minimum_observations=1,
+            retry_of_assignment_id=retry_of_assignment_id, now=now)
+
+    def seed_assignment(
+            self, assignment, evaluator, baseline_returns, candidate_returns,
+            *, baseline_veto=False, candidate_veto=False):
+        self.assertEqual(len(baseline_returns), len(candidate_returns))
+        decisions = []
+        trades = []
+        for lane, variant_id, outcomes, vetoed in (
+                ("baseline", assignment["baseline_variant_id"],
+                 baseline_returns, baseline_veto),
+                ("candidate", assignment["candidate_variant_id"],
+                 candidate_returns, candidate_veto)):
             assumptions = json.dumps({
                 "forward_model": evaluator._models[variant_id].as_dict(),
                 "experiment_provenance": evaluator._provenance[variant_id],
             }, sort_keys=True)
             for index, outcome in enumerate(outcomes):
-                decision_ts = base_ts + index * protocol.PAIR_CLUSTER_SECONDS
-                rows.append({
-                    "trade_id": f"shadow-{variant_id}-{index}",
-                    "proposal_id": f"paired-{index}",
-                    "scope_key": scope,
+                decision_ts = (float(assignment["started_ts"]) + 1
+                               + index * protocol.PAIR_CLUSTER_SECONDS)
+                proposal_id = f"{assignment['assignment_id']}:paired:{index}"
+                trade_id = (None if vetoed else
+                            f"{assignment['assignment_id']}:{lane}:{index}")
+                decisions.append({
+                    "decision_id": f"{assignment['assignment_id']}:{lane}:d:{index}",
+                    "proposal_id": proposal_id,
+                    "scope_key": assignment["scope_key"],
                     "variant_id": variant_id,
-                    "cycle_id": f"cycle-{index}",
-                    "symbol": "BTC/USDT:USDT",
-                    "direction": "long",
-                    "setup_type": "trend_continuation",
-                    "signal_ts": index,
-                    "model_id": "momentum.fixed_rr.15m.v1",
+                    "cycle_id": f"{assignment['assignment_id']}:cycle:{index}",
+                    "symbol": "BTC/USDT:USDT", "direction": "long",
+                    "setup_type": "trend_continuation", "signal_ts": index,
+                    "confidence": 0.9,
+                    "decision_outcome": "VETOED" if vetoed else "PROPOSED",
+                    "reason": "fixture veto" if vetoed else None,
+                    "paper_trade_id": trade_id,
+                    "model_id": "momentum.fixed_rr.15m.v2",
                     "assumptions_json": assumptions,
-                    "entry_ts": decision_ts,
-                    "entry_price": 100.0,
-                    "notional": 1000.0,
-                    "risk_usd": 100.0,
-                    "stop_price": 90.0,
-                    "take_price": 120.0,
-                    "exit_ts": decision_ts + 1,
-                    "exit_price": 120.0,
-                    "result": "target" if outcome > 0 else "stop",
-                    "net_pnl_usd": outcome * 100.0,
-                    "r_multiple": outcome,
+                    "proposal_json": "{}", "decision_ts": decision_ts,
                 })
+                if not vetoed:
+                    trades.append({
+                        **decisions[-1], "trade_id": trade_id,
+                        "entry_ts": decision_ts, "entry_price": 100.0,
+                        "notional": 1000.0, "risk_usd": 100.0,
+                        "stop_price": 90.0, "take_price": 120.0,
+                        "exit_ts": decision_ts + 1, "exit_price": 120.0,
+                        "result": "target" if outcome >= 0 else "stop",
+                        "net_pnl_usd": outcome * 100.0,
+                        "r_multiple": outcome,
+                    })
         with sqlite3.connect(self.path) as conn:
             conn.executemany("""
                 INSERT INTO paper_trades (
@@ -650,7 +680,7 @@ class QualificationAndPacketTests(StoreFixture):
                     :assumptions_json, :entry_ts, :entry_price, :notional,
                     :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
                     :result, :net_pnl_usd, :r_multiple, 'CLOSED')
-            """, rows)
+            """, trades)
             conn.executemany("""
                 INSERT INTO paper_decisions (
                     decision_id, proposal_id, scope_key, variant_id, cycle_id,
@@ -658,11 +688,62 @@ class QualificationAndPacketTests(StoreFixture):
                     decision_outcome, reason, paper_trade_id, model_id,
                     assumptions_json, proposal_json, decision_ts)
                 VALUES (
-                    'decision-' || :trade_id, :proposal_id, :scope_key,
-                    :variant_id, :cycle_id, :symbol, :direction, :setup_type,
-                    :signal_ts, 0.9, 'PROPOSED', NULL, :trade_id, :model_id,
-                    :assumptions_json, '{}', :entry_ts)
-            """, rows)
+                    :decision_id, :proposal_id, :scope_key, :variant_id,
+                    :cycle_id, :symbol, :direction, :setup_type, :signal_ts,
+                    :confidence, :decision_outcome, :reason, :paper_trade_id,
+                    :model_id, :assumptions_json, :proposal_json, :decision_ts)
+            """, decisions)
+        return (float(assignment["started_ts"]) + 2
+                + len(baseline_returns) * protocol.PAIR_CLUSTER_SECONDS)
+
+    def complete_assignment(self, assignment, now):
+        self.store.record_experiment_observations(
+            assignment["assignment_id"],
+            [{"observation_key": f"{assignment['assignment_id']}:complete"}],
+            now=now - 1)
+        completed = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=now)
+        self.assertEqual(completed["status"], "COMPLETED")
+        return completed
+
+    def empty_assignment_analysis(self, scope):
+        evaluator, descriptors = self.assignment_fixture(
+            scope, [self.v, self.control])
+        first = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=1_000.0)
+        self.complete_assignment(first, 1_010.0)
+        second = self.start_assignment(
+            scope, evaluator, descriptors[self.control.variant_id],
+            now=1_100.0)
+        self.complete_assignment(second, 1_110.0)
+        analysis_id, _ = self.store.record_forward_analysis(
+            scope, "momentum", ["strategy.fixed_reward_risk"],
+            self.baseline.variant_id,
+            [self.v.variant_id, self.control.variant_id])
+        return (evaluator, descriptors, first,
+                self.store.analysis(analysis_id)["payload"])
+
+    def qualifying_analysis(self, scope):
+        evaluator, descriptors = self.assignment_fixture(
+            scope, [self.v, self.control])
+        baseline_returns = [
+            -0.2 if index % 2 else 0.1
+            for index in range(protocol.MIN_ROUND_TRIPS)]
+        assignment = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=1_000.0)
+        ended = self.seed_assignment(
+            assignment, evaluator, baseline_returns,
+            [1.0 if index % 3 else 0.8
+             for index in range(protocol.MIN_ROUND_TRIPS)])
+        self.complete_assignment(assignment, ended)
+        control_assignment = self.start_assignment(
+            scope, evaluator, descriptors[self.control.variant_id],
+            now=ended + 100.0)
+        control_ended = self.seed_assignment(
+            control_assignment, evaluator, baseline_returns,
+            [0.2 if index % 2 else 0.1
+             for index in range(protocol.MIN_ROUND_TRIPS)])
+        self.complete_assignment(control_assignment, control_ended)
         analysis_id, verdict = self.store.record_forward_analysis(
             scope, "momentum", ["strategy.fixed_reward_risk"],
             self.baseline.variant_id,
@@ -693,88 +774,20 @@ class QualificationAndPacketTests(StoreFixture):
             "momentum.conf.floor_0_60", {"risk.min_confidence": 0.60})
         for item in (low, middle):
             self.store.register(item)
-        evaluator = shadow.ShadowEvaluator(
-            [self.baseline, low, middle], valid_config(),
-            store=self.store, scope_key=scope)
-        for variant_id in evaluator.variant_ids:
-            state, version = self.store.load_paper_portfolio(
-                scope, variant_id)
-            state["decision_ledger_started_ts"] = 0.0
-            self.store.save_paper_portfolio(
-                scope, variant_id, state, version, now=0)
-        base_ts = 1_000.0
-        decision_rows = []
-        trade_rows = []
-        returns = {
-            low.variant_id: 1.0,
-            middle.variant_id: 0.25,
-        }
-        for variant_id in (
-                self.baseline.variant_id, low.variant_id, middle.variant_id):
-            assumptions = json.dumps({
-                "forward_model": evaluator._models[variant_id].as_dict(),
-                "experiment_provenance": evaluator._provenance[variant_id],
-            }, sort_keys=True)
-            for index in range(protocol.MIN_ROUND_TRIPS):
-                proposal_id = f"confidence-{index}"
-                decision_ts = (
-                    base_ts + index * protocol.PAIR_CLUSTER_SECONDS)
-                proposed = variant_id != self.baseline.variant_id
-                trade_id = (f"confidence-trade-{variant_id}-{index}"
-                            if proposed else None)
-                decision_rows.append({
-                    "decision_id": f"confidence-decision-{variant_id}-{index}",
-                    "proposal_id": proposal_id, "scope_key": scope,
-                    "variant_id": variant_id, "cycle_id": f"cycle-{index}",
-                    "symbol": "BTC/USDT:USDT", "direction": "long",
-                    "setup_type": "trend_continuation", "signal_ts": index,
-                    "confidence": 0.55,
-                    "decision_outcome": "PROPOSED" if proposed else "VETOED",
-                    "reason": None if proposed else "confidence below floor",
-                    "paper_trade_id": trade_id,
-                    "model_id": "momentum.fixed_rr.15m.v1",
-                    "assumptions_json": assumptions,
-                    "proposal_json": '{"confidence":0.55}',
-                    "decision_ts": decision_ts,
-                })
-                if proposed:
-                    outcome = returns[variant_id]
-                    trade_rows.append({
-                        **decision_rows[-1], "trade_id": trade_id,
-                        "entry_ts": decision_ts, "entry_price": 100.0,
-                        "notional": 1000.0, "risk_usd": 100.0,
-                        "stop_price": 90.0, "take_price": 120.0,
-                        "exit_ts": decision_ts + 1, "exit_price": 120.0,
-                        "result": "target", "net_pnl_usd": outcome * 100,
-                        "r_multiple": outcome,
-                    })
-        with sqlite3.connect(self.path) as conn:
-            conn.executemany("""
-                INSERT INTO paper_trades (
-                    trade_id, proposal_id, scope_key, variant_id, cycle_id,
-                    symbol, direction, setup_type, signal_ts, model_id,
-                    assumptions_json, entry_ts, entry_price, notional,
-                    risk_usd, stop_price, take_price, exit_ts, exit_price,
-                    result, net_pnl_usd, r_multiple, status)
-                VALUES (
-                    :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
-                    :symbol, :direction, :setup_type, :signal_ts, :model_id,
-                    :assumptions_json, :entry_ts, :entry_price, :notional,
-                    :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
-                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
-            """, trade_rows)
-            conn.executemany("""
-                INSERT INTO paper_decisions (
-                    decision_id, proposal_id, scope_key, variant_id, cycle_id,
-                    symbol, direction, setup_type, signal_ts, confidence,
-                    decision_outcome, reason, paper_trade_id, model_id,
-                    assumptions_json, proposal_json, decision_ts)
-                VALUES (
-                    :decision_id, :proposal_id, :scope_key, :variant_id,
-                    :cycle_id, :symbol, :direction, :setup_type, :signal_ts,
-                    :confidence, :decision_outcome, :reason, :paper_trade_id,
-                    :model_id, :assumptions_json, :proposal_json, :decision_ts)
-            """, decision_rows)
+        evaluator, descriptors = self.assignment_fixture(scope, [low, middle])
+        zero = [0.0] * protocol.MIN_ROUND_TRIPS
+        assignment = self.start_assignment(
+            scope, evaluator, descriptors[low.variant_id], now=1_000.0)
+        ended = self.seed_assignment(
+            assignment, evaluator, zero,
+            [1.0] * protocol.MIN_ROUND_TRIPS, baseline_veto=True)
+        self.complete_assignment(assignment, ended)
+        middle_assignment = self.start_assignment(
+            scope, evaluator, descriptors[middle.variant_id], now=ended + 100.0)
+        middle_ended = self.seed_assignment(
+            middle_assignment, evaluator, zero,
+            [0.25] * protocol.MIN_ROUND_TRIPS, baseline_veto=True)
+        self.complete_assignment(middle_assignment, middle_ended)
 
         _, verdict = self.store.record_forward_analysis(
             scope, "momentum", ["risk.min_confidence"],
@@ -786,18 +799,172 @@ class QualificationAndPacketTests(StoreFixture):
         self.assertEqual(
             verdict.evidence["paired"]["pair_coverage_pct"], 100.0)
 
+    def test_serial_assignment_evidence_keeps_every_attempt_and_own_baseline(self):
+        scope = "demo:serial-assignment-evidence"
+        evaluator, descriptors = self.assignment_fixture(
+            scope, [self.v, self.control])
+
+        first = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=1_000.0)
+        self.complete_assignment(first, 1_010.0)
+        retry = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=1_100.0,
+            retry_of_assignment_id=first["assignment_id"])
+        retry_ended = self.seed_assignment(
+            retry, evaluator, [0.0] * protocol.MIN_ROUND_TRIPS,
+            [1.0] * protocol.MIN_ROUND_TRIPS)
+        self.complete_assignment(retry, retry_ended)
+
+        later = self.start_assignment(
+            scope, evaluator, descriptors[self.control.variant_id],
+            now=retry_ended + 100.0)
+        later_ended = self.seed_assignment(
+            later, evaluator, [2.0] * protocol.MIN_ROUND_TRIPS,
+            [2.2] * protocol.MIN_ROUND_TRIPS)
+        self.complete_assignment(later, later_ended)
+
+        analysis_id, verdict = self.store.record_forward_analysis(
+            scope, "momentum", ["strategy.fixed_reward_risk"],
+            self.baseline.variant_id,
+            [self.v.variant_id, self.control.variant_id])
+        analysis_payload = self.store.analysis(analysis_id)["payload"]
+        source = analysis_payload["source_evidence"]
+        first_setting = source["settings"][self.v.variant_id]["assignments"]
+        second_setting = source["settings"][self.control.variant_id]["assignments"]
+
+        self.assertEqual(source["schema"], "paper_decision_evidence.v3")
+        self.assertEqual(
+            [row["assignment_id"] for row in first_setting],
+            [first["assignment_id"], retry["assignment_id"]])
+        self.assertEqual(first_setting[1]["attempt"], 2)
+        self.assertEqual(
+            first_setting[1]["retry_of_assignment_id"], first["assignment_id"])
+        self.assertEqual(
+            [row["assignment_id"] for row in second_setting],
+            [later["assignment_id"]])
+        self.assertEqual(verdict.evidence["best"], self.v.variant_id)
+
+        proposal_sets = []
+        for setting in (first_setting, second_setting):
+            for assignment in setting:
+                baseline_ids = {
+                    row["proposal_id"]
+                    for row in assignment["baseline"]["decisions"]}
+                candidate_ids = {
+                    row["proposal_id"]
+                    for row in assignment["candidate"]["decisions"]}
+                self.assertEqual(baseline_ids, candidate_ids)
+                if baseline_ids:
+                    proposal_sets.append(baseline_ids)
+        self.assertTrue(proposal_sets[0].isdisjoint(proposal_sets[1]))
+
+        tampered = json.loads(json.dumps(analysis_payload))
+        tampered_source = tampered["source_evidence"]
+        tampered_source["settings"][self.v.variant_id]["assignments"] = [
+            tampered_source["settings"][self.v.variant_id]["assignments"][1]]
+        tampered_source["sha256"] = (
+            findings.FindingsStore._forward_v3_source_hash(tampered_source))
+        with findings._connect(self.path) as conn:
+            with self.assertRaisesRegex(ValueError, "every eligible assignment"):
+                findings.FindingsStore._forward_verdict_from_payload(
+                    conn, tampered)
+
+    def test_forward_analysis_rejects_matching_unfinished_attempts(self):
+        scope = "demo:unfinished-assignment-evidence"
+        evaluator, descriptors, first, payload = (
+            self.empty_assignment_analysis(scope))
+        cutoff = payload["source_evidence"]["completed_through_ts"]
+        active = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=cutoff,
+            retry_of_assignment_id=first["assignment_id"])
+        self.assertEqual(active["status"], "OBSERVING")
+        message = (
+            rf"{active['assignment_id']}.*unfinished at status OBSERVING")
+
+        with self.assertRaisesRegex(ValueError, message):
+            self.store.record_forward_analysis(
+                scope, "momentum", ["strategy.fixed_reward_risk"],
+                self.baseline.variant_id,
+                [self.v.variant_id, self.control.variant_id])
+        with findings._connect(self.path) as conn:
+            with self.assertRaisesRegex(ValueError, message):
+                findings.FindingsStore._forward_verdict_from_payload(
+                    conn, payload)
+
+    def test_forward_analysis_rejects_matching_rejected_attempts(self):
+        scope = "demo:rejected-assignment-evidence"
+        evaluator, descriptors, first, payload = (
+            self.empty_assignment_analysis(scope))
+        cutoff = payload["source_evidence"]["completed_through_ts"]
+        rejected = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=cutoff,
+            retry_of_assignment_id=first["assignment_id"])
+        rejected = self.store.reject_experiment_assignment(
+            rejected["assignment_id"], "market data gap", now=cutoff)
+        self.assertEqual(rejected["status"], "REJECTED")
+        message = rf"{rejected['assignment_id']}.*REJECTED: market data gap"
+
+        with self.assertRaisesRegex(ValueError, message):
+            self.store.record_forward_analysis(
+                scope, "momentum", ["strategy.fixed_reward_risk"],
+                self.baseline.variant_id,
+                [self.v.variant_id, self.control.variant_id])
+        with findings._connect(self.path) as conn:
+            with self.assertRaisesRegex(ValueError, message):
+                findings.FindingsStore._forward_verdict_from_payload(
+                    conn, payload)
+
+    def test_legacy_v2_forward_evidence_remains_recomputable(self):
+        analysis_id = self.qualifying_analysis("demo:v2-read-compatibility")
+        payload = self.store.analysis(analysis_id)["payload"]
+        source = payload["source_evidence"]
+        arms = {
+            self.baseline.variant_id: {
+                "experiment_provenance":
+                    source["eligibility"]["baseline_provenance"],
+                "decisions": [],
+            },
+        }
+        for variant_id, setting in source["settings"].items():
+            arms[variant_id] = {
+                "experiment_provenance": source["eligibility"]
+                    ["setting_provenances"][variant_id],
+                "decisions": [],
+            }
+            for assignment in setting["assignments"]:
+                arms[self.baseline.variant_id]["decisions"].extend(
+                    assignment["baseline"]["decisions"])
+                arms[variant_id]["decisions"].extend(
+                    assignment["candidate"]["decisions"])
+        legacy_payload = {
+            **payload,
+            "source_evidence": {
+                "schema": "paper_decision_evidence.v2",
+                "baseline_id": self.baseline.variant_id,
+                "setting_ids": [self.v.variant_id, self.control.variant_id],
+                "arms": arms, "sha256": findings._content_hash(arms),
+            },
+        }
+
+        with findings._connect(self.path) as conn:
+            verdict = findings.FindingsStore._forward_verdict_from_payload(
+                conn, legacy_payload)
+
+        self.assertIn(verdict.verdict, {
+            protocol.PROMOTE, protocol.CONTINUE, protocol.REJECT,
+            protocol.INSUFFICIENT_SAMPLE,
+        })
+
     def test_forward_analysis_rejects_operational_failures_in_evidence_window(self):
         scope = "demo:operational-failure"
-        evaluator = shadow.ShadowEvaluator(
-            [self.v, self.baseline, self.control], valid_config(),
-            store=self.store, scope_key=scope)
-        ledger_starts = []
-        for variant_id in evaluator.variant_ids:
-            state, _ = self.store.load_paper_portfolio(scope, variant_id)
-            ledger_starts.append(float(state["decision_ledger_started_ts"]))
+        evaluator, descriptors = self.assignment_fixture(
+            scope, [self.v, self.control])
+        assignment = self.start_assignment(
+            scope, evaluator, descriptors[self.v.variant_id], now=1_000.0)
         self.store.record_paper_failure(
             scope, self.v.variant_id, "variant_evaluation_failed", {},
-            now=max(ledger_starts) + 1)
+            now=1_001.0)
+        self.complete_assignment(assignment, 1_010.0)
 
         with self.assertRaisesRegex(ValueError, "operational failure"):
             self.store.record_forward_analysis(
@@ -817,8 +984,14 @@ class QualificationAndPacketTests(StoreFixture):
             self.v.variant_id, scope)
         source = self.store.analysis(analysis_id)["payload"]["source_evidence"]
         postqualification = []
-        for variant_id, arm in source["arms"].items():
-            decision = arm["decisions"][0]
+        templates = {}
+        for setting in source["settings"].values():
+            for assignment in setting["assignments"]:
+                for lane in ("baseline", "candidate"):
+                    arm = assignment[lane]
+                    templates.setdefault(
+                        arm["variant_id"], arm["decisions"][0])
+        for variant_id, decision in templates.items():
             postqualification.append({
                 "decision_id": f"postqualification-{variant_id}",
                 "proposal_id": "postqualification-proposal",
@@ -860,14 +1033,13 @@ class QualificationAndPacketTests(StoreFixture):
 
         self.assertEqual(verdict.verdict, protocol.PROMOTE)
         self.assertEqual(
-            replay["source_evidence"]["decision_ledger_to_ts"],
-            qualification["ts"])
-        for arm in replay["source_evidence"]["arms"].values():
-            self.assertEqual(
-                len(arm["decisions"]), protocol.MIN_ROUND_TRIPS)
-            self.assertFalse(any(
-                row["decision_id"].startswith("postqualification-")
-                for row in arm["decisions"]))
+            replay["source_evidence"]["settings"], source["settings"])
+        for setting in replay["source_evidence"]["settings"].values():
+            for assignment in setting["assignments"]:
+                for lane in ("baseline", "candidate"):
+                    self.assertFalse(any(
+                        row["decision_id"].startswith("postqualification-")
+                        for row in assignment[lane]["decisions"]))
 
     def test_forward_analysis_rejects_a_mislabeled_axis(self):
         scope = "demo:mislabeled-axis"
@@ -983,7 +1155,7 @@ class QualificationAndPacketTests(StoreFixture):
                 "direction": "long",
                 "setup_type": "trend_continuation",
                 "signal_ts": index,
-                "model_id": "momentum.fixed_rr.15m.v1",
+                "model_id": "momentum.fixed_rr.15m.v2",
                 "assumptions_json": "{}",
                 "entry_ts": 11 + index,
                 "entry_price": 100.0,
@@ -1012,6 +1184,13 @@ class QualificationAndPacketTests(StoreFixture):
                     :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
                     :result, :net_pnl_usd, :r_multiple, 'CLOSED')
             """, rows)
+        analysis = self.store.analysis(analysis_id)
+        assignment_ids = research_cli._forward_assignment_ids(
+            analysis, self.v.variant_id)
+        edge_candidates = [
+            item for item in self.store.edge_candidates_for(
+                variant_id=self.v.variant_id, scope_key=scope)
+            if item["assignment_id"] in assignment_ids]
         return {
             "variant_id": self.v.variant_id,
             "scope_key": scope,
@@ -1021,7 +1200,8 @@ class QualificationAndPacketTests(StoreFixture):
                 "fidelity_code_version": "fidelity"},
             "qualification": self.store.qualification_status(
                 self.v.variant_id, scope),
-            "forward_analysis": self.store.analysis(analysis_id),
+            "forward_analysis": analysis,
+            "edge_candidates": edge_candidates,
             "paper_result": self.store.paper_summary(
                 scope, self.v.variant_id),
             "current_provenance": {
@@ -1130,6 +1310,65 @@ class QualificationAndPacketTests(StoreFixture):
         self.assertEqual(packet["packet_id"], packet_id)
         self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
 
+    def test_prepare_review_artifacts_is_restart_safe_and_manual_only(self):
+        payload = self.complete_payload()
+        scope = payload["scope_key"]
+        cfg = valid_config()
+        journal = Path(self.tmp.name) / "journal.db"
+        args = argparse.Namespace(
+            store=str(self.path), scope=scope, db=str(journal), mode="demo")
+        g2 = {
+            "gate": "G2",
+            "status": "PASS",
+            "proposal_count": 0,
+            "max_proposal_ts": 0.0,
+            "strategy_config_version": state.strategy_fingerprint(cfg),
+            "fidelity_code_version": replay.fidelity_code_fingerprint(),
+        }
+        protected = [
+            research_cli.REPO / "research" / "variants.yaml",
+            research_cli.REPO / "config.yaml",
+        ]
+        before = {path: path.read_bytes() for path in protected}
+
+        with patch.object(research_cli, "_load_config", return_value=cfg), \
+                patch.object(research_cli, "_latest_g2_payload",
+                             return_value=None):
+            self.assertEqual(research_cli.cmd_prepare_review_artifacts(args), 0)
+        self.assertEqual(self.store.t3_packets_for(self.v.variant_id), [])
+
+        with patch.object(research_cli, "_load_config", return_value=cfg), \
+                patch.object(research_cli, "_latest_g2_payload",
+                             return_value=g2):
+            self.assertEqual(research_cli.cmd_prepare_review_artifacts(args), 0)
+
+        reopened = findings.FindingsStore(self.path)
+        packets = reopened.t3_packets_for(self.v.variant_id)
+        self.assertEqual(len(packets), 1)
+        packet = packets[0]
+        self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
+        self.assertIsNone(packet["reviewed_by"])
+        self.assertIsNone(packet["registry_change_ref"])
+        self.assertFalse(
+            packet["payload"]["checklist"][findings.T3_MANUAL_CHECK])
+        self.assertTrue(all(
+            packet["payload"]["checklist"][name]
+            for name in findings.T3_REQUIRED_CHECKS
+            if name != findings.T3_MANUAL_CHECK))
+
+        with patch.object(research_cli, "_load_config", return_value=cfg), \
+                patch.object(research_cli, "_latest_g2_payload",
+                             return_value=g2):
+            self.assertEqual(research_cli.cmd_prepare_review_artifacts(args), 0)
+        self.assertEqual(
+            len(findings.FindingsStore(self.path).t3_packets_for(
+                self.v.variant_id)), 1)
+        self.assertEqual(
+            findings.FindingsStore(self.path).variant(
+                self.v.variant_id)["status"], "candidate")
+        self.assertEqual(
+            {path: path.read_bytes() for path in protected}, before)
+
     def test_checklist_booleans_cannot_fake_a_reviewed_packet(self):
         payload = {
             "variant_id": self.v.variant_id,
@@ -1200,27 +1439,38 @@ class ForwardQualificationCommandTests(StoreFixture):
             active, valid_config(), store=self.store, scope_key=scope)
         calls = []
 
-        def evaluate_axis(settings, baseline, **kwargs):
-            calls.append([variant_id for variant_id, _ in settings])
-            return protocol.Verdict(
-                protocol.CONTINUE, "test", "collecting", {})
+        def record_axis(
+                _store, _scope, _strategy, axis, _baseline_id, setting_ids):
+            calls.append((list(axis), list(setting_ids)))
+            return (f"analysis-{len(calls)}", protocol.Verdict(
+                protocol.CONTINUE, "test", "collecting", {}))
 
         args = argparse.Namespace(
             store=str(self.path), scope=scope, strategy="momentum")
-        with patch.object(research_cli.protocol, "evaluate_axis",
-                          side_effect=evaluate_axis):
+        with patch.object(
+                findings.FindingsStore, "record_forward_analysis",
+                autospec=True, side_effect=record_axis), patch.object(
+                findings.FindingsStore, "analysis",
+                return_value={"payload": {"portfolio_statuses": {}}}):
             result = research_cli.cmd_forward_qualify(args)
 
         self.assertEqual(result, 0)
         self.assertGreaterEqual(len(calls), 4)
-        for ids in calls:
+        for axis, ids in calls:
+            registered_ids = [variant_id for variant_id in ids
+                              if variant_id in registry]
             paths = {
                 tuple(sorted(registry[variant_id].overrides))
-                for variant_id in ids
+                for variant_id in registered_ids
             }
-            self.assertEqual(len(paths), 1, ids)
+            if paths:
+                self.assertEqual(paths, {tuple(sorted(axis))}, ids)
+            else:
+                hypothesis_ids = {
+                    variant_id.split(".")[2] for variant_id in ids}
+                self.assertEqual(len(hypothesis_ids), 1, ids)
         self.assertFalse(any(
-            "momentum.rr.fixed_3_0" in ids for ids in calls))
+            "momentum.rr.fixed_3_0" in ids for _, ids in calls))
 
 
 if __name__ == "__main__":
