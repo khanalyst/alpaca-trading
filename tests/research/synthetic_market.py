@@ -114,6 +114,7 @@ def truncated(root, keep_bars: int, out):
     after *i* stop existing. Truncation is the honest way to ask that, because
     it removes the future entirely rather than trusting a mask.
     """
+    import csv
     from pathlib import Path
 
     root, out = Path(root), Path(out)
@@ -126,11 +127,19 @@ def truncated(root, keep_bars: int, out):
     for folder in ("swap", "funding", "oi"):
         (out / folder).mkdir(parents=True, exist_ok=True)
         for path in sorted((root / folder).glob("*.csv")):
-            frame = pd.read_csv(path)
             # The last retained candle's evidence is evaluated at its close,
             # so auxiliary series stamped exactly at that close are available
             # without exposing any later bar.
             limit = cutoff if folder == "swap" else cutoff + BAR_MS
-            frame[frame["timestamp_ms"] <= limit].to_csv(
-                out / folder / path.name, index=False)
+            with path.open(newline="") as source:
+                rows = csv.reader(source)
+                header = next(rows)
+                timestamp_index = header.index("timestamp_ms")
+                retained = [header]
+                retained.extend(
+                    row for row in rows
+                    if int(row[timestamp_index]) <= limit
+                )
+            with (out / folder / path.name).open("w", newline="") as target:
+                csv.writer(target, lineterminator="\n").writerows(retained)
     return cutoff

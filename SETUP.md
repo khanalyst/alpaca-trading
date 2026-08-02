@@ -4,7 +4,7 @@ This guide installs the shipped demo configuration. Day-to-day research,
 backup, and recovery procedures are in [OPERATIONS.md](OPERATIONS.md).
 
 Current defaults are OKX `demo`, strategy `momentum/phase1-v3`, LLM provider
-`openai`, and model/deployment identifier `gpt-5.6-sol`. No credential is
+`openai`, and model/deployment identifier `gpt-5.6-sol-coding`. No credential is
 stored in the repository. Use an OKX demo API key with Read and Trade only;
 never enable Withdraw.
 
@@ -60,7 +60,7 @@ means collection is still open.
 | --- | --- |
 | `mode` | `demo` |
 | `strategy.id` / `strategy.version` | `momentum` / `phase1-v3` |
-| `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol` |
+| `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol-coding` |
 | `cycle.interval_seconds` | `60` seconds for marks, paper exits, housekeeping, and reconciliation |
 | `cycle.decision_interval_seconds` | `300` seconds; model decisions remain slower than safety/mark cycles |
 | `execution.maker_first_enabled` | Omitted, validated default `false` (B7.5 disabled) |
