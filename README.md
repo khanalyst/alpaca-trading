@@ -30,7 +30,7 @@ research:
 | Decision cadence | `cycle.decision_interval_seconds: 300`; safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 2`; prior simulator evidence remains isolated |
+| Research feed | `forward_feed_version: 3`; prior simulator evidence remains isolated |
 | Active research arms | 14: one baseline and at most one candidate for each of 7 strategies |
 | Shadow workers | `2`; all seven strategies still advance on the same cycle snapshot |
 | Experiment floor | both 3 elapsed days and 100 comparable paired observations |

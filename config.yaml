@@ -255,9 +255,9 @@ research:
   paper_initial_balance_usdt: 10000
   paper_max_failures: 3
   paper_min_closed_trades: 100
-  # The executable all-strategy models fork paper evidence from the earlier
-  # feed scope without deleting or rewriting its historical rows.
-  forward_feed_version: 2
+  # Fork paper evidence whenever executable provenance changes. Feed v3
+  # preserves v1/v2 history after the LLM deployment and code provenance changed.
+  forward_feed_version: 3
   # Rotation requires BOTH 3 elapsed calendar days and 100 comparable paired
   # decisions. Time alone never completes an assignment. The observation
   # default deliberately matches the existing conservative paper sample floor.
