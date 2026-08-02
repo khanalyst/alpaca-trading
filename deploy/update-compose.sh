@@ -37,9 +37,9 @@ if [ -n "$BACKUP_PATH" ]; then
 fi
 
 "${compose[@]}" config --quiet
-"${compose[@]}" build
+"${compose[@]}" build trader
 "${compose[@]}" run --rm --no-deps trader python main.py check
-"${compose[@]}" up -d --remove-orphans
+"${compose[@]}" up -d --no-build --remove-orphans
 "${compose[@]}" exec -T trader python main.py check
 "${compose[@]}" ps
 

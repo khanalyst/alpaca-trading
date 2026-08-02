@@ -25,7 +25,7 @@ research:
 | Account mode | `demo` (OKX Demo Trading) |
 | Order-executing strategy | `momentum/phase1-v3` |
 | Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
-| LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol` |
+| LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol-coding` |
 | Housekeeping cadence | `cycle.interval_seconds: 60` |
 | Decision cadence | `cycle.decision_interval_seconds: 300`; safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
