@@ -28,6 +28,25 @@ class LLMPreflightTests(unittest.TestCase):
         llm.client.models.retrieve.assert_called_once_with(model="gpt-test")
         llm.client.chat.completions.create.assert_not_called()
 
+    def test_openai_uses_a_bounded_probe_when_models_api_is_missing(self):
+        llm = LLM.__new__(LLM)
+        llm.cfg = {"model": "gpt-test"}
+        llm.provider = "openai"
+        llm.client = Mock()
+        llm.client.models.retrieve.side_effect = RuntimeError("not found")
+
+        self.assertEqual(
+            llm.preflight(),
+            "gpt-test (generation probe; /models not served)")
+        llm.client.chat.completions.create.assert_called_once_with(
+            model="gpt-test",
+            max_completion_tokens=16,
+            messages=[{
+                "role": "user",
+                "content": "Reply with OK.",
+            }],
+        )
+
 
 class OpenAITemperatureFallbackTests(unittest.TestCase):
     @staticmethod

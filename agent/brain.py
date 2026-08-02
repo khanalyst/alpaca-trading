@@ -627,8 +627,8 @@ class LLM:
         Prefer the metadata endpoint because it costs nothing. Gateways that
         serve an OpenAI-compatible surface without implementing `/models`
         (Azure AI Foundry among them) would otherwise fail this check while
-        being perfectly able to run the agent, so fall back to the smallest
-        possible generation. A wrong key or an unavailable deployment still
+        being perfectly able to run the agent, so fall back to a small bounded
+        generation. A wrong key or an unavailable deployment still
         fails - it just fails on the call that actually matters.
         """
         model = self.cfg["model"]
@@ -647,8 +647,9 @@ class LLM:
                         messages=[{"role": "user", "content": "ping"}])
                 else:
                     self.client.chat.completions.create(
-                        model=model, max_completion_tokens=1,
-                        messages=[{"role": "user", "content": "ping"}])
+                        model=model, max_completion_tokens=16,
+                        messages=[{"role": "user",
+                                   "content": "Reply with OK."}])
             except Exception as generate_error:
                 raise RuntimeError(
                     f"{model} is not reachable. Metadata lookup said: "
