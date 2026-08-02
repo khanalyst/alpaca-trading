@@ -9,7 +9,7 @@ mode: demo            # demo | live
 
 llm:
   provider: openai          # anthropic | openai
-  model: gpt-5.6-sol       # e.g. claude-sonnet-4-6, claude-opus-4-8,
+  model: gpt-5.6-sol-coding       # e.g. claude-sonnet-4-6, claude-opus-4-8,
                                #      gpt-4.1, gpt-4o, o4-mini
   temperature: 0.2             # ignored automatically on models that reject
                                # sampling params (Sonnet 5, Opus 4.7+, and
