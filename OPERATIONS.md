@@ -123,9 +123,10 @@ logically isolated but intentionally evaluated in a bounded sequence with
 serialized durable writes. Seven simultaneous SQLite writers are not required
 for correctness.
 
-The active simulator identity is `forward_feed_version: 2`; all registered
-forward-model IDs end in `.v2`. Evidence recorded under feed/model v1 remains
-immutable history and is not pooled with the corrected execution semantics.
+The active research scope is `forward_feed_version: 3`. It preserves feed-v1
+and feed-v2 as immutable historical evidence. The current registered forward
+models still end in `.v2`; the feed-v3 fork records the changed executable LLM
+deployment and code provenance without pooling it into older experiment rows.
 
 Within each strategy:
 
