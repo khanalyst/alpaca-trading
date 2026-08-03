@@ -398,6 +398,31 @@ class ResearchReviewTests(ResearchLearningFixture):
             }
         return json.dumps(payload)
 
+    @staticmethod
+    def _hypothesis_draft():
+        return {
+            "title": "Volume-confirmed momentum continuation",
+            "strategy_id": "momentum",
+            "mechanism": (
+                "High relative volume may distinguish persistent demand from "
+                "a low-liquidity price move that quickly mean reverts."),
+            "payer": "Late traders crossing the spread after the impulse",
+            "falsifier": (
+                "Net paired expectancy is no better when the recorded volume "
+                "predicate holds than when it does not."),
+            "predicate": {
+                "field": "relative_volume_1h",
+                "operator": "gte",
+                "value": 1.5,
+                "direction": "both",
+            },
+            "horizon_hours": 12,
+            "cost_treatment": "taker_round_trip",
+            "evidence_needed": (
+                "At least 100 paired forward observations with costs and "
+                "separate fit and confirmation windows."),
+        }
+
     def test_review_failure_is_nonfatal_pending_and_retries_to_success(self):
         outcome = self._pending_outcome()
         cfg = valid_config()
@@ -422,6 +447,10 @@ class ResearchReviewTests(ResearchLearningFixture):
             len(self.store.experiment_review_attempts(outcome["outcome_id"])), 2)
         self.assertEqual(stored["next_selection"]["validation_status"],
                          "ACCEPTED")
+        self.assertIsNone(succeeded["hypothesis_draft"])
+        self.assertIsNone(
+            self.store.experiment_review_attempts(outcome["outcome_id"])[-1]
+            ["response"]["hypothesis_draft"])
         selection = self.store.research_selection(stored["selection_id"])
         self.assertEqual(selection["current_status"], "ACCEPTED")
         self.assertEqual(selection["model_id"], "test-review-model")
@@ -446,6 +475,179 @@ class ResearchReviewTests(ResearchLearningFixture):
         self.assertIn(
             "forbidden field", self.store.experiment_review_attempts(
                 outcome["outcome_id"])[0]["parse_error"])
+
+    def test_omitted_and_null_hypothesis_drafts_are_backward_compatible(self):
+        omitted = json.loads(self._success_response(next_selection=False))
+        explicit_null = {**omitted, "hypothesis_draft": None}
+
+        for payload in (omitted, explicit_null):
+            with self.subTest(hypothesis_draft=payload.get(
+                    "hypothesis_draft", "omitted")):
+                parsed = review.parse_review_response(json.dumps(payload))
+                self.assertIsNone(parsed["hypothesis_draft"])
+
+    def test_hypothesis_draft_is_normalized_persisted_and_not_registered(self):
+        outcome = self._pending_outcome(scope="demo:draft:feed-v1")
+        cfg = valid_config()
+        cfg_before = deepcopy(cfg)
+        variants_before = self.store.variants()
+        baseline_before = self.store.paper_portfolio_state(
+            outcome["scope_key"], outcome["baseline_variant_id"])
+        candidate_before = self.store.paper_portfolio_state(
+            outcome["scope_key"], outcome["candidate_variant_id"])
+        draft = self._hypothesis_draft()
+        draft["title"] = f"  {draft['title']}  "
+        draft["predicate"]["value"] = 2
+        draft["horizon_hours"] = 24
+        payload = json.loads(self._success_response(next_selection=False))
+        payload["hypothesis_draft"] = draft
+
+        result = review.process_pending_review(
+            self.store, cfg, reviewer=FakeReviewer(json.dumps(payload)),
+            now=START + 1001.5)
+        persisted = self.store.experiment_review_attempts(
+            outcome["outcome_id"])[-1]["response"]["hypothesis_draft"]
+
+        self.assertEqual(result["status"], "REVIEWED")
+        self.assertEqual(result["hypothesis_draft"], persisted)
+        self.assertEqual(
+            persisted["title"], "Volume-confirmed momentum continuation")
+        self.assertEqual(persisted["predicate"]["value"], 2.0)
+        self.assertEqual(persisted["horizon_hours"], 24.0)
+        self.assertIsNone(result["review"]["selection_id"])
+        self.assertEqual(self.store.variants(), variants_before)
+        self.assertEqual(cfg, cfg_before)
+        self.assertEqual(
+            self.store.paper_portfolio_state(
+                outcome["scope_key"], outcome["baseline_variant_id"]),
+            baseline_before)
+        self.assertEqual(
+            self.store.paper_portfolio_state(
+                outcome["scope_key"], outcome["candidate_variant_id"]),
+            candidate_before)
+        self.assertEqual(
+            self.store.research_history_context(outcome["scope_key"])
+            ["pending_selections"], [])
+
+    def test_hypothesis_draft_contract_rejects_every_unbounded_form(self):
+        base = json.loads(self._success_response(next_selection=False))
+
+        def response_with(mutator):
+            draft = deepcopy(self._hypothesis_draft())
+            mutator(draft)
+            return json.dumps({**base, "hypothesis_draft": draft})
+
+        cases = {
+            "extra draft key": (
+                lambda item: item.update({"sql": "SELECT 1"}),
+                "exactly the declared fields"),
+            "missing draft key": (
+                lambda item: item.pop("payer"),
+                "exactly the declared fields"),
+            "extra predicate key": (
+                lambda item: item["predicate"].update({"window": 4}),
+                "predicate must have exactly"),
+            "missing predicate key": (
+                lambda item: item["predicate"].pop("direction"),
+                "predicate must have exactly"),
+            "boolean predicate value": (
+                lambda item: item["predicate"].update({"value": True}),
+                "predicate value must be a number"),
+            "boolean horizon": (
+                lambda item: item.update({"horizon_hours": False}),
+                "horizon_hours must be a number"),
+            "nan": (
+                lambda item: item["predicate"].update({"value": float("nan")}),
+                "predicate value must be finite"),
+            "infinity": (
+                lambda item: item.update({"horizon_hours": float("inf")}),
+                "horizon_hours must be finite"),
+            "overflowing integer": (
+                lambda item: item["predicate"].update({"value": 10 ** 400}),
+                "predicate value must be finite"),
+            "unregistered strategy": (
+                lambda item: item.update({"strategy_id": "not-registered"}),
+                "strategy_id is not registered"),
+            "unknown field": (
+                lambda item: item["predicate"].update({"field": "price"}),
+                "predicate field is not allowlisted"),
+            "unknown operator": (
+                lambda item: item["predicate"].update({"operator": "eq"}),
+                "predicate operator is not allowlisted"),
+            "unknown direction": (
+                lambda item: item["predicate"].update({"direction": "buy"}),
+                "predicate direction is not allowlisted"),
+            "out-of-bounds value": (
+                lambda item: item["predicate"].update({"value": -0.1}),
+                "outside the declared bounds"),
+            "out-of-bounds horizon": (
+                lambda item: item.update({"horizon_hours": 337}),
+                "horizon_hours must be 1 to 336"),
+            "unknown cost": (
+                lambda item: item.update({"cost_treatment": "ignore_costs"}),
+                "cost_treatment is not allowlisted"),
+            "short title": (
+                lambda item: item.update({"title": "no"}),
+                "title must be 5 to 120"),
+            "short mechanism": (
+                lambda item: item.update({"mechanism": "too short"}),
+                "mechanism must be 20 to 1000"),
+            "short payer": (
+                lambda item: item.update({"payer": "x"}),
+                "payer must be 5 to 500"),
+            "short falsifier": (
+                lambda item: item.update({"falsifier": "too short"}),
+                "falsifier must be 20 to 1000"),
+            "short evidence": (
+                lambda item: item.update({"evidence_needed": "too short"}),
+                "evidence_needed must be 20 to 1000"),
+        }
+        for name, (mutator, message) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    review.parse_review_response(response_with(mutator))
+
+        for forbidden in ("verdict", "execution_instruction"):
+            with self.subTest(forbidden=forbidden):
+                payload = {**base, forbidden: "unauthorized"}
+                with self.assertRaisesRegex(ValueError, "forbidden field"):
+                    review.parse_review_response(json.dumps(payload))
+
+        with self.assertRaisesRegex(ValueError, "must be an object or null"):
+            review.parse_review_response(json.dumps({
+                **base, "hypothesis_draft": ["not", "declarative"],
+            }))
+
+    def test_prompt_and_request_expose_non_executable_draft_contract(self):
+        outcome = self._pending_outcome(scope="demo:draft-contract:feed-v1")
+
+        request = review.build_review_request(self.store, outcome)
+        contract = request["hypothesis_draft_contract"]
+
+        self.assertIn("NON-EXECUTABLE", review.RESEARCH_REVIEW_SYSTEM)
+        self.assertIn("manually reviewed and registered",
+                      review.RESEARCH_REVIEW_SYSTEM)
+        self.assertIn("no live, demo, order", review.RESEARCH_REVIEW_SYSTEM)
+        self.assertEqual(contract["status"], "NON_EXECUTABLE_DRAFT")
+        self.assertEqual(
+            contract["evidence_source"],
+            "immutable_llm_input_snapshot_corpus")
+        self.assertIn("immutable llm_input corpus",
+                      review.RESEARCH_REVIEW_SYSTEM)
+        self.assertIn("terminal outcome aggregates",
+                      review.RESEARCH_REVIEW_SYSTEM)
+        self.assertTrue(contract["manual_registration_required"])
+        self.assertFalse(contract["creates_variant_or_selection"])
+        self.assertFalse(contract["execution_authority"])
+        self.assertEqual(
+            contract["predicate"]["field_bounds"],
+            review.HYPOTHESIS_PREDICATE_FIELD_BOUNDS)
+        self.assertEqual(
+            contract["predicate"]["operators"],
+            list(review.HYPOTHESIS_PREDICATE_OPERATORS))
+        self.assertEqual(
+            contract["cost_treatments"],
+            list(review.HYPOTHESIS_COST_TREATMENTS))
 
     def test_one_pending_outcome_per_invocation(self):
         first = self._pending_outcome(scope="demo:one:feed-v1")

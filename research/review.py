@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -22,6 +23,33 @@ from .findings import FindingsStore, _content_hash
 MAX_RAW_RESPONSE_CHARS = 16_000
 MAX_REVIEW_TOKENS = 1_200
 
+HYPOTHESIS_PREDICATE_FIELD_BOUNDS = {
+    # These are exact snapshot keys persisted in the immutable llm_input
+    # corpus and consumed through research.corpus. They are not necessarily
+    # present in a terminal outcome's aggregate evidence.
+    "mom_1h_pct": {"minimum": -100.0, "maximum": 100.0},
+    "relative_volume_1h": {"minimum": 0.0, "maximum": 1_000.0},
+    "oi_change_4h_pct": {"minimum": -100.0, "maximum": 10_000.0},
+    "funding_rate_pct": {"minimum": -100.0, "maximum": 100.0},
+    "funding_percentile_30": {"minimum": 0.0, "maximum": 100.0},
+    "perp_index_basis_pct": {"minimum": -100.0, "maximum": 100.0},
+    "range_pos_pct": {"minimum": 0.0, "maximum": 100.0},
+    "atr_1h_ratio": {"minimum": 0.0, "maximum": 1_000.0},
+    "spread_pct": {"minimum": 0.0, "maximum": 100.0},
+}
+HYPOTHESIS_PREDICATE_OPERATORS = ("gt", "gte", "lt", "lte")
+HYPOTHESIS_DIRECTIONS = ("long", "short", "both")
+HYPOTHESIS_COST_TREATMENTS = (
+    "taker_round_trip",
+    "maker_entry_taker_exit",
+    "realized_funding_plus_fees",
+)
+HYPOTHESIS_DRAFT_FIELDS = {
+    "title", "strategy_id", "mechanism", "payer", "falsifier",
+    "predicate", "horizon_hours", "cost_treatment", "evidence_needed",
+}
+HYPOTHESIS_PREDICATE_FIELDS = {"field", "operator", "value", "direction"}
+
 RESEARCH_REVIEW_SYSTEM = """You are reviewing a completed research-only
 shadow experiment. The deterministic verdict in the request is final. You
 must not set, revise, soften, or override it. Explain why the persisted facts
@@ -32,7 +60,18 @@ registered catalog. It is research-only: it cannot change the live/demo
 strategy, risk, capital, positions, or orders. Do not repeat terminal exact
 variants, existing edge candidates, pending selections, or active assignments.
 
-Return one JSON object with exactly these fields:
+You may also return one hypothesis_draft. It is a NON-EXECUTABLE declarative
+draft only. It must be manually reviewed and registered in a later change
+before any experiment can use it. It creates no Variant or selection, changes
+no configuration or tier, and has no live, demo, order, strategy-generation,
+SQL, code, or execution authority. Use only the registered strategy IDs,
+predicate fields and bounds, operators, directions, and cost treatments in
+the request. Predicate fields are exact snapshot keys from the persisted,
+immutable llm_input corpus consumed through research.corpus; do not claim they
+are necessarily present in the terminal outcome aggregates.
+
+Return one JSON object with these required fields and the one optional field
+shown below; do not return any other field:
 {
   "explanation": "20 to 4000 characters",
   "limitations": ["up to 8 concise limitations"],
@@ -40,6 +79,22 @@ Return one JSON object with exactly these fields:
     "strategy_id": "registered strategy",
     "variant_id": "optional exact registered single-axis variant",
     "reasoning": "10 to 1000 characters"
+  },
+  "hypothesis_draft": null OR OMITTED OR {
+    "title": "5 to 120 characters",
+    "strategy_id": "registered strategy from the request",
+    "mechanism": "20 to 1000 characters",
+    "payer": "5 to 500 characters identifying the payer/return source",
+    "falsifier": "20 to 1000 characters",
+    "predicate": {
+      "field": "allowlisted persisted numeric field",
+      "operator": "gt, gte, lt, or lte",
+      "value": "finite number inside the field bounds",
+      "direction": "long, short, or both"
+    },
+    "horizon_hours": "finite number from 1 to 336",
+    "cost_treatment": "allowlisted cost treatment",
+    "evidence_needed": "20 to 1000 characters"
   }
 }
 Do not return a verdict field or any execution instruction.
@@ -126,6 +181,124 @@ def build_review_request(store: FindingsStore, outcome: dict) -> dict:
             } for item in items]
             for strategy_id, items in catalog.items()
         },
+        "hypothesis_draft_contract": {
+            "status": "NON_EXECUTABLE_DRAFT",
+            "evidence_source": "immutable_llm_input_snapshot_corpus",
+            "manual_registration_required": True,
+            "creates_variant_or_selection": False,
+            "execution_authority": False,
+            "registered_strategy_ids": sorted(strategy_registry.REGISTRY),
+            "required_fields": sorted(HYPOTHESIS_DRAFT_FIELDS),
+            "predicate": {
+                "required_fields": sorted(HYPOTHESIS_PREDICATE_FIELDS),
+                "field_bounds": HYPOTHESIS_PREDICATE_FIELD_BOUNDS,
+                "operators": list(HYPOTHESIS_PREDICATE_OPERATORS),
+                "directions": list(HYPOTHESIS_DIRECTIONS),
+            },
+            "cost_treatments": list(HYPOTHESIS_COST_TREATMENTS),
+        },
+    }
+
+
+def _normalized_text(raw: dict, field: str, minimum: int, maximum: int) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"research hypothesis_draft {field} must be a string")
+    value = value.strip()
+    if not minimum <= len(value) <= maximum:
+        raise ValueError(
+            f"research hypothesis_draft {field} must be {minimum} to "
+            f"{maximum} characters")
+    return value
+
+
+def _normalized_number(value: object, field: str) -> float:
+    if type(value) not in {int, float}:  # bool is deliberately not a number.
+        raise ValueError(f"research hypothesis_draft {field} must be a number")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            f"research hypothesis_draft {field} must be finite") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"research hypothesis_draft {field} must be finite")
+    return number
+
+
+def _parse_hypothesis_draft(raw: object) -> dict | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("research hypothesis_draft must be an object or null")
+    if set(raw) != HYPOTHESIS_DRAFT_FIELDS:
+        missing = sorted(HYPOTHESIS_DRAFT_FIELDS - set(raw))
+        extra = sorted(set(raw) - HYPOTHESIS_DRAFT_FIELDS)
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if extra:
+            detail.append("extra " + ", ".join(extra))
+        raise ValueError(
+            "research hypothesis_draft must have exactly the declared fields"
+            + (": " + "; ".join(detail) if detail else ""))
+
+    strategy_id = _normalized_text(raw, "strategy_id", 1, 120)
+    if strategy_id not in strategy_registry.REGISTRY:
+        raise ValueError(
+            "research hypothesis_draft strategy_id is not registered")
+
+    predicate = raw["predicate"]
+    if not isinstance(predicate, dict):
+        raise ValueError("research hypothesis_draft predicate must be an object")
+    if set(predicate) != HYPOTHESIS_PREDICATE_FIELDS:
+        raise ValueError(
+            "research hypothesis_draft predicate must have exactly field, "
+            "operator, value, direction")
+    field = predicate["field"]
+    if not isinstance(field, str) or field not in HYPOTHESIS_PREDICATE_FIELD_BOUNDS:
+        raise ValueError(
+            "research hypothesis_draft predicate field is not allowlisted")
+    operator = predicate["operator"]
+    if operator not in HYPOTHESIS_PREDICATE_OPERATORS:
+        raise ValueError(
+            "research hypothesis_draft predicate operator is not allowlisted")
+    direction = predicate["direction"]
+    if direction not in HYPOTHESIS_DIRECTIONS:
+        raise ValueError(
+            "research hypothesis_draft predicate direction is not allowlisted")
+    predicate_value = _normalized_number(
+        predicate["value"], "predicate value")
+    bounds = HYPOTHESIS_PREDICATE_FIELD_BOUNDS[field]
+    if not bounds["minimum"] <= predicate_value <= bounds["maximum"]:
+        raise ValueError(
+            "research hypothesis_draft predicate value is outside the "
+            f"declared bounds for {field}")
+
+    horizon_hours = _normalized_number(raw["horizon_hours"], "horizon_hours")
+    if not 1.0 <= horizon_hours <= 336.0:
+        raise ValueError(
+            "research hypothesis_draft horizon_hours must be 1 to 336")
+    cost_treatment = raw["cost_treatment"]
+    if cost_treatment not in HYPOTHESIS_COST_TREATMENTS:
+        raise ValueError(
+            "research hypothesis_draft cost_treatment is not allowlisted")
+
+    return {
+        "title": _normalized_text(raw, "title", 5, 120),
+        "strategy_id": strategy_id,
+        "mechanism": _normalized_text(raw, "mechanism", 20, 1_000),
+        "payer": _normalized_text(raw, "payer", 5, 500),
+        "falsifier": _normalized_text(raw, "falsifier", 20, 1_000),
+        "predicate": {
+            "field": field,
+            "operator": operator,
+            "value": predicate_value,
+            "direction": direction,
+        },
+        "horizon_hours": horizon_hours,
+        "cost_treatment": cost_treatment,
+        "evidence_needed": _normalized_text(
+            raw, "evidence_needed", 20, 1_000),
     }
 
 
@@ -141,7 +314,9 @@ def parse_review_response(raw_text: str) -> dict:
             from exc
     if not isinstance(raw, dict):
         raise ValueError("research review response must be an object")
-    allowed = {"explanation", "limitations", "next_selection"}
+    allowed = {
+        "explanation", "limitations", "next_selection", "hypothesis_draft",
+    }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(
@@ -174,6 +349,8 @@ def parse_review_response(raw_text: str) -> dict:
         "explanation": explanation,
         "limitations": limitations,
         "next_selection": parsed_selection,
+        "hypothesis_draft": _parse_hypothesis_draft(
+            raw.get("hypothesis_draft")),
     }
 
 
@@ -300,4 +477,5 @@ def process_pending_review(
         requested_ts=requested_ts,
         completed_ts=time.time() if now is None else float(now))
     return {"status": "REVIEWED", "processed": 1,
-            "outcome_id": outcome["outcome_id"], "review": review}
+            "outcome_id": outcome["outcome_id"], "review": review,
+            "hypothesis_draft": parsed["hypothesis_draft"]}

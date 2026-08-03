@@ -21,7 +21,13 @@ The LLM can submit one bounded research-only selection. Invalid selections and
 their reasons persist. Accepted selections queue and never preempt an active
 assignment. A separate nightly research prompt explains one immutable terminal
 outcome and may nominate one next registered setting; it cannot alter the
-verdict or authorize execution.
+verdict or authorize execution. That same single review may preserve one
+strictly declarative, non-executable hypothesis draft against allowlisted
+numeric snapshot keys from the immutable persisted `llm_input` corpus consumed
+through `research.corpus`; those keys need not appear in terminal aggregates.
+The draft creates no variant or selection, changes no configuration, tier,
+portfolio, or order authority, and must be manually reviewed and registered in
+a later code change before research can use it.
 
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
