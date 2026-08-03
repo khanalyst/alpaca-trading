@@ -391,6 +391,29 @@ class Replay:
             if circuit_state != "RUNNING":
                 continue
 
+            # The provider request intentionally excludes enrichment, while
+            # deterministic live risk consumes this one recorded market-level
+            # field. Join only that field into a private view: replayed model
+            # input and the corpus snapshot must remain byte-identical.
+            risk_snapshot = cycle.snapshot
+            joined = (cycle.enrichment
+                      if isinstance(cycle.enrichment, dict) else {})
+            market_enrichment = joined.get("market")
+            if (isinstance(market_enrichment, dict)
+                    and "setup_breadth_by_strategy" in market_enrichment):
+                risk_snapshot = dict(cycle.snapshot)
+                raw_context = cycle.snapshot.get("_market_context")
+                context = (dict(raw_context)
+                           if isinstance(raw_context, dict) else {})
+                raw_enrichment = context.get("_enrichment")
+                risk_enrichment = (
+                    dict(raw_enrichment)
+                    if isinstance(raw_enrichment, dict) else {})
+                risk_enrichment["setup_breadth_by_strategy"] = (
+                    market_enrichment["setup_breadth_by_strategy"])
+                context["_enrichment"] = risk_enrichment
+                risk_snapshot["_market_context"] = context
+
             for symbol in cycle.symbols():
                 row = dict(cycle.snapshot[symbol])
                 row["setup_evidence"] = strategy.setup_evidence(row, self.cfg)
@@ -480,7 +503,7 @@ class Replay:
                         "take_profit_pct": plan.get("take_profit_pct"),
                     })
                     sized, veto = self.risk.vet_open(
-                        merged, equity, positions, cycle.snapshot,
+                        merged, equity, positions, risk_snapshot,
                         cooldowns, gross_notional,
                         active_trades=active_trades, now=now)
                     if sized is None:

@@ -11,7 +11,7 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
-from agent import registry
+from agent import brain, registry
 from agent.engine import Engine
 from tests.helpers import valid_config
 
@@ -93,6 +93,46 @@ class ShadowRecordingTests(unittest.TestCase):
         kinds = [kind for kind, _, _ in self._events(log_event)]
         self.assertIn("strategy_shadow_decision", kinds)
         self.assertIn("strategy_shadow_summary", kinds)
+
+    @patch("agent.engine.state.log_event")
+    def test_breadth_map_reuses_unique_fired_symbols(self, log_event):
+        snapshot = {
+            "BTC/USDT:USDT": symbol_snapshot(
+                fresh_breakout_long=True, range_pos_pct=90.0),
+            "ETH/USDT:USDT": symbol_snapshot(
+                trend_1h="down", trend_4h="down",
+                mom_1h_pct=0.0, mom_15m_pct=0.0),
+        }
+
+        breadth = self.engine._record_shadow_decisions(snapshot)
+
+        self.assertEqual(breadth["momentum"], {
+            "instruments_scanned": 2,
+            "instruments_with_a_valid_setup": 1,
+            "setup_breadth_pct": 50.0,
+        })
+        momentum_summary = next(
+            payload for kind, payload, kwargs in self._events(log_event)
+            if kind == "strategy_shadow_summary"
+            and kwargs["strategy_id"] == "momentum")
+        self.assertGreater(momentum_summary["signals"], 1)
+        self.assertEqual(momentum_summary["instruments_fired"], 1)
+
+    @patch("agent.engine.state.log_event")
+    def test_strategy_breadth_enrichment_is_hidden_from_the_llm(self, _):
+        snapshot = {
+            "BTC/USDT:USDT": symbol_snapshot(),
+            "_market_context": {"regime": "trend_up"},
+        }
+        breadth = self.engine._record_shadow_decisions(snapshot)
+        snapshot["_market_context"][brain.ENRICHMENT_KEY] = {
+            "setup_breadth_by_strategy": breadth,
+        }
+
+        message = brain.LLM._user_message(snapshot, {}, 1)
+
+        self.assertNotIn("setup_breadth_by_strategy", message)
+        self.assertNotIn(brain.ENRICHMENT_KEY, message)
 
     @patch("agent.engine.state.log_event")
     def test_records_carry_their_own_strategy_attribution(self, log_event):
