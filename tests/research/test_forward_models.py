@@ -115,6 +115,33 @@ class ForwardModelDeclarationTests(unittest.TestCase):
         self.assertEqual(model.entry_price(row, "long"), 99.99)
         self.assertEqual(model.entry_price(row, "short"), 100.01)
 
+    def test_funding_models_share_execution_but_keep_distinct_provenance(self):
+        carry = BY_STRATEGY["funding-carry"]
+        unwind = BY_STRATEGY["funding-unwind"]
+
+        for model in (carry, unwind):
+            with self.subTest(strategy=model.strategy_id):
+                self.assertEqual(
+                    (model.signal_timeframe, model.horizon_hours,
+                     model.exit_policy, model.stop_atr_multiple,
+                     model.reward_risk, model.funding_treatment),
+                    ("1h", 240.0, "fixed_rr", 3.0, 2.0,
+                     "observed_realized_settlements"))
+
+        self.assertEqual(carry.model_id, "funding_carry.interval.1h.v2")
+        self.assertEqual(unwind.model_id, "funding_unwind.reversion.1h.v2")
+        self.assertNotEqual(carry.strategy_id, unwind.strategy_id)
+        self.assertIn(
+            "research/hypotheses/funding-carry.yaml",
+            carry.validation_evidence)
+        self.assertIn(
+            "research/hypotheses/funding-unwind.yaml",
+            unwind.validation_evidence)
+        self.assertNotEqual(carry.validation_evidence, unwind.validation_evidence)
+
+        self.assertIn("perp_index_basis_pct", carry.required_fields)
+        self.assertNotIn("perp_index_basis_pct", unwind.required_fields)
+
 
 class ContractExecutionTests(unittest.TestCase):
     def assert_fires(self, strategy_id, setup_type, direction, row):
@@ -155,6 +182,47 @@ class ContractExecutionTests(unittest.TestCase):
             with self.subTest(strategy=strategy_id):
                 self.assertFalse(evidence[setup]["long"])
                 self.assertFalse(evidence[setup]["short"])
+
+    def test_funding_contracts_share_direction_but_not_basis_eligibility(self):
+        cases = (
+            (market_row(
+                funding_rate_pct=0.02, funding_percentile_30=90.0,
+                perp_index_basis_pct=0.10, trend_1h="flat",
+                trend_4h="flat"), "short"),
+            (market_row(
+                funding_rate_pct=-0.02, funding_percentile_30=10.0,
+                perp_index_basis_pct=-0.10, trend_1h="flat",
+                trend_4h="flat"), "long"),
+        )
+        for row, expected_direction in cases:
+            evidence = {}
+            for strategy_id, setup in (
+                    ("funding-carry", "carry"),
+                    ("funding-unwind", "positioning_unwind")):
+                cfg = shadow._research_cfg(valid_config(), strategy_id)
+                evidence[strategy_id] = strategy.setup_evidence(
+                    row, cfg)[setup]
+            with self.subTest(funding_rate=row["funding_rate_pct"]):
+                self.assertEqual(
+                    evidence["funding-carry"], evidence["funding-unwind"])
+                self.assertTrue(
+                    evidence["funding-carry"][expected_direction])
+
+        row = market_row(
+            perp_index_basis_pct=None, trend_1h="flat", trend_4h="flat")
+        carry = BY_STRATEGY["funding-carry"]
+        unwind = BY_STRATEGY["funding-unwind"]
+        carry_evidence = strategy.setup_evidence(
+            row, shadow._research_cfg(valid_config(), "funding-carry"))
+        unwind_evidence = strategy.setup_evidence(
+            row, shadow._research_cfg(valid_config(), "funding-unwind"))
+
+        self.assertEqual(
+            carry.missing_fields(row), ("perp_index_basis_pct",))
+        self.assertEqual(unwind.missing_fields(row), ())
+        self.assertEqual(
+            carry_evidence["carry"], {"long": False, "short": False})
+        self.assertTrue(unwind_evidence["positioning_unwind"]["short"])
 
     def test_only_realized_funding_events_are_credited(self):
         position = {
