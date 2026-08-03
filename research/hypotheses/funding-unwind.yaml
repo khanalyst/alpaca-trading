@@ -87,12 +87,18 @@ settings:
     claim: >-
       Expectancy should fall towards the unconditional case as the crowding
       requirement relaxes. If it does not, the percentile is not the signal.
+  - id: extreme_percentile
+    params:
+      percentile: 95.0
+    claim: >-
+      The extreme-crowding pre-registration isolated at the 95th percentile
+      tests reversal in the furthest positioning tail.
 
-hypotheses_tested: 4
+hypotheses_tested: 5
 multiple_testing_note: |
-  Counted as 2, not 1: funding-carry and funding-unwind are the same entry
-  rule tested under two different mechanism claims. The entry has been
-  looked at twice on this data, and the count says so.
+  Funding-carry and funding-unwind are the same entry rule tested under two
+  different mechanism claims. The count includes that prior look plus all
+  four declared unwind parameterisations.
 
 data_limitation: |
   Funding coverage limits the usable window to roughly three months, in one

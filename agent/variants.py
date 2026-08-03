@@ -33,6 +33,8 @@ from pathlib import Path
 
 import yaml
 
+from research.protocol import MIN_AXIS_SETTINGS
+
 from .config import ConfigError, validate_config
 
 
@@ -46,6 +48,9 @@ STATUSES = (
     "superseded",   # replaced by a later variant of the same idea
 )
 
+_RUNTIME_SUPERSEDED_PREREG = {
+    "momentum": {"target_2r", "wider_stop"},
+}
 
 @dataclass(frozen=True)
 class Variant:
@@ -308,9 +313,10 @@ def preregistered_variants(
 
     YAML is the pre-registration source of truth for research axes; the
     resulting objects use the same immutable FindingsStore identity as
-    ordinary shadow variants. No status is changed and no paper/live action
-    is implied.
+    ordinary shadow variants. Runtime duplicates of canonical settings are
+    marked superseded; no paper/live action or promotion is implied.
     """
+    use_runtime_settings = path is None
     if path is None:
         path = (Path(__file__).resolve().parents[1] / "research" /
                 "hypotheses" / f"{strategy_id}.yaml")
@@ -366,7 +372,11 @@ def preregistered_variants(
             base_version=base_version,
             overrides=overrides,
             hypothesis=str(entry.get("claim") or raw.get("prediction") or ""),
-            status="candidate",
+            status=(
+                "superseded"
+                if (use_runtime_settings and setting_id in
+                    _RUNTIME_SUPERSEDED_PREREG.get(strategy_id, set()))
+                else "candidate"),
             hypothesis_id=f"{strategy_id}:{setting_id}",
             hypothesis_params=params,
         ))
@@ -419,6 +429,101 @@ def load_registry(path: str | Path) -> dict[str, Variant]:
     return out
 
 
+def _selection_baseline_config(strategy_id: str) -> dict:
+    """Return the same executable baseline used by real-time shadow research."""
+    from . import registry as strategy_registry
+
+    path = Path(__file__).resolve().parents[1] / "config.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    spec = strategy_registry.spec_for(strategy_id)
+    if strategy_id != str((cfg.get("strategy") or {}).get("id") or ""):
+        model = spec.forward_model
+        cfg = copy.deepcopy(cfg)
+        strategy = dict(cfg["strategy"])
+        strategy.update(spec.contract_params)
+        strategy.update({
+            "id": spec.id,
+            "version": spec.version,
+            "signal_timeframe": spec.signal_timeframe,
+            "min_stop_atr_multiple": model.stop_atr_multiple,
+            "fixed_reward_risk": model.reward_risk,
+            "forward_horizon_hours": model.horizon_hours,
+        })
+        cfg["strategy"] = strategy
+        risk = dict(cfg["risk"])
+        risk["max_hold_hours"] = min(
+            float(risk["max_hold_hours"]), spec.max_hold_hours_ceiling)
+        cfg["risk"] = risk
+        costs = dict(cfg["trading_costs"])
+        costs["expected_hold_hours"] = min(model.horizon_hours, 168.0)
+        cfg["trading_costs"] = costs
+    return validate_config(cfg, allow_shadow_strategy=True)
+
+
+def _dotted_value(mapping: dict, path: str):
+    node = mapping
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            raise ConfigError(
+                f"research selection axis {path!r} is not executable")
+        node = node[part]
+    return node
+
+
+def _validate_research_selection_catalog(
+        catalog: dict[str, tuple[dict, ...]],
+        registered: dict[str, Variant]) -> None:
+    """Fail closed unless every emitted axis has a real three-setting family."""
+    for strategy_id, items in sorted(catalog.items()):
+        by_axis: dict[str, list[dict]] = {}
+        for item in items:
+            by_axis.setdefault(str(item["axis"]), []).append(item)
+        baseline_cfg = _selection_baseline_config(strategy_id)
+        for axis, settings in sorted(by_axis.items()):
+            values = []
+            if axis.startswith("hypothesis."):
+                if not any(str(item.get("setting_id")) == "registered"
+                           for item in settings):
+                    raise ConfigError(
+                        f"research selection {strategy_id}/{axis} has no "
+                        "registered baseline setting")
+            else:
+                values.append(_dotted_value(baseline_cfg, axis))
+            seen_variant_ids = set()
+            for item in settings:
+                variant_id = str(item.get("variant_id") or "")
+                if variant_id in seen_variant_ids:
+                    raise ConfigError(
+                        f"research selection {strategy_id}/{axis} repeats "
+                        f"variant_id {variant_id!r}")
+                seen_variant_ids.add(variant_id)
+                setting = item.get("setting")
+                if not isinstance(setting, dict) or len(setting) != 1:
+                    raise ConfigError(
+                        f"research selection {variant_id!r} must declare one "
+                        "executable setting value")
+                value = next(iter(setting.values()))
+                if not axis.startswith("hypothesis."):
+                    variant = registered.get(variant_id)
+                    if variant is None:
+                        raise ConfigError(
+                            f"research selection variant {variant_id!r} is "
+                            "not registered")
+                    executable = apply(
+                        variant, baseline_cfg, allow_shadow_strategy=True)
+                    value = _dotted_value(executable, axis)
+                if any(value == previous for previous in values):
+                    raise ConfigError(
+                        f"research selection {strategy_id}/{axis} has "
+                        f"duplicate executable value {value!r}")
+                values.append(value)
+            if len(values) < MIN_AXIS_SETTINGS:
+                raise ConfigError(
+                    f"research selection {strategy_id}/{axis} has "
+                    f"{len(values)} unique executable settings including "
+                    f"baseline; {MIN_AXIS_SETTINGS} required")
+
+
 def research_selection_catalog() -> dict[str, tuple[dict, ...]]:
     """Enumerate registered, single-axis, non-baseline selector targets."""
     from . import registry as strategy_registry
@@ -448,8 +553,10 @@ def research_selection_catalog() -> dict[str, tuple[dict, ...]]:
             "variant_id": variant.variant_id,
             **declared,
         })
-    return {strategy_id: tuple(items)
-            for strategy_id, items in sorted(catalog.items()) if items}
+    resolved = {strategy_id: tuple(items)
+                for strategy_id, items in sorted(catalog.items()) if items}
+    _validate_research_selection_catalog(resolved, registered)
+    return resolved
 
 
 def save_registry(path: str | Path, variants: dict[str, Variant]) -> None:

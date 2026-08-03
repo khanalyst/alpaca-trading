@@ -51,6 +51,18 @@ settings:
     claim: >-
       A tighter maximum spread tests whether only the most liquid books can
       support a passive-entry inventory trade.
+  - id: very_strong_imbalance
+    params:
+      scalp_min_abs_imbalance: 0.35
+    claim: >-
+      A registered 0.35 imbalance point tests whether only the strongest
+      observed book pressure compensates passive adverse selection.
+  - id: very_tight_spread
+    params:
+      scalp_max_spread_pct: 0.005
+    claim: >-
+      A registered 0.005 percent spread point tests passive capture in the most
+      liquid observed books.
 
 backtestable: false
 why_not_backtestable: |
@@ -67,9 +79,9 @@ why_not_backtestable: |
   at an observed best quote. That is implementation evidence, not proof that
   a real resting order would have obtained queue priority or a fill.
 
-hypotheses_tested: 3
+hypotheses_tested: 5
 multiple_testing_note: |
-  Three parameterisations are declared before forward outcomes are observed.
+  Five parameterisations are declared before forward outcomes are observed.
   No setting has completed the evidence window yet.
 
 design_constraints_already_measured: |

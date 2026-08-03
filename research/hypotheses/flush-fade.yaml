@@ -90,10 +90,16 @@ settings:
       The 60-day open-interest window makes the registered thresholds an
       underpowered test. Loosening all three buys sample; if expectancy is
       unchanged the earlier result was not a power problem.
+  - id: permissive_move
+    params:
+      min_move_atr: 1.0
+    claim: >-
+      The permissive pre-registration isolated at one ATR tests whether
+      reversion needs an unusually violent forced-flow overshoot.
 
-hypotheses_tested: 4
+hypotheses_tested: 5
 multiple_testing_note: |
-  Four declared parameterisations now exist. Any variant tested later must
+  Five declared parameterisations now exist. Any variant tested later must
   increment this count, and the reported result must be discounted
   accordingly.
 

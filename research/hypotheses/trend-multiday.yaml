@@ -61,10 +61,16 @@ settings:
     claim: >-
       Demanding a better-established trend in a calmer volatility regime should
       improve expectancy if persistence is real, at the cost of sample.
+  - id: three_quarter_horizon
+    params:
+      max_hold_bars: 1008
+    claim: >-
+      A registered three-quarter horizon tests persistence between the
+      fourteen-day baseline and half-horizon hold.
 
-hypotheses_tested: 3
+hypotheses_tested: 4
 multiple_testing_note: |
-  One parameter set, registered before the first run.
+  Four parameterisations are declared, including two single-axis horizons.
 
 data_limitation: |
   A 14-day hold on a 200-day window yields few non-overlapping trades, so

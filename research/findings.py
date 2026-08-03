@@ -287,16 +287,28 @@ _RETRYABLE_INCONCLUSIVE_CODES = {
     "SEGMENT_EXPECTANCY_UNAVAILABLE",
     "BASELINE_DELTA_NOT_ESTABLISHED",
 }
+MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS = 3
+
+
+def _inconclusive_reason_codes(payload: object) -> set[str]:
+    if not isinstance(payload, dict) or payload.get("verdict") != "INCONCLUSIVE":
+        return set()
+    return {
+        str(reason.get("code")) for reason in payload.get("reasons") or []
+        if isinstance(reason, dict)}
 
 
 def _retryable_inconclusive_payload(payload: object) -> bool:
     """Return whether more clean data can resolve an inconclusive result."""
-    if not isinstance(payload, dict) or payload.get("verdict") != "INCONCLUSIVE":
-        return False
-    codes = {
-        str(reason.get("code")) for reason in payload.get("reasons") or []
-        if isinstance(reason, dict)}
-    return bool(codes & _RETRYABLE_INCONCLUSIVE_CODES)
+    return bool(
+        _inconclusive_reason_codes(payload) & _RETRYABLE_INCONCLUSIVE_CODES)
+
+
+def _automatic_retry_payload(payload: object) -> bool:
+    """Only a closed but under-floor sample is retried without a new request."""
+    return (
+        _retryable_inconclusive_payload(payload)
+        and "CLOSED_SAMPLE_BELOW_FLOOR" in _inconclusive_reason_codes(payload))
 
 
 def _assignment_trade_costs(row: sqlite3.Row) -> tuple[dict, list[dict]]:
@@ -5042,6 +5054,29 @@ class FindingsStore:
                         str(item.get("variant_id") or ""),
                     ))
                     for candidate in ordered:
+                        previous = retryable.get(
+                            str(candidate.get("variant_id") or ""))
+                        if (previous is None
+                                or str(previous["candidate_key"])
+                                != str(candidate.get("candidate_key") or "")
+                                or not self._terminal_assignment_automatic_retryable(
+                                    previous)
+                                or int(previous["attempt"] or 1)
+                                >= MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS):
+                            continue
+                        is_eligible, _, retry_of = eligible(
+                            candidate, explicit=True)
+                        if is_eligible:
+                            resolved_variant = str(candidate["variant_id"])
+                            resolved_retry_of = retry_of
+                            break
+                if rejection is None and resolved_variant is None:
+                    ordered = sorted(static_candidates, key=lambda item: (
+                        int(item.get("priority", 100)),
+                        str(item.get("order_key") or ""),
+                        str(item.get("variant_id") or ""),
+                    ))
+                    for candidate in ordered:
                         is_eligible, _, _ = eligible(candidate)
                         if is_eligible:
                             resolved_variant = str(candidate["variant_id"])
@@ -5158,6 +5193,17 @@ class FindingsStore:
             return False
         return _retryable_inconclusive_payload(payload)
 
+    @staticmethod
+    def _terminal_assignment_automatic_retryable(
+            row: sqlite3.Row | None) -> bool:
+        if row is None or row["verdict"] != "INCONCLUSIVE":
+            return False
+        try:
+            payload = json.loads(row["outcome_payload_json"] or "null")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return _automatic_retry_payload(payload)
+
     def prioritized_experiment_candidates(
             self, scope_key: str, strategy_id: str,
             candidates: list[dict], *, now: float | None = None) -> list[dict]:
@@ -5227,6 +5273,29 @@ class FindingsStore:
                     "order_key": (
                         f"{float(row['requested_ts']):020.6f}:"
                         f"{ordinal:08d}:{selection_id}"),
+                }
+            for variant_id, candidate in sorted(available.items()):
+                if variant_id in priority_by_variant:
+                    continue
+                terminal_row = terminal.get(variant_id)
+                if (terminal_row is None
+                        or str(terminal_row["candidate_key"])
+                        != str(candidate.get("candidate_key") or "")
+                        or not self._terminal_assignment_automatic_retryable(
+                            terminal_row)
+                        or int(terminal_row["attempt"] or 1)
+                        >= MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS):
+                    continue
+                priority_by_variant[variant_id] = {
+                    "retry_of_assignment_id": str(
+                        terminal_row["assignment_id"]),
+                    # Explicit accepted selections (-100) and exact adaptive
+                    # proposals (0) retain their durable precedence. A retry
+                    # still runs before untouched static settings (normally 10).
+                    "priority": 1,
+                    "order_key": (
+                        f"automatic-retry:{int(terminal_row['attempt'] or 1):08d}:"
+                        f"{terminal_row['assignment_id']}"),
                 }
         for index, candidate in enumerate(out):
             selected = priority_by_variant.get(

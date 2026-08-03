@@ -70,10 +70,17 @@ settings:
     claim: >-
       The mirror test: at mild crowding the carry is smaller, so a result that
       holds up here is a directional result wearing a carry label.
+  - id: extreme_percentile
+    params:
+      percentile: 95.0
+    claim: >-
+      The extreme-crowding pre-registration isolated at the 95th percentile
+      tests the claimed carry return in the furthest tail.
 
-hypotheses_tested: 3
+hypotheses_tested: 4
 multiple_testing_note: |
-  One parameter set, registered before the first run.
+  Four parameterisations are declared, including the single-axis percentile
+  point used by forward rotation.
 
 data_limitation: |
   OKX serves ~97 days of funding history; outside that window edge_lab

@@ -24,7 +24,9 @@ class HypothesisVariantTests(unittest.TestCase):
             [v.variant_id for v in variants],
             ["momentum.prereg.registered", "momentum.prereg.target_2r",
              "momentum.prereg.wider_stop"])
-        self.assertTrue(all(v.status == "candidate" for v in variants))
+        self.assertEqual(
+            [v.status for v in variants],
+            ["candidate", "superseded", "superseded"])
 
     def test_store_persists_exact_hypothesis_metadata_and_lock(self):
         with tempfile.TemporaryDirectory() as directory:
