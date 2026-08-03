@@ -5,7 +5,7 @@ seven isolated real-time research evaluators.
 
 ## 1. Runtime locations
 
-| Operation | Mac | systemd VM | Docker VM |
+| Operation | Mac | Legacy systemd VM | Production Docker VM |
 | --- | --- | --- | --- |
 | Development/tests | Primary | Optional check | Image/CI build |
 | Demo trader | Foreground `main.py run` | `okx-trader.service` | `trader` (one replica) |
@@ -61,6 +61,28 @@ sudo -E docker compose -f compose.yaml \
   -f deploy/compose.external-backup.yaml \
   exec -T trader python main.py status
 ```
+
+Check the `main` deployment automation:
+
+```bash
+sudo systemctl status okx-agent-update.timer --no-pager
+systemctl list-timers okx-agent-update.timer --all
+sudo journalctl -u okx-agent-update.service -n 100 --no-pager
+
+APP_DIR=/opt/okx-agent-crypto
+sudo -u okx git -C "$APP_DIR" fetch origin main
+REMOTE="$(sudo -u okx git -C "$APP_DIR" rev-parse origin/main)"
+LOCAL="$(sudo -u okx git -C "$APP_DIR" rev-parse HEAD)"
+DEPLOYED="$(sudo cat /var/lib/okx-agent-updater/deployed-revision 2>/dev/null \
+  || echo NOT_DEPLOYED)"
+printf 'GitHub:   %s\nVM:       %s\nDeployed: %s\n' \
+  "$REMOTE" "$LOCAL" "$DEPLOYED"
+```
+
+All three revisions must match. The timer polls every five minutes; start
+`okx-agent-update.service` manually when an immediate post-merge deployment is
+required. The service is a oneshot and being inactive after a successful run
+is expected.
 
 The dashboard is available only through host loopback. Use an SSH tunnel to
 `127.0.0.1:8080`; do not publish port 8080 on a public interface. It exposes
@@ -419,6 +441,13 @@ Before deleting or rebuilding the VM:
 | Migration cannot read systemd runtime files | Stop the services, grant temporary `u:10001:rX` ACL access, copy as UID 10001, then remove the ACL. |
 | Migration `chown` is not permitted | Do not force ownership changes. Copy as UID/GID 10001 without `cp -a`; `findings/` is initialized from the image and regenerated. |
 | Docker backup says different device | This is not off-host proof; verify host/cloud retention separately |
+| GitHub SHA differs from VM SHA | The timer has not fetched/deployed `main`; inspect `okx-agent-update.timer` and the update-service journal. |
+| VM SHA differs from deployed marker | Git fast-forward succeeded but build, preflight, or Compose startup failed; the journal contains the failing stage. |
+| Deployed marker is `NOT_DEPLOYED` | No update has completed successfully since the updater was installed. Run the service manually and inspect its journal. |
+| Updater fails with `203/EXEC` or `Exec format error` | `/usr/local/sbin/okx-agent-sync` is malformed or lacks a valid first-line shebang. Validate with `bash -n`; the unit should use `ExecStart=/bin/bash ...`. |
+| Compose preflight cannot read `/app/config.yaml` | Compose ignores config UID/GID/mode fields outside Swarm. Keep tracked `config.yaml` mode `0644` and the updater at `umask 022`. |
+| Compose warns that config/secret UID/GID/mode are ignored | Expected for file-backed local Compose. Enforce host permissions: secret `10001:10001` mode `0400`; tracked `config.yaml` mode `0644`. |
+| `docker compose ps` is empty after an update | The updater failed before `compose up`; fix the first journal/preflight error and rerun the same revision. |
 
 The optional B7.5 maker-first order primitive remains disabled by default.
 `cycle.decision_interval_seconds`, `maker_first_enabled`,

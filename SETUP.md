@@ -108,6 +108,25 @@ create a second agent and it would stop when the Mac sleeps. A Mac may inspect
 the VM through an SSH Docker context, but the containers and volumes remain on
 the VM.
 
+The deployed production layout is:
+
+| Responsibility | Production location |
+| --- | --- |
+| Git checkout and Docker build context | `/opt/okx-agent-crypto`, branch `main` |
+| Trader, recorder, research scheduler, dashboard | Docker Compose on the Ubuntu VM |
+| Runtime state and journal | Docker named volume `runtime-data` |
+| Findings database | Docker named volume `research-cache` |
+| Tournament/results and generated reports | Docker named volumes `research-results` and `findings-reports` |
+| Credentials | `/etc/okx-agent-crypto/agent.env`, outside Git |
+| Durable research backup | `/srv/okx-agent-research-backup`, mounted Azure data disk |
+| Source-update polling | `okx-agent-update.timer` and `okx-agent-update.service` |
+| Successfully deployed Git revision | `/var/lib/okx-agent-updater/deployed-revision` |
+
+The legacy `okx-trader`, `okx-recorder`, `okx-research`, and
+`okx-dashboard` systemd application units must remain disabled on this Docker
+VM. Systemd still manages Docker itself and the GitHub update timer; it does
+not run a second copy of the application processes.
+
 ```bash
 git clone <repository> okx-agent-crypto
 cd okx-agent-crypto
@@ -184,7 +203,11 @@ sudo -E docker compose -f compose.yaml \
 
 Compose implementations may warn that secret/config `uid`, `gid`, and `mode`
 are ignored. File-backed secrets retain host permissions, so the source must
-remain owned by `10001:10001` with mode `0400`.
+remain owned by `10001:10001` with mode `0400`. The non-secret tracked
+`config.yaml` must remain readable by the container UID; keep it owned by the
+Git service user with mode `0644`. The VM updater must use `umask 022`, not
+`077`, so a Git fast-forward does not recreate tracked configuration or source
+files as owner-only files.
 
 After Compose is healthy, disable the legacy units. Never use
 `docker compose down -v`; `-v` deletes the named evidence volumes.
@@ -257,6 +280,82 @@ sudo APP_DIR=/opt/okx-agent-crypto \
   OKX_EXTERNAL_BACKUP_PATH=/srv/okx-agent-research-backup \
   /opt/okx-agent-crypto/deploy/update-compose.sh
 ```
+
+### Automated deployment from GitHub `main`
+
+The production VM treats GitHub `main` as the only deployment reference.
+Feature branches have no effect on the VM until they are reviewed and merged
+into `main`. A root-owned `/usr/local/sbin/okx-agent-sync` wrapper runs from
+`okx-agent-update.timer` every five minutes. It:
+
+1. requires `/srv/okx-agent-research-backup` to be a mounted, separately
+   writable device;
+2. refuses a dirty checkout or a branch other than `main`;
+3. fetches `origin/main` as Git user `okx` using the VM's read-only GitHub
+   deploy key;
+4. accepts only a fast-forward update;
+5. calls `deploy/update-compose.sh`, which builds and preflights before
+   replacing the running containers; and
+6. writes the successful full commit SHA to
+   `/var/lib/okx-agent-updater/deployed-revision` only after deployment passes.
+
+The wrapper must start with a valid shell header, be root-owned/executable, and
+use a normal repository umask:
+
+```bash
+#!/bin/bash
+set -Eeuo pipefail
+umask 022
+```
+
+The systemd unit invokes Bash explicitly so a malformed executable is reported
+clearly rather than only as `203/EXEC`:
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/sbin/okx-agent-sync
+```
+
+Enable and inspect automation on the VM:
+
+```bash
+sudo systemctl enable --now okx-agent-update.timer
+systemctl list-timers okx-agent-update.timer --all
+sudo systemctl status okx-agent-update.timer --no-pager
+sudo journalctl -u okx-agent-update.service -n 200 --no-pager
+```
+
+Trigger an immediate update after merging to `main`:
+
+```bash
+sudo systemctl start okx-agent-update.service
+```
+
+A successful oneshot service normally returns to `inactive (dead)`; inspect
+its result and journal rather than expecting it to remain `active`. Never add
+an unconditional `main.py resume` to the updater. A safe container replacement
+may deliberately leave the trader paused for operator review.
+
+Verify GitHub, checkout, and deployed state independently:
+
+```bash
+APP_DIR=/opt/okx-agent-crypto
+sudo -u okx git -C "$APP_DIR" fetch origin main
+REMOTE="$(sudo -u okx git -C "$APP_DIR" rev-parse origin/main)"
+LOCAL="$(sudo -u okx git -C "$APP_DIR" rev-parse HEAD)"
+DEPLOYED="$(sudo cat /var/lib/okx-agent-updater/deployed-revision 2>/dev/null \
+  || echo NOT_DEPLOYED)"
+printf 'GitHub:   %s\nVM:       %s\nDeployed: %s\n' \
+  "$REMOTE" "$LOCAL" "$DEPLOYED"
+```
+
+All three SHAs must match. `GitHub != VM` means the update was not fetched;
+`VM != Deployed` means Git advanced but build, preflight, or Compose startup
+did not complete. Generated runtime/research data is not stored in the Git
+checkout, so a fast-forward changes application source without replacing the
+named volumes or the external backup disk. Never use `docker compose down -v`
+as part of this flow.
 
 The dashboard has no write endpoint and receives no API-key/LLM secret. It is
 an operational view, not an administration console. Container health, bounded
