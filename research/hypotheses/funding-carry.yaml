@@ -43,7 +43,7 @@ cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 # --- the parameterisations that will be tested -----------------------------
 # Registered 2026-07-30. This hypothesis was rejected on ATTRIBUTION, not on a
 # threshold: funding contributed +0.039% of a +2.008% result. A crowding
-# threshold cannot fix that, and the expectation is that all three settings
+# threshold cannot fix that, and the expectation is that all four settings
 # fail gate 5 for the same reason.
 #
 # They are registered anyway, and the prediction is written here before the

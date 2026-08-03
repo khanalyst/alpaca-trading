@@ -216,10 +216,13 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # selector enumerated only registered single-axis strategy settings
         # and made its no-live-execution authority explicit.
         # That changes the model's proposal domain, so attribution must fork.
+        # 2e6c312ae9d80316 -> ffbd0360d5f624c9 when the selectable research
+        # catalog changed: feasible axes, stricter confidence floors, and
+        # maker penetration.
         # This constant moves only in a batch that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "2e6c312ae9d80316",
+            "ffbd0360d5f624c9",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

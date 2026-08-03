@@ -19,7 +19,7 @@ class HypothesisVariantTests(unittest.TestCase):
                             for v in variants))
 
     def test_yaml_settings_materialize_without_promotion(self):
-        variants = preregistered_variants("momentum", "phase1-v2")
+        variants = preregistered_variants("momentum", "phase1-v3")
         self.assertEqual(
             [v.variant_id for v in variants],
             ["momentum.prereg.registered", "momentum.prereg.target_2r",

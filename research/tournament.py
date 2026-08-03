@@ -12,7 +12,7 @@ is not scored at all. The file records the parameters and the hypothesis
 count before the result exists, which is the only defence against quietly
 tuning until something looks good.
 
-**The benchmark must reproduce.** momentum/phase1-v2 is scored on every run
+**The benchmark must reproduce.** momentum/phase1-v3 is scored on every run
 even though its answer is known. If the harness stops reproducing its
 measured failure, the harness has broken and every other number in the run
 is suspect. That check is the reason this is a tournament and not a search.

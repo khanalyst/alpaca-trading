@@ -229,15 +229,13 @@ snapshot file is size- and SHA-256-verified.
 `research.findings_store` never falls back to a temporary database. If the
 configured path cannot be used, the operation fails.
 
-## One-time VM fixture
+## Optional local historical data
 
-`vm-import/2026-07-30/` is a read-only, one-time evidence export supplied for
-development and tests. Copy its databases or extract its archive into a
-temporary directory before using them. Never configure the trader, findings
-store, recorder, tournament, or backup system to use this fixture as a default
-runtime location. Its 3,520 legacy shadow decisions have no current stored
-outcomes or current provenance manifest, so they remain audit history and are
-rejected for promotion. Do not infer or manufacture an edge from them.
+An ignored local `vm-import/` directory may exist on some development
+machines. If present, it is optional read-only historical data, is not part of
+the clone, and is never required or current. Never configure the trader,
+findings store, recorder, tournament, or backup system to use it as a runtime
+location or infer an edge from it.
 
 ## B7.5 and current boundaries
 
@@ -259,15 +257,15 @@ actions, not hidden automatic steps.
 ## Documentation index
 
 This index covers every version-controlled Markdown document in the
-repository. The one-time `vm-import/` fixture is excluded because it is
-external evidence, not a maintained documentation source.
+repository. Ignored local historical data is not a maintained documentation
+source.
 
 ### Primary and deployment documentation
 
 | Document | What it contains |
 | --- | --- |
 | [README.md](README.md) | Current architecture, shipped configuration, evidence boundaries, persistence model, commands, and this documentation index. Start here for the system-wide view. |
-| [SETUP.md](SETUP.md) | Local and Azure installation, credentials, configuration, services, external backup provisioning, deployment updates, and safe VM-import handling. |
+| [SETUP.md](SETUP.md) | Local and Azure installation, credentials, configuration, services, external backup provisioning, deployment updates, and optional local-history boundaries. |
 | [OPERATIONS.md](OPERATIONS.md) | Daily operation, runtime paths, nightly sequencing and exit codes, experiments, tournaments, backups, recovery, and troubleshooting. |
 | [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) | Short compatibility pointer for Azure deployment. It directs operators to setup/operations and lists data that must survive VM loss. |
 | [MAIN_REPO_REVIEW_PLAN.md](MAIN_REPO_REVIEW_PLAN.md) | Reconciled closure record for the seven implementation topics and remaining environment-only actions. It is a status summary, not a second runbook. |
@@ -306,9 +304,12 @@ external evidence, not a maintained documentation source.
 | [findings/momentum/momentum.net_direction.60.md](findings/momentum/momentum.net_direction.60.md) | Scorecard for a 60% net-direction cap. It tests whether same-side opportunities are mostly correlated duplicates. |
 | [findings/momentum/momentum.net_direction.80.md](findings/momentum/momentum.net_direction.80.md) | Scorecard for an 80% net-direction cap. It tests an intermediate concentration versus opportunity trade-off. |
 | [findings/momentum/momentum.net_direction.120.md](findings/momentum/momentum.net_direction.120.md) | Scorecard for a 120% net-direction cap. It tests whether the shipped ceiling suppresses genuinely independent signals. |
-| [findings/momentum/momentum.conf.floor_0_50.md](findings/momentum/momentum.conf.floor_0_50.md) | Scorecard for a 0.50 confidence floor. It asks whether the shipped floor excludes profitable lower-confidence proposals. |
-| [findings/momentum/momentum.conf.floor_0_55.md](findings/momentum/momentum.conf.floor_0_55.md) | Scorecard for a 0.55 confidence floor. It tests a middle point between sample recovery and proposal quality. |
-| [findings/momentum/momentum.conf.floor_0_60.md](findings/momentum/momentum.conf.floor_0_60.md) | Scorecard for a 0.60 confidence floor. It tests a small relaxation from the shipped threshold. |
+| [findings/momentum/momentum.conf.floor_0_50.md](findings/momentum/momentum.conf.floor_0_50.md) | Superseded 0.50 confidence-floor scorecard; proposals below the shipped 0.65 prompt floor are unobservable. |
+| [findings/momentum/momentum.conf.floor_0_55.md](findings/momentum/momentum.conf.floor_0_55.md) | Superseded 0.55 confidence-floor scorecard; proposals below the shipped 0.65 prompt floor are unobservable. |
+| [findings/momentum/momentum.conf.floor_0_60.md](findings/momentum/momentum.conf.floor_0_60.md) | Superseded 0.60 confidence-floor scorecard; proposals below the shipped 0.65 prompt floor are unobservable. |
+| [findings/momentum/momentum.conf.floor_0_70.md](findings/momentum/momentum.conf.floor_0_70.md) | Active scorecard for whether a modestly stricter observable confidence floor adds value over 0.65. |
+| [findings/momentum/momentum.conf.floor_0_75.md](findings/momentum/momentum.conf.floor_0_75.md) | Active scorecard for whether a materially stricter observable confidence floor adds value over 0.65. |
+| [findings/momentum/momentum.conf.floor_0_80.md](findings/momentum/momentum.conf.floor_0_80.md) | Active scorecard for the strictest registered observable confidence floor. |
 | [findings/momentum/momentum.discriminator.trend_alignment.md](findings/momentum/momentum.discriminator.trend_alignment.md) | Scorecard for separating breakouts from continuations using prior trend alignment. |
 | [findings/momentum/momentum.discriminator.volatility_regime.md](findings/momentum/momentum.discriminator.volatility_regime.md) | Scorecard for separating breakouts using compression versus expansion rather than trend alignment. |
 

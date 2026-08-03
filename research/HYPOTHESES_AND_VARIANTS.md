@@ -22,17 +22,15 @@ The executable sources remain authoritative when prose and code disagree:
 | Layer | Current shipped count/use |
 | --- | --- |
 | Registered strategies | 7 mechanism/falsification claims |
-| Historical/tournament setting rows | 22 across 7 YAML files |
-| Hand-authored momentum variants | 16 immutable identities including baseline |
-| Materialized static identities | 53 including all 7 baselines |
-| Bounded LLM selector candidates | 33 eligible single-axis candidates |
+| Pre-registered YAML setting rows | 32 across 7 strategy files |
+| Hand-authored momentum variants | 19 immutable identities including baseline |
+| Materialized static identities | 66 including all 7 baselines |
+| Bounded LLM selector candidates | 41 eligible single-axis candidates |
 | Active real-time arms | 14 maximum: baseline plus at most one candidate per strategy |
-| Historical tournament coverage | 5 strategies and 16 applicable setting results; 2 remain `NOT SCORED` |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
-The active real-time simulator identity is `forward_feed_version: 2`, and each
-registered forward-model ID ends in `.v2`. Earlier v1 rows remain immutable and
-must not be pooled with current outcomes.
+The active real-time simulator identity is `forward_feed_version: 4`. Earlier
+v1-v3 rows remain immutable and must not be pooled with current outcomes.
 
 All seven strategies receive the same market snapshot and timestamp. Each has
 independent paper cash, positions, risk state, decisions, and trades. Only
@@ -110,7 +108,8 @@ not pay. The first offline test was negative before costs, so this is
 - `move_2_atr`: single-axis 2 ATR move threshold;
 - `violent_only`: 2.5 ATR move and 2% OI drop; tournament multi-axis setting;
 - `permissive`: 1 ATR move, 0.5% OI drop, and 1.0 relative volume; tournament
-  multi-axis setting designed to buy sample.
+  multi-axis setting designed to buy sample;
+- `permissive_move`: single-axis 1 ATR move threshold.
 
 ### Funding carry (`funding-carry`, version `v1`)
 
@@ -141,7 +140,8 @@ falsified and the strategy is `T0_REJECTED`.
 - `extreme_crowding`: 95th percentile with 30 samples; tournament multi-axis
   test of whether funding attribution rises with crowding;
 - `mild_crowding`: 60th percentile; a result that persists here is likely
-  directional rather than carry.
+  directional rather than carry;
+- `extreme_percentile`: single-axis 95th-percentile tail.
 
 ### Funding unwind (`funding-unwind`, version `v1`)
 
@@ -175,7 +175,8 @@ from the carry decomposition on the same data, so it remains
 - `extreme_crowding`: 95th percentile with 30 samples; tournament multi-axis
   monotonicity check;
 - `mild_crowding`: 60th percentile; expectancy should weaken as crowding is
-  relaxed.
+  relaxed;
+- `extreme_percentile`: single-axis 95th-percentile tail.
 
 ### Multi-day trend (`trend-multiday`, version `v1`)
 
@@ -206,7 +207,8 @@ the holding period.
 - `registered`: 14-day hold and 55% range-position floor;
 - `half_horizon`: seven-day hold; the mechanism predicts less expectancy;
 - `stronger_trend`: 70% range floor and 1.5 ATR-ratio ceiling; tournament
-  multi-axis quality filter.
+  multi-axis quality filter;
+- `three_quarter_horizon`: single-axis 10.5-day hold.
 
 ### Relative long/short positioning (`ls-ratio-fade`, version `v1`)
 
@@ -236,7 +238,9 @@ only.
 
 - `registered`: 80th/20th percentile tails;
 - `higher_long_tail`: long threshold rises to the 90th percentile;
-- `lower_short_tail`: short threshold falls to the 10th percentile.
+- `lower_short_tail`: short threshold falls to the 10th percentile;
+- `extreme_long_tail`: long threshold rises to the 95th percentile;
+- `extreme_short_tail`: short threshold falls to the 5th percentile.
 
 ### Maker spread capture (`scalp-maker`, version `v1`)
 
@@ -269,7 +273,11 @@ be reconstructed from candles.
 
 - `registered`: 0.02% spread, 0.15 imbalance, 10,000 USDT per-side depth;
 - `stronger_imbalance`: imbalance threshold rises to 0.25;
-- `tighter_spread`: spread ceiling falls to 0.01%.
+- `tighter_spread`: spread ceiling falls to 0.01%;
+- `very_strong_imbalance`: imbalance threshold rises to 0.35;
+- `very_tight_spread`: spread ceiling falls to 0.005%;
+- `penetration_5bps`: paper maker fills require 5 bps of later trade-through;
+- `penetration_15bps`: paper maker fills require 15 bps of later trade-through.
 
 ## Why funding carry and funding unwind are separate strategies
 
@@ -313,9 +321,12 @@ variant ID; status is the only field that may advance.
 | `momentum.net_direction.60` | net-direction cap `60%` | Are refused same-side entries mostly correlated duplicates? |
 | `momentum.net_direction.80` | net-direction cap `80%` | Is there a better concentration/sample trade-off? |
 | `momentum.net_direction.120` | net-direction cap `120%` | Does the shipped 100% ceiling suppress independent signals? |
-| `momentum.conf.floor_0_50` | confidence floor `0.50` | Does the shipped floor discard profitable lower-confidence trades? |
-| `momentum.conf.floor_0_55` | confidence floor `0.55` | Does a middle floor improve sample without admitting the weakest proposals? |
-| `momentum.conf.floor_0_60` | confidence floor `0.60` | Does a small relaxation improve evidence without erasing expectancy? |
+| `momentum.conf.floor_0_50` | confidence floor `0.50` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
+| `momentum.conf.floor_0_55` | confidence floor `0.55` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
+| `momentum.conf.floor_0_60` | confidence floor `0.60` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
+| `momentum.conf.floor_0_70` | confidence floor `0.70` | Does a modestly stricter observable floor add marginal value over 0.65? |
+| `momentum.conf.floor_0_75` | confidence floor `0.75` | Does a materially stricter observable floor add marginal value over 0.65? |
+| `momentum.conf.floor_0_80` | confidence floor `0.80` | Does the strictest registered observable floor add marginal value over 0.65? |
 | `momentum.discriminator.trend_alignment` | breakout discriminator `trend_alignment` | Is a breakout specifically a transition out of chop? |
 | `momentum.discriminator.volatility_regime` | breakout discriminator `volatility_regime` | Is compression versus expansion the true distinction? |
 

@@ -1,4 +1,4 @@
-# Pre-registration: momentum / phase1-v2
+# Pre-registration: momentum / phase1-v3
 #
 # Registered retrospectively, as the benchmark null. This is the one entry
 # here whose result is already known, and it is kept so that the tournament
@@ -6,7 +6,7 @@
 # strategy's measured failure, the harness is wrong.
 
 strategy_id: momentum
-version: phase1-v2
+version: phase1-v3
 status: benchmark_null
 
 mechanism: |

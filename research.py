@@ -500,7 +500,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
               "including the\nempty ones: a programme that records only "
               "positives records only noise.")
         base_variant = registry.get(spec.base) or variant_mod.baseline(
-            "momentum", "phase1-v3")
+            str(cfg["strategy"]["id"]), str(cfg["strategy"]["version"]))
         subject = variant_mod.Variant(
             variant_id=f"{base_variant.strategy_id}.condition.{spec.name}",
             strategy_id=base_variant.strategy_id,
@@ -543,7 +543,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     # The axis is the unit of decision, not the individual setting: a
     # hypothesis is never rejected on one parameter value.
     base_variant = registry.get(spec.base) or variant_mod.baseline(
-        "momentum", "phase1-v2")
+        str(cfg["strategy"]["id"]), str(cfg["strategy"]["version"]))
     baseline_result = replay_mod.Replay(
         variant_mod.apply(base_variant, cfg),
         variant_id=base_variant.variant_id, mode=args.replay_mode,

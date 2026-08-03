@@ -63,7 +63,7 @@ The small units remain supported:
 - `okx-research.timer` schedules the research service.
 
 Start the recorder before the trader. Runtime state stays under the VM runtime
-directories and is never replaced by the read-only `vm-import/` fixture.
-Provision a different-device destination, then set `BACKUP_TARGET` and
-`REQUIRE_EXTERNAL_BACKUP=1` through a systemd override as documented in
-`../SETUP.md`.
+directories; optional ignored local `vm-import/` history, if present, is never
+used by deployment. Provision a different-device destination, then set
+`BACKUP_TARGET` and `REQUIRE_EXTERNAL_BACKUP=1` through a systemd override as
+documented in `../SETUP.md`.
