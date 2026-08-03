@@ -2262,6 +2262,33 @@ class Engine:
             return None
         return number if math.isfinite(number) else None
 
+    @staticmethod
+    def _plain_levels(value):
+        """Return a JSON-safe executable depth ladder, or None.
+
+        ``_plain`` is intentionally scalar-only.  Order-book depth is the
+        one research field that must retain its two-dimensional shape so the
+        forward simulator can walk observed prices and contract amounts.
+        Reject the whole ladder when any level is malformed rather than
+        silently changing the executable book.
+        """
+        if not isinstance(value, (list, tuple)):
+            return None
+        levels = []
+        for raw in value:
+            if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+                return None
+            try:
+                price = float(raw[0])
+                amount = float(raw[1])
+            except (TypeError, ValueError):
+                return None
+            if (not math.isfinite(price) or price <= 0
+                    or not math.isfinite(amount) or amount < 0):
+                return None
+            levels.append([price, amount])
+        return levels
+
     def _shadow_cfg(self, spec) -> dict:
         """Config a shadow strategy's contract is evaluated against.
 
@@ -2461,10 +2488,10 @@ class Engine:
                     observed.get("top_bid_size")),
                 "book_top_ask_size": self._plain(
                     observed.get("top_ask_size")),
-                "book_bid_levels": self._plain(
-                    observed.get("bid_levels") or []),
-                "book_ask_levels": self._plain(
-                    observed.get("ask_levels") or []),
+                "book_bid_levels": self._plain_levels(
+                    observed.get("bid_levels")),
+                "book_ask_levels": self._plain_levels(
+                    observed.get("ask_levels")),
                 "book_contract_size": self._plain(
                     observed.get("contract_size")),
                 "book_band_pct": self._plain(observed.get("band_pct")),

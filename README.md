@@ -30,7 +30,7 @@ research:
 | Decision cadence | `cycle.decision_interval_seconds: 300`; safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 3`; prior simulator evidence remains isolated |
+| Research feed | `forward_feed_version: 4`; prior simulator evidence remains isolated |
 | Active research arms | 14: one baseline and at most one candidate for each of 7 strategies |
 | Shadow workers | `2`; all seven strategies still advance on the same cycle snapshot |
 | Experiment floor | both 3 elapsed days and 100 comparable paired observations |
@@ -123,10 +123,10 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion. It is an immutable research lead, and current v3 forward
+promotion. It is an immutable research lead, and current v4 forward
 qualification is still required.
 
-The current `forward-qualify` path reconstructs v3 evidence from eligible
+The current `forward-qualify` path reconstructs v4 evidence from eligible
 completed assignments and each setting's contemporaneous baseline. It proves
 one declared axis from the immutable decision ledger, including the non-axis executable
 configuration, held-out confirmation, and family correction. Its

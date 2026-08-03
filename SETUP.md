@@ -70,7 +70,7 @@ means collection is still open.
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
-| `research.forward_feed_version` | `3`; v1/v2 simulator evidence is not pooled with current execution semantics |
+| `research.forward_feed_version` | `4`; v1-v3 simulator evidence is not pooled with repaired executable market-data semantics |
 | `research.experiment_min_duration_days` | `3` |
 | `research.experiment_min_observations` | `100` |
 | `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |

@@ -2,14 +2,15 @@ import json
 import time
 import unittest
 
-from agent.market import (build_universe, market_snapshot, quote_volume_usd,
-                          select_universe, symbol_snapshot)
+from agent.market import (_basis_pct, build_universe, market_snapshot,
+                          quote_volume_usd, select_universe, symbol_snapshot)
 from tests.helpers import valid_config
 
 
 class FakeMarketClient:
     def __init__(self):
         self.frames = {}
+        self.mark_price_calls = []
         self.markets = {
             "BTC/USDT:USDT": {
                 "id": "BTC-USDT-SWAP",
@@ -59,7 +60,24 @@ class FakeMarketClient:
         return {
             "fundingRate": 0.0002, "fundingTimestamp": now,
             "nextFundingTimestamp": now + 4 * 3_600_000,
-            "markPrice": 100.1, "indexPrice": 100,
+        }
+
+    def fetch_mark_prices(self, symbols=None):
+        symbols = list(symbols or self.markets)
+        self.mark_price_calls.append(symbols)
+        now = int(time.time() * 1000)
+        prices = {
+            "BTC/USDT:USDT": 100.2,
+            "ETH/USDT:USDT": 50.1,
+        }
+        return {
+            symbol: {
+                "symbol": symbol,
+                "timestamp": now,
+                "markPrice": prices[symbol],
+                "info": {"markPx": str(prices[symbol]), "ts": str(now)},
+            }
+            for symbol in symbols
         }
 
     @staticmethod
@@ -75,13 +93,17 @@ class FakeMarketClient:
     def fetch_open_interest(symbol):
         return {"openInterestValue": 250_000_000}
 
-    def fetch_tickers(self):
-        return {symbol: self.fetch_ticker(symbol) for symbol in self.markets}
+    def fetch_tickers(self, symbols=None):
+        return {
+            symbol: self.fetch_ticker(symbol)
+            for symbol in (symbols or self.markets)
+        }
 
 
 class FakeExchange:
     def __init__(self):
         self.x = FakeMarketClient()
+        self.public_calls = []
 
     @staticmethod
     def retry(fn, *args, **kwargs):
@@ -105,8 +127,21 @@ class FakeExchange:
     def taker_fee_pct(symbol):
         return 0.07
 
+    def public_call(self, method, params):
+        self.public_calls.append((method, params))
+        if method != "publicGetMarketIndexTickers":
+            return []
+        now = str(int(time.time() * 1000))
+        return [
+            {"instId": "BTC-USDT", "idxPx": "100.0", "ts": now},
+            {"instId": "ETH-USDT", "idxPx": "50.0", "ts": now},
+        ]
+
 
 class MarketSnapshotTests(unittest.TestCase):
+    def test_basis_calculation_rejects_overflow(self):
+        self.assertIsNone(_basis_pct(10**400, 1))
+
     def test_symbol_snapshot_has_relative_and_regime_context(self):
         cfg = valid_config()
         snap = symbol_snapshot(FakeExchange(), "ETH/USDT:USDT", cfg)
@@ -129,6 +164,60 @@ class MarketSnapshotTests(unittest.TestCase):
 
         self.assertIsNone(snap["funding_rate_pct"])
         self.assertEqual(snap["funding_samples_30"], 0)
+
+    def test_symbol_snapshot_preserves_valid_adapter_basis_prices(self):
+        exchange = FakeExchange()
+        original = exchange.x.fetch_funding_rate
+
+        def funding_with_prices(symbol):
+            return {
+                **original(symbol),
+                "markPrice": "100.2",
+                "indexPrice": "100.0",
+            }
+
+        exchange.x.fetch_funding_rate = funding_with_prices
+
+        snap = symbol_snapshot(
+            exchange, "ETH/USDT:USDT", valid_config())
+
+        self.assertEqual(snap["perp_index_basis_pct"], 0.2)
+
+    def test_market_snapshot_uses_one_batched_public_basis_read(self):
+        exchange = FakeExchange()
+        snap = market_snapshot(
+            exchange,
+            ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+            valid_config(),
+        )
+
+        self.assertEqual(snap["BTC/USDT:USDT"]["perp_index_basis_pct"], 0.2)
+        self.assertEqual(snap["ETH/USDT:USDT"]["perp_index_basis_pct"], 0.2)
+        self.assertEqual(
+            exchange.x.mark_price_calls,
+            [["BTC/USDT:USDT", "ETH/USDT:USDT"]],
+        )
+        self.assertEqual(
+            [call for call in exchange.public_calls
+             if call[0] == "publicGetMarketIndexTickers"],
+            [("publicGetMarketIndexTickers", {"quoteCcy": "USDT"})],
+        )
+
+    def test_market_snapshot_rejects_stale_index_basis(self):
+        exchange = FakeExchange()
+        stale = str(int((time.time() - 120) * 1000))
+
+        def stale_index(method, params):
+            if method == "publicGetMarketIndexTickers":
+                return [{"instId": "ETH-USDT", "idxPx": "50", "ts": stale}]
+            return []
+
+        exchange.public_call = stale_index
+
+        snap = market_snapshot(
+            exchange, ["ETH/USDT:USDT"], valid_config())
+
+        self.assertIsNone(snap["ETH/USDT:USDT"]["perp_index_basis_pct"])
 
     def test_btc_context_exists_even_when_btc_is_not_tradable(self):
         cfg = valid_config()
