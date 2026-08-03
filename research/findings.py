@@ -764,7 +764,7 @@ def _deterministic_experiment_payload(
                     "code": "FORWARD_AXIS_QUALIFICATION_REQUIRED",
                     "detail": (
                         "WORKED is an assignment-level research result. A "
-                        "current v4 forward-axis analysis, complete family "
+                        "current v5 forward-axis analysis, complete family "
                         "correction, and isolated PAPER stage remain required "
                         "before a reviewed T3 packet can be created."),
                 })

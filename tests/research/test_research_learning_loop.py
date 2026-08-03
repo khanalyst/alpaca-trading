@@ -260,6 +260,11 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         self.assertIn(
             "funding_cost_usdt",
             outcome["payload"]["candidate"]["costs"])
+        limitations = outcome["payload"]["data_limitations"]
+        self.assertTrue(any(
+            item["code"] == "FORWARD_AXIS_QUALIFICATION_REQUIRED"
+            and "current v5 forward-axis analysis" in item["detail"]
+            for item in limitations))
         self.assertEqual(
             outcome["payload"]["feed_identity"]["forward_feed_version"], 1)
         edges = self.store.edge_evidence(assignment["scope_key"])

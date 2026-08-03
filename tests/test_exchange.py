@@ -453,11 +453,7 @@ class AccountInstrumentTests(unittest.TestCase):
 
     def test_account_taker_fee_is_read_and_cached(self):
         client = Mock()
-        client.market.return_value = {"id": "BTC-USDT-SWAP"}
-        client.private_get_account_trade_fee.return_value = {
-            "code": "0",
-            "data": [{"taker": "-0.0007"}],
-        }
+        client.fetch_trading_fee.return_value = {"taker": "-0.0007"}
         exchange = Exchange.__new__(Exchange)
         exchange.cfg = valid_config()
         exchange.alerts = None
@@ -468,10 +464,18 @@ class AccountInstrumentTests(unittest.TestCase):
 
         self.assertAlmostEqual(first, 0.07)
         self.assertEqual(second, first)
-        client.private_get_account_trade_fee.assert_called_once_with({
-            "instType": "SWAP",
-            "instId": "BTC-USDT-SWAP",
-        })
+        client.fetch_trading_fee.assert_called_once_with("BTC/USDT:USDT")
+
+    def test_missing_account_taker_fee_fails_closed(self):
+        client = Mock()
+        client.fetch_trading_fee.return_value = {"maker": "-0.0002"}
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = client
+
+        with self.assertRaisesRegex(RuntimeError, "no taker fee"):
+            exchange.taker_fee_pct("BTC/USDT:USDT")
 
 
 class AccountValueValidationTests(unittest.TestCase):
