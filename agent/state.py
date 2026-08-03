@@ -368,9 +368,10 @@ def _validate(data: object) -> dict:
                 "setup_type", "run_id", "cycle_id", "exit_policy",
                 "invalidation_anchor", "entry_reason"):
             value = trade.get(key)
+            max_length = 300 if key == "entry_reason" else 200
             if value is not None and (
                     not isinstance(value, str) or not value.strip()
-                    or len(value) > 200):
+                    or len(value) > max_length):
                 raise ValueError(
                     f"state.active_trades.{symbol}.{key} is invalid")
         signal_ts = trade.get("signal_ts")

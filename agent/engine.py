@@ -969,6 +969,18 @@ class Engine:
                 state.log_event("rejected", json.dumps(
                     {"symbol": d.get("symbol"), "why": why}))
                 continue
+            symbol_data = live_snapshot.get(prepared.get("symbol")) or {}
+            if symbol_data.get("fee_rate_source") == "unavailable":
+                why = "account taker fee unavailable"
+                self._mark_setup_status(
+                    st, prepared["setup_id"], "risk_rejected")
+                log.info("Rejected %s %s: %s", prepared.get("direction"),
+                         prepared.get("symbol"), why)
+                state.log_event("rejected", json.dumps(
+                    {"symbol": prepared.get("symbol"), "why": why,
+                     "setup_id": prepared["setup_id"]}),
+                    setup_id=prepared["setup_id"])
+                continue
             plan, why = self.risk.vet_open(
                 prepared, equity, positions, live_snapshot,
                 st.get("cooldowns", {}), gross,

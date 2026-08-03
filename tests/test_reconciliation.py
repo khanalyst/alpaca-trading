@@ -341,6 +341,41 @@ class UnsafeLiquidationExchange(FakeEmergencyExchange):
 
 
 class EmergencyExecutionTests(unittest.TestCase):
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.log_trade")
+    @patch("agent.engine.state.commit")
+    def test_post_fill_persistence_accepts_201_to_300_char_entry_reason(
+            self, commit, log_trade, log_event):
+        # Exercise the same validator used by state.commit while keeping the
+        # test's journal writes isolated from the repository runtime.
+        commit.side_effect = state._validate
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.ex = FakeEmergencyExchange()
+        engine.alerts = Mock()
+        st = {"opened_at": {}, "active_trades": {}, "protection": {},
+              "cooldowns": {}}
+        reason = "r" * 250
+        plan = {
+            "symbol": "BTC/USDT:USDT", "direction": "long",
+            "leverage": 2, "sl_pct": 2, "tp_pct": 4,
+            "confidence": 0.8, "reason": reason,
+            "estimated_loss_pct": 2.7, "entry_equity_usd": 1_000,
+        }
+        execution = {
+            "filled": 2, "average": 100, "fee_usd": 0.2,
+            "position_contracts": 2, "position_id": "position-1",
+            "status": "closed",
+            "protection": {"stop_loss": True, "take_profit": True},
+        }
+
+        self.assertTrue(engine._settle_entry(
+            plan, st, execution, plan["symbol"], "buy", 98, 104))
+
+        commit.assert_called_once_with(st)
+        self.assertEqual(
+            st["active_trades"][plan["symbol"]]["entry_reason"], reason)
+
     @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
     @patch("agent.engine.state.commit")
     @patch("agent.engine.state.log_trade")

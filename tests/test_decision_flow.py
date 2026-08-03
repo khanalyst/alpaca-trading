@@ -220,6 +220,70 @@ class SequentialOpenValidationTests(unittest.TestCase):
         ])
         self.assertEqual(engine._execute_open.call_count, 2)
 
+    @patch("agent.engine.market.market_snapshot")
+    @patch("agent.engine.state.log_equity")
+    @patch("agent.engine.state.log_event")
+    @patch("agent.engine.state.commit")
+    @patch("agent.engine.state.load_state", return_value={"state": "RUNNING"})
+    def test_unavailable_account_fee_rejects_before_risk_or_execution(
+            self, load_state, commit, log_event, log_equity,
+            market_snapshot):
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.alerts = Mock()
+        engine.ex = Mock()
+        engine.ex.equity_usdt.return_value = 10_000
+        engine.ex.positions.return_value = []
+        engine.ex.transfers_since.return_value = (0, 2)
+        engine._reconcile_positions = Mock(return_value=[])
+        engine._startup_reconciled = True
+        engine._manage_positions = Mock(return_value=[])
+        engine._portfolio_view = Mock(return_value={})
+        engine._journal_llm_input = Mock()
+        engine._journal_llm_output = Mock()
+        engine.universe = ["BTC/USDT:USDT"]
+        engine.universe_ts = time.time()
+        unavailable_snapshot = setup_snapshot(1_000)
+        unavailable_snapshot["fee_rate_source"] = "unavailable"
+        market_snapshot.return_value = {
+            "BTC/USDT:USDT": unavailable_snapshot,
+        }
+        engine.llm = Mock()
+        engine.llm.decide.return_value = [open_decision(
+            "BTC/USDT:USDT", 0.9)]
+        engine.risk = Mock()
+        engine._execute_open = Mock(return_value=True)
+        st = {
+            "state": state.RUNNING,
+            "equity_basis": state.EQUITY_BASIS,
+            "high_water_mark": 10_000,
+            "day_start_equity": 10_000,
+            "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "last_ledger_ts": 1,
+            "cooldowns": {},
+            "entry_feedback": {},
+            "entry_failures": {},
+            "opened_at": {},
+            "active_trades": {},
+            "protection": {},
+            "recent_setups": {},
+        }
+
+        engine.cycle(st)
+
+        engine.risk.vet_open.assert_not_called()
+        engine._execute_open.assert_not_called()
+        record = next(iter(st["recent_setups"].values()))
+        self.assertEqual(record["status"], "risk_rejected")
+        rejected = [
+            json.loads(call.args[1]) for call in log_event.call_args_list
+            if call.args and call.args[0] == "rejected"
+        ]
+        self.assertIn(
+            "account taker fee unavailable",
+            [event["why"] for event in rejected],
+        )
+
 
 class UniverseRefreshTests(unittest.TestCase):
     @patch("agent.engine.market.market_snapshot", return_value={})
