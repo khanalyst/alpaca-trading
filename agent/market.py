@@ -66,6 +66,26 @@ def _funding_interval_hours(rate: dict) -> float | None:
     return None
 
 
+def _positive_price(value) -> float | None:
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _basis_pct(mark_value, index_value) -> float | None:
+    mark = _positive_price(mark_value)
+    index = _positive_price(index_value)
+    if mark is None or index is None:
+        return None
+    try:
+        basis = (mark - index) / index * 100
+    except OverflowError:
+        return None
+    return round(basis, 4) if math.isfinite(basis) else None
+
+
 def _funding_history_context(ex, symbol: str,
                              current_rate_pct: float | None) -> dict:
     """Summarize funding and retain realized settlements for paper PnL.
@@ -583,13 +603,13 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
                       / 60_000), 1)
             if next_funding not in (None, "") else None
         )
-        mark = fr.get("markPrice") or (fr.get("info") or {}).get("markPx")
-        index = fr.get("indexPrice") or (fr.get("info") or {}).get("idxPx")
-        mark = float(mark) if mark not in (None, "") else None
-        index = float(index) if index not in (None, "") else None
-        snap["perp_index_basis_pct"] = (
-            round((mark - index) / index * 100, 4)
-            if mark is not None and index is not None and index > 0 else None
+        # Current OKX/CCXT funding responses omit these prices. Preserve the
+        # value only for adapters that genuinely supply both fields; the live
+        # ``market_snapshot`` path overwrites it from dedicated batch sources.
+        info = fr.get("info") or {}
+        snap["perp_index_basis_pct"] = _basis_pct(
+            fr.get("markPrice") or info.get("markPx"),
+            fr.get("indexPrice") or info.get("idxPx"),
         )
         snap.update(_funding_history_context(
             ex, symbol, snap["funding_rate_pct"]))
@@ -826,6 +846,99 @@ def _apply_ticker_refresh(ex, symbol: str, row: dict, ticker: dict,
     strategy.enrich_snapshot(row, cfg)
 
 
+def _index_instrument_id(market: dict) -> str | None:
+    """Map one USDT swap market to its OKX index ticker identifier."""
+    info = market.get("info") or {}
+    for key in ("uly", "instFamily"):
+        value = str(info.get(key) or "").strip()
+        if value:
+            return value
+    market_id = str(info.get("instId") or market.get("id") or "").strip()
+    if market_id.endswith("-SWAP"):
+        market_id = market_id[:-5]
+    return market_id or None
+
+
+def _refresh_batch_basis(ex, snapshot: dict, cfg: dict) -> None:
+    """Attach current mark/index basis with two public calls per cycle.
+
+    Funding responses are not a mark/index price source on OKX.  Fetching the
+    dedicated endpoints once for the whole snapshot avoids two extra calls
+    per symbol while keeping every research lane on the same observation.
+    Missing or stale public data remains explicit as ``None`` and never stops
+    the active trader.
+    """
+    symbols = [symbol for symbol, row in snapshot.items()
+               if not symbol.startswith("_") and isinstance(row, dict)]
+    for symbol in symbols:
+        snapshot[symbol]["perp_index_basis_pct"] = None
+    if not symbols:
+        return
+
+    fetch_marks = getattr(ex.x, "fetch_mark_prices", None)
+    if not callable(fetch_marks):
+        log.warning("ccxt has no batch mark-price endpoint; basis unavailable")
+        return
+    try:
+        marks = ex.retry(fetch_marks, symbols) or {}
+    except Exception as exc:
+        log.warning("batch mark-price refresh failed: %s", exc)
+        return
+    if not isinstance(marks, dict):
+        log.warning("batch mark-price refresh returned an invalid response")
+        return
+
+    public_call = getattr(ex, "public_call", None)
+    if not callable(public_call):
+        log.warning("OKX index-ticker endpoint unavailable; basis unavailable")
+        return
+    try:
+        index_rows = public_call(
+            "publicGetMarketIndexTickers", {"quoteCcy": "USDT"})
+    except Exception as exc:
+        log.warning("batch index-price refresh failed: %s", exc)
+        return
+    if not isinstance(index_rows, list) or not index_rows:
+        log.warning("batch index-price refresh returned no USDT indices")
+        return
+    indices = {
+        str(row.get("instId")): row
+        for row in index_rows
+        if isinstance(row, dict) and row.get("instId")
+    }
+    max_age = float(cfg["execution"]["max_market_data_age_seconds"])
+
+    for symbol in symbols:
+        try:
+            mark_ticker = marks.get(symbol)
+            if not isinstance(mark_ticker, dict):
+                raise ValueError("missing from batch mark-price response")
+            _ticker_timestamp(mark_ticker, f"{symbol} mark", max_age)
+            mark = _positive_price(
+                mark_ticker.get("markPrice")
+                or (mark_ticker.get("info") or {}).get("markPx"))
+            if mark is None:
+                raise ValueError("mark price is invalid")
+
+            market = ex.x.market(symbol)
+            index_id = _index_instrument_id(market)
+            index_ticker = indices.get(str(index_id))
+            if not isinstance(index_ticker, dict):
+                raise ValueError(f"index {index_id or 'unknown'} is missing")
+            _ticker_timestamp(
+                {"timestamp": index_ticker.get("ts"), "info": index_ticker},
+                f"{symbol} index", max_age)
+            index = _positive_price(index_ticker.get("idxPx"))
+            if index is None:
+                raise ValueError("index price is invalid")
+            basis = _basis_pct(mark, index)
+            if basis is None:
+                raise ValueError("mark/index basis is invalid")
+            snapshot[symbol]["perp_index_basis_pct"] = basis
+        except Exception as exc:
+            log.warning("basis refresh failed for %s: %s", symbol, exc)
+
+
 def _refresh_batch_tickers(ex, snapshot: dict, cfg: dict) -> None:
     """Refresh all executable prices together and drop any stale symbol."""
     symbols = [symbol for symbol, row in snapshot.items()
@@ -900,6 +1013,7 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
     # Slow indicator/statistics calls happen before this single final price
     # refresh. Every strategy and configuration therefore evaluates the same
     # near-atomic executable ticker batch rather than sequential stale marks.
+    _refresh_batch_basis(ex, out, cfg)
     _refresh_batch_tickers(ex, out, cfg)
     capture_completed_ms = int(time.time() * 1000)
     ticker_timestamps = [

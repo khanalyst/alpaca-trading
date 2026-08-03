@@ -115,6 +115,55 @@ class ObservationRecordingTests(unittest.TestCase):
                  if kind == "book_state"]
         self.assertEqual([b["symbol"] for b in books], ["BTC/USDT:USDT"])
 
+    def test_attached_book_enrichment_preserves_executable_levels(self):
+        self.engine.ex.book_state.return_value = {
+            "symbol": "BTC/USDT:USDT", "mid": 100.0,
+            "best_bid": 99.99, "best_ask": 100.01,
+            "spread_pct": 0.02,
+            "bid_depth_usd": 9_999.0, "ask_depth_usd": 10_001.0,
+            "top_bid_size": 10.0, "top_ask_size": 12.0,
+            "bid_levels": [[99.99, 10.0], [99.98, 20.0]],
+            "ask_levels": [[100.01, 12.0], [100.02, 18.0]],
+            "contract_size": 0.01,
+            "band_pct": 0.35, "book_ts": 1_760_000_000_000,
+            "age_seconds": 0.1, "error": None,
+        }
+        snapshot = self._snapshot()
+
+        self.engine._attach_research_book_state(snapshot)
+
+        enrichment = snapshot["BTC/USDT:USDT"]["_enrichment"]
+        self.assertEqual(
+            enrichment["book_bid_levels"],
+            [[99.99, 10.0], [99.98, 20.0]],
+        )
+        self.assertEqual(
+            enrichment["book_ask_levels"],
+            [[100.01, 12.0], [100.02, 18.0]],
+        )
+        self.assertEqual(enrichment["book_contract_size"], 0.01)
+
+    def test_attached_book_enrichment_rejects_a_non_finite_ladder(self):
+        self.engine.ex.book_state.return_value = {
+            "symbol": "BTC/USDT:USDT", "mid": 100.0,
+            "best_bid": 99.99, "best_ask": 100.01,
+            "spread_pct": 0.02,
+            "bid_depth_usd": 9_999.0, "ask_depth_usd": 10_001.0,
+            "top_bid_size": 10.0, "top_ask_size": 12.0,
+            "bid_levels": [[99.99, float("nan")]],
+            "ask_levels": [[100.01, 12.0]],
+            "contract_size": 0.01,
+            "band_pct": 0.35, "book_ts": 1_760_000_000_000,
+            "age_seconds": 0.1, "error": None,
+        }
+        snapshot = self._snapshot()
+
+        self.engine._attach_research_book_state(snapshot)
+
+        enrichment = snapshot["BTC/USDT:USDT"]["_enrichment"]
+        self.assertIsNone(enrichment["book_bid_levels"])
+        self.assertEqual(enrichment["book_ask_levels"], [[100.01, 12.0]])
+
 
 class ObservationNeverInterruptsTrading(unittest.TestCase):
     """The acceptance criterion that outranks every field in the batch."""
