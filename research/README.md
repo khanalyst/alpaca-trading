@@ -32,14 +32,14 @@ a later code change before research can use it.
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
-current v4 forward qualification is still required and there is no automatic
+current v5 forward qualification is still required and there is no automatic
 live promotion.
 
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
 used. Replay/G2 must reproduce the recorded decisions before downstream
-authoritative evidence is trusted. The current v4 `forward-qualify` path uses
+authoritative evidence is trusted. The current v5 `forward-qualify` path uses
 eligible completed assignments and each setting's contemporaneous baseline.
 Its paired cluster sign-flip result is valid only under the documented
 cluster-delta sign-exchangeability/symmetric-null assumption.

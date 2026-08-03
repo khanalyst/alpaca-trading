@@ -457,36 +457,23 @@ class Exchange:
         cache = getattr(self, "_taker_fee_pct_cache", {})
         if symbol in cache and not refresh:
             return float(cache[symbol])
-        market = self.x.market(symbol)
-        rate = None
-        getter = getattr(self.x, "private_get_account_trade_fee", None)
-        if callable(getter):
-            response = self.retry(getter, {
-                "instType": "SWAP",
-                "instId": market.get("id"),
-            })
-            if str((response or {}).get("code", "0")) != "0":
-                raise RuntimeError(
-                    "OKX trade-fee query failed: "
-                    f"{(response or {}).get('msg') or response}")
-            rows = (response or {}).get("data") or []
-            row = rows[0] if rows and isinstance(rows[0], dict) else {}
-            for key in ("taker", "takerU", "takerUSDC"):
-                if row.get(key) not in (None, ""):
-                    rate = float(row[key])
-                    break
-        if rate is None:
-            fetcher = getattr(self.x, "fetch_trading_fee", None)
-            if not callable(fetcher):
-                raise RuntimeError(
-                    "installed CCXT cannot read the account taker fee")
-            row = self.retry(fetcher, symbol) or {}
-            if row.get("taker") not in (None, ""):
-                rate = float(row["taker"])
-        if rate is None or not math.isfinite(rate):
+        fetcher = getattr(self.x, "fetch_trading_fee", None)
+        if not callable(fetcher):
+            raise RuntimeError(
+                "installed CCXT cannot read the account taker fee")
+        row = self.retry(fetcher, symbol)
+        if not isinstance(row, dict) or row.get("taker") in (None, ""):
             raise RuntimeError(f"OKX returned no taker fee for {symbol}")
+        try:
+            rate = float(row["taker"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"OKX returned an invalid taker fee for {symbol}") from exc
+        if not math.isfinite(rate):
+            raise RuntimeError(
+                f"OKX returned an invalid taker fee for {symbol}")
         percent = abs(rate) * 100
-        if percent < 0 or percent > 1:
+        if not math.isfinite(percent) or percent < 0 or percent > 1:
             raise RuntimeError(
                 f"OKX returned an implausible taker fee for {symbol}")
         cache = dict(cache)

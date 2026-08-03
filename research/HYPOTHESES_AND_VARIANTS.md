@@ -29,8 +29,10 @@ The executable sources remain authoritative when prose and code disagree:
 | Active real-time arms | 14 maximum: baseline plus at most one candidate per strategy |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
-The active real-time simulator identity is `forward_feed_version: 4`. Earlier
-v1-v3 rows remain immutable and must not be pooled with current outcomes.
+The active real-time simulator identity is `forward_feed_version: 5`. Feeds
+v1-v4 remain immutable historical rows and must not be pooled with current
+outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the clean
+fork caused by immutable experiment-provenance binding.
 
 All seven strategies receive the same market snapshot and timestamp. Each has
 independent paper cash, positions, risk state, decisions, and trades. Only
