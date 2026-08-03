@@ -54,6 +54,27 @@ def parsed_selection(strategy_id, variant_id=None, reasoning=None, **extra):
 
 
 class ResearchSelectorPromptAndParserTests(unittest.TestCase):
+    def test_scalp_maker_penetration_axis_has_baseline_and_two_falsifiers(self):
+        catalog = variants.research_selection_catalog()
+        axis = "execution.paper_maker_fill_penetration_bps"
+        baseline = variants._dotted_value(
+            variants._selection_baseline_config("scalp-maker"), axis)
+        settings = [
+            item for item in catalog["scalp-maker"]
+            if item["axis"] == axis]
+
+        self.assertEqual(baseline, 1)
+        self.assertEqual(
+            {item["variant_id"] for item in settings},
+            {
+                "scalp_maker.prereg.penetration_5bps",
+                "scalp_maker.prereg.penetration_15bps",
+            })
+        self.assertEqual(
+            {baseline, *(next(iter(item["setting"].values()))
+                         for item in settings)},
+            {1, 5, 15})
+
     def test_confidence_catalog_only_selects_floors_above_live_baseline(self):
         registry = selector_registry()
         catalog = variants.research_selection_catalog()

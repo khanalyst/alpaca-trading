@@ -411,8 +411,11 @@ def _experiment_arm_evidence(
     from research.score import score_returns
 
     has_execution_validity = _stored_version(conn) >= 16
-    validity_alias = (
+    stored_validity = (
         "t.valid_for_inference" if has_execution_validity else "1")
+    validity_alias = (
+        "CASE WHEN t.result='unfilled' THEN 0 "
+        f"ELSE {stored_validity} END")
     rows = conn.execute(
         "SELECT d.*, t.proposal_id AS trade_proposal_id, "
         "t.scope_key AS trade_scope_key, t.variant_id AS trade_variant_id, "
@@ -444,13 +447,20 @@ def _experiment_arm_evidence(
         "AND d.decision_ts>=? AND d.decision_ts<=? "
         "ORDER BY t.entry_ts, t.trade_id",
         (scope_key, variant_id, started_ts, ended_ts)).fetchall()
+    unfilled = [row for row in trade_rows
+                if str(row["status"]) == "CLOSED"
+                and str(row["result"]) == "unfilled"
+                and row["exit_ts"] is not None
+                and float(row["exit_ts"]) <= ended_ts]
     closed = [row for row in trade_rows
               if row["exit_ts"] is not None
               and float(row["exit_ts"]) <= ended_ts
+              and str(row["result"]) != "unfilled"
               and row["r_multiple"] is not None
               and (not has_execution_validity
                    or int(row["valid_for_inference"] or 0) == 1)]
-    unresolved = [row for row in trade_rows if row not in closed]
+    unresolved = [row for row in trade_rows
+                  if row not in closed and row not in unfilled]
     costs = {
         "gross_pnl_usdt": 0.0, "fees_usdt": 0.0,
         "execution_cost_usdt": 0.0, "funding_cost_usdt": 0.0,
@@ -521,6 +531,7 @@ def _experiment_arm_evidence(
         "vetoed_decisions": sum(
             str(row["decision_outcome"]) == "VETOED" for row in rows),
         "opens": len(trade_rows), "closes": len(closed),
+        "fill_opportunities": len(trade_rows), "unfilled": len(unfilled),
         "unresolved_opens": len(unresolved),
         "wins": wins, "losses": losses, "breakeven": breakeven,
         "win_rate_pct": (wins / len(closed) * 100.0 if closed else None),
@@ -3368,9 +3379,13 @@ class FindingsStore:
             decisions = [
                 row for row in decisions if paper_started is not None
                 and float(row["decision_ts"]) >= float(paper_started)]
+        unfilled = [row for row in trades if row["status"] == "CLOSED"
+                    and row.get("result") == "unfilled"]
         closed = [row for row in trades if row["status"] == "CLOSED"
+                  and row.get("result") != "unfilled"
                   and int(row.get("valid_for_inference", 1)) == 1]
         invalid = [row for row in trades if row["status"] == "CLOSED"
+                   and row.get("result") != "unfilled"
                    and int(row.get("valid_for_inference", 1)) == 0]
         accepted = [row for row in decisions
                     if row["decision_outcome"] == "PROPOSED"]
@@ -3391,6 +3406,8 @@ class FindingsStore:
             "max_drawdown_pct": state.get("max_drawdown_pct"),
             "open_positions": len(state.get("positions") or []),
             "closed_trades": len(closed),
+            "fill_opportunities": len(trades),
+            "unfilled_trades": len(unfilled),
             "invalid_closed_trades": len(invalid),
             "net_pnl_usdt": sum(float(row["net_pnl_usd"] or 0) for row in closed),
             "expectancy_r": (sum(float(row["r_multiple"] or 0) for row in closed)

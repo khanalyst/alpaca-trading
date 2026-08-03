@@ -1132,11 +1132,12 @@ class ShadowEvaluator:
                     result = "unfilled"
                     exit_price = float(position["entry_price"])
                     net_pnl = r_multiple = 0.0
-                    valid_for_inference = True
+                    valid_for_inference = False
                     exit_evidence = {
                         "entry_execution": position.get("entry_execution"),
                         "cancelled_at_ts": now,
                         "exit_ts": now,
+                        "valid_for_inference": False,
                         "reason": "passive quote did not meet the fill rule",
                     }
             if result is None:

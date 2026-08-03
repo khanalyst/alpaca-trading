@@ -223,6 +223,52 @@ class ExperimentCorrectnessTests(unittest.TestCase):
                  assignment["assignment_id"])],
             ["STARTED", "OBSERVING", "DRAINING", "COMPLETED"])
 
+    def test_terminal_unfilled_attempts_are_fill_evidence_not_trade_samples(self):
+        assignment = self.assignment("demo:unfilled")
+        trade_ids = self._seed_open_pair(assignment)
+        self.store.record_experiment_observations(
+            assignment["assignment_id"],
+            [{"observation_key": "paired-unfilled"}], now=2.0)
+        draining = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=3.0)
+        self.assertEqual(draining["status"], "DRAINING")
+
+        with findings._connect(self.path) as conn:
+            for trade_id in trade_ids:
+                findings.FindingsStore._close_paper_trade(conn, {
+                    "trade_id": trade_id,
+                    "exit_ts": 4.0,
+                    "exit_price": 100.0,
+                    "result": "unfilled",
+                    "net_pnl_usd": 0.0,
+                    "r_multiple": 0.0,
+                    "valid_for_inference": False,
+                    "execution": {
+                        "entry": {"status": "pending"},
+                        "exit": {"reason": "passive quote did not fill"},
+                    },
+                })
+
+        completed = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=5.0)
+        payload = self.store.experiment_outcome(
+            assignment["assignment_id"])["payload"]
+
+        self.assertEqual(completed["status"], "COMPLETED")
+        self.assertEqual(completed["unresolved_actions"]["total"], 0)
+        for arm_name in ("baseline", "candidate"):
+            arm = payload[arm_name]
+            self.assertEqual(arm["fill_opportunities"], 1)
+            self.assertEqual(arm["unfilled"], 1)
+            self.assertEqual(arm["closes"], 0)
+            self.assertEqual(arm["unresolved_opens"], 0)
+            self.assertEqual(arm["trade_r_metrics"]["n"], 0)
+            self.assertEqual(arm["net_pnl_usdt"], 0.0)
+        self.assertEqual(payload["paired"]["full"]["paired_n"], 0)
+        self.assertNotIn(
+            "UNRESOLVED_TRADES",
+            {reason["code"] for reason in payload["reasons"]})
+
     def test_explicit_selection_can_retry_latest_inconclusive_attempt(self):
         scope = "demo:retry"
         first = self.assignment(scope)

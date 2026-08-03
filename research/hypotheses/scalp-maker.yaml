@@ -63,6 +63,19 @@ settings:
     claim: >-
       A registered 0.005 percent spread point tests passive capture in the most
       liquid observed books.
+  - id: penetration_5bps
+    params:
+      execution.paper_maker_fill_penetration_bps: 5
+    claim: >-
+      Requiring 5 bps of later trade-through tests the favorable side of the
+      declared 5-to-15 bps fill crossover before adverse selection dominates.
+  - id: penetration_15bps
+    params:
+      execution.paper_maker_fill_penetration_bps: 15
+    claim: >-
+      Requiring 15 bps of later trade-through tests the declared falsifier: if
+      fills only appear beyond this crossover, adverse selection should erase
+      the maker fee and spread advantage.
 
 backtestable: false
 why_not_backtestable: |
@@ -79,9 +92,9 @@ why_not_backtestable: |
   at an observed best quote. That is implementation evidence, not proof that
   a real resting order would have obtained queue priority or a fill.
 
-hypotheses_tested: 5
+hypotheses_tested: 7
 multiple_testing_note: |
-  Five parameterisations are declared before forward outcomes are observed.
+  Seven parameterisations are declared before forward outcomes are observed.
   No setting has completed the evidence window yet.
 
 design_constraints_already_measured: |
