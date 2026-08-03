@@ -149,17 +149,18 @@ variants:
     status: candidate
 
   # --- the confidence floor ----------------------------------------------
-  # H-F: every arm reuses the same recorded LLM proposal and confidence, so
-  # downward floors are observable in real time without another model call.
+  # The live prompt already suppresses proposals below the shipped 0.65
+  # floor. Reusing recorded proposals can therefore measure only the marginal
+  # value of stricter floors, not the value of proposals the model never emits.
   - variant_id: momentum.conf.floor_0_50
     strategy_id: momentum
     base_version: phase1-v3
     overrides:
       risk.min_confidence: 0.50
     hypothesis: >-
-      The 0.65 floor rejects trades that are profitable in aggregate, which
-      cannot be observed live because those trades are never taken.
-    status: candidate
+      This historical lower-floor candidate is superseded because the live
+      prompt suppresses the low-confidence proposals it would need to observe.
+    status: superseded
 
   - variant_id: momentum.conf.floor_0_55
     strategy_id: momentum
@@ -167,9 +168,9 @@ variants:
     overrides:
       risk.min_confidence: 0.55
     hypothesis: >-
-      A 0.55 confidence floor recovers profitable lower-confidence trades while
-      filtering the weakest proposals admitted by the 0.50 setting.
-    status: candidate
+      This historical lower-floor candidate is superseded because the live
+      prompt suppresses the low-confidence proposals it would need to observe.
+    status: superseded
 
   - variant_id: momentum.conf.floor_0_60
     strategy_id: momentum
@@ -177,8 +178,38 @@ variants:
     overrides:
       risk.min_confidence: 0.60
     hypothesis: >-
-      A 0.60 confidence floor improves sample size over 0.65 without admitting
-      enough weak proposals to erase the added observations' expectancy.
+      This historical lower-floor candidate is superseded because the live
+      prompt suppresses the low-confidence proposals it would need to observe.
+    status: superseded
+
+  - variant_id: momentum.conf.floor_0_70
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.70
+    hypothesis: >-
+      A 0.70 floor measures whether a modestly stricter confidence gate adds
+      marginal value over the observable proposals admitted by the 0.65 baseline.
+    status: candidate
+
+  - variant_id: momentum.conf.floor_0_75
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.75
+    hypothesis: >-
+      A 0.75 floor measures whether a materially stricter confidence gate adds
+      marginal value over the observable proposals admitted by the 0.65 baseline.
+    status: candidate
+
+  - variant_id: momentum.conf.floor_0_80
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      risk.min_confidence: 0.80
+    hypothesis: >-
+      A 0.80 floor measures whether the strictest registered confidence gate
+      adds marginal value over the observable proposals admitted by the 0.65 baseline.
     status: candidate
 
   # --- batch 6.4: which variable separates breakout from continuation ------

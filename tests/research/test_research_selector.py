@@ -54,6 +54,45 @@ def parsed_selection(strategy_id, variant_id=None, reasoning=None, **extra):
 
 
 class ResearchSelectorPromptAndParserTests(unittest.TestCase):
+    def test_confidence_catalog_only_selects_floors_above_live_baseline(self):
+        registry = selector_registry()
+        catalog = variants.research_selection_catalog()
+        baseline = variants._dotted_value(
+            variants._selection_baseline_config("momentum"),
+            "risk.min_confidence")
+        active = [
+            item for item in catalog["momentum"]
+            if item["axis"] == "risk.min_confidence"]
+
+        self.assertEqual(baseline, 0.65)
+        self.assertEqual(
+            {item["variant_id"] for item in active},
+            {
+                "momentum.conf.floor_0_70",
+                "momentum.conf.floor_0_75",
+                "momentum.conf.floor_0_80",
+            })
+        self.assertTrue(all(
+            next(iter(item["setting"].values())) > baseline
+            for item in active))
+
+        historical_ids = {
+            "momentum.conf.floor_0_50",
+            "momentum.conf.floor_0_55",
+            "momentum.conf.floor_0_60",
+        }
+        self.assertTrue(historical_ids <= registry.keys())
+        self.assertEqual(
+            {registry[variant_id].status for variant_id in historical_ids},
+            {"superseded"})
+        self.assertTrue(historical_ids.isdisjoint(
+            item["variant_id"] for item in active))
+        for variant_id in historical_ids:
+            with self.subTest(variant_id=variant_id):
+                self.assertEqual(
+                    parsed_selection("momentum", variant_id)["validation_status"],
+                    "REJECTED")
+
     def test_catalog_axes_have_unique_executable_baseline_families(self):
         catalog = variants.research_selection_catalog()
         all_ids = {

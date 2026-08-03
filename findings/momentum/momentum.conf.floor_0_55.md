@@ -1,7 +1,7 @@
 # momentum.conf.floor_0_55
 
-Status: candidate
-Hypothesis: A 0.55 confidence floor recovers profitable lower-confidence trades while filtering the weakest proposals admitted by the 0.50 setting.
+Status: superseded
+Hypothesis: This historical lower-floor candidate is superseded because the live prompt suppresses the low-confidence proposals it would need to observe.
 Overrides: risk.min_confidence = 0.55
 
 ## Sample
