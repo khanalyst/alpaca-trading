@@ -53,9 +53,37 @@ writable by UID/GID 10001. A Docker bind mount or a different container
 off-host-verified. Confirm the cloud disk's retain/detach policy or a remote
 snapshot/restore independently.
 
-## systemd (existing VM compatibility)
+### Production ownership and automated updates
 
-The small units remain supported:
+On the deployed VM, Docker Compose owns all four application processes.
+Legacy application systemd units remain disabled; systemd manages Docker and
+the separate `okx-agent-update.timer`/`okx-agent-update.service` automation.
+The timer polls GitHub `main`, accepts only clean fast-forward updates, invokes
+[`update-compose.sh`](update-compose.sh), and records the last successful full
+SHA in `/var/lib/okx-agent-updater/deployed-revision`.
+
+The root-owned sync wrapper lives at `/usr/local/sbin/okx-agent-sync`, outside
+the Git checkout. It must use `umask 022`: tracked files are image inputs and
+`config.yaml` is mounted into containers that run as UID/GID 10001. Local
+Compose ignores requested config UID/GID/mode fields, so keep the host
+`config.yaml` readable (`0644`). The credential file is different: keep
+`/etc/okx-agent-crypto/agent.env` owned by `10001:10001` with mode `0400`.
+
+The source checkout is `/opt/okx-agent-crypto`; runtime, cache, results, and
+generated findings live in named volumes, and the verified external backup is
+mounted at `/srv/okx-agent-research-backup`. Git updates therefore replace
+source/image inputs without replacing operational evidence. `down -v`, volume
+pruning, and automatic trader resume are not update steps.
+
+See the automated deployment section in [`../SETUP.md`](../SETUP.md) for the
+service/timer behavior, immediate trigger, journal commands, and three-SHA
+verification procedure.
+
+## systemd application units (legacy VM compatibility)
+
+The small application units remain supported as an alternative deployment
+lane, but they must not be enabled on the same VM as the Compose application
+stack:
 
 - `okx-recorder.service` records short-retention market data;
 - `okx-trader.service` runs the demo-first agent;
