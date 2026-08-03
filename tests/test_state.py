@@ -31,6 +31,18 @@ class StateSafetyTests(unittest.TestCase):
         state._JOURNAL_CONTEXT.update(self.original_context)
         self.temp.cleanup()
 
+    @staticmethod
+    def _active_trade(entry_reason):
+        return {
+            "trade_id": "trade-1",
+            "direction": "long",
+            "opened_at": 1.0,
+            "entry_price": 100.0,
+            "entry_notional": 100.0,
+            "qty": 1.0,
+            "entry_reason": entry_reason,
+        }
+
     def test_corrupt_state_is_preserved_and_forces_killed(self):
         state.RUNTIME.mkdir(parents=True, exist_ok=True)
         state.STATE_FILE.write_text("{not-json")
@@ -82,6 +94,32 @@ class StateSafetyTests(unittest.TestCase):
         state.STATE_FILE.write_text(json.dumps(malformed))
         loaded = state.load_state()
         self.assertEqual(loaded["state"], state.KILLED)
+
+    def test_active_trade_entry_reason_allows_300_characters(self):
+        valid = dict(state.DEFAULT)
+        valid["state"] = state.RUNNING
+        reason = "r" * 300
+        valid["active_trades"] = {
+            "BTC/USDT:USDT": self._active_trade(reason),
+        }
+
+        state.save_state(valid)
+
+        self.assertEqual(
+            state.load_state()["active_trades"]["BTC/USDT:USDT"]
+            ["entry_reason"],
+            reason,
+        )
+
+    def test_active_trade_entry_reason_rejects_301_characters(self):
+        invalid = dict(state.DEFAULT)
+        invalid["state"] = state.RUNNING
+        invalid["active_trades"] = {
+            "BTC/USDT:USDT": self._active_trade("r" * 301),
+        }
+
+        with self.assertRaisesRegex(ValueError, "entry_reason"):
+            state.save_state(invalid)
 
     def test_unknown_equity_basis_fails_closed(self):
         invalid = dict(state.DEFAULT)

@@ -620,21 +620,32 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
         snap["perp_index_basis_pct"] = None
         snap.update(_funding_history_context(ex, symbol, None))
 
-    fee_reader = getattr(ex, "taker_fee_pct", None)
+    configured_fee = float(
+        cfg["trading_costs"]["taker_fee_pct_per_side"])
+    reader_error = None
     try:
-        fee_pct = (
-            float(fee_reader(symbol)) if callable(fee_reader)
-            else float(cfg["trading_costs"]["taker_fee_pct_per_side"])
-        )
-        if not math.isfinite(fee_pct) or fee_pct < 0 or fee_pct > 1:
-            raise ValueError("invalid fee rate")
-        snap["taker_fee_pct_per_side"] = round(fee_pct, 6)
-        snap["fee_rate_source"] = (
-            "okx_account" if callable(fee_reader) else "configured_fallback")
-    except Exception:
-        snap["taker_fee_pct_per_side"] = float(
-            cfg["trading_costs"]["taker_fee_pct_per_side"])
-        snap["fee_rate_source"] = "configured_fallback"
+        fee_reader = getattr(ex, "taker_fee_pct", None)
+    except Exception as exc:                       # noqa: BLE001
+        fee_reader = None
+        reader_error = exc
+    if not callable(fee_reader):
+        snap["taker_fee_pct_per_side"] = configured_fee
+        snap["fee_rate_source"] = "unavailable"
+        log.warning(
+            "Taker fee unavailable for %s: %s", symbol,
+            reader_error or "account fee reader unavailable")
+    else:
+        try:
+            fee_pct = float(fee_reader(symbol))
+            if not math.isfinite(fee_pct) or fee_pct < 0 or fee_pct > 1:
+                raise ValueError("invalid fee rate")
+        except Exception as exc:                       # noqa: BLE001
+            snap["taker_fee_pct_per_side"] = configured_fee
+            snap["fee_rate_source"] = "unavailable"
+            log.warning("Taker fee unavailable for %s: %s", symbol, exc)
+        else:
+            snap["taker_fee_pct_per_side"] = round(fee_pct, 6)
+            snap["fee_rate_source"] = "okx_account"
     open_interest = _open_interest_usd(ex, symbol, last)
     snap["open_interest_musd"] = (
         round(open_interest / 1e6, 2) if open_interest is not None else None)

@@ -1,6 +1,7 @@
 import json
 import time
 import unittest
+from unittest.mock import Mock
 
 from agent.market import (_basis_pct, build_universe, market_snapshot,
                           quote_volume_usd, select_universe, symbol_snapshot)
@@ -164,6 +165,20 @@ class MarketSnapshotTests(unittest.TestCase):
 
         self.assertIsNone(snap["funding_rate_pct"])
         self.assertEqual(snap["funding_samples_30"], 0)
+
+    def test_fee_reader_failure_keeps_numeric_fallback_and_marks_unavailable(self):
+        exchange = FakeExchange()
+        exchange.taker_fee_pct = Mock(side_effect=RuntimeError("fee API down"))
+        cfg = valid_config()
+
+        snap = symbol_snapshot(exchange, "ETH/USDT:USDT", cfg)
+
+        self.assertEqual(
+            snap["taker_fee_pct_per_side"],
+            cfg["trading_costs"]["taker_fee_pct_per_side"],
+        )
+        self.assertEqual(snap["fee_rate_source"], "unavailable")
+        self.assertGreater(snap["price"], 0)
 
     def test_symbol_snapshot_preserves_valid_adapter_basis_prices(self):
         exchange = FakeExchange()
