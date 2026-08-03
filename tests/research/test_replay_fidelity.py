@@ -20,8 +20,10 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
+from agent.risk import RiskEngine
 from research import replay
 from tests.helpers import valid_config
 from tests.research.test_replay_determinism import (cycle, model_output,
@@ -176,6 +178,97 @@ class ReproductionTests(FidelityFixture):
 
         self.assertEqual(len(report["missing"]), report["missing_count"])
         self.assertIn(("cX", "AAA/USDT:USDT", "long"), report["missing"])
+
+
+class SetupBreadthReplayParityTests(unittest.TestCase):
+    @staticmethod
+    def _breadth(firing):
+        return {
+            "momentum": {
+                "instruments_scanned": 10,
+                "instruments_with_a_valid_setup": firing,
+                "setup_breadth_pct": (
+                    firing * 10.0 if isinstance(firing, (int, float))
+                    else None),
+            },
+        }
+
+    @staticmethod
+    def _live_risk(cfg, observed, breadth=None):
+        snapshot = deepcopy(observed.snapshot)
+        if breadth is not None:
+            snapshot["_market_context"]["_enrichment"] = {
+                "setup_breadth_by_strategy": breadth,
+            }
+        decision = dict(
+            open_decision(), stop_loss_pct=2.0, take_profit_pct=4.0)
+        return RiskEngine(cfg).vet_open(
+            decision, 10_000.0, [], snapshot, {}, 0.0, now=observed.ts)
+
+    def _replay(self, cfg, observed):
+        return replay.Replay(cfg, mode="recorded_llm").run(
+            [observed], [model_output(0, [open_decision()])])
+
+    def test_crowded_recorded_lane_matches_the_live_veto(self):
+        cfg = valid_config()
+        observed = cycle(0)
+        breadth = self._breadth(5)
+        observed.enrichment = {
+            "market": {"setup_breadth_by_strategy": breadth},
+            "symbols": {},
+        }
+        original_snapshot = deepcopy(observed.snapshot)
+
+        live_plan, live_veto = self._live_risk(cfg, observed, breadth)
+        result = self._replay(cfg, observed)
+
+        self.assertIsNone(live_plan)
+        self.assertEqual(
+            live_veto,
+            "setup breadth 5 instruments exceeds 4: correlated market-wide "
+            "move")
+        self.assertEqual(result.decisions[0].stage, "vetoed")
+        self.assertEqual(result.decisions[0].reason, live_veto)
+        self.assertEqual(observed.snapshot, original_snapshot)
+        self.assertNotIn("_enrichment",
+                         observed.snapshot["_market_context"])
+
+    def test_quiet_and_missing_legacy_enrichment_remain_openable(self):
+        cfg = valid_config()
+        for label, breadth in (("quiet", self._breadth(4)),
+                               ("legacy_missing", None)):
+            with self.subTest(label=label):
+                observed = cycle(0)
+                if breadth is not None:
+                    observed.enrichment = {
+                        "market": {"setup_breadth_by_strategy": breadth},
+                        "symbols": {},
+                    }
+
+                live_plan, live_veto = self._live_risk(
+                    cfg, observed, breadth)
+                result = self._replay(cfg, observed)
+
+                self.assertIsNotNone(live_plan)
+                self.assertIsNone(live_veto)
+                self.assertEqual(len(result.executed()), 1)
+
+    def test_malformed_recorded_lane_fails_closed_in_live_and_replay(self):
+        cfg = valid_config()
+        observed = cycle(0)
+        breadth = self._breadth("many")
+        observed.enrichment = {
+            "market": {"setup_breadth_by_strategy": breadth},
+            "symbols": {},
+        }
+
+        live_plan, live_veto = self._live_risk(cfg, observed, breadth)
+        result = self._replay(cfg, observed)
+
+        self.assertIsNone(live_plan)
+        self.assertEqual(live_veto, "setup breadth measurement is invalid")
+        self.assertEqual(result.decisions[0].stage, "vetoed")
+        self.assertEqual(result.decisions[0].reason, live_veto)
 
 
 class VacuousGateTests(FidelityFixture):

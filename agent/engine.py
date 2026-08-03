@@ -848,7 +848,16 @@ class Engine:
         # Restricted like the live path: a cross-strategy population whose
         # symbol set moved with another variant's holdings would not be
         # comparable from one cycle to the next.
-        self._record_shadow_decisions(live_snapshot)
+        setup_breadth_by_strategy = self._record_shadow_decisions(live_snapshot)
+        context = live_snapshot.get("_market_context")
+        if not isinstance(context, dict):
+            context = {}
+            live_snapshot["_market_context"] = context
+        enrichment = context.get(brain.ENRICHMENT_KEY)
+        if not isinstance(enrichment, dict):
+            enrichment = {}
+            context[brain.ENRICHMENT_KEY] = enrichment
+        enrichment["setup_breadth_by_strategy"] = setup_breadth_by_strategy
 
         # B0.5: start the irreversible clock. These fields are journalled and
         # read by nothing for months - that is the point. A snapshot taken
@@ -2306,7 +2315,7 @@ class Engine:
         block["version"] = spec.version
         return {**self.cfg, "strategy": block}
 
-    def _record_shadow_decisions(self, snapshot: dict) -> None:
+    def _record_shadow_decisions(self, snapshot: dict) -> dict:
         """Journal what every registered contract would have done.
 
         This is the cheapest way to forward-test strategies that hold no
@@ -2328,6 +2337,7 @@ class Engine:
         """
         symbols = [s for s in snapshot
                    if not s.startswith("_") and isinstance(snapshot[s], dict)]
+        breadth_by_strategy = {}
         for strategy_id, builder in sorted(contracts.EVIDENCE_BUILDERS.items()):
             try:
                 spec = registry.spec_for(strategy_id)
@@ -2358,14 +2368,23 @@ class Engine:
                                     data.get("swing_high_pct")),
                                 "extension_atr": self._plain(extension),
                             })
+                fired_symbols = {signal["symbol"] for signal in fired}
+                breadth = {
+                    "instruments_scanned": len(symbols),
+                    "instruments_with_a_valid_setup": len(fired_symbols),
+                    "setup_breadth_pct": (
+                        round(len(fired_symbols) / len(symbols) * 100, 1)
+                        if symbols else None),
+                }
+                breadth_by_strategy[spec.id] = breadth
                 # One summary per strategy per cycle. Without the denominator
                 # a count of firings cannot be turned into a rate.
                 state.log_event(
                     "strategy_shadow_summary",
                     self._audit_json({
-                        "instruments_scanned": len(symbols),
-                        "instruments_fired": len({f["symbol"]
-                                                  for f in fired}),
+                        "instruments_scanned": breadth["instruments_scanned"],
+                        "instruments_fired": breadth[
+                            "instruments_with_a_valid_setup"],
                         "signals": len(fired),
                         "is_active": spec.id == str(
                             self.cfg["strategy"]["id"]),
@@ -2380,6 +2399,7 @@ class Engine:
             except Exception as exc:                       # noqa: BLE001
                 log.warning("Shadow evaluation failed for %s: %s",
                             strategy_id, exc)
+        return breadth_by_strategy
 
     def _record_observations(self, snapshot: dict) -> None:
         """Journal the enrichment fields and the per-cycle book state.

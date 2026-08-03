@@ -32,9 +32,9 @@ export. On the receiving Mac, run the tournament against the extracted data;
 do not replace the repository runtime directory or treat the fixture as the VM
 authority.
 
-The supplied `vm-import/2026-07-30/` export is a read-only one-time fixture.
-Copy/extract it to a temporary directory before tests. It is never a runtime
-default.
+An ignored local `vm-import/` directory, if present, is optional read-only
+historical data. It is not part of the clone, is not required for tests or
+handoff, and is never a current runtime default.
 
 See [`../../MAIN_REPO_REVIEW_PLAN.md`](../../MAIN_REPO_REVIEW_PLAN.md) for
 status and [`../../OPERATIONS.md`](../../OPERATIONS.md) for commands.

@@ -358,6 +358,20 @@ class SetupBreadthCapTests(unittest.TestCase):
         market["_market_context"]["instruments_with_a_valid_setup"] = firing
         return market
 
+    def _market_by_strategy(self, **firing):
+        market = snapshot()
+        market["_market_context"]["_enrichment"] = {
+            "setup_breadth_by_strategy": {
+                strategy_id: {
+                    "instruments_scanned": 10,
+                    "instruments_with_a_valid_setup": count,
+                    "setup_breadth_pct": count * 10.0,
+                }
+                for strategy_id, count in firing.items()
+            },
+        }
+        return market
+
     def test_crowded_cycle_refuses_every_entry(self):
         plan, why = self.risk.vet_open(
             decision(), 10_000, [], self._market(5), {}, 0)
@@ -373,7 +387,36 @@ class SetupBreadthCapTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIsNotNone(plan)
 
-    def test_missing_breadth_does_not_block(self):
+    def test_each_strategy_reads_only_its_own_crowded_lane(self):
+        market = self._market_by_strategy(momentum=2, **{"flush-fade": 5})
+
+        momentum_plan, momentum_why = self.risk.vet_open(
+            decision(), 10_000, [], market, {}, 0)
+        flush_cfg = valid_config()
+        flush_cfg["strategy"]["id"] = "flush-fade"
+        flush_plan, flush_why = RiskEngine(flush_cfg).vet_open(
+            decision(), 10_000, [], market, {}, 0)
+
+        self.assertIsNotNone(momentum_plan)
+        self.assertIsNone(momentum_why)
+        self.assertIsNone(flush_plan)
+        self.assertEqual(
+            flush_why,
+            "setup breadth 5 instruments exceeds 4: correlated market-wide "
+            "move")
+
+    def test_each_strategy_reads_only_its_own_quiet_lane(self):
+        market = self._market_by_strategy(momentum=5, **{"flush-fade": 2})
+        cfg = valid_config()
+        cfg["strategy"]["id"] = "flush-fade"
+
+        plan, why = RiskEngine(cfg).vet_open(
+            decision(), 10_000, [], market, {}, 0)
+
+        self.assertIsNotNone(plan)
+        self.assertIsNone(why)
+
+    def test_momentum_falls_back_to_legacy_breadth(self):
         # Older snapshots and unit fixtures carry no breadth field; the guard
         # must not turn that into a silent refusal to ever trade.
         plan, why = self.risk.vet_open(
@@ -381,9 +424,48 @@ class SetupBreadthCapTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIsNotNone(plan)
 
+    def test_non_momentum_missing_map_ignores_momentum_legacy_scalar(self):
+        cfg = valid_config()
+        cfg["strategy"]["id"] = "flush-fade"
+
+        plan, why = RiskEngine(cfg).vet_open(
+            decision(), 10_000, [], self._market(5), {}, 0)
+
+        self.assertIsNotNone(plan)
+        self.assertIsNone(why)
+
     def test_malformed_breadth_fails_closed(self):
         plan, why = self.risk.vet_open(
             decision(), 10_000, [], self._market("many"), {}, 0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "setup breadth measurement is invalid")
+
+    def test_malformed_selected_strategy_entry_fails_closed(self):
+        market = snapshot()
+        market["_market_context"]["_enrichment"] = {
+            "setup_breadth_by_strategy": {
+                "momentum": {
+                    "instruments_scanned": 10,
+                    "instruments_with_a_valid_setup": "many",
+                    "setup_breadth_pct": None,
+                },
+            },
+        }
+
+        plan, why = self.risk.vet_open(
+            decision(), 10_000, [], market, {}, 0)
+
+        self.assertIsNone(plan)
+        self.assertEqual(why, "setup breadth measurement is invalid")
+
+    def test_present_map_missing_selected_strategy_fails_closed(self):
+        market = self._market_by_strategy(momentum=2)
+        cfg = valid_config()
+        cfg["strategy"]["id"] = "flush-fade"
+
+        plan, why = RiskEngine(cfg).vet_open(
+            decision(), 10_000, [], market, {}, 0)
+
         self.assertIsNone(plan)
         self.assertEqual(why, "setup breadth measurement is invalid")
 

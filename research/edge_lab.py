@@ -1,4 +1,4 @@
-"""Independent edge laboratory for the phase1-v2 momentum strategy.
+"""Independent edge laboratory for the phase1-v3 momentum strategy.
 
 This is a second, deliberately independent implementation of the strategy's
 signal surface, written to answer one question: **is there a tradable edge
@@ -380,7 +380,7 @@ class SymbolFrame:
 
 @dataclass(frozen=True)
 class Contract:
-    """Tunable copy of the phase1-v2 evidence contract and stop/target rules."""
+    """Tunable copy of the phase1-v3 evidence contract and stop/target rules."""
     breakout_range_threshold_pct: float = 85.0
     breakout_min_relative_volume: float = 1.0
     # 8h-equivalent, matching agent/strategy.py after the interval-

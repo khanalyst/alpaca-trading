@@ -50,8 +50,20 @@ settings:
     claim: >-
       The mirrored short-side test isolates only the bottom decile without
       changing the long threshold.
+  - id: extreme_long_tail
+    params:
+      ls_high_percentile: 95.0
+    claim: >-
+      A registered 95th-percentile long-tail point tests the positioning effect
+      at more extreme long-side crowding.
+  - id: extreme_short_tail
+    params:
+      ls_low_percentile: 5.0
+    claim: >-
+      A registered fifth-percentile short-tail point tests the mirrored
+      positioning effect without changing the long-side threshold.
 
-hypotheses_tested: 3
+hypotheses_tested: 5
 
 backtestable: false
 why_not_backtestable: |

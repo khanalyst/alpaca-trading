@@ -104,6 +104,28 @@ class ExperimentCorrectnessTests(unittest.TestCase):
             f"{assignment['assignment_id']}:{lane}:trade"
             for lane in ("baseline", "candidate")]
 
+    def _complete_below_floor(self, assignment, *, now):
+        trade_ids = self._seed_open_pair(assignment, now=now)
+        self.store.record_experiment_observations(
+            assignment["assignment_id"],
+            [{"observation_key": f"paired-{assignment['assignment_id']}"}],
+            now=now + 0.1)
+        draining = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=now + 0.2)
+        self.assertEqual(draining["status"], "DRAINING")
+        for trade_id in trade_ids:
+            self.store.close_paper_trade(
+                trade_id, exit_ts=now + 0.3, exit_price=101.0,
+                result="timeout", net_pnl_usd=10.0, r_multiple=1.0)
+        completed = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=now + 0.4)
+        outcome = self.store.experiment_outcome(assignment["assignment_id"])
+        self.assertEqual(completed["status"], "COMPLETED")
+        self.assertIn(
+            "CLOSED_SAMPLE_BELOW_FLOOR",
+            {reason["code"] for reason in outcome["payload"]["reasons"]})
+        return outcome
+
     def test_assignment_rebases_both_accounts_at_one_fresh_boundary(self):
         scope = "demo:fresh-boundary"
         for index, variant_id in enumerate(
@@ -201,6 +223,52 @@ class ExperimentCorrectnessTests(unittest.TestCase):
                  assignment["assignment_id"])],
             ["STARTED", "OBSERVING", "DRAINING", "COMPLETED"])
 
+    def test_terminal_unfilled_attempts_are_fill_evidence_not_trade_samples(self):
+        assignment = self.assignment("demo:unfilled")
+        trade_ids = self._seed_open_pair(assignment)
+        self.store.record_experiment_observations(
+            assignment["assignment_id"],
+            [{"observation_key": "paired-unfilled"}], now=2.0)
+        draining = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=3.0)
+        self.assertEqual(draining["status"], "DRAINING")
+
+        with findings._connect(self.path) as conn:
+            for trade_id in trade_ids:
+                findings.FindingsStore._close_paper_trade(conn, {
+                    "trade_id": trade_id,
+                    "exit_ts": 4.0,
+                    "exit_price": 100.0,
+                    "result": "unfilled",
+                    "net_pnl_usd": 0.0,
+                    "r_multiple": 0.0,
+                    "valid_for_inference": False,
+                    "execution": {
+                        "entry": {"status": "pending"},
+                        "exit": {"reason": "passive quote did not fill"},
+                    },
+                })
+
+        completed = self.store.maybe_complete_experiment_assignment(
+            assignment["assignment_id"], now=5.0)
+        payload = self.store.experiment_outcome(
+            assignment["assignment_id"])["payload"]
+
+        self.assertEqual(completed["status"], "COMPLETED")
+        self.assertEqual(completed["unresolved_actions"]["total"], 0)
+        for arm_name in ("baseline", "candidate"):
+            arm = payload[arm_name]
+            self.assertEqual(arm["fill_opportunities"], 1)
+            self.assertEqual(arm["unfilled"], 1)
+            self.assertEqual(arm["closes"], 0)
+            self.assertEqual(arm["unresolved_opens"], 0)
+            self.assertEqual(arm["trade_r_metrics"]["n"], 0)
+            self.assertEqual(arm["net_pnl_usdt"], 0.0)
+        self.assertEqual(payload["paired"]["full"]["paired_n"], 0)
+        self.assertNotIn(
+            "UNRESOLVED_TRADES",
+            {reason["code"] for reason in payload["reasons"]})
+
     def test_explicit_selection_can_retry_latest_inconclusive_attempt(self):
         scope = "demo:retry"
         first = self.assignment(scope)
@@ -239,6 +307,123 @@ class ExperimentCorrectnessTests(unittest.TestCase):
         self.assertEqual(
             self.store.research_selection(selection["selection_id"])
             ["current_status"], "ASSIGNED")
+
+    def test_below_floor_outcome_is_automatically_nominated_and_propagated(self):
+        scope = "demo:auto-retry"
+        first = self.assignment(scope)
+        first_outcome = self._complete_below_floor(first, now=2.0)
+        other = variants.Variant(
+            variant_id="momentum.rr.auto_retry_other",
+            strategy_id="momentum",
+            base_version="phase1-v3",
+            overrides={"strategy.fixed_reward_risk": 1.5},
+            hypothesis="Untested static setting used to verify retry priority.",
+        )
+        self.store.register(other)
+        other_descriptor = candidate_descriptor(other)
+        automatically_prioritized = self.store.prioritized_experiment_candidates(
+            scope, "momentum", [other_descriptor, self.descriptor], now=2.9)
+        ordered = sorted(automatically_prioritized, key=lambda item: (
+            item["priority"], item["order_key"], item["variant_id"]))
+        self.assertEqual(ordered[0]["variant_id"], self.candidate.variant_id)
+        self.assertEqual(
+            ordered[0]["retry_of_assignment_id"], first["assignment_id"])
+        selection = self.store.record_research_selection(
+            {
+                "strategy_id": "momentum",
+                "reasoning": "Continue the latest closed under-floor sample.",
+            }, [other_descriptor, self.descriptor],
+            scope_key=scope, run_id="auto-run",
+            cycle_id="auto-cycle", model_id="test-model",
+            prompt_version="test-prompt", now=3.0)
+        event = self.store.research_selection_events(
+            selection["selection_id"])[-1]
+        prioritized = self.store.prioritized_experiment_candidates(
+            scope, "momentum", [other_descriptor, self.descriptor], now=3.1)
+        second = self.store.ensure_experiment_assignment(
+            scope, "momentum", self.baseline.variant_id, prioritized,
+            minimum_duration_seconds=0, minimum_observations=1, now=4.0)
+
+        self.assertEqual(first_outcome["verdict"], "INCONCLUSIVE")
+        self.assertEqual(selection["resolved_variant_id"],
+                         self.candidate.variant_id)
+        self.assertEqual(
+            event["detail"]["retry_of_assignment_id"],
+            first["assignment_id"])
+        retry_candidate = next(
+            item for item in prioritized
+            if item["variant_id"] == self.candidate.variant_id)
+        self.assertEqual(
+            retry_candidate["retry_of_assignment_id"], first["assignment_id"])
+        self.assertEqual(second["attempt"], 2)
+        self.assertEqual(second["retry_of_assignment_id"], first["assignment_id"])
+
+    def test_automatic_retry_caps_at_three_but_explicit_retry_continues(self):
+        scope = "demo:auto-retry-cap"
+        current = self.assignment(scope)
+        for expected_attempt, now in ((1, 2.0), (2, 4.0), (3, 6.0)):
+            self.assertEqual(current["attempt"], expected_attempt)
+            self._complete_below_floor(current, now=now)
+            prioritized = self.store.prioritized_experiment_candidates(
+                scope, "momentum", [self.descriptor], now=now + 0.5)
+            if expected_attempt < findings.MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS:
+                self.assertEqual(
+                    prioritized[0]["retry_of_assignment_id"],
+                    current["assignment_id"])
+                current = self.store.ensure_experiment_assignment(
+                    scope, "momentum", self.baseline.variant_id, prioritized,
+                    minimum_duration_seconds=0, minimum_observations=1,
+                    now=now + 1.0)
+            else:
+                self.assertNotIn("retry_of_assignment_id", prioritized[0])
+                self.assertIsNone(self.store.ensure_experiment_assignment(
+                    scope, "momentum", self.baseline.variant_id, prioritized,
+                    minimum_duration_seconds=0, minimum_observations=1,
+                    now=now + 1.0))
+        selection = self.store.record_research_selection(
+            {
+                "strategy_id": "momentum",
+                "variant_id": self.candidate.variant_id,
+                "reasoning": "Explicitly continue the latest under-floor sample.",
+            }, [self.descriptor], scope_key=scope, run_id="manual-fourth",
+            cycle_id="manual-fourth", model_id="test-model",
+            prompt_version="test-prompt", now=8.0)
+        explicit = self.store.prioritized_experiment_candidates(
+            scope, "momentum", [self.descriptor], now=8.1)
+        fourth = self.store.ensure_experiment_assignment(
+            scope, "momentum", self.baseline.variant_id, explicit,
+            minimum_duration_seconds=0, minimum_observations=1, now=9.0)
+        self.assertEqual(selection["current_status"], "ACCEPTED")
+        self.assertEqual(fourth["attempt"], 4)
+        self.assertEqual(
+            fourth["retry_of_assignment_id"], current["assignment_id"])
+
+    def test_non_retryable_terminal_outcome_is_excluded(self):
+        scope = "demo:no-auto-retry"
+        first = self.assignment(scope)
+        self.store.reject_experiment_assignment(
+            first["assignment_id"], "structurally invalid setting", now=2.0)
+        other = variants.Variant(
+            variant_id="momentum.rr.correctness_1_5",
+            strategy_id="momentum",
+            base_version="phase1-v3",
+            overrides={"strategy.fixed_reward_risk": 1.5},
+            hypothesis="Test a second exact reward/risk setting.",
+        )
+        self.store.register(other)
+        other_descriptor = candidate_descriptor(other)
+        prioritized = self.store.prioritized_experiment_candidates(
+            scope, "momentum", [self.descriptor, other_descriptor], now=3.0)
+        second = self.store.ensure_experiment_assignment(
+            scope, "momentum", self.baseline.variant_id, prioritized,
+            minimum_duration_seconds=0, minimum_observations=1, now=4.0)
+
+        first_descriptor = next(
+            item for item in prioritized
+            if item["variant_id"] == self.candidate.variant_id)
+        self.assertNotIn("retry_of_assignment_id", first_descriptor)
+        self.assertEqual(second["candidate_variant_id"], other.variant_id)
+        self.assertEqual(second["attempt"], 1)
 
     def test_shadow_does_not_evaluate_new_opens_while_draining(self):
         scope = "demo:shadow-draining"

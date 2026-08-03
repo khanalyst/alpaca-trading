@@ -21,19 +21,25 @@ The LLM can submit one bounded research-only selection. Invalid selections and
 their reasons persist. Accepted selections queue and never preempt an active
 assignment. A separate nightly research prompt explains one immutable terminal
 outcome and may nominate one next registered setting; it cannot alter the
-verdict or authorize execution.
+verdict or authorize execution. That same single review may preserve one
+strictly declarative, non-executable hypothesis draft against allowlisted
+numeric snapshot keys from the immutable persisted `llm_input` corpus consumed
+through `research.corpus`; those keys need not appear in terminal aggregates.
+The draft creates no variant or selection, changes no configuration, tier,
+portfolio, or order authority, and must be manually reviewed and registered in
+a later code change before research can use it.
 
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
-current v3 forward qualification is still required and there is no automatic
+current v4 forward qualification is still required and there is no automatic
 live promotion.
 
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
 used. Replay/G2 must reproduce the recorded decisions before downstream
-authoritative evidence is trusted. The current v3 `forward-qualify` path uses
+authoritative evidence is trusted. The current v4 `forward-qualify` path uses
 eligible completed assignments and each setting's contemporaneous baseline.
 Its paired cluster sign-flip result is valid only under the documented
 cluster-delta sign-exchangeability/symmetric-null assumption.
@@ -54,16 +60,16 @@ records every run and failure in schema 16 and writes immutable artifacts beneat
 copies only. The tournament awards no tier above `T2_CANDIDATE` and cannot
 promote capital.
 
-In the shipped implementation, five strategies are scorable in the OHLCV
-tournament (16 setting rows). `ls-ratio-fade` and `scalp-maker` have executable
-real-time forward evaluators but no current historical tournament contract/data,
-so their three settings each remain declared and are reported `NOT SCORED`.
+Declared settings are loaded from the current strategy YAML rather than a
+fixed strategy or row count. A strategy is scored only when its historical
+contract and required inputs are available; otherwise every declared setting
+is retained and reported `NOT SCORED`. `ls-ratio-fade` and `scalp-maker` use
+real-time forward evidence because their required historical inputs are not
+reconstructable from candles.
 
-The one-time export at `vm-import/2026-07-30/` is read-only development/test
-evidence. Copy/extract it to a temporary directory. It is never a runtime data
-root or findings-store default. Its 3,520 legacy shadow decisions lack current
-stored outcomes and current provenance, so they are preserved for audit and
-rejected for promotion rather than converted into an invented edge.
+An ignored local `vm-import/` directory, if present, is optional read-only
+historical data only. It is not part of the clone, is not required by the
+research workflow, and is never a current runtime or findings-store input.
 
 ## Commands
 

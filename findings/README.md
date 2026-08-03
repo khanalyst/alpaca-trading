@@ -13,9 +13,12 @@ Every registered variant, including the rejected ones. A rejection is a row here
 | variant | status | round trips | expectancy | last updated |
 | --- | --- | --- | --- | --- |
 | [momentum.baseline](momentum/momentum.baseline.md) | testing | 0 | - | 2026-07-28 |
-| [momentum.conf.floor_0_50](momentum/momentum.conf.floor_0_50.md) | candidate | 0 | - | 2026-07-28 |
-| [momentum.conf.floor_0_55](momentum/momentum.conf.floor_0_55.md) | candidate | 0 | - | 2026-07-30 |
-| [momentum.conf.floor_0_60](momentum/momentum.conf.floor_0_60.md) | candidate | 0 | - | 2026-07-30 |
+| [momentum.conf.floor_0_50](momentum/momentum.conf.floor_0_50.md) | superseded | 0 | - | 2026-08-03 |
+| [momentum.conf.floor_0_55](momentum/momentum.conf.floor_0_55.md) | superseded | 0 | - | 2026-08-03 |
+| [momentum.conf.floor_0_60](momentum/momentum.conf.floor_0_60.md) | superseded | 0 | - | 2026-08-03 |
+| [momentum.conf.floor_0_70](momentum/momentum.conf.floor_0_70.md) | candidate | 0 | - | 2026-08-03 |
+| [momentum.conf.floor_0_75](momentum/momentum.conf.floor_0_75.md) | candidate | 0 | - | 2026-08-03 |
+| [momentum.conf.floor_0_80](momentum/momentum.conf.floor_0_80.md) | candidate | 0 | - | 2026-08-03 |
 | [momentum.discriminator.trend_alignment](momentum/momentum.discriminator.trend_alignment.md) | candidate | 0 | - | 2026-07-29 |
 | [momentum.discriminator.volatility_regime](momentum/momentum.discriminator.volatility_regime.md) | candidate | 0 | - | 2026-07-29 |
 | [momentum.net_direction.120](momentum/momentum.net_direction.120.md) | candidate | 0 | - | 2026-07-30 |

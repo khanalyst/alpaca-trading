@@ -16,9 +16,9 @@ seven isolated real-time research evaluators.
 | Dashboard | None | CLI/reports | Loopback-only `dashboard` |
 | External backup | Optional mount | Managed data disk | Explicit verified host bind override |
 
-`vm-import/2026-07-30/` is read-only imported evidence for development and
-tests. It is never a default runtime, findings, tournament, recorder, or backup
-directory.
+An ignored local `vm-import/` directory, if present, is optional read-only
+historical data. Current operation never requires it or uses it as a runtime,
+findings, tournament, recorder, or backup directory.
 
 ## 2. Daily checks
 
@@ -111,7 +111,7 @@ the scheduler can no longer supervise and refresh the child.
 Run manually:
 
 ```bash
-./.venv/bin/bash research/nightly.sh
+./research/nightly.sh
 ```
 
 ## 4. Real-time strategy experiments
@@ -206,20 +206,9 @@ downloader refuses a non-empty directory instead of mixing old membership with
 a new universe. A partial failed download remains failure evidence and is not a
 valid tournament input; the next run uses another fresh directory.
 
-The supplied one-time fixture remains read-only historical evidence. Its legacy
-manifest is deliberately not accepted by the current tournament because it
-does not prove exact file membership and identities. It may be extracted for
-audit without treating it as current provenance-safe scoring input:
-
-```bash
-fixture=$(mktemp -d)
-tar -xzf vm-import/2026-07-30/okx-research-files-2026-07-30.tgz \
-  -C "$fixture"
-```
-
-Copy `vm-import/2026-07-30/okx-findings-2026-07-30.db` to the temporary
-`$fixture/findings.db` first when store-backed history is needed. Do not open
-the supplied WAL-backed database in place for a write operation.
+Ignored local `vm-import/` history, if present, is optional audit material
+only. Its legacy provenance is not accepted as current tournament input, and
+no nightly or recovery step depends on it.
 
 ## 6. Verified backups
 

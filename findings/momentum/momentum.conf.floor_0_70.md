@@ -1,0 +1,13 @@
+# momentum.conf.floor_0_70
+
+Status: candidate
+Hypothesis: A 0.70 floor measures whether a modestly stricter confidence gate adds marginal value over the observable proposals admitted by the 0.65 baseline.
+Overrides: risk.min_confidence = 0.7
+
+## Sample
+
+Registered but never run. No sample, and therefore no result to report.
+
+## Findings log
+
+No findings recorded yet.

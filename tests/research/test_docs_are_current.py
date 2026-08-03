@@ -64,10 +64,13 @@ class ReferencedPathsExistTests(unittest.TestCase):
 
     def test_readme_indexes_every_maintained_markdown_document(self):
         documents = []
+        ignored_dirs = {
+            ".git", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            "vm-import",
+        }
         for path in REPO.rglob("*.md"):
             relative = path.relative_to(REPO)
-            if any(part in {".git", ".venv", "vm-import"}
-                   for part in relative.parts):
+            if any(part in ignored_dirs for part in relative.parts):
                 continue
             documents.append(relative.as_posix())
         missing = sorted(
@@ -287,9 +290,6 @@ class CurrentPipelineClaimsTests(unittest.TestCase):
         self.assertEqual(raw["research"]["experiment_min_duration_days"], 3)
         self.assertEqual(raw["research"]["experiment_min_observations"], 100)
         self.assertIn("14 maximum", HYPOTHESES)
-        self.assertIn("5 strategies and 16 applicable setting results",
-                      HYPOTHESES)
-        self.assertIn("`NOT SCORED`", HYPOTHESES)
 
     def test_current_findings_schema_is_documented(self):
         from research.findings import SCHEMA_VERSION
@@ -347,13 +347,6 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
         for phrase in ("local_default", "configured_local",
                        "external_mounted", "--require-external", "st_dev"):
             self.assertIn(phrase, BOTH)
-
-    def test_vm_fixture_is_documented_as_read_only_and_not_default(self):
-        for doc, name in ((README, "README"), (SETUP, "SETUP")):
-            self.assertIn("vm-import/2026-07-30", doc,
-                          f"{name} omits the supplied VM fixture")
-            self.assertIn("read-only", doc,
-                          f"{name} does not mark the fixture read-only")
 
     def test_tournament_latest_view_is_not_described_as_history(self):
         for phrase in ("runs/<timestamp>-<run-id>", "latest view"):

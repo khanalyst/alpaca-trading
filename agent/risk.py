@@ -38,6 +38,7 @@ class RiskEngine:
         self.r = cfg["risk"]
         self.costs = cfg["trading_costs"]
         self.execution = cfg["execution"]
+        self.strategy_id = str(cfg["strategy"]["id"])
 
     def vet_open(self, decision: dict, equity: float, positions: list[dict],
                  snapshot: dict, cooldowns: dict,
@@ -124,17 +125,37 @@ class RiskEngine:
         # Breadth guard. When many instruments qualify at once they are not
         # independent setups; they are one market-wide move, and those bars
         # were measured materially worse than quiet ones. The count is
-        # supplied by market._market_context, which is a context block in the
-        # snapshot rather than a tradable symbol.
+        # supplied by the engine's per-strategy contract pass under the
+        # market context's hidden enrichment block.
         breadth_limit = self.r.get("max_setups_firing_for_entry")
         if breadth_limit is not None:
             context = snapshot.get("_market_context")
-            firing = (context.get("instruments_with_a_valid_setup")
-                      if isinstance(context, dict) else None)
+            missing = object()
+            breadth_map = missing
+            if isinstance(context, dict):
+                enrichment = context.get("_enrichment")
+                if isinstance(enrichment, dict):
+                    breadth_map = enrichment.get(
+                        "setup_breadth_by_strategy", missing)
+            if breadth_map is missing:
+                firing = (
+                    context.get("instruments_with_a_valid_setup")
+                    if self.strategy_id == "momentum"
+                    and isinstance(context, dict) else None)
+            elif not isinstance(breadth_map, dict):
+                return None, "setup breadth measurement is invalid"
+            else:
+                selected = breadth_map.get(self.strategy_id, missing)
+                if (not isinstance(selected, dict)
+                        or "instruments_with_a_valid_setup" not in selected):
+                    return None, "setup breadth measurement is invalid"
+                firing = selected["instruments_with_a_valid_setup"]
+                if firing is None:
+                    return None, "setup breadth measurement is invalid"
             if firing is not None:
                 try:
                     firing = int(firing)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return None, "setup breadth measurement is invalid"
                 if firing > int(breadth_limit):
                     return None, (

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent import brain, shadow, variants
+from agent.config import ConfigError
 from agent.engine import Engine
 from research import findings
 from tests.helpers import valid_config
@@ -53,6 +54,126 @@ def parsed_selection(strategy_id, variant_id=None, reasoning=None, **extra):
 
 
 class ResearchSelectorPromptAndParserTests(unittest.TestCase):
+    def test_scalp_maker_penetration_axis_has_baseline_and_two_falsifiers(self):
+        catalog = variants.research_selection_catalog()
+        axis = "execution.paper_maker_fill_penetration_bps"
+        baseline = variants._dotted_value(
+            variants._selection_baseline_config("scalp-maker"), axis)
+        settings = [
+            item for item in catalog["scalp-maker"]
+            if item["axis"] == axis]
+
+        self.assertEqual(baseline, 1)
+        self.assertEqual(
+            {item["variant_id"] for item in settings},
+            {
+                "scalp_maker.prereg.penetration_5bps",
+                "scalp_maker.prereg.penetration_15bps",
+            })
+        self.assertEqual(
+            {baseline, *(next(iter(item["setting"].values()))
+                         for item in settings)},
+            {1, 5, 15})
+
+    def test_confidence_catalog_only_selects_floors_above_live_baseline(self):
+        registry = selector_registry()
+        catalog = variants.research_selection_catalog()
+        baseline = variants._dotted_value(
+            variants._selection_baseline_config("momentum"),
+            "risk.min_confidence")
+        active = [
+            item for item in catalog["momentum"]
+            if item["axis"] == "risk.min_confidence"]
+
+        self.assertEqual(baseline, 0.65)
+        self.assertEqual(
+            {item["variant_id"] for item in active},
+            {
+                "momentum.conf.floor_0_70",
+                "momentum.conf.floor_0_75",
+                "momentum.conf.floor_0_80",
+            })
+        self.assertTrue(all(
+            next(iter(item["setting"].values())) > baseline
+            for item in active))
+
+        historical_ids = {
+            "momentum.conf.floor_0_50",
+            "momentum.conf.floor_0_55",
+            "momentum.conf.floor_0_60",
+        }
+        self.assertTrue(historical_ids <= registry.keys())
+        self.assertEqual(
+            {registry[variant_id].status for variant_id in historical_ids},
+            {"superseded"})
+        self.assertTrue(historical_ids.isdisjoint(
+            item["variant_id"] for item in active))
+        for variant_id in historical_ids:
+            with self.subTest(variant_id=variant_id):
+                self.assertEqual(
+                    parsed_selection("momentum", variant_id)["validation_status"],
+                    "REJECTED")
+
+    def test_catalog_axes_have_unique_executable_baseline_families(self):
+        catalog = variants.research_selection_catalog()
+        all_ids = {
+            item["variant_id"] for settings in catalog.values()
+            for item in settings}
+
+        self.assertNotIn("momentum.prereg.target_2r", all_ids)
+        self.assertNotIn("momentum.prereg.wider_stop", all_ids)
+        for strategy_id, settings in catalog.items():
+            baseline_cfg = variants._selection_baseline_config(strategy_id)
+            axes = {}
+            for item in settings:
+                axes.setdefault(item["axis"], []).append(item)
+            for axis, axis_settings in axes.items():
+                values = []
+                if axis.startswith("hypothesis."):
+                    self.assertIn(
+                        "registered",
+                        {item["setting_id"] for item in axis_settings})
+                else:
+                    values.append(variants._dotted_value(baseline_cfg, axis))
+                values.extend(
+                    next(iter(item["setting"].values()))
+                    for item in axis_settings)
+                self.assertEqual(
+                    len(values), len({json.dumps(value, sort_keys=True)
+                                      for value in values}),
+                    f"{strategy_id}/{axis}")
+                self.assertGreaterEqual(
+                    len(values), variants.MIN_AXIS_SETTINGS,
+                    f"{strategy_id}/{axis}")
+
+    def test_catalog_validation_rejects_duplicate_executable_values(self):
+        candidate = variants.Variant(
+            variant_id="momentum.rr.duplicate_1_5",
+            strategy_id="momentum",
+            base_version="phase1-v3",
+            overrides={"strategy.fixed_reward_risk": 1.5},
+            hypothesis="Duplicate executable value used only for validation.",
+        )
+        original = variants.Variant(
+            variant_id="momentum.rr.original_1_5",
+            strategy_id="momentum",
+            base_version="phase1-v3",
+            overrides={"strategy.fixed_reward_risk": 1.5},
+            hypothesis="Original executable value used only for validation.",
+        )
+        catalog = {"momentum": tuple({
+            "strategy_id": "momentum",
+            "variant_id": item.variant_id,
+            "axis": "strategy.fixed_reward_risk",
+            "setting_id": item.variant_id.rsplit(".", 1)[-1],
+            "setting": {"strategy.fixed_reward_risk": 1.5},
+        } for item in (original, candidate))}
+
+        with self.assertRaisesRegex(ConfigError, "duplicate executable value"):
+            variants._validate_research_selection_catalog(
+                catalog, {item.variant_id: item
+                          for item in (original, candidate)})
+
     def test_prompt_enumerates_only_single_axis_nonbaseline_identifiers(self):
         system = brain.build_system(selector_config())
         catalog = variants.research_selection_catalog()

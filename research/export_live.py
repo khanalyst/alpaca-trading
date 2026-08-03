@@ -6,8 +6,8 @@ shadow decisions against real subsequent bars and reports each strategy's
 forward expectancy.
 
 Why this exists: a strategy with no capital otherwise accumulates no
-out-of-sample evidence at all, so testing five strategies would take five
-times as long as testing one. Shadow evaluation costs nothing and runs them
+out-of-sample evidence at all, so testing all registered strategies would take
+longer than testing one. Shadow evaluation costs nothing and runs them
 concurrently on identical data.
 
 Outcomes are resolved with ``edge_lab.simulate`` - the same simulator the

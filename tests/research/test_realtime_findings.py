@@ -543,6 +543,27 @@ class SchedulerAndPortfolioTests(StoreFixture):
         self.assertEqual(paper["closed_trades"], 1)
         self.assertEqual(paper["expectancy_r"], 2.0)
 
+    def test_paper_summary_separates_terminal_unfilled_opportunities(self):
+        scope = "demo:unfilled-summary"
+        self.store.load_paper_portfolio(scope, self.a.variant_id, now=1)
+        unfilled = self.store.record_paper_trade_open(
+            trade(scope, self.a.variant_id, "unfilled", 2))
+        # Legacy rows could have been stored inference-valid before expiry was
+        # classified correctly. Result semantics still keep them out of PnL/R.
+        self.store.close_paper_trade(
+            unfilled, exit_ts=3, exit_price=100, result="unfilled",
+            net_pnl_usd=0, r_multiple=0.0)
+
+        summary = self.store.paper_summary(
+            scope, self.a.variant_id, paper_only=False)
+
+        self.assertEqual(summary["fill_opportunities"], 1)
+        self.assertEqual(summary["unfilled_trades"], 1)
+        self.assertEqual(summary["closed_trades"], 0)
+        self.assertEqual(summary["invalid_closed_trades"], 0)
+        self.assertEqual(summary["net_pnl_usdt"], 0)
+        self.assertIsNone(summary["expectancy_r"])
+
     def test_scorecard_reports_real_time_coverage_and_stage(self):
         scope = "demo:account-a"
         self.store.load_paper_portfolio(scope, self.a.variant_id, now=1)

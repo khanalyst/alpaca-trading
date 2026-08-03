@@ -137,7 +137,7 @@ export OKX_EXTERNAL_BACKUP_PATH=/srv/okx-agent-research-backup
 sudo -E docker compose -f compose.yaml \
   -f deploy/compose.external-backup.yaml build
 
-sudo systemctl stop okx-dashboard.service okx-research.timer \
+sudo systemctl stop okx-research.timer \
   okx-research.service okx-trader.service okx-recorder.service || true
 
 sudo -E docker compose -f compose.yaml \
@@ -190,7 +190,7 @@ After Compose is healthy, disable the legacy units. Never use
 `docker compose down -v`; `-v` deletes the named evidence volumes.
 
 ```bash
-sudo systemctl disable okx-dashboard.service okx-research.timer \
+sudo systemctl disable okx-research.timer \
   okx-trader.service okx-recorder.service
 ```
 
@@ -522,13 +522,13 @@ The first research run after provisioning an external mount can still finish
 with readiness exit 4 because readiness runs before that run's backup. Verify
 the backup, then rerun readiness or the service.
 
-## 8. One-time VM import
+## 8. Optional local historical data
 
-`vm-import/2026-07-30/` contains a one-time journal, findings database, WAL
-files, and research archive imported for development. Treat it as read-only.
-Copy databases or extract the archive into a temporary directory before tests.
-Never point `research.findings_store`, `JOURNAL_DB`, `DATA_DIR`, recorder
-output, tournament output, or `BACKUP_TARGET` at this fixture.
+An ignored local `vm-import/` directory may exist on some development
+machines. If present, it is optional read-only historical data, is not part of
+the clone, and is never required for setup or current operation. Never point
+`research.findings_store`, `JOURNAL_DB`, `DATA_DIR`, recorder output,
+tournament output, or `BACKUP_TARGET` at it.
 
 For current nightly operation, an explicit `DATA_DIR` must name one absent or
 empty snapshot directory. The downloader refuses non-empty output, and the

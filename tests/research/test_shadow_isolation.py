@@ -559,6 +559,24 @@ class SymbolVisibilityTests(unittest.TestCase):
         # The variant accounts still need the wide map to mark their books.
         self.assertIn("self._advance_shadow_variants(snapshot", source)
 
+    @patch("agent.engine.state.log_event")
+    def test_strategy_breadth_excludes_shadow_only_symbols(self, _):
+        from agent import market
+
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine._audit_json = staticmethod(json.dumps)
+        live_view = market.restrict_snapshot(
+            self._wide(), ["BTC/USDT:USDT"])
+
+        breadth = engine._record_shadow_decisions(live_view)
+
+        self.assertEqual(breadth["momentum"], {
+            "instruments_scanned": 1,
+            "instruments_with_a_valid_setup": 1,
+            "setup_breadth_pct": 100.0,
+        })
+
 
 class NonInterferenceTests(unittest.TestCase):
     """Trading decisions must be byte-identical with and without shadow."""

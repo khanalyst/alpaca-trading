@@ -235,11 +235,15 @@ class TournamentEndToEndTests(DatasetFixture):
             "base", "fixed_rr")
 
     def test_a_hypothesis_is_scored_at_every_registered_setting(self):
+        import tournament
+
         row = self.score("flush-fade")
+        declared = tournament.axis_settings(
+            "flush-fade", tournament.load_preregistration("flush-fade"), None)
 
         self.assertTrue(row["scored"])
-        self.assertEqual(row["settings_tested"], 4)
-        self.assertEqual(len(row["settings"]), 4)
+        self.assertEqual(row["settings_tested"], len(declared))
+        self.assertEqual(len(row["settings"]), len(declared))
         self.assertEqual(
             sum(1 for s in row["settings"] if s["registered"]), 1)
 

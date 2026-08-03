@@ -154,6 +154,43 @@ class CoverageAndFreshnessTests(unittest.TestCase):
 
 
 class MakerChronologyTests(unittest.TestCase):
+    def test_expired_unfilled_probe_is_terminal_but_not_an_inference_sample(self):
+        cfg = shadow._research_cfg(valid_config(), "scalp-maker")
+        baseline = variants.baseline(
+            "scalp-maker", cfg["strategy"]["version"])
+        evaluator = shadow.ShadowEvaluator([baseline], cfg, budget_ms=0)
+        row = market_row()
+        enrichment = dict(row[brain.ENRICHMENT_KEY])
+        enrichment.update({
+            "ticker_ts": NOW_MS, "book_ts": NOW_MS,
+            "ticker_best_bid": 99.99, "ticker_best_ask": 100.01,
+            "execution_bars": [], "realized_funding_events": [],
+        })
+        row[brain.ENRICHMENT_KEY] = enrichment
+        proposals = BY_STRATEGY["scalp-maker"].deterministic_proposals(
+            {SYMBOL: row}, cfg)
+
+        evaluator.evaluate({SYMBOL: row}, now=NOW, proposals=proposals)
+        evaluator.advance(
+            {SYMBOL: execution_row(NOW + 180.0)}, now=NOW + 180.0)
+
+        trades = evaluator.store.paper_trades_for(
+            evaluator.scope_key, baseline.variant_id)
+        summary = evaluator.store.paper_summary(
+            evaluator.scope_key, baseline.variant_id, paper_only=False)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["status"], "CLOSED")
+        self.assertEqual(trades[0]["result"], "unfilled")
+        self.assertEqual(trades[0]["valid_for_inference"], 0)
+        self.assertEqual(trades[0]["execution"]["entry"]["status"], "pending")
+        self.assertFalse(
+            trades[0]["execution"]["exit"]["valid_for_inference"])
+        self.assertEqual(summary["fill_opportunities"], 1)
+        self.assertEqual(summary["unfilled_trades"], 1)
+        self.assertEqual(summary["closed_trades"], 0)
+        self.assertEqual(summary["invalid_closed_trades"], 0)
+        self.assertIsNone(summary["expectancy_r"])
+
     def test_bar_straddling_expiry_never_fills(self):
         position = {
             "direction": "long", "entry_ts": NOW,

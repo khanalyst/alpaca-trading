@@ -1,7 +1,7 @@
 # momentum.conf.floor_0_50
 
-Status: candidate
-Hypothesis: The 0.65 floor rejects trades that are profitable in aggregate, which cannot be observed live because those trades are never taken.
+Status: superseded
+Hypothesis: This historical lower-floor candidate is superseded because the live prompt suppresses the low-confidence proposals it would need to observe.
 Overrides: risk.min_confidence = 0.5
 
 ## Sample
