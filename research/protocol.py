@@ -24,7 +24,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from agent.forward_models import require_validated
+from agent.forward_models import require_complete_contract
 
 from .score import score_returns
 from .stats import (INSUFFICIENT_SAMPLE,
@@ -441,7 +441,7 @@ def evaluate_axis(settings: list, baseline_decisions: list | None = None,
             structurally_invalid,
             {"settings": len(settings)})
 
-    require_validated(strategy_id)
+    require_complete_contract(strategy_id)
 
     normalized = []
     per_setting_baselines = False

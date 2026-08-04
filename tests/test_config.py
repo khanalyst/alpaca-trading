@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from agent.config import ConfigError, validate_config
 from tests.helpers import valid_config
@@ -281,6 +282,62 @@ class PerStrategyBoundsTests(unittest.TestCase):
         cfg["cycle"]["timeframes"] = ["15m", "1h"]
         with self.assertRaisesRegex(ConfigError, "missing: 4h"):
             validate_config(cfg)
+
+
+class MakerFirstGuardTests(unittest.TestCase):
+    """The B7.5 flag is demo-scoped until the gate that judges it passes.
+
+    Enabling maker-first on demo is what lets gate B7.5 collect its 20
+    attempts; leaving it off means READY forever and the largest measured
+    cost lever stays unmeasured. But a demo config that carries the flag is
+    one `mode:` edit away from putting an unvalidated entry path in front of
+    real capital, and nothing else in the config stops that.
+    """
+
+    def test_demo_may_enable_maker_first(self):
+        cfg = valid_config()
+        cfg["execution"]["maker_first_enabled"] = True
+        self.assertTrue(
+            validate_config(cfg)["execution"]["maker_first_enabled"])
+
+    def test_the_tier_gate_still_speaks_first_in_live(self):
+        """No registered strategy meets T3, so live stops before this rule.
+
+        The maker-first guard is defence for the day one does, not a
+        substitute for the tier gate. If this ever starts reporting B7.5
+        instead, the ordering has regressed and the more important refusal
+        has been masked.
+        """
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        cfg["execution"]["maker_first_enabled"] = True
+        with self.assertRaisesRegex(ConfigError, "requires T3_VALIDATED"):
+            validate_config(cfg)
+
+    def test_live_refuses_maker_first_once_the_tier_gate_is_satisfied(self):
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        cfg["execution"]["maker_first_enabled"] = True
+        # Stand in for the future in which a strategy has cleared the tier
+        # bar, which is the only world where this guard is reachable.
+        with patch("agent.config.LIVE_MIN_TIER", "T0_REJECTED"):
+            with self.assertRaisesRegex(ConfigError, "B7.5"):
+                validate_config(cfg)
+
+    def test_live_is_allowed_when_maker_first_is_off(self):
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        cfg["execution"]["maker_first_enabled"] = False
+        with patch("agent.config.LIVE_MIN_TIER", "T0_REJECTED"):
+            self.assertEqual(validate_config(cfg)["mode"], "live")
+
+    def test_the_shipped_config_enables_it_so_the_gate_can_move(self):
+        import yaml
+        from pathlib import Path
+        shipped = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+        self.assertEqual(shipped["mode"], "demo")
+        self.assertTrue(shipped["execution"]["maker_first_enabled"])
 
 
 if __name__ == "__main__":

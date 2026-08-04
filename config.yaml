@@ -198,6 +198,18 @@ risk:
   cooldown_minutes_after_loss: 45  # per-symbol timeout after a losing close
 
 execution:
+  # B7.5. Entries rest passively for maker_first_wait_seconds, then fall back
+  # to the IOC path that already works. Enabled here because the gate cannot
+  # move otherwise: it needs 20 recorded attempts and READY simply means the
+  # flag is off, so leaving it off keeps the largest measured cost lever
+  # permanently unmeasured. Taker fees are 0.248%/side against a 0.02% maker
+  # rebate, and momentum's own loss is -0.096R at ordinary costs, so the
+  # spread between the two paths is the same order as the deficit.
+  #
+  # Refused in live by agent/config.py until B7.5 passes: this is demo money
+  # buying a measurement, not a promotion.
+  maker_first_enabled: true
+  maker_first_wait_seconds: 20   # bounded well inside the 15m signal bar
   slippage_guard_pct: 0.5        # abort an entry if price moved more than this
                                  # between analysis and execution
   max_spread_pct: 0.15           # reject entries when the live bid/ask is wider

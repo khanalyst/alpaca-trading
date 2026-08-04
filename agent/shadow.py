@@ -22,7 +22,7 @@ from research.findings import (FindingsStore, _content_hash,
 
 from . import (brain, hypotheses, registry as strategy_registry,
                state as runtime_state, strategy)
-from .forward_models import require_validated
+from .forward_models import require_complete_contract
 from .risk import RiskEngine
 from .variants import (Variant, apply, declared_research_setting, from_record)
 
@@ -87,7 +87,7 @@ class ShadowBudget:
 
 def _variant_runtime(variant: Variant, base_cfg: dict) -> tuple[dict, object, dict]:
     cfg = apply(variant, base_cfg, allow_shadow_strategy=True)
-    model = require_validated(variant.strategy_id)
+    model = require_complete_contract(variant.strategy_id)
     provenance = {
         "variant_definition_hash": variant_identity_hash(variant),
         "strategy_config_version": runtime_state.experiment_fingerprint(cfg),
@@ -1817,7 +1817,7 @@ class StrategyShadowCoordinator:
                     strategy_proposals = list(proposals or [])
                     source = "recorded_llm"
                 else:
-                    model = require_validated(strategy_id)
+                    model = require_complete_contract(strategy_id)
                     strategy_proposals = model.deterministic_proposals(
                         snapshot, evaluator.base_cfg)
                     source = "deterministic_contract"
@@ -1854,7 +1854,7 @@ def _research_cfg(cfg: dict, strategy_id: str) -> dict:
     if strategy_id == str(cfg["strategy"]["id"]):
         return cfg
     spec = strategy_registry.spec_for(strategy_id)
-    model = require_validated(strategy_id)
+    model = require_complete_contract(strategy_id)
     out = deepcopy(cfg)
     block = dict(out["strategy"])
     block.update(spec.contract_params)

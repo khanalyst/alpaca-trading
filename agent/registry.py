@@ -171,10 +171,10 @@ class StrategySpec:
                 raise ValueError(
                     f"strategy {self.id!r} must bind forward model "
                     f"{model.model_id!r}")
-            if self.forward_model_ready != model.validated:
+            if self.forward_model_ready != model.contract_complete:
                 raise ValueError(
                     f"strategy {self.id!r} forward_model_ready must reflect "
-                    f"the validation state of {model.model_id}")
+                    f"whether {model.model_id}'s contract is complete")
         elif self.forward_model_ready:
             raise ValueError(
                 f"strategy {self.id!r} cannot be forward-model ready without "

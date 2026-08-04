@@ -4,6 +4,18 @@ A firing contract is not an expectancy observation until proposal identity,
 entry, stop, target, costs, funding and maximum holding time are fixed before
 the outcome is observed.  These models are implementation-validated only;
 they do not raise a strategy's evidence tier or authorise exchange trading.
+
+``contract_complete`` was called ``validated``, and the name claimed far more
+than the flag carried.  It attests that every field needed to turn a signal
+into a paper outcome is present and internally consistent - nothing more.  For
+most strategies the evidence behind it is a hypothesis YAML and the test that
+checks this dataclass is well formed, which establishes that the contract is
+*specified*, not that it *predicts*.  The distinction matters because a
+complete contract is exactly what makes an expectancy number computable, so
+the flag sat one step away from reading as a licence to believe that number.
+Whether a mechanism is real remains the job of the tier ladder in
+``agent/registry.py`` and the forward evidence loop, neither of which consults
+this flag.
 """
 
 from __future__ import annotations
@@ -52,8 +64,8 @@ class ForwardOutcomeModel:
     entry_slippage_pct: float | None = None
     stop_slippage_pct: float | None = None
     funding_treatment: str = "observed_realized_settlements"
-    validated: bool = False
-    validation_evidence: tuple[str, ...] = ()
+    contract_complete: bool = False
+    contract_evidence: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.strategy_id:
@@ -80,9 +92,10 @@ class ForwardOutcomeModel:
                 or self.maker_entry_fee_pct < 0):
             raise ValueError(
                 f"{self.model_id}: maker entry fee assumption is required")
-        if self.validated and not self.validation_evidence:
+        if self.contract_complete and not self.contract_evidence:
             raise ValueError(
-                f"{self.model_id}: a validated model requires evidence")
+                f"{self.model_id}: a complete contract must cite where its "
+                "assumptions come from")
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -247,8 +260,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
                 "signal_ts", "swing_low_pct", "swing_high_pct"),
             signal_timestamp_field="signal_ts", invalidation_anchor="structure",
             exit_policy="fixed_rr", stop_atr_multiple=1.0, reward_risk=3.0,
-            validated=True,
-            validation_evidence=(
+            contract_complete=True,
+            contract_evidence=(
                 "research/results/edge-audit-2024-2026/REPORT.md",
                 "tests/research/test_forward_models.py",
                 "tests/research/test_cost_parity.py",
@@ -269,8 +282,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
                 "mom_1h_pct", "swing_low_pct", "swing_high_pct"),
             signal_timestamp_field="signal_ts", invalidation_anchor="structure",
             exit_policy="fixed_rr", stop_atr_multiple=1.5, reward_risk=2.0,
-            validated=True,
-            validation_evidence=(
+            contract_complete=True,
+            contract_evidence=(
                 "research/hypotheses/flush-fade.yaml",
                 "tests/research/test_forward_models.py",
             ),
@@ -291,8 +304,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
                 "trend_4h", "swing_low_pct", "swing_high_pct"),
             signal_timestamp_field="signal_1h_ts",
             invalidation_anchor="structure", exit_policy="fixed_rr",
-            stop_atr_multiple=3.0, reward_risk=2.0, validated=True,
-            validation_evidence=(
+            stop_atr_multiple=3.0, reward_risk=2.0, contract_complete=True,
+            contract_evidence=(
                 "research/hypotheses/funding-carry.yaml",
                 "tests/research/test_forward_models.py",
             ),
@@ -313,8 +326,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
                 "swing_low_pct", "swing_high_pct"),
             signal_timestamp_field="signal_1h_ts",
             invalidation_anchor="structure", exit_policy="fixed_rr",
-            stop_atr_multiple=3.0, reward_risk=2.0, validated=True,
-            validation_evidence=(
+            stop_atr_multiple=3.0, reward_risk=2.0, contract_complete=True,
+            contract_evidence=(
                 "research/hypotheses/funding-unwind.yaml",
                 "tests/research/test_forward_models.py",
             ),
@@ -335,8 +348,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
                 "swing_high_pct"),
             signal_timestamp_field="signal_4h_ts",
             invalidation_anchor="structure", exit_policy="fixed_rr",
-            stop_atr_multiple=2.0, reward_risk=3.0, validated=True,
-            validation_evidence=(
+            stop_atr_multiple=2.0, reward_risk=3.0, contract_complete=True,
+            contract_evidence=(
                 "research/hypotheses/trend-multiday.yaml",
                 "tests/research/test_forward_models.py",
             ),
@@ -356,8 +369,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
                 "swing_high_pct"),
             signal_timestamp_field="signal_1h_ts",
             invalidation_anchor="structure", exit_policy="fixed_rr",
-            stop_atr_multiple=2.0, reward_risk=2.0, validated=True,
-            validation_evidence=(
+            stop_atr_multiple=2.0, reward_risk=2.0, contract_complete=True,
+            contract_evidence=(
                 "research/hypotheses/ls-ratio-fade.yaml",
                 "tests/research/test_forward_models.py",
             ),
@@ -385,8 +398,8 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             stop_atr_multiple=0.5, reward_risk=1.0,
             entry_style="top_book_maker", maker_entry_fee_pct=0.02,
             charge_spread=False, entry_slippage_pct=0.0,
-            stop_slippage_pct=0.15, validated=True,
-            validation_evidence=(
+            stop_slippage_pct=0.15, contract_complete=True,
+            contract_evidence=(
                 "research/maker_study.py",
                 "research/hypotheses/scalp-maker.yaml",
                 "tests/research/test_forward_models.py",
@@ -407,10 +420,18 @@ def model_for(strategy_id: str) -> ForwardOutcomeModel:
             f"no forward outcome model is registered for {strategy_id!r}") from None
 
 
-def require_validated(strategy_id: str) -> ForwardOutcomeModel:
+def require_complete_contract(strategy_id: str) -> ForwardOutcomeModel:
+    """Refuse to compute a paper outcome from an unfinished contract.
+
+    This is a completeness check, not an endorsement.  Passing it means the
+    stop, target, cost and holding assumptions are all fixed in advance, which
+    is what makes the resulting number an out-of-sample observation rather
+    than a fitted one.  It says nothing about whether the strategy works;
+    that verdict is the tier ladder's, on forward evidence.
+    """
     model = model_for(strategy_id)
-    if not model.validated:
+    if not model.contract_complete:
         raise ValueError(
-            f"{strategy_id}: forward outcome model {model.model_id} is not "
-            "validated; expectancy and promotion are prohibited")
+            f"{strategy_id}: forward outcome model {model.model_id} has an "
+            "incomplete contract, so no expectancy can be computed from it")
     return model
