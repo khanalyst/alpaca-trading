@@ -22,7 +22,9 @@ from research.findings import (FindingsStore, _content_hash,
 
 from . import (brain, hypotheses, registry as strategy_registry,
                state as runtime_state, strategy)
-from .forward_models import require_complete_contract
+from .forward_models import (_field as _row_field,
+                             _finite as _row_finite,
+                             require_complete_contract)
 from .risk import RiskEngine
 from .variants import (Variant, apply, declared_research_setting, from_record)
 
@@ -1033,6 +1035,9 @@ class ShadowEvaluator:
                 position["maker_fill_bar_pending"] = False
                 fill_bar_pending = False
 
+        carry = cls._carry_normalisation_exit(position, row, now, cfg)
+        if carry is not None:
+            return carry
         if now < float(position["deadline_ts"]):
             return None
         observation_bar = math.floor(now / 60.0) * 60_000
@@ -1215,6 +1220,50 @@ class ShadowEvaluator:
             closed_trades=closed_trades, now=now)
         records.extend(resolved_records)
         return state, version
+
+    @classmethod
+    def _carry_normalisation_exit(
+            cls, position: dict, row: dict, now: float, cfg: dict
+            ) -> tuple[str, float, dict, bool, float] | None:
+        """Close a carry position once the carry it was opened for is spent.
+
+        funding-carry states its own mechanism plainly: the return source is
+        the funding it collects, not a directional forecast. Its contract none
+        the less exited on a 2R price move, so the strategy was scored on
+        whether price happened to travel far enough - the one thing it claims
+        not to be forecasting - and a position could be closed at a profit
+        while the carry it was opened for was still paying, or held while the
+        carry had already gone.
+
+        Reached only after the bar replay has found no stop, so a stop still
+        wins, and only before the deadline check, so the ten-day timeout
+        remains the outer bound.
+
+        Fails closed in every direction. A position on any other exit policy,
+        a missing or non-finite funding percentile, or an unavailable fresh
+        quote all return None and leave the existing behaviour untouched: an
+        absent observation must never manufacture an exit.
+        """
+        if str(position.get("exit_policy") or "") != "carry_until_normalised":
+            return None
+        threshold = position.get("carry_exit_funding_percentile")
+        if threshold is None:
+            return None
+        percentile = _row_finite(
+            _row_field(row, "funding_percentile_30"))
+        if percentile is None or percentile > float(threshold):
+            return None
+        quote = cls._fresh_directional_quote(position, row, now, cfg)
+        if quote is None:
+            position["data_status"] = "awaiting_fresh_market_data"
+            return None
+        price, quote_evidence = quote
+        return "funding_normalised", price, {
+            **quote_evidence,
+            "exit_ts": now,
+            "funding_percentile_30": percentile,
+            "carry_exit_funding_percentile": float(threshold),
+        }, True, now
 
     @staticmethod
     def _exit_reason(position: dict, price: float, now: float) -> str | None:
@@ -1458,6 +1507,11 @@ class ShadowEvaluator:
             "margin_usd": float(entry_execution["margin_usd"]),
             "stop_price": entry - stop_move if long else entry + stop_move,
             "take_price": entry + take_move if long else entry - take_move,
+            # Both fixed at entry, from the contract, so the exit rule cannot
+            # be revised once the outcome starts to be observable.
+            "exit_policy": model.exit_policy,
+            "carry_exit_funding_percentile": (
+                model.carry_exit_funding_percentile),
             "horizon_hours": horizon_hours,
             "deadline_ts": now + horizon_hours * 3600,
             "order_expires_ts": (

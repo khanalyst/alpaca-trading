@@ -46,7 +46,7 @@ INVALIDATION_ANCHORS = {"structure", "atr"}
 # fixed_rr precisely where it was meant to differ. An inert choice is worse
 # than no choice: it makes the decision space look richer than it is, and
 # attributes outcomes to a policy that never applied.
-EXIT_POLICIES = {"fixed_rr", "extended_rr"}
+EXIT_POLICIES = {"fixed_rr", "extended_rr", "carry_until_normalised"}
 EXECUTION_CHOICES = {"normal", "retry_smaller"}
 SETUP_STATUSES = {
     "proposed", "risk_rejected", "attempted", "execution_rejected",
@@ -301,6 +301,16 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
 
     fixed_rr = float(block["fixed_reward_risk"])
     if exit_policy == "extended_rr":
+        take_pct = stop_pct * float(block["extended_reward_risk"])
+    elif exit_policy == "carry_until_normalised":
+        # A carry position has no price target: the return source is the
+        # funding it collects, not a directional forecast, and it closes when
+        # the funding stops paying. The take here is only the protective outer
+        # bound that an exchange TP order needs to exist at all, so it is set
+        # at the widest configured distance rather than at a level the
+        # contract expects to reach. The stop is unchanged: price risk over
+        # the holding window still has to be charged against the carry, which
+        # is exactly what this strategy's falsification demands.
         take_pct = stop_pct * float(block["extended_reward_risk"])
     else:
         take_pct = stop_pct * fixed_rr

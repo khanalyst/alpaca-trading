@@ -164,7 +164,13 @@ state, and `select_universe` feedback that cannot be reconstructed exactly.
 Operational failures invalidate a forward window instead of disappearing as
 missing data. PAPER is local simulation only.
 
-The available exit policies are `fixed_rr` and `extended_rr`.
+The available exit policies are `fixed_rr`, `extended_rr` and
+`carry_until_normalised`. The last one belongs to `funding-carry`, whose return
+source is the funding it collects rather than a directional forecast: it holds
+while funding pays and closes when the 30-day funding percentile falls back to
+its median, instead of on a price target it never claimed to be forecasting.
+Its stop is unchanged, because price risk over the holding window still has to
+be charged against the carry.
 
 ## Tournament and persistence
 
@@ -271,9 +277,6 @@ source.
 | [SETUP.md](SETUP.md) | Local and Azure installation, credentials, configuration, services, external backup provisioning, deployment updates, and optional local-history boundaries. |
 | [OPERATIONS.md](OPERATIONS.md) | Daily operation, runtime paths, nightly sequencing and exit codes, experiments, tournaments, backups, recovery, and troubleshooting. |
 | [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) | Short compatibility pointer for Azure deployment. It directs operators to setup/operations and lists data that must survive VM loss. |
-| [MAIN_REPO_REVIEW_PLAN.md](MAIN_REPO_REVIEW_PLAN.md) | Reconciled closure record for the seven implementation topics and remaining environment-only actions. It is a status summary, not a second runbook. |
-| [V2_HARDENING_PLAN.md](V2_HARDENING_PLAN.md) | Concise record of the hardened foundations now present and the safety boundaries that remain intentional. |
-| [WIP_HANDOFF.md](WIP_HANDOFF.md) | Final implementation handoff, assessment reconciliation, validation record, and remaining environment/operator prerequisites. |
 | [deploy/README.md](deploy/README.md) | Purpose and ordering of the systemd trader, recorder, research service, and timer units. It also points to external-backup configuration. |
 
 ### Strategy and research documentation
@@ -285,7 +288,6 @@ source.
 | [research/protocol.md](research/protocol.md) | Statistical and operational evidence rules for `WORKED`, `FAILED`, `INCONCLUSIVE`, qualification, rejection, pairing, held-out confirmation, and multiple testing. |
 | [research/plan/RECONCILIATION.md](research/plan/RECONCILIATION.md) | Current authority policy separating journal evidence, exploratory tournament evidence, configuration exceptions, and VM handoff requirements. |
 | [research/plan/B7.5-record.md](research/plan/B7.5-record.md) | Current status and completion conditions for the optional maker-first order primitive. It distinguishes that execution experiment from `scalp-maker`. |
-| [research/plan/edge-hypotheses.md](research/plan/edge-hypotheses.md) | Compatibility pointer to the canonical strategy definitions. It maps non-strategy research concepts to their descriptive implementation artifacts. |
 | [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Reconciled implementation-flow summary showing how snapshots become isolated experiments, outcomes, edge evidence, tournaments, and backups. |
 | [research/plan/findings.md](research/plan/findings.md) | Pointer from the earlier findings plan to current implementation and evidence documents. It preserves context without acting as current instructions. |
 
@@ -293,9 +295,9 @@ source.
 
 | Document | What it contains |
 | --- | --- |
+| [findings/main-repo-review-2026-07-30.md](findings/main-repo-review-2026-07-30.md) | Review snapshot explaining the original gaps and repairs. Retained as an evidence trail; current operation lives in the primary guides. |
+| [findings/orchestrated-audit-2026-07-29.md](findings/orchestrated-audit-2026-07-29.md) | Earlier multi-pass audit of research validity, persistence and strategy coherence. Retained as an evidence trail. |
 | [findings/README.md](findings/README.md) | Index of repository audits and committed momentum variant scorecards. Use it to navigate identity-specific findings. |
-| [findings/main-repo-review-2026-07-30.md](findings/main-repo-review-2026-07-30.md) | Detailed review snapshot explaining the original gaps, repairs, and reasoning behind the current reconciliation plan. Current operation remains in the primary guides. |
-| [findings/orchestrated-audit-2026-07-29.md](findings/orchestrated-audit-2026-07-29.md) | Earlier multi-pass audit of research validity, reporting, persistence, strategy coherence, and documentation. It is retained as an evidence trail. |
 | [findings/momentum/momentum.baseline.md](findings/momentum/momentum.baseline.md) | Identity card for the shipped momentum comparison floor. It records status, immutable claim, sample state, and findings log. |
 | [findings/momentum/momentum.rr.fixed_1_5.md](findings/momentum/momentum.rr.fixed_1_5.md) | Scorecard for the 1.5R target candidate. It asks whether improved hit rate outweighs a smaller average win. |
 | [findings/momentum/momentum.rr.fixed_2_0.md](findings/momentum/momentum.rr.fixed_2_0.md) | Scorecard for the 2R target candidate. It tests whether more excursions become wins than under the shipped 3R target. |
@@ -321,11 +323,7 @@ source.
 | Document | What it contains |
 | --- | --- |
 | [research/results/edge-audit-2024-2026/REPORT.md](research/results/edge-audit-2024-2026/REPORT.md) | Independent audit of the earlier momentum strategy over 24 months. It establishes the rejected benchmark and the evidence standard new strategies must beat. |
-| [research/results/edge-audit-2024-2026/crosscheck-legacy-backtest-REPORT.md](research/results/edge-audit-2024-2026/crosscheck-legacy-backtest-REPORT.md) | Deterministic legacy cross-check of momentum entries and portfolio behavior. It is supporting evidence with explicitly documented limitations. |
 | [research/results/edge-discovery-method/REPORT.md](research/results/edge-discovery-method/REPORT.md) | Methodology for recognizing an edge, ranking research directions, and measuring noise, costs, placebos, and mechanism attribution. |
-| [research/results/edge-search-2024-2026/REPORT.md](research/results/edge-search-2024-2026/REPORT.md) | Historical multi-pass edge search and adversarial validation results. It records what was tested rather than granting current execution authority. |
-| [research/results/phase1-v2-backtest-2025-2026/REPORT.md](research/results/phase1-v2-backtest-2025-2026/REPORT.md) | Earlier phase1-v2 backtest snapshot used for comparison and audit continuity. It does not define the current runtime strategy. |
-| [research/results/selection-and-management/REPORT.md](research/results/selection-and-management/REPORT.md) | Historical analysis of universe selection and position management choices, including measured trade-offs and limitations. |
 | [research/results/tournament/REPORT.md](research/results/tournament/REPORT.md) | Committed historical tournament latest-view report. New runs write immutable per-run evidence below `research/results/tournament/runs/`. |
 
 ## Tests
