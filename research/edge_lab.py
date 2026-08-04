@@ -800,9 +800,11 @@ COST_SCENARIOS = {
     #
     # The gap matters more than it looks: at 0.4963% round trip the measured
     # cross-sectional spreads of 0.05-0.30% gross are not "the same size as
-    # the fee" as the edge-search report concluded - they are 2-10x smaller
-    # than it. It also makes maker execution worth ~0.23-0.46% of round-trip
-    # saving rather than the 0.06% that report assumed.
+    # the fee" that the edge-discovery report concluded - they are 2-10x
+    # smaller than it. It also makes maker execution worth ~0.23-0.46% of
+    # round-trip saving rather than the 0.06% that report assumed, which is
+    # why enabling the B7.5 maker path is worth more than it first appeared.
+    # Both affected reports now carry a cost-basis correction banner.
     "account_taker": Costs("account_taker", 0.25, 0.05, 0.05, 0.15, True),
 }
 
