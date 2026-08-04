@@ -1,5 +1,28 @@
 # Independent edge audit — phase1-v2 momentum strategy
 
+> ## ⚠ Cost basis correction — 2026-08-04
+>
+> **Every number below was produced against the `base` cost scenario:
+> 0.05%/side taker fee.** The account this project trades was subsequently
+> measured at **0.248%/side** over 24 demo round trips, a 4.96x
+> understatement. See `config.yaml` `trading_costs` for the derivation and
+> `research/edge_lab.py` `COST_SCENARIOS` for the `account_taker` scenario
+> that new work now runs against.
+>
+> The figures here are **not** restated. `base` is deliberately preserved so
+> this report stays exactly reproducible, and the historical dataset it was
+> built from is not committed, so restating would silently mix a new data
+> vintage into an old conclusion. What follows is therefore a faithful record
+> of what was measured, at a fee the account does not pay.
+>
+> **Read every after-cost conclusion below as optimistic.** Real costs being
+> higher moves results against the strategy, so a negative verdict here (such
+> as momentum's) is conservative and stands. A *survival* claim - "this edge
+> holds at cost X" - does not: the true round trip is ~0.4963%, which is above
+> the range these tables sweep.
+
+
+
 > **Historical result snapshot.** This report evaluates the named historical
 > strategy/corpus, not the current schema-14 real-time seven-strategy pipeline.
 > It remains evidence about that experiment and cannot automatically change

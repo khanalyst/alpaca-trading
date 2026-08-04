@@ -1,5 +1,36 @@
 # How to infer an edge, and where to look for one
 
+> ## ⚠ Cost basis correction — 2026-08-04
+>
+> **Every number below was produced against the `base` cost scenario:
+> 0.05%/side taker fee.** The account this project trades was subsequently
+> measured at **0.248%/side** over 24 demo round trips, a 4.96x
+> understatement. See `config.yaml` `trading_costs` for the derivation and
+> `research/edge_lab.py` `COST_SCENARIOS` for the `account_taker` scenario
+> that new work now runs against.
+>
+> The figures here are **not** restated. `base` is deliberately preserved so
+> this report stays exactly reproducible, and the historical dataset it was
+> built from is not committed, so restating would silently mix a new data
+> vintage into an old conclusion. What follows is therefore a faithful record
+> of what was measured, at a fee the account does not pay.
+>
+> **Read every after-cost conclusion below as optimistic.** Real costs being
+> higher moves results against the strategy, so a negative verdict here (such
+> as momentum's) is conservative and stands. A *survival* claim - "this edge
+> holds at cost X" - does not: the true round trip is ~0.4963%, which is above
+> the range these tables sweep.
+
+> **This report's maker-execution conclusion is materially understated.** It
+> computes the maker saving as 0.06% of round trip from a 0.05%/side taker fee
+> against 0.02%/side maker. At the measured 0.248%/side the saving is
+> ~0.46% of round trip - roughly 7.6x larger - and the measured gross spreads
+> of 0.05-0.30% are not "the same size as the fee" but 2-10x smaller than it.
+> The direction of that error favours acting on maker execution sooner, not
+> later.
+
+
+
 > **Historical research snapshot.** The methods and measured results below are
 > preserved evidence from their original run. Current executable strategy,
 > rotation, outcome, and backup behavior is documented elsewhere.

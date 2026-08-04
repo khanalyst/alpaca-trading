@@ -480,3 +480,67 @@ class TierClaimsAreTraceableTests(unittest.TestCase):
         self.assertEqual(
             missing, [],
             f"tier evidence citing files that do not exist: {missing}")
+
+
+class CommittedReportsDeclareTheirCostBasisTests(unittest.TestCase):
+    """A report built at one fee must not be read as though it used another.
+
+    The configured taker fee was corrected from 0.05%/side to the measured
+    0.248%/side, and nothing propagated that to the committed reports. Every
+    after-cost table under research/results/ still describes an account nobody
+    trades, and those tables are what the tier verdicts cite. Nothing compared
+    the two numbers, so nothing complained - the same failure mode as the
+    original fee bug, one layer up.
+
+    The reports are deliberately NOT restated: `base` is preserved so they stay
+    reproducible, and the dataset behind them is not committed. What is
+    enforced here is that a reader cannot reach the numbers without meeting
+    the correction first.
+    """
+
+    REPORTS = (
+        "research/results/edge-audit-2024-2026/REPORT.md",
+        "research/results/edge-discovery-method/REPORT.md",
+    )
+
+    def test_reports_quoting_the_old_fee_carry_a_correction(self):
+        for name in self.REPORTS:
+            with self.subTest(report=name):
+                path = REPO / name
+                self.assertTrue(path.exists(), f"{name} is missing")
+                text = path.read_text(encoding="utf-8")
+                if "0.05% per side" not in text and "0.05%/side" not in text:
+                    continue          # nothing stale left to warn about
+                self.assertIn(
+                    "Cost basis correction", text,
+                    f"{name} quotes the superseded 0.05%/side basis with no "
+                    "correction; a reader will take its after-cost "
+                    "conclusions at face value")
+
+    def test_the_correction_names_the_rate_actually_paid(self):
+        from research.edge_lab import COST_SCENARIOS, DEFAULT_COST_SCENARIO
+
+        measured = COST_SCENARIOS[DEFAULT_COST_SCENARIO].fee_per_side
+        for name in self.REPORTS:
+            with self.subTest(report=name):
+                text = (REPO / name).read_text(encoding="utf-8")
+                if "Cost basis correction" not in text:
+                    continue
+                self.assertIn(
+                    "0.248", text,
+                    f"{name}'s correction does not state the measured rate")
+                self.assertGreater(measured, 0.2)
+
+    def test_the_historical_scenario_is_preserved_not_edited(self):
+        """`base` must keep meaning what the committed reports meant by it.
+
+        Correcting it in place would rewrite every published number without
+        rewriting the documents that quote them - which is worse than the
+        drift being fixed, because it would be invisible.
+        """
+        from research.edge_lab import COST_SCENARIOS
+
+        self.assertEqual(COST_SCENARIOS["base"].fee_per_side, 0.05)
+        self.assertNotEqual(
+            COST_SCENARIOS["base"].fee_per_side,
+            COST_SCENARIOS["account_taker"].fee_per_side)
