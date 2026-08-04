@@ -219,10 +219,18 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # 2e6c312ae9d80316 -> ffbd0360d5f624c9 when the selectable research
         # catalog changed: feasible axes, stricter confidence floors, and
         # maker penetration.
+        # ffbd0360d5f624c9 -> 608188bfb1314d2e when nine momentum arms were
+        # retired on live demo evidence: the three observable confidence
+        # floors (the 0.70-0.80 bucket went 0 for 13, so the axis runs the
+        # wrong way) and both breakout discriminators (2 range_breakout
+        # trades in 24 round trips, so neither is measurable). The selector's
+        # menu is part of the prompt, so removing options changes the
+        # model's decision space and attribution forks - which is the point:
+        # evidence collected against the old menu must not pool with the new.
         # This constant moves only in a batch that intends it.
         self.assertEqual(
             brain.prompt_version(system),
-            "ffbd0360d5f624c9",
+            "608188bfb1314d2e",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

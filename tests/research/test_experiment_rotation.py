@@ -14,6 +14,9 @@ from tests.research.test_enrichment_isolation import symbol_snapshot
 
 
 THREE_DAYS = 3 * 86_400
+# The configured floor. agent/config.py refuses anything below the
+# 8-cluster arithmetic minimum, so config-derived assignments use this.
+TEN_DAYS = 10 * 86_400
 
 
 def static_variant(variant_id, path, value, strategy_id="momentum"):
@@ -227,7 +230,7 @@ class RotationRuntimeTests(unittest.TestCase):
             "shadow_variants": [
                 "momentum.rr.fixed_2_5", "momentum.stop.atr_1_5"],
             "shadow_budget_ms": 0,
-            "experiment_min_duration_days": 3,
+            "experiment_min_duration_days": 10,
             "experiment_min_observations": 1,
         }
         self.baseline = variants.baseline("momentum", "phase1-v3")
@@ -267,7 +270,7 @@ class RotationRuntimeTests(unittest.TestCase):
             "demo:default-policy", "momentum")
 
         self.assertIsNotNone(evaluator)
-        self.assertEqual(assignment["minimum_duration_seconds"], THREE_DAYS)
+        self.assertEqual(assignment["minimum_duration_seconds"], TEN_DAYS)
         self.assertEqual(assignment["minimum_observations"], 100)
 
     def test_adaptive_proposal_queues_then_observes_for_full_assignment(self):
@@ -290,9 +293,9 @@ class RotationRuntimeTests(unittest.TestCase):
             now=current["started_ts"] + 1)
         self.store.maybe_complete_experiment_assignment(
             current["assignment_id"],
-            now=current["started_ts"] + THREE_DAYS)
+            now=current["started_ts"] + TEN_DAYS)
 
-        now = current["started_ts"] + THREE_DAYS + 1
+        now = current["started_ts"] + TEN_DAYS + 1
         records = evaluator.evaluate(
             {"BTC/USDT:USDT": symbol_snapshot(relative_volume_1h=1.25)},
             now=now, proposals=accepted, advance_accounts=False)
@@ -383,7 +386,7 @@ class RotationMigrationTests(unittest.TestCase):
                 "shadow_enabled": True,
                 "shadow_variants": [baseline.variant_id],
                 "shadow_budget_ms": 0,
-                "experiment_min_duration_days": 3,
+                "experiment_min_duration_days": 10,
                 "experiment_min_observations": 100,
             }
             evaluator = shadow.build(
@@ -394,7 +397,7 @@ class RotationMigrationTests(unittest.TestCase):
 
             self.assertEqual(assignment["candidate_variant_id"], exact.variant_id)
             self.assertEqual(assignment["proposal_id"], proposal["proposal_id"])
-            self.assertEqual(assignment["minimum_duration_seconds"], THREE_DAYS)
+            self.assertEqual(assignment["minimum_duration_seconds"], TEN_DAYS)
             self.assertEqual(assignment["minimum_observations"], 100)
             self.assertEqual(
                 evaluator.variant_ids, [baseline.variant_id, exact.variant_id])

@@ -370,6 +370,39 @@ def cmd_check(args, cfg) -> int:
             print(f"  Eligible crypto universe: {len(universe)} "
                   f"instrument(s)")
             print(f"  Universe head: {', '.join(universe[:5]) or 'none'}")
+            # Every offline cost model reads the CONFIGURED fee, so a gap
+            # between it and the account's real rate voids the research
+            # corpus even while live sizing stays correct. Fail the check:
+            # this is the exact defect that went unnoticed for the whole
+            # demo run.
+            probe = universe[0] if universe else None
+            fetched = None
+            if probe is not None:
+                try:
+                    fetched = float(ex.taker_fee_pct(probe))
+                except Exception:                          # noqa: BLE001
+                    fetched = None
+            fee = market.fee_divergence(cfg, fetched)
+            if fee["status"] == "unavailable":
+                print("  Taker fee: account rate UNAVAILABLE; sizing and "
+                      f"research both fall back to {fee['configured_pct']}%"
+                      "/side")
+            elif fee["status"] == "ok":
+                print(f"  Taker fee OK: account {fee['fetched_pct']}%/side "
+                      f"vs configured {fee['configured_pct']}%/side "
+                      f"({fee['divergence_pct']:.1f}% apart)")
+            else:
+                print(f"  TAKER FEE DIVERGED: account "
+                      f"{fee['fetched_pct']}%/side vs configured "
+                      f"{fee['configured_pct']}%/side "
+                      f"({fee['divergence_pct']:.1f}% apart, tolerance "
+                      f"{fee['tolerance_pct']:.0f}%)")
+                print("  Live sizing uses the account rate and is unaffected, "
+                      "but every backtest, tournament and tier verdict reads "
+                      "trading_costs.taker_fee_pct_per_side. Set it to the "
+                      "account rate and re-run the cost-sensitive research "
+                      "before trusting any after-cost number.")
+                ok = False
             skipped = [
                 row for row in universe_audit["candidates"]
                 if (not row["selected"]

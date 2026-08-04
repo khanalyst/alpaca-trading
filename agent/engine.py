@@ -2534,9 +2534,48 @@ class Engine:
             })
             row[brain.ENRICHMENT_KEY] = enrichment
 
+    def _adverse_r(self, pos: dict, st: dict) -> float | None:
+        """How far the position has moved against entry, in units of its stop.
+
+        The stop lives in ``st["protection"][symbol]`` - that is the price
+        actually attached at the exchange, written by ``_record_open`` and
+        kept current by the protection audit. ``active_trades`` carries the
+        planned distance as ``stop_loss_pct`` but never an ``sl_price``, so
+        it is the fallback for a position whose protection row has not been
+        reconciled yet.
+
+        Returns ``None`` when entry, stop or mark cannot be read, which the
+        caller must treat as "unknown" rather than "not adverse".
+        """
+        symbol = pos.get("symbol")
+        trade = (st.get("active_trades") or {}).get(symbol) or {}
+        protection = (st.get("protection") or {}).get(symbol) or {}
+        try:
+            entry = float(
+                trade.get("entry_price") or pos.get("entryPrice") or 0)
+            mark = float(pos.get("markPrice") or 0)
+            stop = float(protection.get("sl_price") or 0)
+            stop_pct = float(trade.get("stop_loss_pct") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) and value > 0
+                   for value in (entry, mark)):
+            return None
+        if math.isfinite(stop) and stop > 0:
+            risk_distance = abs(entry - stop)
+        elif math.isfinite(stop_pct) and stop_pct > 0:
+            risk_distance = entry * stop_pct / 100.0
+        else:
+            return None
+        if risk_distance <= 0:
+            return None
+        adverse = (entry - mark) if self._direction(pos) == "long" else (
+            mark - entry)
+        return adverse / risk_distance
+
     def _too_young_to_close(self, pos: dict, decision: dict,
                             st: dict) -> bool:
-        """Block a discretionary close inside strategy.min_hold_minutes.
+        """Block a discretionary close only while the position is not losing.
 
         Exchange-side stops and targets are untouched, the max-hold timer
         still fires, and the engine's own safety closes do not pass through
@@ -2546,9 +2585,28 @@ class Engine:
         model is de-risking rather than second-guessing the entry, and a
         floor that blocks de-risking would be a safety regression.
 
-        When the position's age is unknown the close is ALLOWED. Refusing to
-        close a position we cannot age would trap it until the max-hold
-        timer, which is the more dangerous failure.
+        WHY THIS IS NO LONGER A PURE CLOCK. The 90-minute floor was set to
+        protect a right tail - "the payoff depends on the ~20% of trades that
+        reach a 3R target at a ~21h hold". Over 24 demo round trips that tail
+        appeared 0 times, while the floor's cost showed up on every losing
+        trade. One position was refused eleven consecutive times over 55
+        minutes and closed for -250 USDT the moment the gate lifted.
+
+        The result was an inverted exit policy: the model closed winners on
+        momentum fade (average win +28.55) while losers were held past the
+        floor into their exchange stop (average loss -204.75, and five stop
+        closes carried 40% of the total loss). A 12.5% hit rate needs a
+        win/loss ratio above ~7 to break even; the measured ratio was 0.14.
+
+        So the floor keeps the job it can actually do - stop the model
+        scratching a position that has not gone against it - and gives up the
+        job it was doing badly. Once the position is beyond
+        ``min_hold_adverse_r`` of its own planned stop distance, the thesis is
+        measurably failing and the model may act immediately.
+
+        When age or adverse excursion is unknown the close is ALLOWED.
+        Refusing to close a position we cannot measure would trap it until
+        the max-hold timer, which is the more dangerous failure.
         """
         floor_minutes = float(self.cfg["strategy"].get("min_hold_minutes", 0))
         if floor_minutes <= 0:
@@ -2566,10 +2624,21 @@ class Engine:
         held_minutes = (time.time() - opened) / 60.0
         if held_minutes >= floor_minutes:
             return False
+        adverse_r = self._adverse_r(pos, st)
+        release_r = float(
+            self.cfg["strategy"].get("min_hold_adverse_r", 0.5))
+        if adverse_r is None or adverse_r >= release_r:
+            log.info(
+                "Allowed early model close %s: held %.0f min but adverse "
+                "excursion is %s (release at %.2fR)",
+                symbol, held_minutes,
+                "unknown" if adverse_r is None else f"{adverse_r:.2f}R",
+                release_r)
+            return False
         log.info(
-            "Rejected model close %s: held %.0f min, minimum is %.0f min "
-            "(trigger=%s)",
-            symbol, held_minutes, floor_minutes,
+            "Rejected model close %s: held %.0f min, minimum is %.0f min, "
+            "adverse %.2fR below the %.2fR release (trigger=%s)",
+            symbol, held_minutes, floor_minutes, adverse_r, release_r,
             decision.get("close_trigger"))
         state.log_event("rejected", json.dumps({
             "symbol": symbol,
@@ -2577,6 +2646,8 @@ class Engine:
             "why": "inside strategy.min_hold_minutes",
             "held_minutes": round(held_minutes, 1),
             "min_hold_minutes": floor_minutes,
+            "adverse_r": round(adverse_r, 3),
+            "min_hold_adverse_r": release_r,
             "close_trigger": decision.get("close_trigger"),
         }))
         return True

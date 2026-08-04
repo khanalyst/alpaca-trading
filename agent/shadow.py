@@ -129,7 +129,11 @@ class ShadowEvaluator:
             workers: int = 1,
             rotation_baseline: Variant | None = None,
             rotation_candidates: list[dict] | None = None,
-            rotation_min_duration_seconds: float = 3 * 86_400,
+            # 10 days, matching the shipped floor. Anything below the
+            # 8-cluster arithmetic minimum (8*6h/0.30 = 6.67 days) can
+            # only ever produce an INCONCLUSIVE confirmation window, so
+            # the conservative default has to be a reachable one.
+            rotation_min_duration_seconds: float = 10 * 86_400,
             rotation_min_observations: int = 100) -> None:
         self.budget_ms = float(budget_ms)
         self.base_cfg = base_cfg
@@ -1957,7 +1961,7 @@ def _build_strategy_evaluator(
         rotation_baseline=baseline_variant,
         rotation_candidates=rotation_candidates,
         rotation_min_duration_seconds=(
-            float(block.get("experiment_min_duration_days") or 3) * 86_400),
+            float(block.get("experiment_min_duration_days") or 10) * 86_400),
         rotation_min_observations=int(
             block.get("experiment_min_observations")
             or block.get("paper_min_closed_trades") or 100),
@@ -1990,6 +1994,15 @@ def build(
 
     evaluators = {}
     for strategy_id in sorted(strategy_registry.REGISTRY):
+        spec = strategy_registry.spec_for(strategy_id)
+        # A strategy whose horizon cannot reach the closed-trade floor is
+        # researched offline rather than holding a real-time lane open for
+        # hundreds of days to produce nothing. The active strategy is never
+        # skipped: it is the one on the order path, so its evidence is
+        # collected regardless of how long a verdict takes.
+        if not spec.realtime_eligible and strategy_id != str(
+                cfg["strategy"]["id"]):
+            continue
         strategy_cfg = _research_cfg(cfg, strategy_id)
         evaluator = _build_strategy_evaluator(
             strategy_cfg, registry, ["*"], scope_key=resolved_scope,

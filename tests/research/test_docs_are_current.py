@@ -287,7 +287,7 @@ class CurrentPipelineClaimsTests(unittest.TestCase):
             self.assertIn(str(value), HYPOTHESES)
         for strategy_id in registry.REGISTRY:
             self.assertIn(f"`{strategy_id}`", HYPOTHESES)
-        self.assertEqual(raw["research"]["experiment_min_duration_days"], 3)
+        self.assertEqual(raw["research"]["experiment_min_duration_days"], 10)
         self.assertEqual(raw["research"]["experiment_min_observations"], 100)
         self.assertIn("14 maximum", HYPOTHESES)
 

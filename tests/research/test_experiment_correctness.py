@@ -165,17 +165,31 @@ class ExperimentCorrectnessTests(unittest.TestCase):
         candidate = self.store.paper_portfolio_state(
             scope, self.candidate.variant_id)
 
-        for state in (baseline, candidate):
+        for index, state in enumerate((baseline, candidate), start=1):
             self.assertEqual(state["cash_usdt"], 12_345.0)
             self.assertEqual(state["equity_usdt"], 12_345.0)
             self.assertEqual(state["positions"], [])
             self.assertEqual(state["cooldowns"], {})
-            self.assertEqual(state["seen_proposals"], {})
+            # Operational idempotency survives the rebase on purpose.
+            # paper_decisions is append-only and keyed on a signal-derived
+            # proposal_id, so clearing this while those rows remain made
+            # the evaluator re-insert and collide on any signal bar still
+            # current - 74 IntegrityErrors on trend-multiday alone over 4
+            # simulated days. It is not assignment evidence: cash,
+            # positions, counters and drawdown are all still rebased.
+            self.assertEqual(state["seen_proposals"], {f"old-{index}": 0.0})
             self.assertEqual(state["loss_count"], 0)
             self.assertEqual(
                 state["experiment_assignment_id"], assignment["assignment_id"])
             self.assertEqual(state["experiment_assignment_started_ts"], 10.0)
-        comparable_keys = set(baseline) - {"portfolio_version", "updated_ts"}
+        # seen_proposals is per-variant operational idempotency, not part of
+        # the durable boundary: it must survive the rebase (see above) and it
+        # is legitimately different per lane, because each arm has observed
+        # its own proposals. Everything that defines the boundary - cash,
+        # equity, positions, counters, drawdown, provenance - is still
+        # required to match exactly.
+        comparable_keys = set(baseline) - {
+            "portfolio_version", "updated_ts", "seen_proposals"}
         self.assertEqual(
             {key: baseline[key] for key in comparable_keys},
             {key: candidate[key] for key in comparable_keys})
@@ -358,10 +372,18 @@ class ExperimentCorrectnessTests(unittest.TestCase):
         self.assertEqual(second["attempt"], 2)
         self.assertEqual(second["retry_of_assignment_id"], first["assignment_id"])
 
-    def test_automatic_retry_caps_at_three_but_explicit_retry_continues(self):
+    def test_automatic_retry_caps_at_the_budget_but_explicit_retry_continues(
+            self):
+        # The cap is a sample budget now that attempts pool rather than
+        # restart: it has to be large enough for the closed-trade floor to
+        # be reachable at the strategy's own horizon.
         scope = "demo:auto-retry-cap"
         current = self.assignment(scope)
-        for expected_attempt, now in ((1, 2.0), (2, 4.0), (3, 6.0)):
+        attempts = [
+            (n, 2.0 * n)
+            for n in range(
+                1, findings.MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS + 1)]
+        for expected_attempt, now in attempts:
             self.assertEqual(current["attempt"], expected_attempt)
             self._complete_below_floor(current, now=now)
             prioritized = self.store.prioritized_experiment_candidates(
@@ -394,7 +416,9 @@ class ExperimentCorrectnessTests(unittest.TestCase):
             scope, "momentum", self.baseline.variant_id, explicit,
             minimum_duration_seconds=0, minimum_observations=1, now=9.0)
         self.assertEqual(selection["current_status"], "ACCEPTED")
-        self.assertEqual(fourth["attempt"], 4)
+        self.assertEqual(
+            fourth["attempt"],
+            findings.MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS + 1)
         self.assertEqual(
             fourth["retry_of_assignment_id"], current["assignment_id"])
 

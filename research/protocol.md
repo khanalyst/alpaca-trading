@@ -191,6 +191,21 @@ is labeled exact only for enumeration of the sign assignments conditional on
 that assumption. Fixed-seed Monte Carlo output is labeled as an estimate and
 records its resample count and seed.
 
+A pair both arms vetoed stays in the estimate. Its delta is exactly zero,
+which is the correct contribution: a policy is run over every opportunity, so
+a variant that gains 1R on 1% of them is worth 0.01R per opportunity, not 1R.
+Dropping those zeros would change the estimand to "conditional on at least one
+arm acting", inflate a rarely-active variant's effect, and discard the
+uncertainty those clusters carry.
+
+**A window with no informative pair is inadequate, not negative.** When every
+pair is a concordant veto the interval collapses onto exactly zero, and a
+nonpositive delta is otherwise read as a performance failure - which would
+book a strategy that never fired as one that was tested and lost. Windows
+therefore report `informative_pairs`, and a window with none is refused at
+the adequacy gate. This is a floor of one: it targets the empty case only and
+is not a second sample requirement on mixed evidence.
+
 The minimums are fixed constants in `protocol.py`: 100 full pairs, 70 fit
 pairs, 30 confirmation pairs and 80% coverage in every relevant population.
 The natural 70/30 allocation of the 100-pair promotion floor therefore cannot

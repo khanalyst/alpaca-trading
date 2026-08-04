@@ -421,7 +421,7 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertTrue(cfg["research"]["shadow_enabled"])
         self.assertEqual(cfg["research"]["shadow_variants"], ["*"])
         self.assertEqual(cfg["research"]["shadow_budget_ms"], 0)
-        self.assertEqual(cfg["research"]["experiment_min_duration_days"], 3)
+        self.assertEqual(cfg["research"]["experiment_min_duration_days"], 10)
         self.assertEqual(cfg["research"]["experiment_min_observations"], 100)
         self.assertNotIn("shadow_llm_variants", cfg["research"])
 

@@ -182,6 +182,19 @@ variants:
       prompt suppresses the low-confidence proposals it would need to observe.
     status: superseded
 
+  # RETIRED 2026-08-04 on live demo evidence. Confidence is anti-informative
+  # in the band these arms test. Over 24 demo round trips:
+  #
+  #   0.00-0.70   9 trades  22.2% win  -0.41R
+  #   0.70-0.80  13 trades   0.0% win  -0.52R   <- 0 for 13
+  #   0.80-0.90   1 trade   100.0% win +0.04R
+  #
+  # The model's HIGHER-confidence bucket lost every trade and scored worse
+  # per trade than its lower-confidence bucket. Raising the floor to 0.70
+  # selects the 0-for-13 population, so these three arms would spend ~30 days
+  # each measuring an axis that runs the wrong way. Status only is advanced;
+  # the registered claims stay as written.
+
   - variant_id: momentum.conf.floor_0_70
     strategy_id: momentum
     base_version: phase1-v3
@@ -190,7 +203,7 @@ variants:
     hypothesis: >-
       A 0.70 floor measures whether a modestly stricter confidence gate adds
       marginal value over the observable proposals admitted by the 0.65 baseline.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.conf.floor_0_75
     strategy_id: momentum
@@ -200,7 +213,7 @@ variants:
     hypothesis: >-
       A 0.75 floor measures whether a materially stricter confidence gate adds
       marginal value over the observable proposals admitted by the 0.65 baseline.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.conf.floor_0_80
     strategy_id: momentum
@@ -210,7 +223,7 @@ variants:
     hypothesis: >-
       A 0.80 floor measures whether the strictest registered confidence gate
       adds marginal value over the observable proposals admitted by the 0.65 baseline.
-    status: candidate
+    status: superseded
 
   # --- batch 6.4: which variable separates breakout from continuation ------
   # The two contracts overlap, so attribution splits one phenomenon across
@@ -221,6 +234,13 @@ variants:
   # Gate G5 previously blocked 6.4 on the volatility-regime question. Making the discriminator a
   # parameter dissolves that gate: neither answer is baked in, so neither
   # filters the population the other one needs.
+  #
+  # RETIRED 2026-08-04: unrunnable, not refuted. Separating breakouts from
+  # continuations needs a breakout population, and live demo produced 2
+  # range_breakout trades against 21 trend_continuation in 24 round trips.
+  # funding_squeeze produced 0. Momentum is operationally a one-setup
+  # strategy, so neither discriminator can be measured on this feed. Revisit
+  # only if breakout frequency rises materially.
   - variant_id: momentum.discriminator.trend_alignment
     strategy_id: momentum
     base_version: phase1-v3
@@ -230,7 +250,7 @@ variants:
       A breakout is a transition out of chop, so requiring the absence of
       prior multi-timeframe alignment separates it from a continuation
       without losing real breakouts.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.discriminator.volatility_regime
     strategy_id: momentum
@@ -242,4 +262,4 @@ variants:
       is a correlated proxy for it. A breakout from a compressed base is an
       event; a break when volatility is already elevated is an ordinary
       excursion in a distribution that is already wide.
-    status: candidate
+    status: superseded

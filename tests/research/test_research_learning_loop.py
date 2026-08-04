@@ -90,14 +90,14 @@ class ResearchLearningFixture(unittest.TestCase):
                     else baseline_r - 0.45 - (index % 5) * 0.01)
         return baseline_r + 0.20
 
-    def _seed(self, assignment, count, mode):
+    def _seed(self, assignment, count, mode, offset=0):
         scope = assignment["scope_key"]
         baseline_id = assignment["baseline_variant_id"]
         candidate_id = assignment["candidate_variant_id"]
         pattern = (-0.30, 0.10, 0.20, 0.40, 0.0)
         with sqlite3.connect(self.path) as conn:
             for index in range(count):
-                ts = START + (index + 1) * STEP
+                ts = START + (offset + index + 1) * STEP
                 proposal_id = f"{assignment['assignment_id']}-{index:04d}"
                 baseline_r = pattern[index % len(pattern)]
                 candidate_r = self._returns(mode, index, baseline_r)
@@ -192,12 +192,14 @@ class ResearchLearningFixture(unittest.TestCase):
             assignment["assignment_id"], [{
                 "observation_key": (
                     f"{assignment['assignment_id']}-{index:04d}"),
-                "observed_ts": START + (index + 1) * STEP,
-            } for index in range(count)], now=START + count * STEP)
+                "observed_ts": START + (offset + index + 1) * STEP,
+            } for index in range(count)],
+            now=START + (offset + count) * STEP)
 
-    def _complete(self, assignment, count):
+    def _complete(self, assignment, count, offset=0):
         return self.store.maybe_complete_experiment_assignment(
-            assignment["assignment_id"], now=START + (count + 1) * STEP)
+            assignment["assignment_id"],
+            now=START + (offset + count + 1) * STEP)
 
 
 class DeterministicOutcomeTests(ResearchLearningFixture):
@@ -237,7 +239,9 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
                 "paper_execution_evidence_and_validity")
-            self.assertEqual(outcome["verdict"], "FAILED")
+            # Backfilled history uses the same rule as a live rejection: an
+            # operational abort is INCONCLUSIVE, never FAILED.
+            self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
             self.assertEqual(
                 migrated.experiment_assignment(
                     assignment["assignment_id"])["status"], "REJECTED")
@@ -336,7 +340,17 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
             {item["code"] for item in outcome["payload"]["reasons"]})
         self.assertEqual(self.store.edge_evidence(assignment["scope_key"]), [])
 
-    def test_rejected_assignment_has_one_failed_outcome(self):
+    def test_rejected_assignment_is_voided_not_failed(self):
+        """An operational abort produced no evidence, so it decides nothing.
+
+        Every reason an assignment can be rejected is operational: the
+        variant went missing after a restart, code/config identity changed
+        mid-window, or the paper portfolio was revoked. Recording those as
+        FAILED wrote a permanent, immutable verdict about a strategy that was
+        never measured - and because a duplicate-key IntegrityError revokes
+        the portfolio after three occurrences, a SQLite constraint violation
+        could author a research finding.
+        """
         assignment, _ = self._assignment(
             scope="demo:rejected:feed-v1", observations=1)
 
@@ -345,10 +359,10 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         outcome = self.store.experiment_outcome(assignment["assignment_id"])
 
         self.assertEqual(outcome["terminal_status"], "REJECTED")
-        self.assertEqual(outcome["verdict"], "FAILED")
+        self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
         self.assertEqual(
             [item["code"] for item in outcome["payload"]["reasons"]],
-            ["ASSIGNMENT_REJECTED"])
+            ["ASSIGNMENT_VOIDED"])
 
     def test_restart_and_retry_are_idempotent_and_immutable(self):
         assignment, candidate = self._assignment(scope="demo:idempotent:feed-v1")
@@ -707,3 +721,111 @@ class ResearchReviewTests(ResearchLearningFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PooledAttemptTests(ResearchLearningFixture):
+    """A retry must add to the sample, not restart it.
+
+    Six of seven registered strategies cannot reach MIN_ROUND_TRIPS inside
+    one assignment. At a 336h horizon with three concurrent slots, a ten-day
+    window buys two closed trades against a floor of a hundred; at 240h it
+    buys three. The automatic retry produced three independent under-powered
+    windows instead of one adequate one, so the mechanism could never resolve
+    the shortfall it exists to resolve.
+
+    Pooling matches what `forward-qualify` already does with completed
+    attempts under identical code and configuration.
+    """
+
+    def _retry_of(self, first, candidate, scope):
+        descriptor = {
+            "variant_id": candidate.variant_id,
+            "candidate_key": f"{scope}:{candidate.variant_id}",
+            "axis": next(iter(candidate.overrides)),
+            "setting_id": candidate.variant_id.rsplit(".", 1)[-1],
+            "setting": dict(candidate.overrides),
+            "source": "static", "priority": 10,
+            "order_key": candidate.variant_id,
+            "code_identity": first["code_identity"],
+            "config_identity": first["config_identity"],
+            "retry_of_assignment_id": first["assignment_id"],
+        }
+        return self.store.ensure_experiment_assignment(
+            scope, "momentum", self.baseline.variant_id, [descriptor],
+            minimum_duration_seconds=0, minimum_observations=60,
+            now=START + 61 * STEP)
+
+    def test_a_retry_pools_the_earlier_attempt_and_clears_the_floor(self):
+        scope = "demo:pooled:feed-v1"
+        first, candidate = self._assignment(scope=scope, observations=60)
+        self._seed(first, 60, "worked")
+        self._complete(first, 60)
+        first_outcome = self.store.experiment_outcome(first["assignment_id"])
+
+        # Attempt one is genuinely short: 60 closes against a floor of 100.
+        self.assertEqual(first_outcome["verdict"], "INCONCLUSIVE")
+        self.assertIn(
+            "CLOSED_SAMPLE_BELOW_FLOOR",
+            {item["code"] for item in first_outcome["payload"]["reasons"]})
+        self.assertEqual(
+            first_outcome["payload"]["data_window"]["pooled_attempts"], 1)
+
+        second = self._retry_of(first, candidate, scope)
+        self._seed(second, 60, "worked", offset=61)
+        self._complete(second, 60, offset=61)
+        outcome = self.store.experiment_outcome(second["assignment_id"])
+        payload = outcome["payload"]
+
+        self.assertEqual(payload["data_window"]["pooled_attempts"], 2)
+        self.assertEqual(payload["candidate"]["closes"], 120)
+        self.assertEqual(payload["baseline"]["closes"], 120)
+        self.assertNotIn(
+            "CLOSED_SAMPLE_BELOW_FLOOR",
+            {item["code"] for item in payload["reasons"]})
+        self.assertIn(
+            "POOLED_ACROSS_ATTEMPTS",
+            {item["code"] for item in payload["data_limitations"]})
+
+    def test_pooling_stops_at_an_identity_change(self):
+        """A feed fork exists to separate incomparable evidence.
+
+        Pooling across a code or config change would silently mix exactly
+        what the provenance machinery is built to keep apart, so a differing
+        ancestor ends the chain instead of being absorbed.
+        """
+        scope = "demo:pooled-identity:feed-v1"
+        first, candidate = self._assignment(scope=scope, observations=60)
+        self._seed(first, 60, "worked")
+        self._complete(first, 60)
+
+        descriptor = {
+            "variant_id": candidate.variant_id,
+            "candidate_key": f"{scope}:{candidate.variant_id}",
+            "axis": next(iter(candidate.overrides)),
+            "setting_id": candidate.variant_id.rsplit(".", 1)[-1],
+            "setting": dict(candidate.overrides),
+            "source": "static", "priority": 10,
+            "order_key": candidate.variant_id,
+            "code_identity": {
+                "baseline": {"code_version": "DIFFERENT-code",
+                             "forward_model_id": MODEL_ID},
+                "candidate": {"code_version": "DIFFERENT-code",
+                              "forward_model_id": MODEL_ID},
+            },
+            "config_identity": first["config_identity"],
+            "retry_of_assignment_id": first["assignment_id"],
+        }
+        second = self.store.ensure_experiment_assignment(
+            scope, "momentum", self.baseline.variant_id, [descriptor],
+            minimum_duration_seconds=0, minimum_observations=60,
+            now=START + 61 * STEP)
+        self._seed(second, 60, "worked", offset=61)
+        self._complete(second, 60, offset=61)
+        payload = self.store.experiment_outcome(
+            second["assignment_id"])["payload"]
+
+        self.assertEqual(payload["data_window"]["pooled_attempts"], 1)
+        self.assertEqual(payload["candidate"]["closes"], 60)
+        self.assertIn(
+            "CLOSED_SAMPLE_BELOW_FLOOR",
+            {item["code"] for item in payload["reasons"]})

@@ -19,6 +19,54 @@ from .exchange import OKX_CRYPTO_INSTRUMENT_CATEGORY
 log = logging.getLogger("market")
 
 
+# Applied when trading_costs omits an explicit tolerance, so an older config
+# file still gets the guard rather than silently skipping it.
+DEFAULT_FEE_DIVERGENCE_TOLERANCE_PCT = 25.0
+
+
+def fee_divergence(cfg: dict, fetched_pct: float | None) -> dict:
+    """Compare the configured taker fee against the account's real rate.
+
+    Sizing already prefers the fetched rate (``risk.py``), so a divergence is
+    not a live-trading bug. It is a research bug, and a silent one: every
+    offline backtest, tournament run and tier verdict reads the CONFIGURED
+    number, so when the two drift apart the whole evidence corpus describes an
+    account nobody is trading.
+
+    That is exactly what happened. The shipped 0.05%/side was measured at
+    0.248%/side on the demo account - a 4.96x understatement that made every
+    "after-cost" figure in research/results/ unusable while every test still
+    passed. Nothing compared the two, so nothing complained.
+
+    Returns a report rather than raising: the caller decides whether a
+    divergence blocks an operator check or merely warns a running trader.
+    """
+    configured = float(cfg["trading_costs"]["taker_fee_pct_per_side"])
+    tolerance = float(cfg["trading_costs"].get(
+        "fee_divergence_tolerance_pct",
+        DEFAULT_FEE_DIVERGENCE_TOLERANCE_PCT))
+    out = {
+        "configured_pct": configured,
+        "fetched_pct": None,
+        "tolerance_pct": tolerance,
+        "divergence_pct": None,
+        "status": "unavailable",
+    }
+    try:
+        fetched = float(fetched_pct)
+    except (TypeError, ValueError):
+        return out
+    if not math.isfinite(fetched) or fetched <= 0:
+        return out
+    out["fetched_pct"] = fetched
+    # Relative to the fetched rate: the account's rate is the truth, and the
+    # configured one is the estimate being judged against it.
+    divergence = abs(configured - fetched) / fetched * 100.0
+    out["divergence_pct"] = divergence
+    out["status"] = "ok" if divergence <= tolerance else "diverged"
+    return out
+
+
 def quote_volume_usd(ticker: dict, market: dict) -> float:
     """Return a derivative ticker's 24h quote turnover in USD.
 

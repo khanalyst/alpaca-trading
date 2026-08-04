@@ -711,12 +711,24 @@ class EntryFailureBackoffTests(unittest.TestCase):
 
 
 class MinimumHoldTests(unittest.TestCase):
-    """The model may not close inside strategy.min_hold_minutes.
+    """The floor blocks a close only while the position is not yet losing.
 
-    Measured forward return after a qualifying entry is at its worst around
-    30 minutes in, and the shipped payoff depends on the minority of trades
-    that reach a distant target. Sub-hour discretionary exits removed that
-    tail while still paying a full taker round trip.
+    It used to be an unconditional clock, justified by the measured forward
+    return being at its worst around 30 minutes in and by a payoff that
+    depends on the minority of trades reaching a distant target.
+
+    24 demo round trips falsified the second half of that. The 3R target was
+    reached 0 times, while the clock's cost landed on every loser: one ETC
+    short was refused eleven consecutive times over 55 minutes and closed at
+    -250 USDT the moment the gate lifted. The resulting exit policy was
+    inverted - the model closed winners on momentum fade (average win
+    +28.55) and losers ran to their exchange stop (average loss -204.75,
+    with five stop closes carrying 40% of the total loss). A 12.5% hit rate
+    needs a win/loss ratio near 7; the measured ratio was 0.14.
+
+    So the floor keeps the job it can do - stop the model scratching a
+    position that has not gone against it - and releases once the position
+    is measurably failing.
     """
 
     def setUp(self):
@@ -724,19 +736,45 @@ class MinimumHoldTests(unittest.TestCase):
         self.engine.cfg = valid_config()
         self.pos = {"symbol": "BTC/USDT:USDT", "side": "short"}
 
-    def _state(self, minutes_ago):
-        return {"opened_at": {
-            "BTC/USDT:USDT": time.time() - minutes_ago * 60}}
+    def _state(self, minutes_ago, adverse_r=0.0):
+        """Age the position and place its mark at ``adverse_r`` of the stop.
+
+        A short entered at 100 with a stop at 110 risks 10; a mark of 105 is
+        therefore 0.5R adverse.
+
+        The shape here mirrors what ``_record_open`` actually persists, and
+        that is the point: an earlier version of this fixture invented an
+        ``sl_price`` on the active trade, which meant the gate read a stop
+        that never exists in production, returned None, and failed open on
+        every real position while the test reported success.
+        """
+        self.pos["markPrice"] = 100.0 + 10.0 * adverse_r
+        return {
+            "opened_at": {"BTC/USDT:USDT": time.time() - minutes_ago * 60},
+            "active_trades": {"BTC/USDT:USDT": {
+                "entry_price": 100.0, "stop_loss_pct": 10.0}},
+            "protection": {"BTC/USDT:USDT": {
+                "side": "short", "sl_price": 110.0, "tp_price": 70.0}},
+        }
 
     def _close(self, trigger="thesis_invalidated"):
         return {"action": "close", "symbol": "BTC/USDT:USDT",
                 "close_trigger": trigger, "reasoning": "impulse reversed"}
 
     @patch("agent.engine.state.log_event")
-    def test_close_inside_the_floor_is_blocked(self, log_event):
+    def test_close_inside_the_floor_is_blocked_while_not_adverse(
+            self, log_event):
         self.assertTrue(self.engine._too_young_to_close(
-            self.pos, self._close(), self._state(17)))
+            self.pos, self._close(), self._state(17, adverse_r=0.0)))
         self.assertEqual(log_event.call_args.args[0], "rejected")
+
+    @patch("agent.engine.state.log_event")
+    def test_a_position_in_profit_inside_the_floor_is_still_blocked(
+            self, log_event):
+        # This is the case the floor exists for: the thesis has not been
+        # contradicted by price, so a close here is the model scratching.
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(17, adverse_r=-0.8)))
 
     @patch("agent.engine.state.log_event")
     def test_close_after_the_floor_is_allowed(self, log_event):
@@ -761,6 +799,41 @@ class MinimumHoldTests(unittest.TestCase):
         log_event.assert_not_called()
 
     @patch("agent.engine.state.log_event")
+    def test_unknown_adverse_excursion_allows_the_close(self, log_event):
+        # Same reasoning as unknown age: a position whose risk we cannot
+        # measure must not be pinned by a floor that assumes we can.
+        state = self._state(17)
+        state["active_trades"] = {}
+        state["protection"] = {}
+        self.pos.pop("markPrice", None)
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), state))
+        log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_the_stop_is_read_from_the_protection_row(self, log_event):
+        """The regression that made this whole gate a no-op.
+
+        `_record_open` writes sl_price to st["protection"][symbol]; the
+        active trade carries only stop_loss_pct. Reading sl_price off the
+        active trade yields None, which fails open, which silently disables
+        the floor for every engine-opened position.
+        """
+        state = self._state(17, adverse_r=0.0)
+        state["active_trades"]["BTC/USDT:USDT"].pop("stop_loss_pct")
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), state))
+
+    @patch("agent.engine.state.log_event")
+    def test_the_planned_stop_pct_is_the_fallback(self, log_event):
+        # A position whose protection row has not been reconciled yet still
+        # has its planned stop distance on the active trade.
+        state = self._state(17, adverse_r=0.0)
+        state["protection"] = {}
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), state))
+
+    @patch("agent.engine.state.log_event")
     def test_zero_floor_disables_the_guard(self, log_event):
         self.engine.cfg["strategy"]["min_hold_minutes"] = 0
         self.assertFalse(self.engine._too_young_to_close(
@@ -768,14 +841,29 @@ class MinimumHoldTests(unittest.TestCase):
         log_event.assert_not_called()
 
     @patch("agent.engine.state.log_event")
-    def test_the_observed_live_exits_would_all_have_been_blocked(
+    def test_the_observed_live_exits_are_now_released_once_adverse(
             self, log_event):
-        # LTC 17 min, ETC 55 min, DOGE 75 min - every discretionary exit in
-        # the losing window, none of them a risk reduction.
-        for held_minutes in (17, 55, 75):
+        """The regression this change exists to prevent.
+
+        These are the real refusals from the demo journal - ETC at 33 and 55
+        minutes, AAVE at 51, DOGE at 62 - each one a losing position the
+        model wanted out of and was made to hold. Under the old clock every
+        one returned True. They must now be released, because by then the
+        position had already moved against the entry.
+        """
+        for held_minutes in (33, 51, 55, 62, 75, 88):
             with self.subTest(held_minutes=held_minutes):
-                self.assertTrue(self.engine._too_young_to_close(
-                    self.pos, self._close(), self._state(held_minutes)))
+                self.assertFalse(self.engine._too_young_to_close(
+                    self.pos, self._close(),
+                    self._state(held_minutes, adverse_r=0.6)))
+
+    @patch("agent.engine.state.log_event")
+    def test_the_release_threshold_is_the_boundary(self, log_event):
+        # Just inside the release stays blocked; at the release it is freed.
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(17, adverse_r=0.49)))
+        self.assertFalse(self.engine._too_young_to_close(
+            self.pos, self._close(), self._state(17, adverse_r=0.50)))
 
 
 if __name__ == "__main__":

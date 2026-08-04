@@ -276,6 +276,11 @@ def _finite_number(value, default: float = 0.0) -> float:
 
 
 _RETRYABLE_INCONCLUSIVE_CODES = {
+    # ASSIGNMENT_VOIDED is deliberately NOT here. Reclassifying an
+    # operational abort from FAILED to INCONCLUSIVE stops it lying about the
+    # strategy; it is a separate question whether the same setting may then
+    # be re-requested silently, and the existing "silent retest refused"
+    # guard is the right answer to that one. An explicit retry still works.
     "NO_DECISIONS",
     "UNRESOLVED_TRADES",
     "CLOSED_SAMPLE_BELOW_FLOOR",
@@ -287,7 +292,16 @@ _RETRYABLE_INCONCLUSIVE_CODES = {
     "SEGMENT_EXPECTANCY_UNAVAILABLE",
     "BASELINE_DELTA_NOT_ESTABLISHED",
 }
-MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS = 3
+# Attempts now pool rather than restart, so this is a sample budget, not a
+# retry allowance. It has to be large enough for the floor to be reachable:
+# at a 48h horizon and three concurrent slots a ten-day attempt yields ~15
+# closed trades, so 100 needs about seven. Three could never get there, which
+# made the automatic retry unable to resolve the shortfall it exists for.
+#
+# Strategies whose horizon cannot reach the floor at ANY plausible cap are
+# excluded from the real-time loop by registry.realtime_eligible instead of
+# by inflating this number.
+MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS = 8
 
 
 def _inconclusive_reason_codes(payload: object) -> set[str]:
@@ -404,11 +418,77 @@ def _paired_payload(comparison: dict) -> dict:
     }
 
 
+def _pooled_assignment_windows(
+        conn: sqlite3.Connection, assignment: sqlite3.Row,
+        ended_ts: float) -> list[tuple[float, float]]:
+    """Return this attempt's window plus every eligible earlier attempt's.
+
+    A long-horizon strategy cannot reach the closed-trade floor inside one
+    assignment: at a 336h horizon and three concurrent slots, ten days buys
+    two closed trades against a floor of a hundred. Retrying produced three
+    independent under-powered windows instead of one adequate one, so the
+    automatic retry could never resolve what it was retrying for.
+
+    Pooling is not a new liberty. ``forward-qualify`` already reconstructs a
+    setting from *all* eligible completed attempts under identical code,
+    model and configuration; this brings the assignment-level evaluator into
+    line with the stricter path rather than inventing a weaker rule.
+
+    Eligibility is deliberately narrow. An ancestor is pooled only when its
+    scope, strategy, both variant identities, and its full code/config
+    identity match exactly. An identity change is what feed forks exist to
+    separate, so a differing ancestor ends the chain rather than being
+    silently mixed in.
+    """
+    windows: list[tuple[float, float]] = [
+        (float(assignment["started_ts"]), float(ended_ts))]
+    columns = {str(row[1]) for row in conn.execute(
+        "PRAGMA table_info(strategy_experiment_assignments)").fetchall()}
+    if "retry_of_assignment_id" not in columns:
+        return windows
+    seen = {str(assignment["assignment_id"])}
+    parent_id = assignment["retry_of_assignment_id"]
+    while parent_id and str(parent_id) not in seen:
+        seen.add(str(parent_id))
+        parent = conn.execute(
+            "SELECT * FROM strategy_experiment_assignments WHERE "
+            "assignment_id=?", (str(parent_id),)).fetchone()
+        if parent is None:
+            break
+        if any(parent[key] != assignment[key] for key in (
+                "scope_key", "strategy_id", "baseline_variant_id",
+                "candidate_variant_id", "code_identity_json",
+                "config_identity_json")):
+            break
+        event = FindingsStore._assignment_event(conn, str(parent_id))
+        if event is None or str(event["status"]) not in {
+                "COMPLETED", "REJECTED"}:
+            break
+        windows.append(
+            (float(parent["started_ts"]), float(event["event_ts"])))
+        parent_id = parent["retry_of_assignment_id"]
+    return sorted(windows)
+
+
 def _experiment_arm_evidence(
         conn: sqlite3.Connection, scope_key: str, variant_id: str,
-        started_ts: float, ended_ts: float) -> dict:
+        windows: list[tuple[float, float]]) -> dict:
     from research import protocol
     from research.score import score_returns
+
+    # The pooled horizon. A trade opened in one attempt and resolved in a
+    # later one is genuinely closed once the attempts are pooled, so the
+    # truncation boundary is the end of the whole chain.
+    ended_ts = max(end for _, end in windows)
+    # The paper portfolio is rebased at the start of the CURRENT attempt, so
+    # its mark-to-market drawdown belongs to that attempt alone. Returns
+    # pool across the chain but drawdown cannot without replaying every
+    # rebased equity curve, so the payload discloses the narrower basis
+    # rather than implying the two cover the same span.
+    current_started_ts = max(start for start, _ in windows)
+    window_clause = " OR ".join(
+        "(d.decision_ts>=? AND d.decision_ts<=?)" for _ in windows)
+    window_params = [value for window in windows for value in window]
 
     has_execution_validity = _stored_version(conn) >= 16
     stored_validity = (
@@ -426,9 +506,9 @@ def _experiment_arm_evidence(
         "FROM paper_decisions AS d LEFT JOIN paper_trades AS t "
         "ON t.trade_id=d.paper_trade_id "
         "WHERE d.scope_key=? AND d.variant_id=? "
-        "AND d.decision_ts>=? AND d.decision_ts<=? "
+        f"AND ({window_clause}) "
         "ORDER BY d.decision_ts, d.decision_id",
-        (scope_key, variant_id, started_ts, ended_ts)).fetchall()
+        (scope_key, variant_id, *window_params)).fetchall()
     decisions = []
     for row in rows:
         evidence = _forward_decision_evidence(row)
@@ -444,9 +524,9 @@ def _experiment_arm_evidence(
         "SELECT DISTINCT t.* FROM paper_trades AS t "
         "JOIN paper_decisions AS d ON d.paper_trade_id=t.trade_id "
         "WHERE d.scope_key=? AND d.variant_id=? "
-        "AND d.decision_ts>=? AND d.decision_ts<=? "
+        f"AND ({window_clause}) "
         "ORDER BY t.entry_ts, t.trade_id",
-        (scope_key, variant_id, started_ts, ended_ts)).fetchall()
+        (scope_key, variant_id, *window_params)).fetchall()
     unfilled = [row for row in trade_rows
                 if str(row["status"]) == "CLOSED"
                 and str(row["result"]) == "unfilled"
@@ -493,7 +573,7 @@ def _experiment_arm_evidence(
     assignment_matches = (
         portfolio_state.get("experiment_assignment_started_ts") is not None
         and abs(float(portfolio_state["experiment_assignment_started_ts"])
-                - float(started_ts)) <= 1e-6)
+                - float(current_started_ts)) <= 1e-6)
     max_drawdown_pct = (
         _finite_number(portfolio_state.get("max_drawdown_pct"))
         if assignment_matches else None)
@@ -512,11 +592,15 @@ def _experiment_arm_evidence(
             "experiment_provenance")
         if isinstance(provenance, dict) and provenance not in provenances:
             provenances.append(provenance)
+    # Across every pooled attempt, not just the current one: an operational
+    # failure invalidates the window it occurred in, and that window's
+    # evidence is now part of this verdict.
+    failure_clause = " OR ".join("(ts>=? AND ts<=?)" for _ in windows)
     failures = [dict(row) for row in conn.execute(
         "SELECT ts, kind, detail_json FROM paper_failures "
-        "WHERE scope_key=? AND variant_id=? AND ts>=? AND ts<=? "
+        f"WHERE scope_key=? AND variant_id=? AND ({failure_clause}) "
         "ORDER BY ts, failure_id",
-        (scope_key, variant_id, started_ts, ended_ts)).fetchall()]
+        (scope_key, variant_id, *window_params)).fetchall()]
     for failure in failures:
         try:
             failure["detail"] = json.loads(failure.pop("detail_json"))
@@ -568,10 +652,11 @@ def _deterministic_experiment_payload(
         "SELECT * FROM variants WHERE variant_id=?", (baseline_id,)).fetchone()
     candidate_variant = conn.execute(
         "SELECT * FROM variants WHERE variant_id=?", (candidate_id,)).fetchone()
+    windows = _pooled_assignment_windows(conn, assignment, ended_ts)
     baseline = _experiment_arm_evidence(
-        conn, scope_key, baseline_id, started_ts, ended_ts)
+        conn, scope_key, baseline_id, windows)
     candidate = _experiment_arm_evidence(
-        conn, scope_key, candidate_id, started_ts, ended_ts)
+        conn, scope_key, candidate_id, windows)
     full = protocol.paired_arm_comparison(
         candidate["policy_decisions"], baseline["policy_decisions"])
     cutoff = protocol.common_time_cutoff([baseline["policy_decisions"]])
@@ -604,15 +689,34 @@ def _deterministic_experiment_payload(
     }]
     limitations.extend(baseline["cost_limitations"])
     limitations.extend(candidate["cost_limitations"])
+    if len(windows) > 1:
+        limitations.append({
+            "code": "POOLED_ACROSS_ATTEMPTS",
+            "detail": (
+                f"returns pool {len(windows)} assignment attempts under "
+                "identical code and configuration; mark-to-market drawdown "
+                "covers only the latest attempt because the paper portfolio "
+                "is rebased at each one"),
+        })
 
     def add(code: str, gate: str, detail: str) -> None:
         reasons.append({"code": code, "gate": gate, "detail": detail})
 
     status = str(terminal_event["status"])
     if status == "REJECTED":
-        add("ASSIGNMENT_REJECTED", "terminal_status",
-            str(terminal_event["reason"] or "assignment rejected"))
-        verdict = "FAILED"
+        # An aborted assignment produced no evidence either way, so it is
+        # INCONCLUSIVE, not FAILED. Every reason an assignment can be
+        # rejected is operational - the variant was unavailable after a
+        # restart, code/config identity changed mid-window, or the paper
+        # portfolio was revoked. None of them is an observation about the
+        # market, and recording them as FAILED wrote permanent, immutable
+        # research verdicts about strategies that were never measured.
+        #
+        # This is the verdict a SQLite constraint violation used to produce.
+        add("ASSIGNMENT_VOIDED", "evidence_adequacy",
+            str(terminal_event["reason"] or "assignment rejected")
+            + " (operational abort: no market evidence was produced)")
+        verdict = "INCONCLUSIVE"
     else:
         verdict = "WORKED"
         hard_limitations = []
@@ -796,6 +900,12 @@ def _deterministic_experiment_payload(
             "from_ts": started_ts, "to_ts": ended_ts,
             "split_cutoff_ts": cutoff,
             "elapsed_seconds": max(0.0, ended_ts - started_ts),
+            # Every attempt whose evidence was pooled into this verdict, so
+            # the sample behind it is auditable rather than implied. One
+            # entry means this attempt stood alone.
+            "pooled_windows": [
+                {"from_ts": start, "to_ts": end} for start, end in windows],
+            "pooled_attempts": len(windows),
         },
         "feed_identity": {
             "scope_key": scope_key,
@@ -2985,6 +3095,22 @@ class FindingsStore:
                 canonical_provenance = cls._validate_experiment_provenance(
                     variant, provenance)
             state = cls._paper_default(balance, assignment_started_ts)
+            # Operational idempotency is NOT assignment evidence, and wiping
+            # it here was corrupting the ledger it was meant to leave alone.
+            # paper_decisions is append-only with UNIQUE(scope_key,
+            # variant_id, proposal_id), and proposal_id is derived from
+            # signal_ts rather than wall clock. Resetting seen_proposals
+            # while those rows survive means any proposal whose signal bar is
+            # still current gets re-evaluated and collides on insert.
+            #
+            # Measured over 4 simulated days, in exact proportion to signal
+            # bar length: trend-multiday (4h bar) 74 IntegrityErrors,
+            # ls-ratio-fade (1h) 36, funding-carry/unwind (1h) 14 each,
+            # scalp-maker (per-book-ts, always unique) 0. Three failures
+            # revoke the portfolio, which rejects the assignment, which wrote
+            # an immutable verdict of FAILED against the strategy.
+            state["seen_proposals"] = dict(
+                existing_state.get("seen_proposals") or {})
             state.update({
                 "experiment_provenance": canonical_provenance,
                 "experiment_assignment_id": assignment_id,
@@ -3194,12 +3320,26 @@ class FindingsStore:
         outcome = str(decision.get("decision_outcome") or "").upper()
         if outcome not in {"PROPOSED", "VETOED"}:
             raise ValueError("paper decision outcome must be PROPOSED or VETOED")
-        conn.execute(
+        # Re-observing the same proposal identity is idempotent, not an
+        # error. The first row wins and later observations of the same
+        # completed signal bar are dropped, which is exactly the semantics
+        # the ledger already claims ("repeated observations of the same
+        # completed bar are idempotent across process restarts").
+        #
+        # Before this, a duplicate raised IntegrityError, the evaluator
+        # counted it as a paper failure, three failures revoked the portfolio
+        # and the assignment was rejected - turning a constraint violation
+        # into an immutable research verdict about a strategy. The reset in
+        # _reset_assignment_accounts_conn is the source of the duplicates and
+        # is fixed separately; this keeps a collision from ever being
+        # mistaken for evidence again.
+        cursor = conn.execute(
             "INSERT INTO paper_decisions (decision_id, proposal_id, "
             "scope_key, variant_id, cycle_id, symbol, direction, setup_type, "
             "signal_ts, confidence, decision_outcome, reason, paper_trade_id, "
             "model_id, assumptions_json, proposal_json, decision_ts) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(scope_key, variant_id, proposal_id) DO NOTHING",
             (decision_id, decision["proposal_id"], decision["scope_key"],
              decision["variant_id"], decision.get("cycle_id"),
              decision["symbol"], decision.get("direction"),
@@ -3209,6 +3349,14 @@ class FindingsStore:
              _canonical_json(decision.get("assumptions") or {}),
              _canonical_json(decision.get("proposal") or {}),
              decision["decision_ts"]))
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                "SELECT decision_id FROM paper_decisions WHERE scope_key=? "
+                "AND variant_id=? AND proposal_id=?",
+                (decision["scope_key"], decision["variant_id"],
+                 decision["proposal_id"])).fetchone()
+            if existing is not None:
+                return str(existing["decision_id"])
         return decision_id
 
     @staticmethod
