@@ -52,10 +52,12 @@ In another terminal:
 
 The configured momentum strategy is `T0_REJECTED`; demo use is an operations
 rehearsal and data-collection path, not a profitable-edge claim. G2 must pass
-before authoritative downstream research is trusted. G2 compares recorded
-pre-risk proposal keys `(cycle_id, symbol, direction)` with replay keys and
-requires at least 99% reproduction; it does not reproduce full contract or
-execution semantics. `INSUFFICIENT_SAMPLE` means collection is still open.
+before authoritative downstream research is trusted. G2 compares the full
+canonical pre-risk proposal identity symmetrically with replay keys, requires
+a non-vacuous exact match, and fails closed on malformed, duplicate, missing,
+or extra identities. Outcome-resolution gaps remain diagnostics rather than
+proposal mismatches; G2 does not reproduce full contract or execution
+semantics. `INSUFFICIENT_SAMPLE` means collection is still open.
 
 ## 2. Configuration summary
 

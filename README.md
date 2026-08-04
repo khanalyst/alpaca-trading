@@ -164,10 +164,13 @@ and any registry/configuration change remain explicit human actions.
 ## Evidence paths
 
 - The recorded journal path is authoritative only after a current G2 replay
-  PASS. G2 compares recorded pre-risk proposal keys
-  `(cycle_id, symbol, direction)` with replay keys; it requires at least 99%
-  reproduction and does not reproduce full contract or execution semantics.
-  A failed, stale, or vacuous G2 blocks downstream evidence.
+  PASS. G2 compares the full canonical pre-risk proposal identity (including
+  cycle, symbol, direction, setup identity/type, signal timestamp, strategy
+  version, and baseline variant) symmetrically with replay keys. It requires a
+  non-vacuous exact match; malformed, duplicate, missing, or extra identities
+  fail closed. Outcome-resolution gaps remain explicit diagnostics and are not
+  scored as proposal mismatches. A failed, stale, or vacuous G2 blocks
+  downstream evidence.
   `INSUFFICIENT_SAMPLE` means collection is open, not that an edge failed.
 - The OHLCV tournament is exploratory. It awards no tier above
   `T2_CANDIDATE`; an existing higher registered tier is reported as unrevised

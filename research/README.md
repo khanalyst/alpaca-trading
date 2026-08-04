@@ -54,10 +54,13 @@ live promotion.
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
-used. Replay/G2 compares recorded pre-risk proposal keys
-`(cycle_id, symbol, direction)` with replay keys and requires at least 99%
-reproduction before downstream authoritative evidence is trusted. It does not
-reproduce full contract or execution semantics. The current v6
+used. Replay/G2 compares the full canonical pre-risk proposal identity (cycle,
+symbol, direction, setup identity/type, signal timestamp, strategy version, and
+baseline variant) symmetrically with replay keys and requires a non-vacuous
+exact match before downstream authoritative evidence is trusted. Malformed,
+duplicate, missing, or extra identities fail closed; outcome-resolution gaps
+remain diagnostics rather than proposal mismatches. It does not reproduce full
+contract or execution semantics. The current v6
 `forward-qualify` path uses
 eligible completed assignments and each setting's contemporaneous baseline.
 Its paired cluster sign-flip result is valid only under the documented
