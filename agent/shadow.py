@@ -1711,11 +1711,26 @@ class StrategyShadowCoordinator:
     """One isolated evaluator per strategy on one shared in-memory feed."""
 
     def __init__(self, evaluators: dict[str, ShadowEvaluator], *,
-                 active_strategy_id: str) -> None:
+                 active_strategy_id: str,
+                 llm_evaluator: ShadowEvaluator | None = None) -> None:
         if not evaluators:
             raise ValueError("strategy shadow coordinator needs an evaluator")
         self.evaluators = dict(evaluators)
         self.active_strategy_id = str(active_strategy_id)
+        # The active strategy's own LLM decisions, kept as a second lane in
+        # its own scope.
+        #
+        # Every strategy in `evaluators` now sees deterministic proposals, so
+        # a cross-strategy comparison finally varies the strategy rather than
+        # the proposal source. That alone would have thrown away the record of
+        # what the analyst actually decided, which is the only evidence that
+        # can teach it anything: research_history_context() builds the
+        # planner's memory out of experiment outcomes, so a lane that stops
+        # recording LLM decisions is a lane the LLM stops learning from.
+        #
+        # A separate scope rather than a separate variant, because the two
+        # lanes are not comparable and must never be pooled into one verdict.
+        self.llm_evaluator = llm_evaluator
         self.store = next(iter(self.evaluators.values())).store
         self.scope_key = next(iter(self.evaluators.values())).scope_key
         self.last_coverage: dict = {}
@@ -1813,14 +1828,18 @@ class StrategyShadowCoordinator:
                 "phase": "evaluate",
             }
             try:
-                if strategy_id == self.active_strategy_id:
-                    strategy_proposals = list(proposals or [])
-                    source = "recorded_llm"
-                else:
-                    model = require_complete_contract(strategy_id)
-                    strategy_proposals = model.deterministic_proposals(
-                        snapshot, evaluator.base_cfg)
-                    source = "deterministic_contract"
+                # Including the active strategy. Feeding it recorded LLM
+                # proposals while every other strategy got deterministic ones
+                # meant a momentum-vs-anything comparison varied two things at
+                # once, and the proposal source is the larger of the two: an
+                # analyst that declines to propose produces no decision at all,
+                # where a deterministic contract always emits a probe and lets
+                # the strategy veto it. The recorded LLM lane still runs, in
+                # its own scope, below.
+                model = require_complete_contract(strategy_id)
+                strategy_proposals = model.deterministic_proposals(
+                    snapshot, evaluator.base_cfg)
+                source = "deterministic_contract"
                 self.last_cycle_by_strategy[strategy_id].update({
                     "proposal_source": source,
                     "proposals": len(strategy_proposals),
@@ -1840,13 +1859,51 @@ class StrategyShadowCoordinator:
                 coverage[strategy_id] = {"error": message}
                 records.extend(self._isolate_failure(
                     evaluator, strategy_id, "evaluate", exc, timestamp))
+        llm_lane = self._evaluate_llm_lane(
+            snapshot, timestamp, cycle_id, proposals, advance_accounts)
+        records.extend(llm_lane.pop("_records"))
         self.last_coverage = {
             "scope_key": self.scope_key,
             "strategies": coverage,
             "strategy_count": len(self.evaluators),
+            "llm_lane": llm_lane or None,
         }
         self.last_budget = aggregate_budget
         return records
+
+    def _evaluate_llm_lane(
+            self, snapshot: dict, timestamp: float, cycle_id: str | None,
+            proposals: list[dict] | None, advance_accounts: bool) -> dict:
+        """Record what the analyst actually decided, on the same snapshot.
+
+        This is the lane the planner learns from. It is deliberately not
+        comparable to the deterministic lanes and lives in its own scope so
+        no verdict can pool the two, but it sees the identical snapshot and
+        timestamp, so the two readings of the same cycle stay alignable.
+
+        Isolated like every other lane: a failure here must not cost the
+        comparison its cycle.
+        """
+        if self.llm_evaluator is None:
+            return {"_records": []}
+        lane: dict = {
+            "scope_key": self.llm_evaluator.scope_key,
+            "strategy_id": self.active_strategy_id,
+            "proposal_source": "recorded_llm",
+            "proposals": len(proposals or []),
+        }
+        try:
+            lane["_records"] = list(self.llm_evaluator.evaluate(
+                snapshot, now=timestamp, cycle_id=cycle_id,
+                proposals=list(proposals or []),
+                advance_accounts=advance_accounts))
+            lane["coverage"] = dict(self.llm_evaluator.last_coverage)
+        except Exception as exc:                           # noqa: BLE001
+            lane["error"] = f"{type(exc).__name__}: {exc}"
+            lane["_records"] = list(self._isolate_failure(
+                self.llm_evaluator, self.active_strategy_id,
+                "evaluate-llm-lane", exc, timestamp))
+        return lane
 
 
 def _research_cfg(cfg: dict, strategy_id: str) -> dict:
@@ -2011,5 +2068,15 @@ def build(
             evaluators[strategy_id] = evaluator
     if not evaluators:
         return None
+    active_id = str(cfg["strategy"]["id"])
+    # The analyst's own decisions, in a sibling scope. Every lane above now
+    # runs on deterministic proposals so the comparison isolates the strategy;
+    # this one preserves what the LLM actually chose, which is what the
+    # planner's history context is built from and therefore the only record it
+    # can learn an edge from.
+    llm_evaluator = _build_strategy_evaluator(
+        _research_cfg(cfg, active_id), registry, ["*"],
+        scope_key=f"{resolved_scope}:llm", findings_store=findings_store)
     return StrategyShadowCoordinator(
-        evaluators, active_strategy_id=str(cfg["strategy"]["id"]))
+        evaluators, active_strategy_id=active_id,
+        llm_evaluator=llm_evaluator)
