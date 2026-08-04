@@ -74,8 +74,6 @@ def _count(db, kind: str) -> int:
         return 0
 
 
-def _has_kind(db, kind: str) -> bool:
-    return _count(db, kind) > 0
 
 
 def _proposal_snapshot(db) -> tuple[int, float]:

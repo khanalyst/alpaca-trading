@@ -231,23 +231,6 @@ FORWARD_DECISION_FIELDS = (
 )
 
 
-def _forward_trade_evidence(row: dict | sqlite3.Row) -> dict:
-    item = {field: row[field] for field in FORWARD_TRADE_FIELDS}
-    try:
-        assumptions = json.loads(row["assumptions_json"])
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"paper trade {row['trade_id']} has invalid assumptions") from exc
-    if not isinstance(assumptions, dict):
-        raise ValueError(
-            f"paper trade {row['trade_id']} assumptions are not a mapping")
-    item["assumptions"] = assumptions
-    try:
-        item["execution"] = json.loads(row["execution_json"] or "null")
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"paper trade {row['trade_id']} has invalid execution evidence") from exc
-    return json.loads(_canonical_json(item))
 
 
 def _forward_decision_evidence(row: dict | sqlite3.Row) -> dict:

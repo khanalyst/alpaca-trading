@@ -1265,29 +1265,7 @@ class ShadowEvaluator:
             "carry_exit_funding_percentile": float(threshold),
         }, True, now
 
-    @staticmethod
-    def _exit_reason(position: dict, price: float, now: float) -> str | None:
-        if position["direction"] == "long":
-            if price <= float(position["stop_price"]):
-                return "stop"
-            if price >= float(position["take_price"]):
-                return "target"
-        else:
-            if price >= float(position["stop_price"]):
-                return "stop"
-            if price <= float(position["take_price"]):
-                return "target"
-        if now >= float(position["deadline_ts"]):
-            return "timeout"
-        return None
 
-    @staticmethod
-    def _exit_price(position: dict, mark: float, result: str) -> float:
-        if result == "stop":
-            return float(position["stop_price"])
-        if result == "target":
-            return float(position["take_price"])
-        return mark
 
     @staticmethod
     def _paper_pnl(
