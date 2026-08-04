@@ -450,7 +450,7 @@ makes behaviour non-reproducible from bar data alone.
 of funding history. OKX's public API serves ~97 days. A dataset lacking older
 funding rows makes `funding_return_pct` silently return 0.0 for older trades,
 so a run can report "funding included" while charging nothing for most of the
-period. The committed `phase1-v2-backtest-2025-2026` result cannot be
+period. The former `phase1-v2-backtest-2025-2026` result, since removed, could not be
 reproduced or checked because its input data is not committed or hash-pinned.
 
 ### 8.6 Things that are genuinely well built

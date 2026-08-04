@@ -2,7 +2,7 @@
 
 The original broad codebase analysis is retained in Git history. Current
 implementation status is maintained in
-[`../../MAIN_REPO_REVIEW_PLAN.md`](../../MAIN_REPO_REVIEW_PLAN.md), not in this
+the plan documents in this directory, not in this
 historical planning file.
 
 The current system now has:

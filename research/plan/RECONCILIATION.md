@@ -36,5 +36,5 @@ An ignored local `vm-import/` directory, if present, is optional read-only
 historical data. It is not part of the clone, is not required for tests or
 handoff, and is never a current runtime default.
 
-See [`../../MAIN_REPO_REVIEW_PLAN.md`](../../MAIN_REPO_REVIEW_PLAN.md) for
+See this directory for
 status and [`../../OPERATIONS.md`](../../OPERATIONS.md) for commands.

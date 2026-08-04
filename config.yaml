@@ -185,7 +185,9 @@ risk:
   # full-sample, worth about +0.11% per trade on average. The 24h clock was
   # closing trades that had not yet resolved: timeouts fall from ~29% of
   # exits to ~20%. It reduces the loss rate; it does not make the strategy
-  # profitable. See research/results/edge-search-2024-2026/REPORT.md.
+  # profitable. The edge-search report this cited was removed as a stale
+  # point-in-time artifact; the surviving evidence for the momentum
+  # verdict is research/results/edge-audit-2024-2026/REPORT.md.
   max_hold_hours: 48
 
   # --- circuit breakers ---
