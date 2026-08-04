@@ -198,6 +198,18 @@ risk:
   cooldown_minutes_after_loss: 45  # per-symbol timeout after a losing close
 
 execution:
+  # B7.5. Entries rest passively for maker_first_wait_seconds, then fall back
+  # to the IOC path that already works. Enabled here because the gate cannot
+  # move otherwise: it needs 20 recorded attempts and READY simply means the
+  # flag is off, so leaving it off keeps the largest measured cost lever
+  # permanently unmeasured. Taker fees are 0.248%/side against a 0.02% maker
+  # rebate, and momentum's own loss is -0.096R at ordinary costs, so the
+  # spread between the two paths is the same order as the deficit.
+  #
+  # Refused in live by agent/config.py until B7.5 passes: this is demo money
+  # buying a measurement, not a promotion.
+  maker_first_enabled: true
+  maker_first_wait_seconds: 20   # bounded well inside the 15m signal bar
   slippage_guard_pct: 0.5        # abort an entry if price moved more than this
                                  # between analysis and execution
   max_spread_pct: 0.15           # reject entries when the live bid/ask is wider
@@ -299,7 +311,15 @@ research:
   # remain immutable historical evidence; feed v4 is the market-data plumbing
   # repair feed. Feed v5 is a clean fork caused by immutable experiment-
   # provenance binding, so old evidence is never migrated or pooled.
-  forward_feed_version: 5
+  #
+  # Feed v6 forks because the active strategy's shadow lane changed what it
+  # measures. It previously ran on recorded LLM proposals while every other
+  # strategy ran on deterministic ones, so any comparison involving it varied
+  # the proposal source as well as the strategy. All lanes now run on
+  # deterministic proposals. The analyst's own decisions continue to be
+  # recorded in the sibling scope ":llm", which is where the planner's history
+  # context comes from; the two are never pooled.
+  forward_feed_version: 6
   # Rotation requires BOTH 3 elapsed calendar days and 100 comparable paired
   # decisions. Time alone never completes an assignment. The observation
   # default deliberately matches the existing conservative paper sample floor.

@@ -49,7 +49,7 @@ def firing_row(strategy_id):
     return market_row()
 
 
-class SameFeedCoordinatorTests(unittest.TestCase):
+class CoordinatorFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -61,6 +61,8 @@ class SameFeedCoordinatorTests(unittest.TestCase):
         return shadow.build(
             self.cfg, {}, scope_key=self.scope, store=self.store)
 
+
+class SameFeedCoordinatorTests(CoordinatorFixture):
     def test_every_realtime_strategy_processes_the_same_snapshot_and_ts(self):
         coordinator = self.build()
         snapshot = {SYMBOL: market_row()}
@@ -269,3 +271,77 @@ class ExecutableTradeLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProposalSourceParityTests(CoordinatorFixture):
+    """One proposal source across the comparison, LLM preserved beside it.
+
+    The active strategy used to be fed recorded LLM proposals while every
+    other strategy got deterministic ones, so a momentum-vs-anything result
+    varied the proposal source as well as the strategy — and the proposal
+    source is the larger of the two, because an analyst that declines to
+    propose produces no decision at all where a deterministic contract always
+    emits a probe for the strategy to veto.
+    """
+
+    def test_every_comparison_lane_uses_deterministic_proposals(self):
+        coordinator = self.build()
+        coordinator.evaluate(
+            {SYMBOL: market_row()}, now=time.time(), cycle_id="parity",
+            proposals=[momentum_proposal()])
+
+        sources = {
+            strategy_id: observed.get("proposal_source")
+            for strategy_id, observed
+            in coordinator.last_cycle_by_strategy.items()}
+        self.assertEqual(
+            set(sources.values()), {"deterministic_contract"}, sources)
+        self.assertIn(coordinator.active_strategy_id, sources)
+
+    def test_the_llm_lane_runs_in_its_own_scope(self):
+        coordinator = self.build()
+        coordinator.evaluate(
+            {SYMBOL: market_row()}, now=time.time(), cycle_id="llm-lane",
+            proposals=[momentum_proposal()])
+        lane = coordinator.last_coverage["llm_lane"]
+
+        self.assertEqual(lane["proposal_source"], "recorded_llm")
+        self.assertEqual(lane["strategy_id"], coordinator.active_strategy_id)
+        # A sibling scope, never the comparison scope: pooling the two would
+        # mix incomparable evidence into one verdict.
+        self.assertNotEqual(lane["scope_key"], coordinator.scope_key)
+        self.assertTrue(lane["scope_key"].endswith(":llm"))
+
+    def test_the_llm_lane_records_decisions_the_planner_can_learn_from(self):
+        coordinator = self.build()
+        coordinator.evaluate(
+            {SYMBOL: market_row()}, now=time.time(), cycle_id="learnable",
+            proposals=[momentum_proposal()])
+        lane_scope = coordinator.last_coverage["llm_lane"]["scope_key"]
+        baseline = variants.baseline_variant_id(
+            coordinator.active_strategy_id)
+
+        # The lane exists to be learned from: research_history_context() is
+        # built out of this scope's evidence, so an empty lane means the
+        # analyst has no record of its own decisions to improve against.
+        self.assertTrue(
+            self.store.paper_decisions_for(lane_scope, baseline))
+
+    def test_an_llm_lane_failure_does_not_cost_the_comparison_its_cycle(self):
+        coordinator = self.build()
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("synthetic llm-lane failure")
+
+        coordinator.llm_evaluator.evaluate = fail
+        coordinator.evaluate(
+            {SYMBOL: market_row()}, now=time.time(), cycle_id="lane-fails",
+            proposals=[momentum_proposal()])
+
+        self.assertIn(
+            "synthetic llm-lane failure",
+            coordinator.last_coverage["llm_lane"]["error"])
+        for strategy_id in coordinator.strategy_ids:
+            with self.subTest(strategy=strategy_id):
+                self.assertNotIn(
+                    "error", coordinator.last_cycle_by_strategy[strategy_id])

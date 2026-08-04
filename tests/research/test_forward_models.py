@@ -79,7 +79,7 @@ class ForwardModelDeclarationTests(unittest.TestCase):
         })
         for model in BY_STRATEGY.values():
             with self.subTest(strategy=model.strategy_id):
-                self.assertTrue(model.validated)
+                self.assertTrue(model.contract_complete)
                 self.assertTrue(model.required_fields)
                 self.assertGreater(model.stop_atr_multiple, 0)
                 self.assertGreater(model.reward_risk, 0)
@@ -133,11 +133,11 @@ class ForwardModelDeclarationTests(unittest.TestCase):
         self.assertNotEqual(carry.strategy_id, unwind.strategy_id)
         self.assertIn(
             "research/hypotheses/funding-carry.yaml",
-            carry.validation_evidence)
+            carry.contract_evidence)
         self.assertIn(
             "research/hypotheses/funding-unwind.yaml",
-            unwind.validation_evidence)
-        self.assertNotEqual(carry.validation_evidence, unwind.validation_evidence)
+            unwind.contract_evidence)
+        self.assertNotEqual(carry.contract_evidence, unwind.contract_evidence)
 
         self.assertIn("perp_index_basis_pct", carry.required_fields)
         self.assertNotIn("perp_index_basis_pct", unwind.required_fields)

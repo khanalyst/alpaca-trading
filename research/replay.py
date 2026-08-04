@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent import strategy
-from agent.forward_models import require_validated
+from agent.forward_models import require_complete_contract
 from agent.risk import RiskEngine
 
 from . import corpus
@@ -251,7 +251,7 @@ class Replay:
     def run(self, cycles: list, outputs: list,
             max_hold_hours: float | None = None) -> ReplayResult:
         if self.price_cache is not None:
-            require_validated(str(self.cfg["strategy"]["id"]))
+            require_complete_contract(str(self.cfg["strategy"]["id"]))
         recorded = _recorded_by_cycle(outputs)
         max_hold = (float(max_hold_hours) if max_hold_hours is not None
                     else float(self.cfg["risk"]["max_hold_hours"]))

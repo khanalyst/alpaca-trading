@@ -3994,12 +3994,12 @@ class FindingsStore:
     @classmethod
     def _forward_verdict_from_payload(
             cls, conn: sqlite3.Connection, payload: dict):
-        from agent.forward_models import require_validated
+        from agent.forward_models import require_complete_contract
         from research import protocol
 
         source = payload.get("source_evidence") or {}
         strategy_id = str(payload.get("strategy_id") or "")
-        model = require_validated(strategy_id)
+        model = require_complete_contract(strategy_id)
         baseline_id = str(source.get("baseline_id") or "")
         setting_ids = [str(value) for value in source.get("setting_ids") or []]
         if (not baseline_id or len(setting_ids) < 1
@@ -4175,9 +4175,9 @@ class FindingsStore:
             baseline_id: str, setting_ids: list[str]) -> tuple[str, object]:
         """Create assignment-scoped evidence from every eligible completed try."""
         from agent import state as runtime_state
-        from agent.forward_models import require_validated
+        from agent.forward_models import require_complete_contract
 
-        model = require_validated(strategy_id)
+        model = require_complete_contract(strategy_id)
         axis = _canonical_axis(axis)
         current_code = runtime_state.code_fingerprint()
         ordered_ids = [str(baseline_id)] + [str(value) for value in setting_ids]
@@ -4324,7 +4324,7 @@ class FindingsStore:
             cls, conn: sqlite3.Connection, variant_id: str,
             source_analysis_id: str | None, scope_key: str) -> dict:
         from agent import state as runtime_state
-        from agent.forward_models import require_validated
+        from agent.forward_models import require_complete_contract
         from research import protocol
 
         if not source_analysis_id:
@@ -4344,7 +4344,7 @@ class FindingsStore:
                 "edge qualification requires assignment-scoped forward "
                 "evidence v3")
         eligibility = source.get("eligibility") or {}
-        model = require_validated(str(variant["strategy_id"]))
+        model = require_complete_contract(str(variant["strategy_id"]))
         if (eligibility.get("code_version")
                 != runtime_state.code_fingerprint()
                 or eligibility.get("forward_model_id") != model.model_id
@@ -4638,11 +4638,11 @@ class FindingsStore:
             self, variant_id: str, detail: dict, *,
             source_analysis_id: str | None = None,
             scope_key: str = "*") -> str:
-        from agent.forward_models import require_validated
+        from agent.forward_models import require_complete_contract
 
         with _connect(self.path) as conn:
             variant = self._require_variant(conn, variant_id)
-            require_validated(str(variant["strategy_id"]))
+            require_complete_contract(str(variant["strategy_id"]))
             source_payload = self._validated_forward_analysis(
                 conn, variant_id, source_analysis_id, scope_key)
             family = self._validated_family_correction(

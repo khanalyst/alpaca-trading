@@ -405,6 +405,21 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         _boolean(execution, "maker_first_enabled", "execution")
     else:
         execution["maker_first_enabled"] = False
+    # The flag is enabled on demo so gate B7.5 can collect the attempts it
+    # needs, which means a demo config now carries it. Copying that config to
+    # live would put an unvalidated entry path in front of real capital
+    # silently, so live has to say so on purpose.
+    #
+    # B7.5 is what decides the path works, and it collects on demo by its own
+    # remediation text. Until it passes there is nothing to justify running it
+    # live, and once it does, lifting this is one deliberate edit.
+    if cfg.get("mode") == "live" and execution["maker_first_enabled"]:
+        raise ConfigError(
+            "execution.maker_first_enabled is true and mode is live. The "
+            "maker-first entry path is the B7.5 experiment and is validated "
+            "on demo; run `python research.py readiness` and see "
+            "research/plan/B7.5-record.md before enabling it against real "
+            "capital.")
     if execution.get("maker_first_wait_seconds") is not None:
         # Bounded well inside a 15m signal bar. A passive order must resolve
         # within the bar it was signalled on, or the setup it was based on is

@@ -39,6 +39,22 @@ real-time loop: `momentum`, `flush-fade`, `ls-ratio-fade` and `scalp-maker`.
 Each has independent paper cash, positions, risk state, decisions, and trades.
 Only `momentum/phase1-v3` is connected to the configured demo order path.
 
+**All four run on deterministic proposals, including the active strategy.**
+The active strategy previously ran on recorded LLM proposals while the others
+ran on deterministic ones, so any comparison involving it varied the proposal
+source as well as the strategy - and the proposal source is the larger of the
+two, because an analyst that declines to propose produces no decision at all,
+where a deterministic contract always emits a probe and lets the strategy veto
+it. Feed v6 forks on this change.
+
+**The analyst's own decisions are still recorded, in the sibling scope
+`...:llm`.** That lane sees the identical snapshot and timestamp and holds
+what the LLM actually chose. It is what `research_history_context()` is built
+from, so it is the record the planner learns an edge from; dropping it would
+have left the analyst with no evidence of its own past decisions. The two
+lanes are deliberately not comparable and live in separate scopes so no
+verdict can pool them.
+
 `funding-carry`, `funding-unwind` and `trend-multiday` are registered but
 `realtime_eligible=False`, so they are researched offline instead. This is
 arithmetic rather than preference: a verdict needs 100 closed trades per arm,
