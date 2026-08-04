@@ -25,7 +25,7 @@ The executable sources remain authoritative when prose and code disagree:
 | Pre-registered YAML setting rows | 32 across 7 strategy files |
 | Hand-authored momentum variants | 19 immutable identities including baseline |
 | Materialized static identities | 66 including all 7 baselines |
-| Bounded LLM selector candidates | 41 eligible single-axis candidates |
+| Bounded LLM selector candidates | 36 eligible single-axis candidates |
 | Active real-time arms | 14 maximum: baseline plus at most one candidate per strategy |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
@@ -326,11 +326,11 @@ variant ID; status is the only field that may advance.
 | `momentum.conf.floor_0_50` | confidence floor `0.50` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
 | `momentum.conf.floor_0_55` | confidence floor `0.55` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
 | `momentum.conf.floor_0_60` | confidence floor `0.60` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
-| `momentum.conf.floor_0_70` | confidence floor `0.70` | Does a modestly stricter observable floor add marginal value over 0.65? |
-| `momentum.conf.floor_0_75` | confidence floor `0.75` | Does a materially stricter observable floor add marginal value over 0.65? |
-| `momentum.conf.floor_0_80` | confidence floor `0.80` | Does the strictest registered observable floor add marginal value over 0.65? |
-| `momentum.discriminator.trend_alignment` | breakout discriminator `trend_alignment` | Is a breakout specifically a transition out of chop? |
-| `momentum.discriminator.volatility_regime` | breakout discriminator `volatility_regime` | Is compression versus expansion the true distinction? |
+| `momentum.conf.floor_0_70` | confidence floor `0.70` | Retired: the 0.70-0.80 confidence bucket went 0 for 13 live. |
+| `momentum.conf.floor_0_75` | confidence floor `0.75` | Retired: confidence is anti-informative in the observable band. |
+| `momentum.conf.floor_0_80` | confidence floor `0.80` | Retired: one live trade ever exceeded 0.80 confidence. |
+| `momentum.discriminator.trend_alignment` | breakout discriminator `trend_alignment` | Retired as unrunnable: 2 breakout trades in 24 live round trips. |
+| `momentum.discriminator.volatility_regime` | breakout discriminator `volatility_regime` | Retired as unrunnable: no breakout population to partition. |
 
 ## Which settings can rotate in real time
 
@@ -343,8 +343,14 @@ keeps:
 - zero or one active single-axis candidate;
 - a durable queue of remaining candidates and accepted LLM selections.
 
-The default assignment closes only after both three elapsed days and 100
+The default assignment closes only after both ten elapsed days and 100
 comparable paired observations. Restart restores the active assignment.
+
+Ten days is an arithmetic floor, not a preference. The confirmation window is
+the last 30% of the assignment calendar and must span at least eight distinct
+six-hour episodes, so an assignment shorter than 8*6h/0.30 = 6.67 days can
+only ever return `INCONCLUSIVE` on cluster count. `agent/config.py` refuses
+to start below the computed minimum.
 
 ## LLM selection, verdicts, and edge authority
 
@@ -358,6 +364,11 @@ Every terminal assignment receives exactly one deterministic verdict:
 - `WORKED`: adequate evidence passed every conservative performance gate;
 - `FAILED`: adequate evidence disproved the setting or a disqualifier applies;
 - `INCONCLUSIVE`: evidence is inadequate or does not establish the difference.
+
+An assignment aborted for operational reasons - a variant missing after a
+restart, a code/config identity change mid-window, a revoked paper portfolio -
+is `INCONCLUSIVE` with reason `ASSIGNMENT_VOIDED`, never `FAILED`. It produced
+no market evidence, so it decides nothing about the setting.
 
 A separate research-only LLM may explain the immutable verdict and nominate
 one next registered selection. It cannot revise the verdict or authorize an

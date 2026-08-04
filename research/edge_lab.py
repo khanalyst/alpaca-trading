@@ -788,7 +788,27 @@ COST_SCENARIOS = {
     "base": Costs("base", 0.05, 0.05, 0.05, 0.15, True),
     "realistic_alt": Costs("realistic_alt", 0.05, 0.10, 0.10, 0.25, True),
     "stress": Costs("stress", 0.05, 0.35, 0.10, 0.35, True),
+    # The rate this account actually pays. Reconciled from the demo journal
+    # on 2026-08-04 at 0.248%/side over 24 round trips; see config.yaml
+    # trading_costs for the derivation.
+    #
+    # `base` is NOT corrected in place. Every committed report under
+    # research/results/ was produced against it, and silently redefining a
+    # named scenario would rewrite those numbers without rewriting the
+    # documents that quote them. `base` therefore stays as the historical
+    # 5bps scenario and this is the one new work runs against.
+    #
+    # The gap matters more than it looks: at 0.4963% round trip the measured
+    # cross-sectional spreads of 0.05-0.30% gross are not "the same size as
+    # the fee" as the edge-search report concluded - they are 2-10x smaller
+    # than it. It also makes maker execution worth ~0.23-0.46% of round-trip
+    # saving rather than the 0.06% that report assumed.
+    "account_taker": Costs("account_taker", 0.25, 0.05, 0.05, 0.15, True),
 }
+
+# What new research runs against. Historical scenarios stay reachable by name
+# so a committed report can still be reproduced exactly.
+DEFAULT_COST_SCENARIO = "account_taker"
 
 
 def simulate(frame: SymbolFrame, idx: np.ndarray, direction: str,

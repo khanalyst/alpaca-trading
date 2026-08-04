@@ -57,6 +57,22 @@ strategy:
   # clears the worst of the adverse window without approaching the 8h point
   # where an early-exit overlay was measured to start helping.
   min_hold_minutes: 90
+  # The floor above is now conditional, not a clock. Once a position has moved
+  # this far against entry - measured in units of its OWN planned stop
+  # distance - the model may close it immediately regardless of age.
+  #
+  # Measured over 24 demo round trips, the unconditional floor produced an
+  # inverted exit policy: average win +28.55 USDT against average loss
+  # -204.75, a win/loss ratio of 0.14 where a 12.5% hit rate needs ~7. Zero
+  # trades reached the 3R target the floor exists to protect, while eleven
+  # consecutive close requests on one position were refused over 55 minutes
+  # before it closed at -250.
+  #
+  # 0.5 keeps the floor's real job (do not scratch a position that has not
+  # gone against you) and drops the one it was doing badly (hold every loser
+  # to its stop). It is deliberately below 1.0: at 1R the exchange stop has
+  # already fired and the release would never be reachable.
+  min_hold_adverse_r: 0.5
   # Batch 6.4. Which variable separates range_breakout from
   # trend_continuation. The two contracts overlap - a symbol in a strong
   # aligned uptrend is almost always high in its 24h range on good volume -
@@ -206,7 +222,31 @@ execution:
 # Price loss plus fees, spread, adverse funding and expected stop slippage
 # are kept inside risk_per_trade_pct instead of being added on afterward.
 trading_costs:
-  taker_fee_pct_per_side: 0.05
+  # MEASURED, not assumed. Reconciled from the demo journal on 2026-08-04:
+  # 24 round trips, every one charged ~0.248% per side. Derived independently
+  # of contract size from the one winning ETH trade, where entry, exit, fees
+  # and net PnL are all recorded:
+  #
+  #   gross move 0.6007%, implied notional 20,536 USDT, fees 101.92 USDT
+  #   -> 0.2481% per side, 0.4963% round trip
+  #   -> cross-check: net/notional 0.10446% vs journal pnl_pct 0.10493%
+  #
+  # The previous 0.05 was a 4.96x understatement. It cost ~1,850 USDT of the
+  # 4,214 USDT demo loss in fees that no cost model knew about - 44% of the
+  # loss. Live sizing was never wrong (agent/market.py fetches the account
+  # rate and risk.py prefers it); what was wrong is every offline backtest,
+  # tournament run and tier verdict, all of which read THIS number.
+  #
+  # It is also the fallback used when the account fee cannot be fetched, so
+  # it must stay conservative. `main.py check` fails when the fetched account
+  # rate diverges from this value by more than
+  # trading_costs.fee_divergence_tolerance_pct.
+  taker_fee_pct_per_side: 0.25
+  # Maximum accepted relative gap between this configured rate and the rate
+  # OKX reports for the account, as a percentage of the fetched rate. Beyond
+  # it the configured cost model no longer describes the account being traded
+  # and every research number computed from it is void.
+  fee_divergence_tolerance_pct: 25.0
   expected_stop_slippage_pct: 0.15
   expected_funding_intervals_held: 1  # floor when funding schedule is unknown
   # Measured average hold at the 48h cap and a 3R target is ~21h, so an 8h
@@ -263,5 +303,11 @@ research:
   # Rotation requires BOTH 3 elapsed calendar days and 100 comparable paired
   # decisions. Time alone never completes an assignment. The observation
   # default deliberately matches the existing conservative paper sample floor.
-  experiment_min_duration_days: 3
+  # Raised from 3. The confirmation window is the last 30% of the assignment
+  # calendar and needs 8 distinct six-hour episodes, so the arithmetic floor
+  # is 8*6h/0.30 = 6.67 days. At 3 days every strategy reported exactly 4
+  # confirm clusters and returned INCONCLUSIVE regardless of evidence.
+  # 10 leaves margin for the episodes a quiet weekend does not produce.
+  # agent/config.py now refuses to start below the computed floor.
+  experiment_min_duration_days: 10
   experiment_min_observations: 100

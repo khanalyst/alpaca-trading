@@ -59,7 +59,11 @@ class SetupPlan:
     spread_pct: float = 0.0
     funding_rate_pct: float = 0.0
     funding_interval_hours: float = 8.0
-    taker_fee_pct_per_side: float = 0.05
+    # Measured on the demo account, not assumed: 0.248%/side across 24 round
+    # trips (see config.yaml trading_costs). The previous 0.05 default was a
+    # 4.96x understatement, and because it is a DEFAULT it silently applied
+    # wherever a caller had no per-symbol rate to pass.
+    taker_fee_pct_per_side: float = 0.25
 
     @property
     def first_visible_ts(self) -> int:

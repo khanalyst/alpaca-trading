@@ -107,7 +107,7 @@ def stage_baseline(frames, membership, out: dict) -> None:
     contract = Contract()
     rows = []
     for cost_name in ("frictionless", "optimistic", "base", "realistic_alt",
-                      "stress"):
+                      "stress", "account_taker"):
         costs = COST_SCENARIOS[cost_name]
         variants = {
             "signal": dict(),
@@ -601,7 +601,7 @@ def stage_portfolio(frames, membership, out: dict) -> None:
     print("=" * 78)
     from research.portfolio_sim import run_portfolio
     results = {}
-    for cost_name in ("frictionless", "base", "realistic_alt"):
+    for cost_name in ("frictionless", "base", "account_taker"):
         metrics = run_portfolio(frames, membership, Contract(),
                                 COST_SCENARIOS[cost_name])
         results[cost_name] = metrics

@@ -276,6 +276,11 @@ def _finite_number(value, default: float = 0.0) -> float:
 
 
 _RETRYABLE_INCONCLUSIVE_CODES = {
+    # ASSIGNMENT_VOIDED is deliberately NOT here. Reclassifying an
+    # operational abort from FAILED to INCONCLUSIVE stops it lying about the
+    # strategy; it is a separate question whether the same setting may then
+    # be re-requested silently, and the existing "silent retest refused"
+    # guard is the right answer to that one. An explicit retry still works.
     "NO_DECISIONS",
     "UNRESOLVED_TRADES",
     "CLOSED_SAMPLE_BELOW_FLOOR",
@@ -610,9 +615,19 @@ def _deterministic_experiment_payload(
 
     status = str(terminal_event["status"])
     if status == "REJECTED":
-        add("ASSIGNMENT_REJECTED", "terminal_status",
-            str(terminal_event["reason"] or "assignment rejected"))
-        verdict = "FAILED"
+        # An aborted assignment produced no evidence either way, so it is
+        # INCONCLUSIVE, not FAILED. Every reason an assignment can be
+        # rejected is operational - the variant was unavailable after a
+        # restart, code/config identity changed mid-window, or the paper
+        # portfolio was revoked. None of them is an observation about the
+        # market, and recording them as FAILED wrote permanent, immutable
+        # research verdicts about strategies that were never measured.
+        #
+        # This is the verdict a SQLite constraint violation used to produce.
+        add("ASSIGNMENT_VOIDED", "evidence_adequacy",
+            str(terminal_event["reason"] or "assignment rejected")
+            + " (operational abort: no market evidence was produced)")
+        verdict = "INCONCLUSIVE"
     else:
         verdict = "WORKED"
         hard_limitations = []
@@ -2985,6 +3000,22 @@ class FindingsStore:
                 canonical_provenance = cls._validate_experiment_provenance(
                     variant, provenance)
             state = cls._paper_default(balance, assignment_started_ts)
+            # Operational idempotency is NOT assignment evidence, and wiping
+            # it here was corrupting the ledger it was meant to leave alone.
+            # paper_decisions is append-only with UNIQUE(scope_key,
+            # variant_id, proposal_id), and proposal_id is derived from
+            # signal_ts rather than wall clock. Resetting seen_proposals
+            # while those rows survive means any proposal whose signal bar is
+            # still current gets re-evaluated and collides on insert.
+            #
+            # Measured over 4 simulated days, in exact proportion to signal
+            # bar length: trend-multiday (4h bar) 74 IntegrityErrors,
+            # ls-ratio-fade (1h) 36, funding-carry/unwind (1h) 14 each,
+            # scalp-maker (per-book-ts, always unique) 0. Three failures
+            # revoke the portfolio, which rejects the assignment, which wrote
+            # an immutable verdict of FAILED against the strategy.
+            state["seen_proposals"] = dict(
+                existing_state.get("seen_proposals") or {})
             state.update({
                 "experiment_provenance": canonical_provenance,
                 "experiment_assignment_id": assignment_id,
@@ -3194,12 +3225,26 @@ class FindingsStore:
         outcome = str(decision.get("decision_outcome") or "").upper()
         if outcome not in {"PROPOSED", "VETOED"}:
             raise ValueError("paper decision outcome must be PROPOSED or VETOED")
-        conn.execute(
+        # Re-observing the same proposal identity is idempotent, not an
+        # error. The first row wins and later observations of the same
+        # completed signal bar are dropped, which is exactly the semantics
+        # the ledger already claims ("repeated observations of the same
+        # completed bar are idempotent across process restarts").
+        #
+        # Before this, a duplicate raised IntegrityError, the evaluator
+        # counted it as a paper failure, three failures revoked the portfolio
+        # and the assignment was rejected - turning a constraint violation
+        # into an immutable research verdict about a strategy. The reset in
+        # _reset_assignment_accounts_conn is the source of the duplicates and
+        # is fixed separately; this keeps a collision from ever being
+        # mistaken for evidence again.
+        cursor = conn.execute(
             "INSERT INTO paper_decisions (decision_id, proposal_id, "
             "scope_key, variant_id, cycle_id, symbol, direction, setup_type, "
             "signal_ts, confidence, decision_outcome, reason, paper_trade_id, "
             "model_id, assumptions_json, proposal_json, decision_ts) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(scope_key, variant_id, proposal_id) DO NOTHING",
             (decision_id, decision["proposal_id"], decision["scope_key"],
              decision["variant_id"], decision.get("cycle_id"),
              decision["symbol"], decision.get("direction"),
@@ -3209,6 +3254,14 @@ class FindingsStore:
              _canonical_json(decision.get("assumptions") or {}),
              _canonical_json(decision.get("proposal") or {}),
              decision["decision_ts"]))
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                "SELECT decision_id FROM paper_decisions WHERE scope_key=? "
+                "AND variant_id=? AND proposal_id=?",
+                (decision["scope_key"], decision["variant_id"],
+                 decision["proposal_id"])).fetchone()
+            if existing is not None:
+                return str(existing["decision_id"])
         return decision_id
 
     @staticmethod

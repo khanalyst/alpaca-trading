@@ -24,7 +24,7 @@ def config():
         "paper_initial_balance_usdt": 10_000,
         "paper_max_failures": 3,
         "paper_min_closed_trades": 100,
-        "experiment_min_duration_days": 3,
+        "experiment_min_duration_days": 10,
         "experiment_min_observations": 1,
         "forward_feed_version": 2,
     }
@@ -179,11 +179,11 @@ class SameFeedCoordinatorTests(unittest.TestCase):
                 "detail": {"strategy_id": "flush-fade"},
             }], now=now)
         draining = self.store.maybe_complete_experiment_assignment(
-            flush["assignment_id"], now=now + 3 * 86_400)
+            flush["assignment_id"], now=now + 10 * 86_400)
         self.assertEqual(draining["status"], "DRAINING")
         self.assertGreater(draining["unresolved_actions"]["total"], 0)
         still_scalp = self.store.active_experiment_assignment(
-            restarted.scope_key, "scalp-maker", now=now + 3 * 86_400)
+            restarted.scope_key, "scalp-maker", now=now + 10 * 86_400)
         self.assertEqual(still_scalp["assignment_id"], scalp_assignment_id)
 
 

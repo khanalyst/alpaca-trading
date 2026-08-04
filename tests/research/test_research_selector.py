@@ -14,6 +14,8 @@ from tests.helpers import valid_config
 
 
 THREE_DAYS = 3 * 86_400
+# Matches research.experiment_min_duration_days in this module's config.
+TEN_DAYS = 10 * 86_400
 
 
 def selector_config():
@@ -26,7 +28,7 @@ def selector_config():
         "paper_initial_balance_usdt": 10_000,
         "paper_max_failures": 3,
         "paper_min_closed_trades": 1,
-        "experiment_min_duration_days": 3,
+        "experiment_min_duration_days": 10,
         "experiment_min_observations": 1,
         "forward_feed_version": 1,
     }
@@ -86,21 +88,25 @@ class ResearchSelectorPromptAndParserTests(unittest.TestCase):
             if item["axis"] == "risk.min_confidence"]
 
         self.assertEqual(baseline, 0.65)
-        self.assertEqual(
-            {item["variant_id"] for item in active},
-            {
-                "momentum.conf.floor_0_70",
-                "momentum.conf.floor_0_75",
-                "momentum.conf.floor_0_80",
-            })
+        # The whole confidence axis is retired. Live demo evidence showed the
+        # model's confidence is anti-informative in the band these settings
+        # test: the 0.70-0.80 bucket went 0 for 13 at -0.52R while the
+        # sub-0.70 bucket won 22.2% at -0.41R. Raising the floor selects the
+        # losing population, so no floor above the 0.65 baseline is eligible.
+        self.assertEqual({item["variant_id"] for item in active}, set())
         self.assertTrue(all(
             next(iter(item["setting"].values())) > baseline
             for item in active))
 
         historical_ids = {
+            # Below the 0.65 prompt floor, so never observable.
             "momentum.conf.floor_0_50",
             "momentum.conf.floor_0_55",
             "momentum.conf.floor_0_60",
+            # Observable, but measured to run the wrong way.
+            "momentum.conf.floor_0_70",
+            "momentum.conf.floor_0_75",
+            "momentum.conf.floor_0_80",
         }
         self.assertTrue(historical_ids <= registry.keys())
         self.assertEqual(
@@ -333,8 +339,8 @@ class ResearchSelectorLifecycleTests(unittest.TestCase):
             now=current["started_ts"] + 1)
         self.store.maybe_complete_experiment_assignment(
             current["assignment_id"],
-            now=current["started_ts"] + THREE_DAYS)
-        evaluator._refresh_rotation(current["started_ts"] + THREE_DAYS + 1)
+            now=current["started_ts"] + TEN_DAYS)
+        evaluator._refresh_rotation(current["started_ts"] + TEN_DAYS + 1)
         assigned = self.store.active_experiment_assignment(
             self.coordinator.scope_key, strategy_id)
         linked = self.store.research_selection(selected["selection_id"])
@@ -356,7 +362,7 @@ class ResearchSelectorLifecycleTests(unittest.TestCase):
             now=assigned["started_ts"] + 1)
         restarted.store.maybe_complete_experiment_assignment(
             assigned["assignment_id"],
-            now=assigned["started_ts"] + THREE_DAYS)
+            now=assigned["started_ts"] + TEN_DAYS)
         tested = restarted.store.research_selection(selected["selection_id"])
         self.assertEqual(tested["current_status"], "TESTED")
         self.assertEqual(
@@ -404,8 +410,8 @@ class ResearchSelectorLifecycleTests(unittest.TestCase):
             now=current["started_ts"] + 1)
         self.store.maybe_complete_experiment_assignment(
             current["assignment_id"],
-            now=current["started_ts"] + THREE_DAYS)
-        evaluator._refresh_rotation(current["started_ts"] + THREE_DAYS + 1)
+            now=current["started_ts"] + TEN_DAYS)
+        evaluator._refresh_rotation(current["started_ts"] + TEN_DAYS + 1)
         assigned = self.store.active_experiment_assignment(
             self.coordinator.scope_key, strategy_id)
         self.assertEqual(assigned["candidate_variant_id"], selected_variant)

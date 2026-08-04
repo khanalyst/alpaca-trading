@@ -165,17 +165,31 @@ class ExperimentCorrectnessTests(unittest.TestCase):
         candidate = self.store.paper_portfolio_state(
             scope, self.candidate.variant_id)
 
-        for state in (baseline, candidate):
+        for index, state in enumerate((baseline, candidate), start=1):
             self.assertEqual(state["cash_usdt"], 12_345.0)
             self.assertEqual(state["equity_usdt"], 12_345.0)
             self.assertEqual(state["positions"], [])
             self.assertEqual(state["cooldowns"], {})
-            self.assertEqual(state["seen_proposals"], {})
+            # Operational idempotency survives the rebase on purpose.
+            # paper_decisions is append-only and keyed on a signal-derived
+            # proposal_id, so clearing this while those rows remain made
+            # the evaluator re-insert and collide on any signal bar still
+            # current - 74 IntegrityErrors on trend-multiday alone over 4
+            # simulated days. It is not assignment evidence: cash,
+            # positions, counters and drawdown are all still rebased.
+            self.assertEqual(state["seen_proposals"], {f"old-{index}": 0.0})
             self.assertEqual(state["loss_count"], 0)
             self.assertEqual(
                 state["experiment_assignment_id"], assignment["assignment_id"])
             self.assertEqual(state["experiment_assignment_started_ts"], 10.0)
-        comparable_keys = set(baseline) - {"portfolio_version", "updated_ts"}
+        # seen_proposals is per-variant operational idempotency, not part of
+        # the durable boundary: it must survive the rebase (see above) and it
+        # is legitimately different per lane, because each arm has observed
+        # its own proposals. Everything that defines the boundary - cash,
+        # equity, positions, counters, drawdown, provenance - is still
+        # required to match exactly.
+        comparable_keys = set(baseline) - {
+            "portfolio_version", "updated_ts", "seen_proposals"}
         self.assertEqual(
             {key: baseline[key] for key in comparable_keys},
             {key: candidate[key] for key in comparable_keys})

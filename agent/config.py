@@ -7,6 +7,7 @@ validated before an exchange client or model is created.
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 
 from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
@@ -86,7 +87,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         "breakout_discriminator", "breakout_compression_max_atr_ratio",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
         "setup_memory_hours", "loss_reentry_min_minutes",
-        "min_stop_atr_multiple", "min_hold_minutes",
+        "min_stop_atr_multiple", "min_hold_minutes", "min_hold_adverse_r",
         "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
         "breakout_range_threshold_pct", "breakout_min_relative_volume",
         "funding_extreme_pct_per_8h", "fixed_reward_risk",
@@ -160,6 +161,11 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
     _number(strategy, "loss_reentry_min_minutes", 0, 10080, "strategy")
     _number(strategy, "min_stop_atr_multiple", 0.5, 5, "strategy")
     _number(strategy, "min_hold_minutes", 0, 1440, "strategy")
+    # Below 1.0 by construction: at 1R the exchange stop has already filled,
+    # so a release set at or above it can never be reached and the floor
+    # silently reverts to the unconditional clock it replaced.
+    if "min_hold_adverse_r" in strategy:
+        _number(strategy, "min_hold_adverse_r", 0.05, 0.95, "strategy")
     _number(strategy, "structure_buffer_atr_multiple", 0, 2, "strategy")
     _number(strategy, "hard_max_entry_extension_atr", 0.5, 10, "strategy")
     _number(strategy, "breakout_range_threshold_pct", 50, 99, "strategy")
@@ -449,9 +455,15 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
 
     costs = _mapping(cfg.get("trading_costs"), "trading_costs")
     _keys(costs, {"taker_fee_pct_per_side", "expected_stop_slippage_pct",
-                  "expected_funding_intervals_held", "expected_hold_hours"},
+                  "expected_funding_intervals_held", "expected_hold_hours",
+                  "fee_divergence_tolerance_pct"},
           "trading_costs")
     _number(costs, "taker_fee_pct_per_side", 0, 1, "trading_costs")
+    # Optional: absent means the shipped default is applied by
+    # fee_divergence(), so an older config file still validates.
+    if "fee_divergence_tolerance_pct" in costs:
+        _number(costs, "fee_divergence_tolerance_pct", 1, 100,
+                "trading_costs")
     _number(costs, "expected_stop_slippage_pct", 0, 5, "trading_costs")
     _number(costs, "expected_funding_intervals_held", 0, 24, "trading_costs")
     _number(costs, "expected_hold_hours", 0, 168, "trading_costs")
@@ -498,8 +510,32 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             _integer(research, "paper_min_closed_trades", 1, 100_000,
                      "research")
         if "experiment_min_duration_days" in research:
-            _integer(research, "experiment_min_duration_days", 1, 365,
-                     "research")
+            days = _integer(research, "experiment_min_duration_days", 1, 365,
+                            "research")
+            # The confirmation window is the last 30% of the assignment
+            # calendar and must span MIN_BOOTSTRAP_CLUSTERS distinct six-hour
+            # episodes, so the assignment itself has a hard arithmetic floor:
+            #
+            #   8 clusters * 6h / 0.30 = 160h = 6.67 days
+            #
+            # Below it every assignment returns INCONCLUSIVE on cluster count
+            # no matter how much evidence it collects. The shipped value was
+            # 3 days, which produced exactly 4 confirm clusters on all seven
+            # strategies - a guaranteed non-result that no test caught
+            # because the protocol constant and the calendar were never
+            # checked against each other.
+            from research.protocol import (MIN_BOOTSTRAP_CLUSTERS,
+                                           PAIR_CLUSTER_SECONDS)
+            minimum_days = math.ceil(
+                MIN_BOOTSTRAP_CLUSTERS * PAIR_CLUSTER_SECONDS
+                / 0.30 / 86_400)
+            if days < minimum_days:
+                raise ConfigError(
+                    f"research.experiment_min_duration_days must be at least "
+                    f"{minimum_days}: the confirmation window is 30% of the "
+                    f"assignment and needs {MIN_BOOTSTRAP_CLUSTERS} distinct "
+                    f"{PAIR_CLUSTER_SECONDS // 3600}h episodes, so a shorter "
+                    f"assignment can only ever return INCONCLUSIVE")
         if "experiment_min_observations" in research:
             _integer(research, "experiment_min_observations", 1, 100_000,
                      "research")

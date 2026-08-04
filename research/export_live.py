@@ -291,7 +291,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path,
                         default=REPO / "runtime" / "research"
                         / "forward_evidence.json")
-    parser.add_argument("--cost", default="base")
+    parser.add_argument("--cost", default="account_taker")
     parser.add_argument("--min-stop-atr", type=float, default=1.0)
     parser.add_argument("--structure-buffer-atr", type=float, default=0.15)
     parser.add_argument("--reward-risk", type=float, default=3.0)

@@ -237,7 +237,9 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
                 "paper_execution_evidence_and_validity")
-            self.assertEqual(outcome["verdict"], "FAILED")
+            # Backfilled history uses the same rule as a live rejection: an
+            # operational abort is INCONCLUSIVE, never FAILED.
+            self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
             self.assertEqual(
                 migrated.experiment_assignment(
                     assignment["assignment_id"])["status"], "REJECTED")
@@ -336,7 +338,17 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
             {item["code"] for item in outcome["payload"]["reasons"]})
         self.assertEqual(self.store.edge_evidence(assignment["scope_key"]), [])
 
-    def test_rejected_assignment_has_one_failed_outcome(self):
+    def test_rejected_assignment_is_voided_not_failed(self):
+        """An operational abort produced no evidence, so it decides nothing.
+
+        Every reason an assignment can be rejected is operational: the
+        variant went missing after a restart, code/config identity changed
+        mid-window, or the paper portfolio was revoked. Recording those as
+        FAILED wrote a permanent, immutable verdict about a strategy that was
+        never measured - and because a duplicate-key IntegrityError revokes
+        the portfolio after three occurrences, a SQLite constraint violation
+        could author a research finding.
+        """
         assignment, _ = self._assignment(
             scope="demo:rejected:feed-v1", observations=1)
 
@@ -345,10 +357,10 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
         outcome = self.store.experiment_outcome(assignment["assignment_id"])
 
         self.assertEqual(outcome["terminal_status"], "REJECTED")
-        self.assertEqual(outcome["verdict"], "FAILED")
+        self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
         self.assertEqual(
             [item["code"] for item in outcome["payload"]["reasons"]],
-            ["ASSIGNMENT_REJECTED"])
+            ["ASSIGNMENT_VOIDED"])
 
     def test_restart_and_retry_are_idempotent_and_immutable(self):
         assignment, candidate = self._assignment(scope="demo:idempotent:feed-v1")
