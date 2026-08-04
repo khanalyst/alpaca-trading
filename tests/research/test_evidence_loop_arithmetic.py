@@ -202,3 +202,281 @@ class FeeDivergenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClosedTradeFloorIsReachableTests(unittest.TestCase):
+    """A verdict must be reachable by collection, not only computable.
+
+    The suite already proved a WORKED verdict at 100 closed trades, but it
+    did so by writing 100 closed trades straight into SQLite. Nothing asked
+    whether the collection path could ever produce them, and it could not: at
+    three concurrent slots and a 48h horizon a ten-day assignment yields
+    roughly fifteen. Six of seven strategies were short by up to 47x while
+    every test passed, because the one number that mattered was supplied by
+    the fixture rather than earned by the system.
+    """
+
+    def achievable_closes(self, spec, cfg) -> float:
+        """Closed trades one arm can produce across its whole attempt budget.
+
+        A strategy holds at most `max_concurrent_positions` at once and each
+        position occupies a slot for its full horizon, so throughput is
+        bounded by slots divided by holding time regardless of how often it
+        signals.
+        """
+        from agent.forward_models import model_for
+        from research.findings import MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS
+
+        horizon_days = model_for(spec.id).horizon_hours / 24.0
+        slots = int(cfg["risk"]["max_concurrent_positions"])
+        days = (float(cfg["research"]["experiment_min_duration_days"])
+                * MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS)
+        return slots / horizon_days * days
+
+    def test_every_realtime_strategy_can_reach_the_closed_trade_floor(self):
+        from agent import registry
+
+        cfg = shipped_config()
+        short = {}
+        for spec in registry.REGISTRY.values():
+            if not spec.realtime_eligible:
+                continue
+            closes = self.achievable_closes(spec, cfg)
+            if closes < protocol.MIN_ROUND_TRIPS:
+                short[spec.id] = round(closes, 1)
+
+        self.assertEqual(
+            short, {},
+            "strategies held in the real-time loop that cannot reach "
+            f"{protocol.MIN_ROUND_TRIPS} closed trades within the attempt "
+            f"budget: {short}. Either the horizon is too long for real-time "
+            "testing (set realtime_eligible=False and research it offline) "
+            "or the attempt budget is too small.")
+
+    def test_the_offline_strategies_are_offline_for_this_reason(self):
+        """Not preference: they are short by an order of magnitude.
+
+        If one of them ever becomes reachable this test fails, which is the
+        signal to put it back in the loop rather than leave it excluded out
+        of habit.
+        """
+        from agent import registry
+
+        cfg = shipped_config()
+        offline = [spec for spec in registry.REGISTRY.values()
+                   if not spec.realtime_eligible]
+        self.assertTrue(offline, "no strategy is marked offline-only")
+        for spec in offline:
+            with self.subTest(strategy=spec.id):
+                self.assertLess(
+                    self.achievable_closes(spec, cfg),
+                    protocol.MIN_ROUND_TRIPS,
+                    f"{spec.id} can now reach the floor in real time; "
+                    "reconsider realtime_eligible")
+
+    def test_the_attempt_budget_is_what_makes_the_floor_reachable(self):
+        """One attempt is not enough, which is why attempts pool.
+
+        Pinning this stops the budget being quietly lowered back to a value
+        that reads as a retry allowance but silently makes every verdict
+        unreachable again.
+        """
+        from agent import registry
+        from research.findings import MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS
+
+        cfg = shipped_config()
+        single = dict(cfg)
+        slowest = max(
+            (spec for spec in registry.REGISTRY.values()
+             if spec.realtime_eligible),
+            key=lambda spec: self.achievable_closes(spec, cfg) * -1)
+
+        per_attempt = (self.achievable_closes(slowest, single)
+                       / MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS)
+        self.assertLess(per_attempt, protocol.MIN_ROUND_TRIPS)
+        self.assertGreaterEqual(
+            per_attempt * MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS,
+            protocol.MIN_ROUND_TRIPS)
+
+
+class ObservationFloorIsExercisedTests(unittest.TestCase):
+    """The shipped observation gate must not be a fixture-only number.
+
+    Most rotation fixtures pass minimum_observations=1 so an assignment
+    completes on the first paired observation. That is reasonable for testing
+    ordering and lifecycle, but it means the gate that actually ships was
+    never the gate under test, and a floor nothing exercises is a floor that
+    can drift.
+    """
+
+    def test_the_shipped_observation_floor_matches_the_trade_floor(self):
+        research = shipped_config()["research"]
+
+        self.assertEqual(
+            int(research["experiment_min_observations"]),
+            protocol.MIN_ROUND_TRIPS,
+            "the paired-observation floor and the closed-trade floor answer "
+            "the same question and must not drift apart")
+        self.assertEqual(
+            int(research["paper_min_closed_trades"]),
+            protocol.MIN_ROUND_TRIPS)
+
+    def test_the_observation_gate_actually_blocks_at_the_shipped_value(self):
+        """At the shipped floor, one observation must not complete anything.
+
+        The fixtures set this to 1, so without this test nothing anywhere
+        demonstrates that the real value is load-bearing.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from agent import variants
+        from research.findings import FindingsStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FindingsStore(Path(tmp) / "findings.db")
+            baseline = variants.baseline("momentum", "phase1-v3")
+            store.register(baseline)
+            registry = variants.load_registry(REPO / "research" / "variants.yaml")
+            candidate = registry["momentum.rr.fixed_2_5"]
+            store.register(candidate)
+            floor = int(shipped_config()["research"][
+                "experiment_min_observations"])
+            assignment = store.ensure_experiment_assignment(
+                "demo:observation-floor", "momentum", baseline.variant_id,
+                [{
+                    "variant_id": candidate.variant_id,
+                    "candidate_key": "observation-floor-candidate",
+                    "axis": next(iter(candidate.overrides)),
+                    "setting_id": "fixed_2_5",
+                    "setting": dict(candidate.overrides),
+                    "source": "static", "priority": 10,
+                    "order_key": candidate.variant_id,
+                    "code_identity": {"baseline": {}, "candidate": {}},
+                    "config_identity": {"baseline": {}, "candidate": {}},
+                }],
+                minimum_duration_seconds=0, minimum_observations=floor,
+                now=0.0)
+
+            store.record_experiment_observations(
+                assignment["assignment_id"],
+                [{"observation_key": "only-one"}], now=1.0)
+            state = store.maybe_complete_experiment_assignment(
+                assignment["assignment_id"], now=2.0)
+
+        self.assertNotEqual(
+            state["status"], "COMPLETED",
+            f"one observation completed an assignment needing {floor}")
+
+
+class SignalCadenceCanDeliverTheFloorTests(unittest.TestCase):
+    """The bar that produces observations must produce enough of them.
+
+    Duration and observations are two independent gates and an assignment
+    needs both. Nothing compared them, so a signal timeframe long enough to
+    starve the observation floor inside the duration window would have
+    produced the same silent INCONCLUSIVE the duration bug produced - and the
+    fixtures could not have caught it, because they set the floor to 1.
+    """
+
+    BARS_PER_DAY = {
+        "1m": 1440, "5m": 288, "15m": 96, "30m": 48,
+        "1h": 24, "4h": 6, "1d": 1,
+    }
+
+    def test_every_realtime_strategy_can_observe_enough_inside_the_window(self):
+        from agent import registry
+        from research.findings import MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS
+
+        cfg = shipped_config()
+        floor = int(cfg["research"]["experiment_min_observations"])
+        days = (float(cfg["research"]["experiment_min_duration_days"])
+                * MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS)
+        starved = {}
+        for spec in registry.REGISTRY.values():
+            if not spec.realtime_eligible:
+                continue
+            per_day = self.BARS_PER_DAY.get(spec.signal_timeframe)
+            self.assertIsNotNone(
+                per_day, f"unmapped signal timeframe {spec.signal_timeframe}")
+            # One evaluation per bar per symbol; a single symbol is the
+            # conservative floor, so the universe only ever helps.
+            if per_day * days < floor:
+                starved[spec.id] = per_day * days
+
+        self.assertEqual(
+            starved, {},
+            "strategies whose signal cadence cannot deliver "
+            f"{floor} observations inside the assignment window: {starved}")
+
+    def test_the_binding_gate_is_closed_trades_not_observations(self):
+        """Which gate bites is a fact worth pinning.
+
+        Observations are cheap - one per bar - while closed trades are bounded
+        by concurrency and holding time. If observations ever became the
+        binding constraint the diagnosis for an INCONCLUSIVE run would change
+        completely, so the relationship should not flip silently.
+        """
+        from agent import registry
+        from agent.forward_models import model_for
+        from research.findings import MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS
+
+        cfg = shipped_config()
+        days = (float(cfg["research"]["experiment_min_duration_days"])
+                * MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS)
+        slots = int(cfg["risk"]["max_concurrent_positions"])
+        for spec in registry.REGISTRY.values():
+            if not spec.realtime_eligible:
+                continue
+            with self.subTest(strategy=spec.id):
+                observations = self.BARS_PER_DAY[spec.signal_timeframe] * days
+                closes = slots / (model_for(spec.id).horizon_hours / 24.0) * days
+                self.assertGreater(observations, closes)
+
+
+class TierClaimsAreTraceableTests(unittest.TestCase):
+    """A tier claim must be checkable against the artifact it cites.
+
+    registry.py states the numbers that keep momentum away from live capital
+    and names the report they come from. Nothing joined the two, so the prose
+    and the evidence could drift apart in either direction - and the prose is
+    what a reader, or a reviewing model, actually acts on.
+    """
+
+    # The figures momentum's T0_REJECTED verdict rests on.
+    MOMENTUM_CLAIMS = ("45.6", "47.3", "0.096", "115,929")
+
+    def test_momentum_tier_numbers_appear_in_the_cited_report(self):
+        from agent import registry
+
+        spec = registry.spec_for("momentum")
+        self.assertEqual(spec.tier, "T0_REJECTED")
+        cited = [path for path in spec.evidence if path.endswith(".md")]
+        self.assertTrue(cited, "momentum's tier cites no readable artifact")
+
+        corpus = "\n".join(
+            (REPO / path).read_text(encoding="utf-8") for path in cited)
+        prose = (REPO / "agent" / "registry.py").read_text(encoding="utf-8")
+        for claim in self.MOMENTUM_CLAIMS:
+            with self.subTest(claim=claim):
+                self.assertIn(
+                    claim, prose,
+                    f"{claim} is no longer claimed in the registry; update "
+                    "this test if the verdict's basis genuinely changed")
+                self.assertIn(
+                    claim, corpus,
+                    f"the registry claims {claim} but no cited artifact "
+                    f"contains it: {cited}")
+
+    def test_every_cited_evidence_path_exists(self):
+        from agent import registry
+
+        missing = []
+        for spec in registry.REGISTRY.values():
+            for path in spec.evidence:
+                if not (REPO / path.split("#")[0]).exists():
+                    missing.append(f"{spec.id} -> {path}")
+
+        self.assertEqual(
+            missing, [],
+            f"tier evidence citing files that do not exist: {missing}")
