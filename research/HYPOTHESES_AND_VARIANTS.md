@@ -55,6 +55,17 @@ have left the analyst with no evidence of its own past decisions. The two
 lanes are deliberately not comparable and live in separate scopes so no
 verdict can pool them.
 
+`funding-carry` exits on `carry_until_normalised`, not on a price target. Its
+own mechanism says the return source is the carry rather than a directional
+forecast, but its contract closed on a 2R price move, so it was scored on the
+one thing it claims not to be forecasting - and a position could be closed at a
+profit while funding was still paying, or held after the carry had gone. It now
+closes when the 30-day funding percentile falls back to its median (50). The
+stop is unchanged, because its falsification requires price risk over the
+holding window to be charged against the carry, and the ten-day timeout remains
+the outer bound. `funding-unwind` keeps `fixed_rr`: it is a directional bet on
+the crowd being forced out, so a price exit is the right one for it.
+
 `funding-carry`, `funding-unwind` and `trend-multiday` are registered but
 `realtime_eligible=False`, so they are researched offline instead. This is
 arithmetic rather than preference: a verdict needs 100 closed trades per arm,

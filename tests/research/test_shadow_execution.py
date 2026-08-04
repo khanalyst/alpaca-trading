@@ -419,3 +419,113 @@ class ExitAccountingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def carry_position(**overrides):
+    """A funding-carry position: no price target, exits when the carry ends."""
+    base = dict(
+        exit_policy="carry_until_normalised",
+        carry_exit_funding_percentile=50.0,
+        deadline_ts=NOW + 864_000.0,     # the ten-day outer bound
+        take_price=112.0,                # the wide protective bound, not a target
+    )
+    base.update(overrides)
+    return open_position(**base)
+
+
+def carry_row(percentile, now=NOW, *, bars=None):
+    row = execution_row(now, bars=bars if bars is not None else [
+        one_minute_bar(NOW_MS + MINUTE_MS)])
+    # The shared snapshot fixture already carries a funding percentile, so an
+    # "absent observation" has to be removed rather than left unset.
+    row.pop("funding_percentile_30", None)
+    if percentile is not None:
+        row["funding_percentile_30"] = percentile
+    return row
+
+
+class CarryNormalisationExitTests(unittest.TestCase):
+    """funding-carry closes when its carry is spent, not on a price move.
+
+    The strategy states that its return source is the funding it collects
+    rather than a directional forecast, yet its contract exited on a 2R price
+    move. It was therefore scored on the one thing it claims not to be
+    forecasting, and could be closed at a profit while the carry was still
+    paying, or held after the carry had gone.
+    """
+
+    def setUp(self):
+        self.cfg = valid_config()
+        self.now = NOW + 120.0
+
+    def test_normalised_funding_closes_the_position(self):
+        resolved = shadow.ShadowEvaluator._execution_exit(
+            carry_position(), carry_row(41.0, self.now), self.now, self.cfg)
+
+        self.assertIsNotNone(resolved)
+        result, price, evidence, valid, exit_ts = resolved
+        self.assertEqual(result, "funding_normalised")
+        self.assertTrue(valid)
+        self.assertEqual(exit_ts, self.now)
+        self.assertEqual(evidence["funding_percentile_30"], 41.0)
+        self.assertEqual(evidence["carry_exit_funding_percentile"], 50.0)
+        # Exits at the market, not at the protective bound.
+        self.assertNotEqual(price, 112.0)
+
+    def test_funding_still_paying_holds_the_position(self):
+        self.assertIsNone(shadow.ShadowEvaluator._execution_exit(
+            carry_position(), carry_row(88.0, self.now), self.now, self.cfg))
+
+    def test_the_boundary_is_inclusive_at_the_stated_percentile(self):
+        resolved = shadow.ShadowEvaluator._execution_exit(
+            carry_position(), carry_row(50.0, self.now), self.now, self.cfg)
+        self.assertEqual(resolved[0], "funding_normalised")
+
+    def test_a_stop_still_wins_over_a_spent_carry(self):
+        """The bar replay runs first, so price risk is never skipped."""
+        bars = [one_minute_bar(NOW_MS + MINUTE_MS, low=98.0, high=100.2)]
+        resolved = shadow.ShadowEvaluator._execution_exit(
+            carry_position(), carry_row(10.0, self.now, bars=bars),
+            self.now, self.cfg)
+
+        self.assertEqual(resolved[0], "stop")
+
+    def test_a_missing_funding_observation_never_manufactures_an_exit(self):
+        self.assertIsNone(shadow.ShadowEvaluator._execution_exit(
+            carry_position(), carry_row(None, self.now), self.now, self.cfg))
+
+    def test_a_stale_quote_leaves_the_position_unresolved(self):
+        row = carry_row(20.0, self.now)
+        row[brain.ENRICHMENT_KEY]["ticker_ts"] = int((self.now - 60.0) * 1000)
+
+        position = carry_position()
+        self.assertIsNone(shadow.ShadowEvaluator._execution_exit(
+            position, row, self.now, self.cfg))
+        self.assertEqual(
+            position["data_status"], "awaiting_fresh_market_data")
+
+    def test_other_policies_are_untouched_by_the_carry_rule(self):
+        """Every other strategy settles exactly as before.
+
+        This path settles all seven strategies, so the carry rule must be
+        inert for anything that did not pre-register it.
+        """
+        for policy in ("fixed_rr", "extended_rr", None):
+            with self.subTest(exit_policy=policy):
+                position = open_position(
+                    deadline_ts=NOW + 864_000.0, take_price=112.0)
+                if policy is not None:
+                    position["exit_policy"] = policy
+                self.assertIsNone(shadow.ShadowEvaluator._execution_exit(
+                    position, carry_row(1.0, self.now), self.now, self.cfg))
+
+    def test_the_timeout_is_still_the_outer_bound(self):
+        """Funding that never normalises still closes at the deadline."""
+        now = NOW + 180.0
+        bars = [one_minute_bar(NOW_MS + MINUTE_MS * n) for n in (1, 2, 3)]
+        resolved = shadow.ShadowEvaluator._execution_exit(
+            carry_position(deadline_ts=NOW + 60.0),
+            carry_row(90.0, now, bars=bars), now, self.cfg)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved[0], "timeout")

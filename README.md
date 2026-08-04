@@ -164,7 +164,13 @@ state, and `select_universe` feedback that cannot be reconstructed exactly.
 Operational failures invalidate a forward window instead of disappearing as
 missing data. PAPER is local simulation only.
 
-The available exit policies are `fixed_rr` and `extended_rr`.
+The available exit policies are `fixed_rr`, `extended_rr` and
+`carry_until_normalised`. The last one belongs to `funding-carry`, whose return
+source is the funding it collects rather than a directional forecast: it holds
+while funding pays and closes when the 30-day funding percentile falls back to
+its median, instead of on a price target it never claimed to be forecasting.
+Its stop is unchanged, because price risk over the holding window still has to
+be charged against the carry.
 
 ## Tournament and persistence
 

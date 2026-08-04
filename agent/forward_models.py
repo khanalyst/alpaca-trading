@@ -64,6 +64,12 @@ class ForwardOutcomeModel:
     entry_slippage_pct: float | None = None
     stop_slippage_pct: float | None = None
     funding_treatment: str = "observed_realized_settlements"
+    # Only for exit_policy="carry_until_normalised": the 30-day funding
+    # percentile at or below which the carry is considered spent. Fixed on the
+    # contract rather than read from config at exit time, because a
+    # pre-registered exit is the whole reason a paper outcome counts as an
+    # observation rather than a fitted one.
+    carry_exit_funding_percentile: float | None = None
     contract_complete: bool = False
     contract_evidence: tuple[str, ...] = ()
 
@@ -79,6 +85,26 @@ class ForwardOutcomeModel:
             raise ValueError(f"{self.model_id}: unknown entry_style")
         if self.invalidation_anchor not in {"structure", "atr"}:
             raise ValueError(f"{self.model_id}: unknown invalidation anchor")
+        if self.exit_policy not in {
+                "fixed_rr", "extended_rr", "carry_until_normalised"}:
+            raise ValueError(f"{self.model_id}: unknown exit_policy")
+        if self.exit_policy == "carry_until_normalised":
+            if self.carry_exit_funding_percentile is None:
+                raise ValueError(
+                    f"{self.model_id}: a carry exit must state the funding "
+                    "percentile that ends it")
+            if not 0.0 < float(self.carry_exit_funding_percentile) < 100.0:
+                raise ValueError(
+                    f"{self.model_id}: carry exit percentile must be inside "
+                    "(0, 100)")
+            if "funding_percentile_30" not in self.required_fields:
+                raise ValueError(
+                    f"{self.model_id}: a carry exit requires "
+                    "funding_percentile_30")
+        elif self.carry_exit_funding_percentile is not None:
+            raise ValueError(
+                f"{self.model_id}: carry_exit_funding_percentile only "
+                "applies to a carry exit")
         for name in (
                 "signal_timeframe", "entry_assumption", "stop_assumption",
                 "target_assumption", "cost_assumption", "holding_assumption",
@@ -146,6 +172,8 @@ class ForwardOutcomeModel:
                         "confidence": 1.0,
                         "invalidation_anchor": self.invalidation_anchor,
                         "exit_policy": self.exit_policy,
+                        "carry_exit_funding_percentile": (
+                            self.carry_exit_funding_percentile),
                         "execution_choice": "normal",
                         "proposal_source": "deterministic_contract",
                         "strategy_id": self.strategy_id,
@@ -294,16 +322,21 @@ MODELS: dict[str, ForwardOutcomeModel] = {
             horizon_hours=240.0,
             entry_assumption="first observed snapshot after the 1h signal",
             stop_assumption="structure distance with a 3 ATR minimum",
-            target_assumption="fixed 2R price exit while funding is credited",
+            target_assumption="no price target: the position is held while "
+                              "funding pays and closed when the 30-day "
+                              "funding percentile falls back to its median",
             cost_assumption="perpetual only: observed depth/fees and realized "
                             "funding settlements; no invented borrow",
-            holding_assumption="stop/target first, otherwise ten-day timeout",
+            holding_assumption="stop or funding normalisation first, "
+                               "otherwise ten-day timeout",
             required_fields=_COMMON_COST_FIELDS + (
                 "signal_1h_ts", "funding_percentile_30",
                 "funding_samples_30", "perp_index_basis_pct", "trend_1h",
                 "trend_4h", "swing_low_pct", "swing_high_pct"),
             signal_timestamp_field="signal_1h_ts",
-            invalidation_anchor="structure", exit_policy="fixed_rr",
+            invalidation_anchor="structure",
+            exit_policy="carry_until_normalised",
+            carry_exit_funding_percentile=50.0,
             stop_atr_multiple=3.0, reward_risk=2.0, contract_complete=True,
             contract_evidence=(
                 "research/hypotheses/funding-carry.yaml",

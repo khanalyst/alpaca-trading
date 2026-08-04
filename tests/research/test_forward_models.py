@@ -123,10 +123,28 @@ class ForwardModelDeclarationTests(unittest.TestCase):
             with self.subTest(strategy=model.strategy_id):
                 self.assertEqual(
                     (model.signal_timeframe, model.horizon_hours,
-                     model.exit_policy, model.stop_atr_multiple,
-                     model.reward_risk, model.funding_treatment),
-                    ("1h", 240.0, "fixed_rr", 3.0, 2.0,
+                     model.stop_atr_multiple, model.reward_risk,
+                     model.funding_treatment),
+                    ("1h", 240.0, 3.0, 2.0,
                      "observed_realized_settlements"))
+
+    def test_the_two_funding_models_exit_on_different_things(self):
+        """They share a signal cadence and a horizon, not an exit.
+
+        funding-carry earns from the carry, so it closes when the carry is
+        spent. funding-unwind is a directional bet on the crowd being forced
+        out, so a price exit is the right one for it. Collapsing the two onto
+        one exit policy is what made carry scoreable on a move it never
+        claimed to forecast.
+        """
+        carry = BY_STRATEGY["funding-carry"]
+        unwind = BY_STRATEGY["funding-unwind"]
+
+        self.assertEqual(carry.exit_policy, "carry_until_normalised")
+        self.assertEqual(carry.carry_exit_funding_percentile, 50.0)
+        self.assertIn("funding_percentile_30", carry.required_fields)
+        self.assertEqual(unwind.exit_policy, "fixed_rr")
+        self.assertIsNone(unwind.carry_exit_funding_percentile)
 
         self.assertEqual(carry.model_id, "funding_carry.interval.1h.v2")
         self.assertEqual(unwind.model_id, "funding_unwind.reversion.1h.v2")
