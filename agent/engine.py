@@ -2537,20 +2537,36 @@ class Engine:
     def _adverse_r(self, pos: dict, st: dict) -> float | None:
         """How far the position has moved against entry, in units of its stop.
 
-        Returns ``None`` when entry or stop cannot be read, which the caller
-        must treat as "unknown" rather than "not adverse".
+        The stop lives in ``st["protection"][symbol]`` - that is the price
+        actually attached at the exchange, written by ``_record_open`` and
+        kept current by the protection audit. ``active_trades`` carries the
+        planned distance as ``stop_loss_pct`` but never an ``sl_price``, so
+        it is the fallback for a position whose protection row has not been
+        reconciled yet.
+
+        Returns ``None`` when entry, stop or mark cannot be read, which the
+        caller must treat as "unknown" rather than "not adverse".
         """
         symbol = pos.get("symbol")
         trade = (st.get("active_trades") or {}).get(symbol) or {}
+        protection = (st.get("protection") or {}).get(symbol) or {}
         try:
-            entry = float(trade.get("entry_price") or pos.get("entryPrice") or 0)
-            stop = float(trade.get("sl_price") or 0)
+            entry = float(
+                trade.get("entry_price") or pos.get("entryPrice") or 0)
             mark = float(pos.get("markPrice") or 0)
+            stop = float(protection.get("sl_price") or 0)
+            stop_pct = float(trade.get("stop_loss_pct") or 0)
         except (TypeError, ValueError):
             return None
-        if not all(math.isfinite(v) and v > 0 for v in (entry, stop, mark)):
+        if not all(math.isfinite(value) and value > 0
+                   for value in (entry, mark)):
             return None
-        risk_distance = abs(entry - stop)
+        if math.isfinite(stop) and stop > 0:
+            risk_distance = abs(entry - stop)
+        elif math.isfinite(stop_pct) and stop_pct > 0:
+            risk_distance = entry * stop_pct / 100.0
+        else:
+            return None
         if risk_distance <= 0:
             return None
         adverse = (entry - mark) if self._direction(pos) == "long" else (

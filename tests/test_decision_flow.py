@@ -741,12 +741,20 @@ class MinimumHoldTests(unittest.TestCase):
 
         A short entered at 100 with a stop at 110 risks 10; a mark of 105 is
         therefore 0.5R adverse.
+
+        The shape here mirrors what ``_record_open`` actually persists, and
+        that is the point: an earlier version of this fixture invented an
+        ``sl_price`` on the active trade, which meant the gate read a stop
+        that never exists in production, returned None, and failed open on
+        every real position while the test reported success.
         """
         self.pos["markPrice"] = 100.0 + 10.0 * adverse_r
         return {
             "opened_at": {"BTC/USDT:USDT": time.time() - minutes_ago * 60},
-            "active_trades": {
-                "BTC/USDT:USDT": {"entry_price": 100.0, "sl_price": 110.0}},
+            "active_trades": {"BTC/USDT:USDT": {
+                "entry_price": 100.0, "stop_loss_pct": 10.0}},
+            "protection": {"BTC/USDT:USDT": {
+                "side": "short", "sl_price": 110.0, "tp_price": 70.0}},
         }
 
     def _close(self, trigger="thesis_invalidated"):
@@ -796,10 +804,34 @@ class MinimumHoldTests(unittest.TestCase):
         # measure must not be pinned by a floor that assumes we can.
         state = self._state(17)
         state["active_trades"] = {}
+        state["protection"] = {}
         self.pos.pop("markPrice", None)
         self.assertFalse(self.engine._too_young_to_close(
             self.pos, self._close(), state))
         log_event.assert_not_called()
+
+    @patch("agent.engine.state.log_event")
+    def test_the_stop_is_read_from_the_protection_row(self, log_event):
+        """The regression that made this whole gate a no-op.
+
+        `_record_open` writes sl_price to st["protection"][symbol]; the
+        active trade carries only stop_loss_pct. Reading sl_price off the
+        active trade yields None, which fails open, which silently disables
+        the floor for every engine-opened position.
+        """
+        state = self._state(17, adverse_r=0.0)
+        state["active_trades"]["BTC/USDT:USDT"].pop("stop_loss_pct")
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), state))
+
+    @patch("agent.engine.state.log_event")
+    def test_the_planned_stop_pct_is_the_fallback(self, log_event):
+        # A position whose protection row has not been reconciled yet still
+        # has its planned stop distance on the active trade.
+        state = self._state(17, adverse_r=0.0)
+        state["protection"] = {}
+        self.assertTrue(self.engine._too_young_to_close(
+            self.pos, self._close(), state))
 
     @patch("agent.engine.state.log_event")
     def test_zero_floor_disables_the_guard(self, log_event):

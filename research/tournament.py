@@ -49,13 +49,15 @@ from agent.registry import REGISTRY, TIERS  # noqa: E402
 try:  # support both `python -m research.tournament` and legacy imports
     from . import gates as gate_mod  # noqa: E402
     from .findings import FindingsStore, _content_hash, resolve_store_path  # noqa: E402
-    from .edge_lab import (Contract, FlushFadeContract,  # noqa: E402
+    from .edge_lab import (DEFAULT_COST_SCENARIO,  # noqa: E402
+                           Contract, FlushFadeContract,
                            FundingCarryContract, TrendMultidayContract,
                            load_dataset, universe_membership)
 except ImportError:  # tests and direct script execution
     import gates as gate_mod  # noqa: E402
     from findings import FindingsStore, _content_hash, resolve_store_path  # noqa: E402
-    from edge_lab import (Contract, FlushFadeContract,  # noqa: E402
+    from edge_lab import (DEFAULT_COST_SCENARIO,  # noqa: E402
+                          Contract, FlushFadeContract,
                           FundingCarryContract, TrendMultidayContract,
                           load_dataset, universe_membership)
 
@@ -984,8 +986,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--store", type=Path, default=None,
         help="findings.db path; defaults to research.findings_store")
-    parser.add_argument("--cost", default="base",
-                        help="cost scenario the gates score against")
+    parser.add_argument("--cost", default=DEFAULT_COST_SCENARIO,
+                        help="cost scenario the gates score against; defaults to the account's real taker rate")
     parser.add_argument("--exit-policy", default="fixed_rr")
     parser.add_argument("--min-bars", type=int, default=8000)
     parser.add_argument("--top-n", type=int, default=10)

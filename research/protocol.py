@@ -271,57 +271,52 @@ def paired_arm_comparison(
     common = sorted(
         set(left_resolved) & set(right_resolved), key=repr)
 
-    # A pair where BOTH arms vetoed carries no information about the axis.
-    # Pairing vetoes is correct and necessary - for a confidence floor or an
-    # exposure cap the hypothesis IS the value of trades one arm admits while
-    # the other suppresses - but that argument only covers pairs where the
-    # arms DISAGREE, or where both traded and the outcomes can differ. When
-    # both arms refuse the same proposal the delta is exactly 0.0 by
-    # construction, for every such pair, in every resample.
+    # Concordant vetoes - pairs both arms refused - stay in the estimate.
     #
-    # Including them is not neutral, it is dilution. The mean delta becomes
-    # (true delta on informative pairs) * (informative pairs / total pairs),
-    # and a deterministic contract emits both directions for every setup type
-    # on every symbol every cycle, so the concordant-veto population runs to
-    # tens of thousands. Measured over 4 simulated days: scalp-maker logged
-    # 23,040 decisions, 0 trades and 5,200 confirm pairs - every one an exact
-    # (0, 0). Against ~100 informative trades that is a 200x shrink of the
-    # estimate toward zero, and the gate requires an interval ENTIRELY above
-    # zero.
+    # They are tempting to drop, because their delta is exactly 0.0 in every
+    # resample and a deterministic contract emits enough of them to swamp the
+    # informative pairs. Dropping them is wrong: it silently changes the
+    # estimand from "mean return difference per OPPORTUNITY" to "per
+    # opportunity where at least one arm acted", and those answer different
+    # questions. A policy is run over all opportunities, so a variant that
+    # gains +1R on 1% of them is worth +0.01R per opportunity, not +1R.
+    # Deleting the zeros reports the second number, and also removes the
+    # uncertainty those clusters contribute, so a rarely-active variant can
+    # clear promotion on a materially inflated effect. It would additionally
+    # contradict this protocol's own invariant that a veto is an explicit
+    # paired 0R action and that null results carry equal weight.
     #
-    # Worse, an all-concordant population yields interval.high == 0.0, which
-    # the outcome evaluator reads as BASELINE_DELTA_NONPOSITIVE and records
-    # as FAILED - so a strategy that merely never fired was booked as having
-    # been tested and lost.
+    # What IS a real defect is the all-veto window. When no pair is
+    # informative the interval collapses onto exactly [0, 0], and the outcome
+    # evaluator reads interval.high <= 0 as BASELINE_DELTA_NONPOSITIVE and
+    # records FAILED - so a strategy that simply never fired is booked as
+    # having been tested and lost. Measured over 4 simulated days:
+    # scalp-maker logged 23,040 decisions, 0 trades and 5,200 confirm pairs,
+    # every one an exact (0, 0).
     #
-    # Concordant vetoes stay in proposal_union_n and therefore in coverage:
-    # they are evidence that both arms saw the proposal, just not evidence
-    # about the difference between them.
+    # That belongs to adequacy, not performance. `informative_pairs` is
+    # reported so a window with nothing to compare is refused as inadequate
+    # instead of being scored, and the estimate keeps every observation.
     def _concordant_veto(key) -> bool:
         return (left_resolved[key][2] == "vetoed"
                 and right_resolved[key][2] == "vetoed")
 
-    informative = [key for key in common if not _concordant_veto(key)]
-    concordant_vetoes = len(common) - len(informative)
+    concordant_vetoes = sum(1 for key in common if _concordant_veto(key))
+    informative_pairs = len(common) - concordant_vetoes
     pairs = [
         (max(left_resolved[key][0], right_resolved[key][0]),
          left_resolved[key][1], right_resolved[key][1])
-        for key in informative
+        for key in common
     ]
     interval = cluster_block_bootstrap_difference(pairs)
     union = left_proposed | right_proposed
     result = {
         "interval": interval,
-        # paired_n is the population the interval was actually computed from,
-        # so the adequacy floors govern informative pairs. Counting
-        # concordant vetoes here would let an arm claim thousands of pairs
-        # while the bootstrap resampled almost none of them - adequacy
-        # satisfied by rows that cannot move the estimate.
-        "paired_n": len(informative),
-        # Every exactly-matched proposal, informative or not. Coverage is a
-        # statement about whether both arms saw the same opportunities, which
-        # concordant vetoes do evidence.
-        "matched_n": len(common),
+        "paired_n": len(common),
+        # Pairs where the arms actually differed, or where both traded and
+        # the outcomes could differ. Zero of these means there is nothing to
+        # compare and the window is inadequate - see paired_window_adequate.
+        "informative_pairs": informative_pairs,
         "concordant_veto_pairs": concordant_vetoes,
         "proposal_union_n": len(union),
         "pair_coverage_pct": (len(common) / len(union) * 100.0
@@ -410,6 +405,13 @@ def paired_window_adequate(comparison: dict, minimum: int) -> bool:
         # its zero width is an absence of evidence that reads like proof.
         and int(bootstrap.get("clusters") or 0) >= MIN_BOOTSTRAP_CLUSTERS
         and not interval.is_degenerate()
+        # At least one pair where the arms actually differed. A window whose
+        # every pair is a concordant veto has an interval of exactly [0, 0],
+        # which the outcome evaluator would otherwise read as a nonpositive
+        # delta and record as FAILED - scoring a strategy that never fired as
+        # one that was tested and lost. Nothing was compared, so the window
+        # is inadequate rather than negative.
+        and int(comparison.get("informative_pairs") or 0) > 0
     )
 
 

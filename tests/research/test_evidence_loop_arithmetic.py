@@ -62,15 +62,22 @@ class DurationFloorIsReachableTests(unittest.TestCase):
         self.assertTrue(validate_config(shipped_config()))
 
 
-class ConcordantVetoDilutionTests(unittest.TestCase):
-    """Pairs where both arms vetoed cannot move the estimate.
+class ConcordantVetoTests(unittest.TestCase):
+    """Concordant vetoes stay in the estimate; an all-veto window is inadequate.
 
-    Pairing vetoes is right for policy axes - the hypothesis is the value of
-    trades one arm admits while the other suppresses - but that only covers
-    pairs where the arms DISAGREE. When both refuse the same proposal the
-    delta is exactly 0.0 in every resample, and a deterministic contract
-    emits both directions for every setup type on every symbol every cycle,
-    so those pairs run to tens of thousands against ~100 informative trades.
+    Both halves matter and they pull in opposite directions.
+
+    Keeping them is required for the estimand. A policy runs over every
+    opportunity, so a variant that gains +1R on 1% of them is worth +0.01R
+    per opportunity. Dropping the zeros reports +1R instead and removes the
+    uncertainty those clusters carry, which would let a rarely-active variant
+    clear promotion on an inflated effect - and would contradict this
+    protocol's own rule that a veto is an explicit paired 0R action.
+
+    Refusing an all-veto window is required for correctness. With nothing
+    informative the interval collapses onto exactly [0, 0], which the outcome
+    evaluator reads as a nonpositive delta and records as FAILED, booking a
+    strategy that never fired as one that was tested and lost.
     """
 
     @staticmethod
@@ -94,50 +101,56 @@ class ConcordantVetoDilutionTests(unittest.TestCase):
             right.append(self._decision(i, r_multiple=0.0, result="vetoed"))
         return left, right
 
-    def test_concordant_vetoes_are_excluded_from_the_delta(self):
+    def test_concordant_vetoes_are_counted_and_kept(self):
         left, right = self._arms(informative=40, concordant_vetoes=4_000)
         result = protocol.paired_arm_comparison(left, right)
 
-        self.assertEqual(result["paired_n"], 40)
+        self.assertEqual(result["paired_n"], 4_040)
+        self.assertEqual(result["informative_pairs"], 40)
         self.assertEqual(result["concordant_veto_pairs"], 4_000)
-        self.assertEqual(result["matched_n"], 4_040)
 
-    def test_coverage_still_counts_every_matched_proposal(self):
-        # Concordant vetoes are evidence that both arms saw the same
-        # opportunities, which is exactly what coverage is about.
+    def test_the_estimand_stays_per_opportunity(self):
+        """+1R on 1% of opportunities is worth +0.01R, and must report as it.
+
+        Dropping the zeros would report +1R for this variant - the return
+        conditional on it acting - which is not the number a policy decision
+        turns on.
+        """
+        left, right = self._arms(informative=40, concordant_vetoes=3_960)
+        result = protocol.paired_arm_comparison(left, right)
+
+        self.assertAlmostEqual(result["interval"].point, 0.01, places=6)
+
+    def test_coverage_counts_every_matched_proposal(self):
         left, right = self._arms(informative=10, concordant_vetoes=90)
         result = protocol.paired_arm_comparison(left, right)
 
         self.assertEqual(result["pair_coverage_pct"], 100.0)
 
-    def test_dilution_no_longer_collapses_a_real_difference(self):
-        """The failure mode this exists to prevent.
-
-        With concordant vetoes included, 40 clean +1R differences against
-        4,000 exact zeros shrink the mean delta by ~100x and drag the
-        interval onto zero. The gate requires an interval entirely above
-        zero, so a real effect reads as no effect.
-        """
-        left, right = self._arms(informative=40, concordant_vetoes=4_000)
-        result = protocol.paired_arm_comparison(left, right)
-
-        self.assertGreater(result["interval"].low, 0.0)
-        self.assertAlmostEqual(result["interval"].point, 1.0, places=6)
-
-    def test_an_all_veto_population_reports_no_pairs_rather_than_a_zero_delta(
-            self):
+    def test_an_all_veto_window_is_inadequate_not_negative(self):
         """A strategy that never fired must not look like one that was tested.
 
-        All-concordant pairs used to yield interval.high == 0.0, which the
+        All-concordant pairs yield an interval of exactly [0, 0], which the
         outcome evaluator reads as BASELINE_DELTA_NONPOSITIVE and records as
-        FAILED. Reporting zero informative pairs routes it to the adequacy
-        gate instead, where it belongs.
+        FAILED. Zero informative pairs routes it to the adequacy gate
+        instead, where it belongs.
         """
         left, right = self._arms(informative=0, concordant_vetoes=500)
         result = protocol.paired_arm_comparison(left, right)
 
-        self.assertEqual(result["paired_n"], 0)
+        self.assertEqual(result["informative_pairs"], 0)
+        self.assertEqual(result["interval"].low, 0.0)
+        self.assertEqual(result["interval"].high, 0.0)
         self.assertFalse(protocol.paired_window_adequate(result, 1))
+
+    def test_a_mixed_window_is_not_refused_by_the_informative_floor(self):
+        # The floor targets the all-veto case only; it must not become a
+        # second sample requirement on ordinary mixed evidence.
+        left, right = self._arms(informative=1, concordant_vetoes=200)
+        result = protocol.paired_arm_comparison(left, right)
+
+        self.assertEqual(result["informative_pairs"], 1)
+        self.assertTrue(protocol.paired_window_adequate(result, 1))
 
 
 class FeeDivergenceTests(unittest.TestCase):

@@ -31,8 +31,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from research.edge_lab import (  # noqa: E402
-    COST_SCENARIOS, Contract, Costs, HOUR_MS, build_trades, evidence_masks,
-    load_dataset, non_overlapping, simulate, summarize, universe_membership,
+    COST_SCENARIOS, DEFAULT_COST_SCENARIO, Contract, Costs, HOUR_MS,
+    build_trades, evidence_masks, load_dataset, non_overlapping, simulate,
+    summarize, universe_membership,
 )
 
 pd.set_option("display.width", 200)
@@ -137,7 +138,7 @@ def stage_latency(frames, membership, out: dict) -> None:
     print("STAGE 2 - DECISION LATENCY (300s cycle is not 15m-aligned)")
     print("=" * 78)
     contract = Contract()
-    costs = COST_SCENARIOS["base"]
+    costs = COST_SCENARIOS[DEFAULT_COST_SCENARIO]
     rows = []
     for delay in (0, 1, 2, 3):
         shifted = {}
@@ -272,7 +273,7 @@ def stage_conditional(frames, membership, out: dict) -> None:
     print("STAGE 3 - WHERE IS EXPECTANCY POSITIVE? (conditional slices)")
     print("=" * 78)
     contract = Contract()
-    costs = COST_SCENARIOS["base"]
+    costs = COST_SCENARIOS[DEFAULT_COST_SCENARIO]
     trades = non_overlapping(build_trades(frames, membership, contract, costs))
     trades = tag(trades, frames)
     if trades.empty:
@@ -326,7 +327,7 @@ def stage_sweep(frames, membership, out: dict) -> None:
     print("\n" + "=" * 78)
     print("STAGE 4 - PARAMETER SWEEP ON A PURGED WALK-FORWARD SPLIT")
     print("=" * 78)
-    costs = COST_SCENARIOS["base"]
+    costs = COST_SCENARIOS[DEFAULT_COST_SCENARIO]
     grid = []
     for min_stop in (0.75, 1.0, 1.5, 2.0):
         for rr in (1.0, 1.5, 2.0, 3.0):
@@ -462,7 +463,7 @@ def stage_oracle(frames, membership, out: dict) -> None:
     print("STAGE 6 - SELECTOR HEADROOM (what could the LLM add, at best?)")
     print("=" * 78)
     contract = Contract()
-    costs = COST_SCENARIOS["base"]
+    costs = COST_SCENARIOS[DEFAULT_COST_SCENARIO]
     trades = non_overlapping(build_trades(frames, membership, contract, costs))
     trades = tag(trades, frames)
     if trades.empty:
@@ -561,7 +562,7 @@ def stage_power(frames, membership, out: dict) -> None:
     print("=" * 78)
     contract = Contract()
     trades = non_overlapping(build_trades(
-        frames, membership, contract, COST_SCENARIOS["base"]))
+        frames, membership, contract, COST_SCENARIOS[DEFAULT_COST_SCENARIO]))
     if trades.empty:
         print("no trades")
         return
