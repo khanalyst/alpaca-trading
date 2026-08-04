@@ -1994,6 +1994,15 @@ def build(
 
     evaluators = {}
     for strategy_id in sorted(strategy_registry.REGISTRY):
+        spec = strategy_registry.spec_for(strategy_id)
+        # A strategy whose horizon cannot reach the closed-trade floor is
+        # researched offline rather than holding a real-time lane open for
+        # hundreds of days to produce nothing. The active strategy is never
+        # skipped: it is the one on the order path, so its evidence is
+        # collected regardless of how long a verdict takes.
+        if not spec.realtime_eligible and strategy_id != str(
+                cfg["strategy"]["id"]):
+            continue
         strategy_cfg = _research_cfg(cfg, strategy_id)
         evaluator = _build_strategy_evaluator(
             strategy_cfg, registry, ["*"], scope_key=resolved_scope,

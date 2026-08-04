@@ -34,9 +34,18 @@ v1-v4 remain immutable historical rows and must not be pooled with current
 outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the clean
 fork caused by immutable experiment-provenance binding.
 
-All seven strategies receive the same market snapshot and timestamp. Each has
-independent paper cash, positions, risk state, decisions, and trades. Only
-`momentum/phase1-v3` is connected to the configured demo order path.
+Four strategies receive the same market snapshot and timestamp in the
+real-time loop: `momentum`, `flush-fade`, `ls-ratio-fade` and `scalp-maker`.
+Each has independent paper cash, positions, risk state, decisions, and trades.
+Only `momentum/phase1-v3` is connected to the configured demo order path.
+
+`funding-carry`, `funding-unwind` and `trend-multiday` are registered but
+`realtime_eligible=False`, so they are researched offline instead. This is
+arithmetic rather than preference: a verdict needs 100 closed trades per arm,
+and with three concurrent slots a 240h contract closes ~0.3 trades a day and a
+336h contract ~0.2. That is 330-480 days for a single real-time verdict, every
+day of which occupies a lane a testable strategy could use. Offline the same
+contracts run over two years of history in minutes.
 
 ## Strategy definitions
 
@@ -345,6 +354,18 @@ keeps:
 
 The default assignment closes only after both ten elapsed days and 100
 comparable paired observations. Restart restores the active assignment.
+
+Attempts pool rather than restart. A completed attempt's decisions and trades
+are carried into the next attempt's verdict when scope, strategy, both variant
+identities and the full code/config identity match exactly; a differing
+ancestor ends the chain rather than being mixed in. This matches what
+`forward-qualify` already does with eligible completed attempts, and it is
+what makes the closed-trade floor reachable at all: one ten-day attempt yields
+roughly 15 closed trades at a 48h horizon, so a hundred needs about seven.
+`MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS` is therefore a sample budget, not a retry
+allowance. Pooled verdicts carry a `POOLED_ACROSS_ATTEMPTS` limitation
+recording that returns span the chain while mark-to-market drawdown covers
+only the latest attempt.
 
 Ten days is an arithmetic floor, not a preference. The confirmation window is
 the last 30% of the assignment calendar and must span at least eight distinct

@@ -117,6 +117,18 @@ class StrategySpec:
     # setup types. An implemented evidence builder is sufficient for shadow
     # research but not sufficient to make the active LLM trading path valid.
     analyst_ready: bool = False
+    # False when the strategy's holding period makes a real-time verdict
+    # unreachable, so it is researched offline instead of occupying a live
+    # rotation lane.
+    #
+    # This is arithmetic, not preference. A verdict needs MIN_ROUND_TRIPS
+    # closed trades per arm. With three concurrent slots a strategy closes at
+    # most 3/(horizon in days) per day, so a 336h contract yields ~0.2/day:
+    # roughly 480 days for one verdict, and every one of those days occupies
+    # a lane that a testable strategy could use. Offline the same contract
+    # runs over two years of history in minutes, which is where a multi-day
+    # hold belongs.
+    realtime_eligible: bool = True
     # True only when research/export_live.py has a validated stop/target,
     # cost and holding model for this mechanism. Raw shadow signals may be
     # collected without it, but they must not be converted into expectancy.
@@ -335,6 +347,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("carry",),
+            realtime_eligible=False,   # 240h hold: ~0.3 closes/day against a 100-trade floor, so a r...
             forward_model_id="funding_carry.interval.1h.v2",
             forward_model_ready=True,
             implemented=True,
@@ -388,6 +401,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("positioning_unwind",),
+            realtime_eligible=False,   # 240h hold: same arithmetic as funding-carry. Its attribution...
             forward_model_id="funding_unwind.reversion.1h.v2",
             forward_model_ready=True,
             implemented=True,
@@ -425,6 +439,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=336.0,
             execution_style="taker",
             setup_types=("trend_follow",),
+            realtime_eligible=False,   # 336h hold: ~0.2 closes/day, roughly 480 days for one real-ti...
             forward_model_id="trend_multiday.4h.v2",
             forward_model_ready=True,
             implemented=True,

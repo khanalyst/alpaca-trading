@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 
-from agent import shadow, variants
+from agent import registry, shadow, variants
 from agent.forward_models import BY_STRATEGY
 from research.findings import FindingsStore
 from tests.helpers import valid_config
@@ -61,7 +61,7 @@ class SameFeedCoordinatorTests(unittest.TestCase):
         return shadow.build(
             self.cfg, {}, scope_key=self.scope, store=self.store)
 
-    def test_all_seven_process_the_exact_same_snapshot_and_timestamp(self):
+    def test_every_realtime_strategy_processes_the_same_snapshot_and_ts(self):
         coordinator = self.build()
         snapshot = {SYMBOL: market_row()}
         now = time.time()
@@ -70,8 +70,14 @@ class SameFeedCoordinatorTests(unittest.TestCase):
             snapshot, now=now, cycle_id="same-feed",
             proposals=[momentum_proposal()])
 
-        self.assertEqual(coordinator.strategy_ids, sorted(BY_STRATEGY))
-        self.assertEqual(len(coordinator.last_cycle_by_strategy), 7)
+        # Long-horizon strategies are researched offline: their closed-trade
+        # floor is unreachable in real time, so they do not hold a lane.
+        expected = sorted(
+            sid for sid in BY_STRATEGY
+            if registry.spec_for(sid).realtime_eligible)
+        self.assertEqual(coordinator.strategy_ids, expected)
+        self.assertEqual(
+            len(coordinator.last_cycle_by_strategy), len(expected))
         for strategy_id, observed in coordinator.last_cycle_by_strategy.items():
             with self.subTest(strategy=strategy_id):
                 self.assertEqual(observed["timestamp"], now)
@@ -102,9 +108,10 @@ class SameFeedCoordinatorTests(unittest.TestCase):
             with self.subTest(strategy=strategy_id):
                 self.assertEqual(other["cash_usdt"], 10_000.0)
 
-    def test_one_strategy_failure_does_not_stop_the_other_six(self):
+    def test_one_strategy_failure_does_not_stop_the_others(self):
         coordinator = self.build()
-        broken = coordinator.evaluators["funding-carry"]
+        broken_id = "flush-fade"
+        broken = coordinator.evaluators[broken_id]
 
         def fail(*args, **kwargs):
             raise RuntimeError("synthetic strategy-local failure")
@@ -116,9 +123,9 @@ class SameFeedCoordinatorTests(unittest.TestCase):
 
         self.assertIn(
             "synthetic strategy-local failure",
-            coordinator.last_cycle_by_strategy["funding-carry"]["error"])
+            coordinator.last_cycle_by_strategy[broken_id]["error"])
         for strategy_id in coordinator.strategy_ids:
-            if strategy_id == "funding-carry":
+            if strategy_id == broken_id:
                 continue
             with self.subTest(strategy=strategy_id):
                 baseline = variants.baseline_variant_id(strategy_id)

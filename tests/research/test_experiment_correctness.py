@@ -372,10 +372,18 @@ class ExperimentCorrectnessTests(unittest.TestCase):
         self.assertEqual(second["attempt"], 2)
         self.assertEqual(second["retry_of_assignment_id"], first["assignment_id"])
 
-    def test_automatic_retry_caps_at_three_but_explicit_retry_continues(self):
+    def test_automatic_retry_caps_at_the_budget_but_explicit_retry_continues(
+            self):
+        # The cap is a sample budget now that attempts pool rather than
+        # restart: it has to be large enough for the closed-trade floor to
+        # be reachable at the strategy's own horizon.
         scope = "demo:auto-retry-cap"
         current = self.assignment(scope)
-        for expected_attempt, now in ((1, 2.0), (2, 4.0), (3, 6.0)):
+        attempts = [
+            (n, 2.0 * n)
+            for n in range(
+                1, findings.MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS + 1)]
+        for expected_attempt, now in attempts:
             self.assertEqual(current["attempt"], expected_attempt)
             self._complete_below_floor(current, now=now)
             prioritized = self.store.prioritized_experiment_candidates(
@@ -408,7 +416,9 @@ class ExperimentCorrectnessTests(unittest.TestCase):
             scope, "momentum", self.baseline.variant_id, explicit,
             minimum_duration_seconds=0, minimum_observations=1, now=9.0)
         self.assertEqual(selection["current_status"], "ACCEPTED")
-        self.assertEqual(fourth["attempt"], 4)
+        self.assertEqual(
+            fourth["attempt"],
+            findings.MAX_AUTOMATIC_EXPERIMENT_ATTEMPTS + 1)
         self.assertEqual(
             fourth["retry_of_assignment_id"], current["assignment_id"])
 
