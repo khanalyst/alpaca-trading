@@ -49,7 +49,7 @@ falsification: |
   - the placebo reaches 25% or more of the candidate;
   - it fails to beat the random-timing and random-direction nulls.
 
-# --- exactly what will be tested -------------------------------------------
+# Test definition
 signal_timeframe: 1h
 funding_extreme_pct_per_8h: 0.01
 percentile: 80.0
@@ -59,7 +59,7 @@ reward_risk: 2.0
 max_hold_bars: 960
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-# --- the parameterisations that will be tested -----------------------------
+# Parameterizations
 # Registered 2026-07-30. The percentile is the whole hypothesis here: the claim
 # is that funding measures POSITIONING, so the unwind should strengthen as
 # positioning gets more crowded and weaken as it gets less. That is a

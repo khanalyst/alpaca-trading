@@ -78,11 +78,11 @@ def build(data: Path, flow: Path) -> pd.DataFrame:
             / merged["ls_ratio"].rolling(72, min_periods=24).std())
         merged["ls_change"] = merged["ls_ratio"].pct_change() * 100
 
-        # Contemporaneous return of the same hour the flow was measured in.
+        # Return over the hour containing the flow observation.
         merged["ret_same_hour"] = (
             (merged["close"] - merged["open"]) / merged["open"] * 100)
-        # Forward returns start at the NEXT hour's open: the flow figure for
-        # an hour is only known once that hour has closed.
+        # Forward returns begin at the next hour's open because the flow value
+        # is available only after the observed hour closes.
         open_ = merged["open"].to_numpy(float)
         for h in HORIZONS_H:
             entry = np.roll(open_, -1)

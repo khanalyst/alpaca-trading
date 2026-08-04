@@ -1,6 +1,4 @@
-# Order-book depth and the short-retention statistics series. OKX never
-# serves this historically, so every hour this is not running is data that
-# cannot be bought back at any price. Start it before anything else.
+# OKX does not provide historical order-book depth; start the recorder first.
 [Unit]
 Description=OKX market-data recorder
 After=network-online.target

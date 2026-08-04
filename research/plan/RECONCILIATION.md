@@ -1,14 +1,26 @@
 # Current evidence reconciliation policy
 
 This is the short policy used by the current pipeline. It replaces the old
-branch-by-branch reconciliation plan.
+branch-by-branch reconciliation plan. Executable code and `config.yaml` are
+behavioural authority; this file records the evidence boundaries that code
+enforces.
 
 ## Authority
 
 - Real-time strategy assignments first produce deterministic `WORKED`,
   `FAILED`, or `INCONCLUSIVE` outcomes. `WORKED` is RESEARCH_ONLY and cannot
   change capital or configuration.
-- Journal replay is authoritative only after a current G2 PASS.
+- The active simulator is feed v6: four realtime lanes use deterministic
+  contract proposals on the same snapshot/timestamp. The registered
+  `funding-carry`, `funding-unwind`, and `trend-multiday` models are offline-only.
+  The analyst's actual choices remain in a separate `:llm` scope and are not
+  pooled with lane comparisons.
+- The default assignment floor is ten elapsed days and 100 comparable paired
+  observations; both are required before rotation.
+- Journal replay is authoritative only after a current G2 PASS. G2 compares
+  pre-risk proposal keys `(cycle_id, symbol, direction)` with replay keys,
+  requires at least 99% reproduction, and does not reproduce full contract or
+  execution semantics. A failed, stale, or vacuous G2 blocks downstream use.
 - The OHLCV tournament is exploratory. It may reject, rank, or withhold a
   strategy, but it awards no tier above `T2_CANDIDATE` and cannot promote live
   capital.

@@ -191,43 +191,22 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # Pinned by hand. A value derived from build_system() would agree
         # with itself no matter what the prompt said, which is the one thing
         # this assertion must not do.
-        #
-        # b9a09a9dc3bc59ec -> 8d99182f0dcea1c4 in batch 6.1, which removed
-        # structure_target from the model's option set and tightened the
-        # invalidation-anchor rule.
-        # 8d99182f0dcea1c4 -> 0f85dcf00f2acd36 in batch 6.3, which replaced
-        # the unlabelled `other` escape hatch with a versioned list of
-        # registered hypotheses injected into the prompt.
-        # 0f85dcf00f2acd36 -> c61905480bfef239 in R4-02, which made the
-        # hypothesis descriptions parameter-backed and explicitly stated
-        # that the registered contract threshold is the tested point.
-        #
-        # Both are deliberate attribution forks: observations either side of
-        # them describe different decision spaces and must never be pooled.
-        # strategy.version moved phase1-v2 -> phase1-v3 with the second, so
-        # the fork is visible in the journal without reading a prompt hash.
-        # c61905480bfef239 -> 8790863bfadaf741 in R4-03, which added the
-        # bounded registered numeric research-proposal schema, then
-        # 8790863bfadaf741 -> 913e4bb0572a6e4e when proposal reasoning became
-        # required and persisted with the adaptive setting history.
-        # 913e4bb0572a6e4e -> 59f873815ffd3646 when each adaptive setting began
-        # naming its exact target parameter and semantic bounds in the prompt.
-        # 59f873815ffd3646 -> 2e6c312ae9d80316 when the bounded research
-        # selector enumerated only registered single-axis strategy settings
-        # and made its no-live-execution authority explicit.
-        # That changes the model's proposal domain, so attribution must fork.
-        # 2e6c312ae9d80316 -> ffbd0360d5f624c9 when the selectable research
-        # catalog changed: feasible axes, stricter confidence floors, and
-        # maker penetration.
-        # ffbd0360d5f624c9 -> 608188bfb1314d2e when nine momentum arms were
-        # retired on live demo evidence: the three observable confidence
-        # floors (the 0.70-0.80 bucket went 0 for 13, so the axis runs the
-        # wrong way) and both breakout discriminators (2 range_breakout
-        # trades in 24 round trips, so neither is measurable). The selector's
-        # menu is part of the prompt, so removing options changes the
-        # model's decision space and attribution forks - which is the point:
-        # evidence collected against the old menu must not pool with the new.
-        # This constant moves only in a batch that intends it.
+        # Digest ledger for interpreting historical journal attribution:
+        # b9a09a9dc3bc59ec -> 8d99182f0dcea1c4: removed structure_target and
+        # tightened the invalidation-anchor rule.
+        # 8d99182f0dcea1c4 -> 0f85dcf00f2acd36: replaced `other` with registered
+        # hypotheses. 0f85dcf00f2acd36 -> c61905480bfef239: parameter-backed
+        # descriptions and thresholds; strategy version advanced to phase1-v3.
+        # c61905480bfef239 -> 8790863bfadaf741: bounded numeric proposal schema.
+        # 8790863bfadaf741 -> 913e4bb0572a6e4e: required persisted reasoning.
+        # 913e4bb0572a6e4e -> 59f873815ffd3646: named target and semantic bounds.
+        # 59f873815ffd3646 -> 2e6c312ae9d80316: registered single-axis selector
+        # with explicit no-live-execution authority.
+        # 2e6c312ae9d80316 -> ffbd0360d5f624c9: revised feasible axes,
+        # confidence floors, and maker penetration.
+        # ffbd0360d5f624c9 -> 608188bfb1314d2e: retired nine confidence-floor
+        # and breakout-discriminator arms after live-demo evidence.
+        # Each transition changes the decision space; evidence must not pool.
         self.assertEqual(
             brain.prompt_version(system),
             "608188bfb1314d2e",

@@ -99,7 +99,7 @@ def bucket_table(trades: pd.DataFrame, column: str,
         "expectancy_r", ascending=False).round(3)
 
 
-# ------------------------------------------------------------------ stages
+# Stages
 
 def stage_baseline(frames, membership, out: dict) -> None:
     print("\n" + "=" * 78)

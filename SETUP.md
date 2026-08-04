@@ -1,7 +1,8 @@
 # Setup — Mac and Azure VM
 
-This guide installs the shipped demo configuration. Day-to-day research,
-backup, and recovery procedures are in [OPERATIONS.md](OPERATIONS.md).
+This is the installation and deployment authority for the shipped demo
+configuration. Day-to-day research, backup, and recovery procedures are in
+[OPERATIONS.md](OPERATIONS.md).
 
 Current defaults are OKX `demo`, strategy `momentum/phase1-v3`, LLM provider
 `openai`, and model/deployment identifier `gpt-5.6-sol-coding`. No credential is
@@ -51,8 +52,10 @@ In another terminal:
 
 The configured momentum strategy is `T0_REJECTED`; demo use is an operations
 rehearsal and data-collection path, not a profitable-edge claim. G2 must pass
-before authoritative downstream research is trusted. `INSUFFICIENT_SAMPLE`
-means collection is still open.
+before authoritative downstream research is trusted. G2 compares recorded
+pre-risk proposal keys `(cycle_id, symbol, direction)` with replay keys and
+requires at least 99% reproduction; it does not reproduce full contract or
+execution semantics. `INSUFFICIENT_SAMPLE` means collection is still open.
 
 ## 2. Configuration summary
 
@@ -62,25 +65,28 @@ means collection is still open.
 | `strategy.id` / `strategy.version` | `momentum` / `phase1-v3` |
 | `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol-coding` |
 | `cycle.interval_seconds` | `60` seconds for marks, paper exits, housekeeping, and reconciliation |
-| `cycle.decision_interval_seconds` | `300` seconds; model decisions remain slower than safety/mark cycles |
-| `execution.maker_first_enabled` | Omitted, validated default `false` (B7.5 disabled) |
-| `execution.maker_first_wait_seconds` | Omitted, validated default `20` seconds |
+| `cycle.decision_interval_seconds` | `300` elapsed seconds (95% jitter tolerance); model decisions remain slower than safety/mark cycles |
+| `execution.maker_first_enabled` | `true` in shipped demo (B7.5); rejected in live mode |
+| `execution.maker_first_wait_seconds` | `20` seconds before IOC fallback |
 | `research.shadow_enabled` | `true` |
 | `research.shadow_variants` | `[*]` |
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
-| `research.forward_feed_version` | `5`; v5 is a clean immutable-provenance fork; v1-v4 remain historical, with v4 the market-data plumbing repair feed |
-| `research.experiment_min_duration_days` | `3` |
+| `research.forward_feed_version` | `6`; v6 uses deterministic proposals in four realtime lanes; three long-horizon models are offline-only; v1-v5 remain historical, with v4 the market-data plumbing repair feed and v5 the immutable-provenance fork |
+| `research.experiment_min_duration_days` | `10` |
 | `research.experiment_min_observations` | `100` |
 | `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |
 
-All seven research strategies receive the same cycle snapshot/timestamp and
-keep independent paper accounts. Each strategy runs a baseline plus at most
-one candidate; both the duration and observation floors must be met before
-rotation. Only the configured main strategy can reach the demo exchange.
+The four realtime strategies receive the same cycle snapshot/timestamp and
+deterministic contract proposals, with independent paper accounts. Each
+realtime strategy runs a baseline plus at most one candidate; both ten elapsed
+days and 100 comparable paired observations must be met before rotation. The
+three long-horizon registered models are offline-only. Only the configured main
+strategy can reach the demo exchange.
 
-The available exit policies are `fixed_rr` and `extended_rr`.
+The available exit policies are `fixed_rr`, `extended_rr`, and
+`carry_until_normalised` (for `funding-carry`).
 
 ## 3. Local checks and tests
 
@@ -636,7 +642,8 @@ identities still match the directory.
 
 ## 9. B7.5 boundary
 
-B7.5 is the optional maker-first order primitive, not the `scalp-maker` shadow
-strategy. How it completes: deliberately enable it in demo and validate its
-fill/cancel/timeout evidence. Why it waits: the shipped default is disabled and
-exchange-only passive-order races are not proven by historical data.
+B7.5 is the maker-first order primitive, not the `scalp-maker` shadow strategy.
+The shipped demo configuration enables it for measurement: validate its
+fill/cancel/timeout evidence before any live-mode consideration. Configuration
+validation rejects maker-first in live mode; exchange-only passive-order races
+are not proven by historical data.

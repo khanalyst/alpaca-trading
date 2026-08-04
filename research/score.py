@@ -171,7 +171,7 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
     return matched, diagnostics
 
 
-# --------------------------------------------------------------- metrics
+# Metrics
 
 def _drawdown(returns: list) -> float:
     """Max peak-to-trough of the cumulative R curve, as a positive number."""
@@ -268,7 +268,7 @@ def compare(variant_returns: list, baseline_returns: list,
     }
 
 
-# ----------------------------------------------------------------- funnel
+# Funnel
 
 FUNNEL_STAGES = ("fired", "proposed", "vetoed", "executed")
 

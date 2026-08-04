@@ -51,8 +51,7 @@ ENV_FILE = ROOT / ".env"
 SECRETS_FILE_ENV = "OKX_AGENT_SECRETS_FILE"
 SECRET_VARS = ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE",
                "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALERT_WEBHOOK_URL")
-# Credentials that were already in the process environment before .env was
-# read — i.e. coming from somewhere other than .env. Reported by `check`.
+# Credentials present before loading .env, reported by `check`.
 SHELL_SOURCED: list[str] = []
 
 
@@ -176,8 +175,6 @@ def _flatten(cfg, reason: str) -> bool:
               f"See {state.RUNTIME / 'agent.log'} and inspect OKX manually.")
     return ok
 
-
-# ------------------------------------------------------------------ commands
 
 def cmd_run(args, cfg) -> int:
     run_lock = state.acquire_run_lock()
@@ -370,11 +367,7 @@ def cmd_check(args, cfg) -> int:
             print(f"  Eligible crypto universe: {len(universe)} "
                   f"instrument(s)")
             print(f"  Universe head: {', '.join(universe[:5]) or 'none'}")
-            # Every offline cost model reads the CONFIGURED fee, so a gap
-            # between it and the account's real rate voids the research
-            # corpus even while live sizing stays correct. Fail the check:
-            # this is the exact defect that went unnoticed for the whole
-            # demo run.
+            # Configured fees must match account fees for comparable research.
             probe = universe[0] if universe else None
             fetched = None
             if probe is not None:
@@ -552,12 +545,9 @@ def main() -> int:
             state.RuntimeIdentityError) as exc:
         _print_configuration_error(exc)
         return 2
-    # These controls write only local durable state. They must remain usable
-    # during credential loss, .env rotation or an exchange outage. Commands
-    # that also flatten load credentials only after PAUSED/KILLED is saved.
-    # "strategies" only reads the register and the local config, so it must
-    # work before .env exists - it is the command that tells a new operator
-    # what may be configured in the first place.
+    # Local controls remain available during credential or exchange failure;
+    # flattening loads credentials only after PAUSED/KILLED is durable.
+    # Strategy inspection reads only local configuration and the registry.
     credential_free = args.command in {"pause", "resume", "kill", "strategies"}
     try:
         if not credential_free:
@@ -574,9 +564,7 @@ def main() -> int:
         _print_configuration_error(exc)
         return 2
     if credential_free:
-        # pause/resume/kill act on local state alone and are deliberately
-        # given no config, so a malformed block cannot block a stop command.
-        # "strategies" is the exception: it reports on the config itself.
+        # Malformed configuration must not block local stop controls.
         return _dispatch(args, cfg if args.command == "strategies" else None)
     return _dispatch(args, cfg)
 

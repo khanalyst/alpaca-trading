@@ -113,7 +113,7 @@ def walk_forward_masks(trades: pd.DataFrame,
     return trades["entry_ts"] <= cut, trades["entry_ts"] > cut + purge
 
 
-# ------------------------------------------------------------------ gates
+# Gates
 
 def has_mechanism(spec) -> GateResult:
     """Gate 5. Run first because it costs nothing and is disqualifying.
@@ -409,7 +409,7 @@ def is_detectable(frames, membership, contract,
     )
 
 
-# ------------------------------------------------------------------ tiering
+# Tiering
 
 def tier_from_gates(results: list[GateResult]) -> tuple[str, str]:
     """Map gate outcomes onto the register's confidence ladder.

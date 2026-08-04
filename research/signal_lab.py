@@ -35,11 +35,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 BAR_MS = 900_000
 # 15m .. 48h. Anything longer stops being day trading.
 HORIZONS = (1, 2, 4, 8, 16, 32, 64, 96, 192)
-ROUND_TRIP_TAKER_PCT = 0.10      # 0.05% per side at OKX standard rates
-ROUND_TRIP_MAKER_PCT = 0.04      # 0.02% per side if both legs rest
+ROUND_TRIP_TAKER_PCT = 0.10      # Historical 5 bps-per-side scenario.
+ROUND_TRIP_MAKER_PCT = 0.04      # Historical 2 bps-per-side scenario.
 
 
-# ------------------------------------------------------------------ panel
+# Panel
 
 def _zscore(frame: pd.DataFrame, column: str, window: int) -> pd.Series:
     grouped = frame.groupby("symbol", observed=True)[column]
@@ -91,20 +91,20 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
             "in_universe": mask,
         })
 
-        # --- returns over trailing windows, in ATR units where it makes sense
+        # Trailing-window returns, normalized by ATR where applicable.
         series = pd.Series(close)
         for bars, name in ((1, "1b"), (4, "4b"), (16, "16b"),
                            (96, "96b"), (192, "192b")):
             part[f"ret_{name}"] = series.pct_change(bars).to_numpy() * 100
 
-        # --- bar shape
+        # Bar shape.
         span = np.where(high - low > 0, high - low, np.nan)
         part["close_loc"] = (close - low) / span
         part["bar_range_atr"] = (high - low) / close * 100 / part["atr_pct"]
         part["gap"] = (open_ - np.roll(close, 1)) / np.roll(close, 1) * 100
         part.loc[0, "gap"] = np.nan
 
-        # --- consecutive same-direction bars, signed (+3 = three up bars)
+        # Signed consecutive bars (+3 means three up bars).
         direction = np.sign(close - open_)
         changed = np.empty(n, dtype=bool)
         changed[0] = True
@@ -113,12 +113,12 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
         run_start = np.maximum.accumulate(np.where(changed, position, 0))
         part["consec_bars"] = (position - run_start + 1) * direction
 
-        # --- illiquidity: price impact per unit of turnover
+        # Illiquidity: price impact per unit of turnover.
         bar_quote = df["qv_24h_usd"].to_numpy(float) / 96
         part["amihud"] = np.abs(part["ret_1b"]) / np.where(
             bar_quote > 0, bar_quote / 1e6, np.nan)
 
-        # --- residual return vs BTC (idiosyncratic move)
+        # Residual return versus BTC.
         if btc_ret is not None and symbol != "BTC/USDT:USDT":
             beta = np.clip(np.nan_to_num(part["beta"].to_numpy(float), nan=1.0),
                            -3, 3)
@@ -129,7 +129,7 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
             for name in ("4b", "16b", "96b"):
                 part[f"resid_{name}"] = 0.0
 
-        # --- forward returns: next bar open -> open N bars later
+        # Forward returns run from the next bar's open to a later open.
         for h in HORIZONS:
             entry = np.roll(open_, -1)
             exit_ = np.roll(open_, -(1 + h))
@@ -142,7 +142,7 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
     panel = pd.concat(rows, ignore_index=True)
     panel = panel.sort_values(["ts", "symbol"]).reset_index(drop=True)
 
-    # --- volatility-normalized reversal features
+    # Volatility-normalized reversal features.
     for name in ("1b", "4b", "16b", "96b"):
         panel[f"rev_{name}"] = -panel[f"ret_{name}"] / panel["atr_pct"]
         panel[f"residrev_{name}"] = (
@@ -155,7 +155,7 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
     panel["oi_chg_4b"] = panel.groupby("symbol", observed=True)["oi_musd"] \
         .transform(lambda s: s.pct_change(4)) * 100
 
-    # --- forced deleveraging vs new positioning (the OI-price quadrant)
+    # Forced deleveraging versus new positioning (the OI-price quadrant).
     #
     # A price move with open interest FALLING is existing positions being
     # closed, often by a liquidation engine that sells at market regardless
@@ -182,7 +182,7 @@ def build_panel(frames: dict, membership: dict) -> pd.DataFrame:
     return panel
 
 
-# --- cross-sectional ranks, computed per timestamp across live instruments
+# Cross-sectional ranks per timestamp across live instruments.
 
 def add_cross_sectional(panel: pd.DataFrame,
                         columns: tuple[str, ...]) -> pd.DataFrame:
@@ -194,7 +194,7 @@ def add_cross_sectional(panel: pd.DataFrame,
     return panel
 
 
-# -------------------------------------------------------------- evaluation
+# Evaluation
 
 FEATURES = [
     # reversal / overextension

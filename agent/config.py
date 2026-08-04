@@ -14,9 +14,7 @@ from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
                        runnable_ids, spec_for)
 
 
-# Batch 6.4. "none" is the shipped behaviour: the two contracts overlap and
-# nothing separates them. The other two are competing answers to which
-# variable should - see agent/contracts/momentum_phase1v2.py.
+# "none" preserves overlapping breakout and continuation classifications.
 BREAKOUT_DISCRIMINATORS = {"none", "trend_alignment", "volatility_regime"}
 
 
@@ -104,9 +102,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         if (not isinstance(strategy.get(key), str)
                 or not strategy[key].strip()):
             raise ConfigError(f"strategy.{key} must be a non-empty string")
-    # The register is the authority on what may run. It replaces the former
-    # hard-coded 'momentum' check: adding a strategy is now a registry entry
-    # plus a contract, not an edit to this validator.
+    # The registry is authoritative for runnable strategies.
     try:
         spec = spec_for(strategy["id"])
     except UnknownStrategy as exc:
@@ -141,9 +137,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             + f" Reason: {spec.falsification}")
     _boolean(
         strategy, "allow_experimental_setups_in_demo", "strategy")
-    # Batch 6.4. Which variable separates range_breakout from
-    # trend_continuation. Defaults to "none" - the shipped behaviour - so
-    # the choice is made deliberately and its attribution fork is visible.
+    # The discriminator is explicit so classification remains attributable.
     discriminator = strategy.get("breakout_discriminator")
     if discriminator is None:
         strategy["breakout_discriminator"] = "none"
@@ -241,8 +235,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
     _keys(cycle, {"interval_seconds", "decision_interval_seconds",
                   "candles", "timeframes"}, "cycle")
     _integer(cycle, "interval_seconds", 30, 86400, "cycle")
-    # Optional. Absent means decisions run at the housekeeping cadence,
-    # which is the pre-B9.2 behaviour, so an existing config is unaffected.
+    # Absent means decisions run at the housekeeping cadence.
     if cycle.get("decision_interval_seconds") is not None:
         _integer(cycle, "decision_interval_seconds", 30, 86400, "cycle")
         if (cycle["decision_interval_seconds"]
@@ -399,20 +392,12 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                       "entry_failure_backoff_max_minutes",
                       "entry_failure_ttl_minutes"},
           "execution")
-    # B7.5 maker-first path. Off unless set: this is the only research feature that
-    # modifies the entry path, so it must be turned on deliberately.
+    # Maker-first changes the entry path and must be enabled explicitly.
     if execution.get("maker_first_enabled") is not None:
         _boolean(execution, "maker_first_enabled", "execution")
     else:
         execution["maker_first_enabled"] = False
-    # The flag is enabled on demo so gate B7.5 can collect the attempts it
-    # needs, which means a demo config now carries it. Copying that config to
-    # live would put an unvalidated entry path in front of real capital
-    # silently, so live has to say so on purpose.
-    #
-    # B7.5 is what decides the path works, and it collects on demo by its own
-    # remediation text. Until it passes there is nothing to justify running it
-    # live, and once it does, lifting this is one deliberate edit.
+    # Live configuration rejects this demo-only entry path.
     if cfg.get("mode") == "live" and execution["maker_first_enabled"]:
         raise ConfigError(
             "execution.maker_first_enabled is true and mode is live. The "
@@ -474,8 +459,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                   "fee_divergence_tolerance_pct"},
           "trading_costs")
     _number(costs, "taker_fee_pct_per_side", 0, 1, "trading_costs")
-    # Optional: absent means the shipped default is applied by
-    # fee_divergence(), so an older config file still validates.
+    # Absent uses fee_divergence()'s compatibility default.
     if "fee_divergence_tolerance_pct" in costs:
         _number(costs, "fee_divergence_tolerance_pct", 1, 100,
                 "trading_costs")
@@ -496,9 +480,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         raise ConfigError("alerts.minimum_level must be warning, error, or critical")
     _number(alerts, "timeout_seconds", 1, 30, "alerts")
 
-    # Optional. Absent means shadow evaluation is off. The shipped config
-    # explicitly enables isolated variants; custom deployments can omit
-    # the block for a complete no-op.
+    # Absent means shadow evaluation is a complete no-op.
     research = cfg.get("research")
     if research is not None:
         research = _mapping(research, "research")
@@ -527,18 +509,8 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         if "experiment_min_duration_days" in research:
             days = _integer(research, "experiment_min_duration_days", 1, 365,
                             "research")
-            # The confirmation window is the last 30% of the assignment
-            # calendar and must span MIN_BOOTSTRAP_CLUSTERS distinct six-hour
-            # episodes, so the assignment itself has a hard arithmetic floor:
-            #
-            #   8 clusters * 6h / 0.30 = 160h = 6.67 days
-            #
-            # Below it every assignment returns INCONCLUSIVE on cluster count
-            # no matter how much evidence it collects. The shipped value was
-            # 3 days, which produced exactly 4 confirm clusters on all seven
-            # strategies - a guaranteed non-result that no test caught
-            # because the protocol constant and the calendar were never
-            # checked against each other.
+            # The final 30% must contain the protocol's minimum cluster count;
+            # shorter assignments can only return INCONCLUSIVE.
             from research.protocol import (MIN_BOOTSTRAP_CLUSTERS,
                                            PAIR_CLUSTER_SECONDS)
             minimum_days = math.ceil(

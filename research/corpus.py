@@ -57,11 +57,8 @@ class CycleRecord:
     provider: str
     variant_id: str | None = None
     strategy_config_version: str | None = None
-    # Joined from the separate ``snapshot_enrichment`` event, never from the
-    # snapshot above. B0.5 withholds enrichment from the prompt, so it is by
-    # construction absent from ``llm_input`` - which is the point, and which
-    # means a conditioning axis that read the snapshot would silently find
-    # nothing and report every bucket empty.
+    # Enrichment is joined from the separate ``snapshot_enrichment`` event,
+    # never from ``llm_input``; conditioning axes read this private field.
     enrichment: dict = field(default_factory=dict)
 
     def symbols(self) -> list[str]:
@@ -125,7 +122,7 @@ def user_message_of(request: dict, provider: str) -> str | None:
             content = message.get("content")
             if isinstance(content, str):
                 return content
-            # Anthropic also accepts a content-block list.
+            # Anthropic accepts a content-block list as well as plain text.
             if isinstance(content, list):
                 parts = [b.get("text", "") for b in content
                          if isinstance(b, dict)]
@@ -421,10 +418,8 @@ def format_stats(s: dict) -> str:
     if s["providers"]:
         lines.append(f"  providers        {', '.join(s['providers']):>8}")
 
-    # The honest bottom line. The promotion protocol requires 100 matched
-    # round trips per variant and at least three settings along an axis, so
-    # 300 per hypothesis. Saying so here is cheaper than discovering it after
-    # a sweep has run.
+    # Promotion requires 100 matched round trips per setting and at least
+    # three settings on an axis, so a hypothesis needs 300 matched trips.
     trips = s["matched_round_trips"]
     lines += ["", "  " + (
         f"{trips} round trips. A single parameter axis needs ~300 "

@@ -1,12 +1,2 @@
-# Development extras. NOT installed on a trading host: requirements.lock.txt
-# is the production environment and deliberately carries no test runner.
-#
-# The suite is plain unittest, so it runs with no extra packages at all:
-#
-#     python -m unittest discover -s tests -t . -q
-#
-# pytest is optional and only buys nicer output and selection flags:
-#
-#     pip install -r requirements-dev.txt
-#     python -m pytest tests/ -q
+# Optional local test runner; production uses requirements.lock.txt without it.
 pytest==9.0.2

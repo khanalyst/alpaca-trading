@@ -36,7 +36,7 @@ falsification: |
   placebo (identical procedure, entry timing randomised) reaches 25% or more
   of the candidate's expectancy.
 
-# --- exactly what will be tested -------------------------------------------
+# Test definition
 signal_timeframe: 15m
 lookback_bars: 16          # 4 hours
 min_move_atr: 1.5
@@ -47,7 +47,7 @@ reward_risk: 2.0
 max_hold_bars: 96          # 24 hours
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-# --- the parameterisations that will be tested -----------------------------
+# Parameterizations
 # Registered 2026-07-30, after the first verdict and stated as such. The
 # original test scored ONE point - the values above - and the register turned
 # that into T0_REJECTED while its own note said "the mechanism remains
@@ -111,7 +111,7 @@ data_limitation: |
   never for promotion. This limitation is stated before the result so it
   cannot be forgotten after a favourable one.
 
-# --- outcome, appended after the first run ---------------------------------
+# Recorded outcome
 # The parameters above were NOT changed after seeing this result. Tuning them
 # and re-reporting without incrementing hypotheses_tested is precisely how a
 # noise finding becomes a published edge.

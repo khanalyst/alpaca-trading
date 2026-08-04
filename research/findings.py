@@ -275,11 +275,9 @@ _RETRYABLE_INCONCLUSIVE_CODES = {
     "SEGMENT_EXPECTANCY_UNAVAILABLE",
     "BASELINE_DELTA_NOT_ESTABLISHED",
 }
-# Attempts now pool rather than restart, so this is a sample budget, not a
-# retry allowance. It has to be large enough for the floor to be reachable:
-# at a 48h horizon and three concurrent slots a ten-day attempt yields ~15
-# closed trades, so 100 needs about seven. Three could never get there, which
-# made the automatic retry unable to resolve the shortfall it exists for.
+# Attempts pool across windows, so this is a sample budget, not a retry
+# allowance. At a 48h horizon and three concurrent slots, a ten-day attempt
+# yields about 15 closed trades; reaching 100 therefore needs about seven.
 #
 # Strategies whose horizon cannot reach the floor at ANY plausible cap are
 # excluded from the real-time loop by registry.realtime_eligible instead of
@@ -575,9 +573,8 @@ def _experiment_arm_evidence(
             "experiment_provenance")
         if isinstance(provenance, dict) and provenance not in provenances:
             provenances.append(provenance)
-    # Across every pooled attempt, not just the current one: an operational
-    # failure invalidates the window it occurred in, and that window's
-    # evidence is now part of this verdict.
+    # An operational failure invalidates its window across all pooled
+    # attempts, because every pooled window contributes to this verdict.
     failure_clause = " OR ".join("(ts>=? AND ts<=?)" for _ in windows)
     failures = [dict(row) for row in conn.execute(
         "SELECT ts, kind, detail_json FROM paper_failures "
@@ -2684,7 +2681,7 @@ class FindingsStore:
             return [dict(row) for row in conn.execute(
                 "SELECT * FROM schema_migrations ORDER BY version")]
 
-    # ---------------------------------------- tournament and backup evidence
+    # Tournament and backup evidence
 
     def start_tournament_run(self, run: dict) -> None:
         """Append one immutable tournament invocation and its start event."""
@@ -2987,7 +2984,7 @@ class FindingsStore:
                 return item
         return None
 
-    # ------------------------------------------------------- paper research
+    # Paper research
 
     @staticmethod
     def _paper_default(initial_balance: float, now: float) -> dict:
@@ -3547,7 +3544,7 @@ class FindingsStore:
             "revoked_reason": state.get("revoked_reason"),
         }
 
-    # ------------------------------------------------ edge qualification
+    # Edge qualification
 
     def qualification_events(self, variant_id: str) -> list:
         with _connect(self.path) as conn:
@@ -4670,7 +4667,7 @@ class FindingsStore:
                  json.dumps(detail, sort_keys=True, default=str)))
         return event_id
 
-    # --------------------------------------------------------- evidence links
+    # Evidence links
 
     def record_run_evidence(self, run_id: str, evidence: dict) -> None:
         with _connect(self.path) as conn:
@@ -4856,7 +4853,7 @@ class FindingsStore:
             out.append(item)
         return out
 
-    # ------------------------------------------------------------- variants
+    # Variants
 
     @staticmethod
     def _register_variant(
@@ -6048,7 +6045,7 @@ class FindingsStore:
                 _ensure_experiment_outcome_conn(conn, assignment_id)
             return self._assignment_dict(conn, row, timestamp)
 
-    # ------------------------------------------------ experiment learning
+    # Experiment learning
 
     @staticmethod
     def _outcome_dict(row: sqlite3.Row) -> dict:
@@ -6522,7 +6519,7 @@ class FindingsStore:
                 (variant_id,)).fetchone()
         return dict(row) if row else None
 
-    # ----------------------------------------------------------------- runs
+    # Runs
 
     def record_run(self, run_id: str, variant_id: str, result,
                    scorer_version: str = "1", code_version: str = "") -> None:
@@ -6615,7 +6612,7 @@ class FindingsStore:
             return {r["metric"]: dict(r) for r in conn.execute(
                 "SELECT * FROM variant_results WHERE run_id=?", (run_id,))}
 
-    # ------------------------------------------------------------- findings
+    # Findings
 
     def add_finding(self, variant_id: str, kind: str, text: str,
                     author: str = "research", run_id: str = "",
@@ -6646,7 +6643,7 @@ class FindingsStore:
                 "ORDER BY ts ASC, finding_id ASC", (variant_id,))]
 
 
-# --------------------------------------------------------------- scorecards
+# Scorecards
 
 def _fmt(value, spec: str = "+.4f") -> str:
     try:

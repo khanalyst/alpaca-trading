@@ -1,55 +1,43 @@
-# Azure deployment pointer
+# Azure deployment compatibility pointer
 
-The old standalone Azure walkthrough has been merged into [`SETUP.md`](SETUP.md),
-Section 2. Daily operations and reporting are in [`OPERATIONS.md`](OPERATIONS.md).
-This file remains as a compatibility pointer because older deployment links and
-the documentation checks still refer to it.
+This filename is retained for older links and documentation checks. It is not
+an independent deployment guide.
 
-## Canonical documents
-
-- First-time Mac and Azure setup: [`SETUP.md`](SETUP.md).
-- Current configuration and research model: [`README.md`](README.md).
-- Readiness check: `research.py readiness`.
-- Mac/VM operations, reporting, corpus handoff, tournament, and T3 packet:
+- Install and deploy the VM from [`SETUP.md`](SETUP.md).
+- Run the trader, research scheduler, backups, recovery, and handoff from
   [`OPERATIONS.md`](OPERATIONS.md).
+- Use [`README.md`](README.md) for the repository-wide authority hierarchy and
+  current architecture.
+- Use [`deploy/README.md`](deploy/README.md) for the deployment topology and
+  service ownership.
 
-## Data that must be backed up
+Azure resource creation, credentials, and off-host retention are operator
+actions outside this repository. Before VM deletion, follow the verified
+`external_mounted` backup procedure in `SETUP.md` and `OPERATIONS.md`; a path
+or configuration value alone is not VM-loss protection.
 
-The VM contains data that cannot be recreated from the repository. Preserve:
+Compatibility safety anchors retained from the former walkthrough:
 
-- `runtime/research/recorded`;
-- completed immutable trees under `runtime/research/snapshots`;
-- the active `journal.db`;
-- `research/cache/findings.db` and the versioned verified backup set;
-- the corpus manifest and research reports.
+- Check with `research.py readiness` before trusting a run.
+- The `okx` service user is `nologin`; do not use `sudo -iu okx`; run commands
+  with `sudo -u okx` and explicit paths.
+- Preserve `runtime/research/recorded`, completed snapshots, research
+  manifests, forward evidence, `research/results`, the active `journal.db`,
+  and `research/cache/findings.db` in a verified backup before selecting
+  **Delete with VM**. Without a separate retained copy, deleting the VM
+  destroys the corpus.
+- On the legacy systemd lane, install and enable the recorder before the trader:
 
-Use the versioned `research.py backup` workflow. A local-default or same-device
-configured-local copy is not VM-loss protection. Before selecting **Delete with
-VM**, require a verified `external_mounted` backup on a separately provisioned
-different-device mount and confirm it is readable outside the VM. An Azure disk
-**snapshot** may be an additional control, but configuration/path alone is not
-proof. Deleting the VM without a separate verified copy destroys the corpus.
+  ```bash
+  sudo cp deploy/okx-recorder.service /etc/systemd/system/
+  sudo cp deploy/okx-trader.service /etc/systemd/system/
+  sudo cp deploy/okx-research.service /etc/systemd/system/
+  sudo cp deploy/okx-research.timer /etc/systemd/system/
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now okx-recorder
+  sudo systemctl enable --now okx-trader
+  sudo systemctl enable --now okx-research.timer
+  ```
 
-## Service order
-
-The service user is deliberately `nologin`; do not use `sudo -iu okx`. Run
-commands with `sudo -u okx` and explicit paths. Install and enable the units from `deploy/`,
-starting the recorder before the trader:
-
-```bash
-sudo cp deploy/okx-recorder.service /etc/systemd/system/
-sudo cp deploy/okx-trader.service /etc/systemd/system/
-sudo cp deploy/okx-research.service /etc/systemd/system/
-sudo cp deploy/okx-research.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now okx-recorder
-sudo systemctl enable --now okx-trader
-sudo systemctl enable --now okx-research.timer
-```
-
-After provisioning the external mount, add `BACKUP_TARGET` and
-`REQUIRE_EXTERNAL_BACKUP=1` with `systemctl edit okx-research.service`; see
-`SETUP.md` for the exact override and verification commands.
-
-Azure resource creation is outside this repository. There is no provisioning
-code here; Azure AI Foundry is only an OpenAI-compatible model endpoint choice.
+Use `SETUP.md` for the complete commands and `OPERATIONS.md` for ongoing
+verification; these anchors are not a parallel procedure.

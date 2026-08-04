@@ -1,19 +1,10 @@
 # Historical findings pointer
 
-The original broad codebase analysis is retained in Git history. Current
-implementation status is maintained in
-the plan documents in this directory, not in this
-historical planning file.
-
-The current system now has:
-
-- all seven strategies evaluated from one live snapshot with isolated state;
-- persisted baseline-plus-one assignments, bounded proposals/selections, and
-  exact values in FindingsStore schema 16;
-- immutable deterministic outcomes, reasons, reviews, and research-only edge
-  candidates;
-- append-only tournament and verified-backup history.
-
-No result automatically edits the strategy registry. The environment-only
-deployment action is provisioning a different-device external mount. See
+This is an archive pointer, not a current plan. The original broad analysis is
+retained in Git history; current behaviour and operation are defined by
+[`../../README.md`](../../README.md), [`../../SETUP.md`](../../SETUP.md), and
 [`../../OPERATIONS.md`](../../OPERATIONS.md).
+
+No finding automatically edits the strategy registry or authorizes capital.
+For evidence boundaries, see [`RECONCILIATION.md`](RECONCILIATION.md) and
+[`../protocol.md`](../protocol.md).

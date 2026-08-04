@@ -73,7 +73,7 @@ class Verdict:
         return f"{self.verdict} ({self.governing_criterion}): {self.detail}"
 
 
-# --------------------------------------------------------- out-of-sample
+# Out-of-sample evaluation
 
 def split_by_time(items: list, fraction: float = OUT_OF_SAMPLE_FRACTION,
                   key=lambda item: getattr(item, "ts", 0.0)) -> tuple:
@@ -420,7 +420,7 @@ def _paired_evidence(comparison: dict) -> dict:
             if key != "interval"}
 
 
-# ------------------------------------------------------------- the rules
+# Decision rules
 
 def evaluate_axis(settings: list, baseline_decisions: list | None = None,
                   structurally_invalid: str = "",

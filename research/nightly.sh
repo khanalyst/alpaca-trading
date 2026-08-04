@@ -39,14 +39,11 @@ PRICES="${PRICE_CACHE:-$ROOT/research/cache/prices.db}"
 JOURNAL="${JOURNAL_DB:-$ROOT/runtime/$MODE/journal.db}"
 STORE="${FINDINGS_DB:-$ROOT/research/cache/findings.db}"
 
-# ---------------------------------------------------------------------------
 # Authoritative path: journal replay.
-# ---------------------------------------------------------------------------
 
 echo "=== $(date -u +%FT%TZ) readiness ==="
-# First, because it answers "is any of the rest worth running yet?" and
-# because it is the one command that fails loudly when a passive order may
-# have been left resting. Non-zero here is a real problem, not a delay.
+# Readiness runs first because it detects a possibly resting passive order;
+# nonzero is an operational failure, not a collection delay.
 "$PY" research.py readiness --db "$JOURNAL" || readiness_failed=1
 
 echo "=== $(date -u +%FT%TZ) research learning loop ==="
@@ -117,9 +114,7 @@ else
   echo "exploratory evidence is available and no tier may be raised." >&2
 fi
 
-# ---------------------------------------------------------------------------
 # Exploratory path: recomputed OHLCV. Cannot raise a tier.
-# ---------------------------------------------------------------------------
 
 echo "=== $(date -u +%FT%TZ) refreshing market history ==="
 # A fresh directory makes file membership immutable and prevents a stale symbol

@@ -84,7 +84,6 @@ def run_portfolio(frames, membership, contract: Contract, costs: Costs,
     by_ts = build_candidate_index(
         frames, membership, contract, exit_policy, setups)
 
-    # A single ordered timeline across every instrument.
     timeline = sorted({int(t) for frame in frames.values() for t in frame.ts})
     bar_pos = {
         symbol: {int(t): i for i, t in enumerate(frame.ts)}
@@ -132,7 +131,7 @@ def run_portfolio(frames, membership, contract: Contract, costs: Costs,
             day_start_equity = mark_equity(ts, "open")
             day_stopped = False
 
-        # ---- 1. execute entries queued by the previous bar's signals
+        # Fill only signals queued by an earlier bar.
         if pending and not killed and not day_stopped:
             pending.sort(key=lambda row: (
                 0 if row["setup_type"] == "range_breakout" else 1,
@@ -218,7 +217,7 @@ def run_portfolio(frames, membership, contract: Contract, costs: Costs,
                 }
         pending = []
 
-        # ---- 2. funding settlement
+        # Funding settles before exit PnL is calculated.
         if costs.include_funding:
             for symbol, position in positions.items():
                 frame = frames[symbol]
@@ -231,7 +230,7 @@ def run_portfolio(frames, membership, contract: Contract, costs: Costs,
                     cash += paid
                     position["funding_usd"] += paid
 
-        # ---- 3. exits: stop first on an ambiguous bar, then target, then age
+        # On ambiguous bars, stops precede targets; age exits follow.
         for symbol in list(positions):
             position = positions[symbol]
             pos = bar_pos[symbol].get(ts)
@@ -285,7 +284,7 @@ def run_portfolio(frames, membership, contract: Contract, costs: Costs,
                     "signal_1h_ts": position["signal_1h_ts"]}
             del positions[symbol]
 
-        # ---- 4. account-level breakers
+        # Account breakers evaluate after position exits.
         equity_close = mark_equity(ts, "close")
         high_water = max(high_water, equity_close)
         drawdown = (high_water - equity_close) / high_water * 100
@@ -348,8 +347,8 @@ def _snap(frames, symbol, ts, bar_pos, cfg) -> dict:
 
     return {
         "price": float(row["open"]),
-        # Historical top-of-book is unavailable; the spread assumption is
-        # carried by the cost scenario instead of being invented here.
+        # Historical top-of-book is unavailable; spread comes from the cost
+        # scenario rather than an invented series.
         "spread_pct": 0.02,
         "funding_rate_pct": num(row["funding_rate_pct"], 0.0),
         "funding_interval_hours": num(row["funding_interval_hours"], 8.0),

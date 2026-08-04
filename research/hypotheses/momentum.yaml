@@ -34,7 +34,7 @@ horizons_bars: [96, 192]
 exit_policies: [fixed_rr, extended_rr, structure_target]
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-# --- the parameterisations that will be tested -----------------------------
+# Parameterizations
 # Registered 2026-07-30. Unlike the other hypotheses, momentum's axis has
 # already been explored: 79 walk-forward variants, 0 positive out-of-sample,
 # recorded in results/edge-audit-2024-2026. These three settings are not that

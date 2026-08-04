@@ -1,7 +1,8 @@
 # Operations — trader, research, and durable evidence
 
-This is the current runbook. The shipped system uses one demo order path and
-seven isolated real-time research evaluators.
+This is the operational authority. The shipped system uses one demo order path,
+four isolated deterministic realtime research evaluators, and three registered
+models that are offline-only.
 
 ## 1. Runtime locations
 
@@ -138,24 +139,40 @@ Run manually:
 
 ## 4. Real-time strategy experiments
 
-All seven strategies receive the same cycle snapshot and timestamp. Each has
-an isolated paper account and durable assignment state. The configured two
-workers bound computation; they do not reduce the strategy set. The lanes are
-logically isolated but intentionally evaluated in a bounded sequence with
-serialized durable writes. Seven simultaneous SQLite writers are not required
-for correctness.
+The four realtime strategies receive the same cycle snapshot and timestamp and
+use deterministic contract proposals. Each has an isolated paper account and
+durable assignment state. The configured two workers bound computation; they
+do not reduce the realtime lane set. The lanes are logically isolated but
+intentionally evaluated in a bounded sequence with serialized durable writes.
+Four simultaneous SQLite writers are not required for correctness. The
+registered `funding-carry`, `funding-unwind`, and `trend-multiday` models are
+offline-only because their holding horizons cannot reach the closed-trade floor
+in a practical realtime assignment.
 
-The active research scope is `forward_feed_version: 5`. Feeds v1-v4 remain
-immutable historical evidence. Feed v4 remains the market-data plumbing repair
-feed, where executable order-book ladders and mark/index basis collection were
-repaired. Feed v5 is the clean fork caused by immutable experiment-provenance
-binding; no older evidence is migrated or pooled with it.
+The 60-second housekeeping loop remains the safety/mark cadence. The model
+decision throttle is an elapsed-time check: `decision_interval_seconds: 300`
+blocks a new analyst call until at least 95% of 300 seconds has elapsed since
+the prior decision. It is not aligned to wall-clock or signal-bar boundaries;
+safety, marks, exits, reconciliation, and shadow advancement continue on the
+shorter loop.
+
+G2 compares recorded pre-risk proposal keys `(cycle_id, symbol, direction)`
+with replay keys and requires at least 99% reproduction. It does not reproduce
+full contract or execution semantics. A failed, stale, or vacuous G2 blocks
+downstream journal evidence from being treated as authoritative.
+
+The active research scope is `forward_feed_version: 6`. Feed v6 is the
+deterministic four-lane realtime fork; the active analyst's own decisions
+remain in a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v5 remain
+immutable historical evidence. Feed v4 is the market-data plumbing repair feed,
+and feed v5 is the immutable-provenance fork; no older evidence is migrated or
+pooled with v6.
 
 Within each strategy:
 
 1. the stable baseline always remains active;
 2. at most one candidate setting is active;
-3. an assignment is not complete until both three elapsed days and 100
+3. an assignment is not complete until both ten elapsed days and 100
    comparable paired observations are recorded (unless configuration raises
    those floors);
 4. accepted LLM selections queue without preempting the active assignment;
@@ -169,7 +186,7 @@ coverage is insufficient, two time segments cannot be formed, provenance is
 mixed, or a model/operational check failed.
 
 A `WORKED` outcome saves an immutable `RESEARCH_ONLY` `EDGE_CANDIDATE` lead
-with `promotion_allowed: false`; it does not satisfy the current v5
+with `promotion_allowed: false`; it does not satisfy the current v6
 forward-qualification protocol by itself. Qualification still requires the
 eligible completed assignment attempts, their contemporaneous baselines,
 held-out confirmation, and family correction. The paired cluster sign-flip
@@ -379,7 +396,7 @@ included.
 ./.venv/bin/python research.py report
 ```
 
-`prepare-review-artifacts` considers only variants with current v5
+`prepare-review-artifacts` considers only variants with current v6
 qualification. It fails closed unless persisted edge evidence and every
 non-manual T3 checklist item validate, and it creates only an idempotent,
 immutable/content-addressed `DRAFT_REVIEW_REQUIRED` artifact. It cannot mark
@@ -394,7 +411,7 @@ record and any registry/configuration change remain explicit operator actions.
   `RESEARCH_ONLY` edge evidence.
 - `FAILED`: adequate evidence or a persisted gate showed failure.
 - `INCONCLUSIVE`: evidence cannot support success or failure.
-- `QUALIFIED`: current v5 forward-axis research event, not an order instruction.
+- `QUALIFIED`: current v6 forward-axis research event, not an order instruction.
 - `REVOKED`: that evidence/account window is invalid and must not be reused.
 
 Both positive and negative findings remain in the store. Never infer an edge
@@ -422,7 +439,7 @@ Before deleting or rebuilding the VM:
 
 | Symptom | Meaning/action |
 | --- | --- |
-| G2 failed | Stop authoritative interpretation and investigate replay mismatch |
+| G2 failed | Stop authoritative interpretation and investigate proposal-key replay mismatch |
 | `INSUFFICIENT_SAMPLE` | Keep collecting; no edge verdict exists yet |
 | External backup BLOCKED | Provision/mount a different-device destination and run a required external backup |
 | `configured_local` | Explicit path shares a source filesystem; not VM-loss protection |
@@ -430,7 +447,7 @@ Before deleting or rebuilding the VM:
 | Review deferred | Deterministic outcome is safe; retry `research-loop` later |
 | Tournament benchmark failed | Keep the run as failure evidence; do not interpret rankings |
 | Findings DB missing | Check `research.findings_store`; there is no temporary fallback |
-| All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, while feed v5 is the clean immutable-provenance fork and all v1-v4 rows remain historical. |
+| All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, feed v5 is the immutable-provenance fork, feed v6 is the deterministic four-lane realtime fork, and all v1-v5 rows remain historical. |
 | Trader stopped after Compose update | Expected safe `SIGTERM` pause; run `main.py check`, then explicitly `main.py resume` |
 | Recorder unhealthy | Trader startup remains blocked until a fresh recorder CSV exists |
 | Dashboard unreachable remotely | Expected loopback binding; use an SSH tunnel or private VPN |
@@ -450,8 +467,8 @@ Before deleting or rebuilding the VM:
 | Compose warns that config/secret UID/GID/mode are ignored | Expected for file-backed local Compose. Enforce host permissions: secret `10001:10001` mode `0400`; tracked `config.yaml` mode `0644`. |
 | `docker compose ps` is empty after an update | The updater failed before `compose up`; fix the first journal/preflight error and rerun the same revision. |
 
-The optional B7.5 maker-first order primitive remains disabled by default.
-`cycle.decision_interval_seconds`, `maker_first_enabled`,
+The B7.5 maker-first order primitive is enabled in the shipped demo
+configuration and rejected in live mode. `cycle.decision_interval_seconds`, `maker_first_enabled`,
 `maker_first_wait_seconds`, `research.shadow_enabled`,
 `research.shadow_variants`, and `research.shadow_budget_ms` are documented
 configuration controls; the shipped values/defaults are summarized in

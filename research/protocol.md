@@ -54,13 +54,13 @@ finding, it is an opinion with a timestamp.
 
 ## Real-time assignment outcomes
 
-All seven strategies advance from the same cycle snapshot/timestamp. Each
-strategy keeps its stable baseline and tests no more than one candidate at a
-time. Strategies continue together while candidates rotate serially within
-each strategy.
+The four realtime strategies advance from the same cycle snapshot/timestamp.
+Each keeps its stable baseline and tests no more than one candidate at a time.
+The registered `funding-carry`, `funding-unwind`, and `trend-multiday` models
+are offline-only; their candidates do not occupy realtime lanes.
 
 An assignment becomes terminal only after both configured collection floors
-are met (three days and 100 comparable paired observations by default), or it
+are met (ten elapsed days and 100 comparable paired observations by default), or it
 is explicitly rejected. The deterministic evaluator then checks evidence
 adequacy before any performance claim:
 
@@ -299,11 +299,17 @@ positive one. A programme that records only what worked records only noise.
 
 ## From collection to reviewed evidence
 
-The current real-time path is baseline plus one candidate for each strategy,
-not every setting at once. All seven strategy evaluators advance on every
-available shared snapshot. The active momentum analyst is called at most once
-per eligible decision cycle; non-active strategies use deterministic contracts
-and no per-strategy LLM calls. Durable writes remain serialized.
+The current realtime path is baseline plus one candidate for each realtime
+strategy, not every setting at once. Four strategy evaluators advance on every
+available shared snapshot using deterministic contracts and no per-strategy LLM
+calls. The three long-horizon registered models are offline-only. The active
+momentum analyst's actual choices are retained in a separate `:llm` scope.
+Durable writes remain serialized.
+
+The model decision throttle is elapsed-time based: with
+`cycle.decision_interval_seconds: 300`, the engine waits for at least 95% of
+the interval since the prior decision. The 60-second housekeeping/safety loop
+continues independently.
 
 Selections and adaptive values are first-class immutable identities. An
 accepted selection waits behind the active assignment. Terminal assignment
@@ -317,6 +323,12 @@ executed-trades-only populations from silently qualifying an edge. Each
 setting uses all eligible completed assignment windows and the baseline from
 those same windows; an operational failure invalidates its assignment evidence
 rather than becoming missing data.
+
+Gate G2 is narrower than risk or execution validation: replay compares the
+recorded pre-risk proposal keys `(cycle_id, symbol, direction)` with replay
+keys and requires at least 99% reproduction. It does not reproduce full
+contract or execution semantics. A failed, stale, or vacuous G2 blocks treating
+journal-derived evidence as authoritative.
 
 Forward qualification proves one strategy version and one declared axis,
 verifies identical non-axis executable inputs, persists family correction, and

@@ -116,7 +116,7 @@ class Recorder:
             if value > 0:
                 self.contract_size[row["instId"]] = value
 
-    # ------------------------------------------------------------- plumbing
+    # Plumbing
 
     def get(self, path: str, params: dict) -> list | dict | None:
         for attempt in range(3):
@@ -142,9 +142,8 @@ class Recorder:
         if series != "funding":
             return str(row.get("ts")), instrument
 
-        # A forecast changes as its settlement approaches.  Its settlement
-        # timestamp therefore cannot be its identity: doing that retained the
-        # first estimate and silently discarded every later observation.
+        # A forecast changes as settlement approaches. Using settlement time
+        # as identity would retain only the first estimate.
         status = str(row.get("status") or "legacy")
         source = str(row.get("source") or "legacy")
         settlement = str(row.get("settlement_time") or row.get("ts"))
@@ -231,7 +230,7 @@ class Recorder:
             writer.writerows(fresh)
         return len(fresh)
 
-    # -------------------------------------------------------------- capture
+    # Capture
 
     def order_book(self, inst_id: str) -> dict | None:
         data = self.get("/api/v5/market/books",
