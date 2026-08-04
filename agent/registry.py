@@ -57,8 +57,7 @@ from dataclasses import dataclass, field
 from .forward_models import ForwardOutcomeModel, model_for
 
 
-# Ordered worst to best. A tier is a claim about evidence, so the ladder is
-# the same ladder research/tournament.py scores against.
+# Evidence tiers are ordered from weakest to strongest.
 TIERS = (
     "T0_REJECTED",     # failed a gate, or its placebo scored close to it
     "T1_HYPOTHESIS",   # mechanism and falsification stated, nothing tested
@@ -67,21 +66,10 @@ TIERS = (
     "T4_CONFIRMED",    # forward evidence agrees, at the required sample size
 )
 
-# Live capital requires a strategy that has cleared the placebo and cost
-# gates. Demo deliberately does not: running a known-negative strategy on
-# paper to rehearse the machinery is a legitimate and useful thing to do.
+# Live capital requires validated placebo and cost evidence; demo does not.
 LIVE_MIN_TIER = "T3_VALIDATED"
 
-# A tier at or above LIVE_MIN_TIER must name the evidence packet that
-# authorised it, by hash.
-#
-# ``research.py t3-packet`` already builds a content-addressed, review-gated
-# packet: a full checklist, the reviewer, the registry-change reference, and a
-# SHA-256 over the whole payload. Nothing joined that artifact to the tier it
-# exists to justify - ``evidence`` was free-form prose paths, so raising a tier
-# was one edited string, and the packet's immutability protected a document
-# nobody had to cite. Requiring the hash here makes the chain checkable in the
-# direction that matters: from the claim back to the evidence.
+# Live-authorizing tiers must cite their content-addressed evidence packet.
 PACKET_REFERENCE = re.compile(r"^t3-packet:[0-9a-f]{64}$")
 
 class UnknownStrategy(KeyError):
@@ -94,11 +82,9 @@ class StrategySpec:
 
     id: str
     version: str
-    # --- what the strategy claims -------------------------------------
     mechanism: str
     falsification: str
     tier: str
-    # --- what the machinery must provide ------------------------------
     signal_timeframe: str
     required_timeframes: tuple[str, ...]
     # Per-strategy ceiling on holding time. config.yaml may tighten this but
@@ -117,17 +103,7 @@ class StrategySpec:
     # setup types. An implemented evidence builder is sufficient for shadow
     # research but not sufficient to make the active LLM trading path valid.
     analyst_ready: bool = False
-    # False when the strategy's holding period makes a real-time verdict
-    # unreachable, so it is researched offline instead of occupying a live
-    # rotation lane.
-    #
-    # This is arithmetic, not preference. A verdict needs MIN_ROUND_TRIPS
-    # closed trades per arm. With three concurrent slots a strategy closes at
-    # most 3/(horizon in days) per day, so a 336h contract yields ~0.2/day:
-    # roughly 480 days for one verdict, and every one of those days occupies
-    # a lane that a testable strategy could use. Offline the same contract
-    # runs over two years of history in minutes, which is where a multi-day
-    # hold belongs.
+    # False when the holding horizon cannot reach the real-time sample floor.
     realtime_eligible: bool = True
     # True only when research/export_live.py has a validated stop/target,
     # cost and holding model for this mechanism. Raw shadow signals may be
@@ -203,10 +179,7 @@ class StrategySpec:
         return self.tier_rank() >= TIERS.index(minimum_tier)
 
 
-# The archetype descriptions the analyst needs in order to label a momentum
-# setup. Kept beside the spec rather than inside the shared prompt so that
-# registering a second strategy does not mean teaching the model about a
-# strategy it is not running.
+# Strategy-local prompt text prevents cross-strategy label leakage.
 _MOMENTUM_PROMPT = """
 SETUP ARCHETYPES (long side described; mirror them for shorts)
 - Trend continuation pullback: trend_4h and trend_1h up, then the latest \
@@ -347,7 +320,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("carry",),
-            realtime_eligible=False,   # 240h hold: ~0.3 closes/day against a 100-trade floor, so a r...
+            realtime_eligible=False,   # real-time sample floor is unreachable
             forward_model_id="funding_carry.interval.1h.v2",
             forward_model_ready=True,
             implemented=True,
@@ -401,7 +374,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=240.0,
             execution_style="taker",
             setup_types=("positioning_unwind",),
-            realtime_eligible=False,   # 240h hold: same arithmetic as funding-carry. Its attribution...
+            realtime_eligible=False,   # real-time sample floor is unreachable
             forward_model_id="funding_unwind.reversion.1h.v2",
             forward_model_ready=True,
             implemented=True,
@@ -439,7 +412,7 @@ REGISTRY: dict[str, StrategySpec] = {
             max_hold_hours_ceiling=336.0,
             execution_style="taker",
             setup_types=("trend_follow",),
-            realtime_eligible=False,   # 336h hold: ~0.2 closes/day, roughly 480 days for one real-ti...
+            realtime_eligible=False,   # real-time sample floor is unreachable
             forward_model_id="trend_multiday.4h.v2",
             forward_model_ready=True,
             implemented=True,

@@ -46,7 +46,7 @@ EWM_WINDOW = 120          # live agent fetches cycle.candles=120 completed bars
 MIN_HISTORY = 60          # universe.min_history_candles
 
 
-# --------------------------------------------------------------- indicators
+# Indicators
 
 def windowed_ewm_last(
     values: np.ndarray,
@@ -124,7 +124,7 @@ def atr_percent(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     return atr_pct, ratio
 
 
-# ------------------------------------------------------------ symbol frames
+# Symbol frames
 
 class SymbolFrame:
     """All point-in-time features for one instrument, indexed by 15m bar."""
@@ -231,7 +231,7 @@ class SymbolFrame:
             pd.Series(np.asarray(quote, dtype=float))
             .rolling(DAY_BARS).sum().to_numpy(float))
 
-        # --- funding: use the rate in force at the signal bar's close
+        # Use the funding rate in force at the signal bar's close.
         if funding is None or funding.empty:
             funding = pd.DataFrame(
                 {"timestamp_ms": pd.Series(dtype="int64"),
@@ -309,7 +309,7 @@ class SymbolFrame:
             float(np.median(np.diff(f_ts)) / HOUR_MS)
             if len(f_ts) > 2 else 8.0)
 
-        # --- perp/index basis from spot
+        # Perpetual/index basis from spot.
         if spot is not None and not spot.empty:
             spot_close = (spot.sort_values("timestamp_ms")
                           .set_index("timestamp_ms")["close"])
@@ -318,7 +318,7 @@ class SymbolFrame:
         else:
             data["perp_index_basis_pct"] = np.full(n, np.nan)
 
-        # --- open interest (hourly, forward-filled to the last known value)
+        # Hourly open interest, forward-filled from the last known value.
         if oi is not None and not oi.empty:
             oi = oi.sort_values("timestamp_ms")
             oi_ts = oi["timestamp_ms"].to_numpy(np.int64)
@@ -331,7 +331,7 @@ class SymbolFrame:
         else:
             data["open_interest_musd"] = np.full(n, np.nan)
 
-        # --- BTC beta on 1h returns (72 obs, >=24 required, matching live)
+        # BTC beta on 1h returns (72 observations; at least 24 required).
         beta = np.full(n, np.nan)
         corr_samples = np.zeros(n, dtype=int)
         if btc_1h is not None and symbol != "BTC/USDT:USDT":
@@ -376,7 +376,7 @@ class SymbolFrame:
         d["regime"] = regime
 
 
-# ----------------------------------------------------------- evidence layer
+# Evidence layer
 
 @dataclass(frozen=True)
 class Contract:
@@ -405,7 +405,7 @@ class Contract:
     min_stop_pct: float = 0.2
     max_stop_pct: float = 15.0
 
-    # --- StrategyContract protocol -------------------------------------
+    # StrategyContract protocol
     # build_trades talks to a contract through these three methods and the
     # four scalars below, so a new strategy is a new class rather than an
     # edit to the shared trade builder. Momentum delegates to the
@@ -765,7 +765,7 @@ def derive_levels(df: pd.DataFrame, c: Contract, direction: str,
     return np.round(stop, 6), np.round(take, 6)
 
 
-# --------------------------------------------------------- trade simulation
+# Trade simulation
 
 @dataclass(frozen=True)
 class Costs:
@@ -788,26 +788,13 @@ COST_SCENARIOS = {
     "base": Costs("base", 0.05, 0.05, 0.05, 0.15, True),
     "realistic_alt": Costs("realistic_alt", 0.05, 0.10, 0.10, 0.25, True),
     "stress": Costs("stress", 0.05, 0.35, 0.10, 0.35, True),
-    # The rate this account actually pays. Reconciled from the demo journal
-    # on 2026-08-04 at 0.248%/side over 24 round trips; see config.yaml
-    # trading_costs for the derivation.
-    #
-    # `base` is NOT corrected in place. Every committed report under
-    # research/results/ was produced against it, and silently redefining a
-    # named scenario would rewrite those numbers without rewriting the
-    # documents that quote them. `base` therefore stays as the historical
-    # 5bps scenario and this is the one new work runs against.
-    #
-    # The gap matters more than it looks: at 0.4963% round trip the measured
-    # cross-sectional spreads of 0.05-0.30% gross are not "the same size as
-    # the fee" as the edge-search report concluded - they are 2-10x smaller
-    # than it. It also makes maker execution worth ~0.23-0.46% of round-trip
-    # saving rather than the 0.06% that report assumed.
+    # Account-rate scenario. agent/market.py uses the exchange account's
+    # per-side rate when available and the configured rate as its fallback.
+    # Keep `base` unchanged because committed reports identify it by name.
     "account_taker": Costs("account_taker", 0.25, 0.05, 0.05, 0.15, True),
 }
 
-# What new research runs against. Historical scenarios stay reachable by name
-# so a committed report can still be reproduced exactly.
+# Historical scenario names remain stable so committed reports are reproducible.
 DEFAULT_COST_SCENARIO = "account_taker"
 
 
@@ -927,7 +914,7 @@ def simulate(frame: SymbolFrame, idx: np.ndarray, direction: str,
     })
 
 
-# ------------------------------------------------------------- statistics
+# Statistics
 
 def block_bootstrap_ci(values: np.ndarray, months: np.ndarray,
                        draws: int = 4000, seed: int = 11) -> list[float]:
@@ -988,7 +975,7 @@ def summarize(trades: pd.DataFrame, label: str = "",
     return out
 
 
-# ------------------------------------------------------------------ loading
+# Loading
 
 def load_dataset(root: Path, min_bars: int = 8000) -> dict[str, SymbolFrame]:
     """Load every symbol with enough history.
@@ -1024,7 +1011,7 @@ def load_dataset(root: Path, min_bars: int = 8000) -> dict[str, SymbolFrame]:
     return frames
 
 
-# ------------------------------------------------- point-in-time universe
+# Point-in-time universe
 
 def universe_membership(frames: dict[str, SymbolFrame], top_n: int = 10,
                         min_qv_usd: float = 50e6,
@@ -1068,7 +1055,7 @@ def universe_membership(frames: dict[str, SymbolFrame], top_n: int = 10,
     return out
 
 
-# ------------------------------------------------------ candidate builder
+# Candidate builder
 
 def _stable_seed(text: str) -> int:
     """Process-independent seed offset.

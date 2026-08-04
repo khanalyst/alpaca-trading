@@ -26,26 +26,29 @@ The executable sources remain authoritative when prose and code disagree:
 | Hand-authored momentum variants | 19 immutable identities including baseline |
 | Materialized static identities | 66 including all 7 baselines |
 | Bounded LLM selector candidates | 36 eligible single-axis candidates |
-| Active real-time arms | 14 maximum: baseline plus at most one candidate per strategy |
+| Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
-The active real-time simulator identity is `forward_feed_version: 5`. Feeds
-v1-v4 remain immutable historical rows and must not be pooled with current
-outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the clean
-fork caused by immutable experiment-provenance binding.
+The superseded `14 maximum` wording described seven realtime strategies; it is
+not a current arm count.
 
-Four strategies receive the same market snapshot and timestamp in the
-real-time loop: `momentum`, `flush-fade`, `ls-ratio-fade` and `scalp-maker`.
-Each has independent paper cash, positions, risk state, decisions, and trades.
-Only `momentum/phase1-v3` is connected to the configured demo order path.
+The active analyst's separate `:llm` scope can hold its own baseline and
+candidate, adding two non-comparable arms. When that sibling is present, the
+runtime maximum is 10 (8 deterministic comparison arms plus 2 LLM-scope arms).
 
-**All four run on deterministic proposals, including the active strategy.**
-The active strategy previously ran on recorded LLM proposals while the others
-ran on deterministic ones, so any comparison involving it varied the proposal
-source as well as the strategy - and the proposal source is the larger of the
-two, because an analyst that declines to propose produces no decision at all,
-where a deterministic contract always emits a probe and lets the strategy veto
-it. Feed v6 forks on this change.
+The active realtime simulator identity is `forward_feed_version: 6`. Feed v6
+uses deterministic contract proposals in four realtime lanes: `momentum`,
+`flush-fade`, `ls-ratio-fade`, and `scalp-maker`. Each lane receives the same
+market snapshot and timestamp and owns independent paper cash, positions, risk
+state, decisions, and trades. `funding-carry`, `funding-unwind`, and
+`trend-multiday` remain registered offline-only models. Only
+`momentum/phase1-v3` is connected to the configured demo order path.
+
+Feeds v1-v5 remain immutable historical rows and must not be pooled with v6
+outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the
+immutable experiment-provenance fork. The analyst's actual decisions continue
+in the sibling `:llm` scope for planner history; that lane is not comparable
+with deterministic research lanes.
 
 **The analyst's own decisions are still recorded, in the sibling scope
 `...:llm`.** That lane sees the identical snapshot and timestamp and holds
@@ -66,13 +69,10 @@ holding window to be charged against the carry, and the ten-day timeout remains
 the outer bound. `funding-unwind` keeps `fixed_rr`: it is a directional bet on
 the crowd being forced out, so a price exit is the right one for it.
 
-`funding-carry`, `funding-unwind` and `trend-multiday` are registered but
-`realtime_eligible=False`, so they are researched offline instead. This is
-arithmetic rather than preference: a verdict needs 100 closed trades per arm,
-and with three concurrent slots a 240h contract closes ~0.3 trades a day and a
-336h contract ~0.2. That is 330-480 days for a single real-time verdict, every
-day of which occupies a lane a testable strategy could use. Offline the same
-contracts run over two years of history in minutes.
+The four realtime lanes use the shared deterministic snapshot. The three
+offline-only models retain their historical tournament contracts because their
+holding horizons make a 100-pair realtime assignment impractical. The floor is
+a measurement constraint, not a claim that any model has already cleared it.
 
 ## Strategy definitions
 

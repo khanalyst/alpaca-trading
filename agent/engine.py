@@ -59,15 +59,10 @@ class Engine:
             cfg["mode"], os.environ.get("OKX_API_KEY", ""))
         self.run_id = state.new_run_id()
         self.config_version = state.stable_fingerprint(cfg)
-        # Narrower than config_version: covers only the blocks that can
-        # change a decision, so an edit to an alert timeout no longer splits
-        # the sample this run's results will be pooled into.
+        # Fingerprint only configuration that can change a decision.
         self.strategy_config_version = state.strategy_fingerprint(cfg)
         self.code_version = state.code_fingerprint()
-        # Derived from the assembled per-strategy prompt. There is no module
-        # -level PROMPT_VERSION any more: each strategy gets its own prompt,
-        # so the version is a property of the configuration rather than of
-        # the module.
+        # Prompt identity is derived from the assembled per-strategy prompt.
         self.prompt_version = brain.prompt_version(brain.build_system(cfg))
         self.strategy_id, self.strategy_version = strategy.identity(cfg)
         state.set_journal_context(
@@ -96,9 +91,7 @@ class Engine:
             self.llm = brain.LLM(cfg)
             self.llm.preflight()
             self.risk = RiskEngine(cfg)
-        # Built once from the research block. None when shadow evaluation
-        # is off, which makes the whole feature a no-op rather than a
-        # default-on cost.
+        # Disabled shadow evaluation remains a complete no-op.
         self._research_failure_count = 0
         self._research_consecutive_failures = 0
         self._research_last_failure: dict | None = None
@@ -213,8 +206,6 @@ class Engine:
         except Exception as exc:                           # noqa: BLE001
             log.warning("Shadow evaluation disabled: %s", exc)
             return None
-
-    # ------------------------------------------------------------ lifecycle
 
     def request_shutdown(self, reason: str = "process shutdown") -> None:
         """Ask the loop to pause safely after its current bounded operation."""
@@ -488,8 +479,6 @@ class Engine:
             {"error": str(exc), "open_positions": open_symbols})
         return True
 
-    # ------------------------------------------------------------ the cycle
-
     @staticmethod
     def _ensure_equity_basis(st: dict, equity: float, now: float) -> bool:
         """Rebase legacy account-wide benchmarks to USDT equity exactly once.
@@ -681,7 +670,6 @@ class Engine:
             reconciled = False
         state.commit(st)
 
-        # --- drop expired per-symbol cooldowns
         st["cooldowns"] = {s: t for s, t in (st.get("cooldowns") or {}).items()
                            if float(t) > now}
         st["entry_feedback"] = {
@@ -697,10 +685,9 @@ class Engine:
         st["recent_setups"] = strategy.prune_records(
             st.get("recent_setups") or {}, now)
 
-        # --- deposits / withdrawals: rebase benchmarks, never trade on them
+        # Transfers rebase benchmarks and never affect trading decisions.
         self._sync_transfers(st, now)
 
-        # --- UTC day rollover
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if st.get("day") != today:
             st["day"] = today
@@ -715,7 +702,6 @@ class Engine:
         state.log_equity(
             equity, st["state"], st.get("equity_basis_id"))
 
-        # --- circuit breakers
         r = self.cfg["risk"]
         drawdown_pct = (st["high_water_mark"] - equity) / st["high_water_mark"] * 100
         if drawdown_pct >= float(r["max_drawdown_pct"]):
@@ -757,7 +743,6 @@ class Engine:
                 st.update(fresh)
         state.commit(st)
 
-        # --- universe refresh
         refresh_s = float(self.cfg["universe"]["refresh_minutes"]) * 60
         if self.universe_ts <= 0 or now - self.universe_ts > refresh_s:
             self.universe, universe_audit = market.select_universe(
@@ -768,7 +753,7 @@ class Engine:
             log.info("Universe (%d): %s", len(self.universe),
                      ", ".join(self.universe))
 
-        # --- position housekeeping (runs in every state except KILLED)
+        # Position protection runs in every state except KILLED.
         positions = self._manage_positions(positions, st, equity)
 
         can_decide = st["state"] in (state.RUNNING, state.DAY_STOPPED)
@@ -812,27 +797,10 @@ class Engine:
         if st["state"] == state.DAY_STOPPED and not positions:
             return  # opens blocked and nothing held: an LLM call cannot act
 
-        # --- B9.2: decisions run on their own cadence, housekeeping does not
-        #
-        # Everything above this line has already run: reconciliation, the
-        # protection audit, cooldown expiry, the day rollover, both circuit
-        # breakers and the max-hold force close inside _manage_positions.
-        # They keep running every interval_seconds, so safety reaction time
-        # is unchanged.
-        #
-        # What is skipped is the live-decision recording and LLM call. When
-        # shadow research is enabled, its local accounts still receive a
-        # market snapshot so held positions cannot go stale. Measured
-        # over the corpus, 66.5% of cycles observe only signal bars that were
-        # already evaluated, and an LLM call on one of those cannot produce a
-        # fresh evaluation for any symbol - strategy.evaluated_signal blocks
-        # it. Simply raising interval_seconds would also slow the margin
-        # guard to 15 minutes, which is not an acceptable trade; this split
-        # avoids that.
+        # Decision cadence never delays reconciliation or safety housekeeping.
         if not decision_due:
             return
 
-        # --- ask the brain using the same snapshot every variant just marked
         if not live_snapshot:
             log.warning("Empty market snapshot; holding")
             return
@@ -859,11 +827,8 @@ class Engine:
             context[brain.ENRICHMENT_KEY] = enrichment
         enrichment["setup_breadth_by_strategy"] = setup_breadth_by_strategy
 
-        # B0.5: start the irreversible clock. These fields are journalled and
-        # read by nothing for months - that is the point. A snapshot taken
-        # today without open interest in it can never be made to have open
-        # interest in it, so the only genuinely unrecoverable decision in the
-        # programme is the decision not to record.
+        # Persist withheld observations now; missing historical inputs cannot
+        # be reconstructed later.
         self._record_observations(live_snapshot)
 
         portfolio = self._portfolio_view(equity, positions, st,
@@ -906,7 +871,6 @@ class Engine:
         if st["state"] not in (state.RUNNING, state.DAY_STOPPED):
             return
 
-        # --- closes first
         for d in [d for d in decisions if d["action"] == "close"]:
             if state.load_state()["state"] not in (
                     state.RUNNING, state.DAY_STOPPED):
@@ -945,8 +909,7 @@ class Engine:
                     close_evidence=d.get("evidence_change")):
                 positions.remove(pos)
 
-        # --- opens (blocked while DAY_STOPPED or after a failed reconcile,
-        # even if the model proposed one despite being told max_new = 0)
+        # Opens remain blocked after a daily stop or failed reconciliation.
         if st["state"] != state.RUNNING or not reconciled:
             return
         gross = sum(self._notional(p) for p in positions)
@@ -1127,8 +1090,6 @@ class Engine:
                      "error": f"{type(exc).__name__}: {exc}"}))
             except Exception:                              # noqa: BLE001
                 pass
-
-    # ------------------------------------------------------ reconciliation
 
     @staticmethod
     def _direction(pos: dict) -> str:
@@ -1488,8 +1449,6 @@ class Engine:
             raise PositionAgeUnknown(unknown_age)
         return list(actual.values())
 
-    # ------------------------------------------------------------ execution
-
     def _remember_liquidity_rejection(
             self, plan: dict, st: dict,
             rejection: EntryLiquidityRejected) -> dict:
@@ -1834,10 +1793,7 @@ class Engine:
             log.info("Control state changed before order; skipping %s", symbol)
             return False
 
-        # B7.5 maker-first path: post passively first when enabled, then cross.
-        # A passive fill returns a settled execution shaped exactly like
-        # open_position's, so the bookkeeping below is identical either way -
-        # same trade row, same liquidation check, same protection audit.
+        # Passive and crossing fills share the same settlement and risk checks.
         maker = self._maker_first_attempt(
             plan, st, symbol, side, contracts, sl_price, tp_price,
             entry_reference)
@@ -2652,8 +2608,6 @@ class Engine:
         }))
         return True
 
-    # --------------------------------------------------------- housekeeping
-
     def _manage_positions(self, positions: list[dict], st: dict,
                           equity: float) -> list[dict]:
         r = self.cfg["risk"]
@@ -2728,8 +2682,6 @@ class Engine:
             raise RuntimeError(
                 "account margin risk remains unsafe: " + "; ".join(reasons))
         return kept
-
-    # ------------------------------------------------------------- helpers
 
     @staticmethod
     def _audit_json(payload: object) -> str:
@@ -3027,8 +2979,6 @@ class Engine:
             },
             "trading_costs_fyi": self.cfg["trading_costs"],
         }
-
-    # ------------------------------------------------------------- flatten
 
     def flatten_all(self, reason: str) -> bool:
         log.warning("FLATTEN ALL (close positions, then cancel orders): %s",

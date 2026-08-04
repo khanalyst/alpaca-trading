@@ -115,9 +115,7 @@ def main() -> int:
     summary = []
     for currency in [c.strip() for c in args.currencies.split(",") if c.strip()]:
         # OKX documents this series as ts, sellVol, buyVol. The ordering is
-        # verified empirically in analyse_flow.py against same-period returns
-        # rather than trusted, because a flipped sign would invert every
-        # conclusion drawn from it.
+        # checked against same-period returns before interpreting the sign.
         taker = page_back(
             "/api/v5/rubik/stat/taker-volume",
             {"ccy": currency, "instType": "CONTRACTS",

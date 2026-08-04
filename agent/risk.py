@@ -106,11 +106,7 @@ class RiskEngine:
         if len(positions) >= int(self.r["max_concurrent_positions"]):
             return None, "max concurrent positions reached"
 
-        # Correlated-concentration guard, counted in positions rather than
-        # notional. The notional caps below do not bind here in practice: at
-        # the shipped 30% per-position cap, three same-direction positions
-        # total 90% net against a 100% net-direction cap, so an entirely
-        # one-sided book passes every exposure check with headroom.
+        # Count correlated concentration separately from notional exposure.
         direction = decision.get("direction")
         if direction not in {"long", "short"}:
             return None, "direction is invalid"
@@ -322,7 +318,6 @@ class RiskEngine:
         # journal instead of leaving operators to infer it from the numbers.
         sizing_constraint = "risk_per_trade_budget"
 
-        # Per-position cap.
         notional_cap = (
             equity * float(self.r["max_position_notional_pct"]) / 100.0)
         if notional_cap < notional:
@@ -335,7 +330,6 @@ class RiskEngine:
                 sizing_constraint = "liquidity_retry_cap"
                 notional = retry_cap
 
-        # Gross exposure cap across the whole book.
         room = equity * float(self.r["max_gross_exposure_pct"]) / 100.0
         room -= gross_notional
         if room <= 0:

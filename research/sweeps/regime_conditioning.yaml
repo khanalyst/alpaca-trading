@@ -6,10 +6,9 @@
 # pools them will correctly reject a hypothesis that was true in half the
 # sample.
 #
-# This gates batch 6.4. That batch proposes separating range_breakout from
-# trend_continuation by trend alignment; if this partition is the real one,
-# 6.4 would encode a proxy of the right idea in the wrong variable and
-# contaminate the population this test needs.
+# Run this before testing breakout discriminators. If volatility is the real
+# partition, trend alignment would encode a proxy and contaminate the
+# population this test needs.
 hypothesis: >-
   range_breakout expectancy is positive only when volatility is expanding
   from a compressed base, and negative when volatility is already elevated.

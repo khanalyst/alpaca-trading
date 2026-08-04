@@ -80,11 +80,7 @@ class Variant:
             raise ConfigError(
                 f"{self.variant_id}: status must be one of "
                 f"{', '.join(STATUSES)}")
-        # A one-sentence claim, required. The rule exists because a sweep
-        # without a stated hypothesis produces a table nobody can act on: at
-        # these sample sizes something always looks best, and without a claim
-        # written beforehand there is no way to tell a result from a ranking
-        # of noise.
+        # Pre-register one claim so results remain distinguishable from noise.
         if len(self.hypothesis.strip()) < 10:
             raise ConfigError(
                 f"{self.variant_id}: hypothesis is required and must say "

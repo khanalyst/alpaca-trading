@@ -1,13 +1,21 @@
 # OKX AI Trading Agent
 
 This repository runs one demo-first OKX perpetuals strategy and a separate
-research system that evaluates every registered strategy from the same live
-market feed. The shipped account mode is `demo`; no strategy is currently
-eligible for live capital.
+research system for seven registered mechanism models. Four realtime lanes use
+the shared live market feed; `funding-carry`, `funding-unwind`, and
+`trend-multiday` are offline-only. The shipped account mode is `demo`; no
+strategy is currently eligible for live capital.
 
 Use [SETUP.md](SETUP.md) for installation and VM deployment, and
 [OPERATIONS.md](OPERATIONS.md) for daily operation, research, backups, and
 recovery.
+
+Documentation authority is deliberately short: executable code and
+`config.yaml` define behaviour; `SETUP.md` is the installation/deployment
+authority; `OPERATIONS.md` is the runbook; the research documents define
+evidence rules and strategy identities. Files under `research/plan/` are
+compatibility or safety records, not a second implementation plan. When prose
+and executable behaviour differ, report the executable behaviour narrowly.
 
 ## Shipped configuration
 
@@ -16,7 +24,7 @@ These values come from the current `config.yaml` and registry:
 ```yaml
 research:
   findings_store: research/cache/findings.db
-  experiment_min_duration_days: 3
+  experiment_min_duration_days: 10
   experiment_min_observations: 100
 ```
 
@@ -27,13 +35,13 @@ research:
 | Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol-coding` |
 | Housekeeping cadence | `cycle.interval_seconds: 60` |
-| Decision cadence | `cycle.decision_interval_seconds: 300`; safety/mark cycles stay faster |
+| Decision throttle | `cycle.decision_interval_seconds: 300` elapsed seconds (with a 95% jitter tolerance); safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 5`; feed v5 is the clean immutable-provenance fork; feeds v1-v4 remain historical (feed v4 is the market-data plumbing repair feed) |
-| Active research arms | 14: one baseline and at most one candidate for each of 7 strategies |
-| Shadow workers | `2`; all seven strategies still advance on the same cycle snapshot |
-| Experiment floor | both 3 elapsed days and 100 comparable paired observations |
+| Research feed | `forward_feed_version: 6`; feed v6 is the deterministic four-lane realtime fork; feeds v1-v5 remain historical (feed v4 is the market-data plumbing repair feed and v5 is the immutable-provenance fork) |
+| Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
+| Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
+| Experiment floor | both 10 elapsed days and 100 comparable paired observations |
 | Local paper balance | 10,000 USDT per isolated strategy/variant account |
 
 The repository contains no credentials and does not claim that credentials are
@@ -54,19 +62,25 @@ On each eligible decision cycle:
    `research_selection` are recorded.
 3. The order path applies deterministic contracts, risk rules, and execution
    controls to the configured main strategy only.
-4. The `StrategyShadowCoordinator` gives the same snapshot/timestamp to seven
-   isolated evaluators: `momentum`, `flush-fade`, `funding-carry`,
-   `funding-unwind`, `trend-multiday`, `ls-ratio-fade`, and `scalp-maker`.
+4. The `StrategyShadowCoordinator` gives the same snapshot/timestamp to four
+   isolated deterministic realtime evaluators: `momentum`, `flush-fade`,
+   `ls-ratio-fade`, and `scalp-maker`. The three long-horizon models are
+   registered for offline research and do not occupy realtime lanes.
 5. Each evaluator owns its own paper cash, positions, exposure, cooldowns,
    circuit breakers, decisions, and trades. `shadow_decision` rows include
    accepted actions and policy vetoes as explicit zero-return actions.
-6. Every strategy keeps its stable baseline running and tests at most one
-   candidate setting at a time. The seven lanes are logically isolated over
-   the same frozen input, but the coordinator intentionally evaluates them in
-   a bounded sequence and serializes durable writes rather than creating seven
-   simultaneous SQLite writers. Physical wall-clock concurrency is not a
+6. Every realtime strategy keeps its stable baseline running and tests at most
+   one candidate setting at a time. The four deterministic realtime lanes are
+   logically isolated over the same frozen input, but the coordinator
+   intentionally evaluates them in a bounded sequence and serializes durable
+   writes rather than creating four simultaneous SQLite writers. Physical
+   wall-clock concurrency is not a
    correctness requirement. Settings rotate serially within each strategy and
    survive process restarts.
+
+The deterministic comparison set is therefore eight arms. The active analyst's
+separate `:llm` scope may also hold its own baseline and candidate, adding two
+non-comparable arms; when that sibling is present, the runtime maximum is ten.
 
 Isolation runs both ways: research state and decisions are withheld from
 everything on the live path, while live account positions do not leak into a
@@ -102,7 +116,7 @@ verdict, change account settings, or authorize an order.
 ## Experiment outcomes and edge evidence
 
 Assignment completion requires both configured rotation floors: by default,
-three elapsed calendar days and 100 comparable paired observations. Completion
+ten elapsed calendar days and 100 comparable paired observations. Completion
 only closes the collection assignment; it does not guarantee adequate evidence.
 
 The deterministic outcome evaluator checks adequacy before performance. It
@@ -123,10 +137,10 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion. It is an immutable research lead, and current v5 forward
+promotion. It is an immutable research lead, and current v6 forward
 qualification is still required.
 
-The current `forward-qualify` path reconstructs v5 evidence from eligible
+The current `forward-qualify` path reconstructs v6 evidence from eligible
 completed assignments and each setting's contemporaneous baseline. It proves
 one declared axis from the immutable decision ledger, including the non-axis executable
 configuration, held-out confirmation, and family correction. Its
@@ -134,10 +148,13 @@ paired cluster sign-flip test is valid only under the persisted
 cluster-delta sign-exchangeability/symmetric-null assumption; it is not an
 assumption-free p-value.
 
-Feed v5 is a clean fork caused by immutable experiment-provenance binding. Feeds
-v1-v4 remain historical and are never migrated or pooled; feed v4 remains the
-market-data plumbing repair feed. `research.py prepare-review-artifacts` runs only
-after v5 qualification. It
+Feed v6 is a clean fork in which the four realtime lanes use deterministic
+contract proposals; the three long-horizon models remain offline-only. The
+analyst's own decisions remain in a separate `:llm` scope and are never pooled
+with lane evidence. Feeds v1-v5 remain historical and are never migrated or
+pooled; feed v4 remains the market-data plumbing repair feed and v5 the
+immutable-provenance fork. `research.py
+prepare-review-artifacts` runs only after v6 qualification. It
 fails closed unless the saved edge evidence and every non-manual T3 check
 validate, then idempotently creates an immutable, content-addressed draft
 review artifact. It cannot complete manual review, edit the registry or
@@ -147,7 +164,10 @@ and any registry/configuration change remain explicit human actions.
 ## Evidence paths
 
 - The recorded journal path is authoritative only after a current G2 replay
-  PASS. G2 is a stop when replay cannot reproduce the recorded decisions.
+  PASS. G2 compares recorded pre-risk proposal keys
+  `(cycle_id, symbol, direction)` with replay keys; it requires at least 99%
+  reproduction and does not reproduce full contract or execution semantics.
+  A failed, stale, or vacuous G2 blocks downstream evidence.
   `INSUFFICIENT_SAMPLE` means collection is open, not that an edge failed.
 - The OHLCV tournament is exploratory. It awards no tier above
   `T2_CANDIDATE`; an existing higher registered tier is reported as unrevised
@@ -248,16 +268,17 @@ location or infer an edge from it.
 
 ## B7.5 and current boundaries
 
-The optional maker-first exchange primitive (B7.5) exists but the shipped
-configuration omits `execution.maker_first_enabled`, so validation supplies
-the safe default `false`; `maker_first_wait_seconds` defaults to 20 seconds.
-It is not the `scalp-maker` shadow strategy and is not active on the demo order
-path.
+The optional maker-first exchange primitive (B7.5) is enabled in the shipped
+demo configuration with a 20-second wait before IOC fallback. It is not the
+`scalp-maker` shadow strategy. Configuration validation refuses this path in
+live mode; demo execution is explicitly measurement, not promotion.
 
-How it completes: enable it deliberately in demo, collect and review its
-execution evidence, and include its assumptions in the relevant forward model.
-Why it waits: passive-order fill/cancel races require account evidence and are
-not established by the current corpus.
+How it completes: collect and review its demo execution evidence and include
+its assumptions in the relevant forward model. Why it waits: the shipped demo
+measurement must establish passive-order behaviour before any live-mode
+consideration. Why it remains demo-only:
+passive-order fill/cancel races require account evidence and are not established
+for live capital by the current corpus.
 
 No repository change can by itself provision an off-host mount, install
 credentials, or approve capital. Those are explicit environment/operator
@@ -277,7 +298,7 @@ source.
 | [SETUP.md](SETUP.md) | Local and Azure installation, credentials, configuration, services, external backup provisioning, deployment updates, and optional local-history boundaries. |
 | [OPERATIONS.md](OPERATIONS.md) | Daily operation, runtime paths, nightly sequencing and exit codes, experiments, tournaments, backups, recovery, and troubleshooting. |
 | [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) | Short compatibility pointer for Azure deployment. It directs operators to setup/operations and lists data that must survive VM loss. |
-| [deploy/README.md](deploy/README.md) | Purpose and ordering of the systemd trader, recorder, research service, and timer units. It also points to external-backup configuration. |
+| [deploy/README.md](deploy/README.md) | Deployment topology: Compose service ownership, durable volumes, safety boundaries, and the legacy systemd lane. Procedures remain in SETUP/OPERATIONS. |
 
 ### Strategy and research documentation
 
@@ -288,8 +309,8 @@ source.
 | [research/protocol.md](research/protocol.md) | Statistical and operational evidence rules for `WORKED`, `FAILED`, `INCONCLUSIVE`, qualification, rejection, pairing, held-out confirmation, and multiple testing. |
 | [research/plan/RECONCILIATION.md](research/plan/RECONCILIATION.md) | Current authority policy separating journal evidence, exploratory tournament evidence, configuration exceptions, and VM handoff requirements. |
 | [research/plan/B7.5-record.md](research/plan/B7.5-record.md) | Current status and completion conditions for the optional maker-first order primitive. It distinguishes that execution experiment from `scalp-maker`. |
-| [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Reconciled implementation-flow summary showing how snapshots become isolated experiments, outcomes, edge evidence, tournaments, and backups. |
-| [research/plan/findings.md](research/plan/findings.md) | Pointer from the earlier findings plan to current implementation and evidence documents. It preserves context without acting as current instructions. |
+| [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Historical implementation pointer; current flow and commands are in the primary guides. |
+| [research/plan/findings.md](research/plan/findings.md) | Historical findings pointer; current evidence boundaries are in RECONCILIATION and protocol. |
 
 ### Findings indexes, audits, and scorecards
 

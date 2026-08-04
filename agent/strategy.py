@@ -20,10 +20,7 @@ from .contracts import EVIDENCE_BUILDERS, finite as _finite
 from .registry import spec_for
 
 
-# Every setup type any registered strategy may use. The per-strategy subset
-# lives on the spec (StrategySpec.setup_types) and is what build_setup_plan
-# actually enforces; this union exists so signal_probe can bound an untrusted
-# label before the spec is consulted.
+# Bounds untrusted labels before per-strategy validation.
 SETUP_TYPES = {
     "trend_continuation",
     "range_breakout",
@@ -37,15 +34,6 @@ SETUP_TYPES = {
     "spread_capture",
 }
 INVALIDATION_ANCHORS = {"structure", "atr"}
-# structure_target was removed in batch 6.1. It computed
-# max(stop_pct * fixed_rr, distance_to_recent_extreme), and in both setups it
-# was designed for the first term always won: a range_breakout fires at
-# range_pos_pct >= 85, so price is already at the highs and the remaining
-# distance is ~0, and a trend_continuation pullback sits 1-2% from the swing
-# while stop_pct * fixed_rr is ~4%. The policy was therefore identical to
-# fixed_rr precisely where it was meant to differ. An inert choice is worse
-# than no choice: it makes the decision space look richer than it is, and
-# attributes outcomes to a policy that never applied.
 EXIT_POLICIES = {"fixed_rr", "extended_rr", "carry_until_normalised"}
 EXECUTION_CHOICES = {"normal", "retry_smaller"}
 SETUP_STATUSES = {
@@ -221,9 +209,7 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
         return None, "setup type is not recognised"
     hypothesis_id = str(decision.get("hypothesis_id") or "")
     if setup_type == "other":
-        # 6.3: an experimental setup must now name a registered hypothesis.
-        # Without one it is the unlabelled bucket again, and a category
-        # meaning "everything else" teaches nothing.
+        # Experimental setups require a registered attribution hypothesis.
         if (cfg["mode"] != "demo"
                 or not cfg["strategy"]["allow_experimental_setups_in_demo"]):
             return None, "experimental setups are allowed only in demo mode"
@@ -242,11 +228,7 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     anchor = str(decision.get("invalidation_anchor") or "")
     if anchor not in INVALIDATION_ANCHORS:
         return None, "invalidation anchor is not recognised"
-    # Every contracted setup requires a structure invalidation, funding_squeeze
-    # included. It was previously the one setup permitted the ATR anchor, which
-    # yields exactly min_stop_atr_multiple - the narrowest stop the system can
-    # produce - for a counter-trend, mean-reversion entry into a crowded book.
-    # That is backwards: fading a crowd needs more room than following one.
+    # Core momentum setups require a structure-based invalidation.
     if setup_type in {"trend_continuation", "range_breakout",
                       "funding_squeeze"} and anchor != "structure":
         return None, f"{setup_type} requires a structure invalidation"
@@ -303,14 +285,8 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     if exit_policy == "extended_rr":
         take_pct = stop_pct * float(block["extended_reward_risk"])
     elif exit_policy == "carry_until_normalised":
-        # A carry position has no price target: the return source is the
-        # funding it collects, not a directional forecast, and it closes when
-        # the funding stops paying. The take here is only the protective outer
-        # bound that an exchange TP order needs to exist at all, so it is set
-        # at the widest configured distance rather than at a level the
-        # contract expects to reach. The stop is unchanged: price risk over
-        # the holding window still has to be charged against the carry, which
-        # is exactly what this strategy's falsification demands.
+        # Carry exits on funding normalization; this TP is only a protective
+        # exchange bound, while the stop still charges directional price risk.
         take_pct = stop_pct * float(block["extended_reward_risk"])
     else:
         take_pct = stop_pct * fixed_rr

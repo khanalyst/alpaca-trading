@@ -53,34 +53,8 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
     min_relative_volume = float(block["breakout_min_relative_volume"])
     funding_extreme = float(block["funding_extreme_pct_per_8h"])
 
-    # --- batch 6.4: which variable separates a breakout from a continuation
-    #
-    # The two contracts overlap: a symbol in a strong aligned uptrend is
-    # almost always in the top of its 24h range with elevated volume, so both
-    # fire and which label a trade receives depends on which word the model
-    # chose rather than on a difference in the market. Attributing
-    # performance by setup_type then splits one phenomenon across two rows.
-    #
-    # What it should be separated BY is an open question, and the plan and
-    # the edge hypotheses disagree:
-    #
-    #   trend_alignment    6.4 as originally specified. A breakout is a
-    #                      transition OUT of chop, so it requires the absence
-    #                      of prior multi-timeframe alignment.
-    #   volatility_regime  The real partition is compression versus
-    #                      expansion, and trend alignment is a correlated
-    #                      proxy for it. A breakout from a compressed base is
-    #                      a real event; a "break" when volatility is already
-    #                      elevated is an ordinary excursion in a wide
-    #                      distribution.
-    #   none               Neither. The shipped behaviour, kept as the
-    #                      default so this batch changes nothing until a
-    #                      discriminator is chosen deliberately.
-    #
-    # Making it configurable is what lets the corpus decide instead of the
-    # argument. Baking one in and then testing the other would filter the
-    # population on a correlated variable first, which is precisely what
-    # makes the regime test impossible to run cleanly afterwards.
+    # The configured discriminator isolates attribution between overlapping
+    # breakout and continuation contracts; "none" preserves both labels.
     discriminator = str(block.get("breakout_discriminator") or "none")
     compression_max = float(
         block.get("breakout_compression_max_atr_ratio") or 1.0)

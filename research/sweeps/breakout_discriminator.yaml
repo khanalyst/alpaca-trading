@@ -1,4 +1,4 @@
-# Batch 6.4, as a question rather than a decision.
+# Breakout discriminator, registered as a question rather than a decision.
 #
 # This is a PARAMETER axis, so it divides the sample and the forecast will
 # refuse it until the corpus is large enough. That refusal is correct: the

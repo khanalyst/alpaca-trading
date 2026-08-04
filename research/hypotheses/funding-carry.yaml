@@ -40,7 +40,7 @@ reward_risk: 2.0
 max_hold_bars: 960         # 10 days
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-# --- the parameterisations that will be tested -----------------------------
+# Parameterizations
 # Registered 2026-07-30. This hypothesis was rejected on ATTRIBUTION, not on a
 # threshold: funding contributed +0.039% of a +2.008% result. A crowding
 # threshold cannot fix that, and the expectation is that all four settings
@@ -93,7 +93,7 @@ data_limitation: |
 # checkable, so it is declared here and the battery verifies it.
 return_source: funding
 
-# --- outcome, appended after the first run ---------------------------------
+# Recorded outcome
 outcome: falsified_mechanism
 outcome_evidence: research/results/tournament/REPORT.md
 outcome_summary: |

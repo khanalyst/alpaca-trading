@@ -147,7 +147,7 @@ def simulate_managed(frame, idx, direction, stop_pct, take_pct, costs: Costs,
                 exit_price, exit_bar = take_level[k], bar
                 reason = "take_profit"
                 break
-            # Favourable excursion, measured conservatively at the close.
+            # Measure favourable excursion at the close (conservative).
             excursion = sign * (close[bar] - entry[k]) / risk[k]
             if partial_at_r is not None and not took_partial \
                     and excursion >= partial_at_r:
@@ -157,7 +157,7 @@ def simulate_managed(frame, idx, direction, stop_pct, take_pct, costs: Costs,
                 took_partial = True
             if breakeven_at_r is not None and not moved \
                     and excursion >= breakeven_at_r:
-                # Breakeven must cover the round trip, or "scratch" is a loss.
+                # Breakeven must cover round-trip costs; otherwise scratch is a loss.
                 stop = entry[k] * (1 + sign * 2 * fee / 100)
                 moved = True
             if trail_atr is not None and atr_pct is not None:
@@ -206,8 +206,6 @@ def run_variant(frames, membership, contract, costs, **overlay) -> pd.DataFrame:
     if not chunks:
         return pd.DataFrame()
     trades = pd.concat(chunks, ignore_index=True).sort_values("entry_ts")
-    # One live position per symbol is enforced by the agent; approximate it
-    # by thinning to non-overlapping trades per symbol.
     return trades.reset_index(drop=True)
 
 

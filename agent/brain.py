@@ -619,8 +619,6 @@ class LLM:
                 total, fresh, output, cached, hit_rate)
         return resp.choices[0].message.content or ""
 
-    # ----------------------------------------------------------- public
-
     def preflight(self) -> str:
         """Verify API-key access to the configured model.
 

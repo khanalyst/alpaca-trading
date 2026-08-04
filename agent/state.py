@@ -38,7 +38,6 @@ PAUSED = "PAUSED"            # housekeeping only: no LLM calls, no new entries
 DAY_STOPPED = "DAY_STOPPED"  # daily loss limit hit: model may close, cannot open
 KILLED = "KILLED"            # terminal: flatten everything and exit
 EQUITY_BASIS = "usdt_currency_equity_v1"
-# 4: variant_id and strategy_config_version on events and trades (B0).
 JOURNAL_SCHEMA_VERSION = 4
 
 _JOURNAL_CONTEXT: dict[str, object] = {}
@@ -680,8 +679,6 @@ def commit(st: dict, transition: tuple[str, str] | None = None,
         return st
 
 
-# ---------------------------------------------------------------- PID file
-
 def acquire_run_lock():
     """Atomically acquire the single-agent lock and publish this PID."""
     RUNTIME.mkdir(parents=True, exist_ok=True)
@@ -733,9 +730,6 @@ def pid_alive(pid: int) -> bool:
         return True
     except Exception:
         return False
-
-
-# ---------------------------------------------------------------- journal
 
 
 class JournalError(RuntimeError):
@@ -851,8 +845,7 @@ def set_journal_context(**context: object) -> dict:
         "run_id", "cycle_id", "strategy_id", "strategy_version",
         "prompt_version", "config_version", "code_version",
         "equity_basis_id", "runtime_mode", "account_fingerprint",
-        # B0: attribution keys off a readable variant name, never off an
-        # opaque whole-config hash. Live trading writes variant_id "live".
+        # Variant attribution uses readable IDs rather than whole-config hashes.
         "variant_id", "strategy_config_version",
     }
     unknown = set(context) - allowed
@@ -922,7 +915,7 @@ def _db() -> sqlite3.Connection:
         "entry_equity_usd REAL, close_trigger TEXT, close_evidence TEXT, "
         "runtime_mode TEXT, account_fingerprint TEXT)"
     )
-    # Migrate journals created by earlier releases in place.
+    # Additive migration keeps existing journals readable.
     _ensure_columns(conn, "trades", {
         "confidence": "REAL", "pnl_pct": "REAL", "trade_id": "TEXT",
         "order_id": "TEXT", "fee_usd": "REAL", "funding_usd": "REAL",

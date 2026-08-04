@@ -148,8 +148,6 @@ class Exchange:
             self._account_config = self.account_config(refresh=True)
             self.verify_account_safety(require_trade=False, refresh=False)
 
-    # ------------------------------------------------------------- helpers
-
     def _alert(self, level: str, event: str, message: str,
                details: dict | None = None) -> None:
         if self.alerts:
@@ -325,8 +323,6 @@ class Exchange:
             details,
         )
 
-    # --------------------------------------------------------------- clock
-
     def clock_drift_ms(self) -> float:
         """Local clock minus OKX server clock, in milliseconds.
 
@@ -384,8 +380,6 @@ class Exchange:
         last = getattr(self, "_clock_checked_at", 0.0)
         if time.time() - last >= CLOCK_RECHECK_SECONDS:
             self.check_clock(fatal=True)
-
-    # ---------------------------------------------------------- permissions
 
     def account_config(self, refresh: bool = False) -> dict:
         """Return OKX account configuration through its read-only endpoint."""
@@ -789,8 +783,6 @@ class Exchange:
             raise RuntimeError(f"OKX returned an invalid price for {symbol}")
         return value
 
-    # ------------------------------------------------------------- account
-
     @staticmethod
     def _usdt_equity_from_balance(balance: dict) -> float:
         """Return USDT-denominated equity without valuing other currencies.
@@ -1164,8 +1156,6 @@ class Exchange:
                 return position
         return None
 
-    # ------------------------------------------------------------- sizing
-
     def contracts_for_notional(self, symbol: str, notional_usd: float,
                                price: float) -> float:
         if (not math.isfinite(float(notional_usd))
@@ -1396,8 +1386,6 @@ class Exchange:
             "estimated_slippage_pct": abs(vwap - mid) / mid * 100,
             "age_seconds": age_seconds,
         }
-
-    # ------------------------------------------------------------- orders
 
     def protective_orders(self, symbol: str) -> list[dict]:
         """Return regular and conditional orders, deduplicated by order ID."""
@@ -1830,8 +1818,6 @@ class Exchange:
                         {"remaining_contracts": remaining_contracts})
         return result
 
-    # --------------------------------------------------------- cancellation
-
     def cancel_symbol(self, symbol: str) -> None:
         """Cancel every regular and conditional (algo) order on one symbol."""
         try:
@@ -1905,8 +1891,6 @@ class Exchange:
                 details += ("; " if details else "") + (
                     "still open: " + ", ".join(remaining_ids))
             raise RuntimeError(f"order cancellation could not be verified: {details}")
-
-    # ------------------------------------------------------ reconciliation
 
     def closed_position_summary(self, symbol: str, since_ms: int,
                                 direction: str, entry_price: float,

@@ -131,10 +131,7 @@ class ShadowEvaluator:
             workers: int = 1,
             rotation_baseline: Variant | None = None,
             rotation_candidates: list[dict] | None = None,
-            # 10 days, matching the shipped floor. Anything below the
-            # 8-cluster arithmetic minimum (8*6h/0.30 = 6.67 days) can
-            # only ever produce an INCONCLUSIVE confirmation window, so
-            # the conservative default has to be a reachable one.
+            # The default exceeds the minimum reachable confirmation window.
             rotation_min_duration_seconds: float = 10 * 86_400,
             rotation_min_observations: int = 100) -> None:
         self.budget_ms = float(budget_ms)
@@ -143,10 +140,7 @@ class ShadowEvaluator:
         self.initial_balance_usdt = float(initial_balance_usdt)
         self.max_failures = int(max_failures)
         self.workers = max(1, int(workers))
-        # Direct construction is intentionally isolated. Runtime construction
-        # supplies the durable configured store through build(); tests and
-        # one-off callers get a private database instead of contaminating the
-        # repository-wide findings store or one another.
+        # Direct callers get an isolated store; build() supplies durable state.
         self._temporary_store = None
         if store is None:
             self._temporary_store = tempfile.TemporaryDirectory(
@@ -1297,7 +1291,7 @@ class ShadowEvaluator:
                     realized_rates.append(rate)
             cost_pct += sign * sum(realized_rates)
         else:
-            # Schema-3..10 positions remain restart-compatible.
+            # Preserve restart compatibility with earlier position records.
             cost_pct = float(position.get("round_trip_cost_pct") or 0)
             if result != "stop":
                 cost_pct = max(
@@ -1749,19 +1743,8 @@ class StrategyShadowCoordinator:
             raise ValueError("strategy shadow coordinator needs an evaluator")
         self.evaluators = dict(evaluators)
         self.active_strategy_id = str(active_strategy_id)
-        # The active strategy's own LLM decisions, kept as a second lane in
-        # its own scope.
-        #
-        # Every strategy in `evaluators` now sees deterministic proposals, so
-        # a cross-strategy comparison finally varies the strategy rather than
-        # the proposal source. That alone would have thrown away the record of
-        # what the analyst actually decided, which is the only evidence that
-        # can teach it anything: research_history_context() builds the
-        # planner's memory out of experiment outcomes, so a lane that stops
-        # recording LLM decisions is a lane the LLM stops learning from.
-        #
-        # A separate scope rather than a separate variant, because the two
-        # lanes are not comparable and must never be pooled into one verdict.
+        # LLM decisions use a separate scope from deterministic comparisons;
+        # the two proposal sources must never be pooled into one verdict.
         self.llm_evaluator = llm_evaluator
         self.store = next(iter(self.evaluators.values())).store
         self.scope_key = next(iter(self.evaluators.values())).scope_key
@@ -1860,14 +1843,7 @@ class StrategyShadowCoordinator:
                 "phase": "evaluate",
             }
             try:
-                # Including the active strategy. Feeding it recorded LLM
-                # proposals while every other strategy got deterministic ones
-                # meant a momentum-vs-anything comparison varied two things at
-                # once, and the proposal source is the larger of the two: an
-                # analyst that declines to propose produces no decision at all,
-                # where a deterministic contract always emits a probe and lets
-                # the strategy veto it. The recorded LLM lane still runs, in
-                # its own scope, below.
+                # Cross-strategy comparisons use one deterministic proposal source.
                 model = require_complete_contract(strategy_id)
                 strategy_proposals = model.deterministic_proposals(
                     snapshot, evaluator.base_cfg)
@@ -1952,9 +1928,7 @@ def _research_cfg(cfg: dict, strategy_id: str) -> dict:
         "version": spec.version,
         "signal_timeframe": spec.signal_timeframe,
     })
-    # Outcome semantics belong to the validated forward model, not to the
-    # active momentum config copied above or to the historical tournament's
-    # contract-parameter namespace.
+    # Outcome semantics come only from the validated forward model.
     block["min_stop_atr_multiple"] = model.stop_atr_multiple
     block["fixed_reward_risk"] = model.reward_risk
     block["forward_horizon_hours"] = model.horizon_hours
@@ -2070,9 +2044,7 @@ def build(
         resolve_store_path(configured_path))
     resolved_scope = scope_key or f"{cfg.get('mode', 'unknown')}:unscoped"
 
-    # Explicit variant lists retain the original single-strategy API used by
-    # focused tooling. The shipped wildcard is the end-to-end seven-strategy
-    # research mode.
+    # Explicit lists select one strategy; the wildcard selects all strategies.
     if "*" not in names:
         return _build_strategy_evaluator(
             cfg, registry, names, scope_key=resolved_scope,
@@ -2084,11 +2056,8 @@ def build(
     evaluators = {}
     for strategy_id in sorted(strategy_registry.REGISTRY):
         spec = strategy_registry.spec_for(strategy_id)
-        # A strategy whose horizon cannot reach the closed-trade floor is
-        # researched offline rather than holding a real-time lane open for
-        # hundreds of days to produce nothing. The active strategy is never
-        # skipped: it is the one on the order path, so its evidence is
-        # collected regardless of how long a verdict takes.
+        # Keep the active strategy; skip other lanes that cannot reach the
+        # real-time closed-trade floor.
         if not spec.realtime_eligible and strategy_id != str(
                 cfg["strategy"]["id"]):
             continue
@@ -2101,11 +2070,7 @@ def build(
     if not evaluators:
         return None
     active_id = str(cfg["strategy"]["id"])
-    # The analyst's own decisions, in a sibling scope. Every lane above now
-    # runs on deterministic proposals so the comparison isolates the strategy;
-    # this one preserves what the LLM actually chose, which is what the
-    # planner's history context is built from and therefore the only record it
-    # can learn an edge from.
+    # Preserve analyst decisions in a sibling scope for learning history.
     llm_evaluator = _build_strategy_evaluator(
         _research_cfg(cfg, active_id), registry, ["*"],
         scope_key=f"{resolved_scope}:llm", findings_store=findings_store)

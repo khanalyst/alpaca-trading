@@ -1,6 +1,6 @@
 # A parameter axis, registered but deliberately NOT scheduled.
 #
-# Per action-plan C5 this must not run until the funnel report is published.
+# Do not run this until the funnel report is published.
 # If the binding veto sits downstream of the strategy contract - and the
 # first funnel run says it does - then no setting of fixed_reward_risk can
 # change the trade count, and five replays would consume weeks to discover

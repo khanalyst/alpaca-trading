@@ -35,15 +35,12 @@ import requests
 
 BASE = "https://www.okx.com"
 BAR_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
-# OKX's open-interest history reaches back roughly 60 days regardless of the
-# window asked for. Used to decide whether a cached file is complete for the
-# span that can actually be served.
+# OKX serves open-interest history for roughly 60 days; cache validation uses
+# that serviceable span rather than the requested window.
 OI_RETENTION_MS = 60 * 86_400_000
 MANIFEST_SCHEMA = "okx-history-snapshot.v1"
 DOWNLOAD_LOCK = ".download-in-progress"
 
-# OKX publishes per-endpoint IP rate limits. Stay comfortably inside them so a
-# long download never trips a ban: history-candles is 20 requests / 2s.
 CANDLE_SLEEP = 0.0
 OTHER_SLEEP = 0.0
 
@@ -171,7 +168,7 @@ class Downloader:
                 time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"{path} failed after {self.retries} tries: {last_error}")
 
-    # ------------------------------------------------------------- candles
+    # Candles
 
     def candles(self, inst_id: str, bar: str, start_ms: int,
                 end_ms: int) -> pd.DataFrame:
@@ -228,7 +225,7 @@ class Downloader:
         return frame[keep].dropna().sort_values("timestamp_ms").reset_index(
             drop=True)
 
-    # ------------------------------------------------------------- funding
+    # Funding
 
     def funding(self, inst_id: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         rows: dict[int, float] = {}
@@ -261,7 +258,7 @@ class Downloader:
             sorted(rows.items()), columns=["timestamp_ms", "funding_rate"])
         return frame
 
-    # ------------------------------------------------------ open interest
+    # Open interest
 
     def open_interest(self, inst_id: str, start_ms: int,
                       end_ms: int) -> pd.DataFrame:
@@ -348,9 +345,8 @@ def download_symbol(inst_id: str, out: Path, start_ms: int, end_ms: int,
         if covered(spot_path, start_ms, end_ms, 4 * BAR_MS["15m"]):
             spot = pd.read_csv(spot_path)
         else:
-            # Only the perp/index basis needs spot, and not every swap has a
-            # listed spot pair (OKX answers 51001). Losing basis for one
-            # instrument is a missing column; aborting is a missing dataset.
+            # Spot is needed only for perp/index basis; an unavailable pair
+            # leaves that column missing without aborting the dataset.
             try:
                 spot = api.candles(
                     inst_id.replace("-SWAP", ""), "15m", start_ms, end_ms)
@@ -364,13 +360,9 @@ def download_symbol(inst_id: str, out: Path, start_ms: int, end_ms: int,
 
     if want_oi:
         oi_path = out / "oi" / f"{stem}.csv"
-        # Coverage check, not a bare existence check. OKX serves only about
-        # 60 days of open interest whatever window is requested, so the file
-        # can never span a long request - but it must still cover the part
-        # OKX can actually serve. Reusing any existing file regardless of its
-        # span means a short earlier download (a smoke test, an interrupted
-        # run) is silently reused forever, and open interest is precisely the
-        # series a deleveraging hypothesis cannot be tested without.
+        # Validate cache coverage against the span OKX can serve. Reusing a
+        # shorter or interrupted file would silently remove the OI evidence
+        # needed by deleveraging tests.
         oi_start = max(start_ms, end_ms - OI_RETENTION_MS)
         if covered(oi_path, oi_start, end_ms, 6 * 3_600_000):
             oi = pd.read_csv(oi_path)
@@ -486,8 +478,8 @@ def main() -> int:
             print(f"  {row['inst_id']}: {row['error'][:120]}", flush=True)
 
     usable = [r for r in results if r.get("swap_bars", 0) > 5000]
-    # Removing the exclusive in-progress marker is the final transition from
-    # a partial directory to a manifestable immutable snapshot.
+    # Remove the in-progress marker only after the directory is complete;
+    # this publishes an immutable snapshot.
     download_lock.unlink()
     manifest = {
         "schema": MANIFEST_SCHEMA,

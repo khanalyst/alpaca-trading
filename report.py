@@ -28,10 +28,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 
 
-# One scorer, not two. The round-trip matcher lives in research/score.py so
-# the live report and the replay harness compute expectancy the same way; two
-# implementations would produce two sets of numbers that cannot be compared,
-# and comparing them is the job.
+# Live and replay reports share one expectancy implementation.
 from research.score import match_round_trips  # noqa: E402,F401
 
 

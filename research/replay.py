@@ -99,9 +99,8 @@ class ReplayDecision:
     # journals `setup_proposed` at - before vet_open, not after - so gate G2
     # must compare against this rather than against executions.
     contract_passed: bool = False
-    # The B0.5 enrichment for this symbol-cycle, carried alongside the
-    # decision so a conditioning axis can partition on it without a second
-    # pass over the corpus. Recorded, never shown to the model.
+    # Enrichment travels with the decision for conditioning, but is never
+    # shown to the model.
     enrichment: dict = field(default_factory=dict)
 
     def key(self) -> tuple:
@@ -222,7 +221,7 @@ class Replay:
                 cfg["execution"]["max_order_book_slippage_pct"]))
         self.risk = RiskEngine(cfg)
 
-    # ------------------------------------------------------------- proposal
+    # Proposals
 
     def _proposals(self, cycle, row: dict, symbol: str,
                    recorded: dict) -> list:
@@ -246,7 +245,7 @@ class Replay:
         vetoed_directions = {str(d.get("direction")) for d in model}
         return [p for p in fired if p["direction"] in vetoed_directions]
 
-    # --------------------------------------------------------------- replay
+    # Replay
 
     def run(self, cycles: list, outputs: list,
             max_hold_hours: float | None = None) -> ReplayResult:
@@ -728,7 +727,7 @@ def _count(bucket: dict, reason) -> None:
     bucket[key] = bucket.get(key, 0) + 1
 
 
-# ------------------------------------------------------------ self-validation
+# Self-validation
 
 def fidelity(result: ReplayResult, db) -> dict:
     """Gate G2: does the baseline replay reproduce what the agent recorded?

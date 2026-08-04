@@ -34,7 +34,7 @@ reward_risk: 3.0
 max_hold_bars: 1344        # 14 days
 cost_scenarios: [frictionless, optimistic, base, realistic_alt, stress]
 
-# --- the parameterisations that will be tested -----------------------------
+# Parameterizations
 # Registered 2026-07-30, before this hypothesis has been scored at all - which
 # is the right time to register them.
 #

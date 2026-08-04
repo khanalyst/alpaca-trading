@@ -59,10 +59,8 @@ class SetupPlan:
     spread_pct: float = 0.0
     funding_rate_pct: float = 0.0
     funding_interval_hours: float = 8.0
-    # Measured on the demo account, not assumed: 0.248%/side across 24 round
-    # trips (see config.yaml trading_costs). The previous 0.05 default was a
-    # 4.96x understatement, and because it is a DEFAULT it silently applied
-    # wherever a caller had no per-symbol rate to pass.
+    # The 0.25% default is the taker fee per side; CostModel charges both sides
+    # of a round trip. Callers may override it with a per-symbol rate.
     taker_fee_pct_per_side: float = 0.25
 
     @property
@@ -196,8 +194,8 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
         hit_target = (bar.high >= target) if long else (bar.low <= target)
 
         if hit_stop and hit_target:
-            # Both inside one minute. Which came first is unknowable, so it
-            # resolves against the trade. Never configurable.
+            # When both thresholds occur within one minute, order is unknown;
+            # resolve against the trade with a fixed stop-first rule.
             return _finish(plan, costs, "stop", bar.close_ts, stop,
                            held, mae, mfe, tie=True)
         if hit_stop:
@@ -210,8 +208,7 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
     if held == 0:
         return Outcome(result="no_data")
 
-    # Timeout, exiting at that bar's close - mirroring the live max-hold
-    # force close rather than assuming a favourable exit.
+    # Timeout exits at the bar close, matching the live max-hold force close.
     last = bars[held - 1]
     return _finish(plan, costs, "timeout", last.close_ts, last.close,
                    held, mae, mfe)
@@ -227,8 +224,8 @@ def _finish(plan: SetupPlan, costs: CostModel, result: str, exit_ts: int,
     realised = costs.realised(plan, result, hours)
     net = gross - realised["total_pct"]
 
-    # The denominator is the same all-in risk figure the live engine sized
-    # from, so a replayed R and a demo R mean the same thing.
+    # Use the live engine's all-in stop-loss denominator so replayed and demo
+    # R-multiples have the same meaning.
     risk_pct = costs.risk_pct(plan, realised["funding_intervals"])
     return Outcome(
         result=result, exit_ts=exit_ts, exit_price=exit_price,

@@ -5,13 +5,10 @@
 # looks best, and a table of rankings with no claim written beforehand is a
 # ranking of noise.
 #
-# Registered here is not the same as scheduled. Per action-plan-v2 C5, no
-# parameter sweep runs until the funnel report is published, because if the
-# binding veto sits downstream of the strategy contract then no setting of any
-# contract parameter can change the trade count and the whole sweep is wasted
-# calendar time. Per C4, conditioning axes are preferred over parameter axes
-# for the first six months: they partition trades that already exist instead
-# of dividing an already-small sample further.
+# Registration does not schedule execution. Parameter sweeps wait for the
+# funnel report because a downstream binding veto would make contract settings
+# unable to change trade count. Conditioning axes run before parameter axes:
+# they partition existing trades instead of dividing a small sample further.
 
 variants:
   - variant_id: momentum.baseline
@@ -24,7 +21,7 @@ variants:
       any other number here means anything.
     status: testing
 
-  # --- exit policy -------------------------------------------------------
+  # Exit policy
   # findings.md: the 2R target has never been validated against any
   # alternative. Three settings minimum before this axis may be rejected.
   - variant_id: momentum.rr.fixed_1_5
@@ -80,7 +77,7 @@ variants:
       is where a momentum strategy's expectancy lives if it has any.
     status: superseded
 
-  # --- the noise floor ---------------------------------------------------
+  # Noise floor
   # min_stop_atr_multiple sets how much ordinary movement counts as
   # invalidation, so it drives stop distance, position size and R together.
   - variant_id: momentum.stop.atr_1_25
@@ -113,7 +110,7 @@ variants:
       monotonic or has an interior optimum.
     status: candidate
 
-  # --- the veto suspected of binding hardest -----------------------------
+  # Net-direction veto
   # findings.md section 5 flags the net-direction cap as the step that kills
   # most 2nd and 3rd same-side entries. Gate G4 promotes this to first
   # priority if the funnel confirms it dominates.
@@ -148,7 +145,7 @@ variants:
       suppresses genuinely independent signals rather than correlated bets.
     status: candidate
 
-  # --- the confidence floor ----------------------------------------------
+  # Confidence floor
   # The live prompt already suppresses proposals below the shipped 0.65
   # floor. Reusing recorded proposals can therefore measure only the marginal
   # value of stricter floors, not the value of proposals the model never emits.
@@ -225,15 +222,14 @@ variants:
       adds marginal value over the observable proposals admitted by the 0.65 baseline.
     status: superseded
 
-  # --- batch 6.4: which variable separates breakout from continuation ------
+  # Breakout discriminator
   # The two contracts overlap, so attribution splits one phenomenon across
   # two rows. What they should be separated BY is the open question, and the
   # plan and the edge hypotheses give different answers. Registering both as
   # variants is what lets the corpus decide instead of the argument.
   #
-  # Gate G5 previously blocked 6.4 on the volatility-regime question. Making the discriminator a
-  # parameter dissolves that gate: neither answer is baked in, so neither
-  # filters the population the other one needs.
+  # Neither discriminator is preselected, so each population remains
+  # observable while the parameter is evaluated.
   #
   # RETIRED 2026-08-04: unrunnable, not refuted. Separating breakouts from
   # continuations needs a breakout population, and live demo produced 2

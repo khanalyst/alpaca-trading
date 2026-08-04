@@ -1,21 +1,30 @@
 # Research guide
 
-The current research system has three related but separate paths.
+The current research system has three related but separate paths. Executable
+code and `config.yaml` are authoritative; this guide is the compact research
+orientation. Installation belongs to [`../SETUP.md`](../SETUP.md), and
+operation belongs to [`../OPERATIONS.md`](../OPERATIONS.md).
 
-## Real-time seven-strategy experiments
+## Realtime four-lane experiments
 
 Every decision cycle sends the same market snapshot/timestamp to isolated
-paper evaluators for `momentum`, `flush-fade`, `funding-carry`,
-`funding-unwind`, `trend-multiday`, `ls-ratio-fade`, and `scalp-maker`.
-Only the configured main strategy can reach the demo exchange.
+deterministic paper evaluators for `momentum`, `flush-fade`, `ls-ratio-fade`,
+and `scalp-maker`. `funding-carry`, `funding-unwind`, and `trend-multiday` are
+registered offline-only models. Only the configured main strategy can reach the
+demo exchange.
 
-Each strategy continuously keeps its baseline and at most one candidate
-setting. All seven lanes use one snapshot/timestamp and are logically isolated,
-but the coordinator intentionally evaluates them in a bounded sequence and
-serializes durable writes rather than creating seven simultaneous SQLite
-writers. Candidate rotation is serial per strategy. The default assignment
-floor is both three elapsed days and 100 comparable paired observations. State
-survives restart in the schema-16 findings store.
+Each realtime strategy continuously keeps its baseline and at most one candidate
+setting. The four lanes use one snapshot/timestamp and deterministic contract
+proposals. They are logically isolated, but the coordinator intentionally
+evaluates them in a bounded sequence and serializes durable writes rather than
+creating four simultaneous SQLite writers. Candidate rotation is serial per
+strategy. The default assignment floor is both ten elapsed days and 100
+comparable paired observations. State survives restart in the schema-16
+findings store.
+
+These four lanes produce eight deterministic comparison arms. The separate
+`:llm` sibling may hold its own baseline and candidate, adding two
+non-comparable arms for a runtime maximum of ten when present.
 
 The LLM can submit one bounded research-only selection. Invalid selections and
 their reasons persist. Accepted selections queue and never preempt an active
@@ -29,17 +38,27 @@ The draft creates no variant or selection, changes no configuration, tier,
 portfolio, or order authority, and must be manually reviewed and registered in
 a later code change before research can use it.
 
+The active simulator scope is `forward_feed_version: 6`. Feed v6 makes the
+four realtime lanes deterministic; the three long-horizon models remain
+offline-only. The active analyst's actual choices remain in a sibling `:llm`
+scope for planner history and are never pooled with lane comparisons. Feeds
+v1-v5 remain historical (v4 is the market-data plumbing repair feed and v5 the
+immutable-provenance fork).
+
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
-current v5 forward qualification is still required and there is no automatic
+current v6 forward qualification is still required and there is no automatic
 live promotion.
 
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
-used. Replay/G2 must reproduce the recorded decisions before downstream
-authoritative evidence is trusted. The current v5 `forward-qualify` path uses
+used. Replay/G2 compares recorded pre-risk proposal keys
+`(cycle_id, symbol, direction)` with replay keys and requires at least 99%
+reproduction before downstream authoritative evidence is trusted. It does not
+reproduce full contract or execution semantics. The current v6
+`forward-qualify` path uses
 eligible completed assignments and each setting's contemporaneous baseline.
 Its paired cluster sign-flip result is valid only under the documented
 cluster-delta sign-exchangeability/symmetric-null assumption.

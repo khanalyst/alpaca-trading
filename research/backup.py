@@ -539,7 +539,7 @@ def create_backup(
                 backup_path=backup_path, detail=result)
             result["recorded"] = True
         except ValueError:
-            # A verification failure may already have been recorded above.
+            # Preserve any verification failure recorded by an earlier check.
             result["recorded"] = True
         raise BackupError(str(exc), result) from exc
 

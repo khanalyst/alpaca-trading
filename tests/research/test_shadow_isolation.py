@@ -520,7 +520,6 @@ class SymbolVisibilityTests(unittest.TestCase):
         engine.shadow = Mock()
         engine.shadow.held_symbols.return_value = ["DOGE/USDT:USDT"]
 
-        # What the fetch layer returns for the union of both symbol sets.
         wide = self._wide()
         seen = {}
 
@@ -536,10 +535,8 @@ class SymbolVisibilityTests(unittest.TestCase):
                 engine.cfg)
         live_view = market.restrict_snapshot(fetched, engine.universe)
 
-        # The shadow symbol is fetched, so its account can mark its position.
         self.assertIn("DOGE/USDT:USDT", seen["fetched"])
         self.assertIn("DOGE/USDT:USDT", fetched)
-        # And it is invisible to everything the live path reads.
         self.assertNotIn("DOGE/USDT:USDT", live_view)
         self.assertEqual(
             live_view["_market_context"]["instruments_with_a_valid_setup"], 1)
@@ -556,7 +553,6 @@ class SymbolVisibilityTests(unittest.TestCase):
                      "self._record_shadow_decisions(live_snapshot",
                      "self._record_observations(live_snapshot"):
             self.assertIn(call, source, f"{call} is no longer restricted")
-        # The variant accounts still need the wide map to mark their books.
         self.assertIn("self._advance_shadow_variants(snapshot", source)
 
     @patch("agent.engine.state.log_event")

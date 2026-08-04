@@ -359,8 +359,6 @@ def _open_interest_usd(ex, symbol: str, last: float) -> float | None:
     return value if math.isfinite(value) and value >= 0 else None
 
 
-# ------------------------------------------------------------- indicators
-
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
@@ -497,8 +495,6 @@ def classify_regime(snap: dict) -> str:
     return "transition"
 
 
-# ------------------------------------------------------------- universe
-
 def _history_eligibility(ex, symbol: str, cfg: dict) -> tuple[bool, str, dict]:
     """Verify the same completed-candle minimum required by snapshots."""
     minimum = int(cfg["universe"]["min_history_candles"])
@@ -601,8 +597,6 @@ def build_universe(ex, cfg: dict) -> list[str]:
     return select_universe(ex, cfg)[0]
 
 
-# ------------------------------------------------------------- snapshot
-
 def symbol_snapshot(ex, symbol: str, cfg: dict,
                     benchmark_returns: pd.Series | None = None) -> dict:
     tfs = cfg["cycle"]["timeframes"]
@@ -653,7 +647,7 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
         )
         # Current OKX/CCXT funding responses omit these prices. Preserve the
         # value only for adapters that genuinely supply both fields; the live
-        # ``market_snapshot`` path overwrites it from dedicated batch sources.
+        # ``market_snapshot`` overwrites it from dedicated API sources.
         info = fr.get("info") or {}
         snap["perp_index_basis_pct"] = _basis_pct(
             fr.get("markPrice") or info.get("markPx"),
@@ -843,10 +837,7 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     snap = _json_safe(snap)
     snap["regime"] = classify_regime(snap)
     strategy.enrich_snapshot(snap, cfg)
-    # B0.5: recorded from today, shown to the model in no batch but the one
-    # that deliberately tests it. Added after enrich_snapshot so it can never
-    # reach a contract, and after _json_safe so it is sanitized in its own
-    # right rather than by a pass that ran before it existed.
+    # Build sanitized research enrichment after model-visible strategy fields.
     enrichment = realised_vol_enrichment(
         list(df_fast["close"]),
         utc_hour=int(time.gmtime(int(snap["signal_ts"]) / 1000).tm_hour),
@@ -1054,10 +1045,8 @@ def market_snapshot(ex, symbols: list[str], cfg: dict) -> dict:
     except Exception as e:
         log.warning("benchmark snapshot failed: %s", e)
 
-    # B0.5.3: BTC reference returns, recorded so the residual computation
-    # the BTC-residual study needs does not depend on the 1m price cache being complete for
-    # every symbol-day. Costs one OHLCV call per cycle and is withheld from
-    # the prompt like the rest of the enrichment.
+    # BTC reference returns are persisted for residual research and withheld
+    # from the model prompt.
     context[brain.ENRICHMENT_KEY] = _btc_reference_returns(ex, benchmark, cfg)
 
     out = {"_market_context": context}

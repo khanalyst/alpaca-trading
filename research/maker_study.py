@@ -156,15 +156,14 @@ def maker_study(frames, membership, contract: Contract,
         if len(idx) == 0:
             continue
 
-        # --- taker: cross the spread at the next bar's open
+        # Taker execution crosses the spread at the next bar's open.
         taker_entry = open_[idx + 1] * (1 + exit_slip / 100 * sign)
         taker_all.append(run_from_entry(
             frame, idx + 1, taker_entry, direction, stop_pct, take_pct,
             TAKER_FEE, exit_slip, stop_slip, contract.max_hold_bars))
 
-        # --- maker: rest at the signal bar's close and wait to be hit.
-        # A long fills only if price trades down to the limit, which is the
-        # adverse-selection mechanism made explicit.
+        # Maker execution rests at the signal close; a long fills only after
+        # price trades down to the limit (adverse selection).
         limit = close[idx]
         trigger = limit * (1 - fill_margin_bps / 10_000 * sign)
         filled = np.zeros(len(idx), dtype=bool)
@@ -183,7 +182,8 @@ def maker_study(frames, membership, contract: Contract,
             frame, entry_idx, limit[filled], direction,
             stop_pct[filled], take_pct[filled], MAKER_FEE,
             exit_slip, stop_slip, contract.max_hold_bars))
-        # The same signals, executed as taker: isolates selection from price.
+        # Reusing the same signals with taker fills isolates selection from
+        # execution price.
         taker_filled.append(run_from_entry(
             frame, idx[filled] + 1,
             open_[idx[filled] + 1] * (1 + exit_slip / 100 * sign),

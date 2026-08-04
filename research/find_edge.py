@@ -69,8 +69,7 @@ def main() -> int:
         "rev_4b", "rev_16b", "rev_96b",
         "residrev_4b", "residrev_16b", "residrev_96b",
         "ret_16b", "vol_z", "funding_8h",
-        # Ranking within a timestamp cancels market direction, which is the
-        # exact bias that made the last candidate's placebo score 41% of it.
+        # Timestamp-wise ranks remove common market direction from the signal.
         "flush_fade", "build_follow"))
     print(f"panel: {len(panel):,} tradable symbol-bars, "
           f"{panel['symbol'].nunique()} instruments, "

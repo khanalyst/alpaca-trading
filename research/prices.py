@@ -75,8 +75,6 @@ class PriceCache:
         self.fetcher = fetcher
         self.network_calls = 0
 
-    # ------------------------------------------------------------- reading
-
     def bars(self, symbol: str, start_ms: int, end_ms: int) -> list[Bar]:
         """Bars with ``start_ms <= ts < end_ms``, ascending, from cache only."""
         with _connect(self.path) as conn:
@@ -99,8 +97,6 @@ class PriceCache:
             out.append(day_of(cursor))
             cursor += DAY_MS
         return out
-
-    # ------------------------------------------------------------- writing
 
     def store(self, symbol: str, day: str, bars: list) -> int:
         """Insert bars for one day. Existing rows win; the cache is immutable.

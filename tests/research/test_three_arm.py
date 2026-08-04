@@ -40,7 +40,6 @@ class VetoArmTests(unittest.TestCase):
     """Arm C: the contract proposes, the model may only suppress."""
 
     def test_a_declined_symbol_is_suppressed(self):
-        # Contract fires long, model proposed nothing for this cycle.
         cycles = [cycle(0)]
         outputs = [model_output(0, [])]
 
@@ -64,7 +63,6 @@ class VetoArmTests(unittest.TestCase):
 
     def test_a_model_proposal_the_contract_did_not_fire_on_is_ignored(self):
         """Arm C may only subtract from the contract, never add to it."""
-        # Contract cannot fire short here: every trend is up.
         cycles = [cycle(0)]
         outputs = [model_output(0, [open_decision(direction="short")])]
 
@@ -87,7 +85,6 @@ class VetoArmTests(unittest.TestCase):
 
     def test_the_three_arms_are_distinguishable_on_the_same_corpus(self):
         cycles = [cycle(i) for i in range(4)]
-        # The model proposes on only half the cycles.
         outputs = [model_output(i, [open_decision()] if i % 2 == 0 else [])
                    for i in range(4)]
 
