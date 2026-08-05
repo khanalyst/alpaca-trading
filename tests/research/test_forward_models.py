@@ -25,6 +25,7 @@ def market_row(**overrides):
         "long_short_ratio": 1.5,
         "long_short_percentile_30": 90.0,
         "oi_change_4h_pct": -2.0,
+        "liq_notional_1h_usd": 250_000.0,
         "relative_volume_1h": 2.0,
         "mom_1h_pct": 2.0,
         "mom_15m_pct": 0.4,

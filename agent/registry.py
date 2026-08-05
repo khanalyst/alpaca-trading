@@ -256,15 +256,18 @@ REGISTRY: dict[str, StrategySpec] = {
                 "That flow is price-insensitive, mechanically finite and "
                 "overshoots, and whoever absorbs it is compensated. The "
                 "payer is the over-leveraged trader whose margin ran out "
-                "and who has no discretion about exiting. Open interest "
-                "falling during an adverse move distinguishes forced "
+                "and who has no discretion about exiting. Filled "
+                "liquidation notional observes that flow directly "
+                "rather than inferring it, and distinguishes forced "
                 "deleveraging from new positioning, which should not "
                 "revert."),
             falsification=(
-                "Among the largest adverse moves, bars with open interest "
-                "falling show no more 4-24h reversion than bars with open "
-                "interest rising. If both subsets behave alike, OI adds "
-                "nothing and the move is noise."),
+                "Among the largest adverse moves, bars in the top decile of "
+                "filled liquidation notional show no more 4-24h reversion "
+                "than bars where no liquidation printed at all. If forced "
+                "flow is what reverts, reversion must scale with how much of "
+                "it was actually filled; if the subsets behave alike, the "
+                "cascade is not the mechanism and the move is noise."),
             tier="T0_REJECTED",
             signal_timeframe="15m",
             required_timeframes=("15m", "1h", "4h"),
