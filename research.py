@@ -28,7 +28,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from research import (backup as backup_mod, corpus,             # noqa: E402
-                      findings as findings_mod,
+                      artifact as artifact_mod, findings as findings_mod,
                       prices as prices_mod, protocol,
                       readiness as readiness_mod,
                       replay as replay_mod, review as review_mod,
@@ -733,6 +733,14 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
                   "multiple paper scopes", file=sys.stderr)
             return 2
         scope = scopes[0]
+    # The analyst lane is deliberately not comparable to deterministic
+    # forward evidence. Reject it even when supplied explicitly (for
+    # example by the nightly FORWARD_SCOPE override), so an operator cannot
+    # accidentally qualify the sibling ``:llm`` account.
+    if str(scope).endswith(":llm"):
+        print("--scope must identify a deterministic forward lane; the "
+              "analyst :llm scope is not eligible", file=sys.stderr)
+        return 2
     strategy_id = args.strategy
     baseline_id = f"{strategy_id}.baseline"
     axes: dict[str, dict] = {}
@@ -876,7 +884,52 @@ def _build_t3_payload(
         scope: str, db: Path, *, manual_registry_review: bool,
         created_from: str) -> dict:
     """Build one review payload entirely from persisted, recomputable state."""
-    from agent import state
+    from agent import brain, state
+    from agent import variants as variant_mod
+    from agent.forward_models import require_complete_contract
+
+    # The artifact is for the exact executable variant, not merely the base
+    # config that the CLI loaded.  Rehydrate the immutable registry identity
+    # from the store, apply its overrides through the same validator used by
+    # the shadow runtime, and hash that validated result in the neutral
+    # artifact module.
+    variant_row = store.variant(variant_id)
+    if variant_row is None:
+        raise ValueError(f"unknown variant {variant_id!r}")
+    try:
+        registered_variant = variant_mod.Variant(
+            variant_id=str(variant_row["variant_id"]),
+            strategy_id=str(variant_row["strategy_id"]),
+            base_version=str(variant_row["base_version"]),
+            overrides=json.loads(variant_row.get("overrides_json") or "{}"),
+            hypothesis=str(variant_row.get("hypothesis") or ""),
+            status=str(variant_row.get("status") or "candidate"),
+            hypothesis_id=variant_row.get("hypothesis_id"),
+            hypothesis_params=json.loads(
+                variant_row.get("hypothesis_params_json") or "{}"),
+        )
+        artifact_cfg = variant_mod.apply(
+            registered_variant, cfg, allow_shadow_strategy=True)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"{variant_id}: cannot build artifact from registered variant") from exc
+    variant_definition = {
+        "variant_id": str(registered_variant.variant_id),
+        "strategy_id": str(registered_variant.strategy_id),
+        "base_version": str(registered_variant.base_version),
+        "overrides": dict(registered_variant.overrides),
+        "hypothesis": str(registered_variant.hypothesis),
+        "hypothesis_id": str(registered_variant.hypothesis_id or ""),
+        "hypothesis_params": dict(registered_variant.hypothesis_params or {}),
+    }
+    model = require_complete_contract(registered_variant.strategy_id)
+    prompt_catalog = variant_mod.research_selection_catalog()
+    prompt_text = brain.build_system(artifact_cfg, catalog=prompt_catalog)
+    prompt_hash = artifact_mod.sha256_text(prompt_text)
+    prompt_inputs_hash = artifact_mod.sha256_json({
+        "catalog": prompt_catalog,
+        "strategy": artifact_cfg.get("strategy") or {},
+    })
 
     qualification = store.qualification_status(variant_id, scope)
     analysis = store.analysis(
@@ -887,6 +940,45 @@ def _build_t3_payload(
     evidence = analysis_payload.get("evidence") or {}
     eligibility = (
         (analysis_payload.get("source_evidence") or {}).get("eligibility") or {})
+    candidate_provenance = (
+        (eligibility.get("setting_provenances") or {}).get(variant_id))
+    manifest_config = (candidate_provenance.get("experiment_config")
+                       if isinstance(candidate_provenance, dict)
+                       else artifact_cfg)
+    manifest_strategy_config_version = (
+        candidate_provenance.get("strategy_config_version")
+        if isinstance(candidate_provenance, dict)
+        and candidate_provenance.get("strategy_config_version")
+        else state.strategy_fingerprint(artifact_cfg))
+    manifest_model_id = (
+        candidate_provenance.get("forward_model_id")
+        if isinstance(candidate_provenance, dict)
+        and candidate_provenance.get("forward_model_id")
+        else model.model_id)
+    manifest_model_hash = (
+        candidate_provenance.get("forward_model_assumptions_hash")
+        if isinstance(candidate_provenance, dict)
+        and candidate_provenance.get("forward_model_assumptions_hash")
+        else findings_mod._content_hash(model.as_dict()))
+    manifest, artifact_hash = artifact_mod.build_manifest(
+        strategy_id=registered_variant.strategy_id,
+        strategy_version=registered_variant.base_version,
+        variant_id=registered_variant.variant_id,
+        variant_definition_hash=findings_mod.variant_identity_hash(
+            registered_variant),
+        variant_definition=variant_definition,
+        config=manifest_config,
+        strategy_config_version=manifest_strategy_config_version,
+        forward_model_id=manifest_model_id,
+        forward_model_assumptions_hash=manifest_model_hash,
+        prompt_hash=prompt_hash,
+        llm_provider=str((artifact_cfg.get("llm") or {}).get("provider") or ""),
+        llm_model=str((artifact_cfg.get("llm") or {}).get("model") or ""),
+        prompt_inputs_hash=prompt_inputs_hash,
+        deployment_config_hash=state.deployment_config_hash(manifest_config),
+        diagnostic_model_id=str((artifact_cfg.get("llm") or {}).get("model") or "")
+        or None,
+    )
     experiment_provenances = [
         eligibility.get("baseline_provenance"),
         *list((eligibility.get("setting_provenances") or {}).values()),
@@ -944,10 +1036,28 @@ def _build_t3_payload(
         "forward_analysis": analysis,
         "paper_result": paper,
         "current_provenance": {
+            # Preserve the established G2/current-replay provenance field:
+            # G2 replays the baseline config.  The artifact carries the exact
+            # candidate config and has its own explicit binding below.
             "strategy_config_version": state.strategy_fingerprint(cfg),
+            "artifact_strategy_config_version": manifest[
+                "strategy_config_version"],
             "code_version": state.code_fingerprint(),
             "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+            "validated_config_hash": manifest["validated_config_hash"],
+            "runtime_source_hash": manifest["runtime_source_hash"],
+            "variant_definition_hash": manifest["variant_definition_hash"],
+            "forward_model_id": manifest["forward_model_id"],
+            "forward_model_assumptions_hash": (
+                manifest["forward_model_assumptions_hash"]),
+            "deployment_config_hash": manifest["deployment_config_hash"],
+            "llm_endpoint": manifest["llm_endpoint"],
+            "llm_endpoint_hash": manifest["llm_endpoint_hash"],
         },
+        # The manifest and its full digest are additive.  Legacy payloads do
+        # not gain an inferred identity and consequently remain unbound.
+        "artifact_manifest": manifest,
+        "artifact_hash": artifact_hash,
     }
 
 

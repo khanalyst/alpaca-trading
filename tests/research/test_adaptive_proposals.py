@@ -200,7 +200,7 @@ class AdaptiveProposalMigrationTests(unittest.TestCase):
                 [row["name"] for row in migrated.migration_history()])
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-            "paper_execution_evidence_and_validity")
+                "paper_execution_evidence_and_validity")
             with sqlite3.connect(path) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM hypothesis_proposal_value_locks"

@@ -25,11 +25,14 @@ from datetime import datetime, timezone
 
 import ccxt
 
-from . import (brain, contracts, hypotheses, market, registry, shadow, state,
-               strategy, variants)
+from . import (brain, contracts, deployment, hypotheses, market, registry,
+               shadow, state, strategy, variants)
 from .alerts import AlertManager
 from .exchange import (CredentialError, EntryLiquidityRejected,
-                       EntryOrderRejected, Exchange)
+                       EntryOrderRejected, Exchange,
+                       MakerFirstAmbiguousError,
+                       MakerFirstPreSubmitError,
+                       OrderSubmissionAmbiguousError)
 from .risk import RiskEngine
 
 log = logging.getLogger("engine")
@@ -62,9 +65,40 @@ class Engine:
         # Fingerprint only configuration that can change a decision.
         self.strategy_config_version = state.strategy_fingerprint(cfg)
         self.code_version = state.code_fingerprint()
-        # Prompt identity is derived from the assembled per-strategy prompt.
-        self.prompt_version = brain.prompt_version(brain.build_system(cfg))
         self.strategy_id, self.strategy_version = strategy.identity(cfg)
+        self.deployment_artifact = None
+        self.research_selection_catalog = None
+        self.system_prompt = None
+        if cfg["mode"] == "live" and not light:
+            # Capture registry state once. The verifier, prompt version, LLM,
+            # and parser must all use this exact catalog snapshot.
+            self.research_selection_catalog = (
+                variants.research_selection_catalog())
+            self.system_prompt = brain.build_system(
+                cfg, catalog=self.research_selection_catalog)
+            self.deployment_artifact = deployment.verify_live_artifact(
+                cfg, catalog=self.research_selection_catalog,
+                system_prompt=self.system_prompt)
+            self.prompt_version = brain.prompt_version(self.system_prompt)
+        else:
+            # Demo and light control paths retain their existing startup
+            # semantics; only non-light live startup is artifact-gated.
+            self.prompt_version = brain.prompt_version(brain.build_system(cfg))
+        artifact_context = {}
+        if self.deployment_artifact:
+            artifact_context = {
+                "packet_id": self.deployment_artifact["packet_id"],
+                "packet_hash": self.deployment_artifact["payload_hash"],
+                "artifact_hash": self.deployment_artifact["artifact_hash"],
+                "artifact_variant_id": self.deployment_artifact["variant_id"],
+                "artifact_variant_definition_hash": (
+                    self.deployment_artifact["variant_definition_hash"]),
+                "artifact_strategy_config_version": (
+                    self.deployment_artifact[
+                        "artifact_strategy_config_version"]),
+                "deployment_config_hash": (
+                    self.deployment_artifact["deployment_config_hash"]),
+            }
         state.set_journal_context(
             run_id=self.run_id,
             strategy_id=self.strategy_id,
@@ -77,10 +111,16 @@ class Engine:
             # Replayed and shadow variants carry their own readable ids, so
             # the two populations can never be pooled by accident.
             variant_id=variants.LIVE_VARIANT_ID,
+            **artifact_context,
         )
+        if cfg["mode"] == "live" and not light:
+            # A missing or stale findings DB must stop before constructing any
+            # exchange, alert, or model client.
+            state.check_journal()
         self.alerts = AlertManager(cfg)
         if not light:
-            state.check_journal()
+            if cfg["mode"] != "live":
+                state.check_journal()
             if cfg["mode"] == "live":
                 self.alerts.require_live_ready(probe=True)
         self.ex = Exchange(
@@ -88,7 +128,13 @@ class Engine:
         if not light:
             self.ex.verify_account_safety(require_trade=True, refresh=True)
         if not light:
-            self.llm = brain.LLM(cfg)
+            llm_kwargs = {}
+            if self.research_selection_catalog is not None:
+                llm_kwargs = {
+                    "catalog": self.research_selection_catalog,
+                    "system": self.system_prompt,
+                }
+            self.llm = brain.LLM(cfg, **llm_kwargs)
             self.llm.preflight()
             self.risk = RiskEngine(cfg)
         # Disabled shadow evaluation remains a complete no-op.
@@ -302,6 +348,23 @@ class Engine:
             prompt_version=self.prompt_version,
             config_version=self.config_version,
             code_version=self.code_version,
+            packet_id=(getattr(self, "deployment_artifact", None) or {}
+                       ).get("packet_id"),
+            packet_hash=(getattr(self, "deployment_artifact", None) or {}
+                         ).get("payload_hash"),
+            artifact_hash=(getattr(self, "deployment_artifact", None) or {}
+                           ).get("artifact_hash"),
+            artifact_variant_id=(getattr(self, "deployment_artifact", None)
+                                 or {}).get("variant_id"),
+            artifact_variant_definition_hash=(
+                (getattr(self, "deployment_artifact", None) or {}).get(
+                    "variant_definition_hash")),
+            artifact_strategy_config_version=(
+                (getattr(self, "deployment_artifact", None) or {}).get(
+                    "artifact_strategy_config_version")),
+            deployment_config_hash=(
+                (getattr(self, "deployment_artifact", None) or {}).get(
+                    "deployment_config_hash")),
         )
         if "state file was corrupt" in str(st.get("kill_reason") or ""):
             self.alerts.send(
@@ -392,7 +455,7 @@ class Engine:
                 log.warning("Interrupted. State set to PAUSED. Open positions "
                             "keep their exchange-side stop-loss/take-profit "
                             "orders on OKX.")
-                state.set_state(state.PAUSED)
+                state.set_state(state.PAUSED, operator_pause=True)
             final_health = "stopped"
         finally:
             self._heartbeat(final_health)
@@ -656,6 +719,9 @@ class Engine:
                 "Agent paused because max-hold age cannot be verified",
                 detail)
             reconciled = False
+        except (CredentialError, ccxt.AuthenticationError,
+                state.JournalError, OrderSubmissionAmbiguousError):
+            raise
         except Exception as exc:
             # A reconciliation problem must not disable the account-level
             # circuit breakers below. Trade conservatively instead: keep
@@ -1154,32 +1220,216 @@ class Engine:
 
     @staticmethod
     def _position_id(pos: dict):
-        return pos.get("id") or (pos.get("info") or {}).get("posId")
+        if not isinstance(pos, dict):
+            return None
+        info = pos.get("info")
+        if info not in (None, "") and not isinstance(info, dict):
+            return None
+        value = pos.get("id") or (info or {}).get("posId")
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            identity = str(value).strip()
+        except Exception:
+            return None
+        return identity or None
+
+    @staticmethod
+    def _quantity_matches(left: float, right: float) -> bool:
+        tolerance = max(1e-12, max(abs(left), abs(right)) * 1e-6)
+        return abs(left - right) <= tolerance
+
+    def _pause_for_reconciliation_ambiguity(
+            self, st: dict, symbol: str, reason: object) -> None:
+        audit = getattr(reason, "_order_audit", None) or {}
+        self._pause_for_operator_review(
+            st, symbol, reason,
+            operation="position reconciliation ambiguity",
+            order_id=audit.get("order_id"),
+            persistence_label="position reconciliation")
+
+    def _reconciliation_ambiguous(
+            self, st: dict, symbol: str, message: str,
+            *, cause: Exception | None = None):
+        error = OrderSubmissionAmbiguousError(
+            message, {"symbol": symbol,
+                      "outcome": "position_reconciliation_ambiguous"})
+        self._pause_for_reconciliation_ambiguity(st, symbol, error)
+        if cause is None:
+            raise error
+        raise error from cause
+
+    @staticmethod
+    def _validated_close_summary(summary: object, symbol: str) -> dict:
+        if not isinstance(summary, dict) or summary.get("symbol") != symbol:
+            raise OrderSubmissionAmbiguousError(
+                f"close history for {symbol} has no exact symbol identity",
+                {"symbol": symbol, "outcome": "close_history_unresolved"})
+        for key in ("price", "qty"):
+            raw = summary.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                raise OrderSubmissionAmbiguousError(
+                    f"close history for {symbol} has no valid {key}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"})
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise OrderSubmissionAmbiguousError(
+                    f"close history for {symbol} has malformed {key}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"}) from exc
+            if not math.isfinite(value) or value <= 0:
+                raise OrderSubmissionAmbiguousError(
+                    f"close history for {symbol} has invalid {key}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"})
+            summary[key] = value
+        status = summary.get("status")
+        if status not in {
+                "position_history", "fill_history",
+                "fill_history_funding_unavailable"}:
+            raise OrderSubmissionAmbiguousError(
+                f"close history for {symbol} has an invalid status",
+                {"symbol": symbol, "outcome": "close_history_unresolved"})
+        for key in ("fee_usd", "funding_usd", "realized_pnl_usd"):
+            raw = summary.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                raise OrderSubmissionAmbiguousError(
+                    f"close history for {symbol} has no valid {key}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"})
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise OrderSubmissionAmbiguousError(
+                    f"close history for {symbol} has malformed {key}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"}) from exc
+            if not math.isfinite(value):
+                raise OrderSubmissionAmbiguousError(
+                    f"close history for {symbol} has non-finite {key}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"})
+            summary[key] = value
+        return summary
 
     def _reconcile_positions(self, positions: list[dict], st: dict,
                              startup: bool = False) -> list[dict]:
         """Match local trades to exchange positions and verify SL/TP coverage."""
-        actual = {p["symbol"]: p for p in positions}
-        if len(actual) != len(positions):
-            raise RuntimeError(
-                "OKX returned multiple positions for one symbol; net_mode "
-                "cannot be proven")
         active = st.setdefault("active_trades", {})
         protection = st.setdefault("protection", {})
         opened_at = st.setdefault("opened_at", {})
         cooldowns = st.setdefault("cooldowns", {})
         unknown_age: list[str] = []
+        actual = {}
+        if not isinstance(positions, list):
+            self._reconciliation_ambiguous(
+                st, "unknown", "OKX positions response is not structured")
+        for position in positions:
+            if not isinstance(position, dict):
+                self._reconciliation_ambiguous(
+                    st, "unknown", "OKX returned a malformed live position")
+            symbol = position.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                self._reconciliation_ambiguous(
+                    st, "unknown", "OKX returned a position without a symbol")
+            symbol = symbol.strip()
+            if symbol in actual:
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    "OKX returned multiple positions for one symbol; "
+                    "net_mode cannot be proven")
+            actual[symbol] = position
 
         # A tracked trade that disappeared was closed by exchange-side SL/TP
         # or another operator. Recover actual fills before allowing a re-entry.
         for symbol, trade in list(active.items()):
             live = actual.get(symbol)
-            live_id = self._position_id(live) if live else None
-            same_direction = (live is not None and self._direction(live)
-                              == trade.get("direction"))
-            same_id = (not live_id or not trade.get("position_id")
-                       or str(live_id) == str(trade.get("position_id")))
+            tracked_id = self._position_id({
+                "id": trade.get("position_id"), "info": {}})
+            if not tracked_id:
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} durable trade has no exact position identity")
+            live_id = None
+            live_contracts = None
+            live_direction = None
+            if live is not None:
+                info = live.get("info")
+                if info not in (None, "") and not isinstance(info, dict):
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position metadata is malformed")
+                info = info or {}
+                live_id = self._position_id(live)
+                if not live_id:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position has no exact position identity")
+                raw_side = live.get("side")
+                if isinstance(raw_side, str) and raw_side.strip().lower() in {
+                        "long", "short"}:
+                    live_direction = raw_side.strip().lower()
+                else:
+                    raw_position = info.get("pos")
+                    if isinstance(raw_position, bool):
+                        self._reconciliation_ambiguous(
+                            st, symbol,
+                            f"{symbol} live position direction is malformed")
+                    try:
+                        signed_position = float(raw_position)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        self._reconciliation_ambiguous(
+                            st, symbol,
+                            f"{symbol} live position direction is malformed",
+                            cause=exc)
+                    if not math.isfinite(signed_position) \
+                            or signed_position == 0:
+                        self._reconciliation_ambiguous(
+                            st, symbol,
+                            f"{symbol} live position direction is invalid")
+                    live_direction = (
+                        "long" if signed_position > 0 else "short")
+                raw_contracts = live.get("contracts")
+                if isinstance(raw_contracts, bool):
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position contracts are malformed")
+                try:
+                    live_contracts = abs(float(raw_contracts))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position contracts are malformed",
+                        cause=exc)
+                if not math.isfinite(live_contracts) or live_contracts <= 0:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position contracts are invalid")
+            same_direction = (
+                live is not None and live_direction == trade.get("direction"))
+            same_id = live is not None and live_id == tracked_id
             if live is not None and same_direction and same_id:
+                raw_tracked_qty = trade.get("qty")
+                if isinstance(raw_tracked_qty, bool):
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} durable trade quantity is malformed")
+                try:
+                    tracked_qty = float(raw_tracked_qty)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} durable trade quantity is malformed",
+                        cause=exc)
+                if (not math.isfinite(tracked_qty) or tracked_qty <= 0
+                        or not self._quantity_matches(
+                            live_contracts, tracked_qty)):
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live contracts differ from the durable "
+                        "trade; manual add/reduction cannot be auto-adopted")
                 opened = float(
                     trade.get("opened_at")
                     or opened_at.get(symbol) or 0)
@@ -1205,7 +1455,15 @@ class Engine:
                     symbol, int(float(trade.get("opened_at") or 0) * 1000),
                     trade["direction"], float(trade.get("entry_price") or 0),
                     float(trade.get("qty") or 0))
-                realized = float(summary.get("realized_pnl_usd") or 0)
+                summary = self._validated_close_summary(summary, symbol)
+                if not self._quantity_matches(
+                        float(summary["qty"]), float(trade.get("qty"))):
+                    raise OrderSubmissionAmbiguousError(
+                        f"close history quantity for {symbol} does not match "
+                        "the durable trade remainder",
+                        {"symbol": symbol,
+                         "outcome": "close_history_unresolved"})
+                realized = float(summary["realized_pnl_usd"])
                 if summary.get("status") != "position_history":
                     realized -= float(trade.get("entry_fee_usd") or 0)
                 # Partial closes were already journaled with their own
@@ -1228,8 +1486,8 @@ class Engine:
                 state.log_trade(
                     symbol,
                     "sell" if trade["direction"] == "long" else "buy",
-                    "close", summary.get("qty") or trade.get("qty"),
-                    summary.get("price") or 0, entry_notional,
+                    "close", summary["qty"],
+                    summary["price"], entry_notional,
                     trade.get("leverage") or 0,
                     "exchange-side exit reconciled", pnl_pct=pnl_pct,
                     trade_id=trade.get("trade_id"),
@@ -1281,41 +1539,153 @@ class Engine:
                     # that would strip the replacement's own protection.
                     try:
                         self.ex.cancel_symbol(symbol)
+                    except (CredentialError, ccxt.AuthenticationError,
+                            state.JournalError,
+                            OrderSubmissionAmbiguousError):
+                        raise
                     except Exception as cleanup_exc:
                         log.warning("stale protective-order cleanup failed "
                                     "for %s: %s", symbol, cleanup_exc)
+            except (CredentialError, ccxt.AuthenticationError,
+                    state.JournalError):
+                raise
+            except OrderSubmissionAmbiguousError as exc:
+                self._pause_for_reconciliation_ambiguity(st, symbol, exc)
+                raise
             except Exception as exc:
-                log.error("Could not reconcile disappeared position %s: %s",
-                          symbol, exc)
-                cooldowns[symbol] = max(
-                    float(cooldowns.get(symbol) or 0),
-                    time.time() + int(self.cfg["cycle"]["interval_seconds"]) * 2)
-                self.alerts.send(
-                    "error", "close_reconciliation_failed",
-                    f"Could not reconcile the closed {symbol} trade",
-                    {"error": str(exc)})
-                if replaced:
-                    raise RuntimeError(
-                        f"{symbol} live position no longer matches durable state"
-                    ) from exc
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"could not safely reconcile the prior {symbol} trade",
+                    cause=exc)
 
         for symbol, pos in list(actual.items()):
-            direction = self._direction(pos)
-            contracts = abs(float(pos.get("contracts") or 0))
-            mark = float(pos.get("markPrice") or pos.get("last")
-                         or pos.get("entryPrice") or 0)
-            status = self.ex.protection_status(
-                symbol, contracts, direction, mark)
+            info = pos.get("info")
+            if info not in (None, "") and not isinstance(info, dict):
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} live position metadata is malformed")
+            info = info or {}
+            position_id = self._position_id(pos)
+            if not position_id:
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} live position has no exact position identity")
+            raw_side = pos.get("side")
+            if isinstance(raw_side, str) and raw_side.strip().lower() in {
+                    "long", "short"}:
+                direction = raw_side.strip().lower()
+            else:
+                raw_position = info.get("pos")
+                if isinstance(raw_position, bool):
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position direction is malformed")
+                try:
+                    signed_position = float(raw_position)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position direction is malformed",
+                        cause=exc)
+                if not math.isfinite(signed_position) or signed_position == 0:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} live position direction is invalid")
+                direction = "long" if signed_position > 0 else "short"
+            raw_contracts = pos.get("contracts")
+            if isinstance(raw_contracts, bool):
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} live position contracts are malformed")
+            try:
+                contracts = abs(float(raw_contracts))
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} live position contracts are malformed",
+                    cause=exc)
+            if not math.isfinite(contracts) or contracts <= 0:
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} live position contracts are invalid")
+            mark_raw = pos.get("markPrice")
+            if mark_raw in (None, ""):
+                mark_raw = pos.get("last")
+            if mark_raw in (None, ""):
+                mark_raw = pos.get("entryPrice")
+            if isinstance(mark_raw, bool):
+                self._reconciliation_ambiguous(
+                    st, symbol, f"{symbol} live mark price is malformed")
+            try:
+                mark = float(mark_raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._reconciliation_ambiguous(
+                    st, symbol, f"{symbol} live mark price is malformed",
+                    cause=exc)
+            if not math.isfinite(mark) or mark <= 0:
+                self._reconciliation_ambiguous(
+                    st, symbol, f"{symbol} live mark price is invalid")
+            try:
+                status = self.ex.protection_status(
+                    symbol, contracts, direction, mark)
+            except (CredentialError, ccxt.AuthenticationError,
+                    state.JournalError):
+                raise
+            except OrderSubmissionAmbiguousError as exc:
+                self._pause_for_reconciliation_ambiguity(st, symbol, exc)
+                raise
+            except Exception as exc:
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"could not verify protection for {symbol}", cause=exc)
+            if not isinstance(status, dict):
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} protection status is not structured")
+            if (not isinstance(status.get("stop_loss"), bool)
+                    or not isinstance(status.get("take_profit"), bool)):
+                self._reconciliation_ambiguous(
+                    st, symbol,
+                    f"{symbol} protection flags are not exact booleans")
 
             if symbol not in active:
                 # Adopt a pre-existing position so its eventual exit remains
                 # measurable. Unknown positions are never assumed protected.
                 trade_id = state.new_trade_id()
-                entry = float(pos.get("entryPrice") or mark)
-                notional = self._notional(pos)
+                entry_raw = pos.get("entryPrice")
+                if entry_raw in (None, ""):
+                    entry_raw = mark
+                leverage_raw = pos.get("leverage")
+                try:
+                    entry = float(entry_raw)
+                    leverage = float(leverage_raw)
+                    notional = float(self._notional(pos))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} adoption metadata is malformed", cause=exc)
+                if (not math.isfinite(entry) or entry <= 0
+                        or not math.isfinite(notional) or notional <= 0
+                        or not math.isfinite(leverage) or leverage < 0):
+                    self._reconciliation_ambiguous(
+                        st, symbol,
+                        f"{symbol} adoption metadata is invalid")
                 recovered_opened_at = opened_at.get(symbol)
                 if not recovered_opened_at:
-                    recovered_opened_at = self.ex.position_opened_at(pos)
+                    try:
+                        recovered_opened_at = self.ex.position_opened_at(pos)
+                    except (CredentialError, ccxt.AuthenticationError,
+                            state.JournalError):
+                        raise
+                    except OrderSubmissionAmbiguousError as exc:
+                        self._pause_for_reconciliation_ambiguity(
+                            st, symbol, exc)
+                        raise
+                    except Exception as exc:
+                        self._reconciliation_ambiguous(
+                            st, symbol,
+                            f"could not recover opening time for {symbol}",
+                            cause=exc)
                 age_known = bool(recovered_opened_at)
                 active[symbol] = {
                     "trade_id": trade_id,
@@ -1326,8 +1696,8 @@ class Engine:
                     "entry_notional": notional,
                     "qty": contracts,
                     "initial_qty": contracts,
-                    "position_id": self._position_id(pos),
-                    "leverage": float(pos.get("leverage") or 0),
+                    "position_id": position_id,
+                    "leverage": leverage,
                     "entry_fee_usd": 0.0,
                     "entry_fee_remaining_usd": 0.0,
                     "partial_realized_pnl_usd": 0.0,
@@ -1348,7 +1718,7 @@ class Engine:
                     unknown_age.append(symbol)
                 state.log_trade(
                     symbol, "buy" if direction == "long" else "sell", "open",
-                    contracts, entry, notional, pos.get("leverage") or 0,
+                    contracts, entry, notional, leverage,
                     "position adopted during startup reconciliation",
                     trade_id=trade_id, fill_status="adopted",
                     funding_status="unknown",
@@ -1375,9 +1745,25 @@ class Engine:
                         status = self.ex.ensure_protection(
                             symbol, direction, contracts, float(sl_price),
                             float(tp_price), mark)
+                    except (CredentialError, ccxt.AuthenticationError,
+                            state.JournalError):
+                        raise
+                    except OrderSubmissionAmbiguousError as exc:
+                        self._pause_for_reconciliation_ambiguity(
+                            st, symbol, exc)
+                        raise
                     except Exception as exc:
-                        log.error("Protection restore failed for %s: %s",
-                                  symbol, exc)
+                        self._reconciliation_ambiguous(
+                            st, symbol,
+                            f"protection restore failed for {symbol}",
+                            cause=exc)
+                    if (not isinstance(status, dict)
+                            or not isinstance(status.get("stop_loss"), bool)
+                            or not isinstance(
+                                status.get("take_profit"), bool)):
+                        self._reconciliation_ambiguous(
+                            st, symbol,
+                            f"{symbol} restored protection status is malformed")
                 if not status.get("stop_loss"):
                     self.alerts.send(
                         "critical", "startup_position_unprotected",
@@ -1624,6 +2010,90 @@ class Engine:
             symbol, delay, classification, count)
         return record
 
+    @staticmethod
+    def _exception_in_chain(exc: BaseException, error_type):
+        """Find a classified cause without relying on exception text."""
+        current = exc
+        seen = set()
+        while current is not None and id(current) not in seen:
+            if isinstance(current, error_type):
+                return current
+            seen.add(id(current))
+            current = current.__cause__ or current.__context__
+        return None
+
+    def _discard_pending_entry(self) -> None:
+        clear = getattr(self.ex, "_clear_pending_entry", None)
+        if callable(clear):
+            clear()
+
+    def _pause_for_operator_review(
+            self, st: dict, symbol: str, reason: object, *, operation: str,
+            order_id: object = None, discard_pending_entry: bool = False,
+            persistence_label: str = "execution ambiguity") -> dict:
+        """Persist an operator pause for an uncertain exchange-side result."""
+        if discard_pending_entry:
+            self._discard_pending_entry()
+        current = state.load_state()
+        if current.get("state") == state.KILLED:
+            # State.set_state enforces this atomically too. Keep this fast path
+            # so the caller's in-memory view immediately reflects the kill.
+            st.clear()
+            st.update(current)
+            return current
+        safe_reason = Exchange._safe_exchange_error_text(reason)[:240]
+        safe_symbol = str(symbol)[:80]
+        safe_order = (
+            str(order_id).strip()[:80]
+            if order_id not in (None, "") else "unknown")
+        context = (
+            f"{operation} for {safe_symbol} (order {safe_order}); "
+            f"inspect OKX before explicit operator resume: {safe_reason}"
+        )[:480]
+        try:
+            paused = state.set_state(
+                state.PAUSED, reason=context, operator_pause=True)
+        except state.JournalError:
+            raise
+        except Exception as exc:                           # noqa: BLE001
+            raise state.JournalError(
+                f"{persistence_label} pause persistence failed: {exc}") from exc
+        st.clear()
+        st.update(paused)
+        if paused.get("state") == state.KILLED:
+            log.warning(
+                "Operator-review pause lost a race to KILLED after %s for %s; "
+                "KILLED remains authoritative", operation, symbol)
+        else:
+            log.critical(
+                "Agent PAUSED for operator review after %s for %s: %s",
+                operation, symbol, safe_reason)
+        return paused
+
+    def _pause_for_entry_ambiguity(
+            self, st: dict, symbol: str, reason: object,
+            *, order_id: object = None) -> dict:
+        return self._pause_for_operator_review(
+            st, symbol, reason, operation="entry order ambiguity",
+            order_id=order_id, discard_pending_entry=True,
+            persistence_label="entry ambiguity")
+
+    def _pause_for_close_ambiguity(
+            self, st: dict, symbol: str, reason: object,
+            *, order_id: object = None) -> dict:
+        return self._pause_for_operator_review(
+            st, symbol, reason, operation="close order ambiguity",
+            order_id=order_id, persistence_label="close ambiguity")
+
+    def _pause_for_unsettled_fill(
+            self, st: dict, symbol: str, reason: object,
+            *, order_id: object = None) -> dict:
+        return self._pause_for_operator_review(
+            st, symbol, reason,
+            operation="filled entry could not be safely settled",
+            order_id=order_id, discard_pending_entry=True,
+            persistence_label="post-fill safety")
+
     def _maker_first_attempt(self, plan: dict, st: dict, symbol: str,
                              side: str, contracts: float, sl_price: float,
                              tp_price: float, reference: float):
@@ -1635,13 +2105,55 @@ class Engine:
         moves expectancy by more than most of the parameter axes queued for
         sweeping, without requiring any signal to have edge.
 
-        Failure degrades to crossing, never to no entry and never to a
-        resting order. A broken experiment must fall back to the behaviour
-        that already works.
+        Only an explicit zero-fill plus terminal cancellation may cross. Any
+        exception or malformed maker result is fail-closed, because the
+        exchange may have accepted an order whose state is not known here.
         """
         execution_cfg = self.cfg["execution"]
         if not execution_cfg.get("maker_first_enabled"):
             return None
+
+        terminal_cancel = {"canceled", "cancelled", "expired", "rejected"}
+
+        def journal(payload: dict) -> None:
+            try:
+                state.log_event(
+                    "maker_attempt", self._audit_json(payload))
+            except state.JournalError:
+                self._discard_pending_entry()
+                raise
+            except Exception as exc:                       # noqa: BLE001
+                self._discard_pending_entry()
+                raise state.JournalError(
+                    f"maker_attempt journal failed: {exc}") from exc
+
+        def pause_and_block(reason: object, *, audit: dict | None = None,
+                            order_id: object = None) -> bool:
+            details = dict(audit or {}) if isinstance(audit, dict) else {}
+            self._pause_for_entry_ambiguity(
+                st, symbol, reason,
+                order_id=order_id or details.get("order_id"))
+            journal({
+                "symbol": symbol,
+                "outcome": "ambiguous",
+                "error": Exchange._safe_exchange_error_text(reason),
+                "submission_audit": details or None,
+                "crossing_fallback_allowed": False,
+            })
+            try:
+                self.alerts.send(
+                    "critical", "maker_order_ambiguous",
+                    f"Maker-first order state for {symbol} is ambiguous; "
+                    "the agent was paused and crossing was blocked",
+                    {"symbol": symbol,
+                     "order_id": order_id or details.get("order_id"),
+                     "client_order_id": details.get("client_order_id")})
+            except state.JournalError:
+                raise
+            except Exception:                               # noqa: BLE001
+                log.exception("failed to alert maker-first block for %s",
+                              symbol)
+            return False
 
         try:
             attempt = self.ex.maker_first_entry(
@@ -1649,53 +2161,141 @@ class Engine:
                 tp_price,
                 float(execution_cfg["maker_first_wait_seconds"]),
                 reference)
-        except CredentialError:
+        except state.JournalError:
+            self._discard_pending_entry()
             raise
-        except Exception as exc:                           # noqa: BLE001
+        except (CredentialError, ccxt.AuthenticationError) as exc:
             audit = getattr(exc, "_order_audit", None) or {}
-            ambiguous = str(audit.get("outcome") or "").startswith(
-                "ambiguous")
-            log.warning(
-                "maker-first attempt failed for %s (%s): %s", symbol,
-                "crossing blocked" if ambiguous else "crossing allowed", exc)
-            state.log_event("maker_attempt", self._audit_json({
-                "symbol": symbol, "outcome": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "submission_audit": audit or None,
-                "crossing_fallback_allowed": not ambiguous,
-            }))
-            if ambiguous:
-                log.error(
-                    "maker-first result for %s is ambiguous; refusing the "
-                    "crossing fallback to prevent duplicate exposure", symbol)
-                self.alerts.send(
-                    "critical", "maker_order_ambiguous",
-                    f"Maker-first order state for {symbol} is ambiguous; "
-                    "the crossing fallback was blocked",
-                    {"symbol": symbol,
-                     "client_order_id": audit.get("client_order_id")})
-                return False
-            return None
+            if getattr(exc, "_post_fill_unsettled", False):
+                self._pause_for_unsettled_fill(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+            elif str(audit.get("outcome") or "").startswith("ambiguous_"):
+                self._pause_for_entry_ambiguity(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+            else:
+                self._discard_pending_entry()
+            raise
+        except MakerFirstPreSubmitError as exc:
+            nested_journal = self._exception_in_chain(exc, state.JournalError)
+            if nested_journal is not None:
+                self._discard_pending_entry()
+                raise nested_journal
+            nested_credential = self._exception_in_chain(
+                exc, (CredentialError, ccxt.AuthenticationError))
+            if nested_credential is not None:
+                self._discard_pending_entry()
+                raise nested_credential
+            self._discard_pending_entry()
+            self._remember_entry_failure(
+                plan, st, exc, "maker_pre_submit")
+            log.warning("Maker-first pre-submit attempt failed for %s: %s",
+                        symbol, exc)
+            return False
+        except MakerFirstAmbiguousError as exc:
+            audit = getattr(exc, "_order_audit", None) or {}
+            nested_journal = self._exception_in_chain(exc, state.JournalError)
+            if nested_journal is not None:
+                self._pause_for_entry_ambiguity(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+                raise nested_journal
+            nested_credential = self._exception_in_chain(
+                exc, (CredentialError, ccxt.AuthenticationError))
+            if nested_credential is not None:
+                self._pause_for_entry_ambiguity(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+                raise nested_credential
+            return pause_and_block(
+                exc, audit=audit, order_id=audit.get("order_id"))
+        except Exception as exc:                           # noqa: BLE001
+            # Exchange.maker_first_entry classifies every known pre-submit
+            # failure. An unclassified exception therefore cannot prove that
+            # no order exists and is durable ambiguity.
+            audit = getattr(exc, "_order_audit", None) or {}
+            nested_journal = self._exception_in_chain(exc, state.JournalError)
+            if nested_journal is not None:
+                self._pause_for_entry_ambiguity(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+                raise nested_journal
+            nested_credential = self._exception_in_chain(
+                exc, (CredentialError, ccxt.AuthenticationError))
+            if nested_credential is not None:
+                self._pause_for_entry_ambiguity(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+                raise nested_credential
+            return pause_and_block(
+                exc, audit=audit, order_id=audit.get("order_id"))
 
-        journalled = {k: v for k, v in attempt.items() if k != "execution"}
-        state.log_event("maker_attempt", self._audit_json({
-            "symbol": symbol,
-            "outcome": ("filled" if attempt["fill_rate"] >= 1.0
-                        else "partial" if attempt["filled_contracts"] > 0
-                        else "unfilled"),
-            **journalled}))
+        if not isinstance(attempt, dict):
+            return pause_and_block(
+                "maker-first result was not structured")
+        try:
+            if isinstance(attempt.get("filled_contracts"), bool):
+                raise ValueError("filled_contracts is boolean")
+            if isinstance(attempt.get("fill_rate"), bool):
+                raise ValueError("fill_rate is boolean")
+            if isinstance(attempt.get("requested_contracts"), bool):
+                raise ValueError("requested_contracts is boolean")
+            filled = float(attempt.get("filled_contracts"))
+            fill_rate = float(attempt.get("fill_rate"))
+            requested = float(attempt.get("requested_contracts"))
+            requested_here = float(contracts)
+        except (TypeError, ValueError, OverflowError) as exc:
+            return pause_and_block(
+                f"maker-first result quantities were malformed: {exc}",
+                audit=attempt.get("submission_audit"),
+                order_id=attempt.get("order_id"))
+        if (not all(math.isfinite(value)
+                    for value in (filled, fill_rate, requested,
+                                  requested_here))
+                or requested <= 0 or filled < 0 or filled > requested
+                or fill_rate < 0 or fill_rate > 1):
+            return pause_and_block(
+                "maker-first result quantities were invalid",
+                audit=attempt.get("submission_audit"),
+                order_id=attempt.get("order_id"))
+        if requested != requested_here:
+            return pause_and_block(
+                "maker-first result requested quantity did not match request",
+                audit=attempt.get("submission_audit"),
+                order_id=attempt.get("order_id"))
+        if attempt.get("symbol") != symbol:
+            return pause_and_block(
+                "maker-first result symbol did not match request",
+                audit=attempt.get("submission_audit"),
+                order_id=attempt.get("order_id"))
+        raw_order_id = attempt.get("order_id")
+        try:
+            order_id = str(raw_order_id).strip()
+        except Exception as exc:                           # noqa: BLE001
+            return pause_and_block(
+                f"maker-first result order id was malformed: {exc}",
+                audit=attempt.get("submission_audit"))
+        if not order_id:
+            return pause_and_block(
+                "maker-first result had no order id",
+                audit=attempt.get("submission_audit"))
+        quantity_evidence = attempt.get("quantity_evidence")
+        if quantity_evidence not in {
+                "filled", "info.accFillSz", "info.fillSz"}:
+            return pause_and_block(
+                "maker-first result lacked explicit quantity evidence",
+                audit=attempt.get("submission_audit"), order_id=order_id)
+        expected_rate = filled / requested
+        if abs(fill_rate - expected_rate) > 1e-9:
+            return pause_and_block(
+                "maker-first result fill rate was inconsistent",
+                audit=attempt.get("submission_audit"), order_id=order_id)
 
-        if attempt.get("resting"):
+        if attempt.get("resting") is True:
             # The cancel failed and the order may still be live. Crossing now
             # could double the position, so this cycle ends here.
-            log.error("maker-first order for %s may still be resting; "
-                      "not crossing on top of it", symbol)
-            self.alerts.send(
-                "critical", "maker_order_may_rest",
-                f"A maker-first entry order for {symbol} could not be "
-                "cancelled and may still be resting",
-                {"symbol": symbol, "order_id": attempt.get("order_id")})
-            return attempt.get("execution") or False
+            return pause_and_block(
+                "maker-first order may still be resting",
+                audit=attempt.get("submission_audit"), order_id=order_id)
+        if attempt.get("resting") is not False:
+            return pause_and_block(
+                "maker-first result lacked an explicit resting state",
+                audit=attempt.get("submission_audit"), order_id=order_id)
 
         # A partial fill is NOT topped up by crossing the remainder. Splitting
         # one setup across two prices would make the recorded entry an average
@@ -1703,7 +2303,52 @@ class Engine:
         # counterfactual measures.
         # The position is smaller than planned, which is journalled and is the
         # conservative direction.
-        return attempt.get("execution")
+        execution = attempt.get("execution")
+        if filled == 0:
+            status = str(attempt.get("cancellation_status") or "").lower()
+            cancellation_order_id = attempt.get("cancellation_order_id")
+            # This is the sole crossing hand-off. Every field is exact and
+            # explicit so a partial response cannot accidentally open.
+            if (fill_rate == 0 and attempt.get("cancelled") is True
+                    and attempt.get("cancellation_confirmed") is True
+                    and status in terminal_cancel
+                    and attempt.get("resting") is False
+                    and execution is None
+                    and cancellation_order_id == order_id
+                    and quantity_evidence in {
+                        "filled", "info.accFillSz", "info.fillSz"}):
+                journalled = {k: v for k, v in attempt.items()
+                              if k != "execution"}
+                journal({"symbol": symbol, "outcome": "unfilled",
+                         **journalled})
+                return None
+            return pause_and_block(
+                "maker-first zero-fill result lacked exact terminal "
+                "cancellation evidence",
+                audit=attempt.get("submission_audit"), order_id=order_id)
+        if filled < requested:
+            status = str(attempt.get("cancellation_status") or "").lower()
+            if (attempt.get("cancelled") is not True
+                    or attempt.get("cancellation_confirmed") is not True
+                    or status not in terminal_cancel
+                    or attempt.get("cancellation_order_id") != order_id):
+                return pause_and_block(
+                    "maker-first partial fill lacked terminal cancellation",
+                    audit=attempt.get("submission_audit"), order_id=order_id)
+        if not isinstance(execution, dict):
+            return pause_and_block(
+                "maker-first filled result lacked settlement",
+                audit=attempt.get("submission_audit"), order_id=order_id)
+        journalled = {k: v for k, v in attempt.items()
+                      if k != "execution"}
+        journal({
+            "symbol": symbol,
+            "outcome": "filled" if filled >= requested else "partial",
+            **journalled,
+        })
+        # Partial and full fills are already entries. They never cross the
+        # remainder; settled execution continues through normal bookkeeping.
+        return execution
 
     def _execute_open(self, plan: dict, st: dict) -> bool:
         symbol = plan["symbol"]
@@ -1712,7 +2357,9 @@ class Engine:
             return False
         try:
             live = self.ex.price(symbol)
-        except CredentialError:
+        except state.JournalError:
+            raise
+        except (CredentialError, ccxt.AuthenticationError):
             raise
         except Exception as e:
             self._remember_entry_failure(plan, st, e, "price_check")
@@ -1746,7 +2393,9 @@ class Engine:
             self._remember_liquidity_rejection(plan, st, exc)
             log.warning("Entry liquidity guard rejected %s: %s", symbol, exc)
             return False
-        except CredentialError:
+        except state.JournalError:
+            raise
+        except (CredentialError, ccxt.AuthenticationError):
             raise
         except Exception as exc:
             self._remember_entry_failure(
@@ -1803,13 +2452,70 @@ class Engine:
             return self._settle_entry(
                 plan, st, maker, symbol, side, sl_price, tp_price)
 
+        # A pause/kill can arrive while the passive order is waiting or being
+        # cancelled. Consume the one-shot hand-off and refuse the IOC unless
+        # the durable control state is still RUNNING immediately beforehand.
+        try:
+            control = state.load_state()
+        except Exception:
+            self._discard_pending_entry()
+            raise
+        if control.get("state") != state.RUNNING:
+            self._discard_pending_entry()
+            st.clear()
+            st.update(control)
+            log.info("Control state changed during maker wait; skipping "
+                     "crossing fallback for %s", symbol)
+            return False
+
         try:
             execution = self.ex.open_position(
                 symbol, side, contracts, plan["leverage"], sl_price, tp_price,
                 expected_price=entry_reference,
                 entry_limit_price=entry_guard["limit_price"])
-        except CredentialError:
+        except state.JournalError:
             raise
+        except (CredentialError, ccxt.AuthenticationError) as exc:
+            if getattr(exc, "_post_fill_unsettled", False):
+                audit = getattr(exc, "_order_audit", None) or {}
+                self._pause_for_unsettled_fill(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+            raise
+        except OrderSubmissionAmbiguousError as exc:
+            audit = getattr(exc, "_order_audit", None) or {}
+            self._pause_for_entry_ambiguity(
+                st, symbol, exc, order_id=audit.get("order_id"))
+            try:
+                state.log_event(
+                    "entry_order_ambiguous",
+                    self._audit_json({
+                        "symbol": symbol,
+                        "submission_audit": audit or None,
+                        "crossing_fallback": bool(
+                            audit.get("params", {}).get("timeInForce")
+                            == "IOC") if isinstance(audit, dict) else False,
+                    }),
+                    setup_id=plan.get("setup_id"),
+                )
+            except state.JournalError:
+                raise
+            except Exception as journal_exc:                # noqa: BLE001
+                raise state.JournalError(
+                    f"entry ambiguity journal failed: {journal_exc}"
+                ) from journal_exc
+            try:
+                self.alerts.send(
+                    "critical", "entry_order_ambiguous",
+                    f"Entry order state for {symbol} is ambiguous; the "
+                    "agent was paused for operator review",
+                    {"symbol": symbol,
+                     "client_order_id": audit.get("client_order_id")})
+            except state.JournalError:
+                raise
+            except Exception:                               # noqa: BLE001
+                log.exception("failed to alert direct entry ambiguity for %s",
+                              symbol)
+            return False
         except Exception as e:
             self._remember_entry_failure(
                 plan, st, e, "attached_entry")
@@ -1819,9 +2525,148 @@ class Engine:
         return self._settle_entry(
             plan, st, execution, symbol, side, sl_price, tp_price)
 
+    @staticmethod
+    def _trimmed_execution_id(value: object) -> str | None:
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            identity = str(value).strip()
+        except Exception:
+            return None
+        return identity or None
+
+    def _validated_entry_execution(self, plan: dict, execution: object,
+                                   symbol: str) -> tuple[dict, float]:
+        def fail(message: str, cause: Exception | None = None):
+            audit = {}
+            if isinstance(execution, dict):
+                raw_audit = execution.get("submission_audit")
+                if isinstance(raw_audit, dict):
+                    audit.update(raw_audit)
+                audit.update({
+                    "order_id": execution.get("order_id"),
+                    "last_fill_status": execution.get("status"),
+                    "symbol": symbol,
+                    "outcome": "post_fill_unsettled",
+                })
+            error = OrderSubmissionAmbiguousError(
+                f"filled entry for {symbol} has invalid execution evidence: "
+                f"{message}", audit)
+            setattr(error, "_post_fill_unsettled", True)
+            if cause is None:
+                raise error
+            raise error from cause
+
+        if not isinstance(execution, dict):
+            fail("execution is not structured")
+        execution_symbol = execution.get("symbol")
+        if (not isinstance(execution_symbol, str)
+                or execution_symbol.strip() != symbol):
+            fail("symbol identity is missing or mismatched")
+        for key in ("order_id", "client_order_id", "position_id"):
+            identity = self._trimmed_execution_id(execution.get(key))
+            if not identity:
+                fail(f"{key} is missing or malformed")
+            execution[key] = identity
+        status = execution.get("status")
+        if not isinstance(status, str) or not status.strip():
+            fail("status is missing or malformed")
+        execution["status"] = status.strip().lower()
+        if not isinstance(execution.get("partial"), bool):
+            fail("partial flag is not an exact boolean")
+        protection = execution.get("protection")
+        if not isinstance(protection, dict):
+            fail("protection status is not structured")
+        if (not isinstance(protection.get("stop_loss"), bool)
+                or not isinstance(protection.get("take_profit"), bool)):
+            fail("protection flags are not exact booleans")
+        for key in ("filled", "average", "position_contracts"):
+            raw = execution.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                fail(f"{key} is missing or malformed")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                fail(f"{key} is malformed", exc)
+            if not math.isfinite(value) or value <= 0:
+                fail(f"{key} is not positive and finite")
+            execution[key] = value
+        if not self._quantity_matches(
+                execution["filled"], execution["position_contracts"]):
+            fail("position contracts do not match the verified fill")
+        for key in ("fee_usd", "slippage_usd", "adverse_slippage_usd"):
+            raw = execution.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                fail(f"{key} is missing or malformed")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                fail(f"{key} is malformed", exc)
+            if not math.isfinite(value):
+                fail(f"{key} is not finite")
+            execution[key] = value
+        estimated_loss_raw = plan.get("estimated_loss_pct")
+        if isinstance(estimated_loss_raw, bool):
+            fail("estimated loss is malformed")
+        try:
+            estimated_loss = float(estimated_loss_raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            fail("estimated loss is malformed", exc)
+        if not math.isfinite(estimated_loss) or estimated_loss <= 0:
+            fail("estimated loss is not positive and finite")
+        plan["estimated_loss_pct"] = estimated_loss
+        try:
+            market = self.ex.x.market(symbol)
+        except (CredentialError, ccxt.AuthenticationError, state.JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            fail("contract metadata could not be read", exc)
+        if not isinstance(market, dict):
+            fail("contract metadata is not structured")
+        contract_size_raw = market.get("contractSize")
+        if contract_size_raw in (None, "") or isinstance(
+                contract_size_raw, bool):
+            fail("contract size is missing or malformed")
+        try:
+            contract_size = float(contract_size_raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            fail("contract size is malformed", exc)
+        if not math.isfinite(contract_size) or contract_size <= 0:
+            fail("contract size is not positive and finite")
+        return execution, contract_size
+
     def _settle_entry(self, plan: dict, st: dict, execution: dict,
                       symbol: str, side: str, sl_price: float,
                       tp_price: float) -> bool:
+        try:
+            return self._settle_entry_impl(
+                plan, st, execution, symbol, side, sl_price, tp_price)
+        except (CredentialError, ccxt.AuthenticationError,
+                state.JournalError, OrderSubmissionAmbiguousError) as exc:
+            if (isinstance(exc, OrderSubmissionAmbiguousError)
+                    and getattr(exc, "_post_fill_unsettled", False)):
+                audit = getattr(exc, "_order_audit", None) or {}
+                self._pause_for_unsettled_fill(
+                    st, symbol, exc, order_id=audit.get("order_id"))
+            raise
+        except Exception as exc:
+            error = OrderSubmissionAmbiguousError(
+                f"filled entry for {symbol} could not be safely settled: {exc}",
+                {"symbol": symbol,
+                 "order_id": execution.get("order_id")
+                 if isinstance(execution, dict) else None,
+                 "outcome": "post_fill_unsettled"})
+            setattr(error, "_post_fill_unsettled", True)
+            self._pause_for_unsettled_fill(
+                st, symbol, error,
+                order_id=(execution.get("order_id")
+                          if isinstance(execution, dict) else None))
+            raise error from exc
+
+    def _settle_entry_impl(self, plan: dict, st: dict, execution: dict,
+                           symbol: str, side: str, sl_price: float,
+                           tp_price: float) -> bool:
         """Everything that must happen once an entry has actually filled.
 
         Extracted so that any path which can create a position runs the same
@@ -1837,10 +2682,10 @@ class Engine:
         Sharing the code is the only way both paths stay correct as it
         changes.
         """
-        filled = float(execution["filled"])
-        fill_price = float(execution["average"])
-        contract_size = float(
-            self.ex.x.market(symbol).get("contractSize") or 1)
+        execution, contract_size = self._validated_entry_execution(
+            plan, execution, symbol)
+        filled = execution["filled"]
+        fill_price = execution["average"]
         actual_notional = filled * contract_size * fill_price
         trade_id = state.new_trade_id()
         opened = time.time()
@@ -1852,8 +2697,7 @@ class Engine:
             sl_price,
             execution.get("liquidation_price"),
         )
-        stop_verified = bool(
-            (execution.get("protection") or {}).get("stop_loss"))
+        stop_verified = execution["protection"]["stop_loss"]
         liquidation_unsafe = (
             liquidation_check["available"]
             and not liquidation_check["safe"]
@@ -1872,7 +2716,7 @@ class Engine:
             "entry_notional": actual_notional,
             "qty": filled,
             "initial_qty": filled,
-            "position_id": execution.get("position_id"),
+            "position_id": execution["position_id"],
             "leverage": plan["leverage"],
             "entry_fee_usd": float(execution.get("fee_usd") or 0),
             "entry_fee_remaining_usd": float(execution.get("fee_usd") or 0),
@@ -1898,7 +2742,7 @@ class Engine:
         }
         st.setdefault("protection", {})[symbol] = {
             "side": plan["direction"],
-            "contracts": float(execution.get("position_contracts") or filled),
+            "contracts": execution["position_contracts"],
             "sl_price": sl_price,
             "tp_price": tp_price,
         }
@@ -1984,8 +2828,7 @@ class Engine:
                 )
             emergency_position = {
                 "symbol": symbol,
-                "contracts": float(
-                    execution.get("position_contracts") or filled),
+                "contracts": execution["position_contracts"],
                 "side": plan["direction"],
                 "entryPrice": fill_price,
                 "markPrice": fill_price,
@@ -2001,6 +2844,14 @@ class Engine:
                     closed = self._close(
                         current_position,
                         f"emergency close: {emergency_reason}", st)
+                except (CredentialError, ccxt.AuthenticationError) as exc:
+                    audit = getattr(exc, "_order_audit", None) or {}
+                    self._pause_for_unsettled_fill(
+                        st, symbol, exc, order_id=audit.get("order_id"))
+                    raise
+                except (state.JournalError,
+                        OrderSubmissionAmbiguousError):
+                    raise
                 except Exception as exc:
                     close_error = exc
                     if persistence_error is None:
@@ -2016,6 +2867,14 @@ class Engine:
                 try:
                     remaining = self.ex.position(
                         symbol, plan["direction"])
+                except (CredentialError, ccxt.AuthenticationError) as exc:
+                    audit = getattr(exc, "_order_audit", None) or {}
+                    self._pause_for_unsettled_fill(
+                        st, symbol, exc, order_id=audit.get("order_id"))
+                    raise
+                except (state.JournalError,
+                        OrderSubmissionAmbiguousError):
+                    raise
                 except Exception as verify_exc:
                     close_error = close_error or verify_exc
                     log.critical(
@@ -2035,6 +2894,8 @@ class Engine:
                 st.get("protection", {}).pop(symbol, None)
                 try:
                     state.commit(st)
+                except state.JournalError:
+                    raise
                 except Exception as cleanup_exc:
                     if persistence_error is None:
                         persistence_error = state.JournalError(
@@ -2075,23 +2936,59 @@ class Engine:
         symbol = pos["symbol"]
         try:
             execution = self.ex.close_position(pos)
+        except OrderSubmissionAmbiguousError as exc:
+            audit = getattr(exc, "_order_audit", None) or {}
+            self._pause_for_close_ambiguity(
+                st, symbol, exc, order_id=audit.get("order_id"))
+            raise
+        except (CredentialError, ccxt.AuthenticationError,
+                state.JournalError):
+            raise
         except Exception as e:
             log.error("Close failed for %s: %s", symbol, e)
             return False
+        try:
+            execution = Exchange._validated_close_execution(
+                execution, pos.get("contracts"), symbol)
+        except OrderSubmissionAmbiguousError as exc:
+            audit = getattr(exc, "_order_audit", None) or {}
+            self._pause_for_close_ambiguity(
+                st, symbol, exc, order_id=audit.get("order_id"))
+            raise
         trade = (st.get("active_trades") or {}).get(symbol) or {}
         direction = trade.get("direction") or self._direction(pos)
         if close_trigger is None:
             close_trigger = "engine_safety"
         if close_evidence is None:
             close_evidence = reason
-        if not execution.get("fully_closed"):
-            remaining = float(execution.get("remaining_contracts") or 0)
-            filled = float(execution.get("filled") or 0)
-            fill_price = float(execution.get("average") or 0)
+        if not execution["fully_closed"]:
+            remaining = execution["remaining_contracts"]
+            filled = execution["filled"]
+            fill_price = execution["average"]
             entry_price = float(
                 trade.get("entry_price") or pos.get("entryPrice") or 0)
-            contract_size = float(
-                self.ex.x.market(symbol).get("contractSize") or 1)
+            try:
+                market = self.ex.x.market(symbol)
+                contract_size_raw = (
+                    market.get("contractSize")
+                    if isinstance(market, dict) else None)
+                if (contract_size_raw in (None, "")
+                        or isinstance(contract_size_raw, bool)):
+                    raise ValueError("contract size is missing")
+                contract_size = float(contract_size_raw)
+                if not math.isfinite(contract_size) or contract_size <= 0:
+                    raise ValueError("contract size is invalid")
+            except (CredentialError, ccxt.AuthenticationError,
+                    state.JournalError, OrderSubmissionAmbiguousError):
+                raise
+            except Exception as exc:
+                error = OrderSubmissionAmbiguousError(
+                    f"partial close metadata for {symbol} is ambiguous: {exc}",
+                    {"symbol": symbol, "order_id": execution["order_id"],
+                     "outcome": "close_result_ambiguous"})
+                self._pause_for_close_ambiguity(
+                    st, symbol, error, order_id=execution["order_id"])
+                raise error from exc
             gross = (fill_price - entry_price) * filled * contract_size * (
                 1 if direction == "long" else -1)
             initial_qty = float(trade.get("initial_qty") or
@@ -2103,7 +3000,7 @@ class Engine:
                 entry_fee_remaining,
                 entry_fee_total * min(1.0, filled / initial_qty),
             )
-            exit_fee = float(execution.get("fee_usd") or 0)
+            exit_fee = execution["fee_usd"]
             partial_realized = gross - entry_fee_share - exit_fee
             if trade:
                 trade["qty"] = remaining
@@ -2142,13 +3039,13 @@ class Engine:
             state.commit(st)
             return False
 
-        price = float(execution.get("average") or pos.get("markPrice") or 0)
-        qty = float(execution.get("filled") or pos.get("contracts") or 0)
+        price = execution["average"]
+        qty = execution["filled"]
         entry_price = float(trade.get("entry_price") or pos.get("entryPrice") or 0)
         entry_notional = float(trade.get("entry_notional") or self._notional(pos))
         entry_fee = float(trade.get(
             "entry_fee_remaining_usd", trade.get("entry_fee_usd") or 0))
-        exit_fee = float(execution.get("fee_usd") or 0)
+        exit_fee = execution["fee_usd"]
         funding_raw = (pos.get("info") or {}).get("fundingFee")
         funding_status = "available"
         if funding_raw in (None, "") and trade.get("opened_at"):
@@ -2172,8 +3069,28 @@ class Engine:
                 {"trade_id": trade.get("trade_id")})
         else:
             funding = float(funding_raw)
-        contract_size = float(
-            self.ex.x.market(symbol).get("contractSize") or 1)
+        try:
+            market = self.ex.x.market(symbol)
+            contract_size_raw = (
+                market.get("contractSize")
+                if isinstance(market, dict) else None)
+            if (contract_size_raw in (None, "")
+                    or isinstance(contract_size_raw, bool)):
+                raise ValueError("contract size is missing")
+            contract_size = float(contract_size_raw)
+            if not math.isfinite(contract_size) or contract_size <= 0:
+                raise ValueError("contract size is invalid")
+        except (CredentialError, ccxt.AuthenticationError,
+                state.JournalError, OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            error = OrderSubmissionAmbiguousError(
+                f"close metadata for {symbol} is ambiguous: {exc}",
+                {"symbol": symbol, "order_id": execution["order_id"],
+                 "outcome": "close_result_ambiguous"})
+            self._pause_for_close_ambiguity(
+                st, symbol, error, order_id=execution["order_id"])
+            raise error from exc
         move = price - entry_price
         gross_pnl = move * qty * contract_size * (
             1 if direction == "long" else -1)
@@ -2985,6 +3902,8 @@ class Engine:
                     reason)
         try:
             st = state.load_state()
+        except state.JournalError:
+            raise
         except Exception as exc:
             log.critical(
                 "local state unavailable during flatten; exchange remains "
@@ -2996,6 +3915,9 @@ class Engine:
         for p in self.ex.positions():
             try:
                 closed = self._close(p, f"flatten: {reason}", st)
+            except (CredentialError, ccxt.AuthenticationError,
+                    state.JournalError, OrderSubmissionAmbiguousError):
+                raise
             except Exception as exc:
                 # The exchange close happens before journaling. Verify the
                 # exchange directly and keep flattening other symbols even if
@@ -3006,6 +3928,9 @@ class Engine:
                 try:
                     remaining = self.ex.position(
                         p["symbol"], self._direction(p))
+                except (CredentialError, ccxt.AuthenticationError,
+                        state.JournalError, OrderSubmissionAmbiguousError):
+                    raise
                 except Exception:
                     remaining = p
                 closed = remaining is None
@@ -3015,6 +3940,8 @@ class Engine:
                     st.get("protection", {}).pop(p["symbol"], None)
                     try:
                         state.commit(st)
+                    except state.JournalError:
+                        raise
                     except Exception as state_exc:
                         log.critical(
                             "could not persist post-flatten state for %s: %s",
@@ -3037,6 +3964,9 @@ class Engine:
         else:
             try:
                 self.ex.cancel_everything()
+            except (CredentialError, ccxt.AuthenticationError,
+                    state.JournalError, OrderSubmissionAmbiguousError):
+                raise
             except Exception as e:
                 orders_cleared = False
                 log.error("cancel_everything after flatten: %s", e)
@@ -3055,4 +3985,5 @@ class Engine:
                 "critical", "flatten_journal_failed",
                 "Flatten completed but could not be written to the journal",
                 {"error": str(exc), "reason": reason})
+            raise
         return not failed and orders_cleared

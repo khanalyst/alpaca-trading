@@ -72,6 +72,27 @@ LIVE_MIN_TIER = "T3_VALIDATED"
 # Live-authorizing tiers must cite their content-addressed evidence packet.
 PACKET_REFERENCE = re.compile(r"^t3-packet:[0-9a-f]{64}$")
 
+
+def require_t3_packet_reference(spec: "StrategySpec") -> str | None:
+    """Return the sole live-authorizing packet citation or fail closed.
+
+    Evidence may include human-readable supporting documents, but a strategy
+    at or above ``LIVE_MIN_TIER`` must carry exactly one content-addressed T3
+    packet citation.  Multiple citations are ambiguous: the runtime cannot
+    know which reviewed packet authorized the deployed artifact.
+    """
+    if spec.tier_rank() < TIERS.index(LIVE_MIN_TIER):
+        return None
+    references = [
+        str(reference) for reference in spec.evidence
+        if PACKET_REFERENCE.fullmatch(str(reference))
+    ]
+    if len(references) != 1:
+        raise ValueError(
+            f"strategy {spec.id!r} claims {spec.tier}, which requires "
+            "exactly one t3-packet:<64hex> evidence citation")
+    return references[0]
+
 class UnknownStrategy(KeyError):
     """Raised when configuration names a strategy that is not registered."""
 
@@ -155,15 +176,7 @@ class StrategySpec:
             raise ValueError(
                 f"strategy {self.id!r} cannot be forward-model ready without "
                 "a forward_model_id")
-        if (self.tier_rank() >= TIERS.index(LIVE_MIN_TIER)
-            and not any(PACKET_REFERENCE.match(reference)
-                        for reference in self.evidence)):
-            raise ValueError(
-                f"strategy {self.id!r} claims {self.tier}, which authorises "
-                "live capital, without citing the evidence packet that "
-                "granted it. Add the packet hash from `research.py t3-packet` "
-                "to evidence as 't3-packet:<sha256>'. A tier that can be "
-                "raised by editing one string is not a gate.")
+        require_t3_packet_reference(self)
 
     @property
     def forward_model(self) -> ForwardOutcomeModel:

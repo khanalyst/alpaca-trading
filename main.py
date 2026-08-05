@@ -329,9 +329,26 @@ def cmd_status(args, cfg) -> int:
 
 def cmd_check(args, cfg) -> int:
     ok = True
+    live_catalog = None
+    live_system = None
     print(f"Mode: {cfg['mode']}")
     print(f"LLM:  {cfg['llm']['provider']} / {cfg['llm']['model']}")
     print(f"Secrets: {secrets_file()}")
+    if cfg["mode"] == "live":
+        # Resolve the reviewed artifact before constructing Exchange,
+        # AlertManager, or LLM. Keep one catalog/system snapshot for the
+        # verifier and the eventual LLM preflight below.
+        try:
+            from agent import brain, variants
+            from agent.deployment import verify_live_artifact
+            live_catalog = variants.research_selection_catalog()
+            live_system = brain.build_system(cfg, catalog=live_catalog)
+            verify_live_artifact(
+                cfg, catalog=live_catalog, system_prompt=live_system)
+            print("  Live artifact authorization OK")
+        except Exception as exc:                           # noqa: BLE001
+            print(f"  LIVE ARTIFACT CHECK FAILED: {exc}")
+            ok = False
     if SHELL_SOURCED:
         print(f"  NOTE {', '.join(SHELL_SOURCED)} also set in the shell "
               "environment; .env takes precedence. Unset the shell copies so "
@@ -436,7 +453,13 @@ def cmd_check(args, cfg) -> int:
             if ok:
                 try:
                     from agent.brain import LLM
-                    llm = LLM(cfg)
+                    llm_kwargs = {}
+                    if live_catalog is not None:
+                        llm_kwargs = {
+                            "catalog": live_catalog,
+                            "system": live_system,
+                        }
+                    llm = LLM(cfg, **llm_kwargs)
                     model = llm.preflight()
                     # Showing the endpoint makes a mis-set OPENAI_BASE_URL
                     # obvious instead of silently routing to the wrong host.

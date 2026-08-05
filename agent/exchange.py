@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import ccxt
 from ccxt.base.types import Entry
 
+from .state import JournalError
+
 log = logging.getLogger("exchange")
 PROTECTIVE_ALGO_TYPES = ("conditional", "oco", "trigger")
 ALL_ALGO_TYPES = PROTECTIVE_ALGO_TYPES + (
@@ -102,6 +104,42 @@ class EntryOrderRejected(RuntimeError):
     def __init__(self, message: str, details: dict):
         super().__init__(message)
         self.details = details
+
+
+class OrderSubmissionAmbiguousError(RuntimeError):
+    """An order may exist but its single-shot submission was not recovered."""
+
+    def __init__(self, message: str, audit: dict | None = None):
+        super().__init__(message)
+        details = dict(audit or {})
+        details.setdefault("outcome", "ambiguous_unrecovered")
+        self._order_audit = details
+
+
+class MakerFirstPreSubmitError(RuntimeError):
+    """A maker attempt stopped before any order submission was possible."""
+
+    def __init__(self, message: str, audit: dict | None = None):
+        super().__init__(message)
+        details = dict(audit or {})
+        details.setdefault("outcome", "pre_submit_failed")
+        self._order_audit = details
+
+
+class MakerFirstAmbiguousError(RuntimeError):
+    """A maker-first attempt cannot prove a safe fallback boundary.
+
+    Maker-first is allowed to hand the setup to the crossing path only after
+    a structured zero-fill result and an explicit terminal cancellation
+    status.  Every malformed or exceptional boundary is therefore marked as
+    ambiguous so callers can fail closed without parsing exception text.
+    """
+
+    def __init__(self, message: str, audit: dict | None = None):
+        super().__init__(message)
+        details = dict(audit or {})
+        details.setdefault("outcome", "ambiguous_maker_first")
+        self._order_audit = details
 
 
 class Exchange:
@@ -563,20 +601,100 @@ class Exchange:
         if time.time() - last >= ACCOUNT_RECHECK_SECONDS:
             self.verify_account_safety(require_trade=True, refresh=True)
 
+    # Keep a minimal inert pending-entry shim for maker-first compatibility.
+    # Core execution does not carry observer/order-group metadata.
+    def _clear_pending_entry(self) -> None:
+        self._pending_entry = None
+
     @staticmethod
     def _client_order_id(prefix: str) -> str:
         return (prefix + uuid.uuid4().hex)[:32]
 
+    @staticmethod
+    def _trimmed_identity(value: object) -> str | None:
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        try:
+            identity = str(value).strip()
+        except Exception:
+            return None
+        return identity or None
+
+    def _order_identity_matches(self, order: object, symbol: str,
+                                client_order_id: str,
+                                *, require_client_echo: bool = True) -> bool:
+        """Prove one order belongs to the exact symbol and client request."""
+        target_client = self._trimmed_identity(client_order_id)
+        target_symbol = self._trimmed_identity(symbol)
+        if (not isinstance(order, dict) or not target_client
+                or not target_symbol):
+            return False
+        info = order.get("info")
+        if info not in (None, "") and not isinstance(info, dict):
+            return False
+        info = info or {}
+
+        normalized_symbol = self._trimmed_identity(order.get("symbol"))
+        instrument_id = self._trimmed_identity(info.get("instId"))
+        if not normalized_symbol and not instrument_id:
+            return False
+        expected_instrument = None
+        try:
+            market = self.x.market(target_symbol)
+            if isinstance(market, dict):
+                expected_instrument = self._trimmed_identity(market.get("id"))
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception:
+            # A normalized top-level symbol remains sufficient evidence. Raw
+            # instId-only responses require market metadata to map safely.
+            expected_instrument = None
+        if normalized_symbol and normalized_symbol != target_symbol:
+            return False
+        if instrument_id and instrument_id not in {
+                target_symbol, expected_instrument}:
+            return False
+        if instrument_id and expected_instrument is None \
+                and instrument_id != target_symbol:
+            return False
+
+        identities = {
+            self._trimmed_identity(order.get("clientOrderId")),
+            self._trimmed_identity(info.get("clOrdId")),
+            self._trimmed_identity(info.get("algoClOrdId")),
+        }
+        identities.discard(None)
+        if identities:
+            return identities == {target_client}
+        # OKX/CCXT does not consistently echo clOrdId on ordinary order reads.
+        # Recovery is stricter because the client ID is the lookup proof; a
+        # normal fill read is already anchored by the exact exchange order ID.
+        return not require_client_echo
+
     def _recover_order(self, symbol: str, client_order_id: str):
         """Recover an ambiguously acknowledged order without resubmitting it."""
+        target = self._trimmed_identity(client_order_id)
+        if not target:
+            return None
+
+        def identity_matches(order: object) -> bool:
+            return (
+                isinstance(order, dict)
+                and self._trimmed_identity(order.get("id")) is not None
+                and self._order_identity_matches(order, symbol, target)
+            )
+
         for _ in range(4):
             for params in (
-                    {"clientOrderId": client_order_id},
-                    {"clientOrderId": client_order_id, "trigger": True}):
+                    {"clientOrderId": target},
+                    {"clientOrderId": target, "trigger": True}):
                 try:
                     order = self.x.fetch_order(None, symbol, params)
-                    if order and (order.get("id") or order.get("clientOrderId")):
+                    if identity_matches(order):
                         return order
+                except (CredentialError, ccxt.AuthenticationError):
+                    raise
                 except Exception:
                     continue
             # Some OKX/CCXT versions expose a client ID on an algo order as
@@ -586,22 +704,19 @@ class Exchange:
                 try:
                     orders = self.x.fetch_open_orders(
                         symbol, None, None, {"ordType": order_type}) or []
+                except (CredentialError, ccxt.AuthenticationError):
+                    raise
                 except Exception:
                     continue
                 for order in orders:
-                    info = order.get("info") or {}
-                    ids = {
-                        str(order.get("clientOrderId") or ""),
-                        str(info.get("clOrdId") or ""),
-                        str(info.get("algoClOrdId") or ""),
-                    }
-                    if client_order_id in ids:
+                    if identity_matches(order):
                         return order
             time.sleep(0.75)
         return None
 
     def _create_order_once(self, symbol: str, order_type: str, side: str,
-                           amount: float, price, params: dict, prefix: str):
+                           amount: float, price, params: dict, prefix: str,
+                           ):
         """Place an order once; a timeout is reconciled, never blindly retried."""
         request = dict(params)
         client_id = self._client_order_id(prefix)
@@ -660,10 +775,10 @@ class Exchange:
             audit["latency_ms"] = round(
                 (time.monotonic() - started) * 1000, 1)
             audit["outcome"] = "ambiguous_unrecovered"
-            error = RuntimeError(
-                f"ambiguous order result for {client_id}; order was not retried"
+            error = OrderSubmissionAmbiguousError(
+                f"ambiguous order result for {client_id}; order was not retried",
+                audit,
             )
-            setattr(error, "_order_audit", audit)
             raise error from exc
         except Exception as exc:
             audit["latency_ms"] = round(
@@ -695,61 +810,274 @@ class Exchange:
                     expected_price: float | None = None,
                     side: str | None = None) -> dict:
         """Wait for a terminal order state and return actual execution data."""
-        current = order or {}
+        full_terminal = {"filled", "closed"}
+        canceled_terminal = {"canceled", "cancelled", "expired", "rejected"}
+        terminal = full_terminal | canceled_terminal
+
+        original = order if isinstance(order, dict) else {}
+        raw_submission_audit = original.get("_submission_audit")
+        submission_audit = (
+            dict(raw_submission_audit)
+            if isinstance(raw_submission_audit, dict) else {})
+
+        def ambiguous(message: str, *, current=None):
+            audit = dict(submission_audit)
+            if isinstance(current, dict):
+                try:
+                    last_status = str(
+                        current.get("status") or "unknown").lower()
+                except Exception:
+                    last_status = "malformed"
+                audit.update({
+                    "order_id": current.get("id") or original.get("id"),
+                    "last_fill_status": last_status,
+                })
+            else:
+                audit.update({
+                    "order_id": original.get("id"),
+                    "last_fill_status": "unknown",
+                })
+            audit["outcome"] = "fill_ambiguous"
+            raise OrderSubmissionAmbiguousError(message, audit)
+
+        def normalized_status(response: dict) -> str:
+            raw = response.get("status")
+            if raw in (None, ""):
+                return "unknown"
+            if not isinstance(raw, str):
+                ambiguous("order status is malformed", current=response)
+            return raw.strip().lower() or "unknown"
+
+        if isinstance(requested, bool):
+            ambiguous("requested order quantity is malformed")
+        try:
+            requested_value = float(requested)
+        except (TypeError, ValueError, OverflowError):
+            ambiguous("requested order quantity is malformed")
+        if not math.isfinite(requested_value) or requested_value <= 0:
+            ambiguous("requested order quantity is not positive and finite")
+        if not isinstance(order, dict):
+            ambiguous("order acknowledgement is not structured")
+        if raw_submission_audit not in (None, "") \
+                and not isinstance(raw_submission_audit, dict):
+            ambiguous("order submission audit is not structured")
+        current = order
         order_id = current.get("id")
+        if order_id in (None, ""):
+            ambiguous("order acknowledgement has no exchange order id",
+                      current=current)
+        try:
+            expected_order_id = str(order_id).strip()
+        except Exception:
+            ambiguous("order acknowledgement exchange id is malformed",
+                      current=current)
+        if not expected_order_id:
+            ambiguous("order acknowledgement has no exchange order id",
+                      current=current)
+        expected_client_id = self._trimmed_identity(
+            submission_audit.get("client_order_id"))
+        if not expected_client_id:
+            ambiguous("order acknowledgement has no requested client order id",
+                      current=current)
+        try:
+            initial_identity_matches = self._order_identity_matches(
+                current, symbol, expected_client_id,
+                require_client_echo=False)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            ambiguous(f"order identity could not be verified: {exc}",
+                      current=current)
+        if not initial_identity_matches:
+            ambiguous(
+                "order acknowledgement symbol/client identity does not match "
+                "the request", current=current)
+
+        def checked_response(response, stage: str) -> dict:
+            if not isinstance(response, dict):
+                ambiguous(f"{stage} order response is not structured",
+                          current=response)
+            response_id = response.get("id")
+            if response_id in (None, ""):
+                ambiguous(f"{stage} order response has no exchange order id",
+                          current=response)
+            try:
+                response_order_id = str(response_id).strip()
+            except Exception:
+                ambiguous(f"{stage} order response id is malformed",
+                          current=response)
+            if not response_order_id:
+                ambiguous(f"{stage} order response has no exchange order id",
+                          current=response)
+            if response_order_id != expected_order_id:
+                ambiguous(f"{stage} order response id does not match request",
+                          current=response)
+            try:
+                identity_matches = self._order_identity_matches(
+                    response, symbol, expected_client_id,
+                    require_client_echo=False)
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
+            except Exception as exc:
+                ambiguous(f"{stage} order identity is malformed: {exc}",
+                          current=response)
+            if not identity_matches:
+                ambiguous(
+                    f"{stage} order symbol/client identity does not match "
+                    "the request", current=response)
+            return response
+
         deadline = time.monotonic() + float(
             self.cfg["execution"]["fill_timeout_seconds"])
-        while order_id and time.monotonic() < deadline:
-            status = str(current.get("status") or "").lower()
-            if status in {"closed", "canceled", "rejected", "expired"}:
+        while time.monotonic() < deadline:
+            status = normalized_status(current)
+            if status in terminal:
                 break
             try:
-                current = self.retry(self.x.fetch_order, order_id, symbol)
-            except Exception:
-                time.sleep(0.4)
-                continue
+                fetched = self.retry(
+                    self.x.fetch_order, order_id, symbol)
+            except (CredentialError, ccxt.AuthenticationError, JournalError):
+                raise
+            except Exception as exc:
+                ambiguous(
+                    f"could not verify order {expected_order_id}: {exc}",
+                    current=current)
+            current = checked_response(fetched, "polled")
             time.sleep(0.25)
 
-        status = str(current.get("status") or "unknown").lower()
-        if status not in {"closed", "canceled", "rejected", "expired"} and order_id:
+        status = normalized_status(current)
+        if status not in terminal:
             try:
                 self.x.cancel_order(order_id, symbol)
-                current = self.retry(self.x.fetch_order, order_id, symbol)
-                status = str(current.get("status") or status).lower()
+            except (CredentialError, ccxt.AuthenticationError, JournalError):
+                raise
             except Exception as exc:
-                log.warning("could not cancel non-terminal order %s: %s",
-                            order_id, exc)
+                ambiguous(
+                    f"could not confirm cancellation of order "
+                    f"{expected_order_id}: {exc}", current=current)
+            try:
+                fetched = self.retry(
+                    self.x.fetch_order, order_id, symbol)
+            except (CredentialError, ccxt.AuthenticationError, JournalError):
+                raise
+            except Exception as exc:
+                ambiguous(
+                    f"could not read order {expected_order_id} after cancel: "
+                    f"{exc}", current=current)
+            current = checked_response(fetched, "post-cancel")
+            status = normalized_status(current)
+        if status not in terminal:
+            ambiguous(
+                f"order {expected_order_id} has no verified terminal state",
+                current=current)
 
-        info = current.get("info") or {}
-        filled = float(current.get("filled") or info.get("accFillSz")
-                       or info.get("fillSz") or 0)
-        average = float(current.get("average") or info.get("avgPx")
-                        or info.get("fillPx") or 0)
-        submission_audit = dict(
-            current.get("_submission_audit")
-            or (order or {}).get("_submission_audit")
-            or {}
-        )
+        info_raw = current.get("info")
+        if info_raw not in (None, "") and not isinstance(info_raw, dict):
+            ambiguous("terminal order info is not structured", current=current)
+        info = info_raw or {}
+
+        def explicit_value(top_key: str, info_key: str):
+            top = current.get(top_key)
+            if top not in (None, ""):
+                return top, True
+            raw = info.get(info_key)
+            if raw not in (None, ""):
+                return raw, True
+            return None, False
+
+        filled_raw, filled_explicit = explicit_value("filled", "accFillSz")
+        remaining_raw, remaining_explicit = explicit_value(
+            "remaining", "remainSz")
+        if not filled_explicit or isinstance(filled_raw, bool):
+            ambiguous("terminal order has no explicit cumulative fill quantity",
+                      current=current)
+        try:
+            filled = float(filled_raw)
+        except (TypeError, ValueError, OverflowError):
+            ambiguous("terminal cumulative fill quantity is malformed",
+                      current=current)
+        if (not math.isfinite(filled) or filled < 0
+                or filled > requested_value):
+            ambiguous("terminal cumulative fill quantity is invalid",
+                      current=current)
+        if remaining_explicit:
+            if isinstance(remaining_raw, bool):
+                ambiguous("terminal remaining quantity is malformed",
+                          current=current)
+            try:
+                remaining = float(remaining_raw)
+            except (TypeError, ValueError, OverflowError):
+                ambiguous("terminal remaining quantity is malformed",
+                          current=current)
+            if (not math.isfinite(remaining) or remaining < 0
+                    or remaining > requested_value):
+                ambiguous("terminal remaining quantity is invalid",
+                          current=current)
+        else:
+            remaining = requested_value - filled
+
+        tolerance = max(1e-12, requested_value * 1e-9)
+        if remaining_explicit and abs(
+                filled + remaining - requested_value) > tolerance:
+            ambiguous("terminal fill and remaining quantities disagree",
+                      current=current)
+        if status in full_terminal:
+            if (abs(filled - requested_value) > tolerance
+                    or (remaining_explicit and abs(remaining) > tolerance)):
+                ambiguous("full terminal status does not prove a full fill",
+                          current=current)
+            filled = requested_value
+            remaining = 0.0
+        elif filled > 0:
+            if filled >= requested_value - tolerance:
+                ambiguous("canceled terminal status conflicts with a full fill",
+                          current=current)
+            if not remaining_explicit:
+                ambiguous(
+                    "partial fill lacks explicit remaining quantity",
+                    current=current)
+
+        average_raw, average_explicit = explicit_value("average", "avgPx")
+        if filled > 0:
+            if not average_explicit or isinstance(average_raw, bool):
+                ambiguous("verified fill has no exchange average price",
+                          current=current)
+            try:
+                average = float(average_raw)
+            except (TypeError, ValueError, OverflowError):
+                ambiguous("verified fill average price is malformed",
+                          current=current)
+            if not math.isfinite(average) or average <= 0:
+                ambiguous("verified fill average price is invalid",
+                          current=current)
+        else:
+            average = 0.0
+
+        submission_audit = dict(current.get("_submission_audit")
+                                or submission_audit)
         submission_audit.update({
-            "order_id": order_id,
+            "order_id": expected_order_id,
             "last_fill_status": status,
         })
-        if not math.isfinite(filled) or filled <= 0:
+        if filled <= 0:
             submission_audit["outcome"] = "fill_unverified"
             error = RuntimeError(
-                f"order {order_id or '?'} has no verified fill")
-            setattr(error, "_order_audit", submission_audit)
-            raise error
-        if not math.isfinite(average) or average <= 0:
-            average = float(expected_price or 0)
-        if not math.isfinite(average) or average <= 0:
-            submission_audit["outcome"] = "fill_price_unverified"
-            error = RuntimeError(
-                f"order {order_id or '?'} has no verified fill price")
+                f"order {expected_order_id} has no verified fill")
             setattr(error, "_order_audit", submission_audit)
             raise error
 
-        contract_size = float(self.x.market(symbol).get("contractSize") or 1)
+        try:
+            contract_size = float(
+                self.x.market(symbol).get("contractSize") or 1)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            ambiguous(f"contract metadata is malformed: {exc}", current=current)
+        if not math.isfinite(contract_size) or contract_size <= 0:
+            ambiguous("contract size is not positive and finite", current=current)
         slippage = 0.0
         if expected_price and expected_price > 0:
             execution_side = str(
@@ -761,28 +1089,44 @@ class Exchange:
             else:
                 price_shortfall = abs(average - expected_price)
             slippage = price_shortfall * filled * contract_size
+        if not math.isfinite(slippage):
+            ambiguous("fill slippage is not finite", current=current)
         realized_includes_costs = info.get("realizedPnl") not in (None, "")
         realized_raw = info.get("realizedPnl")
         if realized_raw in (None, ""):
             realized_raw = info.get("pnl")
+        if realized_raw in (None, ""):
+            realized = None
+        else:
+            if isinstance(realized_raw, bool):
+                ambiguous("realized PnL is malformed", current=current)
+            try:
+                realized = float(realized_raw)
+            except (TypeError, ValueError, OverflowError):
+                ambiguous("realized PnL is malformed", current=current)
+            if not math.isfinite(realized):
+                ambiguous("realized PnL is not finite", current=current)
+        try:
+            fee_usd = self._fee_usd(current)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            ambiguous(f"fill fee metadata is malformed: {exc}", current=current)
         return {
-            "order_id": order_id,
+            "symbol": str(symbol).strip(),
+            "order_id": expected_order_id,
             "status": status,
-            "requested": float(requested),
+            "requested": requested_value,
             "filled": filled,
             "average": average,
-            "partial": filled + 1e-12 < float(requested),
-            "fee_usd": self._fee_usd(current),
-            "realized_pnl_usd": (float(realized_raw)
-                                 if realized_raw not in (None, "") else None),
+            "partial": filled + tolerance < requested_value,
+            "fee_usd": fee_usd,
+            "realized_pnl_usd": realized,
             "realized_includes_costs": realized_includes_costs,
             "slippage_usd": slippage,
             "adverse_slippage_usd": max(0.0, slippage),
-            "client_order_id": (
-                current.get("clientOrderId") or info.get("clOrdId")
-                or (order or {}).get("clientOrderId")
-                or ((order or {}).get("_submission_audit") or {}).get(
-                    "client_order_id")),
+            "client_order_id": expected_client_id,
             "submission_audit": (
                 submission_audit or None),
             "order": current,
@@ -827,8 +1171,9 @@ class Exchange:
         return value
 
     def equity_usdt(self) -> float:
-        return self._usdt_equity_from_balance(
-            self.retry(self.x.fetch_balance))
+        balance = self.retry(self.x.fetch_balance)
+        value = self._usdt_equity_from_balance(balance)
+        return value
 
     def collateral_breakdown(self) -> tuple[float, float]:
         """Return (enabled non-USDT USD, USDT-plus-enabled USD equity).
@@ -1057,6 +1402,9 @@ class Exchange:
         try:
             rows = self.retry(
                 self.x.fetch_funding_history, symbol, since_ms, 100) or []
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
         except Exception as exc:
             log.warning("funding history unavailable for %s: %s", symbol, exc)
             return None
@@ -1113,6 +1461,9 @@ class Exchange:
         try:
             fills = self.retry(
                 self.x.fetch_my_trades, symbol, since_ms, 100) or []
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
         except Exception as exc:
             log.warning("position age fill history unavailable for %s: %s",
                         symbol, exc)
@@ -1411,6 +1762,9 @@ class Exchange:
                           self.retry(self.x.fetch_open_orders, symbol, None,
                                      None, params))
                 found.extend(orders or [])
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
             except Exception:
                 continue
         deduped = {}
@@ -1509,6 +1863,9 @@ class Exchange:
                      "takeProfitPrice": self.x.price_to_precision(symbol, tp_price)},
                     "okxtp",
                 )
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
             except Exception as exc:
                 log.error("take-profit placement failed for %s: %s", symbol, exc)
                 self._alert("error", "take_profit_missing",
@@ -1533,59 +1890,190 @@ class Exchange:
         anything having checked.
         """
         position_side = "long" if side == "buy" else "short"
+
+        def mark_unsettled(exc: Exception) -> None:
+            raw_audit = (getattr(exc, "_order_audit", None)
+                         or (fill.get("submission_audit")
+                             if isinstance(fill, dict) else None))
+            audit = dict(raw_audit) if isinstance(raw_audit, dict) else {}
+            audit.update({
+                "order_id": fill.get("order_id"),
+                "last_fill_status": fill.get("status"),
+                "outcome": "post_fill_unsettled",
+            })
+            setattr(exc, "_order_audit", audit)
+            setattr(exc, "_post_fill_unsettled", True)
+
+        def ambiguous(message: str, cause: Exception | None = None):
+            raw_audit = (fill.get("submission_audit")
+                         if isinstance(fill, dict) else None)
+            audit = dict(raw_audit) if isinstance(raw_audit, dict) else {}
+            audit.update({
+                "order_id": fill.get("order_id")
+                if isinstance(fill, dict) else None,
+                "last_fill_status": fill.get("status")
+                if isinstance(fill, dict) else None,
+                "outcome": "post_fill_unsettled",
+            })
+            error = OrderSubmissionAmbiguousError(message, audit)
+            mark_unsettled(error)
+            if cause is None:
+                raise error
+            raise error from cause
+
+        if not isinstance(fill, dict):
+            ambiguous("verified entry fill is not structured")
+        raw_fill_audit = fill.get("submission_audit")
+        if raw_fill_audit not in (None, "") \
+                and not isinstance(raw_fill_audit, dict):
+            ambiguous("verified entry submission audit is not structured")
+        fill_symbol = self._trimmed_identity(fill.get("symbol"))
+        order_id = self._trimmed_identity(fill.get("order_id"))
+        client_id = self._trimmed_identity(fill.get("client_order_id"))
+        position_symbol = self._trimmed_identity(symbol)
+        if (not fill_symbol or fill_symbol != position_symbol
+                or not order_id or not client_id):
+            ambiguous("verified entry fill identity is missing or mismatched")
+        for key in ("filled", "average"):
+            raw = fill.get(key)
+            if isinstance(raw, bool):
+                ambiguous(f"verified entry {key} is malformed")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                ambiguous(f"verified entry {key} is malformed", exc)
+            if not math.isfinite(value) or value <= 0:
+                ambiguous(f"verified entry {key} is not positive and finite")
+            fill[key] = value
+        if not isinstance(fill.get("partial"), bool):
+            ambiguous("verified entry partial flag is not boolean")
+
         try:
             live_position = self.position(symbol)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError) as exc:
+            mark_unsettled(exc)
+            raise
         except Exception as exc:
-            # The verified fill is enough to protect the position even when
-            # the positions endpoint is temporarily unavailable.
-            live_position = None
-            log.warning("position verification failed after %s fill: %s",
-                        symbol, exc)
-            self._alert("warning", "position_read_after_fill_failed",
-                        f"Using the verified {symbol} fill to place protection",
-                        {"error": str(exc)})
-        live_contracts = abs(float((live_position or {}).get("contracts")
-                                   or fill["filled"]))
-        mark = float((live_position or {}).get("markPrice")
-                     or fill["average"])
+            ambiguous(
+                f"verified fill exists but the live position read failed: {exc}",
+                exc)
+        if not isinstance(live_position, dict):
+            ambiguous("verified fill exists but no structured live position "
+                      "was returned")
+        live_symbol = self._trimmed_identity(live_position.get("symbol"))
+        live_info = live_position.get("info")
+        if live_info not in (None, "") and not isinstance(live_info, dict):
+            ambiguous("live position metadata is not structured")
+        live_info = live_info or {}
+        live_inst = self._trimmed_identity(live_info.get("instId"))
+        if live_symbol and live_symbol != position_symbol:
+            ambiguous("live position symbol does not match the filled entry")
+        if live_inst:
+            expected_inst = None
+            try:
+                market = self.x.market(symbol)
+                if isinstance(market, dict):
+                    expected_inst = self._trimmed_identity(market.get("id"))
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError) as exc:
+                mark_unsettled(exc)
+                raise
+            except Exception as exc:
+                ambiguous(f"position instrument metadata is unavailable: {exc}",
+                          exc)
+            if live_inst not in {position_symbol, expected_inst}:
+                ambiguous("live position instrument does not match the filled "
+                          "entry")
+        raw_contracts = live_position.get("contracts")
+        if isinstance(raw_contracts, bool):
+            ambiguous("live position contracts are malformed")
+        try:
+            live_contracts = abs(float(raw_contracts))
+        except (TypeError, ValueError, OverflowError) as exc:
+            ambiguous("live position contracts are malformed", exc)
+        if not math.isfinite(live_contracts) or live_contracts <= 0:
+            ambiguous("live position contracts are not positive and finite")
+        tolerance = max(1e-12, fill["filled"] * 1e-6)
+        if abs(live_contracts - fill["filled"]) > tolerance:
+            ambiguous("live position contracts do not match the verified fill")
+        raw_mark = live_position.get("markPrice")
+        if isinstance(raw_mark, bool):
+            ambiguous("live position mark price is malformed")
+        try:
+            mark = float(raw_mark)
+        except (TypeError, ValueError, OverflowError) as exc:
+            ambiguous("live position mark price is malformed", exc)
+        if not math.isfinite(mark) or mark <= 0:
+            ambiguous("live position mark price is not positive and finite")
+        position_id = self._trimmed_identity(
+            live_position.get("id") or live_info.get("posId"))
+        if not position_id:
+            ambiguous("live position has no position identity")
         # Attached algo orders can be eventually consistent on the read API.
         time.sleep(0.4)
         try:
             protection = self.ensure_protection(
                 symbol, position_side, live_contracts, sl_price, tp_price, mark)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError) as exc:
+            mark_unsettled(exc)
+            raise
         except Exception as e:
-            protection = {"stop_loss": False, "take_profit": False}
-            log.error("protection verification failed for %s: %s", symbol, e)
+            ambiguous(
+                f"verified fill exists but protection verification failed: {e}",
+                e)
+        if not isinstance(protection, dict):
+            ambiguous("entry protection status is not structured")
+        if (not isinstance(protection.get("stop_loss"), bool)
+                or not isinstance(protection.get("take_profit"), bool)):
+            ambiguous("entry protection flags are not exact booleans")
 
         if not protection.get("stop_loss"):
-            self._alert("critical", "unprotected_position",
-                        f"{symbol} entry filled without a verified stop-loss",
-                        {"contracts": live_contracts})
+            try:
+                self._alert(
+                    "critical", "unprotected_position",
+                    f"{symbol} entry filled without a verified stop-loss",
+                    {"contracts": live_contracts})
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError) as exc:
+                mark_unsettled(exc)
+                raise
+            except Exception as exc:
+                ambiguous(
+                    f"verified fill exists but the unprotected-position "
+                    f"alert failed: {exc}", exc)
         if fill["partial"]:
             log.warning("PARTIAL ENTRY %s: requested %s, filled %s", symbol,
                         contracts, fill["filled"])
-            self._alert("warning", "partial_entry",
-                        f"{symbol} entry partially filled",
-                        {"requested": contracts, "filled": fill["filled"]})
+            try:
+                self._alert(
+                    "warning", "partial_entry",
+                    f"{symbol} entry partially filled",
+                    {"requested": contracts, "filled": fill["filled"]})
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError) as exc:
+                mark_unsettled(exc)
+                raise
+            except Exception as exc:
+                ambiguous(
+                    f"verified partial fill exists but its alert failed: {exc}",
+                    exc)
         fill["protection"] = protection
         fill["position_contracts"] = live_contracts
-        fill["position_id"] = ((live_position or {}).get("id")
-                               or ((live_position or {}).get("info") or {}).get(
-                                   "posId"))
+        fill["position_id"] = position_id
         liquidation_raw = (
-            (live_position or {}).get("liquidationPrice")
-            or ((live_position or {}).get("info") or {}).get("liqPx")
+            live_position.get("liquidationPrice") or live_info.get("liqPx")
         )
         if liquidation_raw in (None, "", "0", 0):
             liquidation_price = None
         else:
             try:
                 liquidation_price = float(liquidation_raw)
-            except (TypeError, ValueError):
-                # The engine treats an invalid available measurement as unsafe
-                # and emergency-closes the already-filled position. Never raise
-                # here and accidentally make a real fill look like no fill.
-                liquidation_price = liquidation_raw
+            except (TypeError, ValueError, OverflowError) as exc:
+                ambiguous("live position liquidation price is malformed", exc)
+            if not math.isfinite(liquidation_price) or liquidation_price <= 0:
+                ambiguous("live position liquidation price is invalid")
         fill["liquidation_price"] = liquidation_price
         fill["mark_price"] = mark
         return fill
@@ -1616,40 +2104,130 @@ class Exchange:
         the order server-side exactly as the IOC path attaches them, so a
         fill arrives already protected.
         """
-        self.retry(self.x.set_leverage, int(leverage), symbol,
-                   {"mgnMode": "cross"})
-        book = self.retry(self.x.fetch_order_book, symbol, 5)
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
-        if not bids or not asks:
-            raise RuntimeError(f"{symbol} order book has no two-sided depth")
+        # A prior maker attempt may have failed before its crossing fallback
+        # consumed the correlation. Never let that old group attach to this
+        # fresh symbol/attempt; a successfully submitted maker order below
+        # installs its own group for the immediate fallback path.
+        self._clear_pending_entry()
+
+        def block(message: str, *, outcome: str,
+                  cause: Exception | None = None,
+                  audit: dict | None = None):
+            """Clear the hand-off and raise a classified blocking error."""
+            self._clear_pending_entry()
+            details = dict(audit or {}) if isinstance(audit, dict) else {}
+            details.update({"outcome": outcome, "symbol": symbol})
+            error = MakerFirstAmbiguousError(
+                message, details)
+            if cause is None:
+                raise error
+            raise error from cause
+
+        def pre_submit_block(message: str, *, outcome: str,
+                             cause: Exception | None = None):
+            """Reject this attempt without implying an order may exist."""
+            self._clear_pending_entry()
+            error = MakerFirstPreSubmitError(
+                message, {"outcome": outcome, "symbol": symbol})
+            if cause is None:
+                raise error
+            raise error from cause
+
+        try:
+            requested = float(contracts)
+        except (TypeError, ValueError, OverflowError) as exc:
+            pre_submit_block(
+                "maker-first requested contracts are malformed",
+                outcome="invalid_requested_contracts", cause=exc)
+        if not math.isfinite(requested) or requested <= 0:
+            pre_submit_block(
+                "maker-first requested contracts are non-positive or non-finite",
+                outcome="invalid_requested_contracts")
+
+        # Nothing has been submitted yet, but pre-submit errors are still a
+        # hard stop for this attempt.  The engine must not turn an unknown
+        # maker-path failure into an immediate crossing order.
+        try:
+            self.retry(self.x.set_leverage, int(leverage), symbol,
+                       {"mgnMode": "cross"})
+            book = self.retry(self.x.fetch_order_book, symbol, 5)
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            if not bids or not asks:
+                raise RuntimeError(
+                    f"{symbol} order book has no two-sided depth")
+        except (CredentialError, ccxt.AuthenticationError):
+            raise
+        except Exception as exc:                       # noqa: BLE001
+            pre_submit_block(
+                "maker-first pre-submit failure blocks this attempt",
+                outcome="pre_submit_exchange_failure", cause=exc)
 
         # Join the near touch rather than improving it: improving would cross
         # into the spread we are trying to capture.
-        passive = float(bids[0][0]) if side == "buy" else float(asks[0][0])
-        limit = float(self.x.price_to_precision(symbol, passive))
+        try:
+            passive = (float(bids[0][0]) if side == "buy"
+                       else float(asks[0][0]))
+            limit = float(self.x.price_to_precision(symbol, passive))
+            if not math.isfinite(limit) or limit <= 0:
+                raise ValueError("maker-first passive price is invalid")
+        except Exception as exc:                       # noqa: BLE001
+            pre_submit_block(
+                "maker-first passive price is malformed",
+                outcome="invalid_passive_price", cause=exc)
 
-        params = {
-            "tdMode": "cross",
-            "stopLoss": {"triggerPrice":
-                         self.x.price_to_precision(symbol, sl_price)},
-            "takeProfit": {"triggerPrice":
-                           self.x.price_to_precision(symbol, tp_price)},
-            # Post-only: if it would cross, it is rejected rather than
-            # silently becoming the taker order this method exists to avoid.
-            "postOnly": True,
-        }
+        try:
+            params = {
+                "tdMode": "cross",
+                "stopLoss": {"triggerPrice":
+                             self.x.price_to_precision(symbol, sl_price)},
+                "takeProfit": {"triggerPrice":
+                               self.x.price_to_precision(symbol, tp_price)},
+                # Post-only: if it would cross, it is rejected rather than
+                # silently becoming the taker order this method exists to avoid.
+                "postOnly": True,
+            }
+        except (CredentialError, ccxt.AuthenticationError):
+            raise
+        except Exception as exc:                       # noqa: BLE001
+            pre_submit_block(
+                "maker-first protection prices are malformed",
+                outcome="invalid_protection_price", cause=exc)
         # Order creation is deliberately single-shot. A generic retry can
         # submit the same passive order twice after an ambiguous timeout,
         # leaving duplicate exposure when the crossing fallback runs.
-        order = self._create_order_once(
-            symbol, "limit", side, contracts, limit, params, "okxmk")
+        try:
+            order = self._create_order_once(
+                symbol, "limit", side, contracts, limit, params, "okxmk",
+                )
+        except (CredentialError, ccxt.AuthenticationError):
+            self._clear_pending_entry()
+            raise
+        except Exception as exc:                       # noqa: BLE001
+            block("maker-first order submission failed; fallback blocked",
+                  outcome="ambiguous_submit", cause=exc,
+                  audit=getattr(exc, "_order_audit", None))
+        if not isinstance(order, dict):
+            block("maker-first order acknowledgement is not a mapping",
+                  outcome="ambiguous_ack")
         order_id = order.get("id")
         if not order_id:
-            audit = dict(order.get("_submission_audit") or {})
-            recovered = self._recover_order(
-                symbol, str(audit.get("client_order_id") or ""))
+            raw_audit = order.get("_submission_audit")
+            if raw_audit not in (None, "") and not isinstance(raw_audit, dict):
+                block("maker-first order audit is malformed",
+                      outcome="ambiguous_ack")
+            audit = dict(raw_audit or {})
+            try:
+                recovered = self._recover_order(
+                    symbol, str(audit.get("client_order_id") or ""))
+            except Exception as exc:                   # noqa: BLE001
+                block("maker-first order recovery failed; fallback blocked",
+                      outcome="ambiguous_recovery", cause=exc,
+                      audit=getattr(exc, "_order_audit", None))
             if recovered:
+                if not isinstance(recovered, dict):
+                    block("maker-first recovered acknowledgement is malformed",
+                          outcome="ambiguous_recovery")
                 recovered["_submission_audit"] = {
                     **audit, "outcome": "recovered_missing_order_id",
                     "recovery_attempted": True,
@@ -1662,85 +2240,312 @@ class Exchange:
                 "outcome": "ambiguous_unrecovered",
                 "recovery_attempted": True,
             })
-            error = RuntimeError(
-                "maker-first order acknowledgement has no exchange order id")
-            setattr(error, "_order_audit", audit)
-            raise error
+            self._clear_pending_entry()
+            raise MakerFirstAmbiguousError(
+                "maker-first order acknowledgement has no exchange order id",
+                audit)
+        try:
+            order_id = str(order_id).strip()
+        except Exception as exc:                           # noqa: BLE001
+            block("maker-first order id is malformed",
+                  outcome="ambiguous_ack", cause=exc)
+        if not order_id:
+            block("maker-first order acknowledgement has an empty order id",
+                  outcome="ambiguous_ack")
+        maker_audit = order.get("_submission_audit")
+        if maker_audit not in (None, "") and not isinstance(maker_audit, dict):
+            block("maker-first order audit is malformed",
+                  outcome="ambiguous_ack")
+        maker_client_id = self._trimmed_identity(
+            (maker_audit or {}).get("client_order_id"))
 
-        deadline = time.time() + max(0.0, float(wait_seconds))
-        filled = float(order.get("filled") or 0)
-        while time.time() < deadline and filled < contracts:
+        try:
+            wait_value = float(wait_seconds)
+            if not math.isfinite(wait_value) or wait_value < 0:
+                raise ValueError("maker-first wait duration is invalid")
+            reference_value = float(reference_price)
+            if not math.isfinite(reference_value) or reference_value <= 0:
+                raise ValueError("maker-first reference price is invalid")
+            deadline = time.time() + wait_value
+        except (TypeError, ValueError, OverflowError) as exc:
+            block("maker-first wait duration is malformed",
+                  outcome="ambiguous_post_ack", cause=exc)
+
+        def read_number(value, *, label: str, context: str) -> float:
+            if isinstance(value, bool):
+                block(f"maker-first {context} {label} is malformed",
+                      outcome="ambiguous_quantity")
+            try:
+                result = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                block(f"maker-first {context} {label} is malformed",
+                      outcome="ambiguous_quantity", cause=exc)
+            if not math.isfinite(result):
+                block(f"maker-first {context} {label} is not finite",
+                      outcome="ambiguous_quantity")
+            return result
+
+        def order_evidence(value: object, *, context: str,
+                           allow_missing_filled: bool = False):
+            """Return strict cumulative fill evidence from one order read."""
+            if not isinstance(value, dict):
+                block(f"maker-first {context} order state is not a mapping",
+                      outcome="ambiguous_quantity")
+            info = value.get("info")
+            info = info if isinstance(info, dict) else {}
+
+            top_raw = value.get("filled")
+            acc_raw = info.get("accFillSz")
+            last_raw = info.get("fillSz")
+            if top_raw not in (None, ""):
+                filled_value = read_number(
+                    top_raw, label="filled quantity", context=context)
+                fill_source = "filled"
+                # accFillSz is cumulative exchange evidence. If CCXT's
+                # projection disagrees with it, neither is safe to use for a
+                # crossing decision.
+                if acc_raw not in (None, ""):
+                    accumulated = read_number(
+                        acc_raw, label="accumulated fill quantity",
+                        context=context)
+                    if accumulated != filled_value:
+                        block(
+                            f"maker-first {context} fill quantities disagree",
+                            outcome="ambiguous_quantity")
+            elif acc_raw not in (None, ""):
+                filled_value = read_number(
+                    acc_raw, label="accumulated fill quantity",
+                    context=context)
+                fill_source = "info.accFillSz"
+            elif last_raw not in (None, ""):
+                filled_value = read_number(
+                    last_raw, label="fill quantity", context=context)
+                fill_source = "info.fillSz"
+            elif allow_missing_filled:
+                # Only the initial create acknowledgement may provisionally
+                # omit quantity. No terminal/cancel decision uses this zero.
+                filled_value = 0.0
+                fill_source = None
+            else:
+                block(
+                    f"maker-first {context} has no explicit fill quantity",
+                    outcome="ambiguous_quantity")
+
+            if filled_value < 0 or filled_value > requested:
+                block(f"maker-first {context} fill state is invalid",
+                      outcome="ambiguous_quantity")
+
+            remaining_raw = value.get("remaining")
+            if remaining_raw in (None, ""):
+                remaining_raw = info.get("remainSz")
+            if remaining_raw not in (None, ""):
+                remaining = read_number(
+                    remaining_raw, label="remaining quantity",
+                    context=context)
+                if remaining < 0 or remaining > requested:
+                    block(
+                        f"maker-first {context} remaining state is invalid",
+                        outcome="ambiguous_quantity")
+                tolerance = max(1e-12, abs(requested) * 1e-12)
+                if not math.isclose(
+                        filled_value + remaining, requested,
+                        rel_tol=0.0, abs_tol=tolerance):
+                    block(
+                        f"maker-first {context} fill and remaining disagree",
+                        outcome="ambiguous_quantity")
+
+            average_raw = value.get("average")
+            if average_raw in (None, ""):
+                average_raw = info.get("avgPx")
+            if average_raw in (None, ""):
+                average_raw = info.get("fillPx")
+            average_value = None
+            if filled_value > 0:
+                if average_raw in (None, ""):
+                    block(
+                        f"maker-first {context} has no explicit fill average",
+                        outcome="ambiguous_quantity")
+                average_value = read_number(
+                    average_raw, label="fill average", context=context)
+                if average_value <= 0:
+                    block(f"maker-first {context} average is invalid",
+                          outcome="ambiguous_quantity")
+            return filled_value, average_value, fill_source
+
+        def verify_read_identity(value: dict, *, context: str) -> None:
+            candidate = value.get("id")
+            if candidate in (None, ""):
+                block(f"maker-first {context} has no order id",
+                      outcome="ambiguous_order_identity")
+            try:
+                candidate = str(candidate).strip()
+            except Exception as exc:                       # noqa: BLE001
+                block(f"maker-first {context} order id is malformed",
+                      outcome="ambiguous_order_identity", cause=exc)
+            if not candidate or candidate != order_id:
+                block(f"maker-first {context} order id does not match",
+                      outcome="ambiguous_order_identity")
+
+        filled, average, quantity_source = order_evidence(
+            order, context="ack", allow_missing_filled=True)
+        while time.time() < deadline and filled < requested:
             time.sleep(min(1.0, max(0.05, deadline - time.time())))
             try:
-                order = self.retry(self.x.fetch_order, order_id, symbol)
-                filled = float(order.get("filled") or 0)
+                polled = self.retry(self.x.fetch_order, order_id, symbol)
+            except (CredentialError, ccxt.AuthenticationError):
+                self._clear_pending_entry()
+                raise
             except Exception as exc:                       # noqa: BLE001
-                log.warning("maker-first fill poll failed for %s: %s",
-                            symbol, exc)
-                break
+                block("maker-first fill poll failed; fallback blocked",
+                      outcome="ambiguous_post_ack", cause=exc)
+            if not isinstance(polled, dict):
+                block("maker-first fill poll returned a non-mapping",
+                      outcome="ambiguous_post_ack")
+            verify_read_identity(polled, context="poll")
+            order = polled
+            filled, average, quantity_source = order_evidence(
+                order, context="poll")
 
-        cancelled = True
-        if filled < contracts:
+        # A full fill is terminal independently of cancellation. For zero or
+        # partial fills, a successful cancel response is only a request; the
+        # post-cancel read must expose an explicit terminal non-live status.
+        cancelled = False
+        cancel_confirmed = False
+        status = ""
+        if filled < requested:
             try:
                 self.retry(self.x.cancel_order, order_id, symbol)
+            except (CredentialError, ccxt.AuthenticationError):
+                self._clear_pending_entry()
+                raise
             except Exception as exc:                       # noqa: BLE001
-                # The order may have filled in the race. Re-read rather than
-                # assume either way: assuming unfilled would double the
-                # position, assuming filled would leave one unmanaged.
-                cancelled = False
                 log.warning("maker-first cancel failed for %s: %s",
                             symbol, exc)
             try:
-                order = self.retry(self.x.fetch_order, order_id, symbol)
-                filled = float(order.get("filled") or 0)
+                post_cancel = self.retry(self.x.fetch_order, order_id, symbol)
+            except (CredentialError, ccxt.AuthenticationError):
+                self._clear_pending_entry()
+                raise
             except Exception as exc:                       # noqa: BLE001
-                log.warning("maker-first post-cancel read failed for %s: %s",
-                            symbol, exc)
+                block("maker-first post-cancel read failed; fallback blocked",
+                      outcome="ambiguous_cancel_confirmation", cause=exc)
+            if not isinstance(post_cancel, dict):
+                block("maker-first post-cancel read returned a non-mapping",
+                      outcome="ambiguous_cancel_confirmation")
+            verify_read_identity(post_cancel, context="post-cancel")
+            order = post_cancel
+            filled, average, quantity_source = order_evidence(
+                order, context="post-cancel")
+            try:
+                info = order.get("info")
+                info = info if isinstance(info, dict) else {}
+                status = str(order.get("status") or info.get("state")
+                             or "").strip().lower()
+            except Exception as exc:                       # noqa: BLE001
+                block("maker-first cancellation status is malformed",
+                      outcome="ambiguous_cancel_confirmation", cause=exc)
+            terminal = {"canceled", "cancelled", "expired", "rejected"}
+            cancel_confirmed = bool(status in terminal)
+            cancelled = bool(filled < requested and cancel_confirmed)
+        if filled >= requested:
+            # A race can turn a partial/zero state into a full fill while the
+            # cancel is in flight. Full fill remains terminal and is settled.
+            filled = requested
+            cancelled = False
+            cancel_confirmed = False
 
         # A passive fill is a position, so it goes through exactly the same
-        # verification an IOC fill does - live position read, protection
-        # audit, mark and liquidation prices. Skipping it would leave the
-        # engine believing a position is protected without anything having
-        # checked.
+        # verification an IOC fill does. Settlement failures are an ambiguity
+        # boundary and can never leak a fallback hand-off.
         settled = None
-        if filled > 0:
-            settled = self.settle_fill(
-                {"filled": float(filled),
-                 "average": float(order.get("average") or limit),
-                 "requested": float(contracts),
-                 "partial": float(filled) < float(contracts),
-                 "order_id": order_id,
-                 "client_order_id": (order.get("clientOrderId")
-                                     or (order.get("info") or {}).get(
-                                         "clOrdId")),
-                 "status": order.get("status"),
-                 "fee_usd": 0.0, "slippage_usd": 0.0,
-                 "submission_audit": {"path": "maker_first"}},
-                symbol, side, contracts, sl_price, tp_price)
+        if filled > 0 and (filled >= requested or cancelled):
+            self._clear_pending_entry()
+            if not maker_client_id:
+                block("maker-first filled request has no client order identity",
+                      outcome="ambiguous_settlement")
+            try:
+                settled = self.settle_fill(
+                    {"symbol": symbol,
+                     "filled": float(filled),
+                     "average": average,
+                     "requested": requested,
+                     "partial": float(filled) < requested,
+                     "order_id": order_id,
+                     "client_order_id": (order.get("clientOrderId")
+                                         or ((order.get("info") or {}).get(
+                                             "clOrdId")
+                                             if isinstance(order.get("info"),
+                                                           dict) else None)
+                                         or maker_client_id),
+                     "status": order.get("status"),
+                     "fee_usd": 0.0, "slippage_usd": 0.0,
+                     "submission_audit": {"path": "maker_first"}},
+                    symbol, side, requested, sl_price, tp_price)
+            except (CredentialError, ccxt.AuthenticationError) as exc:
+                setattr(exc, "_order_audit", {
+                    "outcome": "ambiguous_settlement",
+                    "symbol": symbol,
+                    "order_id": order_id,
+                })
+                raise
+            except (JournalError, OrderSubmissionAmbiguousError):
+                raise
+            except Exception as exc:                       # noqa: BLE001
+                block("maker-first settlement failed; fallback blocked",
+                      outcome="ambiguous_settlement", cause=exc)
+            if not isinstance(settled, dict):
+                block("maker-first settlement returned a non-mapping",
+                      outcome="ambiguous_settlement")
+        elif filled > 0:
+            # A partial order whose cancellation is not proven may still be
+            # live or may race into another fill. Do not treat it as a normal
+            # completed entry; reconciliation owns any later position read.
+            self._clear_pending_entry()
 
-        average = order.get("average") or (limit if filled else None)
+        # The hand-off is deliberately installed at the last possible point:
+        # only an explicit zero-fill and an explicit terminal cancellation can
+        # authorize the crossing fallback. Partial and full fills always clear
+        # it, even when a partial was confirmed cancelled.
+        self._clear_pending_entry()
+
         slippage_saved_pct = None
-        if average and reference_price:
-            realised = float(average)
-            direction = 1.0 if side == "buy" else -1.0
-            # Positive means the passive fill beat the reference.
-            slippage_saved_pct = round(
-                direction * (reference_price - realised)
-                / reference_price * 100, 6)
+        if average is not None and reference_price:
+            try:
+                direction = 1.0 if side == "buy" else -1.0
+                # Positive means the passive fill beat the reference.
+                slippage_saved_pct = round(
+                    direction * (reference_value - average)
+                    / reference_value * 100, 6)
+            except Exception as exc:                       # noqa: BLE001
+                block("maker-first counterfactual is malformed",
+                      outcome="ambiguous_post_ack", cause=exc)
 
         return {
+            "symbol": symbol,
             "order_id": order_id,
-            "requested_contracts": float(contracts),
+            "requested_contracts": requested,
             "filled_contracts": float(filled),
-            "fill_rate": (float(filled) / float(contracts)
-                          if contracts else 0.0),
+            "fill_rate": (float(filled) / requested if requested else 0.0),
             "limit_price": limit,
-            "average_price": float(average) if average else None,
-            "reference_price": float(reference_price),
+            "average_price": average,
+            "reference_price": reference_value,
             "ioc_counterfactual_pct": slippage_saved_pct,
-            "wait_seconds": float(wait_seconds),
+            "wait_seconds": wait_value,
             "cancelled": cancelled,
-            "resting": bool(not cancelled and filled < contracts),
+            "resting": bool(filled < requested and not cancelled),
+            "blocking": bool(filled < requested and not cancelled),
+            "cancellation_status": status or None,
+            "cancellation_confirmed": bool(cancel_confirmed),
+            "cancellation_order_id": (
+                order_id if cancel_confirmed else None),
+            "quantity_evidence": quantity_source,
+            "blocking_reason": (
+                None if (filled >= requested or cancelled)
+                else "cancel_confirmation_uncertain"),
+            "submission_audit": (
+                None if (filled >= requested or cancelled)
+                else {"outcome": "ambiguous_cancel_confirmation",
+                      "symbol": symbol}),
             # The settled fill, shaped exactly like open_position's return so
             # the engine's own post-fill bookkeeping can consume it unchanged.
             # None when nothing filled, which is the ordinary outcome.
@@ -1751,6 +2556,10 @@ class Exchange:
                       leverage: float, sl_price: float, tp_price: float,
                       expected_price: float | None = None,
                       entry_limit_price: float | None = None) -> dict:
+        # Consume the maker hand-off at absolute method entry.  Leverage,
+        # precision and request construction can all raise; none of those
+        # failures may let a one-shot group leak into a later symbol/attempt.
+        self._clear_pending_entry()
         try:
             self.retry(self.x.set_leverage, int(leverage), symbol,
                        {"mgnMode": "cross"})
@@ -1788,11 +2597,104 @@ class Exchange:
         return self.settle_fill(
             fill, symbol, side, contracts, sl_price, tp_price)
 
+    @classmethod
+    def _validated_close_execution(cls, execution: object,
+                                   requested: object,
+                                   symbol: str) -> dict:
+        """Return a close result only when its quantity proof is exact."""
+        audit = {}
+        if isinstance(execution, dict):
+            raw_audit = execution.get("submission_audit")
+            if isinstance(raw_audit, dict):
+                audit.update(raw_audit)
+            audit.update({
+                "order_id": execution.get("order_id"),
+                "last_fill_status": execution.get("status"),
+                "outcome": "close_result_ambiguous",
+            })
+
+        def fail(message: str):
+            raise OrderSubmissionAmbiguousError(
+                f"close result for {symbol} is ambiguous: {message}", audit)
+
+        if not isinstance(execution, dict):
+            fail("result is not structured")
+        for key in ("order_id", "client_order_id"):
+            identity = cls._trimmed_identity(execution.get(key))
+            if not identity:
+                fail(f"{key} is missing or malformed")
+            execution[key] = identity
+        status = execution.get("status")
+        if not isinstance(status, str) or not status.strip():
+            fail("status is missing or malformed")
+        execution["status"] = status.strip().lower()
+        if isinstance(requested, bool):
+            fail("requested contracts are malformed")
+        try:
+            requested_value = float(requested)
+        except (TypeError, ValueError, OverflowError):
+            fail("requested contracts are malformed")
+        if not math.isfinite(requested_value) or requested_value <= 0:
+            fail("requested contracts are not positive and finite")
+        for key in ("filled", "average", "remaining_contracts"):
+            raw = execution.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                fail(f"{key} is missing or malformed")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                fail(f"{key} is malformed")
+            if not math.isfinite(value):
+                fail(f"{key} is not finite")
+            execution[key] = value
+        filled = execution["filled"]
+        average = execution["average"]
+        remaining = execution["remaining_contracts"]
+        tolerance = max(1e-12, requested_value * 1e-6)
+        if filled <= 0 or filled > requested_value + tolerance:
+            fail("filled contracts are outside the requested close")
+        if average <= 0:
+            fail("average price is not positive")
+        if remaining < 0 or remaining > requested_value + tolerance:
+            fail("remaining contracts are outside the original position")
+        if abs(filled + remaining - requested_value) > tolerance:
+            fail("filled and remaining contracts disagree with the request")
+        fully_closed = execution.get("fully_closed")
+        if not isinstance(fully_closed, bool):
+            fail("fully_closed is not an exact boolean")
+        expected_closed = remaining <= tolerance
+        if fully_closed is not expected_closed:
+            fail("fully_closed conflicts with remaining contracts")
+        for key in ("fee_usd", "slippage_usd", "adverse_slippage_usd"):
+            raw = execution.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                fail(f"{key} is missing or malformed")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                fail(f"{key} is malformed")
+            if not math.isfinite(value):
+                fail(f"{key} is not finite")
+            execution[key] = value
+        execution["requested"] = requested_value
+        return execution
+
     def close_position(self, pos: dict) -> dict:
         symbol = pos["symbol"]
-        contracts = abs(float(pos.get("contracts") or 0))
-        if contracts <= 0:
-            return None
+        raw_contracts = pos.get("contracts")
+        if isinstance(raw_contracts, bool):
+            raise OrderSubmissionAmbiguousError(
+                f"close position contracts for {symbol} are malformed")
+        try:
+            contracts = abs(float(raw_contracts))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise OrderSubmissionAmbiguousError(
+                f"close position contracts for {symbol} are malformed"
+            ) from exc
+        if not math.isfinite(contracts) or contracts <= 0:
+            raise OrderSubmissionAmbiguousError(
+                f"close position contracts for {symbol} are not positive "
+                "and finite")
         position_side = str(pos.get("side") or "").lower()
         if position_side not in {"long", "short"}:
             raw = float((pos.get("info") or {}).get("pos") or 0)
@@ -1815,12 +2717,77 @@ class Exchange:
             order, symbol, contracts,
             float(pos.get("markPrice") or pos.get("last") or 0) or None,
             side=side)
-        remaining = self.position(symbol, position_side)
-        remaining_contracts = abs(float((remaining or {}).get("contracts") or 0))
+        try:
+            remaining = self.position(symbol, position_side)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            audit = dict(result.get("submission_audit") or {})
+            audit.update({
+                "order_id": result.get("order_id"),
+                "last_fill_status": result.get("status"),
+                "outcome": "close_position_read_ambiguous",
+            })
+            raise OrderSubmissionAmbiguousError(
+                f"close fill for {symbol} was verified but the remaining "
+                f"position could not be read: {exc}", audit) from exc
+        if remaining is not None and not isinstance(remaining, dict):
+            audit = dict(result.get("submission_audit") or {})
+            audit.update({
+                "order_id": result.get("order_id"),
+                "last_fill_status": result.get("status"),
+                "outcome": "close_position_read_ambiguous",
+            })
+            raise OrderSubmissionAmbiguousError(
+                f"close fill for {symbol} was verified but the remaining "
+                "position response was malformed", audit)
+        if remaining is None:
+            remaining_raw = 0
+        elif "contracts" not in remaining:
+            remaining_raw = float("nan")
+        else:
+            remaining_symbol = self._trimmed_identity(remaining.get("symbol"))
+            if remaining_symbol and remaining_symbol != symbol:
+                remaining_raw = float("nan")
+            else:
+                remaining_raw = remaining.get("contracts")
+        if isinstance(remaining_raw, bool):
+            remaining_raw = float("nan")
+        try:
+            remaining_contracts = abs(float(remaining_raw))
+        except (TypeError, ValueError, OverflowError):
+            remaining_contracts = float("nan")
+        if not math.isfinite(remaining_contracts):
+            audit = dict(result.get("submission_audit") or {})
+            audit.update({
+                "order_id": result.get("order_id"),
+                "last_fill_status": result.get("status"),
+                "outcome": "close_position_read_ambiguous",
+            })
+            raise OrderSubmissionAmbiguousError(
+                f"close fill for {symbol} was verified but remaining "
+                "contracts were malformed", audit)
         result["fully_closed"] = remaining_contracts <= max(1e-12, contracts * 1e-6)
         result["remaining_contracts"] = remaining_contracts
+        result = self._validated_close_execution(result, contracts, symbol)
         if result["fully_closed"]:
-            if not any(p.get("symbol") == symbol for p in self.positions()):
+            try:
+                positions = self.positions()
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
+            except Exception as exc:
+                audit = dict(result.get("submission_audit") or {})
+                audit.update({
+                    "order_id": result.get("order_id"),
+                    "last_fill_status": result.get("status"),
+                    "outcome": "close_account_read_ambiguous",
+                })
+                raise OrderSubmissionAmbiguousError(
+                    f"close fill for {symbol} was verified but account "
+                    f"positions could not be reconciled: {exc}", audit) from exc
+            if not any(p.get("symbol") == symbol for p in positions):
                 self.cancel_symbol(symbol)
         else:
             log.error("close for %s left %s contracts; protection retained",
@@ -1836,8 +2803,14 @@ class Exchange:
             for o in self.retry(self.x.fetch_open_orders, symbol) or []:
                 try:
                     self.x.cancel_order(o["id"], symbol)
+                except (CredentialError, ccxt.AuthenticationError,
+                        JournalError, OrderSubmissionAmbiguousError):
+                    raise
                 except Exception as e:
                     log.warning("cancel %s: %s", o.get("id"), e)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
         except Exception as e:
             log.debug("fetch_open_orders(%s): %s", symbol, e)
         for order_type in ALL_ALGO_TYPES:
@@ -1849,8 +2822,14 @@ class Exchange:
                 for o in algos:
                     try:
                         self.x.cancel_order(o["id"], symbol, cancel_params)
+                    except (CredentialError, ccxt.AuthenticationError,
+                            JournalError, OrderSubmissionAmbiguousError):
+                        raise
                     except Exception as e:
                         log.warning("cancel algo %s: %s", o.get("id"), e)
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
             except Exception:
                 continue
 
@@ -1861,9 +2840,15 @@ class Exchange:
             for o in self.retry(self.x.fetch_open_orders) or []:
                 try:
                     self.x.cancel_order(o["id"], o.get("symbol"))
+                except (CredentialError, ccxt.AuthenticationError,
+                        JournalError, OrderSubmissionAmbiguousError):
+                    raise
                 except Exception as e:
                     log.warning("cancel %s: %s", o.get("id"), e)
                     failures.append(f"{o.get('id')}: {e}")
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
         except Exception as e:
             failures.append(f"regular-order query: {e}")
         for order_type in ALL_ALGO_TYPES:
@@ -1876,9 +2861,15 @@ class Exchange:
                     try:
                         self.x.cancel_order(
                             o["id"], o.get("symbol"), cancel_params)
+                    except (CredentialError, ccxt.AuthenticationError,
+                            JournalError, OrderSubmissionAmbiguousError):
+                        raise
                     except Exception as e:
                         log.warning("cancel algo %s: %s", o.get("id"), e)
                         failures.append(f"algo {o.get('id')}: {e}")
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
             except Exception as exc:
                 failures.append(f"{order_type}-order query: {exc}")
 
@@ -1886,6 +2877,9 @@ class Exchange:
         remaining = []
         try:
             remaining.extend(self.retry(self.x.fetch_open_orders) or [])
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
         except Exception as exc:
             failures.append(f"regular-order verification: {exc}")
         for order_type in ALL_ALGO_TYPES:
@@ -1893,6 +2887,9 @@ class Exchange:
                 rows = self.x.fetch_open_orders(
                     None, None, None, {"ordType": order_type}) or []
                 remaining.extend(rows)
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
             except Exception as exc:
                 failures.append(f"{order_type}-order verification: {exc}")
         remaining_ids = sorted({str(order.get("id") or "unknown")
@@ -1908,48 +2905,129 @@ class Exchange:
                                 direction: str, entry_price: float,
                                 quantity: float) -> dict:
         """Recover actual close price, fees, funding and PnL after SL/TP exit."""
+        def finite_number(value: object, *, positive: bool = False):
+            if value in (None, "") or isinstance(value, bool):
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(number) or (positive and number <= 0):
+                return None
+            return number
+
         if self.x.has.get("fetchPositionsHistory"):
             try:
                 rows = self.retry(self.x.fetch_positions_history,
                                   [symbol], since_ms, 100) or []
-                rows = [r for r in rows if r.get("symbol") == symbol]
-                if rows:
-                    row = max(rows, key=lambda r: int(r.get("timestamp") or 0))
-                    info = row.get("info") or {}
-                    realized = float(row.get("realizedPnl")
-                                     or info.get("realizedPnl") or 0)
-                    fee_raw = float(info.get("fee") or 0)
-                    funding = float(info.get("fundingFee") or 0)
-                    price = float(row.get("exitPrice") or info.get("closeAvgPx")
-                                  or info.get("avgPx") or 0)
-                    qty = abs(float(info.get("closeTotalPos") or quantity))
+                valid_rows = []
+                for row in rows:
+                    if not isinstance(row, dict) or row.get("symbol") != symbol:
+                        continue
+                    info = row.get("info")
+                    if info not in (None, "") and not isinstance(info, dict):
+                        continue
+                    info = info or {}
+                    price = finite_number(
+                        row.get("exitPrice")
+                        if row.get("exitPrice") not in (None, "")
+                        else info.get("closeAvgPx")
+                        if info.get("closeAvgPx") not in (None, "")
+                        else info.get("avgPx"), positive=True)
+                    qty = finite_number(info.get("closeTotalPos"), positive=True)
+                    if price is None or qty is None:
+                        continue
+                    realized = finite_number(
+                        row.get("realizedPnl")
+                        if row.get("realizedPnl") not in (None, "")
+                        else info.get("realizedPnl"))
+                    fee_raw = finite_number(info.get("fee"))
+                    funding = finite_number(info.get("fundingFee"))
+                    if realized is None:
+                        realized = 0.0
+                    if fee_raw is None:
+                        fee_raw = 0.0
+                    if funding is None:
+                        funding = 0.0
+                    timestamp = finite_number(row.get("timestamp")) or 0.0
+                    valid_rows.append((timestamp, price, qty, realized,
+                                       fee_raw, funding))
+                if valid_rows:
+                    _, price, qty, realized, fee_raw, funding = max(
+                        valid_rows, key=lambda item: item[0])
                     return {
+                        "symbol": symbol,
                         "price": price,
-                        "qty": qty,
+                        "qty": abs(qty),
                         "fee_usd": abs(fee_raw),
                         "funding_usd": funding,
                         "realized_pnl_usd": realized,
                         "status": "position_history",
                     }
+            except (CredentialError, ccxt.AuthenticationError, JournalError,
+                    OrderSubmissionAmbiguousError):
+                raise
             except Exception as exc:
                 log.warning("position history reconciliation failed for %s: %s",
                             symbol, exc)
 
         try:
             fills = self.retry(self.x.fetch_my_trades, symbol, since_ms, 100) or []
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
         except Exception as exc:
             raise RuntimeError(f"could not fetch closing fills for {symbol}: {exc}")
         close_side = "sell" if direction == "long" else "buy"
-        closing = [f for f in fills if f.get("side") == close_side]
+        closing = []
+        for fill in fills:
+            if (not isinstance(fill, dict) or fill.get("symbol") != symbol
+                    or fill.get("side") != close_side):
+                continue
+            amount = finite_number(fill.get("amount"), positive=True)
+            price = finite_number(fill.get("price"), positive=True)
+            info = fill.get("info")
+            if info not in (None, "") and not isinstance(info, dict):
+                continue
+            if amount is None or price is None:
+                continue
+            closing.append((fill, amount, price, info or {}))
         if not closing:
-            raise RuntimeError(f"no closing fills found for {symbol}")
-        qty = sum(abs(float(f.get("amount") or 0)) for f in closing)
-        cost = sum(abs(float(f.get("amount") or 0))
-                   * float(f.get("price") or 0) for f in closing)
-        price = cost / qty if qty else 0.0
-        fee = sum(self._fee_usd(f) for f in closing)
-        pnl = sum(float((f.get("info") or {}).get("fillPnl") or 0)
-                  for f in closing)
+            raise OrderSubmissionAmbiguousError(
+                f"no valid closing fills found yet for {symbol}",
+                {"symbol": symbol, "outcome": "close_history_unresolved"})
+        qty = sum(amount for _, amount, _, _ in closing)
+        cost = sum(amount * fill_price
+                   for _, amount, fill_price, _ in closing)
+        if not math.isfinite(qty) or qty <= 0 \
+                or not math.isfinite(cost) or cost <= 0:
+            raise OrderSubmissionAmbiguousError(
+                f"closing fill quantity/price is invalid for {symbol}",
+                {"symbol": symbol, "outcome": "close_history_unresolved"})
+        price = cost / qty
+        try:
+            fee = sum(self._fee_usd(fill)
+                      for fill, _, _, _ in closing)
+        except (CredentialError, ccxt.AuthenticationError, JournalError,
+                OrderSubmissionAmbiguousError):
+            raise
+        except Exception as exc:
+            raise OrderSubmissionAmbiguousError(
+                f"closing fill fee metadata is invalid for {symbol}",
+                {"symbol": symbol, "outcome": "close_history_unresolved"}
+            ) from exc
+        pnl = 0.0
+        for _, _, _, info in closing:
+            raw_pnl = info.get("fillPnl")
+            if raw_pnl in (None, ""):
+                continue
+            value = finite_number(raw_pnl)
+            if value is None:
+                raise OrderSubmissionAmbiguousError(
+                    f"closing fill PnL metadata is invalid for {symbol}",
+                    {"symbol": symbol,
+                     "outcome": "close_history_unresolved"})
+            pnl += value
         if pnl == 0 and entry_price > 0:
             contract_size = float(self.x.market(symbol).get("contractSize") or 1)
             move = price - entry_price
@@ -1962,6 +3040,7 @@ class Exchange:
         if funding is not None:
             pnl += funding
         return {
+            "symbol": symbol,
             "price": price,
             "qty": qty,
             "fee_usd": fee,

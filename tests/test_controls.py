@@ -8,9 +8,11 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import ccxt
 import main
 from agent import state
 from agent.engine import Engine
+from agent.exchange import CredentialError, OrderSubmissionAmbiguousError
 from tests.helpers import valid_config
 
 
@@ -174,6 +176,27 @@ class KillSemanticsTests(unittest.TestCase):
         self.assertEqual(engine.alerts.send.call_args.args[1],
                          "journal_failure_stop")
 
+    @patch("agent.engine.state.log_run")
+    @patch("agent.engine.state.set_state")
+    @patch("agent.engine.state.load_state")
+    def test_keyboard_interrupt_persists_operator_pause(
+            self, load_state, set_state, log_run):
+        load_state.return_value = {
+            "state": state.RUNNING, "kill_reason": None,
+            "flatten_on_kill": True, "operator_pause": False,
+        }
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.alerts = Mock()
+        engine.ex = Mock()
+        engine.shadow = None
+        engine.cycle = Mock(side_effect=KeyboardInterrupt)
+
+        engine.run(run_lock=object())
+
+        set_state.assert_called_once_with(
+            state.PAUSED, operator_pause=True)
+
     @patch("agent.engine.state.load_state", return_value={"state": state.KILLED})
     @patch("agent.engine.state.log_equity")
     @patch("agent.engine.state.commit")
@@ -211,6 +234,30 @@ class KillSemanticsTests(unittest.TestCase):
             engine.cycle(st)
 
         self.assertIn("max drawdown", commit.call_args_list[-1].kwargs["kill"])
+
+    def test_cycle_rethrows_typed_reconciliation_boundaries(self):
+        errors = (
+            CredentialError("bad credentials"),
+            ccxt.AuthenticationError("bad credentials"),
+            state.JournalError("journal unavailable"),
+            OrderSubmissionAmbiguousError("reconciliation unresolved"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                engine = Engine.__new__(Engine)
+                engine.cfg = valid_config()
+                engine.alerts = Mock()
+                engine.ex = Mock()
+                engine.ex.equity_usdt.return_value = 100
+                engine.ex.positions.return_value = []
+                engine._ensure_equity_basis = Mock(return_value=False)
+                engine._reconcile_positions = Mock(side_effect=error)
+                engine._startup_reconciled = False
+                st = {"state": state.RUNNING, "active_trades": {},
+                      "protection": {}, "opened_at": {}, "cooldowns": {}}
+
+                with self.assertRaises(type(error)):
+                    engine.cycle(st)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ PAUSED = "PAUSED"            # housekeeping only: no LLM calls, no new entries
 DAY_STOPPED = "DAY_STOPPED"  # daily loss limit hit: model may close, cannot open
 KILLED = "KILLED"            # terminal: flatten everything and exit
 EQUITY_BASIS = "usdt_currency_equity_v1"
-JOURNAL_SCHEMA_VERSION = 4
+JOURNAL_SCHEMA_VERSION = 5
 
 _JOURNAL_CONTEXT: dict[str, object] = {}
 
@@ -569,9 +569,11 @@ def save_state(st: dict) -> None:
 def set_state(name: str, reason: str | None = None, **extra) -> dict:
     with _state_lock():
         st = _load_state_unlocked()
-        st["state"] = name
-        if reason is not None:
-            st["kill_reason"] = reason
+        killed_wins = st.get("state") == KILLED and name == PAUSED
+        if not killed_wins:
+            st["state"] = name
+            if reason is not None:
+                st["kill_reason"] = reason
         st.update(extra)
         _write_atomic(_validate(st))
         return st
@@ -805,6 +807,28 @@ def experiment_fingerprint(cfg: dict) -> str:
     return stable_fingerprint(experiment_fingerprint_material(cfg))
 
 
+def deployment_fingerprint_material(cfg: dict) -> dict:
+    """Return executable deployment inputs with mode normalized to live.
+
+    A reviewed packet is commonly produced from demo evidence, while the
+    process that consumes it must run against live capital.  Mode is the one
+    intentional difference between those configurations; every other
+    decision-making input must match exactly.
+    """
+    material = experiment_fingerprint_material(cfg)
+    material["mode"] = "live"
+    return material
+
+
+def deployment_config_hash(cfg: dict) -> str:
+    """Return the full SHA-256 identity required by a live artifact gate."""
+    encoded = json.dumps(
+        deployment_fingerprint_material(cfg), sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def strategy_fingerprint(cfg: dict) -> str:
     """Compatibility name for the executable experiment fingerprint.
 
@@ -846,7 +870,10 @@ def set_journal_context(**context: object) -> dict:
         "prompt_version", "config_version", "code_version",
         "equity_basis_id", "runtime_mode", "account_fingerprint",
         # Variant attribution uses readable IDs rather than whole-config hashes.
-        "variant_id", "strategy_config_version",
+        "variant_id", "strategy_config_version", "packet_id", "packet_hash",
+        "artifact_hash", "artifact_variant_id",
+        "artifact_variant_definition_hash", "artifact_strategy_config_version",
+        "deployment_config_hash",
     }
     unknown = set(context) - allowed
     if unknown:
@@ -947,10 +974,18 @@ def _db() -> sqlite3.Connection:
         "run_id TEXT PRIMARY KEY, started_ts REAL, mode TEXT, "
         "strategy_id TEXT, strategy_version TEXT, model TEXT, "
         "prompt_version TEXT, config_version TEXT, code_version TEXT, "
-        "account_fingerprint TEXT)"
+        "account_fingerprint TEXT, packet_id TEXT, packet_hash TEXT, "
+        "artifact_hash TEXT, "
+        "artifact_variant_id TEXT, artifact_variant_definition_hash TEXT, "
+        "artifact_strategy_config_version TEXT, deployment_config_hash TEXT)"
     )
     _ensure_columns(conn, "runs", {
         "account_fingerprint": "TEXT",
+        "packet_id": "TEXT", "packet_hash": "TEXT", "artifact_hash": "TEXT",
+        "artifact_variant_id": "TEXT",
+        "artifact_variant_definition_hash": "TEXT",
+        "artifact_strategy_config_version": "TEXT",
+        "deployment_config_hash": "TEXT",
     })
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_meta ("
@@ -991,7 +1026,14 @@ def check_journal() -> None:
 
 def log_run(run_id: str, *, mode: str, strategy_id: str,
             strategy_version: str, model: str, prompt_version: str,
-            config_version: str, code_version: str) -> None:
+            config_version: str, code_version: str,
+            packet_id: str | None = None,
+            packet_hash: str | None = None,
+            artifact_hash: str | None = None,
+            artifact_variant_id: str | None = None,
+            artifact_variant_definition_hash: str | None = None,
+            artifact_strategy_config_version: str | None = None,
+            deployment_config_hash: str | None = None) -> None:
     context = journal_context()
     try:
         with _db() as c:
@@ -999,10 +1041,22 @@ def log_run(run_id: str, *, mode: str, strategy_id: str,
                 "INSERT OR IGNORE INTO runs ("
                 "run_id, started_ts, mode, strategy_id, strategy_version, "
                 "model, prompt_version, config_version, code_version, "
-                "account_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "account_fingerprint, packet_id, packet_hash, artifact_hash, "
+                "artifact_variant_id, artifact_variant_definition_hash, "
+                "artifact_strategy_config_version, deployment_config_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, time.time(), mode, strategy_id, strategy_version,
                  model, prompt_version, config_version, code_version,
-                 context.get("account_fingerprint")),
+                 context.get("account_fingerprint"),
+                 packet_id or context.get("packet_id"),
+                 packet_hash or context.get("packet_hash"),
+                 artifact_hash or context.get("artifact_hash"),
+                 artifact_variant_id or context.get("artifact_variant_id"),
+                 artifact_variant_definition_hash
+                 or context.get("artifact_variant_definition_hash"),
+                 artifact_strategy_config_version
+                 or context.get("artifact_strategy_config_version"),
+                 deployment_config_hash or context.get("deployment_config_hash")),
             )
     except Exception as exc:
         log.critical("run journal write failed: %s", exc)

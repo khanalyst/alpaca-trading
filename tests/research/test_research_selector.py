@@ -56,6 +56,22 @@ def parsed_selection(strategy_id, variant_id=None, reasoning=None, **extra):
 
 
 class ResearchSelectorPromptAndParserTests(unittest.TestCase):
+    def test_empty_captured_catalog_is_not_reloaded(self):
+        existing = variants.research_selection_catalog()["momentum"][0]
+        parsed = brain.parse_decisions(json.dumps({
+            "decisions": [],
+            "research_selection": {
+                "strategy_id": "momentum",
+                "variant_id": existing["variant_id"],
+                "reasoning": (
+                    "Use this registered setting for the next research "
+                    "window."),
+            },
+        }), research_catalog={})
+
+        self.assertEqual(parsed[-1]["validation_status"], "REJECTED")
+        self.assertIn("not registered", parsed[-1]["rejection_reason"])
+
     def test_scalp_maker_penetration_axis_has_baseline_and_two_falsifiers(self):
         catalog = variants.research_selection_catalog()
         axis = "execution.paper_maker_fill_penetration_bps"

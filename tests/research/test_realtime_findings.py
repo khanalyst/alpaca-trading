@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agent import shadow, state, variants
-from research import corpus, findings, protocol, replay
+from agent import brain, shadow, state, variants
+from research import artifact, corpus, findings, protocol, replay
 from tests.helpers import valid_config
 from tests.research.test_enrichment_isolation import (execution_enriched,
                                                       symbol_snapshot)
@@ -1157,6 +1157,9 @@ class QualificationAndPacketTests(StoreFixture):
                                 "family_analysis_id": self.family_analysis_id,
                                 "axis": ["strategy.fixed_reward_risk"]},
             source_analysis_id=analysis_id, scope_key=scope)
+        from agent import state as runtime_state
+        base_strategy_config_version = runtime_state.strategy_fingerprint(
+            valid_config())
         state, version = self.store.load_paper_portfolio(
             scope, self.v.variant_id, now=9)
         state["status"] = "PAPER"
@@ -1206,6 +1209,43 @@ class QualificationAndPacketTests(StoreFixture):
                     :result, :net_pnl_usd, :r_multiple, 'CLOSED')
             """, rows)
         analysis = self.store.analysis(analysis_id)
+        candidate_provenance = (
+            analysis["payload"]["source_evidence"]["eligibility"]
+            ["setting_provenances"][self.v.variant_id])
+        prompt_catalog = variants.research_selection_catalog()
+        prompt_config = candidate_provenance["experiment_config"]
+        manifest, artifact_hash = artifact.build_manifest(
+            strategy_id="momentum",
+            strategy_version=self.v.base_version,
+            variant_id=self.v.variant_id,
+            variant_definition_hash=findings.variant_identity_hash(self.v),
+            variant_definition={
+                "variant_id": self.v.variant_id,
+                "strategy_id": self.v.strategy_id,
+                "base_version": self.v.base_version,
+                "overrides": self.v.overrides,
+                "hypothesis": self.v.hypothesis,
+                "hypothesis_id": self.v.hypothesis_id or "",
+                "hypothesis_params": self.v.hypothesis_params,
+            },
+            config=candidate_provenance["experiment_config"],
+            strategy_config_version=candidate_provenance[
+                "strategy_config_version"],
+            forward_model_id=candidate_provenance["forward_model_id"],
+            forward_model_assumptions_hash=candidate_provenance[
+                "forward_model_assumptions_hash"],
+            prompt_hash=artifact.sha256_text(
+                brain.build_system(prompt_config, catalog=prompt_catalog)),
+            llm_provider=prompt_config["llm"]["provider"],
+            llm_model=prompt_config["llm"]["model"],
+            prompt_inputs_hash=artifact.sha256_json({
+                "catalog": prompt_catalog,
+                "strategy": prompt_config["strategy"],
+            }),
+            deployment_config_hash=runtime_state.deployment_config_hash(
+                candidate_provenance["experiment_config"]),
+            root=research_cli.REPO,
+        )
         assignment_ids = research_cli._forward_assignment_ids(
             analysis, self.v.variant_id)
         edge_candidates = [
@@ -1217,7 +1257,8 @@ class QualificationAndPacketTests(StoreFixture):
             "scope_key": scope,
             "checklist": self.complete_checklist(),
             "g2": {
-                "status": "PASS", "strategy_config_version": "cfg",
+                "status": "PASS", "strategy_config_version":
+                    base_strategy_config_version,
                 "fidelity_code_version": "fidelity"},
             "qualification": self.store.qualification_status(
                 self.v.variant_id, scope),
@@ -1226,9 +1267,24 @@ class QualificationAndPacketTests(StoreFixture):
             "paper_result": self.store.paper_summary(
                 scope, self.v.variant_id),
             "current_provenance": {
-                "strategy_config_version": "cfg",
+                "strategy_config_version": base_strategy_config_version,
+                "artifact_strategy_config_version": manifest[
+                    "strategy_config_version"],
                 "code_version": "code",
-                "fidelity_code_version": "fidelity"},
+                "fidelity_code_version": "fidelity",
+                "validated_config_hash": manifest[
+                    "validated_config_hash"],
+                "runtime_source_hash": manifest["runtime_source_hash"],
+                "variant_definition_hash": manifest[
+                    "variant_definition_hash"],
+                "forward_model_id": manifest["forward_model_id"],
+                "forward_model_assumptions_hash": manifest[
+                    "forward_model_assumptions_hash"],
+                "deployment_config_hash": manifest["deployment_config_hash"],
+                "llm_endpoint": manifest["llm_endpoint"],
+                "llm_endpoint_hash": manifest["llm_endpoint_hash"]},
+            "artifact_manifest": manifest,
+            "artifact_hash": artifact_hash,
         }
 
     def test_qualification_is_scope_specific_and_append_only(self):
@@ -1437,6 +1493,118 @@ class QualificationAndPacketTests(StoreFixture):
 
         self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
 
+    def test_forged_or_stale_artifact_never_yields_reviewed(self):
+        baseline_payload = self.complete_payload()
+        for field, value in (
+                ("validated_config_hash", "f" * 64),
+                ("strategy_id", "other-strategy"),
+                ("forward_model_id", "other-model"),
+                ("runtime_source_hash", "0" * 64)):
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(baseline_payload))
+                manifest = dict(payload["artifact_manifest"])
+                manifest[field] = value
+                manifest["artifact_hash"] = artifact.artifact_sha256(manifest)
+                payload["artifact_manifest"] = manifest
+                payload["artifact_hash"] = manifest["artifact_hash"]
+                packet_id = self.store.create_t3_packet(
+                    self.v.variant_id, payload, reviewed_by="reviewer",
+                    registry_change_ref="change-forged")
+                packet = next(
+                    row for row in self.store.t3_packets_for(self.v.variant_id)
+                    if row["packet_id"] == packet_id)
+                self.assertEqual(packet["review_status"],
+                                 "DRAFT_REVIEW_REQUIRED")
+
+    def test_persisted_candidate_config_mismatch_blocks_review(self):
+        payload = self.complete_payload()
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT state_json FROM paper_portfolios WHERE scope_key=? "
+                "AND variant_id=?", ("demo:a", self.v.variant_id)).fetchone()
+            state_json = json.loads(row[0])
+            state_json["experiment_provenance"]["experiment_config"][
+                "strategy"]["fixed_reward_risk"] = 99.0
+            conn.execute(
+                "UPDATE paper_portfolios SET state_json=? WHERE scope_key=? "
+                "AND variant_id=?",
+                (json.dumps(state_json, sort_keys=True), "demo:a",
+                 self.v.variant_id))
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-config")
+        packet = next(
+            row for row in self.store.t3_packets_for(self.v.variant_id)
+            if row["packet_id"] == packet_id)
+        self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
+
+    def _raw_packet_status(self, packet_id):
+        with sqlite3.connect(self.path) as conn:
+            return conn.execute(
+                "SELECT review_status FROM t3_evidence_packets "
+                "WHERE packet_id=?", (packet_id,)).fetchone()[0]
+
+    def test_packet_variant_identity_must_match_row_payload_and_manifest(self):
+        baseline = self.complete_payload()
+        for field in ("payload", "manifest"):
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(baseline))
+                if field == "payload":
+                    payload["variant_id"] = "momentum.forged"
+                else:
+                    payload["artifact_manifest"] = dict(
+                        payload["artifact_manifest"])
+                    payload["artifact_manifest"]["variant_id"] = (
+                        "momentum.forged")
+                packet_id = self.store.create_t3_packet(
+                    self.v.variant_id, payload, reviewed_by="reviewer",
+                    registry_change_ref="change-variant")
+                self.assertEqual(
+                    self._raw_packet_status(packet_id),
+                    "DRAFT_REVIEW_REQUIRED")
+
+    def test_recomputed_forged_packet_stays_draft_when_provenance_changes(self):
+        payload = self.complete_payload()
+        analysis_payload = payload["forward_analysis"]["payload"]
+        candidate = analysis_payload["source_evidence"]["eligibility"]
+        candidate = candidate["setting_provenances"][self.v.variant_id]
+        candidate["forward_model_id"] = "forged.model"
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-forged-provenance")
+        self.assertEqual(
+            self._raw_packet_status(packet_id), "DRAFT_REVIEW_REQUIRED")
+
+    def test_malformed_truthy_packet_fields_fail_closed_as_drafts(self):
+        baseline = self.complete_payload()
+        mutations = {
+            "artifact_manifest": [],
+            "forward_analysis": "malformed",
+            "qualification": [],
+            "paper_result": "malformed",
+            "g2": [],
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(baseline))
+                payload[field] = value
+                packet_id = self.store.create_t3_packet(
+                    self.v.variant_id, payload, reviewed_by="reviewer",
+                    registry_change_ref="change-malformed")
+                self.assertEqual(
+                    self._raw_packet_status(packet_id),
+                    "DRAFT_REVIEW_REQUIRED")
+
+        payload = json.loads(json.dumps(baseline))
+        payload["forward_analysis"]["payload"]["source_evidence"][
+            "eligibility"]["setting_provenances"][self.v.variant_id][
+                "experiment_config"] = []
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-malformed-config")
+        self.assertEqual(
+            self._raw_packet_status(packet_id), "DRAFT_REVIEW_REQUIRED")
+
     def test_t3_packet_family_evidence_cannot_be_faked_by_checklist(self):
         payload = self.complete_payload()
         payload["checklist"]["axis_family_corrected"] = True
@@ -1461,6 +1629,20 @@ class QualificationAndPacketTests(StoreFixture):
 
 
 class ForwardQualificationCommandTests(StoreFixture):
+    def test_nightly_targets_deterministic_scope_and_rejects_llm_lane(self):
+        script = (Path(__file__).resolve().parents[2]
+                  / "research" / "nightly.sh").read_text()
+        self.assertIn('FORWARD_SCOPE="${FORWARD_SCOPE:-}"', script)
+        self.assertIn('forward_args+=(--scope "$FORWARD_SCOPE")', script)
+
+        args = argparse.Namespace(
+            store=str(self.path), scope="demo:account:feed-v1:llm",
+            strategy="momentum")
+        with patch.object(research_cli, "_load_config",
+                          return_value=valid_config()):
+            result = research_cli.cmd_forward_qualify(args)
+        self.assertEqual(result, 2)
+
     def test_report_uses_configured_store_when_cli_store_is_omitted(self):
         configured = Path(self.tmp.name) / "configured" / "findings.db"
         out = Path(self.tmp.name) / "scorecards"
