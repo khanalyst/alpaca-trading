@@ -42,7 +42,7 @@ The active simulator scope is `forward_feed_version: 7`. Feed v7 makes the
 four realtime lanes deterministic; the three long-horizon models remain
 offline-only. The active analyst's actual choices remain in a sibling `:llm`
 scope for planner history and are never pooled with lane comparisons. Feeds
-v1-v5 remain historical (v4 is the market-data plumbing repair feed and v5 the
+v1-v6 remain historical (v4 is the market-data plumbing repair feed and v5 the
 immutable-provenance fork).
 
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is

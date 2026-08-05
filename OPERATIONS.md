@@ -164,12 +164,13 @@ identities. Outcome-resolution gaps remain diagnostics rather than proposal
 mismatches. A failed, stale, or vacuous G2 blocks downstream journal evidence
 from being treated as authoritative.
 
-The active research scope is `forward_feed_version: 7`. Feed v7 is the
-deterministic four-lane realtime fork; the active analyst's own decisions
-remain in a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v5 remain
-immutable historical evidence. Feed v4 is the market-data plumbing repair feed,
-and feed v5 is the immutable-provenance fork; no older evidence is migrated or
-pooled with v7.
+The active research scope is `forward_feed_version: 7`. Feed v7 keeps the
+deterministic four realtime lanes and adds the real liquidation flow and the
+pre-registered conditioning axes; the active analyst's own decisions remain in
+a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v6
+remain immutable historical evidence. Feed v4 is the market-data plumbing
+repair feed, feed v5 is the immutable-provenance fork, and feed v6 is the
+deterministic four-lane fork; no older evidence is migrated or pooled with v7.
 
 Within each strategy:
 

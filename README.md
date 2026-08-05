@@ -151,7 +151,7 @@ assumption-free p-value.
 Feed v6 is a clean fork in which the four realtime lanes use deterministic
 contract proposals; the three long-horizon models remain offline-only. The
 analyst's own decisions remain in a separate `:llm` scope and are never pooled
-with lane evidence. Feeds v1-v5 remain historical and are never migrated or
+with lane evidence. Feeds v1-v6 remain historical and are never migrated or
 pooled; feed v4 remains the market-data plumbing repair feed and v5 the
 immutable-provenance fork. `research.py
 prepare-review-artifacts` runs only after v7 qualification. It
