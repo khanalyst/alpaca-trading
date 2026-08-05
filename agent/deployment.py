@@ -247,9 +247,15 @@ def verify_demo_artifact(
             "demo candidate variant strategy identity does not match runtime")
     try:
         candidate_variant = variants.from_record(dict(variant_row))
+        # Validated as strictly as an ordinary demo start, deliberately.
+        # ``allow_shadow_strategy`` relaxes the analyst-contract requirement
+        # and lets cycle.timeframes omit the strategy's required and signal
+        # timeframes. Every other caller of that relaxation is a shadow or
+        # research path with no exchange object; this config is handed to a
+        # real order-placing Engine, so a reviewed candidate must clear the
+        # same checks ``main.py run`` applies rather than fewer.
         try:
-            candidate_cfg = variants.apply(
-                candidate_variant, dict(cfg), allow_shadow_strategy=True)
+            candidate_cfg = variants.apply(candidate_variant, dict(cfg))
         except ValueError:
             # Direct callers and focused checks often provide only a findings
             # store path under ``research``.  That bookkeeping block is not
@@ -261,8 +267,7 @@ def verify_demo_artifact(
                 raise
             stripped = deepcopy(dict(cfg))
             stripped.pop("research", None)
-            candidate_cfg = variants.apply(
-                candidate_variant, stripped, allow_shadow_strategy=True)
+            candidate_cfg = variants.apply(candidate_variant, stripped)
             candidate_cfg["research"] = deepcopy(dict(research_block))
     except (TypeError, ValueError, KeyError) as exc:
         raise DeploymentAuthorizationError(

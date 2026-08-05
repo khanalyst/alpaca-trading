@@ -578,7 +578,14 @@ class SchedulerAndPortfolioTests(StoreFixture):
         self.assertIn("SHADOW", card)
 
 
-class QualificationAndPacketTests(StoreFixture):
+class QualificationAndPacketFixture(StoreFixture):
+    """Shared store/variant fixture and packet builders.
+
+    Held apart from the tests so another module can reuse the setup
+    without naming one of its test methods, and so pytest never
+    collects the fixture itself.
+    """
+
     def setUp(self):
         super().setUp()
         self.v = variant()
@@ -787,6 +794,147 @@ class QualificationAndPacketTests(StoreFixture):
             })
         return analysis_id
 
+    def complete_payload(self):
+        scope = "demo:a"
+        analysis_id = self.qualifying_analysis(scope)
+        self.store.qualify_variant(
+            self.v.variant_id, {"reason": "paired edge",
+                                "family_analysis_id": self.family_analysis_id,
+                                "axis": ["strategy.fixed_reward_risk"]},
+            source_analysis_id=analysis_id, scope_key=scope)
+        from agent import state as runtime_state
+        base_strategy_config_version = runtime_state.strategy_fingerprint(
+            valid_config())
+        state, version = self.store.load_paper_portfolio(
+            scope, self.v.variant_id, now=9)
+        state["status"] = "PAPER"
+        state["resume_status"] = "PAPER"
+        state["paper_started_ts"] = 10
+        self.store.save_paper_portfolio(
+            scope, self.v.variant_id, state, version, now=10)
+        rows = []
+        for index in range(protocol.MIN_ROUND_TRIPS):
+            rows.append({
+                "trade_id": f"paper-{index}",
+                "proposal_id": f"proposal-{index}",
+                "scope_key": scope,
+                "variant_id": self.v.variant_id,
+                "cycle_id": f"cycle-{index}",
+                "symbol": "BTC/USDT:USDT",
+                "direction": "long",
+                "setup_type": "trend_continuation",
+                "signal_ts": index,
+                "model_id": "momentum.fixed_rr.15m.v2",
+                "assumptions_json": "{}",
+                "entry_ts": 11 + index,
+                "entry_price": 100.0,
+                "notional": 1000.0,
+                "risk_usd": 100.0,
+                "stop_price": 90.0,
+                "take_price": 120.0,
+                "exit_ts": 12 + index,
+                "exit_price": 120.0,
+                "result": "target",
+                "net_pnl_usd": 100.0,
+                "r_multiple": 1.0,
+            })
+        with sqlite3.connect(self.path) as conn:
+            conn.executemany("""
+                INSERT INTO paper_trades (
+                    trade_id, proposal_id, scope_key, variant_id, cycle_id,
+                    symbol, direction, setup_type, signal_ts, model_id,
+                    assumptions_json, entry_ts, entry_price, notional,
+                    risk_usd, stop_price, take_price, exit_ts, exit_price,
+                    result, net_pnl_usd, r_multiple, status)
+                VALUES (
+                    :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
+                    :symbol, :direction, :setup_type, :signal_ts, :model_id,
+                    :assumptions_json, :entry_ts, :entry_price, :notional,
+                    :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
+                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
+            """, rows)
+        analysis = self.store.analysis(analysis_id)
+        candidate_provenance = (
+            analysis["payload"]["source_evidence"]["eligibility"]
+            ["setting_provenances"][self.v.variant_id])
+        prompt_catalog = variants.research_selection_catalog()
+        prompt_config = candidate_provenance["experiment_config"]
+        manifest, artifact_hash = artifact.build_manifest(
+            strategy_id="momentum",
+            strategy_version=self.v.base_version,
+            variant_id=self.v.variant_id,
+            variant_definition_hash=findings.variant_identity_hash(self.v),
+            variant_definition={
+                "variant_id": self.v.variant_id,
+                "strategy_id": self.v.strategy_id,
+                "base_version": self.v.base_version,
+                "overrides": self.v.overrides,
+                "hypothesis": self.v.hypothesis,
+                "hypothesis_id": self.v.hypothesis_id or "",
+                "hypothesis_params": self.v.hypothesis_params,
+            },
+            config=candidate_provenance["experiment_config"],
+            strategy_config_version=candidate_provenance[
+                "strategy_config_version"],
+            forward_model_id=candidate_provenance["forward_model_id"],
+            forward_model_assumptions_hash=candidate_provenance[
+                "forward_model_assumptions_hash"],
+            prompt_hash=artifact.sha256_text(
+                brain.build_system(prompt_config, catalog=prompt_catalog)),
+            llm_provider=prompt_config["llm"]["provider"],
+            llm_model=prompt_config["llm"]["model"],
+            prompt_inputs_hash=artifact.sha256_json({
+                "catalog": prompt_catalog,
+                "strategy": prompt_config["strategy"],
+            }),
+            deployment_config_hash=runtime_state.deployment_config_hash(
+                candidate_provenance["experiment_config"]),
+            root=research_cli.REPO,
+        )
+        assignment_ids = research_cli._forward_assignment_ids(
+            analysis, self.v.variant_id)
+        edge_candidates = [
+            item for item in self.store.edge_candidates_for(
+                variant_id=self.v.variant_id, scope_key=scope)
+            if item["assignment_id"] in assignment_ids]
+        return {
+            "variant_id": self.v.variant_id,
+            "scope_key": scope,
+            "checklist": self.complete_checklist(),
+            "g2": {
+                "status": "PASS", "strategy_config_version":
+                    base_strategy_config_version,
+                "fidelity_code_version": "fidelity"},
+            "qualification": self.store.qualification_status(
+                self.v.variant_id, scope),
+            "forward_analysis": analysis,
+            "edge_candidates": edge_candidates,
+            "paper_result": self.store.paper_summary(
+                scope, self.v.variant_id),
+            "current_provenance": {
+                "strategy_config_version": base_strategy_config_version,
+                "artifact_strategy_config_version": manifest[
+                    "strategy_config_version"],
+                "code_version": "code",
+                "fidelity_code_version": "fidelity",
+                "validated_config_hash": manifest[
+                    "validated_config_hash"],
+                "runtime_source_hash": manifest["runtime_source_hash"],
+                "variant_definition_hash": manifest[
+                    "variant_definition_hash"],
+                "forward_model_id": manifest["forward_model_id"],
+                "forward_model_assumptions_hash": manifest[
+                    "forward_model_assumptions_hash"],
+                "deployment_config_hash": manifest["deployment_config_hash"],
+                "llm_endpoint": manifest["llm_endpoint"],
+                "llm_endpoint_hash": manifest["llm_endpoint_hash"]},
+            "artifact_manifest": manifest,
+            "artifact_hash": artifact_hash,
+        }
+
+
+
+class QualificationAndPacketTests(QualificationAndPacketFixture):
     def test_policy_axis_can_promote_from_explicit_accept_vs_veto_actions(self):
         scope = "demo:confidence-edge"
         low = variant(
@@ -1148,144 +1296,6 @@ class QualificationAndPacketTests(StoreFixture):
                 scope, "momentum", ["strategy.fixed_reward_risk"],
                 self.baseline.variant_id,
                 [old.variant_id, self.control.variant_id])
-
-    def complete_payload(self):
-        scope = "demo:a"
-        analysis_id = self.qualifying_analysis(scope)
-        self.store.qualify_variant(
-            self.v.variant_id, {"reason": "paired edge",
-                                "family_analysis_id": self.family_analysis_id,
-                                "axis": ["strategy.fixed_reward_risk"]},
-            source_analysis_id=analysis_id, scope_key=scope)
-        from agent import state as runtime_state
-        base_strategy_config_version = runtime_state.strategy_fingerprint(
-            valid_config())
-        state, version = self.store.load_paper_portfolio(
-            scope, self.v.variant_id, now=9)
-        state["status"] = "PAPER"
-        state["resume_status"] = "PAPER"
-        state["paper_started_ts"] = 10
-        self.store.save_paper_portfolio(
-            scope, self.v.variant_id, state, version, now=10)
-        rows = []
-        for index in range(protocol.MIN_ROUND_TRIPS):
-            rows.append({
-                "trade_id": f"paper-{index}",
-                "proposal_id": f"proposal-{index}",
-                "scope_key": scope,
-                "variant_id": self.v.variant_id,
-                "cycle_id": f"cycle-{index}",
-                "symbol": "BTC/USDT:USDT",
-                "direction": "long",
-                "setup_type": "trend_continuation",
-                "signal_ts": index,
-                "model_id": "momentum.fixed_rr.15m.v2",
-                "assumptions_json": "{}",
-                "entry_ts": 11 + index,
-                "entry_price": 100.0,
-                "notional": 1000.0,
-                "risk_usd": 100.0,
-                "stop_price": 90.0,
-                "take_price": 120.0,
-                "exit_ts": 12 + index,
-                "exit_price": 120.0,
-                "result": "target",
-                "net_pnl_usd": 100.0,
-                "r_multiple": 1.0,
-            })
-        with sqlite3.connect(self.path) as conn:
-            conn.executemany("""
-                INSERT INTO paper_trades (
-                    trade_id, proposal_id, scope_key, variant_id, cycle_id,
-                    symbol, direction, setup_type, signal_ts, model_id,
-                    assumptions_json, entry_ts, entry_price, notional,
-                    risk_usd, stop_price, take_price, exit_ts, exit_price,
-                    result, net_pnl_usd, r_multiple, status)
-                VALUES (
-                    :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
-                    :symbol, :direction, :setup_type, :signal_ts, :model_id,
-                    :assumptions_json, :entry_ts, :entry_price, :notional,
-                    :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
-                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
-            """, rows)
-        analysis = self.store.analysis(analysis_id)
-        candidate_provenance = (
-            analysis["payload"]["source_evidence"]["eligibility"]
-            ["setting_provenances"][self.v.variant_id])
-        prompt_catalog = variants.research_selection_catalog()
-        prompt_config = candidate_provenance["experiment_config"]
-        manifest, artifact_hash = artifact.build_manifest(
-            strategy_id="momentum",
-            strategy_version=self.v.base_version,
-            variant_id=self.v.variant_id,
-            variant_definition_hash=findings.variant_identity_hash(self.v),
-            variant_definition={
-                "variant_id": self.v.variant_id,
-                "strategy_id": self.v.strategy_id,
-                "base_version": self.v.base_version,
-                "overrides": self.v.overrides,
-                "hypothesis": self.v.hypothesis,
-                "hypothesis_id": self.v.hypothesis_id or "",
-                "hypothesis_params": self.v.hypothesis_params,
-            },
-            config=candidate_provenance["experiment_config"],
-            strategy_config_version=candidate_provenance[
-                "strategy_config_version"],
-            forward_model_id=candidate_provenance["forward_model_id"],
-            forward_model_assumptions_hash=candidate_provenance[
-                "forward_model_assumptions_hash"],
-            prompt_hash=artifact.sha256_text(
-                brain.build_system(prompt_config, catalog=prompt_catalog)),
-            llm_provider=prompt_config["llm"]["provider"],
-            llm_model=prompt_config["llm"]["model"],
-            prompt_inputs_hash=artifact.sha256_json({
-                "catalog": prompt_catalog,
-                "strategy": prompt_config["strategy"],
-            }),
-            deployment_config_hash=runtime_state.deployment_config_hash(
-                candidate_provenance["experiment_config"]),
-            root=research_cli.REPO,
-        )
-        assignment_ids = research_cli._forward_assignment_ids(
-            analysis, self.v.variant_id)
-        edge_candidates = [
-            item for item in self.store.edge_candidates_for(
-                variant_id=self.v.variant_id, scope_key=scope)
-            if item["assignment_id"] in assignment_ids]
-        return {
-            "variant_id": self.v.variant_id,
-            "scope_key": scope,
-            "checklist": self.complete_checklist(),
-            "g2": {
-                "status": "PASS", "strategy_config_version":
-                    base_strategy_config_version,
-                "fidelity_code_version": "fidelity"},
-            "qualification": self.store.qualification_status(
-                self.v.variant_id, scope),
-            "forward_analysis": analysis,
-            "edge_candidates": edge_candidates,
-            "paper_result": self.store.paper_summary(
-                scope, self.v.variant_id),
-            "current_provenance": {
-                "strategy_config_version": base_strategy_config_version,
-                "artifact_strategy_config_version": manifest[
-                    "strategy_config_version"],
-                "code_version": "code",
-                "fidelity_code_version": "fidelity",
-                "validated_config_hash": manifest[
-                    "validated_config_hash"],
-                "runtime_source_hash": manifest["runtime_source_hash"],
-                "variant_definition_hash": manifest[
-                    "variant_definition_hash"],
-                "forward_model_id": manifest["forward_model_id"],
-                "forward_model_assumptions_hash": manifest[
-                    "forward_model_assumptions_hash"],
-                "deployment_config_hash": manifest["deployment_config_hash"],
-                "llm_endpoint": manifest["llm_endpoint"],
-                "llm_endpoint_hash": manifest["llm_endpoint_hash"]},
-            "artifact_manifest": manifest,
-            "artifact_hash": artifact_hash,
-        }
 
     def test_qualification_is_scope_specific_and_append_only(self):
         analysis_id = self.qualifying_analysis("demo:a")

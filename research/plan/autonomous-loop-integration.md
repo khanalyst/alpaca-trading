@@ -122,18 +122,33 @@ exchange-side result.
 
 ### Batch 4 - demo promotion gate
 
-- [ ] B4.1 Merge `ca4c734` and `af86ee7`
-- [ ] B4.2 Fix `agent/deployment.py` `allow_shadow_strategy=True` on the
+- [x] B4.1 Cherry-pick `ca4c734` and `af86ee7`
+- [x] B4.2 Fix `agent/deployment.py` `allow_shadow_strategy=True` on the
       exchange-facing path; every other caller of that flag is a research
       path that never reaches an exchange
-- [ ] B4.3 Remove the mock-based receipt test superseded by the real-journal one
-- [ ] B4.4 Extract the cross-module test fixture instead of instantiating
+- [x] B4.3 Remove the mock-based receipt test superseded by the real-journal one
+- [x] B4.4 Extract the cross-module test fixture instead of instantiating
       another test class by name
-- [ ] B4.5 Full suite green with the stricter flag
-- [ ] B4.6 `--candidate-demo` fails closed and comprehensibly against an
+- [x] B4.5 Full suite green with the stricter flag
+- [x] B4.6 `--candidate-demo` fails closed and comprehensibly against an
       empty findings store
 
 Gate: suite green with the stricter validation, and the failure path readable.
+
+B4.2 evidence. The relaxation disables three checks: the analyst-contract
+requirement, `cycle.timeframes` covering the strategy's required timeframes,
+and the signal timeframe appearing in that list. Applying a variant that drops
+`15m` from `cycle.timeframes` is rejected by ordinary validation with
+"cycle.timeframes must include 15m, 1h, 4h ... (missing: 15m)" and was
+accepted under the relaxation, which then handed that config to a real
+order-placing Engine. The reviewed-candidate path now validates exactly as
+strictly as `main.py run`.
+
+B4.6 evidence. Missing arguments exit 2 naming each one. With all four
+supplied and no findings store, authorization stops before any exchange or
+model client is constructed: first on the account fingerprint, then, once that
+matches, on "authoritative findings DB is missing: ...". Both exit 1 with the
+reason on the final line.
 
 ### Batch 5 - code freeze and G2 first contact
 

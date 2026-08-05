@@ -122,37 +122,9 @@ class DemoPreflightTests(unittest.TestCase):
                 valid_config(), scope_key="demo:test", packet_ref="packet",
                 expected_account_fingerprint="account", store=MagicMock())
 
-    def test_authorization_receipt_is_append_only_journalled_with_attribution(self):
-        authorization = {
-            "variant_id": "candidate",
-            "scope_key": "demo:test",
-            "packet_id": "packet",
-            "packet_hash": "p" * 64,
-            "artifact_hash": "a" * 64,
-            "variant_definition_hash": "v" * 64,
-            "candidate_config_hash": "c" * 64,
-            "artifact_strategy_config_version": "s" * 16,
-            "model_id": "model",
-            "model_assumptions_hash": "m" * 64,
-            "prompt_hash": "q" * 64,
-            "prompt_inputs_hash": "i" * 64,
-            "runtime_source_hash": "r" * 64,
-            "deployment_config_hash": "d" * 64,
-            "reviewed_by": "reviewer",
-            "registry_change_ref": "change-1",
-        }
-        with patch("agent.deployment.state.log_event") as log_event, \
-             patch("agent.deployment.state.set_journal_context") as set_context, \
-             patch("agent.deployment.state.journal_context", return_value={}):
-            receipt = deployment.record_demo_authorization_receipt(
-                authorization, account_fingerprint="demo-account",
-                preflight={"account_fingerprint": "demo-account"})
-        self.assertEqual(receipt["variant_id"], "candidate")
-        self.assertEqual(receipt["account_fingerprint"], "demo-account")
-        log_event.assert_called_once()
-        self.assertIn("demo_candidate_authorization", log_event.call_args.args)
-        self.assertIn("reviewer", log_event.call_args.args[1])
-        set_context.assert_called_once()
+    # A mock-based twin of the test below was removed: asserting that
+    # ``log_event`` was called cannot fail unless the real-journal test
+    # below, which reads the persisted row back, also fails.
 
     def test_authorization_receipt_uses_real_state_log_event_signature(self):
         authorization = {
@@ -201,10 +173,12 @@ class DemoPreflightTests(unittest.TestCase):
         self.assertEqual(json.loads(row[1])["reviewed_by"], "reviewer")
 
     def test_real_verifier_requires_current_positive_paper_success(self):
-        from tests.research.test_realtime_findings import QualificationAndPacketTests
+        # The fixture is imported, not one of its tests: naming a test method
+        # here would break this test when that unrelated one is renamed.
+        from tests.research.test_realtime_findings import (
+            QualificationAndPacketFixture)
 
-        fixture = QualificationAndPacketTests(
-            "test_t3_packets_are_deterministic_review_gated_and_immutable")
+        fixture = QualificationAndPacketFixture()
         fixture.setUp()
         try:
             payload = fixture.complete_payload()
