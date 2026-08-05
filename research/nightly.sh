@@ -87,6 +87,13 @@ echo "=== $(date -u +%FT%TZ) readiness ==="
 # nonzero is an operational failure, not a collection delay.
 "$PY" research.py readiness --db "$JOURNAL" || readiness_failed=1
 
+# Generation runs before review and is not gated on a terminal outcome.
+# The reviewer needs a finished assignment to have something to explain;
+# when nothing has finished, generation is exactly what the loop needs.
+echo "=== $(date -u +%FT%TZ) authoring new candidate mechanisms ==="
+"$PY" research.py author --store "$STORE" \
+  || echo "  (authoring unavailable this cycle; retried next run)"
+
 echo "=== $(date -u +%FT%TZ) research learning loop ==="
 # One invocation reviews at most one completed outcome. Provider or parse
 # failures are persisted for retry and must not abort the wider nightly run.

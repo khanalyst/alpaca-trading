@@ -252,6 +252,9 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify
+./.venv/bin/python research.py author
+./.venv/bin/python research.py author --dry-run
+./.venv/bin/python research.py staged
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts
@@ -261,6 +264,28 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py backup --target <mounted-directory> --require-external
 ./.venv/bin/python research.py verify-backup <backup-directory>
 ```
+
+### Proposing new mechanisms
+
+`research.py author` asks the configured model for new candidate mechanisms
+and stages the ones that validate. A proposal is data, not code: a mechanism,
+the payer, a falsifier, and comparisons over fields the validated forward
+models already declare. Anything naming an unknown field, using an operator
+other than the four comparisons, setting a threshold outside a field's
+observed range, or stating a claim too thin to name a cause is refused, and
+one bad proposal never discards the rest of a generation.
+
+It is deliberately not gated on a terminal outcome. The nightly reviewer needs
+a finished assignment to have something to explain, so on a corpus where none
+has finished it never runs at all - which is exactly the state in which new
+ideas matter most.
+
+Staged mechanisms enter at `T1_HYPOTHESIS` and are append-only: a registered
+claim cannot be reworded once results exist, which is the difference between a
+pre-registered hypothesis and a retro-fitted one. Live still requires
+`T3_VALIDATED` and a reviewed content-addressed packet, so nothing here
+shortens the path to capital. `research.py staged` lists what is registered
+and what each mechanism claims.
 
 `research.findings_store` never falls back to a temporary database. If the
 configured path cannot be used, the operation fails.

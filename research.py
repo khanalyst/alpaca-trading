@@ -1400,6 +1400,69 @@ def cmd_research_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_author(args: argparse.Namespace) -> int:
+    """Ask for new candidate mechanisms and stage the ones that validate.
+
+    Deliberately not gated on a terminal outcome. The reviewer needs one to
+    have something to explain; generation is what a loop with nothing left to
+    nominate needs most, and that is exactly the state with no terminal
+    outcome in it.
+    """
+    from agent.staging import StagingStore
+    from research import authoring
+
+    cfg = _load_config()
+    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    history = {}
+    if not args.no_history:
+        findings_store = findings_mod.FindingsStore(
+            findings_mod.resolve_store_path(args.store))
+        try:
+            context = findings_store.research_history_context()
+        except Exception as exc:  # noqa: BLE001 - history is an input, not a gate
+            print(f"history unavailable, proposing without it: {exc}",
+                  file=sys.stderr)
+            context = {}
+        history = {
+            "falsified": (context or {}).get("failed_outcomes", []),
+            "inconclusive": (context or {}).get(
+                "retryable_inconclusive_assignments", []),
+        }
+    if args.dry_run:
+        request = authoring.build_request(
+            store, history=history, max_proposals=args.max_proposals)
+        print(json.dumps(request, indent=2, sort_keys=True, default=str))
+        return 0
+    result = authoring.author_generation(
+        store, cfg, history=history, max_proposals=args.max_proposals)
+    print(json.dumps(result, sort_keys=True, default=str))
+    # A failed provider call is recorded and retried on the next cadence
+    # rather than failing the nightly run around it.
+    return 0
+
+
+def cmd_staged(args: argparse.Namespace) -> int:
+    """List staged mechanisms and what each one claims."""
+    from agent.staging import StagingStore
+
+    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    contracts = store.active()
+    if not contracts:
+        print("no staged mechanisms")
+        return 0
+    for contract in contracts:
+        print(f"{contract.contract_id}  [{contract.direction}]")
+        print(f"  mechanism: {contract.mechanism}")
+        print(f"  payer:     {contract.payer}")
+        print(f"  falsifier: {contract.falsifier}")
+        print(f"  fires when {contract.describe()}")
+        print()
+    summary = store.summary()
+    print(f"{summary['active']} active, {summary['retired']} retired, "
+          f"tiers {', '.join(summary['tiers'])}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -1568,6 +1631,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="findings.db to inspect read-only; absent stores are not created")
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
+
+    author = sub.add_parser(
+        "author",
+        help="propose new candidate mechanisms and stage the valid ones")
+    author.add_argument("--staging", default=None, help="staging.db path")
+    author.add_argument("--store", default=None, help="findings.db path")
+    author.add_argument("--max-proposals", type=int, default=4)
+    author.add_argument("--no-history", action="store_true",
+                        help="propose without prior falsification context")
+    author.add_argument("--dry-run", action="store_true",
+                        help="print the request without calling a provider")
+    author.set_defaults(func=cmd_author)
+
+    staged = sub.add_parser("staged", help="list staged candidate mechanisms")
+    staged.add_argument("--staging", default=None, help="staging.db path")
+    staged.set_defaults(func=cmd_staged)
 
     learning = sub.add_parser(
         "research-loop",

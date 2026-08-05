@@ -187,7 +187,7 @@ attribution deliberately.
       measured, replacing blanket `analyst_ready`
 - [ ] B2.8 Wire `StagingStore.evaluators()` into the shadow coordinator so a
       staged contract gets a lane on the next cycle
-- [ ] B2.9 Authoring prompt and response schema for the nightly reviewer
+- [x] B2.9 Authoring prompt and response schema, on its own cadence
 
 ## What 30 days can and cannot deliver
 
@@ -198,3 +198,43 @@ trades, beat every null, survived its placebo and was better out-of-sample -
 and decomposition showed funding contributed +0.039% against price movement's
 +1.969%, so it was a directional bet wearing a carry label. The shortlist is
 where human judgement is applied, not replaced.
+
+
+### B2.9 landed: generation is now a cadence, not a consequence
+
+`research/authoring.py` plus `research.py author` ask for new mechanisms and
+stage the ones that validate. It runs in `nightly.sh` *before* the reviewer
+and is deliberately not gated on a terminal outcome: the reviewer needs a
+finished assignment to have something to explain, so on a corpus where none
+has finished it never runs at all, which is exactly the state in which new
+ideas matter most.
+
+The request carries the derived field list and what has already been
+falsified, so a proposer cannot name an input the pipeline does not populate
+and can see why the last generation died. One malformed proposal is recorded
+and skipped rather than discarding the generation, because most proposals are
+expected to be wrong.
+
+Demonstrated end to end: an authored intraday mechanism - filled liquidations
+are price-insensitive sells that must complete regardless of price - compiled
+and fired correctly on a flush snapshot, vetoed the wrong direction, and
+vetoed a quiet hour, with no code written for it.
+
+### Still open, and why the loop is not yet closed
+
+- [ ] B2.8 Give staged contracts shadow lanes. This is the critical link:
+      a staged mechanism is executable but nothing evaluates it yet, so
+      proposals accumulate without being measured
+- [ ] B2.3 Three-stage funnel
+- [ ] B2.4 Parallel arms with false-discovery control
+- [ ] B2.5 Reason-coded verdicts
+- [ ] B2.6 Ranked shortlist report
+- [ ] B2.7 Deterministic order path
+
+B2.8 needs one design decision first. A staged contract produces a signal but
+not a paper trade, because a trade needs entry, stop, target, cost and holding
+assumptions - a forward model. The right answer is a single fixed measurement
+harness shared by every staged mechanism rather than letting a proposer choose
+its own exits: holding the outcome contract constant is what makes differences
+between mechanisms attributable to the mechanism instead of to the exit
+policy. That harness is the first task of the next batch.
