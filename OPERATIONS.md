@@ -407,6 +407,50 @@ manual review complete, edit `agent/registry.py` or `config.yaml`, switch the
 demo strategy, or deploy an edge to live trading. The reviewed `t3-packet`
 record and any registry/configuration change remain explicit operator actions.
 
+### 7.1 Run one reviewed candidate on OKX demo
+
+This path is opt-in and demo-only. Do not use it for a merely `WORKED`
+candidate or a draft packet. Before starting it:
+
+1. stop the ordinary trader and confirm there is no second loop;
+2. keep `mode: demo` and run `./.venv/bin/python main.py check` with the
+   intended Read+Trade, no-Withdraw OKX demo key;
+3. use the `account_fingerprint` bound in `runtime/demo/state.json` as the
+   expected account fingerprint;
+4. require a current, non-revoked qualification and a content-addressed
+   `REVIEWED` T3 packet for the exact variant and scope; and
+5. confirm local PAPER and the OKX demo account are flat, with no open regular
+   or algorithmic orders.
+
+```bash
+./.venv/bin/python main.py run --candidate-demo \
+  --variant-id <qualified-variant-id> \
+  --scope-key <authoritative-paper-scope> \
+  --packet-ref t3-packet:<reviewed-packet-hash> \
+  --expected-demo-account-fingerprint <account_fingerprint>
+```
+
+Authorization runs before exchange/model trading clients continue. It
+revalidates the reviewed packet and artifact, exact current qualification,
+current positive PAPER summary and closed-trade floor, PAPER flatness, and all
+executable identity hashes. Startup then performs read-only account,
+position, regular-order, algo-order, and local-state checks. Missing APIs,
+unexpected responses, identity drift, non-flat state, or any open order fails
+closed. The variant is applied in memory only; no registry, configuration, or
+live-capital authority is changed.
+
+After a successful preflight, confirm the attributable receipt:
+
+```bash
+sqlite3 runtime/demo/journal.db \
+  "SELECT datetime(ts,'unixepoch'), variant_id, account_fingerprint, payload FROM events WHERE kind='demo_candidate_authorization' ORDER BY ts DESC LIMIT 1;"
+```
+
+To stop the rehearsal, use `./.venv/bin/python main.py pause --flatten` and
+verify OKX has no remaining positions or orders. If flattening is incomplete,
+close them manually in OKX and keep the agent paused. A local test pass does
+not replace one real credentialed OKX demo smoke test.
+
 ## 8. Interpreting results
 
 - `candidate`/`testing`: registered research identity, not an edge.

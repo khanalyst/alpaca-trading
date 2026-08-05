@@ -59,6 +59,32 @@ or extra identities. Outcome-resolution gaps remain diagnostics rather than
 proposal mismatches; G2 does not reproduce full contract or execution
 semantics. `INSUFFICIENT_SAMPLE` means collection is still open.
 
+### Reviewed candidate demo startup
+
+The ordinary `main.py run` command remains unchanged. An operator may instead
+start exactly one reviewed candidate with `run --candidate-demo` only after the
+research path has produced a current qualification, successful flat local
+PAPER evidence, and a content-addressed `REVIEWED` T3 packet. Run `main.py
+check` first; it binds the current demo key to `runtime/demo/state.json`. Pass
+that file's non-secret `account_fingerprint` explicitly:
+
+```bash
+./.venv/bin/python main.py run --candidate-demo \
+  --variant-id <qualified-variant-id> \
+  --scope-key <authoritative-paper-scope> \
+  --packet-ref t3-packet:<reviewed-packet-hash> \
+  --expected-demo-account-fingerprint <account_fingerprint>
+```
+
+Use a dedicated OKX demo key with Read and Trade only and Withdraw disabled.
+The account and local runtime must be flat and free of regular/algo orders.
+The command fails closed on missing or stale evidence, identity/configuration
+drift, account mismatch, unsupported order-state queries, or non-flat state.
+It applies the reviewed variant in memory and records a demo authorization
+receipt; it does not edit configuration, update the strategy registry, or
+authorize live mode. The complete operating and rollback procedure is in
+[OPERATIONS.md](OPERATIONS.md#71-run-one-reviewed-candidate-on-okx-demo).
+
 ## 2. Configuration summary
 
 | Key | Shipped value/behavior |

@@ -238,6 +238,10 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python main.py check
 ./.venv/bin/python main.py strategies --verbose
 ./.venv/bin/python main.py run
+./.venv/bin/python main.py run --candidate-demo \
+  --variant-id <qualified-variant-id> --scope-key <scope> \
+  --packet-ref t3-packet:<reviewed-packet-hash> \
+  --expected-demo-account-fingerprint <okx-demo-fingerprint>
 ./.venv/bin/python main.py status
 
 ./.venv/bin/python research.py corpus stats
@@ -260,6 +264,27 @@ snapshot file is size- and SHA-256-verified.
 
 `research.findings_store` never falls back to a temporary database. If the
 configured path cannot be used, the operation fails.
+
+### Reviewed candidate on OKX demo
+
+`run --candidate-demo` is an explicit operator action for one reviewed variant;
+it is not part of the normal demo startup and is never selected automatically
+by research or the LLM. The command requires `mode: demo`, a current
+non-revoked qualification, a content-addressed `REVIEWED` T3 packet, and a
+successful local PAPER stage that is flat, has no open paper trades, meets the
+configured closed-trade floor, and has positive finite expectancy. Packet,
+artifact, variant, configuration, prompt, provider endpoint, forward-model,
+source, and deployment identities must still match the current runtime.
+
+After local authorization, startup verifies the expected demo account, trade
+permission, flat positions, every supported regular/algo open-order query, and
+flat local runtime state. Unknown or malformed account/order state fails
+closed. The reviewed variant is applied only in memory: the command does not
+edit `config.yaml`, the strategy registry, or live authorization. A successful
+preflight writes a `demo_candidate_authorization` receipt to
+`runtime/demo/journal.db` before the trading loop continues. A real OKX demo
+run still requires operator-provided demo credentials and external account
+availability.
 
 ## Optional local historical data
 
