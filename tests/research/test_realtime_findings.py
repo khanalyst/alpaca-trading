@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent import shadow, state, variants
-from research import findings, protocol, replay
+from research import corpus, findings, protocol, replay
 from tests.helpers import valid_config
 from tests.research.test_enrichment_isolation import (execution_enriched,
                                                       symbol_snapshot)
@@ -1338,11 +1338,42 @@ class QualificationAndPacketTests(StoreFixture):
         journal = Path(self.tmp.name) / "journal.db"
         args = argparse.Namespace(
             store=str(self.path), scope=scope, db=str(journal), mode="demo")
+        with sqlite3.connect(journal) as conn:
+            conn.execute(
+                "CREATE TABLE events (ts REAL, kind TEXT, payload TEXT)")
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?)", (
+                    1.0, "setup_proposed", json.dumps({
+                        "cycle_id": "c1", "symbol": "BTC/USDT:USDT",
+                        "direction": "long",
+                        "setup_type": "trend_continuation",
+                        "setup_id": "setup-1", "setup_key": "key-1",
+                        "signal_ts": 1000, "strategy_id": "momentum",
+                        "strategy_version": "phase1-v3", "variant_id": "live",
+                    })))
         g2 = {
             "gate": "G2",
             "status": "PASS",
-            "proposal_count": 0,
-            "max_proposal_ts": 0.0,
+            "proposal_count": 1,
+            "max_proposal_ts": 1.0,
+            "matched": 1,
+            "recorded": 1,
+            "reproduction_rate": 1.0,
+            "missing_count": 0, "extra_count": 0,
+            "malformed_count": 0, "duplicate_count": 0,
+            "unresolved_count": 0, "malformed_reasons": {},
+            "modern_evidence_count": 1,
+            "legacy_excluded_count": 0,
+            "legacy_after_boundary_count": 0,
+            "modern_boundary_ts": 1.0,
+            "modern_boundary_rowid": 1,
+            "modern_boundary_cycle_id": "c1",
+            "vacuous": False, "legacy_identity": False,
+            "corpus_digest": replay.g2_corpus_digest(journal),
+            **corpus.g2_replay_corpus_metadata(journal),
+            "replay_digest": "test-replay-digest",
+            "variant_id": "momentum.baseline",
+            "replay_mode": "recorded_llm",
             "strategy_config_version": state.strategy_fingerprint(cfg),
             "fidelity_code_version": replay.fidelity_code_fingerprint(),
         }

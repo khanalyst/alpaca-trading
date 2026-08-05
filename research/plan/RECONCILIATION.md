@@ -18,9 +18,12 @@ enforces.
 - The default assignment floor is ten elapsed days and 100 comparable paired
   observations; both are required before rotation.
 - Journal replay is authoritative only after a current G2 PASS. G2 compares
-  pre-risk proposal keys `(cycle_id, symbol, direction)` with replay keys,
-  requires at least 99% reproduction, and does not reproduce full contract or
-  execution semantics. A failed, stale, or vacuous G2 blocks downstream use.
+  the full canonical pre-risk proposal identity symmetrically with replay
+  keys, requires a non-vacuous exact match, and fails closed on malformed,
+  duplicate, missing, or extra identities. Outcome-resolution gaps remain
+  diagnostics rather than proposal mismatches. It does not reproduce full
+  contract or execution semantics. A failed, stale, or vacuous G2 blocks
+  downstream use.
 - The OHLCV tournament is exploratory. It may reject, rank, or withhold a
   strategy, but it awards no tier above `T2_CANDIDATE` and cannot promote live
   capital.

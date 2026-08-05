@@ -26,8 +26,6 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent import state
-
 from . import corpus, replay
 
 
@@ -37,8 +35,8 @@ COLLECTING = "COLLECTING"
 BLOCKED = "BLOCKED"
 FAILED = "FAILED"
 
-# The 99% threshold is a ratio, so it is meaningless on a handful of events:
-# at n=10 a single mismatch reads as 90% and fails a replay that is fine.
+# Exact symmetric identity is required, but a minimum corpus still prevents
+# declaring a meaningful readiness result from a handful of events.
 MIN_PROPOSALS_FOR_G2 = 100
 
 # Positioning and book-state studies condition on cells, and require 150 observations per
@@ -118,46 +116,63 @@ def gate_g1() -> Gate:
 def gate_g2(db, stats: dict, cfg: dict) -> Gate:
     """The keystone. Nothing downstream means anything until this passes."""
     proposals, max_proposal_ts = _proposal_snapshot(db)
+    evidence_metadata = replay.g2_evidence_metadata(db)
+    evidence_count = int(evidence_metadata.get("modern_evidence_count") or 0)
     result = _latest_g2_result(db)
-    result_is_current = bool(
-        result
-        and int(result.get("proposal_count", -1)) == proposals
-        and float(result.get("max_proposal_ts", -1)) == max_proposal_ts
-        and result.get("strategy_config_version")
-        == state.strategy_fingerprint(cfg)
-        and result.get("fidelity_code_version")
-        == replay.fidelity_code_fingerprint())
+    result_is_current, validation_detail = replay.validate_persisted_g2(
+        result, db, cfg)
     if result_is_current and result.get("status") == PASS:
         return Gate(
             "G2", "Replay reproduces the agent's own decisions", PASS,
             f"{result.get('matched', 0)}/{result.get('recorded', 0)} "
-            "recorded proposals reproduced; result persisted in the journal",
+            "recorded proposals reproduced; "
+            f"missing={result.get('missing_count', 0)}, "
+            f"extra={result.get('extra_count', 0)}, "
+            f"duplicates={result.get('duplicate_count', 0)}, "
+            f"malformed={result.get('malformed_count', 0)}, "
+            f"unresolved={result.get('unresolved_count', 0)}; "
+            f"modern_evidence={result.get('modern_evidence_count', 0)}, "
+            f"legacy_excluded={result.get('legacy_excluded_count', 0)}, "
+            f"legacy_after_boundary={result.get('legacy_after_boundary_count', 0)}, "
+            f"boundary={result.get('modern_boundary_ts')}@"
+            f"{result.get('modern_boundary_rowid')}; "
+            "result persisted in the journal",
             "re-run after code/config changes or after collecting new proposals")
     if result_is_current and result.get("status") == FAILED:
         return Gate(
             "G2", "Replay reproduces the agent's own decisions", FAILED,
             f"latest persisted run reproduced {result.get('matched', 0)}/"
-            f"{result.get('recorded', 0)} recorded proposals",
+            f"{result.get('recorded', 0)} recorded proposals; "
+            f"missing={result.get('missing_count', 0)}, "
+            f"extra={result.get('extra_count', 0)}, "
+            f"duplicates={result.get('duplicate_count', 0)}, "
+            f"malformed={result.get('malformed_count', 0)}, "
+            f"unresolved={result.get('unresolved_count', 0)}, "
+            f"modern_evidence={result.get('modern_evidence_count', 0)}, "
+            f"legacy_excluded={result.get('legacy_excluded_count', 0)}, "
+            f"legacy_after_boundary={result.get('legacy_after_boundary_count', 0)}, "
+            f"boundary={result.get('modern_boundary_ts')}@"
+            f"{result.get('modern_boundary_rowid')}",
             "explain every mismatch, then rerun replay --check-fidelity")
-    if proposals == 0:
+    if evidence_count == 0:
         return Gate(
             "G2", "Replay reproduces the agent's own decisions", COLLECTING,
-            "no setup_proposed events recorded yet, so a fidelity check "
-            "would reproduce 100% of nothing",
+            "no authoritative G2 proposal evidence recorded yet, so a "
+            "fidelity check would reproduce 100% of nothing",
             "run the agent until it proposes setups", blocks=["B7.5", "G4"])
-    if proposals < MIN_PROPOSALS_FOR_G2:
+    if evidence_count < MIN_PROPOSALS_FOR_G2:
         return Gate(
             "G2", "Replay reproduces the agent's own decisions", COLLECTING,
-            f"{proposals} recorded proposals; ~{MIN_PROPOSALS_FOR_G2} are "
-            "needed before a 99% ratio is meaningful (at this n a single "
-            f"mismatch reads as {(proposals - 1) / proposals:.0%})",
+            f"{evidence_count} authoritative proposals; ~{MIN_PROPOSALS_FOR_G2} are "
+            "needed before exact replay evidence is meaningful (at this n a "
+            f"single mismatch covers {(1 / evidence_count):.0%} of the "
+            f"corpus, leaving {(evidence_count - 1) / evidence_count:.0%})",
             "keep the agent running", blocks=["B7.5"])
-    stale = (
-        " A prior G2 result is stale because the corpus has changed."
-        if result else "")
+    stale = (f" A prior G2 result is stale: {validation_detail}."
+             if result and validation_detail else "")
     return Gate(
         "G2", "Replay reproduces the agent's own decisions", READY,
-        f"{proposals} recorded proposals: enough for the threshold to mean "
+        f"{evidence_count} authoritative proposals: enough for the threshold to mean "
         f"something. It has not passed on this exact corpus.{stale}",
         "python research.py replay --check-fidelity")
 

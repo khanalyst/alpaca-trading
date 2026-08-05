@@ -164,8 +164,15 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
         raise ValueError("stop_pct and take_pct must both be positive")
 
     floor_ts = plan.first_visible_ts
+    previous_ts = None
     for bar in bars:
-        if int(bar.ts) < floor_ts:
+        bar_ts = int(bar.ts)
+        if previous_ts is not None and bar_ts <= previous_ts:
+            raise LookaheadError(
+                f"{plan.symbol}: bars must be strictly ascending; "
+                f"{bar_ts} follows {previous_ts}")
+        previous_ts = bar_ts
+        if bar_ts < floor_ts:
             raise LookaheadError(
                 f"{plan.symbol}: bar at {bar.ts} precedes the first observable "
                 f"post-entry bar ({floor_ts}); the resolver may not see it")

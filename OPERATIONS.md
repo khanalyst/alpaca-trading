@@ -156,10 +156,13 @@ the prior decision. It is not aligned to wall-clock or signal-bar boundaries;
 safety, marks, exits, reconciliation, and shadow advancement continue on the
 shorter loop.
 
-G2 compares recorded pre-risk proposal keys `(cycle_id, symbol, direction)`
-with replay keys and requires at least 99% reproduction. It does not reproduce
-full contract or execution semantics. A failed, stale, or vacuous G2 blocks
-downstream journal evidence from being treated as authoritative.
+G2 compares the full canonical pre-risk proposal identity (cycle, symbol,
+direction, setup identity/type, signal timestamp, strategy version, and
+baseline variant) symmetrically with replay keys. It requires a non-vacuous
+exact match and fails closed on malformed, duplicate, missing, or extra
+identities. Outcome-resolution gaps remain diagnostics rather than proposal
+mismatches. A failed, stale, or vacuous G2 blocks downstream journal evidence
+from being treated as authoritative.
 
 The active research scope is `forward_feed_version: 6`. Feed v6 is the
 deterministic four-lane realtime fork; the active analyst's own decisions

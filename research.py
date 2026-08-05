@@ -128,6 +128,33 @@ def _corpus_for(db: Path):
     return cycles, outputs
 
 
+def _g2_replay_window(db: Path, cycles: list, outputs: list) -> tuple[list, list]:
+    """Restrict a strict G2 replay to cycles at/after the journal boundary."""
+    rows, _ = corpus.load_g2_proposals(db)
+    evidence = corpus.g2_evidence_window(rows)
+    allowed = corpus.g2_post_boundary_cycle_ids(db, evidence)
+    if allowed is None:
+        return cycles, outputs
+    return (
+        [cycle for cycle in cycles if cycle.cycle_id in allowed],
+        [output for output in outputs if output.cycle_id in allowed],
+    )
+
+
+def _g2_captured_corpus(
+        db: Path) -> tuple[list, list, dict, list[str]]:
+    """Capture the G2 window before loading the exact replay inputs."""
+    captured = replay_mod.g2_capture_metadata(db)
+    allowed = captured.pop("_allowed_cycle_ids", None)
+    cycles, outputs = _corpus_for(db)
+    if allowed is not None:
+        cycles = [cycle for cycle in cycles if cycle.cycle_id in allowed]
+        outputs = [output for output in outputs if output.cycle_id in allowed]
+    current = replay_mod.g2_evidence_metadata(db)
+    changed = replay_mod.g2_metadata_changes(captured, current)
+    return cycles, outputs, captured, changed
+
+
 def _proposal_snapshot(db: Path) -> tuple[int, float]:
     with sqlite3.connect(db) as conn:
         row = conn.execute(
@@ -158,11 +185,35 @@ def _paper_decisions(rows: list) -> list:
 
 
 def _record_g2_result(
-        db: Path, status: str, report: dict, result, cfg: dict) -> bool:
+        db: Path, status: str, report: dict, result, cfg: dict,
+        captured_metadata: dict | None = None) -> bool:
     """Append a durable G2 audit record to the journal being checked."""
     from agent import state
 
     proposals, max_proposal_ts = _proposal_snapshot(db)
+    evidence_metadata = replay_mod.g2_evidence_metadata(db)
+    if captured_metadata is None:
+        captured_metadata = {
+            key: report[key]
+            for key in replay_mod.G2_METADATA_FIELDS if key in report
+        }
+    captured_metadata = dict(captured_metadata or evidence_metadata)
+    changed_fields = replay_mod.g2_metadata_changes(
+        captured_metadata, evidence_metadata)
+    capture_stale = bool(changed_fields)
+    forced_failed = capture_stale and status == "PASS"
+    capture_stale_reason = (
+        "authoritative G2 replay corpus changed after replay capture: "
+        + ", ".join(changed_fields)
+        if capture_stale else report.get("capture_stale_reason", ""))
+    if capture_stale:
+        report["capture_stale"] = True
+        report["capture_stale_reason"] = capture_stale_reason
+    if forced_failed:
+        status = "FAILED"
+    malformed_reasons = dict(report.get("malformed_reasons", {}))
+    if capture_stale:
+        malformed_reasons["authoritative_corpus_changed_after_replay"] = 1
     payload = json.dumps({
         "gate": "G2",
         "status": status,
@@ -171,6 +222,53 @@ def _record_g2_result(
         "matched": report["matched"],
         "recorded": report["recorded"],
         "reproduction_rate": report["reproduction_rate"],
+        "missing_count": report.get("missing_count", 0),
+        "extra_count": report.get("extra_count", 0),
+        "malformed_count": report.get("malformed_count", 0),
+        "duplicate_count": report.get("duplicate_count", 0),
+        "unresolved_count": report.get("unresolved_count", 0),
+        "malformed_reasons": malformed_reasons,
+        "capture_stale": capture_stale or bool(
+            report.get("capture_stale", False)),
+        "capture_stale_reason": capture_stale_reason,
+        "vacuous": bool(report.get(
+            "vacuous", int(report.get("recorded", 0) or 0) == 0)),
+        "legacy_identity": bool(captured_metadata.get(
+            "legacy_identity", evidence_metadata["legacy_identity"])),
+        "modern_evidence_count": int(
+            captured_metadata.get("modern_evidence_count",
+                                 evidence_metadata["modern_evidence_count"])
+            or 0),
+        "legacy_excluded_count": int(
+            captured_metadata.get("legacy_excluded_count",
+                                 evidence_metadata["legacy_excluded_count"])
+            or 0),
+        "legacy_after_boundary_count": int(
+            captured_metadata.get("legacy_after_boundary_count",
+                                 evidence_metadata["legacy_after_boundary_count"])
+            or 0),
+        "modern_boundary_ts": captured_metadata.get(
+            "modern_boundary_ts", evidence_metadata["modern_boundary_ts"]),
+        "modern_boundary_rowid": captured_metadata.get(
+            "modern_boundary_rowid", evidence_metadata["modern_boundary_rowid"]),
+        "modern_boundary_cycle_id": captured_metadata.get(
+            "modern_boundary_cycle_id",
+            evidence_metadata["modern_boundary_cycle_id"]),
+        "corpus_digest": captured_metadata.get(
+            "corpus_digest", report.get(
+                "corpus_digest", replay_mod.g2_corpus_digest(db))),
+        "replay_corpus_digest": captured_metadata.get(
+            "replay_corpus_digest", evidence_metadata["replay_corpus_digest"]),
+        "replay_corpus_count": int(report.get(
+            "replay_corpus_count",
+            captured_metadata.get("replay_corpus_count",
+                                 evidence_metadata["replay_corpus_count"]))
+            or 0),
+        "replay_corpus_max_rowid": int(report.get(
+            "replay_corpus_max_rowid",
+            captured_metadata.get("replay_corpus_max_rowid",
+                                 evidence_metadata["replay_corpus_max_rowid"]))
+            or 0),
         "replay_digest": result.digest(),
         "variant_id": result.variant_id,
         "replay_mode": result.mode,
@@ -185,26 +283,43 @@ def _record_g2_result(
     except sqlite3.Error as exc:
         print(f"could not persist G2 result to {db}: {exc}", file=sys.stderr)
         return False
-    return True
+    # The audit row is retained as FAILED evidence, but a caller that had
+    # believed this was a PASS must stop downstream work after the race.
+    return not forced_failed
 
 
 def _require_g2(db: Path, cfg: dict, cycles: list, outputs: list) -> int:
     """Refuse downstream research unless baseline replay fidelity is real."""
+    loaded_cycles, loaded_outputs, captured_metadata, changed = (
+        _g2_captured_corpus(db))
+    # Replace the caller's lists so every downstream arm uses the exact rows
+    # that were loaded after the pre-capture check.
+    cycles[:] = loaded_cycles
+    outputs[:] = loaded_outputs
+    if changed:
+        reason = ("authoritative G2 replay corpus changed while loading "
+                  "the replay window: " + ", ".join(changed))
+        print(f"G2 capture stale: {reason}", file=sys.stderr)
+        return 2
     baseline = replay_mod.Replay(
         cfg, variant_id="momentum.baseline", mode="recorded_llm").run(
             cycles, outputs)
-    report = replay_mod.fidelity(baseline, db)
+    baseline.g2_metadata = captured_metadata
+    report = replay_mod.fidelity(
+        baseline, db, captured_metadata=captured_metadata)
     print(f"G2 fidelity: {report['reproduction_rate']:.4%} "
           f"({report['matched']}/{report['recorded']})")
     if report["vacuous"]:
-        _record_g2_result(db, "VACUOUS", report, baseline, cfg)
+        _record_g2_result(
+            db, "VACUOUS", report, baseline, cfg, captured_metadata)
         print("G2 VACUOUS: no recorded setup proposals exist. Downstream "
               "research is blocked until fidelity can be measured.",
               file=sys.stderr)
         return 4
     if report["recorded"] < readiness_mod.MIN_PROPOSALS_FOR_G2:
         _record_g2_result(
-            db, "INSUFFICIENT_SAMPLE", report, baseline, cfg)
+            db, "INSUFFICIENT_SAMPLE", report, baseline, cfg,
+            captured_metadata)
         print(
             f"G2 COLLECTING: {report['recorded']} recorded proposals; "
             f"{readiness_mod.MIN_PROPOSALS_FOR_G2} are required before the "
@@ -212,11 +327,16 @@ def _require_g2(db: Path, cfg: dict, cycles: list, outputs: list) -> int:
             file=sys.stderr)
         return 4
     if not report["passes_g2"]:
-        _record_g2_result(db, "FAILED", report, baseline, cfg)
+        _record_g2_result(
+            db, "FAILED", report, baseline, cfg, captured_metadata)
         print("G2 FAILED: downstream research is blocked until every "
               "mismatch is explained.", file=sys.stderr)
         return 2
-    if not _record_g2_result(db, "PASS", report, baseline, cfg):
+    if not _record_g2_result(
+            db, "PASS", report, baseline, cfg, captured_metadata):
+        if report.get("capture_stale_reason"):
+            print(f"G2 capture stale: {report['capture_stale_reason']}",
+                  file=sys.stderr)
         print("G2 passed but its audit record was not stored; downstream "
               "research remains blocked.", file=sys.stderr)
         return 5
@@ -233,10 +353,20 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print(f"no journal at {db}", file=sys.stderr)
         return 1
     cfg = _resolve_cfg(args.variant)
-    cycles, outputs = _corpus_for(db)
+    captured_metadata = None
+    if args.check_fidelity:
+        cycles, outputs, captured_metadata, changed = _g2_captured_corpus(db)
+        if changed:
+            reason = ("authoritative G2 replay corpus changed while loading "
+                      "the replay window: " + ", ".join(changed))
+            print(f"G2 capture stale: {reason}", file=sys.stderr)
+            return 2
+    else:
+        cycles, outputs = _corpus_for(db)
     result = replay_mod.Replay(
         cfg, variant_id=args.variant, mode=args.replay_mode,
         price_cache=_price_cache(args)).run(cycles, outputs)
+    result.g2_metadata = captured_metadata
 
     print(f"variant {result.variant_id}  mode {result.mode}  "
           f"cycles {result.cycles:,}")
@@ -258,7 +388,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print("G2 must use momentum.baseline in recorded_llm mode.",
                   file=sys.stderr)
             return 2
-        report = replay_mod.fidelity(result, db)
+        report = replay_mod.fidelity(
+            result, db, captured_metadata=captured_metadata)
         print(f"\nG2 fidelity: {report['reproduction_rate']:.4%} "
               f"({report['matched']}/{report['recorded']} recorded "
               f"decisions reproduced)")
@@ -266,7 +397,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print("G2 audit persistence disabled (--no-persist).")
         if report["vacuous"]:
             if persist_fidelity:
-                _record_g2_result(db, "VACUOUS", report, result, cfg)
+                _record_g2_result(
+                    db, "VACUOUS", report, result, cfg, captured_metadata)
             print("G2 VACUOUS: the corpus contains no recorded decisions, so "
                   "the replay\nreproduced 100% of nothing. That is not "
                   "evidence of fidelity. Run the agent\nuntil it has "
@@ -276,7 +408,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
         if report["recorded"] < readiness_mod.MIN_PROPOSALS_FOR_G2:
             if persist_fidelity:
                 _record_g2_result(
-                    db, "INSUFFICIENT_SAMPLE", report, result, cfg)
+                    db, "INSUFFICIENT_SAMPLE", report, result, cfg,
+                    captured_metadata)
             print(
                 f"G2 COLLECTING: {report['recorded']} recorded proposals; "
                 f"{readiness_mod.MIN_PROPOSALS_FOR_G2} are required before "
@@ -284,13 +417,18 @@ def cmd_replay(args: argparse.Namespace) -> int:
             return 4
         if not report["passes_g2"]:
             if persist_fidelity:
-                _record_g2_result(db, "FAILED", report, result, cfg)
+                _record_g2_result(
+                    db, "FAILED", report, result, cfg, captured_metadata)
             print("G2 FAILED. Every number downstream of this replay is "
                   "worthless until it is explained. This is a full stop, "
                   "not a debugging task to work around.", file=sys.stderr)
             return 2
         if (persist_fidelity
-                and not _record_g2_result(db, "PASS", report, result, cfg)):
+                and not _record_g2_result(
+                    db, "PASS", report, result, cfg, captured_metadata)):
+            if report.get("capture_stale_reason"):
+                print(f"G2 capture stale: {report['capture_stale_reason']}",
+                      file=sys.stderr)
             return 5
     return 0
 
@@ -745,8 +883,6 @@ def _build_t3_payload(
         str((qualification or {}).get("source_analysis_id") or ""))
     paper = store.paper_summary(scope, variant_id, paper_only=True)
     g2 = _latest_g2_payload(db)
-    proposal_count, max_proposal_ts = (
-        _proposal_snapshot(db) if db.exists() else (0, 0.0))
     analysis_payload = (analysis or {}).get("payload") or {}
     evidence = analysis_payload.get("evidence") or {}
     eligibility = (
@@ -758,12 +894,9 @@ def _build_t3_payload(
     min_paper = int((cfg.get("research") or {}).get(
         "paper_min_closed_trades") or 100)
     g2_current = bool(
-        g2 and g2.get("status") == "PASS"
-        and int(g2.get("proposal_count", -1)) == proposal_count
-        and float(g2.get("max_proposal_ts", -1)) == max_proposal_ts
-        and g2.get("strategy_config_version") == state.strategy_fingerprint(cfg)
-        and g2.get("fidelity_code_version")
-        == replay_mod.fidelity_code_fingerprint())
+        db.exists()
+        and g2 and g2.get("status") == "PASS"
+        and replay_mod.validate_persisted_g2(g2, db, cfg)[0])
     assignment_ids = _forward_assignment_ids(analysis, variant_id)
     edge_candidates = [
         item for item in store.edge_candidates_for(

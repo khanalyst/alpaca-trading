@@ -42,11 +42,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent import strategy
+from agent import state, strategy
 from agent.forward_models import require_complete_contract
 from agent.risk import RiskEngine
 
@@ -103,6 +106,13 @@ class ReplayDecision:
     # shown to the model.
     enrichment: dict = field(default_factory=dict)
 
+    # The following are populated for current journals/replays.  They remain
+    # optional so older ``ReplayDecision`` fixtures and protocol rows can be
+    # read without inventing an identity they never recorded.
+    strategy_id: str | None = None
+    strategy_version: str | None = None
+    setup_key: str | None = None
+
     def key(self) -> tuple:
         return (self.cycle_id, self.symbol, self.direction, self.setup_type)
 
@@ -124,6 +134,11 @@ class ReplayResult:
     corpus_from_ts: float = 0.0
     corpus_to_ts: float = 0.0
     state_diagnostics: dict = field(default_factory=dict)
+    strategy_id: str | None = None
+    strategy_version: str | None = None
+    # G2 callers attach the authoritative journal fingerprint captured before
+    # this replay started.  It is intentionally excluded from ``digest``.
+    g2_metadata: dict | None = None
 
     def executed(self) -> list:
         return [d for d in self.decisions if d.stage == "executed"]
@@ -133,6 +148,7 @@ class ReplayResult:
         import hashlib
         payload = json.dumps(
             [[d.cycle_id, d.symbol, d.stage, d.direction, d.setup_type,
+              d.proposal_id, d.setup_key, d.strategy_id, d.strategy_version,
               d.reason, d.stop_pct, d.take_pct] for d in self.decisions],
             sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
@@ -257,7 +273,10 @@ class Replay:
         result = ReplayResult(
             variant_id=self.variant_id, mode=self.mode, cycles=len(cycles),
             corpus_from_ts=cycles[0].ts if cycles else 0.0,
-            corpus_to_ts=cycles[-1].ts if cycles else 0.0)
+            corpus_to_ts=cycles[-1].ts if cycles else 0.0,
+            strategy_id=str(self.cfg["strategy"].get("id") or "") or None,
+            strategy_version=str(self.cfg["strategy"].get("version") or "")
+            or None)
         funnel = {"fired": 0, "proposed": 0, "vetoed": 0, "executed": 0,
                   "veto_reasons": {}}
 
@@ -513,7 +532,11 @@ class Replay:
                             _confidence(decision), reason=veto,
                             stop_pct=plan.get("stop_loss_pct"),
                             take_pct=plan.get("take_profit_pct"),
-                            contract_passed=True))
+                            proposal_id=plan.get("setup_id"),
+                            contract_passed=True,
+                            strategy_id=plan.get("strategy_id"),
+                            strategy_version=plan.get("strategy_version"),
+                            setup_key=plan.get("setup_key")))
                         funnel["vetoed"] += 1
                         _count(funnel["veto_reasons"], veto)
                         continue
@@ -526,11 +549,21 @@ class Replay:
                         stop_pct=sized.get("sl_pct"),
                         take_pct=sized.get("tp_pct"),
                         notional=sized.get("notional"),
+                        proposal_id=plan.get("setup_id"),
                         contract_passed=True,
-                        enrichment=_enrichment_of(row, cycle, symbol))
+                        enrichment=_enrichment_of(row, cycle, symbol),
+                        strategy_id=plan.get("strategy_id"),
+                        strategy_version=plan.get("strategy_version"),
+                        setup_key=plan.get("setup_key"))
                     record.outcome = self._resolve(
                         symbol, row, sized, decision, max_hold,
                         decision_ts=now)
+                    unresolved_outcome = bool(
+                        isinstance(record.outcome, dict)
+                        and record.outcome.get("result") == "no_data")
+                    if unresolved_outcome:
+                        diagnostics["transitions"][
+                            "outcomes_unresolved"] += 1
                     result.decisions.append(record)
 
                     # "side", not "direction": vet_open validates held
@@ -557,6 +590,7 @@ class Replay:
                         "round_trip_cost_pct": float(
                             sized.get("estimated_cost_pct") or 0),
                         "outcome": record.outcome,
+                        "unresolved_counted": unresolved_outcome,
                         "setup_id": plan.get("setup_id"),
                     })
                     diagnostics["transitions"]["positions_opened"] += 1
@@ -634,7 +668,8 @@ class Replay:
             closed += 1
             outcome = position.get("outcome") or {}
             if outcome.get("r_multiple") is None:
-                unresolved += 1
+                if not position.get("unresolved_counted"):
+                    unresolved += 1
                 continue
             pnl = (float(position.get("risk_usd") or 0)
                    * float(outcome["r_multiple"]))
@@ -681,7 +716,12 @@ class Replay:
             plan, self.price_cache, max_hold_hours=max_hold_hours,
             costs=self.costs)
         return {
-            "result": outcome.result, "r_multiple": outcome.r_multiple,
+            # ``no_data`` is unresolved, never a zero-R trade.  Keeping the
+            # key present with None lets settlement release max-hold capacity
+            # while incrementing the explicit unresolved diagnostic.
+            "result": outcome.result,
+            "r_multiple": (None if outcome.result == "no_data"
+                            else outcome.r_multiple),
             "net_pct": outcome.net_pct, "mae_pct": outcome.mae_pct,
             "mfe_pct": outcome.mfe_pct, "bars_held": outcome.bars_held,
             "tie_broken": outcome.tie_broken, "exit_ts": outcome.exit_ts,
@@ -727,9 +767,174 @@ def _count(bucket: dict, reason) -> None:
     bucket[key] = bucket.get(key, 0) + 1
 
 
+def _normal_variant(value, strategy_id: str | None = None) -> str | None:
+    """Normalize live/baseline aliases to one comparable identity.
+
+    Live journals historically use ``live`` while the authoritative replay is
+    named ``<strategy>.baseline``.  Those names describe the same unmodified
+    contract for G2.  Candidate variants remain distinct and therefore cannot
+    accidentally clear the baseline gate.
+    """
+    if value is None or not str(value).strip():
+        return "baseline"
+    text = str(value).strip().lower()
+    strategy = str(strategy_id or "").strip().lower()
+    strategy_prefix = strategy.replace("-", "_")
+    aliases = {"live", "baseline"}
+    if strategy:
+        aliases.add(f"{strategy}.baseline")
+        # The registry's variant naming convention uses an underscore-safe
+        # strategy prefix, while the strategy identity itself retains its
+        # original hyphenated value.
+        aliases.add(f"{strategy_prefix}.baseline")
+    else:
+        # Legacy rows have no strategy context; retain the historical
+        # momentum alias only for that deliberately ambiguous case.
+        aliases.add("momentum.baseline")
+    if text in aliases:
+        return "baseline"
+    return text
+
+
+def canonical_proposal_identity(row, *, strategy_id: str | None = None,
+                                strategy_version: str | None = None,
+                                variant_id: str | None = None,
+                                legacy: bool = False,
+                                include_strategy: bool = True) -> tuple:
+    """Return the strict G2 identity for one recorded/replayed proposal.
+
+    ``legacy`` is selected only when the corpus has no modern identity fields;
+    it preserves replayability of old `(cycle, symbol, direction)` journals.
+    Current rows include strategy/version, normalized variant, setup identity
+    and type, signal timestamp, symbol, direction, and cycle identity.
+    """
+    def get(name, fallback=None):
+        if isinstance(row, dict):
+            value = row.get(name)
+        else:
+            value = getattr(row, name, None)
+        return fallback if value is None else value
+
+    cycle = get("cycle_id")
+    symbol = get("symbol")
+    direction = get("direction")
+    if not isinstance(cycle, str) or not cycle.strip():
+        raise ValueError("missing cycle_id")
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ValueError("missing symbol")
+    if direction not in {"long", "short"}:
+        raise ValueError("invalid direction")
+    if legacy:
+        return ("g2-legacy", cycle.strip(), symbol.strip(), direction)
+
+    sid = (get("strategy_id", strategy_id) if include_strategy
+           else strategy_id)
+    sversion = (get("strategy_version", strategy_version)
+                if include_strategy else strategy_version)
+    # Modern rows should carry both fields.  A missing pair is an intentional
+    # legacy fallback; a half-populated pair is malformed and cannot be
+    # compared safely.
+    if (sid is None) != (sversion is None):
+        raise ValueError("incomplete strategy identity")
+    if sid is not None and (not isinstance(sid, str)
+                            or not isinstance(sversion, str)):
+        raise ValueError("invalid strategy identity")
+    sid = str(sid).strip() if sid is not None else None
+    sversion = str(sversion).strip() if sversion is not None else None
+    if sid == "" or sversion == "":
+        raise ValueError("empty strategy identity")
+    signal = get("signal_ts")
+    if signal is not None:
+        try:
+            if isinstance(signal, bool):
+                raise ValueError
+            numeric_signal = float(signal)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("invalid signal_ts") from None
+        if not numeric_signal.is_integer():
+            raise ValueError("invalid signal_ts")
+        signal = int(numeric_signal)
+    if signal is None:
+        raise ValueError("missing signal_ts")
+    if signal < 0:
+        raise ValueError("invalid signal_ts")
+    setup_type = get("setup_type")
+    if setup_type is not None:
+        if not isinstance(setup_type, str) or not setup_type.strip():
+            raise ValueError("invalid setup_type")
+        setup_type = setup_type.strip()
+    raw_variant = get("variant_id", variant_id)
+    if raw_variant is not None and not isinstance(raw_variant, str):
+        raise ValueError("invalid variant identity")
+    setup_id = get("setup_id", get("proposal_id", get("_g2_setup_id")))
+    setup_key = get("setup_key")
+    if setup_id is not None:
+        if not isinstance(setup_id, str) or not setup_id.strip():
+            raise ValueError("invalid setup_id")
+        setup_id = setup_id.strip()
+    if setup_key is not None:
+        if not isinstance(setup_key, str) or not setup_key.strip():
+            raise ValueError("invalid setup_key")
+        setup_key = setup_key.strip()
+    # setup identity is represented by the stable setup_id where present,
+    # otherwise the semantic setup_key/type.  At least one must be present in
+    # a modern row; this prevents materially different proposals collapsing.
+    if setup_type is None:
+        raise ValueError("missing setup_type")
+    setup_identity = setup_id or setup_key
+    if setup_identity is None:
+        raise ValueError("missing setup identity")
+    return (
+        "g2-v2", sid, sversion,
+        _normal_variant(raw_variant, sid),
+        setup_identity, setup_key, setup_type, signal,
+        symbol.strip(), direction, cycle.strip(),
+    )
+
+
+def _g2_legacy_mode(rows: list[dict]) -> bool:
+    """Detect journals predating strict proposal identity fields."""
+    return corpus.g2_evidence_window(rows).legacy_mode
+
+
+def _strict_replay_rows(result: ReplayResult, legacy: bool,
+                        include_strategy: bool,
+                        allowed_cycle_ids: set[str] | None = None
+                        ) -> tuple[list[tuple], dict]:
+    keys = []
+    diagnostics = {"malformed": 0, "duplicate": 0, "reasons": {}}
+    seen = set()
+    def reject(reason):
+        diagnostics["malformed"] += 1
+        diagnostics["reasons"][reason] = diagnostics["reasons"].get(reason, 0) + 1
+    for decision in result.decisions:
+        if not getattr(decision, "contract_passed", False):
+            continue
+        if (allowed_cycle_ids is not None
+                and getattr(decision, "cycle_id", None)
+                not in allowed_cycle_ids):
+            continue
+        try:
+            key = canonical_proposal_identity(
+                decision,
+                strategy_id=(result.strategy_id if include_strategy else None),
+                strategy_version=(result.strategy_version
+                                  if include_strategy else None),
+                variant_id=result.variant_id, legacy=legacy,
+                include_strategy=include_strategy)
+        except ValueError as exc:
+            reject(str(exc))
+            continue
+        if key in seen:
+            diagnostics["duplicate"] += 1
+        seen.add(key)
+        keys.append(key)
+    return keys, diagnostics
+
+
 # Self-validation
 
-def fidelity(result: ReplayResult, db) -> dict:
+def fidelity(result: ReplayResult, db, captured_metadata: dict | None = None) -> dict:
     """Gate G2: does the baseline replay reproduce what the agent recorded?
 
     This is the keystone. If the replay does not reproduce the live agent's
@@ -760,40 +965,384 @@ def fidelity(result: ReplayResult, db) -> dict:
     a price cache those transitions remain explicitly listed as unmodelled in
     ``state_diagnostics`` rather than being silently assumed.
     """
-    recorded = corpus.load_events(db, "setup_proposed")
-    recorded_keys = {
-        (r.get("cycle_id"), r.get("symbol"), r.get("direction"))
-        for r in recorded
-    }
+    # ``captured_metadata`` is supplied by the CLI immediately before the
+    # Replay.run that produced ``result``.  Recomputing the fingerprint only
+    # after execution would certify a journal that the replay never saw when
+    # another process appends an event during the run.
+    captured_metadata = (captured_metadata
+                         or getattr(result, "g2_metadata", None)
+                         or g2_evidence_metadata(db))
+    captured_metadata = dict(captured_metadata)
+    all_recorded, load_report = corpus.load_g2_proposals(db)
+    evidence = corpus.g2_evidence_window(all_recorded)
+    recorded = evidence.rows
+    legacy = evidence.legacy_mode
+    include_strategy = any(
+        row.get("strategy_id") is not None
+        or row.get("strategy_version") is not None for row in recorded)
+    recorded_keys: list[tuple] = []
+    recorded_duplicates = 0
+    seen_recorded = set()
+    for row in recorded:
+        try:
+            key = canonical_proposal_identity(
+                row, strategy_id=row.get("strategy_id"),
+                strategy_version=row.get("strategy_version"),
+                variant_id=row.get("variant_id"), legacy=legacy,
+                include_strategy=include_strategy)
+        except ValueError as exc:
+            load_report.reject(str(exc))
+            continue
+        if key in seen_recorded:
+            recorded_duplicates += 1
+        seen_recorded.add(key)
+        recorded_keys.append(key)
+    recorded_reasons = dict(load_report.reasons)
+    allowed_cycle_ids = corpus.g2_post_boundary_cycle_ids(db, evidence)
+    replayed_keys, replay_diag = _strict_replay_rows(
+        result, legacy, include_strategy, allowed_cycle_ids)
+    replay_corpus = corpus.g2_replay_corpus_metadata(db, evidence)
+    current_metadata = g2_evidence_metadata(db)
+    changed_fields = g2_metadata_changes(captured_metadata, current_metadata)
+    capture_stale = bool(changed_fields)
+    capture_stale_reason = (
+        "authoritative G2 replay corpus changed after replay capture: "
+        + ", ".join(changed_fields)
+        if capture_stale else "")
     # Everything the contract accepted, not everything that executed. The
-    # live engine journals setup_proposed in _prepare_setup_decision, which
-    # runs BEFORE RiskEngine.vet_open - so comparing against executions
-    # would count every risk-vetoed setup as a reproduction failure. On the
-    # historical corpus that is roughly four fifths of them, and G2 would
-    # fail at ~20% while the replay was in fact correct.
-    replayed_keys = {
-        (d.cycle_id, d.symbol, d.direction)
-        for d in result.decisions if d.contract_passed
-    }
-    matched = recorded_keys & replayed_keys
-    missing = recorded_keys - replayed_keys
-    extra = replayed_keys - recorded_keys
-    total = len(recorded_keys)
+    # live engine journals setup_proposed before RiskEngine.vet_open.
+    recorded_set = set(recorded_keys)
+    replayed_set = set(replayed_keys)
+    matched = recorded_set & replayed_set
+    missing = recorded_set - replayed_set
+    extra = replayed_set - recorded_set
+    total = len(recorded_set)
+    transitions = result.state_diagnostics.get("transitions") or {}
+    unresolved = int(transitions.get("outcomes_unresolved") or 0)
+    malformed = (int(load_report.malformed)
+                 + int(replay_diag["malformed"])
+                 + int(evidence.legacy_after_boundary_count))
+    duplicate = recorded_duplicates + int(replay_diag["duplicate"])
+    # G2 is a proposal-fidelity check.  Outcome resolution is deliberately
+    # diagnostic here: the nightly replay has no authoritative price cache,
+    # and a ``no_data`` outcome must not turn an otherwise exact proposal
+    # comparison into a false failure.  If a future authoritative outcome
+    # lane changes later proposals, the exact missing/extra comparison above
+    # still fails closed.
+    passes = bool(total and not missing and not extra and not malformed
+                 and not duplicate and not capture_stale)
+    reasons = dict(recorded_reasons)
+    if evidence.legacy_after_boundary_count:
+        reasons["legacy_after_modern_boundary"] = (
+            evidence.legacy_after_boundary_count)
+    for key, value in replay_diag["reasons"].items():
+        reasons[f"replay:{key}"] = value
+    if capture_stale:
+        reasons["authoritative_corpus_changed_after_replay"] = 1
+    missing_display = (sorted(missing, key=repr)[:50]
+                       if not legacy else
+                       sorted((key[1], key[2], key[3]) for key in missing)[:50])
+    extra_display = (sorted(extra, key=repr)[:50]
+                     if not legacy else
+                     sorted((key[1], key[2], key[3]) for key in extra)[:50])
     return {
         "recorded": total,
-        "replayed": len(replayed_keys),
+        "replayed": len(replayed_set),
         "matched": len(matched),
-        "missing": sorted(missing)[:50],
-        "extra": sorted(extra)[:50],
+        "missing": missing_display,
+        "extra": extra_display,
         "missing_count": len(missing),
         "extra_count": len(extra),
-        "reproduction_rate": (len(matched) / total) if total else 1.0,
-        "passes_g2": ((len(matched) / total) >= 0.99) if total else True,
-        # A corpus with nothing recorded reproduces 100% of nothing. That is
-        # not evidence the replay is faithful, and treating it as a pass
-        # would let an empty or broken journal clear the keystone gate while
-        # every downstream number ran on air. Callers gating on G2 must check
-        # this and refuse to proceed, rather than reading the rate alone.
+        "malformed_count": malformed,
+        "duplicate_count": duplicate,
+        "unresolved_count": unresolved,
+        "malformed_reasons": reasons,
+        "reproduction_rate": (len(matched) / total) if total else 0.0,
+        "passes_g2": passes,
         "vacuous": total == 0,
+        "legacy_identity": legacy,
+        "modern_evidence_count": captured_metadata.get(
+            "modern_evidence_count", len(recorded)),
+        "legacy_excluded_count": captured_metadata.get(
+            "legacy_excluded_count", evidence.legacy_excluded_count),
+        "legacy_after_boundary_count": captured_metadata.get(
+            "legacy_after_boundary_count", evidence.legacy_after_boundary_count),
+        "modern_boundary_ts": captured_metadata.get(
+            "modern_boundary_ts", evidence.modern_boundary_ts),
+        "modern_boundary_rowid": captured_metadata.get(
+            "modern_boundary_rowid", evidence.modern_boundary_rowid),
+        "modern_boundary_cycle_id": captured_metadata.get(
+            "modern_boundary_cycle_id", evidence.modern_boundary_cycle_id),
+        "corpus_digest": captured_metadata.get(
+            "corpus_digest", corpus.g2_proposal_digest(recorded)),
+        "replay_corpus_digest": captured_metadata.get(
+            "replay_corpus_digest", replay_corpus["replay_corpus_digest"]),
+        "replay_corpus_count": captured_metadata.get(
+            "replay_corpus_count", replay_corpus["replay_corpus_count"]),
+        "replay_corpus_max_rowid": captured_metadata.get(
+            "replay_corpus_max_rowid",
+            replay_corpus["replay_corpus_max_rowid"]),
+        "capture_stale": capture_stale,
+        "capture_stale_reason": capture_stale_reason,
         "state_diagnostics": result.state_diagnostics,
     }
+
+
+def g2_corpus_digest(db) -> str:
+    """Return the digest used by persisted G2 readiness evidence."""
+    rows, _ = corpus.load_g2_proposals(db)
+    return corpus.g2_proposal_digest(corpus.g2_evidence_window(rows).rows)
+
+
+def g2_evidence_metadata(db) -> dict:
+    """Return the deterministic modern-boundary metadata for persistence."""
+    metadata = g2_capture_metadata(db)
+    metadata.pop("_allowed_cycle_ids", None)
+    return metadata
+
+
+def g2_capture_metadata(db) -> dict:
+    """Capture G2 metadata and its replay window before loading corpus rows."""
+    rows, _ = corpus.load_g2_proposals(db)
+    evidence = corpus.g2_evidence_window(rows)
+    metadata = {
+        "corpus_digest": corpus.g2_proposal_digest(evidence.rows),
+        "legacy_identity": evidence.legacy_mode,
+        "modern_evidence_count": len(evidence.rows),
+        "legacy_excluded_count": evidence.legacy_excluded_count,
+        "legacy_after_boundary_count": evidence.legacy_after_boundary_count,
+        "modern_boundary_ts": evidence.modern_boundary_ts,
+        "modern_boundary_rowid": evidence.modern_boundary_rowid,
+        "modern_boundary_cycle_id": evidence.modern_boundary_cycle_id,
+    }
+    metadata.update(corpus.g2_replay_corpus_metadata(db, evidence))
+    metadata["_allowed_cycle_ids"] = corpus.g2_post_boundary_cycle_ids(
+        db, evidence)
+    return metadata
+
+
+G2_METADATA_FIELDS = (
+    "corpus_digest", "legacy_identity", "modern_evidence_count",
+    "legacy_excluded_count", "legacy_after_boundary_count",
+    "modern_boundary_ts", "modern_boundary_rowid",
+    "modern_boundary_cycle_id", "replay_corpus_digest",
+    "replay_corpus_count", "replay_corpus_max_rowid")
+
+
+def g2_metadata_changes(captured: dict, current: dict) -> list[str]:
+    """List authoritative G2 fields changed since a pre-replay capture."""
+    return [
+        field for field in G2_METADATA_FIELDS
+        if field in captured and captured.get(field) != current.get(field)]
+
+
+def validate_persisted_g2(payload: dict | None, db, cfg: dict) -> tuple[bool, str]:
+    """Validate a persisted G2 result against current corpus/code/config.
+
+    Kept in replay.py so the CLI's T3 path and readiness report cannot drift.
+    Missing fields deliberately return ``False`` (READY/re-run), while a
+    malformed payload never raises into a readiness command.
+    """
+    if not isinstance(payload, dict) or payload.get("gate") != "G2":
+        return False, "no persisted G2 result"
+    try:
+        proposals, max_ts = _proposal_snapshot_for_validation(db)
+    except Exception:  # noqa: BLE001
+        return False, "journal unreadable"
+    required = ("status", "proposal_count", "max_proposal_ts",
+                "strategy_config_version", "fidelity_code_version",
+                "corpus_digest", "matched", "recorded",
+                "reproduction_rate", "missing_count", "extra_count",
+                "malformed_count", "duplicate_count", "unresolved_count",
+                "malformed_reasons", "vacuous", "legacy_identity",
+                "modern_evidence_count",
+                "legacy_excluded_count", "legacy_after_boundary_count",
+                "modern_boundary_ts", "modern_boundary_rowid",
+                "modern_boundary_cycle_id",
+                "replay_corpus_digest", "replay_corpus_count",
+                "replay_corpus_max_rowid",
+                "replay_digest", "variant_id", "replay_mode")
+    if any(field not in payload for field in required):
+        return False, "persisted G2 result lacks current diagnostics"
+    try:
+        status = payload.get("status")
+        if not isinstance(status, str):
+            return False, "persisted G2 result has an invalid status"
+        if status not in {"PASS", "FAILED", "VACUOUS", "INSUFFICIENT_SAMPLE"}:
+            return False, "persisted G2 result has an unknown status"
+        if status == "PASS" and payload.get("capture_stale"):
+            return False, "persisted G2 replay corpus changed during replay"
+        if not isinstance(payload.get("strategy_config_version"), str) \
+                or not payload["strategy_config_version"].strip():
+            return False, "persisted G2 result has an invalid config fingerprint"
+        if not isinstance(payload.get("fidelity_code_version"), str) \
+                or not payload["fidelity_code_version"].strip():
+            return False, "persisted G2 result has an invalid code fingerprint"
+        if not isinstance(payload.get("corpus_digest"), str) \
+                or not payload["corpus_digest"].strip():
+            return False, "persisted G2 result has an invalid corpus digest"
+        if not isinstance(payload.get("replay_digest"), str) \
+                or not payload["replay_digest"].strip():
+            return False, "persisted G2 result has an invalid replay digest"
+        if not isinstance(payload.get("replay_corpus_digest"), str) \
+                or not payload["replay_corpus_digest"].strip():
+            return False, "persisted G2 result has an invalid replay corpus digest"
+        if not isinstance(payload.get("variant_id"), str) \
+                or not payload["variant_id"].strip():
+            return False, "persisted G2 result has an invalid variant id"
+        if payload.get("replay_mode") != "recorded_llm":
+            return False, "persisted G2 result has an invalid replay mode"
+        if not isinstance(payload.get("malformed_reasons"), dict):
+            return False, "persisted G2 result has invalid diagnostics"
+        if "capture_stale" in payload and not isinstance(
+                payload.get("capture_stale"), bool):
+            return False, "persisted G2 result has invalid capture status"
+        if "capture_stale_reason" in payload and not isinstance(
+                payload.get("capture_stale_reason"), str):
+            return False, "persisted G2 result has invalid capture reason"
+        if not isinstance(payload.get("vacuous"), bool) \
+                or not isinstance(payload.get("legacy_identity"), bool):
+            return False, "persisted G2 result has invalid flags"
+
+        def nonnegative_int(name: str) -> int:
+            value = payload.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or value < 0:
+                raise ValueError(f"invalid {name}")
+            return value
+
+        proposal_count = nonnegative_int("proposal_count")
+        matched_count = nonnegative_int("matched")
+        recorded_count = nonnegative_int("recorded")
+        diagnostic_counts = {
+            name: nonnegative_int(name)
+            for name in ("missing_count", "extra_count", "malformed_count",
+                         "duplicate_count", "unresolved_count",
+                         "modern_evidence_count",
+                         "legacy_excluded_count",
+                         "legacy_after_boundary_count",
+                         "replay_corpus_count",
+                         "replay_corpus_max_rowid")}
+        max_ts_value = payload.get("max_proposal_ts")
+        if isinstance(max_ts_value, bool) or not isinstance(
+                max_ts_value, (int, float)):
+            return False, "persisted G2 result has an invalid timestamp"
+        max_ts_value = float(max_ts_value)
+        if not math.isfinite(max_ts_value):
+            return False, "persisted G2 result has an invalid timestamp"
+        reproduction_rate = payload.get("reproduction_rate")
+        if isinstance(reproduction_rate, bool) or not isinstance(
+                reproduction_rate, (int, float)):
+            return False, "persisted G2 result has an invalid reproduction rate"
+        reproduction_rate = float(reproduction_rate)
+        if (not math.isfinite(reproduction_rate)
+                or not 0.0 <= reproduction_rate <= 1.0):
+            return False, "persisted G2 result has an invalid reproduction rate"
+        if matched_count > recorded_count:
+            return False, "persisted G2 result has inconsistent counts"
+        expected_rate = (matched_count / recorded_count
+                         if recorded_count else 0.0)
+        if reproduction_rate != expected_rate:
+            return False, "persisted G2 result has inconsistent counts"
+        if bool(payload["vacuous"]) != (recorded_count == 0):
+            return False, "persisted G2 result has inconsistent vacuous flag"
+        current_digest = g2_corpus_digest(db)
+        current_rows, current_load = corpus.load_g2_proposals(db)
+        evidence = corpus.g2_evidence_window(current_rows)
+        if evidence.modern_boundary_ts is None:
+            if payload.get("modern_boundary_ts") is not None \
+                    or payload.get("modern_boundary_rowid") is not None \
+                    or payload.get("modern_boundary_cycle_id") is not None:
+                return False, "persisted G2 modern boundary is stale"
+        else:
+            boundary_ts = payload.get("modern_boundary_ts")
+            boundary_rowid = payload.get("modern_boundary_rowid")
+            boundary_cycle_id = payload.get("modern_boundary_cycle_id")
+            if (isinstance(boundary_ts, bool)
+                    or not isinstance(boundary_ts, (int, float))
+                    or not math.isfinite(float(boundary_ts))
+                    or float(boundary_ts) != evidence.modern_boundary_ts
+                    or isinstance(boundary_rowid, bool)
+                    or not isinstance(boundary_rowid, int)
+                    or boundary_rowid != evidence.modern_boundary_rowid
+                    or boundary_cycle_id != evidence.modern_boundary_cycle_id):
+                return False, "persisted G2 modern boundary is stale"
+        if (diagnostic_counts["legacy_excluded_count"]
+                != evidence.legacy_excluded_count
+                or diagnostic_counts["legacy_after_boundary_count"]
+                != evidence.legacy_after_boundary_count
+                or diagnostic_counts["modern_evidence_count"]
+                != len(evidence.rows)):
+            return False, "persisted G2 legacy boundary diagnostics are stale"
+        current_replay_corpus = corpus.g2_replay_corpus_metadata(
+            db, evidence)
+        if (payload["replay_corpus_digest"]
+                != current_replay_corpus["replay_corpus_digest"]):
+            return False, "persisted G2 replay corpus digest is stale"
+        if (diagnostic_counts["replay_corpus_count"]
+                != current_replay_corpus["replay_corpus_count"]):
+            return False, "persisted G2 replay corpus count is stale"
+        if (diagnostic_counts["replay_corpus_max_rowid"]
+                != current_replay_corpus["replay_corpus_max_rowid"]):
+            return False, "persisted G2 replay corpus watermark is stale"
+        if current_load.malformed and status != "FAILED":
+            return False, "current proposal corpus contains malformed rows"
+        current_rows = evidence.rows
+        legacy = evidence.legacy_mode
+        include_strategy = any(
+            row.get("strategy_id") is not None
+            or row.get("strategy_version") is not None
+            for row in current_rows)
+        current_keys = []
+        for row in current_rows:
+            try:
+                current_keys.append(canonical_proposal_identity(
+                    row, strategy_id=row.get("strategy_id"),
+                    strategy_version=row.get("strategy_version"),
+                    variant_id=row.get("variant_id"), legacy=legacy,
+                    include_strategy=include_strategy))
+            except ValueError:
+                if status != "FAILED":
+                    return False, "current proposal corpus contains malformed rows"
+        current_unique_count = len(set(current_keys))
+        if (len(current_keys) != current_unique_count
+                and status != "FAILED"):
+            return False, "current proposal corpus contains duplicate identities"
+        # ``recorded`` is the number of unique, valid canonical identities,
+        # not the raw setup_proposed row count.  A FAILED result may have
+        # malformed or duplicate rows, but its denominator still reflects the
+        # unique identities that could be compared.
+        if recorded_count != current_unique_count:
+            return False, "persisted G2 denominator is stale"
+        if payload.get("legacy_identity") != evidence.legacy_mode:
+            return False, "persisted G2 identity mode is stale"
+        strategy_cfg = cfg.get("strategy") if isinstance(cfg, dict) else {}
+        strategy_id = (strategy_cfg or {}).get("id")
+        if _normal_variant(payload["variant_id"], strategy_id) != "baseline":
+            return False, "persisted G2 variant is not the baseline"
+        if status == "PASS":
+            if any(diagnostic_counts[name] != 0 for name in (
+                    "missing_count", "extra_count", "malformed_count",
+                    "duplicate_count", "legacy_after_boundary_count")):
+                return False, "persisted G2 result is not a clean PASS"
+            if recorded_count <= 0 or matched_count != recorded_count:
+                return False, "persisted G2 PASS is not exact/non-vacuous"
+        current = (
+            proposal_count == proposals
+            and max_ts_value == max_ts
+            and payload["strategy_config_version"] ==
+                state.strategy_fingerprint(cfg)
+            and payload["fidelity_code_version"] == fidelity_code_fingerprint()
+            and payload["corpus_digest"] == current_digest)
+    except (TypeError, ValueError, OSError, sqlite3.Error):
+        return False, "persisted G2 result is malformed"
+    return current, ("" if current else "persisted G2 result is stale")
+
+
+def _proposal_snapshot_for_validation(db) -> tuple[int, float]:
+    with closing(sqlite3.connect(
+            f"file:{Path(db)}?mode=ro", uri=True)) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM events "
+            "WHERE kind='setup_proposed'").fetchone()
+    return int(row[0]), float(row[1])
