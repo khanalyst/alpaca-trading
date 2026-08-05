@@ -206,10 +206,13 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # confidence floors, and maker penetration.
         # ffbd0360d5f624c9 -> 608188bfb1314d2e: retired nine confidence-floor
         # and breakout-discriminator arms after live-demo evidence.
+        # 608188bfb1314d2e -> 86d91dc0c41fee7d: retired nine momentum
+        # reward:risk, stop-distance and net-direction arms after the order
+        # path closed 35 live-demo trades at 11.4% wins and -0.974% each.
         # Each transition changes the decision space; evidence must not pool.
         self.assertEqual(
             brain.prompt_version(system),
-            "608188bfb1314d2e",
+            "86d91dc0c41fee7d",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

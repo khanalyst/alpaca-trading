@@ -38,7 +38,7 @@ research:
 | Decision throttle | `cycle.decision_interval_seconds: 300` elapsed seconds (with a 95% jitter tolerance); safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 7`; feed v7 adds the real liquidation flow and the pre-registered conditioning axes; feeds v1-v6 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, and v6 the deterministic four-lane realtime fork) |
+| Research feed | `forward_feed_version: 8`; feed v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; feeds v1-v7 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane realtime fork, and v7 added the liquidation flow and conditioning axes) |
 | Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
 | Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
 | Experiment floor | both 10 elapsed days and 100 comparable paired observations |
@@ -137,7 +137,7 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion. It is an immutable research lead, and current v7 forward
+promotion. It is an immutable research lead, and current v8 forward
 qualification is still required.
 
 The current `forward-qualify` path reconstructs v6 evidence from eligible
@@ -151,10 +151,10 @@ assumption-free p-value.
 Feed v6 is a clean fork in which the four realtime lanes use deterministic
 contract proposals; the three long-horizon models remain offline-only. The
 analyst's own decisions remain in a separate `:llm` scope and are never pooled
-with lane evidence. Feeds v1-v6 remain historical and are never migrated or
+with lane evidence. Feeds v1-v7 remain historical and are never migrated or
 pooled; feed v4 remains the market-data plumbing repair feed and v5 the
 immutable-provenance fork. `research.py
-prepare-review-artifacts` runs only after v7 qualification. It
+prepare-review-artifacts` runs only after v8 qualification. It
 fails closed unless the saved edge evidence and every non-manual T3 check
 validate, then idempotently creates an immutable, content-addressed draft
 review artifact. It cannot complete manual review, edit the registry or
@@ -337,6 +337,7 @@ source.
 | [research/protocol.md](research/protocol.md) | Statistical and operational evidence rules for `WORKED`, `FAILED`, `INCONCLUSIVE`, qualification, rejection, pairing, held-out confirmation, and multiple testing. |
 | [research/plan/RECONCILIATION.md](research/plan/RECONCILIATION.md) | Current authority policy separating journal evidence, exploratory tournament evidence, configuration exceptions, and VM handoff requirements. |
 | [research/plan/B7.5-record.md](research/plan/B7.5-record.md) | Current status and completion conditions for the optional maker-first order primitive. It distinguishes that execution experiment from `scalp-maker`. |
+| [research/plan/edge-platform.md](research/plan/edge-platform.md) | What the 7-day demo corpus established, the silent depth-ladder rejection it exposed, and the batched plan for turning the research loop into an edge-producing platform. |
 | [research/plan/autonomous-loop-integration.md](research/plan/autonomous-loop-integration.md) | Batched plan and checklist for merging the G2/promotion and audit-remediation work into one unattended loop. Records why runtime code settles before collection opens. |
 | [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Historical implementation pointer; current flow and commands are in the primary guides. |
 | [research/plan/findings.md](research/plan/findings.md) | Historical findings pointer; current evidence boundaries are in RECONCILIATION and protocol. |
@@ -371,6 +372,7 @@ source.
 | [findings/momentum/momentum.cond.session.md](findings/momentum/momentum.cond.session.md) | Conditioning-axis scorecard. It partitions existing trades by UTC session window and may only be quoted after the out-of-sample split. |
 | [findings/momentum/momentum.universe.top_5.md](findings/momentum/momentum.universe.top_5.md) | Scorecard for a five-instrument universe. It asks whether the edge lives in the liquid majors. |
 | [findings/momentum/momentum.universe.top_25.md](findings/momentum/momentum.universe.top_25.md) | Scorecard for a twenty-five-instrument universe. It asks the opposite question: whether the edge lives in the tail. |
+| [findings/momentum/momentum.universe.top_10.md](findings/momentum/momentum.universe.top_10.md) | Scorecard for a twenty-five-instrument universe. It asks the opposite question: whether the edge lives in the tail. |
 
 ### Research result snapshots
 

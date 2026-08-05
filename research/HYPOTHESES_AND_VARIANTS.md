@@ -23,9 +23,9 @@ The executable sources remain authoritative when prose and code disagree:
 | --- | --- |
 | Registered strategies | 7 mechanism/falsification claims |
 | Pre-registered YAML setting rows | 32 across 7 strategy files |
-| Hand-authored momentum variants | 23 immutable identities including baseline |
-| Materialized static identities | 70 including all 7 baselines |
-| Bounded LLM selector candidates | 36 eligible single-axis candidates |
+| Hand-authored momentum variants | 24 immutable identities including baseline |
+| Materialized static identities | 71 including all 7 baselines |
+| Bounded LLM selector candidates | 27 eligible single-axis candidates |
 | Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
@@ -36,7 +36,7 @@ The active analyst's separate `:llm` scope can hold its own baseline and
 candidate, adding two non-comparable arms. When that sibling is present, the
 runtime maximum is 10 (8 deterministic comparison arms plus 2 LLM-scope arms).
 
-The active realtime simulator identity is `forward_feed_version: 7`. Feed v7
+The active realtime simulator identity is `forward_feed_version: 8`. Feed v8
 uses deterministic contract proposals in four realtime lanes: `momentum`,
 `flush-fade`, `ls-ratio-fade`, and `scalp-maker`. Each lane receives the same
 market snapshot and timestamp and owns independent paper cash, positions, risk
@@ -44,7 +44,7 @@ state, decisions, and trades. `funding-carry`, `funding-unwind`, and
 `trend-multiday` remain registered offline-only models. Only
 `momentum/phase1-v3` is connected to the configured demo order path.
 
-Feeds v1-v6 remain immutable historical rows and must not be pooled with v7
+Feeds v1-v7 remain immutable historical rows and must not be pooled with v8
 outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the
 immutable experiment-provenance fork. The analyst's actual decisions continue
 in the sibling `:llm` scope for planner history; that lane is not comparable
@@ -349,16 +349,16 @@ variant ID; status is the only field that may advance.
 | Variant | Exact change | Question being tested |
 | --- | --- | --- |
 | `momentum.baseline` | None | Comparison floor and replay identity |
-| `momentum.rr.fixed_1_5` | `fixed_reward_risk=1.5` | Does higher hit rate outweigh the smaller win? |
-| `momentum.rr.fixed_2_0` | `fixed_reward_risk=2.0` | Does 2R capture more valid excursions than shipped 3R? |
-| `momentum.rr.fixed_2_5` | `fixed_reward_risk=2.5` | Is an intermediate target better than the registered baseline? |
+| `momentum.rr.fixed_1_5` | `fixed_reward_risk=1.5` | Retired: the order path closed 35 live trades at 11.4% wins. |
+| `momentum.rr.fixed_2_0` | `fixed_reward_risk=2.0` | Retired: sizing an already-negative directional edge. |
+| `momentum.rr.fixed_2_5` | `fixed_reward_risk=2.5` | Retired: sizing an already-negative directional edge. |
 | `momentum.rr.fixed_3_0` | `fixed_reward_risk=3.0` | Superseded because it duplicates the current baseline |
-| `momentum.stop.atr_1_25` | stop floor `1.25 ATR` | Does a modestly wider stop remove ordinary-noise exits? |
-| `momentum.stop.atr_1_5` | stop floor `1.5 ATR` | Does a materially wider stop rescue early-but-correct trades? |
-| `momentum.stop.atr_2_0` | stop floor `2.0 ATR` | Is the stop-width effect monotonic? |
-| `momentum.net_direction.60` | net-direction cap `60%` | Are refused same-side entries mostly correlated duplicates? |
-| `momentum.net_direction.80` | net-direction cap `80%` | Is there a better concentration/sample trade-off? |
-| `momentum.net_direction.120` | net-direction cap `120%` | Does the shipped 100% ceiling suppress independent signals? |
+| `momentum.stop.atr_1_25` | stop floor `1.25 ATR` | Retired: sizing an already-negative directional edge. |
+| `momentum.stop.atr_1_5` | stop floor `1.5 ATR` | Retired: sizing an already-negative directional edge. |
+| `momentum.stop.atr_2_0` | stop floor `2.0 ATR` | Retired: sizing an already-negative directional edge. |
+| `momentum.net_direction.60` | net-direction cap `60%` | Retired: sizing an already-negative directional edge. |
+| `momentum.net_direction.80` | net-direction cap `80%` | Retired: sizing an already-negative directional edge. |
+| `momentum.net_direction.120` | net-direction cap `120%` | Retired: sizing an already-negative directional edge. |
 | `momentum.conf.floor_0_50` | confidence floor `0.50` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
 | `momentum.conf.floor_0_55` | confidence floor `0.55` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
 | `momentum.conf.floor_0_60` | confidence floor `0.60` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
@@ -370,7 +370,8 @@ variant ID; status is the only field that may advance.
 | `momentum.cond.vol_regime` | None; conditioning axis | Does expectancy change sign between volatility compression and expansion? |
 | `momentum.cond.session` | None; conditioning axis | Are thin-liquidity-hour entries disproportionately stop-runs? |
 | `momentum.universe.top_5` | `universe.top_n=5` | Does the edge live in the liquid majors? Registered, not scheduled. |
-| `momentum.universe.top_25` | `universe.top_n=25` | Does the edge live in the tail? Registered, not scheduled. |
+| `momentum.universe.top_25` | `universe.top_n=25` | Superseded: 25 is now the shipped universe. |
+| `momentum.universe.top_10` | `universe.top_n=10` | Does the previous shipped breadth beat 25? Registered, not scheduled. |
 
 The two `momentum.cond.*` rows carry no override on purpose. A conditioning
 axis partitions trades that already exist instead of dividing the sample, so it

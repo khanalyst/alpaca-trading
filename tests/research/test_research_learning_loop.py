@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import sqlite3
 import tempfile
@@ -48,6 +49,14 @@ class ResearchLearningFixture(unittest.TestCase):
             self, scope="demo:learning:feed-v1",
             candidate_id="momentum.rr.fixed_2_5", observations=100):
         candidate = self.registry[candidate_id]
+        # These tests exercise outcome arithmetic, not registry status policy.
+        # The chosen arm was retired on 2026-08-05 live evidence, and a
+        # superseded candidate is disqualified by EXISTING_DISQUALIFYING_GATE
+        # before any verdict is computed, which would mask what is under test.
+        # Status is pinned locally so the arithmetic stays observable;
+        # ExistingDisqualifyingGateTests covers the policy itself.
+        if candidate.status != "candidate":
+            candidate = dataclasses.replace(candidate, status="candidate")
         self.store.register(candidate)
         descriptor = {
             "variant_id": candidate.variant_id,
@@ -409,11 +418,16 @@ class ResearchReviewTests(ResearchLearningFixture):
         }
         if next_selection:
             payload["next_selection"] = {
+                # The stop-width arms were retired on 2026-08-05 live
+                # evidence, and the selector rejects a superseded target, so
+                # a nomination the reviewer can actually have accepted has to
+                # name an arm the registry still schedules.
                 "strategy_id": "momentum",
-                "variant_id": "momentum.stop.atr_1_5",
+                "variant_id": "momentum.hyp.volume_thrust.registered",
                 "reasoning": (
-                    "Test the registered stop-width setting after the current "
-                    "exact variant finished without sufficient evidence."),
+                    "Test the registered participation threshold after the "
+                    "current exact variant finished without sufficient "
+                    "evidence."),
             }
         return json.dumps(payload)
 

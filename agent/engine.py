@@ -3256,30 +3256,53 @@ class Engine:
 
     @staticmethod
     def _plain_levels(value):
-        """Return a JSON-safe executable depth ladder, or None.
+        """Return a JSON-safe executable depth ladder and why it was cut.
 
-        ``_plain`` is intentionally scalar-only.  Order-book depth is the
-        one research field that must retain its two-dimensional shape so the
+        ``_plain`` is intentionally scalar-only. Order-book depth is the one
+        research field that must retain its two-dimensional shape so the
         forward simulator can walk observed prices and contract amounts.
-        Reject the whole ladder when any level is malformed rather than
-        silently changing the executable book.
+
+        Truncating at the first malformed level replaces an earlier rule that
+        discarded the whole ladder. A ladder is ordered outward from the
+        touch, so a valid prefix is a true book that is merely shallower than
+        the one observed: it understates available depth, which is the
+        conservative direction for a simulator deciding whether size could
+        have filled. Discarding it instead produced a data-missing veto, and
+        on the 2026-07-29..08-05 corpus that silently rejected 6,184 of 8,727
+        ladders while the fetch itself never once failed, starving six of
+        seven strategies of 63-100% of their decisions with no error recorded.
+
+        Returns ``(levels, reason)``. ``reason`` is None only when the whole
+        observed ladder survived, so a caller can never mistake a truncated
+        book for a complete one.
         """
         if not isinstance(value, (list, tuple)):
-            return None
-        levels = []
-        for raw in value:
+            return None, f"depth ladder is {type(value).__name__}, not a list"
+        levels: list[list[float]] = []
+        for index, raw in enumerate(value):
+            reason = None
             if not isinstance(raw, (list, tuple)) or len(raw) < 2:
-                return None
-            try:
-                price = float(raw[0])
-                amount = float(raw[1])
-            except (TypeError, ValueError):
-                return None
-            if (not math.isfinite(price) or price <= 0
-                    or not math.isfinite(amount) or amount < 0):
-                return None
+                reason = f"level {index} is not a [price, amount] pair"
+            else:
+                try:
+                    price = float(raw[0])
+                    amount = float(raw[1])
+                except (TypeError, ValueError):
+                    reason = f"level {index} has non-numeric price or amount"
+                else:
+                    if not math.isfinite(price) or price <= 0:
+                        reason = f"level {index} has invalid price {raw[0]!r}"
+                    elif not math.isfinite(amount) or amount < 0:
+                        reason = f"level {index} has invalid amount {raw[1]!r}"
+            if reason is not None:
+                note = f"{reason}; kept {len(levels)} of {len(value)} levels"
+                # Zero surviving levels is not a shallow book, it is no book.
+                # ``missing_fields`` treats only None as absent, so returning
+                # an empty list here would present unusable depth to a
+                # contract as though it were observed.
+                return (levels or None), note
             levels.append([price, amount])
-        return levels
+        return levels, None
 
     def _shadow_cfg(self, spec) -> dict:
         """Config a shadow strategy's contract is evaluated against.
@@ -3477,6 +3500,27 @@ class Engine:
                     "age_seconds": None,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+            # A truncated ladder must say so. The observation error carries
+            # both the exchange-side problem and any depth we could not keep,
+            # so a silently shortened book cannot reach a contract as if it
+            # were the full observed one.
+            bid_levels, bid_cut = self._plain_levels(
+                observed.get("bid_levels"))
+            ask_levels, ask_cut = self._plain_levels(
+                observed.get("ask_levels"))
+
+            def _observed_len(raw) -> int | None:
+                return len(raw) if isinstance(raw, (list, tuple)) else None
+
+            # Coerced, not trusted: ``error`` reaches here from an exchange
+            # response and must never turn an observation into an exception.
+            notes = [
+                str(observed.get("error") or ""),
+                f"bid depth: {bid_cut}" if bid_cut else "",
+                f"ask depth: {ask_cut}" if ask_cut else "",
+            ]
+            observation_error = " | ".join(n for n in notes if n) or None
+
             enrichment = dict(row.get(brain.ENRICHMENT_KEY) or {})
             enrichment.update({
                 "book_mid": self._plain(observed.get("mid")),
@@ -3491,9 +3535,11 @@ class Engine:
                     observed.get("top_bid_size")),
                 "book_top_ask_size": self._plain(
                     observed.get("top_ask_size")),
-                "book_bid_levels": self._plain_levels(
+                "book_bid_levels": bid_levels,
+                "book_ask_levels": ask_levels,
+                "book_bid_levels_observed": _observed_len(
                     observed.get("bid_levels")),
-                "book_ask_levels": self._plain_levels(
+                "book_ask_levels_observed": _observed_len(
                     observed.get("ask_levels")),
                 "book_contract_size": self._plain(
                     observed.get("contract_size")),
@@ -3501,7 +3547,7 @@ class Engine:
                 "book_ts": self._plain(observed.get("book_ts")),
                 "book_age_seconds": self._plain(
                     observed.get("age_seconds")),
-                "book_observation_error": observed.get("error"),
+                "book_observation_error": observation_error,
             })
             row[brain.ENRICHMENT_KEY] = enrichment
 

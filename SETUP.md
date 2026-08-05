@@ -101,7 +101,7 @@ authorize live mode. The complete operating and rollback procedure is in
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
-| `research.forward_feed_version` | `7`; v7 adds the real liquidation flow and pre-registered conditioning axes to the deterministic four-lane fork; three long-horizon models are offline-only; v1-v6 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, and v6 the deterministic four-lane fork |
+| `research.forward_feed_version` | `8`; v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; three long-horizon models are offline-only; v1-v7 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane fork, and v7 the liquidation-flow and conditioning-axis fork |
 | `research.experiment_min_duration_days` | `10` |
 | `research.experiment_min_observations` | `100` |
 | `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |

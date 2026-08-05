@@ -16,7 +16,13 @@ strategy:
   id: momentum
   version: phase1-v3
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
-  allow_experimental_setups_in_demo: false
+  # The three registered hypotheses (volume-thrust, oi-divergence,
+  # basis-stretch) reach the book only through experimental setups. While
+  # this was false they never fired: 3,556 vetoes over 2026-07-29..08-05
+  # read "experimental setups are allowed only in demo mode". Demo is
+  # where they are supposed to be measured, and live mode still refuses
+  # them regardless of this flag.
+  allow_experimental_setups_in_demo: true
   setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
   setup_memory_hours: 72        # bounded operational idempotency history
   loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence
@@ -42,7 +48,12 @@ strategy:
   extended_reward_risk: 4.0
 
 universe:
-  top_n: 10                          # trade only the N highest-volume USDT perpetuals
+  # Signal supply scales with the universe, and every research lane draws
+  # from the same snapshot, so this is the cheapest throughput lever
+  # available. Raised from 10 after seven days produced only 238 paper
+  # trades across seven strategies. Watch cycle duration and OKX rate
+  # limits on the first deploy: each symbol costs one order-book read.
+  top_n: 25                          # trade only the N highest-volume USDT perpetuals
   min_24h_quote_volume_usd: 50000000 # $50m floor before account/category/history checks
   min_history_candles: 60            # required completed bars on every configured timeframe
   denylist: []                       # e.g. ["DOGE/USDT:USDT"]
@@ -156,7 +167,7 @@ research:
   paper_min_closed_trades: 100
   # Increment when executable provenance changes; evidence from different
   # feed versions must never be pooled.
-  forward_feed_version: 7
+  forward_feed_version: 8
   # Assignments require both duration and comparable observations. Validation
   # enforces the minimum duration needed for the confirmation window.
   experiment_min_duration_days: 10

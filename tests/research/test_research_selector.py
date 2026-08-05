@@ -329,7 +329,10 @@ class ResearchSelectorLifecycleTests(unittest.TestCase):
 
     def test_exact_selection_waits_then_assigns_survives_restart_and_tests(self):
         strategy_id = "momentum"
-        selected_variant = "momentum.stop.atr_1_5"
+        # momentum's reward:risk, stop and net-direction arms were retired
+        # on 2026-08-05 live evidence, so a selector target has to be an arm
+        # the registry still schedules.
+        selected_variant = "momentum.hyp.volume_thrust.registered"
         evaluator = self.coordinator.evaluators[strategy_id]
         current = self.store.active_experiment_assignment(
             self.coordinator.scope_key, strategy_id)
