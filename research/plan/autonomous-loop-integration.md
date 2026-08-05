@@ -11,17 +11,59 @@ inputs and are never modified.
 ## The governing constraint
 
 `agent/state.py::code_fingerprint` hashes every `.py` file under `agent/` plus
-`main.py`. Attempt pooling breaks its lineage on any `code_identity_json`
-mismatch, and `forward_feed_version` must fork whenever executable provenance
-changes because evidence from different feed versions is never pooled.
+`main.py`, and it is one of three fields in an assignment's `code_identity`
+alongside `forward_model_id` and `forward_model_assumptions_hash`. The paired
+`config_identity` carries `variant_definition_hash`, `strategy_config_version`
+and `experiment_config`.
 
-Any merge that touches `agent/` or `main.py` during a collection window
-therefore resets accumulated forward evidence. The batch order below settles
-all runtime code first, then opens one collection window and leaves it alone.
+What a runtime-code change actually costs is narrower than "resets the
+evidence", and the distinction decides the batch order:
+
+- completed outcomes are unaffected. `WORKED`, `FAILED` and `INCONCLUSIVE`
+  rows are protected by SQL immutability triggers and no code change can
+  alter them;
+- an assignment still collecting is rejected. On restart the coordinator
+  compares both bundles and calls `reject_experiment_assignment` with
+  "code/config identity changed before assignment completed", so its partial
+  paired observations stop counting toward a verdict;
+- variants the loop generates for itself change nothing. A new hypothesis, a
+  newly registered variant, and a candidate rotating to the next setting are
+  all new immutable identities by construction.
+
+The ceiling is therefore one in-flight assignment per realtime lane, once:
+at the configured floors, up to ten elapsed days and 100 paired observations.
+Only a human editing runtime source triggers it; the autonomous loop never
+does.
+
+The batch order below still settles runtime code before opening a long
+collection window, because paying that cost once at the start is free while
+paying it on day nine is not.
 
 G2 is the exception that makes this workable: its commit touches only
 `research/`, `research.py`, docs and tests, so it can be merged early and
 fixed repeatedly at no cost to evidence identity.
+
+### Fork scope: decided, not narrowed
+
+`strategy_config_version` is already scenario-scoped. It hashes only `llm`,
+`strategy`, `universe`, `cycle`, `risk`, `execution` and `trading_costs`, so
+an alerts webhook or a findings-store path deliberately does not fork it.
+
+`code_version` is deliberately coarser than it needs to be: editing a log
+message forks identity exactly as rewriting the risk engine does. That
+over-inclusion is retained on purpose. A narrower hash would need an
+allowlist, and a wrong exclusion pools incomparable evidence silently, which
+is the one failure mode this system refuses everywhere else. Over-inclusion
+costs an occasional assignment; under-inclusion costs a conclusion that looks
+sound and is not.
+
+The operating rule is a cadence rather than a prohibition: land runtime
+changes in the window just after a rotation completes, so a fork costs a fresh
+assignment instead of a nearly finished one, and accept the one-lap cost
+deliberately when a real fix cannot wait. Splitting the hash into a
+decision-bearing set and a recorded-but-not-identity-bearing set stays
+available if that cadence ever proves insufficient; it is not worth building
+before then.
 
 ## What each source supplies
 
@@ -150,31 +192,39 @@ model client is constructed: first on the account fingerprint, then, once that
 matches, on "authoritative findings DB is missing: ...". Both exit 1 with the
 reason on the final line.
 
-### Batch 5 - code freeze and G2 first contact
+### Batch 5 - integrate to main, then G2 first contact
 
 Operational, not a coding batch.
 
-- [ ] B5.1 Freeze `agent/` and `main.py`
-- [ ] B5.2 Run the demo agent until at least 100 `setup_proposed` events
-- [ ] B5.3 `research.py replay --check-fidelity`
-- [ ] B5.4 Resolve mismatches in `research/replay.py` only; a fix requiring
-      `agent/` restarts the window
-- [ ] B5.5 One clean PASS: zero missing, extra, malformed, duplicate; non-vacuous
+The merge to `main` leads this batch rather than closing the sequence. A G2
+pass has to be produced by the tree that will keep running, so the corpus must
+come from the merged code; collecting it from the integration branch and
+merging afterwards would invalidate the pass it was collected for.
+
+- [x] B5.1 Merge `integration/autonomous-loop` into `main`
+- [ ] B5.2 Deploy `main` and start the demo agent
+- [ ] B5.3 Collect at least 100 `setup_proposed` events. Risk vetoes roughly
+      four fifths of proposals, so this is a matter of days
+- [ ] B5.4 `research.py replay --check-fidelity`
+- [ ] B5.5 Resolve mismatches in `research/replay.py` where possible; a fix
+      that needs `agent/` costs the in-flight assignments and is cheap now
+      precisely because nothing has accumulated yet
+- [ ] B5.6 One clean PASS: zero missing, extra, malformed, duplicate; non-vacuous
 
 Gate: a clean non-vacuous G2 PASS. This is the moment the stack becomes real;
 nothing above layer 1 means anything until it happens.
 
 ### Batch 6 - collection and first promotion
 
-- [ ] B6.1 Merge the integration branch to `main`
-- [ ] B6.2 Run `research/nightly.sh` unattended
-- [ ] B6.3 Hold the code freeze; any `agent/` change costs a feed fork
-- [ ] B6.4 Collect until arms reach the paired-observation floor
-- [ ] B6.5 `forward-qualify` reaches QUALIFIED
-- [ ] B6.6 `prepare-review-artifacts` produces a draft packet
-- [ ] B6.7 Human signs the packet with a reviewer and registry change ref
-- [ ] B6.8 `run --candidate-demo` against a real demo account
-- [ ] B6.9 Confirm the authorization receipt in the journal
+- [ ] B6.1 Run `research/nightly.sh` unattended
+- [ ] B6.2 Land runtime changes in the window after a rotation completes
+      rather than mid-assignment
+- [ ] B6.3 Collect until arms reach the paired-observation floor
+- [ ] B6.4 `forward-qualify` reaches QUALIFIED
+- [ ] B6.5 `prepare-review-artifacts` produces a draft packet
+- [ ] B6.6 Human signs the packet with a reviewer and registry change ref
+- [ ] B6.7 `run --candidate-demo` against a real demo account
+- [ ] B6.8 Confirm the authorization receipt in the journal
 
 Gate: a reviewed packet and a demo candidate run whose receipt is attributable.
 
