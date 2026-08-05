@@ -83,21 +83,42 @@ when the feed genuinely says nothing.
 
 ### Batch 3 - exchange hardening and artifact identity
 
-Depends on an external decision: `7a3c5ee` mixes wired exchange hardening and
-artifact identity with roughly 3,550 lines of subsystem that no production
-path reaches (`research/demo_evidence.py`, `research/exchange_envelope.py`,
+`7a3c5ee` mixed wired exchange hardening and artifact identity with roughly
+3,550 lines of subsystem that no production path reaches
+(`research/demo_evidence.py`, `research/exchange_envelope.py`,
 `agent/exchange_observer.py`) plus an irreversible findings schema 16 -> 19
-migration.
+migration. `_migrate` refuses a downgrade and the tree carries no downgrade
+path, so a store opened once at schema 19 can no longer be opened by schema-16
+code.
 
-- [ ] B3.1 Decide: request a split from codex, merge whole, or drop the
-      unreachable subsystem. Record the decision either way
-- [ ] B3.2 Merge the agreed content
-- [ ] B3.3 Full suite green
-- [ ] B3.4 Bite-test the order-ambiguity paths: a malformed status response
+- [x] B3.1 Decision: split requested and delivered on
+      `codex/batch2-split-ledger`. The ledger is future post-deployment
+      infrastructure with no production driver today, and the T3 plus PAPER
+      promotion path does not require it. Commit A is taken now; commit B
+      (`e017784`) stays unmerged and available
+- [x] B3.2 Cherry-pick `b120f0d`
+- [x] B3.3 Full suite green
+- [x] B3.4 Bite-test the order-ambiguity paths: a malformed status response
       must pause rather than assume a fill
-- [ ] B3.5 Confirm no new unreachable module enters the tree undecided
+- [x] B3.5 Confirm no new unreachable module enters the tree undecided
 
 Gate: suite green and the subsystem decision recorded.
+
+Split verified before use rather than accepted on description: commit A plus
+commit B produces a tree byte-identical to `7a3c5ee`, so the split is
+lossless. Commit A alone carries `SCHEMA_VERSION = 16`, no migrations 17-19,
+none of the three dormant modules, and a single residual observer mention that
+is a comment. The 51 fail-closed order-ambiguity constructs remain.
+
+B3.4 evidence. `verify_fill` was driven with eight malformed or unrecoverable
+exchange responses: a non-string status, an unstructured response, a missing
+order id, an id that does not match the request, a terminal state with no fill
+quantity, a malformed fill quantity, an unstructured info block, and a
+`fetch_order` that raises. All eight raise `OrderSubmissionAmbiguousError`
+with `outcome=fill_ambiguous`; none returns a fill. The engine converts that
+error into `state.set_state(PAUSED, operator_pause=True)`, so the trading loop
+stops and requires an explicit operator resume rather than assuming an
+exchange-side result.
 
 ### Batch 4 - demo promotion gate
 
