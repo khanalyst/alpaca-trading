@@ -164,12 +164,12 @@ identities. Outcome-resolution gaps remain diagnostics rather than proposal
 mismatches. A failed, stale, or vacuous G2 blocks downstream journal evidence
 from being treated as authoritative.
 
-The active research scope is `forward_feed_version: 6`. Feed v6 is the
+The active research scope is `forward_feed_version: 7`. Feed v7 is the
 deterministic four-lane realtime fork; the active analyst's own decisions
 remain in a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v5 remain
 immutable historical evidence. Feed v4 is the market-data plumbing repair feed,
 and feed v5 is the immutable-provenance fork; no older evidence is migrated or
-pooled with v6.
+pooled with v7.
 
 Within each strategy:
 
@@ -189,7 +189,7 @@ coverage is insufficient, two time segments cannot be formed, provenance is
 mixed, or a model/operational check failed.
 
 A `WORKED` outcome saves an immutable `RESEARCH_ONLY` `EDGE_CANDIDATE` lead
-with `promotion_allowed: false`; it does not satisfy the current v6
+with `promotion_allowed: false`; it does not satisfy the current v7
 forward-qualification protocol by itself. Qualification still requires the
 eligible completed assignment attempts, their contemporaneous baselines,
 held-out confirmation, and family correction. The paired cluster sign-flip
@@ -399,7 +399,7 @@ included.
 ./.venv/bin/python research.py report
 ```
 
-`prepare-review-artifacts` considers only variants with current v6
+`prepare-review-artifacts` considers only variants with current v7
 qualification. It fails closed unless persisted edge evidence and every
 non-manual T3 checklist item validate, and it creates only an idempotent,
 immutable/content-addressed `DRAFT_REVIEW_REQUIRED` artifact. It cannot mark
@@ -414,7 +414,7 @@ record and any registry/configuration change remain explicit operator actions.
   `RESEARCH_ONLY` edge evidence.
 - `FAILED`: adequate evidence or a persisted gate showed failure.
 - `INCONCLUSIVE`: evidence cannot support success or failure.
-- `QUALIFIED`: current v6 forward-axis research event, not an order instruction.
+- `QUALIFIED`: current v7 forward-axis research event, not an order instruction.
 - `REVOKED`: that evidence/account window is invalid and must not be reused.
 
 Both positive and negative findings remain in the store. Never infer an edge
@@ -450,7 +450,7 @@ Before deleting or rebuilding the VM:
 | Review deferred | Deterministic outcome is safe; retry `research-loop` later |
 | Tournament benchmark failed | Keep the run as failure evidence; do not interpret rankings |
 | Findings DB missing | Check `research.findings_store`; there is no temporary fallback |
-| All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, feed v5 is the immutable-provenance fork, feed v6 is the deterministic four-lane realtime fork, and all v1-v5 rows remain historical. |
+| All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, feed v5 is the immutable-provenance fork, feed v6 is the deterministic four-lane realtime fork, feed v7 adds the real liquidation flow and conditioning axes, and all v1-v6 rows remain historical. |
 | Trader stopped after Compose update | Expected safe `SIGTERM` pause; run `main.py check`, then explicitly `main.py resume` |
 | Recorder unhealthy | Trader startup remains blocked until a fresh recorder CSV exists |
 | Dashboard unreachable remotely | Expected loopback binding; use an SSH tunnel or private VPN |

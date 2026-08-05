@@ -38,7 +38,7 @@ research:
 | Decision throttle | `cycle.decision_interval_seconds: 300` elapsed seconds (with a 95% jitter tolerance); safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 6`; feed v6 is the deterministic four-lane realtime fork; feeds v1-v5 remain historical (feed v4 is the market-data plumbing repair feed and v5 is the immutable-provenance fork) |
+| Research feed | `forward_feed_version: 7`; feed v7 adds the real liquidation flow and the pre-registered conditioning axes; feeds v1-v6 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, and v6 the deterministic four-lane realtime fork) |
 | Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
 | Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
 | Experiment floor | both 10 elapsed days and 100 comparable paired observations |
@@ -137,7 +137,7 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion. It is an immutable research lead, and current v6 forward
+promotion. It is an immutable research lead, and current v7 forward
 qualification is still required.
 
 The current `forward-qualify` path reconstructs v6 evidence from eligible
@@ -154,7 +154,7 @@ analyst's own decisions remain in a separate `:llm` scope and are never pooled
 with lane evidence. Feeds v1-v5 remain historical and are never migrated or
 pooled; feed v4 remains the market-data plumbing repair feed and v5 the
 immutable-provenance fork. `research.py
-prepare-review-artifacts` runs only after v6 qualification. It
+prepare-review-artifacts` runs only after v7 qualification. It
 fails closed unless the saved edge evidence and every non-manual T3 check
 validate, then idempotently creates an immutable, content-addressed draft
 review artifact. It cannot complete manual review, edit the registry or

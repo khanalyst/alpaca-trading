@@ -75,7 +75,7 @@ semantics. `INSUFFICIENT_SAMPLE` means collection is still open.
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
-| `research.forward_feed_version` | `6`; v6 uses deterministic proposals in four realtime lanes; three long-horizon models are offline-only; v1-v5 remain historical, with v4 the market-data plumbing repair feed and v5 the immutable-provenance fork |
+| `research.forward_feed_version` | `7`; v7 adds the real liquidation flow and pre-registered conditioning axes to the deterministic four-lane fork; three long-horizon models are offline-only; v1-v6 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, and v6 the deterministic four-lane fork |
 | `research.experiment_min_duration_days` | `10` |
 | `research.experiment_min_observations` | `100` |
 | `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |

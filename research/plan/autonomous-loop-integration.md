@@ -63,6 +63,24 @@ Gate: suite green and the liquidation feed confirmed live. Flush-fade now
 requires `liq_notional_1h_usd`; if OKX does not supply it the strategy is
 permanently contract-incomplete and that must be known before collection.
 
+Gate evidence, 2026-08-05, `public/liquidation-orders` against production OKX:
+
+| Instrument | Fills returned | Span | `liq_count_1h` | `liq_notional_1h_usd` |
+| --- | --- | --- | --- | --- |
+| `BTC-USDT-SWAP` | 660 | 23.7h | 0 | 0.00 |
+| `ETH-USDT-SWAP` | 643 | 23.7h | 5 | 16,942.70 |
+| `SOL-USDT-SWAP` | 71 | 23.7h | 0 | 0.00 |
+
+The endpoint rejects `instId` alone with `50015` ("Either parameter uly or
+instFamily is required"), which is why the caller passes `uly` and filters the
+response back down to one instrument.
+
+Liquidations are sparse: two of three instruments had none in the trailing
+hour despite hundreds over the day. A quiet hour reads `0.0`, and
+`missing_fields` treats `0.0` as present while rejecting `None` and `NaN`, so
+flush-fade stays contract-complete through quiet periods and degrades only
+when the feed genuinely says nothing.
+
 ### Batch 3 - exchange hardening and artifact identity
 
 Depends on an external decision: `7a3c5ee` mixes wired exchange hardening and

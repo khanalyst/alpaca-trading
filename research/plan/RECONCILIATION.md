@@ -10,7 +10,7 @@ enforces.
 - Real-time strategy assignments first produce deterministic `WORKED`,
   `FAILED`, or `INCONCLUSIVE` outcomes. `WORKED` is RESEARCH_ONLY and cannot
   change capital or configuration.
-- The active simulator is feed v6: four realtime lanes use deterministic
+- The active simulator is feed v7: four realtime lanes use deterministic
   contract proposals on the same snapshot/timestamp. The registered
   `funding-carry`, `funding-unwind`, and `trend-multiday` models are offline-only.
   The analyst's actual choices remain in a separate `:llm` scope and are not

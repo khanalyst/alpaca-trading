@@ -36,7 +36,7 @@ The active analyst's separate `:llm` scope can hold its own baseline and
 candidate, adding two non-comparable arms. When that sibling is present, the
 runtime maximum is 10 (8 deterministic comparison arms plus 2 LLM-scope arms).
 
-The active realtime simulator identity is `forward_feed_version: 6`. Feed v6
+The active realtime simulator identity is `forward_feed_version: 7`. Feed v7
 uses deterministic contract proposals in four realtime lanes: `momentum`,
 `flush-fade`, `ls-ratio-fade`, and `scalp-maker`. Each lane receives the same
 market snapshot and timestamp and owns independent paper cash, positions, risk
@@ -44,7 +44,7 @@ state, decisions, and trades. `funding-carry`, `funding-unwind`, and
 `trend-multiday` remain registered offline-only models. Only
 `momentum/phase1-v3` is connected to the configured demo order path.
 
-Feeds v1-v5 remain immutable historical rows and must not be pooled with v6
+Feeds v1-v6 remain immutable historical rows and must not be pooled with v7
 outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the
 immutable experiment-provenance fork. The analyst's actual decisions continue
 in the sibling `:llm` scope for planner history; that lane is not comparable
