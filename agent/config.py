@@ -12,6 +12,7 @@ from copy import deepcopy
 
 from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
                        runnable_ids, spec_for)
+from .provider import normalize_provider_endpoint
 
 
 # "none" preserves overlapping breakout and continuation classifications.
@@ -71,11 +72,19 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         raise ConfigError("mode must be exactly 'demo' or 'live'")
 
     llm = _mapping(cfg.get("llm"), "llm")
-    _keys(llm, {"provider", "model", "temperature", "max_tokens"}, "llm")
+    _keys(llm, {"provider", "model", "temperature", "max_tokens",
+                "base_url"}, "llm")
     if llm.get("provider") not in {"anthropic", "openai"}:
         raise ConfigError("llm.provider must be 'anthropic' or 'openai'")
     if not isinstance(llm.get("model"), str) or not llm["model"].strip():
         raise ConfigError("llm.model must be a non-empty string")
+    if "base_url" in llm:
+        if not isinstance(llm["base_url"], str) or not llm["base_url"].strip():
+            raise ConfigError("llm.base_url must be a non-empty URL")
+        try:
+            normalize_provider_endpoint(llm["base_url"], allow_sensitive=False)
+        except ValueError as exc:
+            raise ConfigError("llm.base_url must be an absolute HTTP(S) URL") from exc
     _number(llm, "temperature", 0, 2, "llm")
     _integer(llm, "max_tokens", 128, 32000, "llm")
 

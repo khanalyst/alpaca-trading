@@ -29,7 +29,10 @@ import math
 import sqlite3
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
+
+from research import artifact as artifact_mod
 
 
 DEFAULT_STORE = Path(__file__).resolve().parent / "cache" / "findings.db"
@@ -2622,6 +2625,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+class T3PacketResolutionError(ValueError):
+    """A persisted T3 row is present but no longer content-addressed."""
+
+
 class FindingsStore:
     def __init__(self, path: str | Path = DEFAULT_STORE) -> None:
         self.path = Path(path)
@@ -4318,12 +4325,26 @@ class FindingsStore:
             raise ValueError(
                 f"unknown forward analysis {source_analysis_id!r}")
         payload = cls._analysis_payload(row)
-        source = payload.get("source_evidence") or {}
+        if not isinstance(payload, Mapping):
+            raise ValueError("forward analysis payload is not a mapping")
+        source = payload.get("source_evidence")
+        if not isinstance(source, Mapping):
+            raise ValueError("forward analysis source evidence is not a mapping")
         if source.get("schema") != "paper_decision_evidence.v3":
             raise ValueError(
                 "edge qualification requires assignment-scoped forward "
                 "evidence v3")
-        eligibility = source.get("eligibility") or {}
+        eligibility = source.get("eligibility")
+        if not isinstance(eligibility, Mapping):
+            raise ValueError("forward analysis eligibility is not a mapping")
+        setting_provenances = eligibility.get("setting_provenances")
+        if not isinstance(setting_provenances, Mapping):
+            raise ValueError(
+                "forward analysis setting provenances are not a mapping")
+        baseline_provenance = eligibility.get("baseline_provenance")
+        if not isinstance(baseline_provenance, Mapping):
+            raise ValueError(
+                "forward analysis baseline provenance is not a mapping")
         model = require_complete_contract(str(variant["strategy_id"]))
         if (eligibility.get("code_version")
                 != runtime_state.code_fingerprint()
@@ -4334,10 +4355,13 @@ class FindingsStore:
                 "forward analysis is not current-code/current-model evidence")
         current_provenances = {
             str(source.get("baseline_id") or ""):
-                eligibility.get("baseline_provenance"),
-            **dict(eligibility.get("setting_provenances") or {}),
+                baseline_provenance,
+            **dict(setting_provenances),
         }
         for current_variant_id, expected_provenance in current_provenances.items():
+            if not isinstance(expected_provenance, Mapping):
+                raise ValueError(
+                    "forward analysis portfolio provenance is not a mapping")
             portfolio = conn.execute(
                 "SELECT state_json FROM paper_portfolios WHERE scope_key=? "
                 "AND variant_id=?", (scope_key, current_variant_id)).fetchone()
@@ -4346,6 +4370,8 @@ class FindingsStore:
                     "forward analysis portfolio provenance is unavailable")
             state = json.loads(portfolio["state_json"])
             current_variant = cls._require_variant(conn, current_variant_id)
+            if not isinstance(state, Mapping):
+                raise ValueError("forward analysis portfolio state is malformed")
             observed = cls._validate_experiment_provenance(
                 current_variant, state.get("experiment_provenance") or {})
             if observed != expected_provenance or state.get("status") == "REVOKED":
@@ -4721,6 +4747,8 @@ class FindingsStore:
         from research import protocol
 
         try:
+            if not isinstance(payload, Mapping):
+                return False
             if payload.get("variant_id") != variant_id:
                 return False
             scope_key = str(payload.get("scope_key") or "")
@@ -4730,26 +4758,51 @@ class FindingsStore:
                 conn, variant_id, scope_key)
             if qualification is None or qualification["status"] != "QUALIFIED":
                 return False
-            supplied_qualification = payload.get("qualification") or {}
+            supplied_qualification = payload.get("qualification")
+            if not isinstance(supplied_qualification, Mapping):
+                return False
+            for field in ("detail", "family"):
+                value = supplied_qualification.get(field)
+                if value is not None and not isinstance(value, Mapping):
+                    return False
             if supplied_qualification.get("event_id") != qualification["event_id"]:
                 return False
             analysis_id = str(qualification["source_analysis_id"] or "")
             source_payload = cls._validated_forward_analysis(
                 conn, variant_id, analysis_id, scope_key)
             qualification_detail = json.loads(qualification["detail_json"])
+            if not isinstance(qualification_detail, Mapping):
+                return False
             cls._validated_family_correction(
                 conn, variant_id, analysis_id, scope_key,
                 qualification_detail, source_payload)
-            supplied_analysis = payload.get("forward_analysis") or {}
+            supplied_analysis = payload.get("forward_analysis")
+            if not isinstance(supplied_analysis, Mapping):
+                return False
             if supplied_analysis.get("analysis_id") != analysis_id:
                 return False
-            source_evidence = source_payload.get("source_evidence") or {}
-            selected_setting = (
-                (source_evidence.get("settings") or {}).get(variant_id) or {})
+            supplied_analysis_payload = supplied_analysis.get("payload")
+            if (not isinstance(supplied_analysis_payload, Mapping)
+                    or _canonical_json(supplied_analysis_payload)
+                    != _canonical_json(source_payload)):
+                return False
+            source_evidence = source_payload.get("source_evidence")
+            if not isinstance(source_evidence, Mapping):
+                return False
+            settings = source_evidence.get("settings")
+            if not isinstance(settings, Mapping):
+                return False
+            selected_setting = settings.get(variant_id)
+            if not isinstance(selected_setting, Mapping):
+                return False
+            assignments = selected_setting.get("assignments")
+            if (not isinstance(assignments, list)
+                    or not all(isinstance(item, Mapping)
+                               for item in assignments)):
+                return False
             assignment_ids = {
                 str(item.get("assignment_id") or "")
-                for item in selected_setting.get("assignments") or []
-                if isinstance(item, dict) and item.get("assignment_id")}
+                for item in assignments if item.get("assignment_id")}
             if not assignment_ids:
                 return False
             placeholders = ",".join("?" for _ in assignment_ids)
@@ -4759,8 +4812,12 @@ class FindingsStore:
                 "ORDER BY created_ts, edge_id",
                 (scope_key, variant_id, *sorted(assignment_ids))).fetchall()
             expected_edges = [cls._edge_candidate_dict(row) for row in edge_rows]
-            if (not expected_edges
-                    or _canonical_json(payload.get("edge_candidates") or [])
+            edge_candidates = payload.get("edge_candidates")
+            if (not isinstance(edge_candidates, list)
+                    or not all(isinstance(item, Mapping)
+                               for item in edge_candidates)
+                    or not expected_edges
+                    or _canonical_json(edge_candidates)
                     != _canonical_json(expected_edges)):
                 return False
 
@@ -4771,6 +4828,8 @@ class FindingsStore:
             if portfolio is None:
                 return False
             state = json.loads(portfolio["state_json"])
+            if not isinstance(state, Mapping):
+                return False
             paper_started = state.get("paper_started_ts")
             if (state.get("status") != "PAPER" or paper_started is None
                     or state.get("revoked_reason")):
@@ -4786,8 +4845,18 @@ class FindingsStore:
                     or float(paper["expectancy"]) <= 0):
                 return False
 
-            g2 = payload.get("g2") or {}
-            provenance = payload.get("current_provenance") or {}
+            g2 = payload.get("g2")
+            provenance = payload.get("current_provenance")
+            paper_result = payload.get("paper_result")
+            if (not isinstance(g2, Mapping)
+                    or not isinstance(provenance, Mapping)
+                    or (paper_result is not None
+                        and not isinstance(paper_result, Mapping))):
+                return False
+            malformed_reasons = g2.get("malformed_reasons")
+            if (malformed_reasons is not None
+                    and not isinstance(malformed_reasons, Mapping)):
+                return False
             if g2.get("status") != "PASS":
                 return False
             if (g2.get("strategy_config_version")
@@ -4796,18 +4865,156 @@ class FindingsStore:
             if (g2.get("fidelity_code_version")
                     != provenance.get("fidelity_code_version")):
                 return False
+
+            # A reviewed packet must bind the exact executable artifact that
+            # produced its evidence.  This check is deliberately additive:
+            # historical packets without a manifest remain readable, but are
+            # unbound and can never be promoted to REVIEWED.
+            manifest = payload.get("artifact_manifest")
+            artifact_hash = payload.get("artifact_hash")
+            if (not isinstance(manifest, Mapping)
+                    or not isinstance(artifact_hash, str)):
+                return False
+            if (payload.get("variant_id") != variant_id
+                    or manifest.get("variant_id") != variant_id):
+                return False
+            from agent import state as runtime_state
+            variant = cls._require_variant(conn, variant_id)
+            eligibility = source_evidence.get("eligibility")
+            if not isinstance(eligibility, Mapping):
+                return False
+            setting_provenances = eligibility.get("setting_provenances")
+            if not isinstance(setting_provenances, Mapping):
+                return False
+            candidate_provenance = setting_provenances.get(variant_id)
+            if not isinstance(candidate_provenance, Mapping):
+                return False
+            candidate_config = candidate_provenance.get("experiment_config")
+            if not isinstance(candidate_config, Mapping):
+                return False
+            candidate_strategy = candidate_config.get("strategy")
+            candidate_llm = candidate_config.get("llm")
+            if (not isinstance(candidate_strategy, Mapping)
+                    or not isinstance(candidate_llm, Mapping)):
+                return False
+            candidate_definition = _variant_identity(variant)
+            candidate_definition_hash = variant_identity_hash(variant)
+            if (candidate_provenance.get("variant_definition_hash")
+                    != candidate_definition_hash
+                    or str(candidate_strategy.get("id") or "")
+                    != str(variant["strategy_id"])
+                    or str(candidate_strategy.get("version") or "")
+                    != str(variant["base_version"])):
+                return False
+            optional_provenance = {
+                "strategy_id": str(variant["strategy_id"]),
+                "strategy_version": str(variant["base_version"]),
+                "validated_config_hash": artifact_mod.sha256_json(
+                    candidate_config),
+                "deployment_config_hash": runtime_state.deployment_config_hash(
+                    candidate_config),
+                "llm_endpoint": artifact_mod.provider_endpoint_identity(
+                    candidate_llm.get("provider"), candidate_llm),
+                "llm_endpoint_hash": artifact_mod.provider_endpoint_hash(
+                    candidate_llm.get("provider"), candidate_llm),
+                "variant_definition": candidate_definition,
+            }
+            for name, expected_value in optional_provenance.items():
+                supplied_value = candidate_provenance.get(name)
+                if (supplied_value is not None
+                        and supplied_value != expected_value):
+                    return False
+            expected_artifact = {
+                "strategy_id": str(variant["strategy_id"]),
+                "strategy_version": str(variant["base_version"]),
+                "variant_id": str(variant_id),
+                "variant_definition_hash": candidate_definition_hash,
+                "strategy_config_version": candidate_provenance.get(
+                    "strategy_config_version"),
+                "forward_model_id": candidate_provenance.get(
+                    "forward_model_id"),
+                "forward_model_assumptions_hash": candidate_provenance.get(
+                    "forward_model_assumptions_hash"),
+                "deployment_config_hash": runtime_state.deployment_config_hash(
+                    candidate_provenance.get("experiment_config") or {}),
+                "llm_endpoint": artifact_mod.provider_endpoint_identity(
+                    candidate_llm.get("provider"), candidate_llm),
+                "llm_endpoint_hash": artifact_mod.provider_endpoint_hash(
+                    candidate_llm.get("provider"), candidate_llm),
+            }
+            if (_canonical_json(manifest.get("variant_definition") or {})
+                    != _canonical_json(candidate_definition)):
+                return False
+            candidate_config_hash = artifact_mod.sha256_json(candidate_config)
+            candidate_deployment_hash = runtime_state.deployment_config_hash(
+                candidate_config)
+            if (manifest.get("validated_config_hash") != candidate_config_hash
+                    or manifest.get("deployment_config_hash")
+                    != candidate_deployment_hash
+                    or candidate_provenance.get("strategy_config_version")
+                    != manifest.get("strategy_config_version")
+                    or candidate_provenance.get("forward_model_id")
+                    != manifest.get("forward_model_id")
+                    or candidate_provenance.get(
+                        "forward_model_assumptions_hash")
+                    != manifest.get("forward_model_assumptions_hash")):
+                return False
+            from agent import brain, variants as runtime_variants
+            from agent.forward_models import require_complete_contract
+            forward_model = require_complete_contract(str(variant["strategy_id"]))
+            prompt_catalog = runtime_variants.research_selection_catalog()
+            prompt_text = brain.build_system(
+                candidate_config, catalog=prompt_catalog)
+            expected_prompt_hash = artifact_mod.sha256_text(prompt_text)
+            expected_prompt_inputs_hash = artifact_mod.sha256_json({
+                "catalog": prompt_catalog,
+                "strategy": candidate_config.get("strategy") or {},
+            })
+            llm = candidate_llm
+            if (manifest.get("prompt_hash") != expected_prompt_hash
+                    or manifest.get("prompt_inputs_hash")
+                    != expected_prompt_inputs_hash
+                    or manifest.get("llm_provider") != llm.get("provider")
+                    or manifest.get("llm_model") != llm.get("model")):
+                return False
+            expected_deployment_hash = candidate_deployment_hash
+            if manifest.get("deployment_config_hash") != expected_deployment_hash:
+                return False
+            # These are the current packet inputs, not live research/data
+            # gates.  A mismatch means the caller assembled a mixed packet.
+            for name in (
+                    "validated_config_hash", "runtime_source_hash",
+                    "artifact_strategy_config_version",
+                    "variant_definition_hash", "forward_model_id",
+                    "forward_model_assumptions_hash",
+                    "deployment_config_hash", "llm_endpoint",
+                    "llm_endpoint_hash"):
+                manifest_name = (
+                    "strategy_config_version"
+                    if name == "artifact_strategy_config_version" else name)
+                if provenance.get(name) != manifest.get(manifest_name):
+                    return False
+            artifact_mod.validate_manifest(
+                manifest, artifact_hash, config=candidate_config,
+                deployment_config_hash=expected_deployment_hash,
+                expected=expected_artifact,
+                forward_model=forward_model.as_dict())
             return True
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        except (AttributeError, KeyError, TypeError, ValueError,
+                json.JSONDecodeError):
             return False
 
     def create_t3_packet(
             self, variant_id: str, payload: dict, *, reviewed_by: str = "",
             registry_change_ref: str = "") -> str:
+        if not isinstance(payload, Mapping):
+            raise ValueError("T3 packet payload must be a mapping")
         with _connect(self.path) as conn:
             self._require_variant(conn, variant_id)
-            checklist = payload.get("checklist") or {}
+            checklist = payload.get("checklist")
             complete = (
-                T3_REQUIRED_CHECKS.issubset(checklist)
+                isinstance(checklist, Mapping)
+                and T3_REQUIRED_CHECKS.issubset(checklist)
                 and all(bool(checklist[key]) for key in T3_REQUIRED_CHECKS)
                 and self._t3_evidence_is_backed_by_store(
                     conn, variant_id, payload))
@@ -4841,17 +5048,88 @@ class FindingsStore:
             return self._t3_evidence_is_backed_by_store(
                 conn, variant_id, payload)
 
+    @staticmethod
+    def _decode_t3_packet_row(row: sqlite3.Row) -> dict:
+        """Decode one packet and fail if its immutable envelope was tampered."""
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise T3PacketResolutionError(
+                f"T3 packet {row['packet_id']} has invalid payload JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise T3PacketResolutionError(
+                f"T3 packet {row['packet_id']} payload is not a mapping")
+        canonical, payload_hash = _t3_canonical(
+            str(row["variant_id"]), payload, str(row["review_status"]),
+            row["reviewed_by"], row["registry_change_ref"])
+        if (canonical != str(row["payload_json"])
+                or payload_hash != str(row["payload_hash"])):
+            raise T3PacketResolutionError(
+                f"T3 packet {row['packet_id']} failed its content hash")
+        row_variant_id = str(row["variant_id"])
+        payload_variant_id = payload.get("variant_id")
+        if (payload_variant_id is not None
+                and payload_variant_id != row_variant_id):
+            raise T3PacketResolutionError(
+                f"T3 packet {row['packet_id']} row and payload variants differ")
+        manifest = payload.get("artifact_manifest")
+        if manifest is not None and not isinstance(manifest, Mapping):
+            # Keep malformed packets readable as drafts, but never treat them
+            # as artifact-bound authorization.
+            artifact_bound = False
+        else:
+            artifact_bound = bool(
+                isinstance(manifest, Mapping)
+                and isinstance(payload.get("artifact_hash"), str))
+            if (artifact_bound and (payload_variant_id != row_variant_id
+                                    or manifest.get("variant_id")
+                                    != row_variant_id)):
+                raise T3PacketResolutionError(
+                    f"T3 packet {row['packet_id']} row and manifest variants differ")
+        content_addressed = str(row["packet_id"]) == payload_hash[:32]
+        if artifact_bound and not content_addressed:
+            raise T3PacketResolutionError(
+                f"T3 packet {row['packet_id']} has a forged packet id")
+        item = dict(row)
+        item.pop("payload_json", None)
+        item["artifact_bound"] = artifact_bound
+        item["content_addressed"] = content_addressed
+        item["payload"] = payload
+        return item
+
+    def resolve_t3_packet(self, packet_ref: str) -> dict | None:
+        """Resolve a packet id or full payload hash from the authoritative store.
+
+        A ``t3-packet:`` prefix is accepted for registry citations.  Missing
+        rows return ``None``; a present row whose canonical envelope no longer
+        matches its persisted hash raises ``T3PacketResolutionError``.
+        """
+        reference = str(packet_ref or "")
+        if reference.startswith("t3-packet:"):
+            reference = reference[len("t3-packet:"):]
+        if not reference:
+            return None
+        with _connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT * FROM t3_evidence_packets WHERE packet_id=? "
+                "OR payload_hash=? ORDER BY packet_id LIMIT 1",
+                (reference, reference)).fetchone()
+        return self._decode_t3_packet_row(row) if row is not None else None
+
+    def t3_packet_by_id(self, packet_id: str) -> dict | None:
+        """Authoritatively resolve a packet's stored short id."""
+        return self.resolve_t3_packet(packet_id)
+
+    def t3_packet_by_hash(self, payload_hash: str) -> dict | None:
+        """Authoritatively resolve a packet's full payload hash."""
+        return self.resolve_t3_packet(payload_hash)
+
     def t3_packets_for(self, variant_id: str) -> list:
         with _connect(self.path) as conn:
             rows = conn.execute(
                 "SELECT * FROM t3_evidence_packets WHERE variant_id=? "
                 "ORDER BY created_ts", (variant_id,)).fetchall()
-        out = []
-        for row in rows:
-            item = dict(row)
-            item["payload"] = json.loads(item.pop("payload_json"))
-            out.append(item)
-        return out
+        return [self._decode_t3_packet_row(row) for row in rows]
 
     # Variants
 

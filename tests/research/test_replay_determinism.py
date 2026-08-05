@@ -361,6 +361,23 @@ class PortfolioStateTests(unittest.TestCase):
         self.assertTrue(all(d.outcome for d in executed))
         self.assertTrue(all(d.outcome["exit_ts"] for d in executed))
 
+    def test_no_data_outcome_is_unresolved_and_not_zero_r(self):
+        class EmptyCache:
+            @staticmethod
+            def bars(symbol, start_ms, end_ms):
+                return []
+
+        cfg = valid_config()
+        result = replay.Replay(
+            cfg, mode="recorded_llm", price_cache=EmptyCache()).run(
+                [cycle(0)], [model_output(0, [open_decision()])])
+        executed = result.executed()
+        self.assertTrue(executed)
+        self.assertEqual(executed[0].outcome["result"], "no_data")
+        self.assertIsNone(executed[0].outcome["r_multiple"])
+        self.assertEqual(
+            result.state_diagnostics["transitions"]["outcomes_unresolved"], 1)
+
 
 def funnel_upper_bound(cycles) -> int:
     return sum(len(c.symbols()) for c in cycles)

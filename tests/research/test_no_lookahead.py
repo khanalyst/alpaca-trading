@@ -85,6 +85,11 @@ class NoLookaheadTests(unittest.TestCase):
             resolve(plan(entry_ts=entry_ts), [first_post_entry]).result,
             "no_data")
 
+    def test_reversed_bars_are_rejected_instead_of_silently_sorted(self):
+        bars = [bar(1, 101.0, 99.0), bar(0, 101.0, 99.0)]
+        with self.assertRaises(LookaheadError):
+            resolve(plan(), bars)
+
 
 class GoldenPathTests(unittest.TestCase):
     """A hand-built price path with three known outcomes."""

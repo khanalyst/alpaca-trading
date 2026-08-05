@@ -54,6 +54,28 @@ class FidelityFixture(unittest.TestCase):
         conn.commit()
         conn.close()
 
+    def record_modern(self, decision, *, ts: float = 1.0) -> None:
+        """Record the full proposal-stage identity used by current G2."""
+        payload = {
+            "symbol": decision.symbol,
+            "direction": decision.direction,
+            "setup_type": decision.setup_type,
+            "setup_id": decision.proposal_id,
+            "setup_key": decision.setup_key,
+            "signal_ts": decision.signal_ts,
+            "strategy_id": decision.strategy_id or "momentum",
+            "strategy_version": decision.strategy_version or "phase1-v3",
+            "variant_id": "live",
+            "cycle_id": decision.cycle_id,
+        }
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?)",
+            (ts, "setup_proposed", json.dumps(payload), "run-a",
+             decision.cycle_id, decision.proposal_id))
+        conn.commit()
+        conn.close()
+
     def replay_baseline(self, cycles, outputs):
         return replay.Replay(
             valid_config(), variant_id="momentum.baseline",
@@ -86,9 +108,12 @@ class ReproductionTests(FidelityFixture):
         outputs = [model_output(i, [open_decision()]) for i in range(4)]
         result = self.replay_baseline(cycles, outputs)
 
-        for decision in result.executed():
-            self.record(decision.cycle_id, decision.symbol,
-                        decision.direction)
+        # G2 compares the contract boundary, which includes risk-vetoed
+        # proposals.  Record every contract-passed decision, not executions
+        # alone; the latter would manufacture a false extra mismatch.
+        for decision in result.decisions:
+            if decision.contract_passed:
+                self.record_modern(decision)
 
         report = replay.fidelity(result, self.db)
 
@@ -144,11 +169,28 @@ class ReproductionTests(FidelityFixture):
         self.assertFalse(report["passes_g2"])
         self.assertLess(report["reproduction_rate"], 0.99)
 
-    def test_ninety_nine_percent_passes_the_gate(self):
+    def test_replay_corpus_appended_after_run_cannot_certify_pass(self):
+        """A replay is bound to the corpus fingerprint captured before it ran."""
+        result = self._synthetic(1, 0)
+        captured = replay.g2_evidence_metadata(self.db)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (2.0, "llm_input", json.dumps({"decision": "hold"}),
+                 "run-a", "hold-cycle", None))
+
+        report = replay.fidelity(
+            result, self.db, captured_metadata=captured)
+
+        self.assertFalse(report["passes_g2"])
+        self.assertTrue(report["capture_stale"])
+        self.assertIn("replay corpus", report["capture_stale_reason"])
+
+    def test_ninety_nine_percent_fails_exact_gate(self):
         report = replay.fidelity(self._synthetic(99, 1), self.db)
 
         self.assertAlmostEqual(report["reproduction_rate"], 0.99, 6)
-        self.assertTrue(report["passes_g2"])
+        self.assertFalse(report["passes_g2"])
 
     def test_ninety_eight_percent_fails_the_gate(self):
         report = replay.fidelity(self._synthetic(98, 2), self.db)
@@ -163,7 +205,7 @@ class ReproductionTests(FidelityFixture):
 
         report = replay.fidelity(result, self.db)
 
-        self.assertTrue(report["passes_g2"])
+        self.assertFalse(report["passes_g2"])
         self.assertEqual(report["recorded"], 0)
 
     def test_the_report_lists_specific_mismatches_for_explanation(self):
@@ -292,7 +334,7 @@ class VacuousGateTests(FidelityFixture):
         """A caller reading passes_g2 alone would be misled, so both exist."""
         empty = replay.fidelity(self.replay_baseline([], []), self.db)
 
-        self.assertTrue(empty["passes_g2"])
+        self.assertFalse(empty["passes_g2"])
         self.assertTrue(empty["vacuous"],
                         "the gate must expose that it checked nothing")
 
@@ -361,3 +403,188 @@ class ComparisonStageTests(FidelityFixture):
                                if d.stage == "executed"])
         self.assertLess(executions_only / 206, 0.99,
                         "comparing against executions alone would fail G2")
+
+
+class StrictIdentityTests(FidelityFixture):
+    """Current journals use the full proposal identity at the G2 boundary."""
+
+    def record_modern(self, cycle_id="c1", *, setup_type="trend_continuation",
+                      setup_id="setup-1", setup_key="key-1",
+                      variant_id="live", signal_ts=100, ts=1.0):
+        payload = {
+            "symbol": "BTC/USDT:USDT", "direction": "long",
+            "setup_type": setup_type, "setup_id": setup_id,
+            "setup_key": setup_key, "signal_ts": signal_ts,
+            "strategy_id": "momentum", "strategy_version": "v1",
+            "variant_id": variant_id,
+        }
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (ts, "setup_proposed", json.dumps(payload), "run-a",
+                 cycle_id, setup_id))
+            # The fixture's legacy schema does not expose context columns;
+            # payload identity remains authoritative for this regression.
+            conn.commit()
+
+    def decision(self, *, cycle_id="c1", setup_type="trend_continuation",
+                 setup_id="setup-1", setup_key="key-1", signal_ts=100):
+        return replay.ReplayDecision(
+            cycle_id=cycle_id, ts=1.0, symbol="BTC/USDT:USDT",
+            signal_ts=signal_ts, stage="vetoed", direction="long",
+            setup_type=setup_type, proposal_id=setup_id,
+            strategy_id="momentum", strategy_version="v1",
+            setup_key=setup_key, contract_passed=True)
+
+    def test_setup_type_change_does_not_collapse_to_same_key(self):
+        self.record_modern()
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm",
+            decisions=[self.decision(setup_type="range_breakout")],
+            strategy_id="momentum", strategy_version="v1")
+        report = replay.fidelity(result, self.db)
+        self.assertEqual(report["missing_count"], 1)
+        self.assertEqual(report["extra_count"], 1)
+        self.assertFalse(report["passes_g2"])
+
+    def test_live_and_baseline_variant_aliases_match(self):
+        self.record_modern()
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm",
+            decisions=[self.decision()], strategy_id="momentum",
+            strategy_version="v1")
+        report = replay.fidelity(result, self.db)
+        self.assertTrue(report["passes_g2"])
+
+    def test_hyphenated_strategy_uses_registry_safe_baseline_alias(self):
+        common = {
+            "cycle_id": "c1", "symbol": "BTC/USDT:USDT",
+            "direction": "long", "strategy_id": "flush-fade",
+            "strategy_version": "v1", "setup_id": "setup-1",
+            "setup_key": "key-1", "setup_type": "trend",
+            "signal_ts": 100,
+        }
+        safe = replay.canonical_proposal_identity(
+            {**common, "variant_id": "flush_fade.baseline"})
+        candidate = replay.canonical_proposal_identity(
+            {**common, "variant_id": "flush_fade.other"})
+        self.assertEqual(safe[3], "baseline")
+        self.assertNotEqual(candidate[3], "baseline")
+
+    def test_duplicate_and_malformed_rows_fail_closed(self):
+        self.record_modern()
+        self.record_modern()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (2.0, "setup_proposed", "not-json", "run-a", "c2",
+                 "setup-2"))
+        result = replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm",
+            decisions=[self.decision()], strategy_id="momentum",
+            strategy_version="v1")
+        report = replay.fidelity(result, self.db)
+        self.assertEqual(report["duplicate_count"], 1)
+        self.assertGreaterEqual(report["malformed_count"], 1)
+        self.assertFalse(report["passes_g2"])
+
+
+class ModernBoundaryTests(StrictIdentityTests):
+    """Legacy rows are readable, but never dilute modern strict evidence."""
+
+    def _result(self, *decisions):
+        return replay.ReplayResult(
+            variant_id="momentum.baseline", mode="recorded_llm",
+            decisions=list(decisions), strategy_id="momentum",
+            strategy_version="v1")
+
+    def test_legacy_only_corpus_remains_compatible(self):
+        self.record("legacy-1", "BTC/USDT:USDT", "long")
+        result = self._result(replay.ReplayDecision(
+            cycle_id="legacy-1", ts=1.0, symbol="BTC/USDT:USDT",
+            signal_ts=None, stage="vetoed", direction="long",
+            contract_passed=True))
+
+        report = replay.fidelity(result, self.db)
+
+        self.assertTrue(report["passes_g2"])
+        self.assertTrue(report["legacy_identity"])
+        self.assertEqual(report["legacy_excluded_count"], 0)
+        self.assertIsNone(report["modern_boundary_ts"])
+
+    def test_legacy_before_modern_is_excluded_from_strict_evidence(self):
+        self.record("legacy-1", "BTC/USDT:USDT", "long", ts=1.0)
+        self.record_modern(cycle_id="c1", ts=2.0)
+
+        report = replay.fidelity(self._result(self.decision()), self.db)
+
+        self.assertTrue(report["passes_g2"])
+        self.assertFalse(report["legacy_identity"])
+        self.assertEqual(report["legacy_excluded_count"], 1)
+        self.assertEqual(report["modern_evidence_count"], 1)
+        self.assertEqual(report["modern_boundary_ts"], 2.0)
+
+    def test_legacy_after_modern_fails_closed(self):
+        self.record_modern(cycle_id="c1", ts=1.0)
+        self.record("legacy-2", "BTC/USDT:USDT", "long", ts=2.0)
+
+        report = replay.fidelity(self._result(self.decision()), self.db)
+
+        self.assertFalse(report["passes_g2"])
+        self.assertEqual(report["legacy_after_boundary_count"], 1)
+        self.assertEqual(report["malformed_reasons"]
+                         ["legacy_after_modern_boundary"], 1)
+
+    def test_late_appended_legacy_row_fails_even_with_older_timestamp(self):
+        self.record_modern(cycle_id="c1", ts=10.0)
+        self.record("legacy-2", "BTC/USDT:USDT", "long", ts=1.0)
+
+        report = replay.fidelity(self._result(self.decision()), self.db)
+
+        self.assertEqual(report["modern_boundary_rowid"], 1)
+        self.assertEqual(report["legacy_after_boundary_count"], 1)
+        self.assertFalse(report["passes_g2"])
+
+    def test_post_boundary_replay_extra_still_fails(self):
+        self.record("legacy-1", "BTC/USDT:USDT", "long", ts=1.0)
+        self.record_modern(cycle_id="c1", ts=2.0)
+        extra = self.decision(cycle_id="c2", setup_id="setup-2",
+                              setup_key="key-2", signal_ts=200)
+
+        report = replay.fidelity(
+            self._result(self.decision(), extra), self.db)
+
+        self.assertEqual(report["legacy_excluded_count"], 1)
+        self.assertEqual(report["extra_count"], 1)
+        self.assertFalse(report["passes_g2"])
+
+    def test_pre_boundary_replay_is_ignored_but_post_boundary_hold_is_extra(self):
+        # The pre-boundary model input was appended before the legacy proposal;
+        # the later HOLD cycle has no setup proposal and must remain visible.
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT INTO events (ts, kind, payload, run_id, cycle_id, setup_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (1.0, "llm_input", "{}", "run-a", "legacy-cycle", None))
+        self.record("legacy-cycle", "BTC/USDT:USDT", "long", ts=2.0)
+        self.record_modern(cycle_id="modern-cycle", ts=3.0)
+        with sqlite3.connect(self.db) as conn:
+            conn.executemany(
+                "INSERT INTO events (ts, kind, payload, run_id, cycle_id, setup_id) "
+                "VALUES (?,?,?,?,?,?)", [
+                    (4.0, "llm_input", "{}", "run-a", "modern-cycle", None),
+                    (5.0, "llm_input", "{}", "run-a", "hold-cycle", None),
+                ])
+        modern = self.decision(cycle_id="modern-cycle")
+        pre_boundary = self.decision(cycle_id="legacy-cycle",
+                                     setup_id="legacy-setup",
+                                     setup_key="legacy-key", signal_ts=99)
+        hold = self.decision(cycle_id="hold-cycle", setup_id="hold-setup",
+                             setup_key="hold-key", signal_ts=200)
+
+        matched = replay.fidelity(self._result(modern, pre_boundary), self.db)
+        self.assertTrue(matched["passes_g2"])
+
+        extra = replay.fidelity(self._result(modern, hold), self.db)
+        self.assertEqual(extra["extra_count"], 1)
+        self.assertFalse(extra["passes_g2"])

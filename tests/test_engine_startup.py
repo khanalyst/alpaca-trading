@@ -67,6 +67,78 @@ class EngineStartupTests(unittest.TestCase):
         second = self._build(cfg).prompt_version
         self.assertNotEqual(first, second)
 
+    def test_live_artifact_gate_runs_before_external_clients(self):
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        events = []
+        with patch("agent.engine.deployment.verify_live_artifact",
+                   side_effect=lambda *args, **kwargs: (
+                       events.append("gate")
+                       or (_ for _ in ()).throw(
+                           RuntimeError("missing reviewed packet")))), \
+             patch("agent.engine.AlertManager",
+                   side_effect=lambda *_args, **_kwargs: events.append("alert")), \
+             patch("agent.engine.Exchange",
+                   side_effect=lambda *_args, **_kwargs: events.append("exchange")), \
+             patch("agent.engine.brain.LLM",
+                   side_effect=lambda *_args, **_kwargs: events.append("llm")), \
+             patch("agent.engine.state.configure_runtime"), \
+             patch("agent.engine.state.bind_runtime_identity"), \
+             patch("agent.engine.state.new_run_id", return_value="run-test"), \
+             patch("agent.engine.state.stable_fingerprint",
+                   return_value="cfg-test"), \
+             patch("agent.engine.state.code_fingerprint",
+                   return_value="code-test"):
+            from agent.engine import Engine
+            with self.assertRaisesRegex(RuntimeError, "missing reviewed packet"):
+                Engine(cfg)
+        self.assertEqual(events, ["gate"])
+
+    def test_live_llm_receives_the_verified_catalog_and_system(self):
+        cfg = valid_config()
+        cfg["mode"] = "live"
+        catalog = {"momentum": ()}
+        artifact = {
+            "packet_id": "packet-id", "artifact_hash": "a" * 64,
+            "payload_hash": "e" * 64,
+            "variant_id": "momentum.baseline",
+            "variant_definition_hash": "b" * 64,
+            "artifact_strategy_config_version": "c" * 16,
+            "deployment_config_hash": "d" * 64,
+        }
+        llm = MagicMock()
+        with patch("agent.engine.deployment.verify_live_artifact",
+                   return_value=artifact) as verify, \
+             patch("agent.engine.variants.research_selection_catalog",
+                   return_value=catalog), \
+             patch("agent.engine.brain.build_system",
+                   return_value="captured-system"), \
+             patch("agent.engine.brain.prompt_version",
+                   return_value="prompt-version"), \
+             patch("agent.engine.brain.LLM", return_value=llm) as llm_cls, \
+             patch("agent.engine.AlertManager",
+                   return_value=MagicMock()), \
+             patch("agent.engine.Exchange",
+                   return_value=MagicMock()), \
+             patch("agent.engine.RiskEngine"), \
+             patch("agent.engine.Engine._build_shadow",
+                   return_value=None), \
+             patch("agent.engine.state.configure_runtime"), \
+             patch("agent.engine.state.bind_runtime_identity"), \
+             patch("agent.engine.state.check_journal"), \
+             patch("agent.engine.state.set_journal_context"), \
+             patch("agent.engine.state.new_run_id", return_value="run-test"), \
+             patch("agent.engine.state.stable_fingerprint",
+                   return_value="cfg-test"), \
+             patch("agent.engine.state.code_fingerprint",
+                   return_value="code-test"):
+            from agent.engine import Engine
+            Engine(cfg)
+        verify.assert_called_once_with(
+            cfg, catalog=catalog, system_prompt="captured-system")
+        llm_cls.assert_called_once_with(
+            cfg, catalog=catalog, system="captured-system")
+
 
 if __name__ == "__main__":
     unittest.main()

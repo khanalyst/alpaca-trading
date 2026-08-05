@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agent import shadow, state, variants
-from research import findings, protocol, replay
+from agent import brain, shadow, state, variants
+from research import artifact, corpus, findings, protocol, replay
 from tests.helpers import valid_config
 from tests.research.test_enrichment_isolation import (execution_enriched,
                                                       symbol_snapshot)
@@ -578,7 +578,14 @@ class SchedulerAndPortfolioTests(StoreFixture):
         self.assertIn("SHADOW", card)
 
 
-class QualificationAndPacketTests(StoreFixture):
+class QualificationAndPacketFixture(StoreFixture):
+    """Shared store/variant fixture and packet builders.
+
+    Held apart from the tests so another module can reuse the setup
+    without naming one of its test methods, and so pytest never
+    collects the fixture itself.
+    """
+
     def setUp(self):
         super().setUp()
         self.v = variant()
@@ -787,6 +794,147 @@ class QualificationAndPacketTests(StoreFixture):
             })
         return analysis_id
 
+    def complete_payload(self):
+        scope = "demo:a"
+        analysis_id = self.qualifying_analysis(scope)
+        self.store.qualify_variant(
+            self.v.variant_id, {"reason": "paired edge",
+                                "family_analysis_id": self.family_analysis_id,
+                                "axis": ["strategy.fixed_reward_risk"]},
+            source_analysis_id=analysis_id, scope_key=scope)
+        from agent import state as runtime_state
+        base_strategy_config_version = runtime_state.strategy_fingerprint(
+            valid_config())
+        state, version = self.store.load_paper_portfolio(
+            scope, self.v.variant_id, now=9)
+        state["status"] = "PAPER"
+        state["resume_status"] = "PAPER"
+        state["paper_started_ts"] = 10
+        self.store.save_paper_portfolio(
+            scope, self.v.variant_id, state, version, now=10)
+        rows = []
+        for index in range(protocol.MIN_ROUND_TRIPS):
+            rows.append({
+                "trade_id": f"paper-{index}",
+                "proposal_id": f"proposal-{index}",
+                "scope_key": scope,
+                "variant_id": self.v.variant_id,
+                "cycle_id": f"cycle-{index}",
+                "symbol": "BTC/USDT:USDT",
+                "direction": "long",
+                "setup_type": "trend_continuation",
+                "signal_ts": index,
+                "model_id": "momentum.fixed_rr.15m.v2",
+                "assumptions_json": "{}",
+                "entry_ts": 11 + index,
+                "entry_price": 100.0,
+                "notional": 1000.0,
+                "risk_usd": 100.0,
+                "stop_price": 90.0,
+                "take_price": 120.0,
+                "exit_ts": 12 + index,
+                "exit_price": 120.0,
+                "result": "target",
+                "net_pnl_usd": 100.0,
+                "r_multiple": 1.0,
+            })
+        with sqlite3.connect(self.path) as conn:
+            conn.executemany("""
+                INSERT INTO paper_trades (
+                    trade_id, proposal_id, scope_key, variant_id, cycle_id,
+                    symbol, direction, setup_type, signal_ts, model_id,
+                    assumptions_json, entry_ts, entry_price, notional,
+                    risk_usd, stop_price, take_price, exit_ts, exit_price,
+                    result, net_pnl_usd, r_multiple, status)
+                VALUES (
+                    :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
+                    :symbol, :direction, :setup_type, :signal_ts, :model_id,
+                    :assumptions_json, :entry_ts, :entry_price, :notional,
+                    :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
+                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
+            """, rows)
+        analysis = self.store.analysis(analysis_id)
+        candidate_provenance = (
+            analysis["payload"]["source_evidence"]["eligibility"]
+            ["setting_provenances"][self.v.variant_id])
+        prompt_catalog = variants.research_selection_catalog()
+        prompt_config = candidate_provenance["experiment_config"]
+        manifest, artifact_hash = artifact.build_manifest(
+            strategy_id="momentum",
+            strategy_version=self.v.base_version,
+            variant_id=self.v.variant_id,
+            variant_definition_hash=findings.variant_identity_hash(self.v),
+            variant_definition={
+                "variant_id": self.v.variant_id,
+                "strategy_id": self.v.strategy_id,
+                "base_version": self.v.base_version,
+                "overrides": self.v.overrides,
+                "hypothesis": self.v.hypothesis,
+                "hypothesis_id": self.v.hypothesis_id or "",
+                "hypothesis_params": self.v.hypothesis_params,
+            },
+            config=candidate_provenance["experiment_config"],
+            strategy_config_version=candidate_provenance[
+                "strategy_config_version"],
+            forward_model_id=candidate_provenance["forward_model_id"],
+            forward_model_assumptions_hash=candidate_provenance[
+                "forward_model_assumptions_hash"],
+            prompt_hash=artifact.sha256_text(
+                brain.build_system(prompt_config, catalog=prompt_catalog)),
+            llm_provider=prompt_config["llm"]["provider"],
+            llm_model=prompt_config["llm"]["model"],
+            prompt_inputs_hash=artifact.sha256_json({
+                "catalog": prompt_catalog,
+                "strategy": prompt_config["strategy"],
+            }),
+            deployment_config_hash=runtime_state.deployment_config_hash(
+                candidate_provenance["experiment_config"]),
+            root=research_cli.REPO,
+        )
+        assignment_ids = research_cli._forward_assignment_ids(
+            analysis, self.v.variant_id)
+        edge_candidates = [
+            item for item in self.store.edge_candidates_for(
+                variant_id=self.v.variant_id, scope_key=scope)
+            if item["assignment_id"] in assignment_ids]
+        return {
+            "variant_id": self.v.variant_id,
+            "scope_key": scope,
+            "checklist": self.complete_checklist(),
+            "g2": {
+                "status": "PASS", "strategy_config_version":
+                    base_strategy_config_version,
+                "fidelity_code_version": "fidelity"},
+            "qualification": self.store.qualification_status(
+                self.v.variant_id, scope),
+            "forward_analysis": analysis,
+            "edge_candidates": edge_candidates,
+            "paper_result": self.store.paper_summary(
+                scope, self.v.variant_id),
+            "current_provenance": {
+                "strategy_config_version": base_strategy_config_version,
+                "artifact_strategy_config_version": manifest[
+                    "strategy_config_version"],
+                "code_version": "code",
+                "fidelity_code_version": "fidelity",
+                "validated_config_hash": manifest[
+                    "validated_config_hash"],
+                "runtime_source_hash": manifest["runtime_source_hash"],
+                "variant_definition_hash": manifest[
+                    "variant_definition_hash"],
+                "forward_model_id": manifest["forward_model_id"],
+                "forward_model_assumptions_hash": manifest[
+                    "forward_model_assumptions_hash"],
+                "deployment_config_hash": manifest["deployment_config_hash"],
+                "llm_endpoint": manifest["llm_endpoint"],
+                "llm_endpoint_hash": manifest["llm_endpoint_hash"]},
+            "artifact_manifest": manifest,
+            "artifact_hash": artifact_hash,
+        }
+
+
+
+class QualificationAndPacketTests(QualificationAndPacketFixture):
     def test_policy_axis_can_promote_from_explicit_accept_vs_veto_actions(self):
         scope = "demo:confidence-edge"
         low = variant(
@@ -1149,88 +1297,6 @@ class QualificationAndPacketTests(StoreFixture):
                 self.baseline.variant_id,
                 [old.variant_id, self.control.variant_id])
 
-    def complete_payload(self):
-        scope = "demo:a"
-        analysis_id = self.qualifying_analysis(scope)
-        self.store.qualify_variant(
-            self.v.variant_id, {"reason": "paired edge",
-                                "family_analysis_id": self.family_analysis_id,
-                                "axis": ["strategy.fixed_reward_risk"]},
-            source_analysis_id=analysis_id, scope_key=scope)
-        state, version = self.store.load_paper_portfolio(
-            scope, self.v.variant_id, now=9)
-        state["status"] = "PAPER"
-        state["resume_status"] = "PAPER"
-        state["paper_started_ts"] = 10
-        self.store.save_paper_portfolio(
-            scope, self.v.variant_id, state, version, now=10)
-        rows = []
-        for index in range(protocol.MIN_ROUND_TRIPS):
-            rows.append({
-                "trade_id": f"paper-{index}",
-                "proposal_id": f"proposal-{index}",
-                "scope_key": scope,
-                "variant_id": self.v.variant_id,
-                "cycle_id": f"cycle-{index}",
-                "symbol": "BTC/USDT:USDT",
-                "direction": "long",
-                "setup_type": "trend_continuation",
-                "signal_ts": index,
-                "model_id": "momentum.fixed_rr.15m.v2",
-                "assumptions_json": "{}",
-                "entry_ts": 11 + index,
-                "entry_price": 100.0,
-                "notional": 1000.0,
-                "risk_usd": 100.0,
-                "stop_price": 90.0,
-                "take_price": 120.0,
-                "exit_ts": 12 + index,
-                "exit_price": 120.0,
-                "result": "target",
-                "net_pnl_usd": 100.0,
-                "r_multiple": 1.0,
-            })
-        with sqlite3.connect(self.path) as conn:
-            conn.executemany("""
-                INSERT INTO paper_trades (
-                    trade_id, proposal_id, scope_key, variant_id, cycle_id,
-                    symbol, direction, setup_type, signal_ts, model_id,
-                    assumptions_json, entry_ts, entry_price, notional,
-                    risk_usd, stop_price, take_price, exit_ts, exit_price,
-                    result, net_pnl_usd, r_multiple, status)
-                VALUES (
-                    :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
-                    :symbol, :direction, :setup_type, :signal_ts, :model_id,
-                    :assumptions_json, :entry_ts, :entry_price, :notional,
-                    :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
-                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
-            """, rows)
-        analysis = self.store.analysis(analysis_id)
-        assignment_ids = research_cli._forward_assignment_ids(
-            analysis, self.v.variant_id)
-        edge_candidates = [
-            item for item in self.store.edge_candidates_for(
-                variant_id=self.v.variant_id, scope_key=scope)
-            if item["assignment_id"] in assignment_ids]
-        return {
-            "variant_id": self.v.variant_id,
-            "scope_key": scope,
-            "checklist": self.complete_checklist(),
-            "g2": {
-                "status": "PASS", "strategy_config_version": "cfg",
-                "fidelity_code_version": "fidelity"},
-            "qualification": self.store.qualification_status(
-                self.v.variant_id, scope),
-            "forward_analysis": analysis,
-            "edge_candidates": edge_candidates,
-            "paper_result": self.store.paper_summary(
-                scope, self.v.variant_id),
-            "current_provenance": {
-                "strategy_config_version": "cfg",
-                "code_version": "code",
-                "fidelity_code_version": "fidelity"},
-        }
-
     def test_qualification_is_scope_specific_and_append_only(self):
         analysis_id = self.qualifying_analysis("demo:a")
         event_id = self.store.qualify_variant(
@@ -1338,11 +1404,42 @@ class QualificationAndPacketTests(StoreFixture):
         journal = Path(self.tmp.name) / "journal.db"
         args = argparse.Namespace(
             store=str(self.path), scope=scope, db=str(journal), mode="demo")
+        with sqlite3.connect(journal) as conn:
+            conn.execute(
+                "CREATE TABLE events (ts REAL, kind TEXT, payload TEXT)")
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?)", (
+                    1.0, "setup_proposed", json.dumps({
+                        "cycle_id": "c1", "symbol": "BTC/USDT:USDT",
+                        "direction": "long",
+                        "setup_type": "trend_continuation",
+                        "setup_id": "setup-1", "setup_key": "key-1",
+                        "signal_ts": 1000, "strategy_id": "momentum",
+                        "strategy_version": "phase1-v3", "variant_id": "live",
+                    })))
         g2 = {
             "gate": "G2",
             "status": "PASS",
-            "proposal_count": 0,
-            "max_proposal_ts": 0.0,
+            "proposal_count": 1,
+            "max_proposal_ts": 1.0,
+            "matched": 1,
+            "recorded": 1,
+            "reproduction_rate": 1.0,
+            "missing_count": 0, "extra_count": 0,
+            "malformed_count": 0, "duplicate_count": 0,
+            "unresolved_count": 0, "malformed_reasons": {},
+            "modern_evidence_count": 1,
+            "legacy_excluded_count": 0,
+            "legacy_after_boundary_count": 0,
+            "modern_boundary_ts": 1.0,
+            "modern_boundary_rowid": 1,
+            "modern_boundary_cycle_id": "c1",
+            "vacuous": False, "legacy_identity": False,
+            "corpus_digest": replay.g2_corpus_digest(journal),
+            **corpus.g2_replay_corpus_metadata(journal),
+            "replay_digest": "test-replay-digest",
+            "variant_id": "momentum.baseline",
+            "replay_mode": "recorded_llm",
             "strategy_config_version": state.strategy_fingerprint(cfg),
             "fidelity_code_version": replay.fidelity_code_fingerprint(),
         }
@@ -1406,6 +1503,118 @@ class QualificationAndPacketTests(StoreFixture):
 
         self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
 
+    def test_forged_or_stale_artifact_never_yields_reviewed(self):
+        baseline_payload = self.complete_payload()
+        for field, value in (
+                ("validated_config_hash", "f" * 64),
+                ("strategy_id", "other-strategy"),
+                ("forward_model_id", "other-model"),
+                ("runtime_source_hash", "0" * 64)):
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(baseline_payload))
+                manifest = dict(payload["artifact_manifest"])
+                manifest[field] = value
+                manifest["artifact_hash"] = artifact.artifact_sha256(manifest)
+                payload["artifact_manifest"] = manifest
+                payload["artifact_hash"] = manifest["artifact_hash"]
+                packet_id = self.store.create_t3_packet(
+                    self.v.variant_id, payload, reviewed_by="reviewer",
+                    registry_change_ref="change-forged")
+                packet = next(
+                    row for row in self.store.t3_packets_for(self.v.variant_id)
+                    if row["packet_id"] == packet_id)
+                self.assertEqual(packet["review_status"],
+                                 "DRAFT_REVIEW_REQUIRED")
+
+    def test_persisted_candidate_config_mismatch_blocks_review(self):
+        payload = self.complete_payload()
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT state_json FROM paper_portfolios WHERE scope_key=? "
+                "AND variant_id=?", ("demo:a", self.v.variant_id)).fetchone()
+            state_json = json.loads(row[0])
+            state_json["experiment_provenance"]["experiment_config"][
+                "strategy"]["fixed_reward_risk"] = 99.0
+            conn.execute(
+                "UPDATE paper_portfolios SET state_json=? WHERE scope_key=? "
+                "AND variant_id=?",
+                (json.dumps(state_json, sort_keys=True), "demo:a",
+                 self.v.variant_id))
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-config")
+        packet = next(
+            row for row in self.store.t3_packets_for(self.v.variant_id)
+            if row["packet_id"] == packet_id)
+        self.assertEqual(packet["review_status"], "DRAFT_REVIEW_REQUIRED")
+
+    def _raw_packet_status(self, packet_id):
+        with sqlite3.connect(self.path) as conn:
+            return conn.execute(
+                "SELECT review_status FROM t3_evidence_packets "
+                "WHERE packet_id=?", (packet_id,)).fetchone()[0]
+
+    def test_packet_variant_identity_must_match_row_payload_and_manifest(self):
+        baseline = self.complete_payload()
+        for field in ("payload", "manifest"):
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(baseline))
+                if field == "payload":
+                    payload["variant_id"] = "momentum.forged"
+                else:
+                    payload["artifact_manifest"] = dict(
+                        payload["artifact_manifest"])
+                    payload["artifact_manifest"]["variant_id"] = (
+                        "momentum.forged")
+                packet_id = self.store.create_t3_packet(
+                    self.v.variant_id, payload, reviewed_by="reviewer",
+                    registry_change_ref="change-variant")
+                self.assertEqual(
+                    self._raw_packet_status(packet_id),
+                    "DRAFT_REVIEW_REQUIRED")
+
+    def test_recomputed_forged_packet_stays_draft_when_provenance_changes(self):
+        payload = self.complete_payload()
+        analysis_payload = payload["forward_analysis"]["payload"]
+        candidate = analysis_payload["source_evidence"]["eligibility"]
+        candidate = candidate["setting_provenances"][self.v.variant_id]
+        candidate["forward_model_id"] = "forged.model"
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-forged-provenance")
+        self.assertEqual(
+            self._raw_packet_status(packet_id), "DRAFT_REVIEW_REQUIRED")
+
+    def test_malformed_truthy_packet_fields_fail_closed_as_drafts(self):
+        baseline = self.complete_payload()
+        mutations = {
+            "artifact_manifest": [],
+            "forward_analysis": "malformed",
+            "qualification": [],
+            "paper_result": "malformed",
+            "g2": [],
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                payload = json.loads(json.dumps(baseline))
+                payload[field] = value
+                packet_id = self.store.create_t3_packet(
+                    self.v.variant_id, payload, reviewed_by="reviewer",
+                    registry_change_ref="change-malformed")
+                self.assertEqual(
+                    self._raw_packet_status(packet_id),
+                    "DRAFT_REVIEW_REQUIRED")
+
+        payload = json.loads(json.dumps(baseline))
+        payload["forward_analysis"]["payload"]["source_evidence"][
+            "eligibility"]["setting_provenances"][self.v.variant_id][
+                "experiment_config"] = []
+        packet_id = self.store.create_t3_packet(
+            self.v.variant_id, payload, reviewed_by="reviewer",
+            registry_change_ref="change-malformed-config")
+        self.assertEqual(
+            self._raw_packet_status(packet_id), "DRAFT_REVIEW_REQUIRED")
+
     def test_t3_packet_family_evidence_cannot_be_faked_by_checklist(self):
         payload = self.complete_payload()
         payload["checklist"]["axis_family_corrected"] = True
@@ -1430,6 +1639,20 @@ class QualificationAndPacketTests(StoreFixture):
 
 
 class ForwardQualificationCommandTests(StoreFixture):
+    def test_nightly_targets_deterministic_scope_and_rejects_llm_lane(self):
+        script = (Path(__file__).resolve().parents[2]
+                  / "research" / "nightly.sh").read_text()
+        self.assertIn('FORWARD_SCOPE="${FORWARD_SCOPE:-}"', script)
+        self.assertIn('forward_args+=(--scope "$FORWARD_SCOPE")', script)
+
+        args = argparse.Namespace(
+            store=str(self.path), scope="demo:account:feed-v1:llm",
+            strategy="momentum")
+        with patch.object(research_cli, "_load_config",
+                          return_value=valid_config()):
+            result = research_cli.cmd_forward_qualify(args)
+        self.assertEqual(result, 2)
+
     def test_report_uses_configured_store_when_cli_store_is_omitted(self):
         configured = Path(self.tmp.name) / "configured" / "findings.db"
         out = Path(self.tmp.name) / "scorecards"

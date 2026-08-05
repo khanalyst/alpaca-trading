@@ -38,7 +38,7 @@ research:
 | Decision throttle | `cycle.decision_interval_seconds: 300` elapsed seconds (with a 95% jitter tolerance); safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 6`; feed v6 is the deterministic four-lane realtime fork; feeds v1-v5 remain historical (feed v4 is the market-data plumbing repair feed and v5 is the immutable-provenance fork) |
+| Research feed | `forward_feed_version: 7`; feed v7 adds the real liquidation flow and the pre-registered conditioning axes; feeds v1-v6 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, and v6 the deterministic four-lane realtime fork) |
 | Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
 | Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
 | Experiment floor | both 10 elapsed days and 100 comparable paired observations |
@@ -137,7 +137,7 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion. It is an immutable research lead, and current v6 forward
+promotion. It is an immutable research lead, and current v7 forward
 qualification is still required.
 
 The current `forward-qualify` path reconstructs v6 evidence from eligible
@@ -154,7 +154,7 @@ analyst's own decisions remain in a separate `:llm` scope and are never pooled
 with lane evidence. Feeds v1-v5 remain historical and are never migrated or
 pooled; feed v4 remains the market-data plumbing repair feed and v5 the
 immutable-provenance fork. `research.py
-prepare-review-artifacts` runs only after v6 qualification. It
+prepare-review-artifacts` runs only after v7 qualification. It
 fails closed unless the saved edge evidence and every non-manual T3 check
 validate, then idempotently creates an immutable, content-addressed draft
 review artifact. It cannot complete manual review, edit the registry or
@@ -164,10 +164,13 @@ and any registry/configuration change remain explicit human actions.
 ## Evidence paths
 
 - The recorded journal path is authoritative only after a current G2 replay
-  PASS. G2 compares recorded pre-risk proposal keys
-  `(cycle_id, symbol, direction)` with replay keys; it requires at least 99%
-  reproduction and does not reproduce full contract or execution semantics.
-  A failed, stale, or vacuous G2 blocks downstream evidence.
+  PASS. G2 compares the full canonical pre-risk proposal identity (including
+  cycle, symbol, direction, setup identity/type, signal timestamp, strategy
+  version, and baseline variant) symmetrically with replay keys. It requires a
+  non-vacuous exact match; malformed, duplicate, missing, or extra identities
+  fail closed. Outcome-resolution gaps remain explicit diagnostics and are not
+  scored as proposal mismatches. A failed, stale, or vacuous G2 blocks
+  downstream evidence.
   `INSUFFICIENT_SAMPLE` means collection is open, not that an edge failed.
 - The OHLCV tournament is exploratory. It awards no tier above
   `T2_CANDIDATE`; an existing higher registered tier is reported as unrevised
@@ -235,6 +238,10 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python main.py check
 ./.venv/bin/python main.py strategies --verbose
 ./.venv/bin/python main.py run
+./.venv/bin/python main.py run --candidate-demo \
+  --variant-id <qualified-variant-id> --scope-key <scope> \
+  --packet-ref t3-packet:<reviewed-packet-hash> \
+  --expected-demo-account-fingerprint <okx-demo-fingerprint>
 ./.venv/bin/python main.py status
 
 ./.venv/bin/python research.py corpus stats
@@ -257,6 +264,27 @@ snapshot file is size- and SHA-256-verified.
 
 `research.findings_store` never falls back to a temporary database. If the
 configured path cannot be used, the operation fails.
+
+### Reviewed candidate on OKX demo
+
+`run --candidate-demo` is an explicit operator action for one reviewed variant;
+it is not part of the normal demo startup and is never selected automatically
+by research or the LLM. The command requires `mode: demo`, a current
+non-revoked qualification, a content-addressed `REVIEWED` T3 packet, and a
+successful local PAPER stage that is flat, has no open paper trades, meets the
+configured closed-trade floor, and has positive finite expectancy. Packet,
+artifact, variant, configuration, prompt, provider endpoint, forward-model,
+source, and deployment identities must still match the current runtime.
+
+After local authorization, startup verifies the expected demo account, trade
+permission, flat positions, every supported regular/algo open-order query, and
+flat local runtime state. Unknown or malformed account/order state fails
+closed. The reviewed variant is applied only in memory: the command does not
+edit `config.yaml`, the strategy registry, or live authorization. A successful
+preflight writes a `demo_candidate_authorization` receipt to
+`runtime/demo/journal.db` before the trading loop continues. A real OKX demo
+run still requires operator-provided demo credentials and external account
+availability.
 
 ## Optional local historical data
 
@@ -309,6 +337,7 @@ source.
 | [research/protocol.md](research/protocol.md) | Statistical and operational evidence rules for `WORKED`, `FAILED`, `INCONCLUSIVE`, qualification, rejection, pairing, held-out confirmation, and multiple testing. |
 | [research/plan/RECONCILIATION.md](research/plan/RECONCILIATION.md) | Current authority policy separating journal evidence, exploratory tournament evidence, configuration exceptions, and VM handoff requirements. |
 | [research/plan/B7.5-record.md](research/plan/B7.5-record.md) | Current status and completion conditions for the optional maker-first order primitive. It distinguishes that execution experiment from `scalp-maker`. |
+| [research/plan/autonomous-loop-integration.md](research/plan/autonomous-loop-integration.md) | Batched plan and checklist for merging the G2/promotion and audit-remediation work into one unattended loop. Records why runtime code settles before collection opens. |
 | [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Historical implementation pointer; current flow and commands are in the primary guides. |
 | [research/plan/findings.md](research/plan/findings.md) | Historical findings pointer; current evidence boundaries are in RECONCILIATION and protocol. |
 
@@ -338,6 +367,10 @@ source.
 | [findings/momentum/momentum.conf.floor_0_80.md](findings/momentum/momentum.conf.floor_0_80.md) | Active scorecard for the strictest registered observable confidence floor. |
 | [findings/momentum/momentum.discriminator.trend_alignment.md](findings/momentum/momentum.discriminator.trend_alignment.md) | Scorecard for separating breakouts from continuations using prior trend alignment. |
 | [findings/momentum/momentum.discriminator.volatility_regime.md](findings/momentum/momentum.discriminator.volatility_regime.md) | Scorecard for separating breakouts using compression versus expansion rather than trend alignment. |
+| [findings/momentum/momentum.cond.vol_regime.md](findings/momentum/momentum.cond.vol_regime.md) | Conditioning-axis scorecard. It partitions existing trades by volatility regime instead of changing a setting, so it consumes no rotation arm. |
+| [findings/momentum/momentum.cond.session.md](findings/momentum/momentum.cond.session.md) | Conditioning-axis scorecard. It partitions existing trades by UTC session window and may only be quoted after the out-of-sample split. |
+| [findings/momentum/momentum.universe.top_5.md](findings/momentum/momentum.universe.top_5.md) | Scorecard for a five-instrument universe. It asks whether the edge lives in the liquid majors. |
+| [findings/momentum/momentum.universe.top_25.md](findings/momentum/momentum.universe.top_25.md) | Scorecard for a twenty-five-instrument universe. It asks the opposite question: whether the edge lives in the tail. |
 
 ### Research result snapshots
 

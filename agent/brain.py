@@ -31,7 +31,7 @@ import os
 import re
 from copy import deepcopy
 
-from . import hypotheses, variants
+from . import hypotheses, provider, variants
 from .registry import spec_for
 
 log = logging.getLogger("brain")
@@ -394,7 +394,8 @@ _RESEARCH_SELECTION_MARKER = "__RESEARCH_SELECTION_LIST__"
 
 def research_selection_prompt_fragment(
         catalog: dict[str, tuple[dict, ...]] | None = None) -> str:
-    catalog = catalog or variants.research_selection_catalog()
+    if catalog is None:
+        catalog = variants.research_selection_catalog()
     lines = []
     for strategy_id, settings in catalog.items():
         identifiers = ", ".join(str(item["variant_id"]) for item in settings)
@@ -402,7 +403,9 @@ def research_selection_prompt_fragment(
     return "\n".join(lines) or "- none"
 
 
-def build_system(cfg: dict) -> str:
+def build_system(
+        cfg: dict,
+        *, catalog: dict[str, tuple[dict, ...]] | None = None) -> str:
     """Assemble the system prompt for the configured strategy.
 
     The shared text covers the parts that are true of any strategy this agent
@@ -422,7 +425,7 @@ def build_system(cfg: dict) -> str:
     # registered before it was taken.
     system = system.replace(_HYPOTHESIS_MARKER, hypotheses.prompt_fragment())
     return system.replace(
-        _RESEARCH_SELECTION_MARKER, research_selection_prompt_fragment())
+        _RESEARCH_SELECTION_MARKER, research_selection_prompt_fragment(catalog))
 
 
 def prompt_version(system: str) -> str:
@@ -466,29 +469,40 @@ class LLM:
         name = str(model).lower()
         return name.startswith(("gpt-5", "o1", "o3", "o4"))
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, *,
+                 catalog: dict[str, tuple[dict, ...]] | None = None,
+                 system: str | None = None):
         self.cfg = cfg["llm"]
         # Resolved once, then byte-identical for the life of the process,
         # which is what both providers' prompt caches require.
-        self.system = build_system(cfg)
+        self.research_selection_catalog = (
+            variants.research_selection_catalog()
+            if catalog is None else catalog)
+        self.system = (
+            build_system(cfg, catalog=self.research_selection_catalog)
+            if system is None else str(system))
         self.prompt_version = prompt_version(self.system)
-        self.research_selection_catalog = variants.research_selection_catalog()
-        provider = self.cfg["provider"]
-        self.provider = provider
-        if provider == "anthropic":
+        provider_name = self.cfg["provider"]
+        self.provider = provider_name
+        effective_endpoint = provider.resolve_provider_endpoint(
+            provider_name, self.cfg)
+        self.endpoint_hash = provider.hash_provider_endpoint(effective_endpoint)
+        self.endpoint_identity = provider.safe_provider_endpoint(effective_endpoint)
+        client_kwargs = {"base_url": effective_endpoint}
+        if provider_name == "anthropic":
             if not os.getenv("ANTHROPIC_API_KEY"):
                 raise RuntimeError("ANTHROPIC_API_KEY missing from .env")
             from anthropic import Anthropic
-            self.client = Anthropic()
+            self.client = Anthropic(**client_kwargs)
             self._call = self._anthropic
-        elif provider == "openai":
+        elif provider_name == "openai":
             if not os.getenv("OPENAI_API_KEY"):
                 raise RuntimeError("OPENAI_API_KEY missing from .env")
             from openai import OpenAI
-            self.client = OpenAI()
+            self.client = OpenAI(**client_kwargs)
             self._call = self._openai
         else:
-            raise ValueError(f"Unknown llm.provider '{provider}' "
+            raise ValueError(f"Unknown llm.provider '{provider_name}' "
                              "(use anthropic or openai)")
         # Newer models (Sonnet 5, Opus 4.7+) reject sampling parameters;
         # discovered once at runtime, then omitted from every later call.
@@ -657,7 +671,7 @@ class LLM:
 
     def endpoint(self) -> str:
         """The base URL actually in use, so `check` can show it."""
-        return str(getattr(self.client, "base_url", "provider default"))
+        return self.endpoint_identity
 
     @staticmethod
     def _user_message(snapshot: dict, portfolio: dict, max_new: int) -> str:
@@ -817,9 +831,12 @@ def parse_decisions(
 
     parsed_selection = None
     if "research_selection" in obj:
+        catalog = (research_catalog
+                   if research_catalog is not None
+                   else variants.research_selection_catalog())
         parsed_selection = _parse_research_selection(
             obj.get("research_selection"),
-            research_catalog or variants.research_selection_catalog())
+            catalog)
 
     proposal = obj.get("proposal")
     parsed_proposal = None

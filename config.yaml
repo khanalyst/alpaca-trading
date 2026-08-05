@@ -156,7 +156,7 @@ research:
   paper_min_closed_trades: 100
   # Increment when executable provenance changes; evidence from different
   # feed versions must never be pooled.
-  forward_feed_version: 6
+  forward_feed_version: 7
   # Assignments require both duration and comparable observations. Validation
   # enforces the minimum duration needed for the confirmation window.
   experiment_min_duration_days: 10

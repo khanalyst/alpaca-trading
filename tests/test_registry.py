@@ -133,6 +133,19 @@ class RegisterContentTests(unittest.TestCase):
 
         self.assertTrue(spec.meets(LIVE_MIN_TIER))
 
+    def test_a_live_tier_rejects_multiple_packet_citations(self):
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            StrategySpec(
+                id="ambiguous", version="v1",
+                mechanism="a stated mechanism",
+                falsification="a stated falsifier", tier="T3_VALIDATED",
+                signal_timeframe="1h", required_timeframes=("1h",),
+                max_hold_hours_ceiling=24.0, execution_style="taker",
+                setup_types=("x",), evidence=(
+                    "t3-packet:" + "a" * 64,
+                    "t3-packet:" + "b" * 64,
+                ))
+
     def test_a_malformed_packet_reference_does_not_satisfy_it(self):
         for reference in ("t3-packet:", "t3-packet:abc", "t3-packet:" + "z" * 64,
                           "sha256:" + "a" * 64):

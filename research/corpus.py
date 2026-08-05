@@ -31,9 +31,11 @@ agent was not running", and those have opposite meanings.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections import defaultdict
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +59,7 @@ class CycleRecord:
     provider: str
     variant_id: str | None = None
     strategy_config_version: str | None = None
+    journal_rowid: int | None = None
     # Enrichment is joined from the separate ``snapshot_enrichment`` event,
     # never from ``llm_input``; conditioning axes read this private field.
     enrichment: dict = field(default_factory=dict)
@@ -90,6 +93,191 @@ class LoadReport:
     def skip(self, reason: str) -> None:
         self.skipped += 1
         self.reasons[reason] += 1
+
+
+@dataclass
+class G2ProposalReport:
+    """Strict proposal-corpus diagnostics used only by gate G2.
+
+    The generic event loader intentionally tolerates malformed rows for
+    exploratory corpus statistics.  G2 cannot: a skipped proposal changes the
+    denominator and can turn a broken journal into an apparent pass.
+    """
+
+    rows: int = 0
+    parsed: int = 0
+    malformed: int = 0
+    duplicates: int = 0
+    reasons: dict = field(default_factory=lambda: defaultdict(int))
+
+    def reject(self, reason: str) -> None:
+        self.malformed += 1
+        self.reasons[reason] += 1
+
+
+@dataclass
+class G2EvidenceWindow:
+    """The authoritative proposal rows for one strict G2 evaluation.
+
+    Journals written before rich proposal identity existed remain readable as
+    legacy-only corpora.  Once the first modern row appears, only modern rows
+    from that deterministic journal position onward are evidence; old rows
+    are excluded from the denominator and a legacy row after that boundary is
+    a fail-closed journal violation.
+    """
+
+    rows: list[dict]
+    legacy_mode: bool
+    modern_boundary_ts: float | None = None
+    modern_boundary_rowid: int | None = None
+    modern_boundary_cycle_id: str | None = None
+    legacy_excluded_count: int = 0
+    legacy_after_boundary_count: int = 0
+
+
+_G2_MODERN_FIELDS = (
+    # Strategy context columns were added before the rich proposal payload;
+    # they alone do not establish a modern identity boundary.
+    "signal_ts", "setup_key", "setup_type",
+)
+
+
+def is_modern_g2_row(row: dict) -> bool:
+    """Whether a loaded row carries any rich-identity evidence field."""
+    return any(row.get(field) is not None for field in _G2_MODERN_FIELDS)
+
+
+def g2_evidence_window(rows: list[dict]) -> G2EvidenceWindow:
+    """Select strict G2 evidence without weakening legacy-only journals."""
+    # SQLite rowid is the append position.  Timestamps can arrive late or be
+    # backfilled, so they cannot define the migration boundary.
+    ordered = sorted(rows, key=lambda row: (
+        int(row.get("_g2_rowid") or 0), float(row.get("_g2_ts") or 0.0)))
+    first_modern = next(
+        (index for index, row in enumerate(ordered)
+         if is_modern_g2_row(row)), None)
+    if first_modern is None:
+        return G2EvidenceWindow(ordered, legacy_mode=True)
+
+    boundary_row = ordered[first_modern]
+    boundary_ts = boundary_row.get("_g2_ts")
+    boundary_rowid = boundary_row.get("_g2_rowid")
+    boundary_cycle_id = boundary_row.get("cycle_id")
+    evaluated = []
+    legacy_before = 0
+    legacy_after = 0
+    for index, row in enumerate(ordered):
+        if is_modern_g2_row(row):
+            evaluated.append(row)
+        elif index < first_modern:
+            legacy_before += 1
+        else:
+            legacy_after += 1
+    return G2EvidenceWindow(
+        evaluated, legacy_mode=False,
+        modern_boundary_ts=(float(boundary_ts)
+                            if boundary_ts is not None else None),
+        modern_boundary_rowid=(int(boundary_rowid)
+                               if boundary_rowid is not None else None),
+        modern_boundary_cycle_id=(str(boundary_cycle_id)
+                                  if boundary_cycle_id is not None else None),
+        legacy_excluded_count=legacy_before,
+        legacy_after_boundary_count=legacy_after,
+    )
+
+
+def g2_post_boundary_cycle_ids(
+        db: str | Path, evidence: G2EvidenceWindow) -> set[str] | None:
+    """Return all model-input cycles in the authoritative G2 window.
+
+    ``None`` means the journal has no model-input rows (as in small unit
+    fixtures), so callers should retain their existing comparison behavior.
+    The boundary cycle itself is included because the engine may append its
+    ``llm_input`` before the proposal event that establishes the boundary.
+    """
+    if evidence.legacy_mode or evidence.modern_boundary_rowid is None:
+        return None
+    try:
+        with closing(_connect(db)) as conn:
+            columns = _columns(conn, "events")
+            cycle_column = "cycle_id" if "cycle_id" in columns \
+                else "NULL AS cycle_id"
+            rows = conn.execute(
+                "SELECT rowid, " + cycle_column
+                + " FROM events WHERE kind='llm_input' "
+                "ORDER BY rowid ASC").fetchall()
+    except (sqlite3.Error, OSError):
+        return None
+    if not rows:
+        return None
+    cycle_ids = {
+        str(row["cycle_id"])
+        for row in rows
+        if row["cycle_id"] is not None
+        and int(row["rowid"]) >= int(evidence.modern_boundary_rowid)
+    }
+    if evidence.modern_boundary_cycle_id:
+        cycle_ids.add(evidence.modern_boundary_cycle_id)
+    return cycle_ids
+
+
+def g2_replay_corpus_metadata(
+        db: str | Path, evidence: G2EvidenceWindow | None = None) -> dict:
+    """Digest the ordered model-input/output corpus in the G2 window."""
+    if evidence is None:
+        rows, _ = load_g2_proposals(db)
+        evidence = g2_evidence_window(rows)
+    try:
+        with closing(_connect(db)) as conn:
+            columns = _columns(conn, "events")
+            if not {"ts", "kind", "payload"}.issubset(columns):
+                raise sqlite3.OperationalError("events schema incomplete")
+            cycle_column = "cycle_id" if "cycle_id" in columns \
+                else "NULL AS cycle_id"
+            events = conn.execute(
+                "SELECT rowid, ts, kind, " + cycle_column + ", payload FROM events "
+                "WHERE kind IN ('llm_input', 'llm_output') "
+                "ORDER BY rowid ASC").fetchall()
+    except (sqlite3.Error, OSError):
+        events = []
+    selected = []
+    for event in events:
+        rowid = int(event["rowid"])
+        if evidence.legacy_mode or evidence.modern_boundary_rowid is None:
+            in_window = True
+        else:
+            in_window = (
+                rowid >= evidence.modern_boundary_rowid
+                or (evidence.modern_boundary_cycle_id is not None
+                    and event["cycle_id"] == evidence.modern_boundary_cycle_id))
+        if not in_window:
+            continue
+        raw_payload = event["payload"]
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = raw_payload
+        selected.append({
+            "rowid": rowid,
+            "ts": float(event["ts"] or 0.0),
+            "kind": str(event["kind"]),
+            "cycle_id": event["cycle_id"],
+            "payload": payload,
+        })
+    canonical = {
+        "boundary_ts": evidence.modern_boundary_ts,
+        "boundary_rowid": evidence.modern_boundary_rowid,
+        "boundary_cycle_id": evidence.modern_boundary_cycle_id,
+        "events": selected,
+    }
+    digest = hashlib.sha256(json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"),
+        default=str, allow_nan=True).encode("utf-8")).hexdigest()
+    return {
+        "replay_corpus_digest": digest,
+        "replay_corpus_count": len(selected),
+        "replay_corpus_max_rowid": (selected[-1]["rowid"] if selected else 0),
+    }
 
 
 def _connect(db: str | Path) -> sqlite3.Connection:
@@ -182,14 +370,14 @@ def load_cycles(db: str | Path) -> tuple[list[CycleRecord], LoadReport]:
     report = LoadReport()
     out: list[CycleRecord] = []
     enrichment = load_enrichment(db)
-    with _connect(db) as conn:
+    with closing(_connect(db)) as conn:
         available = _columns(conn, "events")
         optional = [c for c in ("variant_id", "strategy_config_version")
                     if c in available]
         columns = ", ".join(["ts", "payload", "run_id", "cycle_id"] + optional)
         for row in conn.execute(
-                f"SELECT {columns} FROM events WHERE kind='llm_input' "
-                "ORDER BY ts ASC"):
+                f"SELECT rowid AS journal_rowid, {columns} "
+                "FROM events WHERE kind='llm_input' ORDER BY ts ASC"):
             report.rows += 1
             try:
                 payload = json.loads(row["payload"])
@@ -217,6 +405,7 @@ def load_cycles(db: str | Path) -> tuple[list[CycleRecord], LoadReport]:
                 strategy_config_version=(
                     row["strategy_config_version"]
                     if "strategy_config_version" in optional else None),
+                journal_rowid=int(row["journal_rowid"]),
                 enrichment=enrichment.get(row["cycle_id"]) or {},
             ))
     return out, report
@@ -231,7 +420,7 @@ def load_model_outputs(db: str | Path) -> tuple[list[ModelOutput], LoadReport]:
     """
     report = LoadReport()
     out: list[ModelOutput] = []
-    with _connect(db) as conn:
+    with closing(_connect(db)) as conn:
         for row in conn.execute(
                 "SELECT ts, payload, cycle_id FROM events "
                 "WHERE kind='llm_output' ORDER BY ts ASC"):
@@ -264,7 +453,7 @@ def load_model_outputs(db: str | Path) -> tuple[list[ModelOutput], LoadReport]:
 def load_events(db: str | Path, kind: str) -> list[dict]:
     """Any journalled event kind, decoded, oldest first. Bad rows skipped."""
     out: list[dict] = []
-    with _connect(db) as conn:
+    with closing(_connect(db)) as conn:
         for row in conn.execute(
                 "SELECT ts, payload, cycle_id, setup_id FROM events "
                 "WHERE kind=? ORDER BY ts ASC", (kind,)):
@@ -281,9 +470,133 @@ def load_events(db: str | Path, kind: str) -> list[dict]:
     return out
 
 
+def load_g2_proposals(db: str | Path) -> tuple[list[dict], G2ProposalReport]:
+    """Load ``setup_proposed`` rows without changing generic corpus behavior.
+
+    Columns were added to the journal over time, so the query is assembled
+    from the columns actually present.  Payload fields remain authoritative
+    for values written by older builds; journal columns are used as a
+    fallback.  Every row is returned with a private ``_g2_rowid`` marker so
+    diagnostics can identify duplicate/malformed input without exposing the
+    SQLite implementation to callers.
+    """
+    report = G2ProposalReport()
+    out: list[dict] = []
+    try:
+        conn = _connect(db)
+    except (sqlite3.Error, OSError):
+        report.reject("journal_unreadable")
+        return out, report
+    # ``sqlite3.Connection.__exit__`` commits/rolls back but does not close
+    # the handle.  This loader is called repeatedly by readiness and replay,
+    # so close it explicitly even on the early-return diagnostics below.
+    with closing(conn):
+        columns = _columns(conn, "events")
+        if not columns:
+            report.reject("events_table_missing")
+            return out, report
+        if not {"ts", "payload", "kind"}.issubset(columns):
+            report.reject("events_schema_missing")
+            return out, report
+        optional = [
+            name for name in (
+                "strategy_id", "strategy_version", "variant_id",
+                "strategy_config_version", "prompt_version", "setup_key",
+                "setup_type", "signal_ts", "symbol", "direction",
+            ) if name in columns
+        ]
+        # ``rowid`` is an implicit SQLite column and is not reported by
+        # PRAGMA table_info, but selecting it is safe for the journal
+        # tables we support and gives deterministic duplicate diagnostics.
+        selected = ["rowid", "ts", "payload"]
+        selected.extend(name for name in ("cycle_id", "setup_id")
+                        if name in columns)
+        selected.extend(optional)
+        try:
+            rows = conn.execute(
+                "SELECT " + ", ".join(selected) +
+                " FROM events WHERE kind='setup_proposed' "
+                "ORDER BY rowid ASC").fetchall()
+        except sqlite3.Error:
+            report.reject("journal_query_failed")
+            return out, report
+        for row in rows:
+            report.rows += 1
+            raw = row["payload"]
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                report.reject("invalid_json")
+                continue
+            if not isinstance(payload, dict):
+                report.reject("payload_not_object")
+                continue
+            data = {key: row[key] for key in selected if key in row.keys()}
+            # Payload wins: a context column can be stale relative to the
+            # explicit event body in journals written during a migration.
+            data.update(payload)
+            data["_g2_rowid"] = int(row["rowid"])
+            data["_g2_ts"] = float(row["ts"] or 0.0)
+            data["_g2_cycle_id"] = (
+                row["cycle_id"] if "cycle_id" in row.keys() else None)
+            data["_g2_setup_id"] = (
+                row["setup_id"] if "setup_id" in row.keys() else None)
+            # A proposal must identify the cycle, symbol, and direction.  The
+            # remaining identity fields are optional for legacy journals and
+            # are handled by replay.canonical_proposal_identity.
+            if not isinstance(data.get("cycle_id") or data.get("_g2_cycle_id"),
+                              str) or not str(data.get("cycle_id") or
+                                               data.get("_g2_cycle_id")):
+                report.reject("missing_cycle_id")
+                continue
+            if not isinstance(data.get("symbol"), str) or not str(
+                    data.get("symbol")).strip():
+                report.reject("missing_symbol")
+                continue
+            if data.get("direction") not in {"long", "short"}:
+                report.reject("invalid_direction")
+                continue
+            data["cycle_id"] = str(data.get("cycle_id") or
+                                    data.get("_g2_cycle_id"))
+            data["symbol"] = str(data["symbol"]).strip()
+            data["direction"] = str(data["direction"])
+            report.parsed += 1
+            out.append(data)
+    return out, report
+
+
+def g2_proposal_digest(rows: list[dict]) -> str:
+    """Content digest for a canonical proposal corpus.
+
+    Sorting makes the digest independent of SQLite insertion order while
+    retaining duplicates (which are themselves a fail-closed diagnostic).
+    Private row markers are excluded so a backup/restore does not alter the
+    content identity.
+    """
+    canonical = []
+    for row in rows:
+        normalized = {}
+        for key in sorted(row):
+            if key.startswith("_") or key == "rowid":
+                continue
+            value = row.get(key)
+            if key == "payload" and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            normalized[key] = value
+        canonical.append(normalized)
+    canonical.sort(key=lambda row: json.dumps(
+        row, sort_keys=True, separators=(",", ":"), default=str))
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                         default=str, allow_nan=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def load_outcomes(db: str | Path) -> dict:
     """Trades and the lifecycle events that explain what happened to setups."""
-    with _connect(db) as conn:
+    with closing(_connect(db)) as conn:
         trades = [dict(row) for row in conn.execute(
             "SELECT * FROM trades ORDER BY ts ASC")]
     return {

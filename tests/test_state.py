@@ -1,11 +1,15 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent import state
+from agent.engine import Engine
+from agent.exchange import OrderSubmissionAmbiguousError
+from tests.helpers import valid_config
 
 
 class StateSafetyTests(unittest.TestCase):
@@ -236,6 +240,84 @@ class StateSafetyTests(unittest.TestCase):
             operator_pause=True)
         self.assertFalse(saved["flatten_on_kill"])
         self.assertFalse(state.load_state()["flatten_on_kill"])
+
+    def test_killed_state_cannot_be_downgraded_by_late_pause(self):
+        state.set_state(
+            state.KILLED, "manual kill", flatten_on_kill=True,
+            operator_pause=True)
+
+        saved = state.set_state(
+            state.PAUSED, "late ambiguity", operator_pause=True)
+
+        self.assertEqual(saved["state"], state.KILLED)
+        self.assertEqual(saved["kill_reason"], "manual kill")
+        persisted = state.load_state()
+        self.assertEqual(persisted["state"], state.KILLED)
+        self.assertEqual(persisted["kill_reason"], "manual kill")
+
+    def test_concurrent_kill_and_pause_always_finish_killed(self):
+        state.set_state(state.RUNNING, operator_pause=False)
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def transition(name, reason):
+            try:
+                barrier.wait()
+                state.set_state(name, reason, operator_pause=True)
+            except Exception as exc:  # pragma: no cover - assertion captures it
+                errors.append(exc)
+
+        killers = [
+            threading.Thread(
+                target=transition, args=(state.KILLED, "manual kill")),
+            threading.Thread(
+                target=transition, args=(state.PAUSED, "late pause")),
+        ]
+        for thread in killers:
+            thread.start()
+        barrier.wait()
+        for thread in killers:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        persisted = state.load_state()
+        self.assertEqual(persisted["state"], state.KILLED)
+        self.assertEqual(persisted["kill_reason"], "manual kill")
+
+    def test_direct_entry_ambiguity_survives_restart_and_blocks_next_open(self):
+        state.set_state(state.RUNNING, operator_pause=False)
+        plan = {
+            "symbol": "BTC/USDT:USDT", "direction": "long",
+            "leverage": 2, "notional": 1000.0, "sl_pct": 2.0,
+            "tp_pct": 4.0, "estimated_loss_pct": 2.62,
+            "risk_budget_usd": 100.0, "price": 100.0,
+        }
+        engine = Engine.__new__(Engine)
+        engine.cfg = valid_config()
+        engine.cfg["execution"]["maker_first_enabled"] = False
+        engine.ex = Mock()
+        engine.alerts = Mock()
+        engine.ex.price.return_value = 100.0
+        engine.ex.contracts_for_notional.return_value = 10.0
+        engine.ex.guarded_entry_limit.return_value = {
+            "mid": 100.0, "limit_price": 100.0, "spread_pct": 0.0,
+        }
+        engine.ex.open_position.side_effect = OrderSubmissionAmbiguousError(
+            "unknown direct fill", {"order_id": "entry-1"})
+
+        with patch("agent.engine.state.log_event"):
+            self.assertFalse(engine._execute_open(plan, state.load_state()))
+
+        persisted = state.load_state()
+        self.assertEqual(persisted["state"], state.PAUSED)
+        self.assertTrue(persisted["operator_pause"])
+
+        restarted = Engine.__new__(Engine)
+        restarted.cfg = engine.cfg
+        restarted.ex = Mock()
+        restarted.alerts = Mock()
+        self.assertFalse(restarted._execute_open(plan, persisted))
+        restarted.ex.price.assert_not_called()
 
     def test_journal_failure_is_never_silently_swallowed(self):
         with patch("agent.state._db", side_effect=OSError("disk full")):

@@ -39,6 +39,47 @@ PRICES="${PRICE_CACHE:-$ROOT/research/cache/prices.db}"
 JOURNAL="${JOURNAL_DB:-$ROOT/runtime/$MODE/journal.db}"
 STORE="${FINDINGS_DB:-$ROOT/research/cache/findings.db}"
 
+# Qualification must name the deterministic feed lane. A wildcard shadow
+# build also creates a sibling ``:llm`` scope, and guessing between the two
+# would allow non-comparable analyst decisions into forward evidence. An
+# operator may provide FORWARD_SCOPE explicitly; otherwise derive it only
+# when the journal proves one account identity and the configured feed
+# version supplies one unambiguous deterministic scope. If identity is
+# unavailable, leave it empty and the CLI remains fail-closed.
+FORWARD_SCOPE="${FORWARD_SCOPE:-}"
+if [ -z "$FORWARD_SCOPE" ] && [ -f "$JOURNAL" ]; then
+  FORWARD_SCOPE="$($PY - "$JOURNAL" "$MODE" "$ROOT/config.yaml" <<'PY'
+import sqlite3
+import sys
+
+journal, mode, config_path = sys.argv[1:]
+try:
+    with sqlite3.connect(f"file:{journal}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT account_fingerprint FROM runs "
+            "WHERE mode=? AND account_fingerprint IS NOT NULL "
+            "AND account_fingerprint <> ''",
+            (mode,),
+        ).fetchall()
+except sqlite3.Error:
+    rows = []
+
+identities = {str(row[0]) for row in rows if row[0]}
+if len(identities) == 1:
+    try:
+        import yaml
+        with open(config_path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        feed = int((config.get("research") or {}).get(
+            "forward_feed_version") or 1)
+    except (OSError, TypeError, ValueError):
+        feed = None
+    if feed is not None:
+        print(f"{mode}:{next(iter(identities))}:feed-v{feed}")
+PY
+)"
+fi
+
 # Authoritative path: journal replay.
 
 echo "=== $(date -u +%FT%TZ) readiness ==="
@@ -96,7 +137,11 @@ if [ -f "$JOURNAL" ]; then
   "$PY" research.py three-arm --db "$JOURNAL" --prices "$PRICES" || true
 
   echo "=== $(date -u +%FT%TZ) paired real-time variant qualification ==="
-  "$PY" research.py forward-qualify --store "$STORE" \
+  forward_args=(forward-qualify --store "$STORE")
+  if [ -n "$FORWARD_SCOPE" ]; then
+    forward_args+=(--scope "$FORWARD_SCOPE")
+  fi
+  "$PY" research.py "${forward_args[@]}" \
     || echo "  (collecting, unscoped, or no promotable edge; see above)"
 
   echo "=== $(date -u +%FT%TZ) preparing operator review artifacts ==="

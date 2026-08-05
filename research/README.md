@@ -38,7 +38,7 @@ The draft creates no variant or selection, changes no configuration, tier,
 portfolio, or order authority, and must be manually reviewed and registered in
 a later code change before research can use it.
 
-The active simulator scope is `forward_feed_version: 6`. Feed v6 makes the
+The active simulator scope is `forward_feed_version: 7`. Feed v7 makes the
 four realtime lanes deterministic; the three long-horizon models remain
 offline-only. The active analyst's actual choices remain in a sibling `:llm`
 scope for planner history and are never pooled with lane comparisons. Feeds
@@ -48,16 +48,19 @@ immutable-provenance fork).
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
-current v6 forward qualification is still required and there is no automatic
+current v7 forward qualification is still required and there is no automatic
 live promotion.
 
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
-used. Replay/G2 compares recorded pre-risk proposal keys
-`(cycle_id, symbol, direction)` with replay keys and requires at least 99%
-reproduction before downstream authoritative evidence is trusted. It does not
-reproduce full contract or execution semantics. The current v6
+used. Replay/G2 compares the full canonical pre-risk proposal identity (cycle,
+symbol, direction, setup identity/type, signal timestamp, strategy version, and
+baseline variant) symmetrically with replay keys and requires a non-vacuous
+exact match before downstream authoritative evidence is trusted. Malformed,
+duplicate, missing, or extra identities fail closed; outcome-resolution gaps
+remain diagnostics rather than proposal mismatches. It does not reproduce full
+contract or execution semantics. The current v7
 `forward-qualify` path uses
 eligible completed assignments and each setting's contemporaneous baseline.
 Its paired cluster sign-flip result is valid only under the documented

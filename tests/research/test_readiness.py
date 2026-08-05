@@ -17,8 +17,7 @@ import unittest
 from pathlib import Path
 
 from agent import state
-from research import readiness
-from research import replay
+from research import corpus, readiness, replay
 from tests.helpers import valid_config
 
 
@@ -39,6 +38,19 @@ class ReadinessFixture(unittest.TestCase):
         self.cfg = valid_config()
 
     def event(self, kind, payload=None, ts=1.0, cycle_id="c1"):
+        if kind == "setup_proposed" and payload is None:
+            payload = {
+                "cycle_id": cycle_id,
+                "symbol": "BTC/USDT:USDT",
+                "direction": "long",
+                "setup_type": "trend_continuation",
+                "setup_id": f"setup-{cycle_id}",
+                "setup_key": f"key-{cycle_id}",
+                "signal_ts": int(float(ts) * 1000),
+                "strategy_id": "momentum",
+                "strategy_version": "phase1-v3",
+                "variant_id": "live",
+            }
         conn = sqlite3.connect(self.db)
         conn.execute(
             "INSERT INTO events VALUES (?,?,?,?,?,?)",
@@ -58,6 +70,22 @@ class ReadinessFixture(unittest.TestCase):
             "max_proposal_ts": float(readiness.MIN_PROPOSALS_FOR_G2),
             "matched": readiness.MIN_PROPOSALS_FOR_G2,
             "recorded": readiness.MIN_PROPOSALS_FOR_G2,
+            "reproduction_rate": 1.0,
+            "missing_count": 0, "extra_count": 0,
+            "malformed_count": 0, "duplicate_count": 0,
+            "unresolved_count": 0, "malformed_reasons": {},
+            "modern_evidence_count": readiness.MIN_PROPOSALS_FOR_G2,
+            "legacy_excluded_count": 0,
+            "legacy_after_boundary_count": 0,
+            "modern_boundary_ts": 1.0,
+            "modern_boundary_rowid": 1,
+            "modern_boundary_cycle_id": "c0",
+            "vacuous": False, "legacy_identity": False,
+            "corpus_digest": replay.g2_corpus_digest(self.db),
+            **corpus.g2_replay_corpus_metadata(self.db),
+            "replay_digest": "test-replay-digest",
+            "variant_id": "momentum.baseline",
+            "replay_mode": "recorded_llm",
             "strategy_config_version": state.strategy_fingerprint(self.cfg),
             "fidelity_code_version": replay.fidelity_code_fingerprint(),
         }
@@ -92,7 +120,7 @@ class G2Tests(ReadinessFixture):
         gate = self.gates()["G2"]
 
         self.assertEqual(gate.status, readiness.COLLECTING)
-        self.assertIn("10 recorded proposals", gate.detail)
+        self.assertIn("10 authoritative proposals", gate.detail)
         self.assertIn("90%", gate.detail)
 
     def test_a_sufficient_sample_is_ready_not_passed(self):

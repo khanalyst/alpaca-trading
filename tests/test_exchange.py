@@ -5,7 +5,8 @@ from unittest.mock import Mock, patch
 import ccxt
 
 from agent.exchange import (CredentialError, EntryLiquidityRejected,
-                            EntryOrderRejected, Exchange)
+                            EntryOrderRejected, Exchange,
+                            OrderSubmissionAmbiguousError)
 from tests.helpers import valid_config
 
 
@@ -15,22 +16,28 @@ class FillClient:
 
     @staticmethod
     def market(symbol):
-        return {"contractSize": 1}
+        return {"id": "BTC-USDT-SWAP", "contractSize": 1}
 
     @staticmethod
     def fetch_order(order_id, symbol, params=None):
         if order_id is None and not (params or {}).get("trigger"):
             raise ccxt.OrderNotFound("not a regular order")
         if order_id is None:
+            client_id = (params or {}).get("clientOrderId")
             return {"id": "recovered", "status": "closed", "filled": 1,
-                    "average": 100}
+                    "average": 100, "clientOrderId": client_id,
+                    "symbol": symbol, "info": {"clOrdId": client_id,
+                                                 "instId": "BTC-USDT-SWAP"}}
         return {
             "id": order_id,
-            "status": "closed",
+            "symbol": symbol,
+            "clientOrderId": "client-1",
+            "status": "canceled",
             "filled": 3,
+            "remaining": 2,
             "average": 101,
             "fee": {"currency": "USDT", "cost": -0.5},
-            "info": {},
+            "info": {"clOrdId": "client-1", "instId": "BTC-USDT-SWAP"},
         }
 
     def create_order(self, *args, **kwargs):
@@ -45,9 +52,21 @@ class FillVerificationTests(unittest.TestCase):
         self.exchange.alerts = None
         self.exchange.x = FillClient()
 
+    @staticmethod
+    def identified_order(**values):
+        order = {
+            "id": "order-1", "symbol": "BTC/USDT:USDT",
+            "clientOrderId": "client-1",
+            "info": {"clOrdId": "client-1",
+                     "instId": "BTC-USDT-SWAP"},
+            "_submission_audit": {"client_order_id": "client-1"},
+        }
+        order.update(values)
+        return order
+
     def test_actual_partial_fill_fee_and_slippage_are_recorded(self):
         result = self.exchange.verify_fill(
-            {"id": "order-1", "status": "open"},
+            self.identified_order(status="open"),
             "BTC/USDT:USDT", requested=5, expected_price=100, side="buy")
         self.assertTrue(result["partial"])
         self.assertEqual(result["filled"], 3)
@@ -58,7 +77,7 @@ class FillVerificationTests(unittest.TestCase):
 
     def test_favorable_fill_is_negative_shortfall_not_a_cost(self):
         result = self.exchange.verify_fill(
-            {"id": "order-1", "status": "open"},
+            self.identified_order(status="open"),
             "BTC/USDT:USDT", requested=5, expected_price=102, side="buy")
         self.assertEqual(result["slippage_usd"], -3)
         self.assertEqual(result["adverse_slippage_usd"], 0)
@@ -68,6 +87,80 @@ class FillVerificationTests(unittest.TestCase):
             "BTC/USDT:USDT", "market", "buy", 1, None, {}, "test")
         self.assertEqual(result["id"], "recovered")
         self.assertEqual(self.exchange.x.create_calls, 1)
+
+    def test_recovery_rejects_mismatched_or_absent_client_identity(self):
+        for recovered in (
+                {"id": "other", "clientOrderId": "wrong"},
+                {"id": "other", "info": {}},
+                {"id": "other", "clientOrderId": "target",
+                 "info": {"clOrdId": "wrong"}},
+        ):
+            exchange = Exchange.__new__(Exchange)
+            exchange.x = Mock()
+            exchange.x.market.return_value = {"id": "BTC-USDT-SWAP"}
+            exchange.x.fetch_order.return_value = recovered
+            exchange.x.fetch_open_orders.return_value = []
+            with patch("agent.exchange.time.sleep"):
+                self.assertIsNone(exchange._recover_order(
+                    "BTC/USDT:USDT", "target"))
+
+    def test_recovery_accepts_only_an_exact_client_identity(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+        recovered = {
+            "id": "recovered", "clientOrderId": "target",
+            "symbol": "BTC/USDT:USDT",
+            "info": {"clOrdId": "target", "instId": "BTC-USDT-SWAP"},
+        }
+        exchange.x.market.return_value = {"id": "BTC-USDT-SWAP"}
+        exchange.x.fetch_order.return_value = recovered
+
+        self.assertIs(exchange._recover_order(
+            "BTC/USDT:USDT", "target"), recovered)
+
+    def test_recovery_rejects_wrong_symbol_with_correct_client_identity(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+        exchange.x.market.return_value = {"id": "BTC-USDT-SWAP"}
+        exchange.x.fetch_order.return_value = {
+            "id": "recovered", "symbol": "ETH/USDT:USDT",
+            "clientOrderId": "target",
+            "info": {"clOrdId": "target", "instId": "ETH-USDT-SWAP"},
+        }
+        exchange.x.fetch_open_orders.return_value = []
+
+        with patch("agent.exchange.time.sleep"):
+            self.assertIsNone(exchange._recover_order(
+                "BTC/USDT:USDT", "target"))
+
+    def test_empty_recovery_target_makes_no_exchange_call(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+
+        self.assertIsNone(exchange._recover_order("BTC/USDT:USDT", ""))
+        exchange.x.fetch_order.assert_not_called()
+        exchange.x.fetch_open_orders.assert_not_called()
+
+    def test_recovery_never_swallows_authentication_failure(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+        exchange.x.fetch_order.side_effect = ccxt.AuthenticationError(
+            "bad credentials")
+
+        with self.assertRaises(ccxt.AuthenticationError):
+            exchange._recover_order("BTC/USDT:USDT", "target")
+
+    def test_unrecovered_ambiguous_create_has_a_narrow_type(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.alerts = None
+        exchange.x = Mock()
+        exchange.x.create_order.side_effect = ccxt.RequestTimeout("timeout")
+        exchange._recover_order = Mock(return_value=None)
+
+        with self.assertRaises(OrderSubmissionAmbiguousError):
+            exchange._create_order_once(
+                "BTC/USDT:USDT", "limit", "buy", 1, 100, {}, "test")
 
     def test_fee_is_not_double_counted_when_ccxt_exposes_both_shapes(self):
         fee = {"currency": "USDT", "cost": 0.5}
@@ -79,7 +172,11 @@ class FillVerificationTests(unittest.TestCase):
                 self.exchange.x, "fetch_order",
                 return_value={
                     "id": "order-2", "status": "canceled", "filled": 0,
-                    "average": None, "info": {},
+                    "average": None, "remaining": 1,
+                    "symbol": "BTC/USDT:USDT",
+                    "clientOrderId": "client-2",
+                    "info": {"clOrdId": "client-2",
+                             "instId": "BTC-USDT-SWAP"},
                 }):
             with self.assertRaisesRegex(
                     RuntimeError, "no verified fill") as raised:
@@ -87,6 +184,10 @@ class FillVerificationTests(unittest.TestCase):
                     {
                         "id": "order-2",
                         "status": "open",
+                        "symbol": "BTC/USDT:USDT",
+                        "clientOrderId": "client-2",
+                        "info": {"clOrdId": "client-2",
+                                 "instId": "BTC-USDT-SWAP"},
                         "_submission_audit": {
                             "client_order_id": "client-2",
                             "submission_count": 1,
@@ -102,6 +203,387 @@ class FillVerificationTests(unittest.TestCase):
             raised.exception._order_audit["client_order_id"], "client-2")
         self.assertEqual(
             raised.exception._order_audit["outcome"], "fill_unverified")
+
+    def test_full_terminal_statuses_require_and_accept_full_quantity(self):
+        for status in ("filled", "closed"):
+            with self.subTest(status=status):
+                result = self.exchange.verify_fill(
+                    self.identified_order(
+                        id="full-1", status=status, filled=5,
+                        remaining=0, average=100),
+                    "BTC/USDT:USDT", requested=5)
+                self.assertFalse(result["partial"])
+                self.assertEqual(result["filled"], 5)
+
+    def test_canceled_spellings_accept_explicit_partial_and_zero(self):
+        for status in ("canceled", "cancelled", "expired", "rejected"):
+            with self.subTest(status=status):
+                result = self.exchange.verify_fill(
+                    self.identified_order(
+                        id="partial-1", status=status, filled=2,
+                        remaining=3, average=101),
+                    "BTC/USDT:USDT", requested=5)
+                self.assertTrue(result["partial"])
+                self.assertEqual(result["filled"], 2)
+        with self.assertRaisesRegex(RuntimeError, "no verified fill"):
+            self.exchange.verify_fill(
+                self.identified_order(
+                    id="zero-1", status="canceled", filled=0,
+                    remaining=5, average=None),
+                "BTC/USDT:USDT", requested=5)
+
+    def test_open_partial_with_cancel_or_post_cancel_read_failure_is_ambiguous(self):
+        for failure_at in ("cancel", "read"):
+            with self.subTest(failure_at=failure_at):
+                exchange = Exchange.__new__(Exchange)
+                exchange.cfg = valid_config()
+                exchange.cfg["execution"]["fill_timeout_seconds"] = 0
+                exchange.alerts = None
+                exchange.x = Mock()
+                exchange.x.market.return_value = {
+                    "id": "BTC-USDT-SWAP", "contractSize": 1}
+                if failure_at == "cancel":
+                    exchange.x.cancel_order.side_effect = ccxt.RequestTimeout(
+                        "cancel timeout")
+                else:
+                    exchange.x.fetch_order.side_effect = ccxt.RequestTimeout(
+                        "read timeout")
+                exchange.retry = lambda fn, *args, **kwargs: fn(*args, **kwargs)
+
+                with self.assertRaises(OrderSubmissionAmbiguousError):
+                    exchange.verify_fill(
+                        self.identified_order(
+                            id="open-1", status="open", filled=2,
+                            remaining=3, average=100),
+                        "BTC/USDT:USDT", requested=5)
+
+    def test_missing_or_mismatched_exchange_id_is_ambiguous(self):
+        with self.assertRaises(OrderSubmissionAmbiguousError):
+            self.exchange.verify_fill(
+                self.identified_order(
+                    id=None, status="closed", filled=1, average=100),
+                "BTC/USDT:USDT", requested=1)
+
+        exchange = Exchange.__new__(Exchange)
+        exchange.cfg = valid_config()
+        exchange.cfg["execution"]["fill_timeout_seconds"] = 0
+        exchange.alerts = None
+        exchange.x = Mock()
+        exchange.x.market.return_value = {
+            "id": "BTC-USDT-SWAP", "contractSize": 1}
+        exchange.x.cancel_order.return_value = {}
+        exchange.x.fetch_order.return_value = {
+            "id": "different", "status": "canceled", "filled": 0,
+            "remaining": 1, "symbol": "BTC/USDT:USDT",
+            "clientOrderId": "client-1",
+            "info": {"clOrdId": "client-1",
+                     "instId": "BTC-USDT-SWAP"},
+        }
+        exchange.retry = lambda fn, *args, **kwargs: fn(*args, **kwargs)
+        with self.assertRaises(OrderSubmissionAmbiguousError):
+            exchange.verify_fill(
+                self.identified_order(id="expected", status="open"),
+                "BTC/USDT:USDT", requested=1)
+
+    def test_malformed_or_inconsistent_fill_evidence_is_ambiguous(self):
+        cases = (
+            ({"id": "x", "status": "closed", "average": 100}, 1),
+            ({"id": "x", "status": "closed", "filled": float("nan"),
+              "average": 100}, 1),
+            ({"id": "x", "status": "closed", "filled": 2,
+              "average": 100}, 1),
+            ({"id": "x", "status": "canceled", "filled": 0.5,
+              "remaining": 0.25, "average": 100}, 1),
+            ({"id": "x", "status": "open", "filled": 1,
+              "remaining": 0, "average": 100}, 1),
+            ({"id": "x", "status": True, "filled": 1,
+              "remaining": 0, "average": 100}, 1),
+            ({"id": "x", "status": "closed", "filled": 1,
+              "remaining": 0, "average": 100,
+              "info": {"realizedPnl": "nan"}}, 1),
+            ({"id": "x", "status": "closed", "filled": 1,
+              "remaining": 0, "average": 100,
+              "fee": {"cost": "bad"}}, 1),
+        )
+        for order, requested in cases:
+            with self.subTest(order=order):
+                with self.assertRaises(OrderSubmissionAmbiguousError):
+                    self.exchange.verify_fill(
+                        order, "BTC/USDT:USDT", requested=requested)
+        for requested in (0, -1, float("inf"), float("nan")):
+            with self.subTest(requested=requested):
+                with self.assertRaises(OrderSubmissionAmbiguousError):
+                    self.exchange.verify_fill(
+                        {"id": "x", "status": "closed", "filled": 1,
+                         "average": 100},
+                        "BTC/USDT:USDT", requested=requested)
+
+    def test_only_cumulative_fill_fields_are_used(self):
+        with self.assertRaises(OrderSubmissionAmbiguousError):
+            self.exchange.verify_fill(
+                {"id": "x", "status": "closed", "average": 100,
+                 "info": {"fillSz": "1", "avgPx": "100"}},
+                "BTC/USDT:USDT", requested=1)
+
+    def test_poll_and_cancel_credentials_propagate(self):
+        for failure_at in ("poll", "cancel"):
+            with self.subTest(failure_at=failure_at):
+                exchange = Exchange.__new__(Exchange)
+                exchange.cfg = valid_config()
+                exchange.alerts = None
+                exchange.x = Mock()
+                exchange.x.market.return_value = {
+                    "id": "BTC-USDT-SWAP", "contractSize": 1}
+                if failure_at == "poll":
+                    exchange.cfg["execution"]["fill_timeout_seconds"] = 1
+                    exchange.retry = Mock(
+                        side_effect=CredentialError("bad credentials"))
+                else:
+                    exchange.cfg["execution"]["fill_timeout_seconds"] = 0
+                    exchange.x.cancel_order.side_effect = CredentialError(
+                        "bad credentials")
+                with self.assertRaises(CredentialError):
+                    exchange.verify_fill(
+                        self.identified_order(id="x", status="open"),
+                        "BTC/USDT:USDT", requested=1)
+
+    def test_okx_order_without_client_echo_uses_exchange_id_and_symbol(self):
+        order = self.identified_order(
+            id="okx-order-1", status="closed", filled="1", remaining="0",
+            average="100.5", clientOrderId=None,
+            info={"instId": "BTC-USDT-SWAP", "state": "filled"})
+
+        result = self.exchange.verify_fill(
+            order, "BTC/USDT:USDT", requested=1)
+
+        self.assertEqual(result["client_order_id"], "client-1")
+        self.assertEqual(result["symbol"], "BTC/USDT:USDT")
+
+    def test_present_mismatched_client_or_wrong_symbol_is_ambiguous(self):
+        cases = (
+            self.identified_order(
+                status="closed", filled=1, remaining=0, average=100,
+                clientOrderId="wrong",
+                info={"clOrdId": "wrong", "instId": "BTC-USDT-SWAP"}),
+            self.identified_order(
+                status="closed", filled=1, remaining=0, average=100,
+                symbol="ETH/USDT:USDT",
+                info={"clOrdId": "client-1", "instId": "ETH-USDT-SWAP"}),
+        )
+        for order in cases:
+            with self.subTest(order=order):
+                with self.assertRaises(OrderSubmissionAmbiguousError):
+                    self.exchange.verify_fill(
+                        order, "BTC/USDT:USDT", requested=1)
+
+
+class PostFillSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.exchange = Exchange.__new__(Exchange)
+        self.exchange.alerts = None
+        self.exchange.x = Mock()
+        self.exchange.x.market.return_value = {
+            "id": "BTC-USDT-SWAP", "contractSize": 1}
+        self.exchange.position = Mock()
+        self.exchange.ensure_protection = Mock(return_value={
+            "stop_loss": True, "take_profit": True,
+        })
+        self.fill = {
+            "symbol": "BTC/USDT:USDT", "order_id": "entry-1",
+            "client_order_id": "client-1",
+            "status": "closed", "filled": 1,
+            "average": 100, "partial": False,
+            "submission_audit": {"client_order_id": "client-1"},
+        }
+
+    def test_position_and_protection_credentials_propagate_as_unsettled_fill(self):
+        for failure_at in ("position", "protection"):
+            with self.subTest(failure_at=failure_at):
+                self.exchange.position.reset_mock(side_effect=True)
+                self.exchange.ensure_protection.reset_mock(side_effect=True)
+                self.exchange.position.return_value = {
+                    "id": "position-1", "symbol": "BTC/USDT:USDT",
+                    "contracts": 1, "markPrice": 100,
+                    "info": {"posId": "position-1",
+                             "instId": "BTC-USDT-SWAP"},
+                }
+                self.exchange.ensure_protection.return_value = {
+                    "stop_loss": True, "take_profit": True,
+                }
+                error = CredentialError("bad credentials")
+                if failure_at == "position":
+                    self.exchange.position.side_effect = error
+                else:
+                    self.exchange.ensure_protection.side_effect = error
+                with patch("agent.exchange.time.sleep"):
+                    with self.assertRaises(CredentialError) as raised:
+                        self.exchange.settle_fill(
+                            dict(self.fill), "BTC/USDT:USDT", "buy", 1,
+                            98, 104)
+                self.assertTrue(raised.exception._post_fill_unsettled)
+                self.assertEqual(
+                    raised.exception._order_audit["order_id"], "entry-1")
+
+    def test_malformed_position_or_protection_after_fill_is_ambiguous(self):
+        valid_position = {
+            "id": "position-1", "symbol": "BTC/USDT:USDT",
+            "contracts": 1, "markPrice": 100,
+            "info": {"posId": "position-1", "instId": "BTC-USDT-SWAP"},
+        }
+        cases = (
+            ("position", "not-a-position"),
+            ("position", {**valid_position, "contracts": 2}),
+            ("protection", "not-a-status"),
+            ("protection", {"stop_loss": "true", "take_profit": True}),
+        )
+        for boundary, value in cases:
+            with self.subTest(boundary=boundary, value=value):
+                self.exchange.position.return_value = valid_position
+                self.exchange.ensure_protection.return_value = {
+                    "stop_loss": True, "take_profit": True}
+                if boundary == "position":
+                    self.exchange.position.return_value = value
+                else:
+                    self.exchange.ensure_protection.return_value = value
+                with patch("agent.exchange.time.sleep"):
+                    with self.assertRaises(
+                            OrderSubmissionAmbiguousError) as raised:
+                        self.exchange.settle_fill(
+                            dict(self.fill), "BTC/USDT:USDT", "buy", 1,
+                            98, 104)
+                self.assertTrue(raised.exception._post_fill_unsettled)
+
+
+class ExchangeTypedBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def valid_close_result(**updates):
+        result = {
+            "order_id": "close-1", "client_order_id": "client-close-1",
+            "status": "canceled", "filled": 1, "average": 100,
+            "remaining_contracts": 1, "fully_closed": False,
+            "fee_usd": 0.1, "slippage_usd": 0,
+            "adverse_slippage_usd": 0,
+        }
+        result.update(updates)
+        return result
+
+    def test_protective_order_auth_failure_is_not_best_effort(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+        exchange.retry = Mock(side_effect=CredentialError("bad credentials"))
+
+        with self.assertRaises(CredentialError):
+            exchange.protective_orders("BTC/USDT:USDT")
+
+    def test_closed_position_summary_preserves_auth_failures(self):
+        for positions_history in (True, False):
+            with self.subTest(positions_history=positions_history):
+                exchange = Exchange.__new__(Exchange)
+                exchange.x = Mock()
+                exchange.x.has = {
+                    "fetchPositionsHistory": positions_history,
+                }
+                exchange.retry = Mock(
+                    side_effect=CredentialError("bad credentials"))
+                with self.assertRaises(CredentialError):
+                    exchange.closed_position_summary(
+                        "BTC/USDT:USDT", 0, "long", 100, 1)
+
+    def test_post_close_position_read_uncertainty_is_ambiguous(self):
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+        exchange._create_order_once = Mock(return_value={
+            "id": "close-1", "status": "closed", "filled": 1,
+            "average": 100,
+        })
+        exchange.verify_fill = Mock(return_value={
+            "order_id": "close-1", "status": "closed", "filled": 1,
+            "average": 100, "submission_audit": {},
+        })
+        exchange.position = Mock(side_effect=ccxt.RequestTimeout("timeout"))
+
+        with self.assertRaises(OrderSubmissionAmbiguousError) as raised:
+            exchange.close_position({
+                "symbol": "BTC/USDT:USDT", "side": "long",
+                "contracts": 1, "markPrice": 100, "info": {},
+            })
+
+        self.assertEqual(
+            raised.exception._order_audit["order_id"], "close-1")
+
+    def test_close_result_rejects_malformed_or_inconsistent_quantities(self):
+        cases = (
+            self.valid_close_result(
+                fully_closed=True, remaining_contracts=1),
+            {key: value for key, value in self.valid_close_result().items()
+             if key != "remaining_contracts"},
+            self.valid_close_result(remaining_contracts="bad"),
+            self.valid_close_result(remaining_contracts=3),
+            self.valid_close_result(filled=0.5, remaining_contracts=1),
+        )
+        for result in cases:
+            with self.subTest(result=result):
+                with self.assertRaises(OrderSubmissionAmbiguousError):
+                    Exchange._validated_close_execution(
+                        result, requested=2, symbol="BTC/USDT:USDT")
+
+    def test_close_result_accepts_exact_full_and_partial_shapes(self):
+        full = self.valid_close_result(
+            status="closed", filled=2, remaining_contracts=0,
+            fully_closed=True)
+        partial = self.valid_close_result()
+
+        self.assertTrue(Exchange._validated_close_execution(
+            full, 2, "BTC/USDT:USDT")["fully_closed"])
+        self.assertFalse(Exchange._validated_close_execution(
+            partial, 2, "BTC/USDT:USDT")["fully_closed"])
+
+    def test_position_history_requires_explicit_positive_price_and_qty(self):
+        bad_values = (None, 0, float("nan"))
+        for field in ("price", "qty"):
+            for bad in bad_values:
+                with self.subTest(field=field, bad=bad):
+                    exchange = Exchange.__new__(Exchange)
+                    exchange.x = Mock()
+                    exchange.x.has = {"fetchPositionsHistory": True}
+                    info = {
+                        "closeAvgPx": "105", "closeTotalPos": "1",
+                        "realizedPnl": "5", "fee": "-0.1",
+                        "fundingFee": "0",
+                    }
+                    if field == "price":
+                        info["closeAvgPx"] = bad
+                    else:
+                        info["closeTotalPos"] = bad
+                    exchange.x.fetch_positions_history.return_value = [{
+                        "symbol": "BTC/USDT:USDT", "timestamp": 1,
+                        "info": info,
+                    }]
+                    exchange.x.fetch_my_trades.return_value = []
+                    exchange.retry = lambda fn, *args, **kwargs: fn(
+                        *args, **kwargs)
+                    with self.assertRaises(OrderSubmissionAmbiguousError):
+                        exchange.closed_position_summary(
+                            "BTC/USDT:USDT", 0, "long", 100, 1)
+
+    def test_trade_fallback_requires_matching_symbol_price_and_qty(self):
+        rows = (
+            {"symbol": "ETH/USDT:USDT", "side": "sell",
+             "amount": 1, "price": 105, "info": {}},
+            {"symbol": "BTC/USDT:USDT", "side": "sell",
+             "amount": 0, "price": 105, "info": {}},
+            {"symbol": "BTC/USDT:USDT", "side": "sell",
+             "amount": 1, "price": float("nan"), "info": {}},
+        )
+        exchange = Exchange.__new__(Exchange)
+        exchange.x = Mock()
+        exchange.x.has = {"fetchPositionsHistory": False}
+        exchange.x.fetch_my_trades.return_value = list(rows)
+        exchange.retry = lambda fn, *args, **kwargs: fn(*args, **kwargs)
+
+        with self.assertRaises(OrderSubmissionAmbiguousError):
+            exchange.closed_position_summary(
+                "BTC/USDT:USDT", 0, "long", 100, 1)
 
 
 class PositionAgeRecoveryTests(unittest.TestCase):
@@ -536,7 +1018,12 @@ class EmergencyHedgeCloseTests(unittest.TestCase):
         exchange.alerts = None
         exchange.x = Mock()
         exchange._create_order_once = Mock(return_value={"id": "close"})
-        exchange.verify_fill = Mock(return_value={"filled": 2})
+        exchange.verify_fill = Mock(return_value={
+            "order_id": "close", "client_order_id": "client-close",
+            "status": "closed", "filled": 2, "average": 100,
+            "fee_usd": 0, "slippage_usd": 0,
+            "adverse_slippage_usd": 0, "submission_audit": {},
+        })
         exchange.position = Mock(return_value=None)
         exchange.positions = Mock(return_value=[])
         exchange.cancel_symbol = Mock()

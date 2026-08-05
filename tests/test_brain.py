@@ -1,12 +1,35 @@
 import unittest
+import os
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agent.brain import LLM, build_system, parse_decisions
 from tests.helpers import valid_config
 
 
 class LLMPreflightTests(unittest.TestCase):
+    def test_provider_client_receives_exact_resolved_endpoint_and_safe_display(self):
+        cfg = valid_config()
+        cfg["llm"]["provider"] = "openai"
+        with patch.dict(os.environ, {
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_BASE_URL":
+                    "https://user:secret@example.test/v1?tenant=a"},
+                clear=False), patch("openai.OpenAI") as constructor:
+            llm = LLM(cfg)
+        constructor.assert_called_once_with(
+            base_url="https://user:secret@example.test/v1?tenant=a")
+        self.assertEqual(llm.endpoint(), "https://example.test/v1")
+        self.assertNotIn("secret", llm.endpoint())
+
+    def test_provider_client_receives_explicit_default_endpoint(self):
+        cfg = valid_config()
+        cfg["llm"]["provider"] = "openai"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"},
+                        clear=False), patch("openai.OpenAI") as constructor:
+            LLM(cfg)
+        constructor.assert_called_once_with(base_url="https://api.openai.com/v1")
+
     def test_anthropic_model_access_is_checked_without_generation(self):
         llm = LLM.__new__(LLM)
         llm.cfg = {"model": "claude-test"}

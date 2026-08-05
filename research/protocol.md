@@ -325,10 +325,12 @@ those same windows; an operational failure invalidates its assignment evidence
 rather than becoming missing data.
 
 Gate G2 is narrower than risk or execution validation: replay compares the
-recorded pre-risk proposal keys `(cycle_id, symbol, direction)` with replay
-keys and requires at least 99% reproduction. It does not reproduce full
-contract or execution semantics. A failed, stale, or vacuous G2 blocks treating
-journal-derived evidence as authoritative.
+full canonical pre-risk proposal identity (cycle, symbol, direction, setup
+identity/type, signal timestamp, strategy version, and baseline variant)
+symmetrically with replay keys. It requires a non-vacuous exact match and
+fails closed on malformed, duplicate, missing, or extra identities. Outcome
+resolution gaps remain diagnostics rather than proposal mismatches. A failed,
+stale, or vacuous G2 blocks treating journal-derived evidence as authoritative.
 
 Forward qualification proves one strategy version and one declared axis,
 verifies identical non-axis executable inputs, persists family correction, and
