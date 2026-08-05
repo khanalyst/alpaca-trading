@@ -13,6 +13,8 @@ Every registered variant, including the rejected ones. A rejection is a row here
 | variant | status | round trips | expectancy | last updated |
 | --- | --- | --- | --- | --- |
 | [momentum.baseline](momentum/momentum.baseline.md) | testing | 0 | - | 2026-07-28 |
+| [momentum.cond.session](momentum/momentum.cond.session.md) | candidate | 0 | - | 2026-08-05 |
+| [momentum.cond.vol_regime](momentum/momentum.cond.vol_regime.md) | candidate | 0 | - | 2026-08-05 |
 | [momentum.conf.floor_0_50](momentum/momentum.conf.floor_0_50.md) | superseded | 0 | - | 2026-08-03 |
 | [momentum.conf.floor_0_55](momentum/momentum.conf.floor_0_55.md) | superseded | 0 | - | 2026-08-03 |
 | [momentum.conf.floor_0_60](momentum/momentum.conf.floor_0_60.md) | superseded | 0 | - | 2026-08-03 |
@@ -31,3 +33,5 @@ Every registered variant, including the rejected ones. A rejection is a row here
 | [momentum.stop.atr_1_25](momentum/momentum.stop.atr_1_25.md) | candidate | 0 | - | 2026-07-30 |
 | [momentum.stop.atr_1_5](momentum/momentum.stop.atr_1_5.md) | candidate | 0 | - | 2026-07-28 |
 | [momentum.stop.atr_2_0](momentum/momentum.stop.atr_2_0.md) | candidate | 0 | - | 2026-07-28 |
+| [momentum.universe.top_25](momentum/momentum.universe.top_25.md) | superseded | 0 | - | 2026-08-05 |
+| [momentum.universe.top_5](momentum/momentum.universe.top_5.md) | superseded | 0 | - | 2026-08-05 |

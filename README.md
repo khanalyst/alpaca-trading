@@ -342,6 +342,10 @@ source.
 | [findings/momentum/momentum.conf.floor_0_80.md](findings/momentum/momentum.conf.floor_0_80.md) | Active scorecard for the strictest registered observable confidence floor. |
 | [findings/momentum/momentum.discriminator.trend_alignment.md](findings/momentum/momentum.discriminator.trend_alignment.md) | Scorecard for separating breakouts from continuations using prior trend alignment. |
 | [findings/momentum/momentum.discriminator.volatility_regime.md](findings/momentum/momentum.discriminator.volatility_regime.md) | Scorecard for separating breakouts using compression versus expansion rather than trend alignment. |
+| [findings/momentum/momentum.cond.vol_regime.md](findings/momentum/momentum.cond.vol_regime.md) | Conditioning-axis scorecard. It partitions existing trades by volatility regime instead of changing a setting, so it consumes no rotation arm. |
+| [findings/momentum/momentum.cond.session.md](findings/momentum/momentum.cond.session.md) | Conditioning-axis scorecard. It partitions existing trades by UTC session window and may only be quoted after the out-of-sample split. |
+| [findings/momentum/momentum.universe.top_5.md](findings/momentum/momentum.universe.top_5.md) | Scorecard for a five-instrument universe. It asks whether the edge lives in the liquid majors. |
+| [findings/momentum/momentum.universe.top_25.md](findings/momentum/momentum.universe.top_25.md) | Scorecard for a twenty-five-instrument universe. It asks the opposite question: whether the edge lives in the tail. |
 
 ### Research result snapshots
 

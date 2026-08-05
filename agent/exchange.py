@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 
 import ccxt
+from ccxt.base.types import Entry
 
 log = logging.getLogger("exchange")
 PROTECTIVE_ALGO_TYPES = ("conditional", "oco", "trigger")
@@ -127,6 +128,17 @@ class Exchange:
             "enableRateLimit": True,
             "options": {"defaultType": "swap"},
         })
+        # OKX publishes filled liquidation orders, but ccxt does not map the
+        # path: its implicit endpoints are class-level Entry descriptors from
+        # a static table (ccxt/abstract/okx.py) and the runtime
+        # define_rest_api that once extended it is gone. Bind one more Entry
+        # to THIS client through the same descriptor protocol ccxt uses, so
+        # public_call finds an ordinary implicit method and ccxt - not this
+        # file - still builds the URL. See public_call for why hand-building
+        # one fails, and fails silently.
+        self.x.publicGetPublicLiquidationOrders = Entry(
+            "public/liquidation-orders", "public", "GET", {"cost": 1},
+        ).__get__(self.x, type(self.x))
         if self.demo:
             # OKX demo trading = same endpoints + a simulated-trading header.
             try:

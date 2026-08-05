@@ -281,6 +281,71 @@ def _okx_oi_history(ex, symbol: str) -> list[float]:
     return out
 
 
+def _liquidation_flow(ex, symbol: str) -> dict:
+    """Notional and count of liquidations actually filled in the last hour.
+
+    ``_open_interest_change`` is a proxy for this, and only a proxy: open
+    interest falling is consistent with forced deleveraging but cannot tell a
+    liquidation apart from a voluntary close, and it is sampled hourly. This
+    is the event itself - OKX publishes each filled liquidation order with
+    its size, side and bankruptcy price. Both fields are kept so the proxy
+    and the direct measurement stay comparable on the same rows.
+
+    Rows returned but none inside the window means zero forced flow, which is
+    a real reading. No rows at all means the feed said nothing, and both
+    fields degrade to None.
+    """
+    empty = {"liq_notional_1h_usd": None, "liq_count_1h": None}
+    rows = _cached_series("liquidations", symbol,
+                          lambda: _okx_liquidations(ex, symbol))
+    if not rows:
+        return empty
+    cutoff = time.time() * 1000 - 3_600_000
+    recent = [notional for ts, notional in rows if ts >= cutoff]
+    return {"liq_notional_1h_usd": round(sum(recent), 2),
+            "liq_count_1h": len(recent)}
+
+
+def _okx_liquidations(ex, symbol: str) -> list[tuple[float, float]]:
+    """Return (timestamp_ms, notional_usd) for recent filled liquidations."""
+    inst_id = _inst_id(ex, symbol)
+    if not inst_id:
+        return []
+    try:
+        contract_size = float(ex.x.market(symbol).get("contractSize") or 1)
+    except Exception:
+        return []
+    # ``sz`` is a contract count, so notional needs the multiplier. OKX also
+    # rejects instId on its own here (50015): the underlying is mandatory,
+    # which is why the response is filtered back down to this instrument.
+    raw = ex.public_call(
+        "publicGetPublicLiquidationOrders",
+        {"instType": "SWAP", "uly": "-".join(inst_id.split("-")[:2]),
+         "state": "filled", "limit": "100"})
+    out = []
+    for row in raw or []:
+        if not isinstance(row, dict) or str(row.get("instId") or "") != inst_id:
+            continue
+        for detail in row.get("details") or []:
+            try:
+                ts = float(detail["ts"])
+                notional = (float(detail["sz"]) * contract_size
+                            * float(detail["bkPx"]))
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if math.isfinite(ts) and math.isfinite(notional):
+                out.append((ts, notional))
+    if not out:
+        # These fields degrade to None by design, which makes an outage here
+        # indistinguishable from a quiet market unless it is said out loud.
+        # The series cache holds the empty result for its TTL, so this cannot
+        # log once per symbol per cycle.
+        log.warning("OKX returned no filled liquidations for %s; "
+                    "liq_notional_1h_usd and liq_count_1h are unavailable",
+                    inst_id)
+    return out
+
+
 def _long_short_ratio(ex, symbol: str) -> dict:
     """Retail long/short account ratio, and where it sits in its own recent range.
 
@@ -691,10 +756,11 @@ def symbol_snapshot(ex, symbol: str, cfg: dict,
     open_interest = _open_interest_usd(ex, symbol, last)
     snap["open_interest_musd"] = (
         round(open_interest / 1e6, 2) if open_interest is not None else None)
-    # Enrichment for the positioning-based contracts. Both are cached hourly
-    # series and both degrade to None rather than raising: no order depends
-    # on them, so a statistics outage must not be able to stop trading.
+    # Enrichment for the positioning-based contracts. All are cached series
+    # and all degrade to None rather than raising: no order depends on them,
+    # so a statistics outage must not be able to stop trading.
     snap.update(_open_interest_change(ex, symbol))
+    snap.update(_liquidation_flow(ex, symbol))
     snap.update(_long_short_ratio(ex, symbol))
 
     for tf, df in frames.items():
