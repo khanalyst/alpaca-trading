@@ -129,9 +129,9 @@ collection answers that question with data instead of a guess.
 
 ## Batch 2 - redesign for edge production
 
-- [ ] B2.1 Declarative contract DSL so a proposed mechanism is executable
+- [x] B2.1 Declarative contract DSL so a proposed mechanism is executable
       without hand-written Python, bounded to known snapshot fields
-- [ ] B2.2 Staging tier: LLM-authored hypotheses register at T1, get shadow
+- [x] B2.2 Staging tier: LLM-authored hypotheses register at T1, get shadow
       lanes immediately, and remain barred from capital by `LIVE_MIN_TIER`
 - [ ] B2.3 Three-stage funnel - screen on ~30 observations, measure on 100
       with full costs, confirm on held-out evidence - instead of applying the
@@ -146,6 +146,48 @@ collection answers that question with data instead of a guess.
 
 Gate: a generation of LLM-authored candidates runs end to end and produces a
 shortlist without a human in the inner loop.
+
+B2.1/B2.2 landed. `agent/contract_dsl.py` validates an authored proposal and
+compiles it into the same `(snapshot, direction, cfg, params) -> (fired,
+reason)` callable the hand-written contracts implement, so a proposed
+mechanism reaches a shadow lane through the path a reviewed one already uses.
+The bounds are derived rather than declared: the 26 proposable fields come
+from what the validated forward models require, so an author can only name
+inputs the pipeline is known to populate.
+
+`agent/staging.py` gives an authored mechanism an identity that is append-only
+and immutable at the database level - a registered claim cannot be reworded
+after results exist, which is the difference between a pre-registered
+hypothesis and a retro-fitted one. Everything enters at `T1_HYPOTHESIS`, and
+the constant is duplicated rather than imported so a future edit to the tier
+ladder cannot silently raise the tier a machine-authored contract is born at.
+
+Verified by removing each guardrail in turn: dropping the field allowlist, the
+substance floor and the immutability trigger fails nine tests.
+
+### Why the analyst layer is the wrong way to promote a strategy
+
+Making every strategy `analyst_ready` would let the LLM trade any of them on
+the order path, but it would also put an unmeasured layer on top of a
+mechanism whose evidence came from its deterministic contract. The lanes
+measure contracts; promoting one and then running it under an analyst trades
+something other than the thing that earned the promotion.
+
+The mechanism that serves the same goal without breaking the evidence chain is
+a deterministic order path: the contract proposes, risk vets, execution
+places, and no analyst call happens at all. That is what the shadow lanes
+already do minus the exchange, so a promoted edge would trade exactly what was
+measured. Per-strategy analyst prompts remain worth adding later, one at a
+time, once a contract has earned one - and each addition should fork
+attribution deliberately.
+
+### Remaining in Batch 2
+
+- [ ] B2.7 Deterministic order path so a promoted contract can trade as
+      measured, replacing blanket `analyst_ready`
+- [ ] B2.8 Wire `StagingStore.evaluators()` into the shadow coordinator so a
+      staged contract gets a lane on the next cycle
+- [ ] B2.9 Authoring prompt and response schema for the nightly reviewer
 
 ## What 30 days can and cannot deliver
 
