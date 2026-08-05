@@ -177,6 +177,23 @@ def _flatten(cfg, reason: str) -> bool:
 
 
 def cmd_run(args, cfg) -> int:
+    candidate_demo = None
+    if getattr(args, "candidate_demo", False):
+        candidate_demo = {
+            "variant_id": getattr(args, "variant_id", None),
+            "scope_key": getattr(args, "scope_key", None),
+            "packet_ref": getattr(args, "packet_ref", None),
+            "expected_account_fingerprint": getattr(
+                args, "expected_demo_account_fingerprint", None),
+        }
+        missing = [name for name, value in candidate_demo.items() if not value]
+        if missing:
+            print("candidate demo requires: " + ", ".join(missing),
+                  file=sys.stderr)
+            return 2
+        if cfg.get("mode") != "demo":
+            print("candidate demo requires config mode=demo", file=sys.stderr)
+            return 2
     run_lock = state.acquire_run_lock()
     if run_lock is None:
         pid = state.read_pid()
@@ -201,7 +218,7 @@ def cmd_run(args, cfg) -> int:
         shutdown.install()
         try:
             from agent.engine import Engine
-            engine = Engine(cfg)
+            engine = Engine(cfg, candidate_demo=candidate_demo)
             shutdown.attach(engine)
             engine.run(run_lock)
         finally:
@@ -528,6 +545,18 @@ def main() -> int:
     p = sub.add_parser("run", help="start the trading loop")
     p.add_argument("--acknowledge-kill", action="store_true",
                    help="restart after a self-kill event")
+    p.add_argument("--candidate-demo", action="store_true",
+                   help="explicitly start one reviewed variant in demo mode")
+    p.add_argument("--variant-id", "--variant", dest="variant_id",
+                   help="reviewed candidate variant id (candidate demo only)")
+    p.add_argument("--scope-key", "--scope", dest="scope_key",
+                   help="authoritative paper/research scope (candidate demo only)")
+    p.add_argument("--packet-ref", "--packet", dest="packet_ref",
+                   help="reviewed t3 packet reference (candidate demo only)")
+    p.add_argument(
+        "--expected-demo-account-fingerprint", "--expected-account-fingerprint",
+        dest="expected_demo_account_fingerprint",
+        help="explicit expected demo account fingerprint (candidate demo only)")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("pause", help="stop opening new positions")

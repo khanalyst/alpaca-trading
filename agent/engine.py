@@ -21,6 +21,8 @@ import logging
 import math
 import os
 import time
+from collections.abc import Mapping
+from copy import deepcopy
 from datetime import datetime, timezone
 
 import ccxt
@@ -53,13 +55,51 @@ class PositionAgeUnknown(RuntimeError):
 
 
 class Engine:
-    def __init__(self, cfg: dict, light: bool = False):
+    def __init__(self, cfg: dict, light: bool = False,
+                 candidate_demo: Mapping[str, object] | None = None,
+                 *, demo_variant_id: str | None = None,
+                 demo_scope_key: str | None = None,
+                 demo_packet_ref: str | None = None,
+                 expected_demo_account_fingerprint: str | None = None):
         self.cfg = cfg
         # Protect library/direct callers as well as main.py: state and journal
         # access must already be scoped to, and bound to, this exact key/mode.
         state.configure_runtime(cfg["mode"])
         state.bind_runtime_identity(
             cfg["mode"], os.environ.get("OKX_API_KEY", ""))
+        requested_demo = dict(candidate_demo or {})
+        if demo_variant_id is not None:
+            requested_demo["variant_id"] = demo_variant_id
+        if demo_scope_key is not None:
+            requested_demo["scope_key"] = demo_scope_key
+        if demo_packet_ref is not None:
+            requested_demo["packet_ref"] = demo_packet_ref
+        if expected_demo_account_fingerprint is not None:
+            requested_demo["expected_account_fingerprint"] = (
+                expected_demo_account_fingerprint)
+        self.demo_authorization = None
+        if requested_demo:
+            if cfg.get("mode") != "demo":
+                raise deployment.DeploymentAuthorizationError(
+                    "candidate demo startup cannot authorize live mode")
+            if light:
+                raise deployment.DeploymentAuthorizationError(
+                    "candidate demo startup requires the full engine")
+            self.demo_authorization = deployment.verify_demo_artifact(
+                cfg,
+                variant_id=requested_demo.get("variant_id"),
+                scope_key=requested_demo.get("scope_key"),
+                packet_ref=requested_demo.get("packet_ref"),
+                expected_account_fingerprint=requested_demo.get(
+                    "expected_account_fingerprint"),
+                runtime_account_fingerprint=(
+                    state.journal_context().get("account_fingerprint")),
+            )
+            # Applying a reviewed variant in memory is intentional.  The
+            # registry and on-disk config remain untouched, while every
+            # client below receives the exact reviewed candidate config.
+            self.cfg = deepcopy(self.demo_authorization["runtime_config"])
+            cfg = self.cfg
         self.run_id = state.new_run_id()
         self.config_version = state.stable_fingerprint(cfg)
         # Fingerprint only configuration that can change a decision.
@@ -80,6 +120,10 @@ class Engine:
                 cfg, catalog=self.research_selection_catalog,
                 system_prompt=self.system_prompt)
             self.prompt_version = brain.prompt_version(self.system_prompt)
+        elif self.demo_authorization:
+            self.research_selection_catalog = self.demo_authorization["catalog"]
+            self.system_prompt = self.demo_authorization["system_prompt"]
+            self.prompt_version = brain.prompt_version(self.system_prompt)
         else:
             # Demo and light control paths retain their existing startup
             # semantics; only non-light live startup is artifact-gated.
@@ -99,6 +143,24 @@ class Engine:
                 "deployment_config_hash": (
                     self.deployment_artifact["deployment_config_hash"]),
             }
+        journal_variant_id = (
+            self.demo_authorization["variant_id"]
+            if self.demo_authorization else variants.LIVE_VARIANT_ID)
+        if self.demo_authorization:
+            artifact_context.update({
+                "packet_id": self.demo_authorization.get("packet_id"),
+                "packet_hash": self.demo_authorization.get("packet_hash"),
+                "artifact_hash": self.demo_authorization.get("artifact_hash"),
+                "artifact_variant_id": self.demo_authorization.get(
+                    "variant_id"),
+                "artifact_variant_definition_hash": (
+                    self.demo_authorization.get("variant_definition_hash")),
+                "artifact_strategy_config_version": (
+                    self.demo_authorization.get(
+                        "artifact_strategy_config_version")),
+                "deployment_config_hash": self.demo_authorization.get(
+                    "deployment_config_hash"),
+            })
         state.set_journal_context(
             run_id=self.run_id,
             strategy_id=self.strategy_id,
@@ -110,7 +172,7 @@ class Engine:
             # Everything the live agent writes is attributed to "live".
             # Replayed and shadow variants carry their own readable ids, so
             # the two populations can never be pooled by accident.
-            variant_id=variants.LIVE_VARIANT_ID,
+            variant_id=journal_variant_id,
             **artifact_context,
         )
         if cfg["mode"] == "live" and not light:
@@ -127,6 +189,21 @@ class Engine:
             cfg, self.alerts, validate_account=not light)
         if not light:
             self.ex.verify_account_safety(require_trade=True, refresh=True)
+        if self.demo_authorization:
+            self.demo_preflight = deployment.preflight_demo_account(
+                self.ex,
+                expected_account_fingerprint=self.demo_authorization[
+                    "expected_account_fingerprint"],
+                runtime_account_fingerprint=(
+                    state.journal_context().get("account_fingerprint")),
+                runtime_state_snapshot=state.load_state(),
+            )
+            self.demo_receipt = deployment.record_demo_authorization_receipt(
+                self.demo_authorization,
+                account_fingerprint=self.demo_preflight[
+                    "account_fingerprint"],
+                preflight=self.demo_preflight,
+            )
         if not light:
             llm_kwargs = {}
             if self.research_selection_catalog is not None:
@@ -328,6 +405,27 @@ class Engine:
             self.strategy_config_version = state.strategy_fingerprint(self.cfg)
         if not hasattr(self, "code_version"):
             self.code_version = state.code_fingerprint()
+        run_context = {
+            "variant_id": (
+                self.demo_authorization["variant_id"]
+                if getattr(self, "demo_authorization", None)
+                else variants.LIVE_VARIANT_ID),
+        }
+        if getattr(self, "demo_authorization", None):
+            run_context.update({
+                "packet_id": self.demo_authorization.get("packet_id"),
+                "packet_hash": self.demo_authorization.get("packet_hash"),
+                "artifact_hash": self.demo_authorization.get("artifact_hash"),
+                "artifact_variant_id": self.demo_authorization.get(
+                    "variant_id"),
+                "artifact_variant_definition_hash": (
+                    self.demo_authorization.get("variant_definition_hash")),
+                "artifact_strategy_config_version": (
+                    self.demo_authorization.get(
+                        "artifact_strategy_config_version")),
+                "deployment_config_hash": self.demo_authorization.get(
+                    "deployment_config_hash"),
+            })
         state.set_journal_context(
             run_id=self.run_id,
             strategy_id=self.strategy_id,
@@ -336,7 +434,7 @@ class Engine:
             config_version=self.config_version,
             code_version=self.code_version,
             strategy_config_version=self.strategy_config_version,
-            variant_id=variants.LIVE_VARIANT_ID,
+            **run_context,
         )
         st = state.load_state()
         state.log_run(
