@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -50,6 +51,25 @@ HYPOTHESIS_DRAFT_FIELDS = {
 }
 HYPOTHESIS_PREDICATE_FIELDS = {"field", "operator", "value", "direction"}
 
+# research/gates.py::has_mechanism refuses a registered hypothesis whose
+# mechanism or falsification runs under 40 characters, on the grounds that a
+# claim that thin cannot name a payer or an observation. A model-proposed
+# draft is held to the same floor, and additionally to the phrasing test
+# below: "try it and see" proposes an action rather than a cause or a test,
+# which is precisely the guess this repository exists to refuse. Such a draft
+# is rejected at parse time so it is never stored as a proposal at all.
+HYPOTHESIS_SUBSTANTIVE_MIN_CHARS = 40
+HYPOTHESIS_SUBSTANTIVE_FIELDS = ("mechanism", "falsifier")
+HYPOTHESIS_CAUSAL_FIELDS = ("mechanism", "payer", "falsifier")
+HYPOTHESIS_NON_MECHANISM_PATTERNS = (
+    r"\band see\b",
+    r"\bsee what happens\b",
+    r"\bsee if\b",
+    r"\bfind out\b",
+    r"\btry (?:it|this|that|out)\b",
+    r"\blook at the (?:numbers|results)\b",
+)
+
 RESEARCH_REVIEW_SYSTEM = """You are reviewing a completed research-only
 shadow experiment. The deterministic verdict in the request is final. You
 must not set, revise, soften, or override it. Explain why the persisted facts
@@ -70,6 +90,12 @@ the request. Predicate fields are exact snapshot keys from the persisted,
 immutable llm_input corpus consumed through research.corpus; do not claim they
 are necessarily present in the terminal outcome aggregates.
 
+A draft must state a cause and a test, not an action to try. The mechanism
+must say who pays and why they keep paying; the falsifier must name the
+observation that would kill the claim. A draft whose mechanism, payer, or
+falsifier merely proposes trying something and seeing the result is rejected
+and never stored.
+
 Return one JSON object with these required fields and the one optional field
 shown below; do not return any other field:
 {
@@ -83,9 +109,10 @@ shown below; do not return any other field:
   "hypothesis_draft": null OR OMITTED OR {
     "title": "5 to 120 characters",
     "strategy_id": "registered strategy from the request",
-    "mechanism": "20 to 1000 characters",
+    "mechanism": "20 to 1000 characters, at least 40, stating the cause",
     "payer": "5 to 500 characters identifying the payer/return source",
-    "falsifier": "20 to 1000 characters",
+    "falsifier": "20 to 1000 characters, at least 40, stating the "
+                 "observation that would refute the claim",
     "predicate": {
       "field": "allowlisted persisted numeric field",
       "operator": "gt, gte, lt, or lte",
@@ -196,6 +223,8 @@ def build_review_request(store: FindingsStore, outcome: dict) -> dict:
                 "directions": list(HYPOTHESIS_DIRECTIONS),
             },
             "cost_treatments": list(HYPOTHESIS_COST_TREATMENTS),
+            "substantive_min_chars": HYPOTHESIS_SUBSTANTIVE_MIN_CHARS,
+            "rejects_action_without_cause": True,
         },
     }
 
@@ -223,6 +252,27 @@ def _normalized_number(value: object, field: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"research hypothesis_draft {field} must be finite")
     return number
+
+
+def _reject_unsubstantiated(draft: dict) -> None:
+    """Refuse a draft that proposes an action instead of a cause and a test.
+
+    Runs on the already length-checked text, so the declared bounds remain
+    the first thing a too-short field is told about.
+    """
+    for field in HYPOTHESIS_CAUSAL_FIELDS:
+        for pattern in HYPOTHESIS_NON_MECHANISM_PATTERNS:
+            if re.search(pattern, draft[field], flags=re.IGNORECASE):
+                raise ValueError(
+                    f"research hypothesis_draft {field} proposes trying "
+                    "something and seeing the result; it must state a cause, "
+                    "a payer, or an observation that would refute the claim")
+    for field in HYPOTHESIS_SUBSTANTIVE_FIELDS:
+        if len(draft[field]) < HYPOTHESIS_SUBSTANTIVE_MIN_CHARS:
+            raise ValueError(
+                f"research hypothesis_draft {field} must be at least "
+                f"{HYPOTHESIS_SUBSTANTIVE_MIN_CHARS} characters to state a "
+                "mechanism or a falsifier")
 
 
 def _parse_hypothesis_draft(raw: object) -> dict | None:
@@ -283,7 +333,7 @@ def _parse_hypothesis_draft(raw: object) -> dict | None:
         raise ValueError(
             "research hypothesis_draft cost_treatment is not allowlisted")
 
-    return {
+    draft = {
         "title": _normalized_text(raw, "title", 5, 120),
         "strategy_id": strategy_id,
         "mechanism": _normalized_text(raw, "mechanism", 20, 1_000),
@@ -300,6 +350,8 @@ def _parse_hypothesis_draft(raw: object) -> dict | None:
         "evidence_needed": _normalized_text(
             raw, "evidence_needed", 20, 1_000),
     }
+    _reject_unsubstantiated(draft)
+    return draft
 
 
 def parse_review_response(raw_text: str) -> dict:
