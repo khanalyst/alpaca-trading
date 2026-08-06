@@ -101,7 +101,7 @@ authorize live mode. The complete operating and rollback procedure is in
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
-| `strategy.execution_mode` | `analyst`; `deterministic` trades the strategy's own forward contract with no LLM call, which is how a strategy other than `momentum` can occupy the order path |
+| `strategy.execution_mode` | `shadow_only` (shipped): no order path, research lanes unchanged, because no mechanism has earned the account yet. `analyst` makes one LLM call per decision cycle; `deterministic` trades the strategy's own forward contract with no LLM call, which is how a strategy other than `momentum` can occupy the order path |
 | `research.staging_store` | `research/cache/staging.db`; machine-authored mechanisms, created by `research.py author` and absent until one is staged |
 | `research.forward_feed_version` | `8`; v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; three long-horizon models are offline-only; v1-v7 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane fork, and v7 the liquidation-flow and conditioning-axis fork |
 | `research.experiment_min_duration_days` | `10` |

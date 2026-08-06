@@ -454,3 +454,59 @@ population on a fixed harness, never pooled with the registered arms; and
 `research/README.md` records their coded verdicts.
 
 Batch 2 is complete.
+
+## B2.10: replacing momentum
+
+The loop can now author, stage, measure, verdict and rank mechanisms, but
+every registered strategy was falsified or unmeasured, so there was nothing
+worth measuring in it and nothing that should have been trading.
+
+Three hand-written pre-registrations were staged as replacements for the
+rejected `momentum` claim rather than as new thresholds on it:
+`funding-crowd-unwind` (the directional residual `funding-carry` left behind),
+`oi-buildup-fade` (new leverage arriving at a range edge, the mirror of
+`flush-fade`'s already-rejected exit claim) and `basis-crowd-fade` (the
+registered `basis-stretch` hypothesis, which never fired because experimental
+setups were disabled for its entire life). They live in
+`research/staged/pre-registered.yaml`, reach the store through
+`research.py stage-seed`, and are otherwise indistinguishable from an authored
+claim: same table, same triggers, same `T1_HYPOTHESIS` tier, same fixed
+harness.
+
+Thresholds were calibrated by replaying the compiled contracts over the 13,637
+recorded symbol observations rather than chosen for how they read. That
+changed every draft. `funding_percentile_30 >= 80` - the obvious way to write
+"crowded funding" - fires on 56.3% of the corpus and is not a crowding signal
+at all, because the percentile is computed over 30 samples that are frequently
+pinned; the absolute funding floor is what makes the tail a tail. The basis
+thresholds moved by an order of magnitude once the real distribution was
+available. A relative-volume filter on `oi-buildup-fade` was tested and
+dropped: it cut firing to 0.19%, which would not reach the 30-trade screening
+floor in a month.
+
+A fourth, `liq-absorption-direct`, is in the file as `deferred` and is not
+registered: `liq_notional_1h_usd` appears in none of the 13,637 observations,
+so its threshold cannot be calibrated. A staged contract that cannot fire is
+worse than a missing one - in the evidence it is indistinguishable from one
+that fired and lost - so the seed format carries the distinction and the
+loader refuses a deferral with no stated reason.
+
+### The order path is empty
+
+`strategy.execution_mode` gained a third value, `shadow_only`: nothing
+proposes and nothing opens. It exists because leaving a falsified mechanism on
+the account is not a neutral holding pattern. `momentum` returned -8.97% over
+seven days and `risk.max_drawdown_pct` is 15; reaching it flattens the book
+and self-kills the process, which would end the collection every research lane
+depends on. The order path is not the measuring instrument, so the mechanism
+that would kill the instrument does not keep the seat.
+
+No untested strategy was promoted into it. `funding-unwind`, `ls-ratio-fade`
+and `trend-multiday` have no negative evidence because they have no evidence,
+and swapping a known-bad mechanism for an unmeasured one is the substitution
+this platform exists to prevent. `research/plan/order-path-succession.md`
+states the criterion instead, pre-committed: a `SUPPORTED` shortlist label
+(100+ trades, positive mean, surviving BH correction, agreeing out of sample),
+not `RETIRING`, single feed version and code fingerprint with G2 passing, and
+a complete forward contract. When those hold the successor takes the seat by
+config edit, not by judgement exercised while looking at the numbers.

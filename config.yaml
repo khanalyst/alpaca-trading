@@ -15,14 +15,28 @@ llm:
 strategy:
   id: momentum
   version: phase1-v3
-  # analyst | deterministic. A strategy earns promotion on evidence its
-  # deterministic contract produced in a shadow lane, so running it live
-  # under an analyst would trade something other than the thing that earned
-  # the promotion. `deterministic` removes the analyst call entirely: the
-  # contract proposes, risk vets, execution places. It needs no analyst
-  # prompt, which is what lets a shadow-only strategy occupy the order path
-  # once its evidence justifies it.
-  execution_mode: analyst
+  # analyst | deterministic | shadow_only.
+  #
+  # A strategy earns promotion on evidence its deterministic contract
+  # produced in a shadow lane, so running it live under an analyst would
+  # trade something other than the thing that earned the promotion.
+  # `deterministic` removes the analyst call entirely: the contract
+  # proposes, risk vets, execution places. It needs no analyst prompt, which
+  # is what lets a shadow-only strategy occupy the order path once its
+  # evidence justifies it.
+  #
+  # `shadow_only` is set here because no mechanism currently justifies it.
+  # momentum is T0_REJECTED and returned -8.97% over 2026-07-29..08-05, and
+  # at that rate it reaches risk.max_drawdown_pct, which flattens the book
+  # and self-kills the process - ending the research collection every other
+  # lane depends on. Nothing opens a position in this mode. Research lanes
+  # are untouched: every registered and staged contract is still evaluated
+  # on every snapshot. Open positions still exit through exchange stops and
+  # targets, max_hold_hours, and every risk reduction path.
+  #
+  # research/plan/order-path-succession.md states, pre-committed, what a
+  # successor has to show before this goes back to `deterministic`.
+  execution_mode: shadow_only
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
   # The three registered hypotheses (volume-thrust, oi-divergence,
   # basis-stretch) reach the book only through experimental setups. While

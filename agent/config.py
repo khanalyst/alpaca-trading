@@ -135,11 +135,19 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
     # Exact, like mode: two configuration files that look different must not
     # behave identically, and silently normalising case or whitespace is how
     # a typo becomes a mode change nobody reviewed.
+    # ``shadow_only`` is the third state the two modes could not express: no
+    # order path at all. It exists because the only analyst-ready strategy is
+    # falsified, and leaving a falsified mechanism on the account is not
+    # neutral - a sustained drawdown trips max_drawdown_pct, which flattens
+    # and self-kills the process, ending the research collection every other
+    # lane depends on. Research lanes are unaffected by this setting: they
+    # evaluate every registered and staged contract on the same snapshots
+    # whether or not anything occupies the order path.
     execution_mode = strategy.get("execution_mode", "analyst")
-    if execution_mode not in {"analyst", "deterministic"}:
+    if execution_mode not in {"analyst", "deterministic", "shadow_only"}:
         raise ConfigError(
-            "strategy.execution_mode must be exactly 'analyst' or "
-            "'deterministic'")
+            "strategy.execution_mode must be exactly 'analyst', "
+            "'deterministic' or 'shadow_only'")
     strategy["execution_mode"] = execution_mode
     if execution_mode == "deterministic":
         try:
@@ -148,6 +156,10 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             raise ConfigError(
                 f"strategy.execution_mode is deterministic but {spec.id!r} "
                 f"has no complete forward contract to trade: {exc}") from None
+    elif execution_mode == "shadow_only":
+        # Nothing is analysed and nothing is traded, so neither an analyst
+        # prompt nor a complete forward contract is required of strategy.id.
+        pass
     elif not spec.analyst_ready and not allow_shadow_strategy:
         raise ConfigError(
             f"strategy.id {spec.id!r} has no live contract implementation; "

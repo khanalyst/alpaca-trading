@@ -1457,6 +1457,35 @@ def cmd_author(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stage_seed(args: argparse.Namespace) -> int:
+    """Register the version-controlled pre-registrations into staging.
+
+    Idempotent: a claim already in the store is reported and skipped, so this
+    can run on every deploy without a human deciding whether the second run's
+    failure mattered.
+    """
+    from agent.staging import StagingStore
+    from research import staging_seed
+
+    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    try:
+        entries = staging_seed.load(args.file)
+    except staging_seed.SeedError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(json.dumps(
+            [{"contract_id": entry.get("contract_id"),
+              "status": entry.get("status")} for entry in entries],
+            indent=2, sort_keys=True))
+        return 0
+    result = staging_seed.seed(store, entries, generation=args.generation)
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    # A rejected pre-registration is a broken claim in version control, not a
+    # transient failure, so unlike the authoring path this one fails loudly.
+    return 1 if result["rejected"] else 0
+
+
 def cmd_staged(args: argparse.Namespace) -> int:
     """List staged mechanisms and what each one claims."""
     from agent.staging import StagingStore
@@ -1742,6 +1771,20 @@ def build_parser() -> argparse.ArgumentParser:
     author.add_argument("--dry-run", action="store_true",
                         help="print the request without calling a provider")
     author.set_defaults(func=cmd_author)
+
+    stage_seed = sub.add_parser(
+        "stage-seed",
+        help="register the version-controlled pre-registrations into staging")
+    stage_seed.add_argument("--staging", default=None, help="staging.db path")
+    stage_seed.add_argument("--file", default=None,
+                            help="seed YAML; defaults to "
+                                 "research/staged/pre-registered.yaml")
+    stage_seed.add_argument("--generation", type=int, default=0,
+                            help="generation label for these claims; 0 marks "
+                                 "them as founding rather than loop-produced")
+    stage_seed.add_argument("--dry-run", action="store_true",
+                            help="list what the file contains without writing")
+    stage_seed.set_defaults(func=cmd_stage_seed)
 
     staged = sub.add_parser("staged", help="list staged candidate mechanisms")
     staged.add_argument("--staging", default=None, help="staging.db path")

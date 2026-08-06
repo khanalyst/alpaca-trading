@@ -45,7 +45,10 @@ scope for planner history and are never pooled with lane comparisons. Feeds
 v1-v7 remain historical (v4 is the market-data plumbing repair feed and v5 the
 immutable-provenance fork).
 
-Machine-authored mechanisms are a separate population. They live in
+Staged mechanisms are a separate population. They arrive either from
+`research.py author`, which proposes from what the evidence has killed, or
+from `research.py stage-seed`, which registers the hand-written
+pre-registrations kept in `research/staged/pre-registered.yaml`. They live in
 `research/cache/staging.db`, run in a `:staged` scope with one paper account
 each on a single fixed measurement harness, and receive their own coded
 verdicts from `research.py review-staged`: `NEGATIVE_EXPECTANCY`,

@@ -41,8 +41,14 @@ uses deterministic contract proposals in four realtime lanes: `momentum`,
 `flush-fade`, `ls-ratio-fade`, and `scalp-maker`. Each lane receives the same
 market snapshot and timestamp and owns independent paper cash, positions, risk
 state, decisions, and trades. `funding-carry`, `funding-unwind`, and
-`trend-multiday` remain registered offline-only models. Only
-`momentum/phase1-v3` is connected to the configured demo order path.
+`trend-multiday` remain registered offline-only models. **No strategy is
+connected to the configured demo order path**: `strategy.execution_mode` is
+`shadow_only`. `momentum/phase1-v3` was the only strategy that ever occupied
+it and is `T0_REJECTED`; the seat now goes to whatever first meets the
+pre-committed criterion in `research/plan/order-path-succession.md`. The
+research lanes are unaffected - they were always the measuring instrument,
+and every registered and staged contract is still evaluated on every
+snapshot.
 
 Feeds v1-v7 remain immutable historical rows and must not be pooled with v8
 outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the
@@ -391,7 +397,7 @@ variant IDs in the live system prompt through
 `research_selection_prompt_fragment()`, forking `prompt_version` and every
 attribution downstream in exchange for no measurement.
 
-## Machine-authored mechanisms
+## Staged mechanisms
 
 A mechanism no longer has to be a hand-written Python function. A proposal is
 data - a claim, the payer, a falsifier, and comparisons over fields the
@@ -412,6 +418,53 @@ strategies' comparison arms, and `research.py review-staged` gives each a
 coded verdict - `NEGATIVE_EXPECTANCY`, `DIED_OUT_OF_SAMPLE` and `NEVER_FIRED`
 retire one, `STARVED_OF_DATA` never does because a claim evaluated on
 snapshots it could not read has not been tested.
+
+Two sources reach the same store. `research.py author` proposes from what the
+evidence has killed; `research.py stage-seed` registers the hand-written
+pre-registrations in `research/staged/pre-registered.yaml`, which are kept in
+version control so the wording cannot drift after results exist. The `author`
+column is what distinguishes them.
+
+### Shipped pre-registrations
+
+Registered as replacements for `momentum` rather than as variants of it: they
+are new claims with new payers, not new thresholds on a rejected one. Firing
+rates are measured by replaying the compiled contracts over the 13,637
+recorded symbol observations of 2026-07-29..08-05, because a threshold chosen
+for how it reads rather than for what it selects either fires on half the
+corpus or on none of it.
+
+| Contract | Claim | Direction | Fires on |
+| --- | --- | --- | --- |
+| `funding-crowd-unwind` | The price move persistent extreme funding predicts, not the carry it pays | both | 2.47% of direction-evaluations |
+| `oi-buildup-fade` | New leverage arriving at the edge of a 4h range, measured before the exit rather than after | both | 1.13% |
+| `basis-crowd-fade` | Perpetual premium or discount to its own index converging | both | 0.25% |
+
+`funding-crowd-unwind` is the directional residual of `funding-carry`, which
+was rejected as a carry claim: over 116 forward trades the price component
+contributed +1.969% against +0.039% from funding itself. That residual was
+set aside at the time as needing its own pre-registration. The 24h staged
+harness is what makes it testable at all - `funding-carry`'s own 240h
+contract could never reach the sample floor.
+
+`oi-buildup-fade` is deliberately not `flush-fade`. That contract fades open
+interest *drops* - forced exits that have already happened - and is
+`T0_REJECTED`. This fades open interest *builds*, and the payer is the late
+entrant rather than the liquidated holder.
+
+`basis-crowd-fade` is the registered `basis-stretch` hypothesis, which never
+fired once across the whole corpus because `allow_experimental_setups_in_demo`
+was false for its entire life. Its calibration is the weakest of the three and
+is documented as such: `perp_index_basis_pct` was unavailable on 25,990 of
+27,274 direction evaluations, so it should be expected to verdict
+`STARVED_OF_DATA`. That is written into its own falsifier.
+
+A fourth, `liq-absorption-direct`, is in the seed file as `deferred` and is
+not registered. `liq_notional_1h_usd` appears in none of the 13,637
+observations, so its threshold cannot be calibrated and the field is not
+confirmed to populate. A staged contract that cannot fire is worse than a
+missing one: in the evidence it is indistinguishable from one that fired and
+lost.
 
 ## Which settings can rotate in real time
 

@@ -13,6 +13,7 @@ path at all no matter what its evidence said.
 
 import copy
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 from agent.config import ConfigError, validate_config
@@ -36,7 +37,8 @@ class ConfigurationGatesTheModeTests(unittest.TestCase):
         self.assertEqual(validated["strategy"]["execution_mode"], "analyst")
 
     def test_an_unknown_mode_is_refused(self):
-        for mode in ("auto", "llm", "", "DETERMINISTIC ", None, 7):
+        for mode in ("auto", "llm", "", "DETERMINISTIC ", "shadow-only",
+                     "SHADOW_ONLY", None, 7):
             with self.subTest(repr(mode)):
                 with self.assertRaises(ConfigError):
                     validate_config(cfg_for(mode=mode))
@@ -65,6 +67,46 @@ class ConfigurationGatesTheModeTests(unittest.TestCase):
             with self.assertRaises(ConfigError) as caught:
                 validate_config(cfg)
         self.assertIn("no complete forward contract", str(caught.exception))
+
+
+class ShadowOnlyEmptiesTheOrderPathTests(unittest.TestCase):
+    """No mechanism has earned the account, so none occupies it.
+
+    Leaving a falsified strategy trading is not neutral: a sustained drawdown
+    trips risk.max_drawdown_pct, which flattens and self-kills the process,
+    ending the research collection every other lane depends on.
+    """
+
+    def test_a_strategy_with_no_analyst_prompt_may_still_be_configured(self):
+        # Nothing is analysed and nothing is traded, so neither an analyst
+        # prompt nor a complete forward contract is required of strategy.id.
+        cfg = cfg_for("ls-ratio-fade", "shadow_only",
+                      version="v1", signal_timeframe="1h")
+        cfg["cycle"]["timeframes"] = ["1h", "4h"]
+        validated = validate_config(cfg)
+        self.assertEqual(validated["strategy"]["execution_mode"], "shadow_only")
+
+    def test_the_mode_switch_reads_configuration(self):
+        for mode, deterministic, shadow_only in (
+                ("analyst", False, False),
+                ("deterministic", True, False),
+                ("shadow_only", False, True)):
+            with self.subTest(mode):
+                engine = Engine.__new__(Engine)
+                engine.cfg = validate_config(cfg_for("momentum", mode))
+                self.assertIs(engine._deterministic_order_path(), deterministic)
+                self.assertIs(engine._shadow_only_order_path(), shadow_only)
+
+    def test_the_shipped_configuration_opens_nothing(self):
+        # The repository default is the state this was introduced for. If it
+        # ever goes back to a trading mode, that is a decision with a
+        # pre-committed criterion behind it, not an incidental edit.
+        import yaml
+
+        cfg = validate_config(yaml.safe_load(
+            Path(__file__).resolve().parents[1].joinpath(
+                "config.yaml").read_text(encoding="utf-8")))
+        self.assertEqual(cfg["strategy"]["execution_mode"], "shadow_only")
 
 
 class DeterministicDecisionsComeFromTheContractTests(unittest.TestCase):

@@ -1011,7 +1011,12 @@ class Engine:
         # Everything after this - research recording, risk, execution, the
         # close path - stays one code path, because a second copy of the
         # order logic is a second place for it to diverge.
-        if self._deterministic_order_path():
+        if self._shadow_only_order_path():
+            # No source of entries at all. Observations were already recorded
+            # above and the research lanes below still run, so the platform
+            # keeps measuring every contract while the account opens nothing.
+            decisions = []
+        elif self._deterministic_order_path():
             decisions = self._deterministic_decisions(live_snapshot, max_new)
         else:
             self._journal_llm_input(live_snapshot, portfolio, max_new)
@@ -3329,11 +3334,28 @@ class Engine:
         block["version"] = spec.version
         return {**self.cfg, "strategy": block}
 
-    def _deterministic_order_path(self) -> bool:
-        """True when the contract decides and no analyst call is made."""
+    def _execution_mode(self) -> str:
         # Configuration validation already guarantees an exact value.
         return (self.cfg.get("strategy") or {}).get(
-            "execution_mode", "analyst") == "deterministic"
+            "execution_mode", "analyst")
+
+    def _deterministic_order_path(self) -> bool:
+        """True when the contract decides and no analyst call is made."""
+        return self._execution_mode() == "deterministic"
+
+    def _shadow_only_order_path(self) -> bool:
+        """True when nothing may open a position this cycle.
+
+        The research lanes are the measuring instrument; the order path is
+        not. Holding the order path empty while no mechanism has earned it
+        keeps the instrument running instead of spending the account - and
+        the drawdown breaker - on a claim the evidence has already rejected.
+
+        Open positions are unaffected: exchange stops and targets, the
+        max_hold_hours force-close and every risk reduction path run exactly
+        as before. Only discretionary opens and closes have no source.
+        """
+        return self._execution_mode() == "shadow_only"
 
     def _deterministic_decisions(self, snapshot: dict,
                                  max_new: int) -> list[dict]:

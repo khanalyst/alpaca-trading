@@ -459,7 +459,7 @@ verify OKX has no remaining positions or orders. If flattening is incomplete,
 close them manually in OKX and keep the agent paused. A local test pass does
 not replace one real credentialed OKX demo smoke test.
 
-### 7.2 Machine-authored mechanisms
+### 7.2 Staged mechanisms
 
 Every registered mechanism used to be a hand-written Python function, which
 capped the registry at three hypotheses attached to one strategy. A mechanism
@@ -468,11 +468,22 @@ over named market fields - and compiles into the same callable the
 hand-written contracts implement.
 
 ```bash
+./.venv/bin/python research.py stage-seed         # the version-controlled ones
 ./.venv/bin/python research.py author --dry-run   # what the proposer is asked
 ./.venv/bin/python research.py staged             # what is registered
 ./.venv/bin/python research.py review-staged --dry-run
 ./.venv/bin/python research.py shortlist
 ```
+
+`stage-seed` registers the hand-written pre-registrations in
+`research/staged/pre-registered.yaml`. It is idempotent - an already
+registered claim is reported and skipped - so it belongs in the deploy
+sequence rather than being run once by hand. An entry marked `deferred` is
+reported and never registered, which is how a claim whose threshold cannot
+yet be calibrated stays visible without occupying a lane that would never
+fire. Unlike `author`, a rejected entry here exits nonzero: a broken
+pre-registration is a mistake in version control, not a transient provider
+failure.
 
 Staged mechanisms run in their own `:staged` scope, one paper account each, on
 a single fixed measurement harness: first observed price after the signal, a
@@ -507,11 +518,12 @@ afterwards cannot be told apart from one retro-fitted to the result.
 ### 7.3 Running a contract without an analyst
 
 `strategy.execution_mode` selects what decides on the order path. `analyst`
-is shipped and makes one LLM call per decision cycle. `deterministic` makes no
-LLM call at all: the strategy's own forward contract proposes, and risk and
-execution apply unchanged.
+makes one LLM call per decision cycle. `deterministic` makes no LLM call at
+all: the strategy's own forward contract proposes, and risk and execution
+apply unchanged. `shadow_only` is shipped and has no order path: nothing
+proposes and nothing opens.
 
-Use it when a strategy has earned promotion on shadow evidence. That evidence
+Use `deterministic` when a strategy has earned promotion on shadow evidence. That evidence
 was produced by its deterministic contract, so trading it under an analyst
 would put an unmeasured layer on top of the thing that justified the
 promotion. It is also the only way a strategy other than `momentum` can occupy
@@ -526,10 +538,22 @@ strategy:
 ```
 
 Configuration refuses to start when the named strategy has no complete
-forward contract, and the value must be exactly `analyst` or `deterministic` -
-no case or whitespace normalisation, so a typo cannot become a mode change
-nobody reviewed. Tier gating is unchanged: live still requires
+forward contract, and the value must be exactly `analyst`, `deterministic` or
+`shadow_only` - no case or whitespace normalisation, so a typo cannot become a
+mode change nobody reviewed. Tier gating is unchanged: live still requires
 `T3_VALIDATED` and a reviewed packet.
+
+`shadow_only` is the shipped state because no mechanism currently justifies
+the seat: `momentum` is `T0_REJECTED` and returned -8.97% over
+2026-07-29..08-05, and at that rate it reaches `risk.max_drawdown_pct`, which
+flattens the book and self-kills the process - ending the research collection
+every other lane depends on. Research lanes run unchanged in this mode, and
+open positions still exit through exchange stops and targets,
+`max_hold_hours` and every risk reduction path. Only discretionary opens and
+closes have no source. `research/plan/order-path-succession.md` states,
+pre-committed, what a successor has to show before this returns to
+`deterministic`; it is deliberately not a judgement to be made while looking
+at the numbers.
 
 ## 8. Interpreting results
 

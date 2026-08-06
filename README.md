@@ -31,7 +31,7 @@ research:
 | Area | Current value |
 | --- | --- |
 | Account mode | `demo` (OKX Demo Trading) |
-| Order-executing strategy | `momentum/phase1-v3`, `execution_mode: analyst` |
+| Order-executing strategy | none; `execution_mode: shadow_only`. `strategy.id` stays `momentum/phase1-v3` as the registry anchor for the shadow lanes, but nothing opens a position |
 | Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol-coding` |
 | Housekeeping cadence | `cycle.interval_seconds: 60` |
@@ -117,10 +117,11 @@ verdict, change account settings, or authorize an order.
 
 `strategy.execution_mode` selects what decides on the order path:
 
-- `analyst` (shipped): the momentum analyst makes one LLM call per decision
-  cycle and its parsed decisions go through contracts, risk and execution;
+- `analyst`: the momentum analyst makes one LLM call per decision cycle and
+  its parsed decisions go through contracts, risk and execution;
 - `deterministic`: the strategy's own forward contract proposes, and no LLM
-  call is made at all.
+  call is made at all;
+- `shadow_only` (shipped): nothing proposes and nothing opens.
 
 A strategy earns promotion on evidence its deterministic contract produced in
 a shadow lane. Running it live under an analyst trades something other than
@@ -136,7 +137,21 @@ start when that contract is missing. Tier gating is unchanged - live still
 requires `T3_VALIDATED` and a reviewed packet.
 
 Only the source of the decisions differs. Research recording, risk vetting,
-execution controls and the close path are one code path in both modes.
+execution controls and the close path are one code path in every mode.
+
+`shadow_only` is shipped because no mechanism currently justifies the seat.
+`momentum` is `T0_REJECTED` and returned -8.97% over 2026-07-29..08-05 across
+35 closes; every other registered strategy is falsified or has never been
+measured. Leaving a falsified mechanism trading is not neutral - at that rate
+it reaches `risk.max_drawdown_pct`, which flattens the book and self-kills the
+process, ending the research collection every other lane depends on. The order
+path is not the measuring instrument; the research lanes are, and they run
+unchanged in this mode. Open positions still exit through exchange stops and
+targets, `max_hold_hours` and every risk reduction path; only discretionary
+opens and closes have no source.
+[research/plan/order-path-succession.md](research/plan/order-path-succession.md)
+states, pre-committed, what a successor has to show before this goes back to
+`deterministic`.
 
 ## Experiment outcomes and edge evidence
 
@@ -277,6 +292,7 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify
+./.venv/bin/python research.py stage-seed
 ./.venv/bin/python research.py author
 ./.venv/bin/python research.py author --dry-run
 ./.venv/bin/python research.py staged
@@ -378,6 +394,18 @@ frees the lane and keeps the claim, the payer and the reason recorded together,
 because a proposer told only that something failed will restate it with a
 different number.
 
+`research.py stage-seed` is the other entry point to the same store, for
+claims that came out of analysis rather than out of the proposer.
+`research/staged/pre-registered.yaml` holds them in version control so the
+wording cannot drift after results exist, and the command is idempotent: a
+claim already registered is reported and skipped, so it can run on every
+deploy. Both paths land in the same table under the same immutability
+triggers at the same tier; only the `author` column differs, which is what
+keeps a reviewed claim distinguishable from a proposed one. An entry marked
+`deferred` is parsed and reported but never registered - a staged contract
+that cannot fire is worse than a missing one, because in the evidence it
+looks exactly like one that fired and lost.
+
 Staged mechanisms enter at `T1_HYPOTHESIS` and are append-only: a registered
 claim cannot be reworded once results exist, which is the difference between a
 pre-registered hypothesis and a retro-fitted one. Live still requires
@@ -462,6 +490,7 @@ source.
 | [research/plan/B7.5-record.md](research/plan/B7.5-record.md) | Current status and completion conditions for the optional maker-first order primitive. It distinguishes that execution experiment from `scalp-maker`. |
 | [research/plan/edge-platform.md](research/plan/edge-platform.md) | What the 7-day demo corpus established, the silent depth-ladder rejection it exposed, and the batched plan for turning the research loop into an edge-producing platform. |
 | [research/plan/autonomous-loop-integration.md](research/plan/autonomous-loop-integration.md) | Batched plan and checklist for merging the G2/promotion and audit-remediation work into one unattended loop. Records why runtime code settles before collection opens. |
+| [research/plan/order-path-succession.md](research/plan/order-path-succession.md) | Why the order path is empty, and the pre-committed criterion a mechanism has to meet before it trades the account. Written before the evidence exists. |
 | [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Historical implementation pointer; current flow and commands are in the primary guides. |
 | [research/plan/findings.md](research/plan/findings.md) | Historical findings pointer; current evidence boundaries are in RECONCILIATION and protocol. |
 
