@@ -26,6 +26,9 @@ research:
   findings_store: research/cache/findings.db
   experiment_min_duration_days: 10
   experiment_min_observations: 100
+  experiment_candidate_batch_size: 4
+  shadow_workers: 4
+  collector: {top_n: 50, workers: 4}
 ```
 
 | Area | Current value |
@@ -39,8 +42,9 @@ research:
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
 | Research feed | `forward_feed_version: 8`; feed v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; feeds v1-v7 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane realtime fork, and v7 added the liquidation flow and conditioning axes) |
-| Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
-| Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
+| Realtime comparison arms | Each deterministic lane keeps one shared baseline and a bounded batch of up to 4 pre-registered candidates (hard cap 8 per lane); the separate `:llm` sibling remains non-comparable |
+| Shadow workers | `4` bounded workers per evaluator; durable FindingsStore commits remain serialized |
+| Research collector | Separate recorder scans up to 50 instruments with 4 public-read workers; it does not alter the active universe or risk limits |
 | Experiment floor | both 10 elapsed days and 100 comparable paired observations |
 | Local paper balance | 10,000 USDT per isolated strategy/variant account |
 
@@ -69,18 +73,17 @@ On each eligible decision cycle:
 5. Each evaluator owns its own paper cash, positions, exposure, cooldowns,
    circuit breakers, decisions, and trades. `shadow_decision` rows include
    accepted actions and policy vetoes as explicit zero-return actions.
-6. Every realtime strategy keeps its stable baseline running and tests at most
-   one candidate setting at a time. The four deterministic realtime lanes are
-   logically isolated over the same frozen input, but the coordinator
-   intentionally evaluates them in a bounded sequence and serializes durable
-   writes rather than creating four simultaneous SQLite writers. Physical
-   wall-clock concurrency is not a
-   correctness requirement. Settings rotate serially within each strategy and
-   survive process restarts.
+6. Every realtime strategy keeps one stable baseline running while a bounded
+   batch of pre-registered candidates tests one axis family in parallel. Each
+   candidate has its own durable assignment/account, all candidates share the
+   same baseline input, and the batch is capped at eight candidates per lane.
+   Each individual assignment still tests at most one candidate setting.
+   Workers compute isolated packets concurrently; durable SQLite writes remain
+   serialized. Assignments drain independently and survive process restarts.
 
-The deterministic comparison set is therefore eight arms. The active analyst's
-separate `:llm` scope may also hold its own baseline and candidate, adding two
-non-comparable arms; when that sibling is present, the runtime maximum is ten.
+The deterministic comparison set is therefore bounded per lane rather than
+serially fixed at one candidate. The active analyst's separate `:llm` scope
+remains a distinct, non-comparable population.
 
 Isolation runs both ways: research state and decisions are withheld from
 everything on the live path, while live account positions do not leak into a
@@ -301,8 +304,9 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py author --dry-run
 ./.venv/bin/python research.py staged
 ./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py qualify-staged
 ./.venv/bin/python research.py shortlist
-./.venv/bin/python research.py research-loop
+./.venv/bin/python research.py research-loop --max-reviews 8
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet --variant <qualified-variant-id>

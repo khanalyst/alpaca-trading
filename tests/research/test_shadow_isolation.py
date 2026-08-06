@@ -410,6 +410,38 @@ class ConfigValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config(cfg)
 
+    def test_research_collector_has_its_own_bounded_parallelism_contract(self):
+        from agent.config import validate_config
+
+        cfg = valid_config()
+        cfg["research"] = {
+            "shadow_enabled": True,
+            "shadow_budget_ms": 500,
+            "shadow_variants": [],
+            "collector": {
+                "enabled": True,
+                "out": "runtime/research/recorded",
+                "top_n": 80,
+                "book_interval_seconds": 60,
+                "hourly_interval_seconds": 900,
+                "refresh_minutes": 30,
+                "workers": 8,
+            },
+        }
+        validated = validate_config(cfg)
+        self.assertEqual(validated["research"]["collector"]["workers"], 8)
+
+    def test_research_collector_unknown_key_is_refused(self):
+        from agent.config import ConfigError, validate_config
+
+        cfg = valid_config()
+        cfg["research"] = {
+            "shadow_enabled": False,
+            "collector": {"parallel_everything": True},
+        }
+        with self.assertRaises(ConfigError):
+            validate_config(cfg)
+
     def test_the_shipped_config_rotates_deterministic_variants(self):
         import yaml
         from agent.config import validate_config

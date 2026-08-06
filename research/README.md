@@ -13,18 +13,20 @@ and `scalp-maker`. `funding-carry`, `funding-unwind`, and `trend-multiday` are
 registered offline-only models. Only the configured main strategy can reach the
 demo exchange.
 
-Each realtime strategy continuously keeps its baseline and at most one candidate
-setting. The four lanes use one snapshot/timestamp and deterministic contract
-proposals. They are logically isolated, but the coordinator intentionally
-evaluates them in a bounded sequence and serializes durable writes rather than
-creating four simultaneous SQLite writers. Candidate rotation is serial per
-strategy. The default assignment floor is both ten elapsed days and 100
-comparable paired observations. State survives restart in the schema-16
-findings store.
+Each realtime strategy continuously keeps one shared baseline and a bounded
+batch of pre-registered candidate settings (four by shipped config, hard cap
+eight per lane). Every assignment still tests only one candidate setting. The
+four lanes use one snapshot/timestamp and deterministic contract proposals.
+Packet computation is bounded and may run concurrently; durable SQLite writes
+remain serialized. Candidate batches are isolated per strategy and survive
+restart in the schema-16 findings store. The default assignment floor is both
+ten elapsed days and 100 comparable paired observations.
 
-These four lanes produce eight deterministic comparison arms. The separate
-`:llm` sibling may hold its own baseline and candidate, adding two
-non-comparable arms for a runtime maximum of ten when present.
+At shipped configuration, these four lanes can produce up to twenty
+deterministic comparison arms (one baseline plus four candidates per lane).
+The hard cap permits up to thirty-six deterministic arms if every lane uses
+eight candidates. The separate `:llm` sibling remains a distinct,
+non-comparable population.
 
 The LLM can submit one bounded research-only selection. Invalid selections and
 their reasons persist. Accepted selections queue and never preempt an active

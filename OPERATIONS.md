@@ -103,20 +103,22 @@ is treated as durably backed up.
 2. `review-staged`, which gives each machine-authored mechanism a coded
    verdict and retires the ones that are finished;
 3. `author`, which proposes new mechanisms and stages the ones that validate.
-   It runs after the verdicts and before the reviewer on purpose: a proposer
-   that has not been told why the last batch died restates a dead claim at a
-   different threshold, and it needs no terminal outcome to run at all;
-4. `research-loop`, which creates missing deterministic outcomes and reviews
-   at most one pending result;
-5. corpus statistics and G2 replay when the journal exists;
-6. funnel, cadence, sweeps, three-arm analysis, forward qualification,
+   It runs after the verdicts so the next generation sees the latest coded
+   failures;
+4. `qualify-staged`, which starts isolated local PAPER only for staged
+   mechanisms whose fixed-harness evidence is supported;
+5. `research-loop`, which creates missing deterministic outcomes and reviews a
+   bounded queue (default eight) of pending results; one failed provider call
+   is persisted and does not stop later items;
+6. corpus statistics and G2 replay when the journal exists;
+7. funnel, cadence, sweeps, three-arm analysis, forward qualification,
    fail-closed draft review-artifact preparation, the candidate shortlist,
    and scorecard regeneration;
-7. one fresh immutable market-history snapshot under
+8. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
-8. the exploratory tournament, with immutable per-run artifacts;
-9. one new verified backup.
+9. the exploratory tournament, with immutable per-run artifacts;
+10. one new verified backup.
 
 Exact exit behavior:
 
@@ -148,10 +150,12 @@ Run manually:
 
 The four realtime strategies receive the same cycle snapshot and timestamp and
 use deterministic contract proposals. Each has an isolated paper account and
-durable assignment state. The configured two workers bound computation; they
-do not reduce the realtime lane set. The lanes are logically isolated but
-intentionally evaluated in a bounded sequence with serialized durable writes.
-Four simultaneous SQLite writers are not required for correctness. The
+durable assignment state. A bounded batch of pre-registered candidates shares
+one stable baseline in each lane (four by shipped config, hard cap eight).
+Four packet workers bound computation; they do not reduce the realtime lane
+set. The lanes are logically isolated, and packet computation may overlap while
+durable writes remain serialized. Four simultaneous SQLite writers are not
+required for correctness. The
 registered `funding-carry`, `funding-unwind`, and `trend-multiday` models are
 offline-only because their holding horizons cannot reach the closed-trade floor
 in a practical realtime assignment.
@@ -182,12 +186,14 @@ deterministic four-lane fork; no older evidence is migrated or pooled with v8.
 Within each strategy:
 
 1. the stable baseline always remains active;
-2. at most one candidate setting is active;
+2. a bounded batch of pre-registered candidate settings is active, sharing
+   that baseline (four by shipped config, hard cap eight per lane);
 3. an assignment is not complete until both ten elapsed days and 100
    comparable paired observations are recorded (unless configuration raises
    those floors);
-4. accepted LLM selections queue without preempting the active assignment;
-5. restart reconstructs the same active assignment from schema 16;
+4. each individual assignment still tests only one candidate setting, and
+   accepted LLM selections queue without preempting active assignments;
+5. restart reconstructs the same active batch from schema 16;
 6. terminal assignments produce one immutable `WORKED`, `FAILED`, or
    `INCONCLUSIVE` outcome with reasons and limitations.
 
@@ -472,6 +478,7 @@ hand-written contracts implement.
 ./.venv/bin/python research.py author --dry-run   # what the proposer is asked
 ./.venv/bin/python research.py staged             # what is registered
 ./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py qualify-staged
 ./.venv/bin/python research.py shortlist
 ```
 

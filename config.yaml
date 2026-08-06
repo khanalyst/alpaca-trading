@@ -196,8 +196,25 @@ research:
   shadow_enabled: true
   shadow_variants: ["*"]
   shadow_budget_ms: 0
-  shadow_workers: 2
+  # Bounded research-only variant work; durable paper writes remain serialized
+  # by each shadow evaluator and never share the active account/order path.
+  shadow_workers: 4
+  # Four pre-registered candidates share one baseline per strategy rotation;
+  # the hard safety cap remains eight in code.
+  experiment_candidate_batch_size: 4
   findings_store: research/cache/findings.db
+  # Standalone public-data collection is intentionally separate from the live
+  # universe/risk settings above. It may scan more instruments or poll books
+  # more often without changing what the active account can trade.
+  collector:
+    enabled: true
+    out: runtime/research/recorded
+    top_n: 50
+    min_volume_usd: 30000000
+    book_interval_seconds: 300
+    hourly_interval_seconds: 900
+    refresh_minutes: 60
+    workers: 4
   # Machine-authored mechanisms, kept apart from the hand-registered ones so
   # a proposed claim can never be mistaken for a reviewed one. Created by
   # `research.py author`; absent until something is staged, and the shadow

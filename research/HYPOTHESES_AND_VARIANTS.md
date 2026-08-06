@@ -26,7 +26,7 @@ The executable sources remain authoritative when prose and code disagree:
 | Hand-authored momentum variants | 24 immutable identities including baseline |
 | Materialized static identities | 77 including all 7 baselines |
 | Bounded LLM selector candidates | 33 eligible single-axis candidates |
-| Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes |
+| Realtime comparison arms | Up to 20 deterministic arms at shipped config: one shared baseline plus 4 pre-registered candidates in each of 4 realtime lanes (hard cap 36) |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
 The superseded `14 maximum` wording described seven realtime strategies; it is

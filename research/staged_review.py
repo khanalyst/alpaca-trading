@@ -138,41 +138,82 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
     from agent.shadow import staged_variant_id
 
     timestamp = time.time() if now is None else float(now)
+    active = staging_store.active()
+    variant_ids = {
+        staged_variant_id(contract.contract_id) for contract in active}
+    measured = shortlist_mod.from_store(
+        findings_store, staging_store, scope_key=scope_key)
+
+    # A variant id is stable across feed/account scopes.  Keying only by that
+    # id silently replaced one population with whichever scope happened to be
+    # iterated last, so a bad staged arm in one account could be reported as a
+    # good arm from another.  Keep scope in the identity all the way through
+    # adjudication and only retire globally when the decision is unambiguous.
     candidates = {
-        item.variant_id: item
-        for item in shortlist_mod.from_store(
-            findings_store, staging_store, scope_key=scope_key)
+        (str(item.scope_key), str(item.variant_id)): item
+        for item in measured
+        if item.variant_id in variant_ids
     }
+    if scope_key is not None:
+        scopes = [str(scope_key)]
+    else:
+        scopes = sorted({scope for scope, _ in candidates})
+        # No paper portfolio exists yet. Preserve the old one verdict per
+        # active contract so callers still get a useful COLLECTING result.
+        if not scopes:
+            scopes = [None]
+
     verdicts, retired = [], []
-    for contract in staging_store.active():
-        variant_id = staged_variant_id(contract.contract_id)
-        candidate = candidates.get(variant_id)
-        if candidate is None:
-            # Registered but never evaluated: the lane has not run yet.
-            code, explanation = COLLECTING, (
-                "no evaluations recorded yet; the lane has not run.")
-        else:
-            code, explanation = verdict_for(candidate)
-        entry = {
-            "contract_id": contract.contract_id,
-            "variant_id": variant_id,
-            "stage": (stage_of(candidate) if candidate is not None else SCREEN),
-            "code": code,
-            "explanation": explanation,
-            "mechanism": contract.mechanism,
-            "payer": contract.payer,
-            "trades": getattr(candidate, "trades", 0),
-            "mean_r": getattr(candidate, "mean_r", 0.0),
-        }
-        verdicts.append(entry)
-        if retire and code in RETIRING:
+    by_contract: dict[str, list[dict]] = {}
+    for scope in scopes:
+        for contract in active:
+            variant_id = staged_variant_id(contract.contract_id)
+            candidate = (candidates.get((scope, variant_id))
+                         if scope is not None else None)
+            if candidate is None:
+                # Registered but never evaluated in this exact scope: the
+                # lane has not run yet.
+                code, explanation = COLLECTING, (
+                    "no evaluations recorded yet; the lane has not run.")
+            else:
+                code, explanation = verdict_for(candidate)
+            entry = {
+                "contract_id": contract.contract_id,
+                "variant_id": variant_id,
+                "scope_key": scope,
+                "stage": (stage_of(candidate)
+                           if candidate is not None else SCREEN),
+                "code": code,
+                "explanation": explanation,
+                "mechanism": contract.mechanism,
+                "payer": contract.payer,
+                "trades": getattr(candidate, "trades", 0),
+                "mean_r": getattr(candidate, "mean_r", 0.0),
+            }
+            verdicts.append(entry)
+            by_contract.setdefault(contract.contract_id, []).append(entry)
+
+    if retire:
+        for contract in active:
+            entries = by_contract.get(contract.contract_id, [])
+            # An explicit scope is an operator request to adjudicate that
+            # account.  Without one, require every observed scope to agree;
+            # one scope's negative result must not retire a claim still
+            # collecting or supported in another isolated account.
+            should_retire = bool(entries) and all(
+                entry["code"] in RETIRING for entry in entries)
+            if not should_retire:
+                continue
+            entry = entries[0]
             try:
                 staging_store.retire(
-                    contract.contract_id, f"{code}: {explanation}",
+                    contract.contract_id,
+                    f"{entry['code']}: {entry['explanation']}",
                     now=timestamp)
                 retired.append(contract.contract_id)
             except Exception as exc:  # noqa: BLE001 - one failure is not fatal
-                entry["retire_error"] = f"{type(exc).__name__}: {exc}"
+                for item in entries:
+                    item["retire_error"] = f"{type(exc).__name__}: {exc}"
     return {
         "reviewed": len(verdicts),
         "retired": retired,

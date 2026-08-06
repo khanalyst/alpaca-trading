@@ -1028,10 +1028,54 @@ def _connect(path: str | Path) -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         _migrate(conn)
+        _ensure_experiment_batch_tables(conn)
     except Exception:
         conn.close()
         raise
     return conn
+
+
+def _ensure_experiment_batch_tables(conn: sqlite3.Connection) -> None:
+    """Install the additive batch index without changing legacy schema ids.
+
+    Schema 10 stores one active slot per strategy.  Batch rotation is an
+    additive capability: the original assignment/slot tables remain the
+    compatibility path for callers and stores written before batching, while
+    these tables provide durable grouping and membership for new batches.
+    Keeping them outside ``SCHEMA_VERSION`` lets old migrations and their
+    append-only history remain readable.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS strategy_experiment_batches (
+            batch_id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            baseline_variant_id TEXT NOT NULL,
+            target_size INTEGER NOT NULL CHECK (target_size >= 1),
+            started_ts REAL NOT NULL,
+            minimum_duration_seconds REAL NOT NULL CHECK (
+                minimum_duration_seconds >= 0),
+            minimum_observations INTEGER NOT NULL CHECK (
+                minimum_observations > 0),
+            status TEXT NOT NULL CHECK (status IN ('ACTIVE','COMPLETED','REJECTED')),
+            FOREIGN KEY (baseline_variant_id) REFERENCES variants(variant_id)
+        );
+        CREATE INDEX IF NOT EXISTS strategy_experiment_batches_scope
+            ON strategy_experiment_batches(scope_key, strategy_id, started_ts);
+        CREATE TABLE IF NOT EXISTS strategy_experiment_batch_members (
+            batch_id TEXT NOT NULL,
+            assignment_id TEXT NOT NULL UNIQUE,
+            candidate_variant_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            PRIMARY KEY (batch_id, assignment_id),
+            FOREIGN KEY (batch_id) REFERENCES strategy_experiment_batches(batch_id),
+            FOREIGN KEY (assignment_id)
+                REFERENCES strategy_experiment_assignments(assignment_id),
+            FOREIGN KEY (candidate_variant_id) REFERENCES variants(variant_id)
+        );
+        CREATE INDEX IF NOT EXISTS strategy_experiment_batch_members_scope
+            ON strategy_experiment_batch_members(batch_id, ordinal, assignment_id);
+    """)
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -3002,6 +3046,7 @@ class FindingsStore:
             "paper_started_ts": None,
             "decision_ledger_started_ts": now,
             "resume_status": "SHADOW",
+            "paper_initial_balance_usdt": balance,
             "cash_usdt": balance,
             "equity_usdt": balance,
             "realized_pnl_usdt": 0.0,
@@ -3037,7 +3082,8 @@ class FindingsStore:
             scope_key: str, assignment_started_ts: float,
             attempt: int, baseline_variant_id: str,
             candidate_variant_id: str, code_identity: dict,
-            config_identity: dict, initial_balance: float) -> None:
+            config_identity: dict, initial_balance: float,
+            *, reset_baseline: bool = True) -> None:
         """Start both assignment arms from one equivalent durable boundary.
 
         Historical trades and decisions remain append-only. Only the mutable
@@ -3047,10 +3093,9 @@ class FindingsStore:
         balance = float(initial_balance)
         if not math.isfinite(balance) or balance <= 0:
             raise ValueError("paper initial balance must be positive and finite")
-        lanes = (
-            ("baseline", str(baseline_variant_id)),
-            ("candidate", str(candidate_variant_id)),
-        )
+        lanes = (("candidate", str(candidate_variant_id)),)
+        if reset_baseline:
+            lanes = (("baseline", str(baseline_variant_id)),) + lanes
         prepared = []
         required_provenance = {
             "variant_definition_hash", "strategy_config_version",
@@ -3581,6 +3626,295 @@ class FindingsStore:
                 .get("status") == "QUALIFIED"]
 
     @staticmethod
+    def _staged_harness():
+        """Resolve the one outcome contract shared by staged mechanisms.
+
+        The staged harness is intentionally not part of the registered
+        strategy model map.  Import it lazily here so the findings store can
+        validate staged evidence without turning ``staged`` into a live
+        strategy or making generic registered-strategy qualification depend on
+        the staging lane.
+        """
+        from agent.forward_models import STAGED_HARNESS
+
+        return STAGED_HARNESS
+
+    @classmethod
+    def _staged_candidate(cls, findings_store, scope_key: str,
+                          variant_id: str):
+        """Return the recomputed shortlist row for one staged arm."""
+        from research import shortlist
+
+        candidates = shortlist.from_store(
+            findings_store, scope_key=scope_key)
+        for candidate in candidates:
+            if candidate.variant_id == variant_id:
+                return candidate
+        return None
+
+    @classmethod
+    def _staged_qualification_detail(
+            cls, conn: sqlite3.Connection, variant: sqlite3.Row,
+            scope_key: str, detail: Mapping | None,
+            candidate, timestamp: float) -> dict:
+        """Build the immutable, research-only staged qualification envelope.
+
+        Staged evidence has no registered baseline/axis analysis.  Its
+        qualification boundary is the fixed harness plus the recomputed
+        shortlist verdict for the isolated scope.  The envelope is explicit
+        about that narrower authority so downstream callers cannot mistake a
+        local PAPER start for a registry or live-promotion event.
+        """
+        harness = cls._staged_harness()
+        supplied = dict(detail or {})
+        safety = {
+            "authority": "RESEARCH_ONLY",
+            "promotion_allowed": False,
+            "live_promotion": False,
+            "paper_only": True,
+            "live_allowed": False,
+            "paper_mode": "isolated_local",
+            "paper_status": "PAPER",
+            "execution_mode": "local_paper",
+            "mode": "isolated_local_paper",
+            "source": "staged_shadow",
+            "qualification_kind": "staged_shadow",
+            "harness_id": harness.model_id,
+            "staged_harness_id": harness.model_id,
+            "paper_scope": scope_key,
+        }
+        for key, expected in safety.items():
+            if key in supplied and supplied[key] != expected:
+                raise ValueError(
+                    f"staged qualification metadata {key!r} is immutable")
+
+        if candidate is None:
+            raise ValueError(
+                "staged qualification requires persisted shadow evidence")
+        if candidate.label != "SUPPORTED":
+            raise ValueError(
+                "staged qualification requires a recomputed SUPPORTED "
+                f"shadow verdict, got {candidate.label}")
+        if candidate.scope_key != scope_key:
+            raise ValueError("staged qualification evidence scope mismatch")
+        supplied_verdict = supplied.get("verdict", supplied.get("code"))
+        if supplied_verdict not in {None, "SUPPORTED"}:
+            raise ValueError("staged qualification verdict is not SUPPORTED")
+
+        # A caller may include a review object for display, but the values
+        # that determine qualification always come from the persisted store.
+        review = supplied.get("review")
+        if review is not None:
+            if not isinstance(review, Mapping):
+                raise ValueError("staged qualification review must be a mapping")
+            supplied_code = review.get("code", review.get("verdict"))
+            if supplied_code not in {None, "SUPPORTED"}:
+                raise ValueError(
+                    "staged qualification review is not SUPPORTED")
+
+        evidence = {
+            "variant_id": str(variant["variant_id"]),
+            "scope_key": scope_key,
+            "source": "deterministic_shadow",
+            "label": candidate.label,
+            "stage": "CONFIRM",
+            "trades": int(candidate.trades),
+            "wins": int(candidate.wins),
+            "mean_r": float(candidate.mean_r),
+            "ci_low": float(candidate.ci_low),
+            "ci_high": float(candidate.ci_high),
+            "fit_mean_r": (None if candidate.fit_mean_r is None
+                           else float(candidate.fit_mean_r)),
+            "confirmation_mean_r": (
+                None if candidate.confirmation_mean_r is None
+                else float(candidate.confirmation_mean_r)),
+            "p_value": (None if candidate.p_value is None
+                        else float(candidate.p_value)),
+            "p_adjusted": (None if candidate.p_adjusted is None
+                           else float(candidate.p_adjusted)),
+            "family_size": int(candidate.family_size),
+            "starved_decisions": int(candidate.starved_decisions),
+            "declined_decisions": int(candidate.declined_decisions),
+            "harness_id": harness.model_id,
+            "harness": json.loads(_canonical_json(harness.as_dict())),
+            "evaluated_ts": timestamp,
+        }
+        # Caller metadata remains useful for the audit trail, but cannot
+        # override the safety envelope or recomputed evidence.
+        metadata = {
+            key: value for key, value in supplied.items()
+            if key not in safety and key not in {"evidence", "review"}}
+        metadata.update(safety)
+        metadata.update({
+            "schema": "staged_qualification.v1",
+            "strategy_id": str(variant["strategy_id"]),
+            "variant_id": str(variant["variant_id"]),
+            "scope_key": scope_key,
+            "base_version": str(variant["base_version"]),
+            "hypothesis": str(variant["hypothesis"]),
+            "verdict": "SUPPORTED",
+            "stage": "CONFIRM",
+            "harness": evidence["harness"],
+            "evidence": evidence,
+        })
+        if review is not None:
+            metadata["review"] = json.loads(_canonical_json(review))
+            if review.get("contract_id"):
+                metadata["contract_id"] = str(review["contract_id"])
+        return json.loads(_canonical_json(metadata))
+
+    @staticmethod
+    def _start_staged_local_paper(
+            conn: sqlite3.Connection, scope_key: str, variant_id: str,
+            state: dict, timestamp: float) -> dict:
+        """Rebase a flat staged shadow account into local PAPER."""
+        if state.get("positions") or state.get("active_trades"):
+            raise ValueError(
+                f"{variant_id}: staged qualification requires a flat account")
+        if state.get("status") == "REVOKED" or state.get("revoked_reason"):
+            raise ValueError(
+                f"{variant_id}: revoked staged account cannot enter paper")
+        if state.get("paper_started_ts") is not None:
+            # Qualification is idempotent after the account has started.
+            state["status"] = "PAPER"
+            state["resume_status"] = "PAPER"
+            return state
+        balance = float(state.get("assignment_initial_balance_usdt")
+                        or state.get("paper_initial_balance_usdt")
+                        or 10_000.0)
+        if not math.isfinite(balance) or balance <= 0:
+            raise ValueError("staged paper initial balance must be positive")
+        state.update({
+            "status": "PAPER",
+            "resume_status": "PAPER",
+            "paper_started_ts": timestamp,
+            "paper_initial_balance_usdt": balance,
+            "cash_usdt": balance,
+            "equity_usdt": balance,
+            "realized_pnl_usdt": 0.0,
+            "unrealized_pnl_usdt": 0.0,
+            "high_water_mark": balance,
+            "day_start_equity": balance,
+            "gross_notional": 0.0,
+            "net_notional": 0.0,
+            "open_risk_usdt": 0.0,
+            "reserved_margin_usdt": 0.0,
+            "margin_usage_pct": 0.0,
+            "cooldowns": {},
+            "active_trades": {},
+            "loss_count": 0,
+            "consecutive_losses": 0,
+            "win_count": 0,
+            "unfilled_count": 0,
+            "invalid_outcome_count": 0,
+            "max_drawdown_pct": 0.0,
+            "failure_count": 0,
+            "revoked_reason": None,
+        })
+        return state
+
+    def qualify_staged_variant(
+            self, variant_id: str, detail: Mapping | None = None, *,
+            scope_key: str = "*", source_analysis_id: str | None = None,
+            now: float | None = None) -> str:
+        """Qualify deterministic staged evidence for isolated local PAPER.
+
+        This is intentionally separate from ``qualify_variant``.  Registered
+        variants retain the paired forward-analysis and family-correction
+        protocol; staged contracts have no baseline axis and instead use the
+        fixed ``STAGED_HARNESS`` plus a recomputed ``SUPPORTED`` shortlist
+        result.  The resulting event is research-only and cannot authorize
+        registry or live promotion.
+        """
+        scope_key = str(scope_key or "")
+        if not scope_key or scope_key == "*" or not scope_key.endswith(":staged"):
+            raise ValueError(
+                "staged qualification requires an isolated :staged scope")
+        timestamp = time.time() if now is None else float(now)
+        harness = self._staged_harness()
+
+        with _connect(self.path) as conn:
+            variant = self._require_variant(conn, str(variant_id))
+            if str(variant["strategy_id"]) != "staged":
+                raise ValueError(
+                    "qualify_staged_variant requires a staged variant")
+            if str(variant["base_version"]) != str(harness.model_id):
+                raise ValueError(
+                    "staged variant is bound to a different harness version")
+            portfolio = conn.execute(
+                "SELECT state_json FROM paper_portfolios "
+                "WHERE scope_key=? AND variant_id=?",
+                (scope_key, str(variant_id))).fetchone()
+            if portfolio is None:
+                raise ValueError(
+                    "staged qualification requires an enrolled paper portfolio")
+            state = json.loads(portfolio["state_json"])
+            if not isinstance(state, dict):
+                raise ValueError("staged paper portfolio state is malformed")
+            provenance = state.get("experiment_provenance")
+            if provenance is not None:
+                if not isinstance(provenance, Mapping):
+                    raise ValueError(
+                        "staged paper portfolio provenance is malformed")
+                if (provenance.get("forward_model_id") != harness.model_id
+                        or provenance.get("forward_model_assumptions_hash")
+                        != _content_hash(harness.as_dict())):
+                    raise ValueError(
+                        "staged portfolio is not bound to the fixed harness")
+
+            # Read the candidate outside this transaction only through the
+            # public store view; recomputation itself is deterministic and
+            # the immutable event records the resulting values below.
+            candidate = self._staged_candidate(self, scope_key, str(variant_id))
+            metadata = self._staged_qualification_detail(
+                conn, variant, scope_key, detail, candidate, timestamp)
+            if source_analysis_id is not None:
+                metadata["source_analysis_id"] = str(source_analysis_id)
+
+            # Every staged outcome must carry the fixed model identity.  A
+            # mixed model corpus is not a staged qualification even if its
+            # aggregate expectancy happens to look positive.
+            for table in ("paper_decisions", "paper_trades"):
+                rows = conn.execute(
+                    f"SELECT model_id FROM {table} WHERE scope_key=? "
+                    "AND variant_id=?", (scope_key, str(variant_id))).fetchall()
+                if any(str(row["model_id"]) != harness.model_id for row in rows):
+                    raise ValueError(
+                        "staged qualification evidence mixes forward models")
+
+            current = self._latest_qualification(
+                conn, str(variant_id), scope_key)
+            if current is not None and current["status"] == "QUALIFIED":
+                return str(current["event_id"])
+
+            state = self._start_staged_local_paper(
+                conn, scope_key, str(variant_id), state, timestamp)
+            conn.execute(
+                "UPDATE paper_portfolios SET state_json=?, version=version+1, "
+                "updated_ts=? WHERE scope_key=? AND variant_id=?",
+                (_canonical_json(state), timestamp, scope_key,
+                 str(variant_id)))
+            event_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO edge_qualification_events (event_id, variant_id, "
+                "scope_key, status, ts, source_analysis_id, detail_json) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (event_id, str(variant_id), scope_key, "QUALIFIED",
+                 timestamp, source_analysis_id, _canonical_json(metadata)))
+        return event_id
+
+    # Short public spelling for callers that deal exclusively in the staged
+    # population.  Keep the descriptive method above as the canonical API so
+    # it is obvious that the variant identity is still the persisted key.
+    def qualify_staged(
+            self, variant_id: str, detail: Mapping | None = None, *,
+            scope_key: str = "*", source_analysis_id: str | None = None,
+            now: float | None = None) -> str:
+        return self.qualify_staged_variant(
+            variant_id, detail, scope_key=scope_key,
+            source_analysis_id=source_analysis_id, now=now)
+
+    @staticmethod
     def _analysis_payload(row: sqlite3.Row) -> dict:
         payload = json.loads(row["payload_json"])
         canonical, payload_hash = _analysis_canonical(
@@ -3986,6 +4320,10 @@ class FindingsStore:
 
         source = payload.get("source_evidence") or {}
         strategy_id = str(payload.get("strategy_id") or "")
+        if strategy_id == "staged":
+            raise ValueError(
+                "staged mechanisms use qualify_staged_variant on the fixed "
+                "staged harness, not registered forward-axis analysis")
         model = require_complete_contract(strategy_id)
         baseline_id = str(source.get("baseline_id") or "")
         setting_ids = [str(value) for value in source.get("setting_ids") or []]
@@ -4164,6 +4502,10 @@ class FindingsStore:
         from agent import state as runtime_state
         from agent.forward_models import require_complete_contract
 
+        if str(strategy_id) == "staged":
+            raise ValueError(
+                "staged mechanisms use qualify_staged_variant on the fixed "
+                "staged harness, not registered forward-axis analysis")
         model = require_complete_contract(strategy_id)
         axis = _canonical_axis(axis)
         current_code = runtime_state.code_fingerprint()
@@ -4318,6 +4660,10 @@ class FindingsStore:
             raise ValueError(
                 "edge qualification requires a persisted forward analysis")
         variant = cls._require_variant(conn, variant_id)
+        if str(variant["strategy_id"]) == "staged":
+            raise ValueError(
+                "staged mechanisms use qualify_staged_variant on the fixed "
+                "staged harness, not registered forward-axis analysis")
         row = conn.execute(
             "SELECT * FROM analysis_runs WHERE analysis_id=?",
             (source_analysis_id,)).fetchone()
@@ -4327,6 +4673,10 @@ class FindingsStore:
         payload = cls._analysis_payload(row)
         if not isinstance(payload, Mapping):
             raise ValueError("forward analysis payload is not a mapping")
+        if str(payload.get("strategy_id") or "") == "staged":
+            raise ValueError(
+                "staged mechanisms use qualify_staged_variant on the fixed "
+                "staged harness, not registered forward-axis analysis")
         source = payload.get("source_evidence")
         if not isinstance(source, Mapping):
             raise ValueError("forward analysis source evidence is not a mapping")
@@ -4644,6 +4994,15 @@ class FindingsStore:
             self, variant_id: str, detail: dict, *,
             source_analysis_id: str | None = None,
             scope_key: str = "*") -> str:
+        # Staged mechanisms are a separate population measured on one fixed
+        # harness.  They have no registered baseline/axis analysis, so do not
+        # send them through the registered-strategy protocol below (which
+        # quite correctly requires a complete registered contract).
+        existing = self.variant(variant_id)
+        if existing is not None and str(existing.get("strategy_id")) == "staged":
+            return self.qualify_staged_variant(
+                variant_id, detail, source_analysis_id=source_analysis_id,
+                scope_key=scope_key)
         from agent.forward_models import require_complete_contract
 
         with _connect(self.path) as conn:
@@ -4750,6 +5109,9 @@ class FindingsStore:
             if not isinstance(payload, Mapping):
                 return False
             if payload.get("variant_id") != variant_id:
+                return False
+            variant = cls._require_variant(conn, variant_id)
+            if str(variant["strategy_id"]) == "staged":
                 return False
             scope_key = str(payload.get("scope_key") or "")
             if not scope_key:
@@ -5010,7 +5372,11 @@ class FindingsStore:
         if not isinstance(payload, Mapping):
             raise ValueError("T3 packet payload must be a mapping")
         with _connect(self.path) as conn:
-            self._require_variant(conn, variant_id)
+            variant = self._require_variant(conn, variant_id)
+            if str(variant["strategy_id"]) == "staged":
+                raise ValueError(
+                    "staged mechanisms are research-only and cannot create "
+                    "T3 or live-promotion packets")
             checklist = payload.get("checklist")
             complete = (
                 isinstance(checklist, Mapping)
@@ -5136,6 +5502,10 @@ class FindingsStore:
     @staticmethod
     def _register_variant(
             conn: sqlite3.Connection, variant, now: float) -> None:
+        if (str(getattr(variant, "strategy_id", "")) == "staged"
+                and str(getattr(variant, "status", "")) == "promoted"):
+            raise ValueError(
+                "staged mechanisms are research-only and cannot be promoted")
         overrides = json.dumps(variant.overrides, sort_keys=True)
         existing = conn.execute(
             "SELECT * FROM variants WHERE variant_id=?",
@@ -5390,15 +5760,25 @@ class FindingsStore:
                 for candidate in static_candidates
                 if candidate.get("variant_id")
             }
-            active = conn.execute(
+            active_rows = conn.execute(
+                "SELECT assignment.candidate_variant_id "
+                "FROM strategy_experiment_batch_members AS member "
+                "JOIN strategy_experiment_batches AS batch "
+                "ON batch.batch_id=member.batch_id "
+                "JOIN strategy_experiment_assignments AS assignment "
+                "ON assignment.assignment_id=member.assignment_id "
+                "WHERE batch.scope_key=? AND batch.strategy_id=? "
+                "AND batch.status='ACTIVE' "
+                "UNION ALL "
                 "SELECT assignment.candidate_variant_id "
                 "FROM strategy_experiment_active_slots AS slot "
                 "JOIN strategy_experiment_assignments AS assignment "
                 "ON assignment.assignment_id=slot.assignment_id "
                 "WHERE slot.scope_key=? AND slot.strategy_id=?",
-                (scope_key, requested_strategy)).fetchone()
-            active_variant = (
-                str(active["candidate_variant_id"]) if active is not None else None)
+                (scope_key, requested_strategy, scope_key, requested_strategy)
+            ).fetchall()
+            active_variants = {
+                str(row["candidate_variant_id"]) for row in active_rows}
             terminal_rows = self._terminal_assignment_rows(
                 conn, scope_key, requested_strategy)
             terminal_variants = {
@@ -5437,7 +5817,7 @@ class FindingsStore:
                     return False, (
                         f"candidate status is {registered['status']}, not eligible"
                     ), None
-                if variant_id == active_variant:
+                if variant_id in active_variants:
                     return False, "candidate is already the active assignment", None
                 if variant_id in pending_variants:
                     return False, (
@@ -5830,6 +6210,29 @@ class FindingsStore:
             and item["observations_satisfied"])
         item["ready_to_complete"] = (
             status == "DRAINING" and resolution["total"] == 0)
+        batch = conn.execute(
+            "SELECT member.batch_id, member.ordinal, batch.target_size, "
+            "batch.status AS batch_status "
+            "FROM strategy_experiment_batch_members AS member "
+            "JOIN strategy_experiment_batches AS batch "
+            "ON batch.batch_id=member.batch_id "
+            "WHERE member.assignment_id=?",
+            (item["assignment_id"],)).fetchone()
+        if batch is not None:
+            item.update({
+                "batch_id": str(batch["batch_id"]),
+                "batch_ordinal": int(batch["ordinal"]),
+                "batch_target_size": int(batch["target_size"]),
+                "batch_status": str(batch["batch_status"]),
+            })
+        else:
+            # Legacy one-candidate assignments are their own durable batch.
+            item.update({
+                "batch_id": str(item["assignment_id"]),
+                "batch_ordinal": 0,
+                "batch_target_size": 1,
+                "batch_status": "ACTIVE" if not terminal else status,
+            })
         return item
 
     def experiment_assignment(
@@ -5907,7 +6310,36 @@ class FindingsStore:
     def active_experiment_assignment(
             self, scope_key: str, strategy_id: str, *,
             now: float | None = None) -> dict | None:
+        assignments = self.active_experiment_assignments(
+            scope_key, strategy_id, now=now)
+        return assignments[0] if assignments else None
+
+    def active_experiment_assignments(
+            self, scope_key: str, strategy_id: str, *,
+            now: float | None = None) -> list[dict]:
+        """Return every active candidate assignment for one strategy.
+
+        Batch rotations use the additive batch index. Legacy stores continue
+        to resolve through the original one-row active-slot table.
+        """
         with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT assignment.* "
+                "FROM strategy_experiment_batch_members AS member "
+                "JOIN strategy_experiment_batches AS batch "
+                "ON batch.batch_id=member.batch_id "
+                "JOIN strategy_experiment_assignments AS assignment "
+                "ON assignment.assignment_id=member.assignment_id "
+                "WHERE batch.scope_key=? AND batch.strategy_id=? "
+                "AND batch.status='ACTIVE' "
+                "ORDER BY member.ordinal, assignment.assignment_id",
+                (scope_key, strategy_id)).fetchall()
+            if rows:
+                assignments = [self._assignment_dict(conn, row, now)
+                               for row in rows]
+                return [item for item in assignments
+                        if item["status"] not in {"COMPLETED", "REJECTED"}]
+
             row = conn.execute(
                 "SELECT assignment.* "
                 "FROM strategy_experiment_active_slots AS slot "
@@ -5916,13 +6348,13 @@ class FindingsStore:
                 "WHERE slot.scope_key=? AND slot.strategy_id=?",
                 (scope_key, strategy_id)).fetchone()
             if row is None:
-                return None
+                return []
             assignment = self._assignment_dict(conn, row, now)
             if assignment["status"] in {"COMPLETED", "REJECTED"}:
                 raise MigrationError(
                     f"{scope_key}:{strategy_id} active slot points to a "
                     "terminal experiment")
-            return assignment
+            return [assignment]
 
     def next_experiment_candidate(
             self, scope_key: str, strategy_id: str,
@@ -6168,6 +6600,242 @@ class FindingsStore:
                 "WHERE assignment_id=?", (assignment_id,)).fetchone()
             return self._assignment_dict(conn, row, timestamp)
 
+    @staticmethod
+    def _active_batch_assignment_rows(
+            conn: sqlite3.Connection, scope_key: str,
+            strategy_id: str) -> list[sqlite3.Row]:
+        rows = conn.execute(
+            "SELECT assignment.* "
+            "FROM strategy_experiment_batch_members AS member "
+            "JOIN strategy_experiment_batches AS batch "
+            "ON batch.batch_id=member.batch_id "
+            "JOIN strategy_experiment_assignments AS assignment "
+            "ON assignment.assignment_id=member.assignment_id "
+            "WHERE batch.scope_key=? AND batch.strategy_id=? "
+            "AND batch.status='ACTIVE' "
+            "ORDER BY member.ordinal, assignment.assignment_id",
+            (scope_key, strategy_id)).fetchall()
+        # A batch stays ACTIVE while sibling candidates drain.  Do not hand
+        # terminal members back to callers that are resuming the batch; those
+        # members are durable history and must remain out of the scheduler.
+        active = []
+        for row in rows:
+            latest = FindingsStore._assignment_event(
+                conn, str(row["assignment_id"]))
+            if latest is None or str(latest["status"]) not in {
+                    "COMPLETED", "REJECTED"}:
+                active.append(row)
+        return active
+
+    def ensure_experiment_batch(
+            self, scope_key: str, strategy_id: str,
+            baseline_variant_id: str, candidates: list[dict], *,
+            minimum_duration_seconds: float,
+            minimum_observations: int,
+            target_candidates: int = 4,
+            hard_cap: int = 8,
+            initial_balance_usdt: float = 10_000.0,
+            pre_registered_only: bool = True,
+            now: float | None = None) -> list[dict]:
+        """Start or resume one bounded, durable candidate batch.
+
+        Each member retains the legacy assignment schema and therefore keeps
+        the existing outcome/family-correction path.  The additive batch
+        index only groups members, shares the baseline account boundary, and
+        lets shadow evaluate a bounded set concurrently.
+        """
+        target = max(1, int(target_candidates))
+        cap = max(1, int(hard_cap))
+        if target > cap:
+            target = cap
+        if float(minimum_duration_seconds) < 0:
+            raise ValueError("minimum_duration_seconds cannot be negative")
+        if int(minimum_observations) <= 0:
+            raise ValueError("minimum_observations must be positive")
+
+        # Select deterministically using the existing terminal/retry gates.
+        remaining = [dict(candidate) for candidate in candidates]
+        chosen: list[dict] = []
+        while remaining and len(chosen) < target:
+            if pre_registered_only:
+                remaining = [
+                    item for item in remaining
+                    if str(item.get("source") or "static") == "static"]
+            candidate = self.next_experiment_candidate(
+                scope_key, strategy_id, remaining)
+            if candidate is None:
+                break
+            chosen.append(candidate)
+            selected_id = str(candidate.get("variant_id") or "")
+            remaining = [
+                item for item in remaining
+                if str(item.get("variant_id") or "") != selected_id]
+        if not chosen:
+            return []
+
+        timestamp = time.time() if now is None else float(now)
+        baseline_id = str(baseline_variant_id)
+        member_identity = [{
+            "variant_id": str(item["variant_id"]),
+            "candidate_key": str(item["candidate_key"]),
+            "code_identity": item.get("code_identity") or {},
+            "config_identity": item.get("config_identity") or {},
+            "attempt": int(item.get("attempt") or 1),
+            "retry_of_assignment_id": item.get("retry_of_assignment_id"),
+        } for item in chosen]
+        batch_id = _content_hash({
+            "scope_key": str(scope_key),
+            "strategy_id": str(strategy_id),
+            "baseline_variant_id": baseline_id,
+            "members": member_identity,
+            "minimum_duration_seconds": float(minimum_duration_seconds),
+            "minimum_observations": int(minimum_observations),
+        })[:32]
+
+        with _connect(self.path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active_batch = self._active_batch_assignment_rows(
+                conn, scope_key, strategy_id)
+            if active_batch:
+                return [self._assignment_dict(conn, row, timestamp)
+                        for row in active_batch]
+            legacy_active = conn.execute(
+                "SELECT assignment.* FROM strategy_experiment_active_slots AS slot "
+                "JOIN strategy_experiment_assignments AS assignment "
+                "ON assignment.assignment_id=slot.assignment_id "
+                "WHERE slot.scope_key=? AND slot.strategy_id=?",
+                (scope_key, strategy_id)).fetchall()
+            if legacy_active:
+                return [self._assignment_dict(conn, legacy_active[0], timestamp)]
+
+            baseline = self._require_variant(conn, baseline_id)
+            if str(baseline["strategy_id"]) != str(strategy_id):
+                raise ValueError("experiment baseline does not match strategy_id")
+            conn.execute(
+                "INSERT INTO strategy_experiment_batches "
+                "(batch_id, scope_key, strategy_id, baseline_variant_id, "
+                "target_size, started_ts, minimum_duration_seconds, "
+                "minimum_observations, status) VALUES (?,?,?,?,?,?,?,?,?)",
+                (batch_id, str(scope_key), str(strategy_id), baseline_id,
+                 len(chosen), timestamp, float(minimum_duration_seconds),
+                 int(minimum_observations), "ACTIVE"))
+
+            rows: list[sqlite3.Row] = []
+            for ordinal, candidate in enumerate(chosen):
+                variant_id = str(candidate.get("variant_id") or "")
+                candidate_key = str(candidate.get("candidate_key") or "")
+                axis = str(candidate.get("axis") or "").strip()
+                setting_id = str(candidate.get("setting_id") or "").strip()
+                source = str(candidate.get("source") or "static")
+                if not variant_id or not candidate_key or not axis or not setting_id:
+                    raise ValueError("batch candidate identity is incomplete")
+                if source not in {"static", "adaptive"}:
+                    raise ValueError("experiment source must be static or adaptive")
+                experiment = self._require_variant(conn, variant_id)
+                if str(experiment["strategy_id"]) != str(strategy_id):
+                    raise ValueError("experiment candidate does not match strategy_id")
+                if variant_id == baseline_id:
+                    raise ValueError("experiment candidate cannot be its baseline")
+                proposal_id = candidate.get("proposal_id")
+                selection_id = candidate.get("selection_id")
+                retry_of = str(candidate.get("retry_of_assignment_id") or "").strip() or None
+                attempt = int(candidate.get("attempt") or 1)
+                if retry_of:
+                    previous = conn.execute(
+                        "SELECT assignment.*, outcome.verdict, "
+                        "outcome.payload_json AS outcome_payload_json "
+                        "FROM strategy_experiment_assignments AS assignment "
+                        "JOIN experiment_outcomes AS outcome "
+                        "ON outcome.assignment_id=assignment.assignment_id "
+                        "WHERE assignment.assignment_id=?", (retry_of,)).fetchone()
+                    if (previous is None
+                            or previous["scope_key"] != scope_key
+                            or previous["strategy_id"] != strategy_id
+                            or previous["baseline_variant_id"] != baseline_id
+                            or previous["candidate_variant_id"] != variant_id
+                            or previous["candidate_key"] != candidate_key
+                            or not self._terminal_assignment_retryable(previous)):
+                        raise ValueError(
+                            "batch retry must name a matching terminal INCONCLUSIVE assignment")
+                    attempt = int(previous["attempt"] or 1) + 1
+                assignment_id = _content_hash({
+                    "batch_id": batch_id,
+                    "candidate_variant_id": variant_id,
+                    "candidate_key": candidate_key,
+                    "attempt": attempt,
+                    "retry_of_assignment_id": retry_of,
+                })[:32]
+                setting_json = _canonical_json(candidate.get("setting") or {})
+                code_identity_json = _canonical_json(candidate.get("code_identity") or {})
+                config_identity_json = _canonical_json(candidate.get("config_identity") or {})
+                conn.execute(
+                    "INSERT INTO strategy_experiment_assignments "
+                    "(assignment_id, scope_key, strategy_id, baseline_variant_id, "
+                    "candidate_variant_id, candidate_key, axis, setting_id, "
+                    "setting_json, source, proposal_id, started_ts, "
+                    "minimum_duration_seconds, minimum_observations, "
+                    "code_identity_json, config_identity_json, attempt, "
+                    "retry_of_assignment_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (assignment_id, scope_key, strategy_id, baseline_id,
+                     variant_id, candidate_key, axis, setting_id, setting_json,
+                     source, proposal_id, timestamp,
+                     float(minimum_duration_seconds), int(minimum_observations),
+                     code_identity_json, config_identity_json, attempt, retry_of))
+                self._reset_assignment_accounts_conn(
+                    conn, batch_id, scope_key, timestamp, attempt,
+                    baseline_id, variant_id,
+                    json.loads(code_identity_json),
+                    json.loads(config_identity_json), initial_balance_usdt,
+                    reset_baseline=(ordinal == 0))
+                for status in ("STARTED", "OBSERVING"):
+                    conn.execute(
+                        "INSERT INTO strategy_experiment_assignment_events "
+                        "(event_id, assignment_id, status, event_ts, reason, detail_json) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (uuid.uuid4().hex, assignment_id, status, timestamp, None,
+                         _canonical_json({
+                             "batch_id": batch_id,
+                             "batch_ordinal": ordinal,
+                             "baseline_variant_id": baseline_id,
+                             "candidate_variant_id": variant_id,
+                             "axis": axis, "setting_id": setting_id,
+                             "attempt": attempt,
+                             "fresh_account_boundary_ts": timestamp,
+                         })))
+                conn.execute(
+                    "INSERT INTO strategy_experiment_batch_members "
+                    "(batch_id, assignment_id, candidate_variant_id, ordinal) "
+                    "VALUES (?,?,?,?)",
+                    (batch_id, assignment_id, variant_id, ordinal))
+                if proposal_id and not retry_of:
+                    self._append_proposal_event_conn(
+                        conn, str(proposal_id), "OBSERVING", {
+                            "assignment_id": assignment_id,
+                            "batch_id": batch_id,
+                            "scope_key": scope_key,
+                            "variant_id": variant_id,
+                        }, timestamp)
+                if selection_id:
+                    latest_selection = self._research_selection_event(
+                        conn, str(selection_id))
+                    if (latest_selection is None
+                            or latest_selection["status"] != "ACCEPTED"):
+                        raise ValueError("research selection is not pending")
+                    self._append_research_selection_event_conn(
+                        conn, str(selection_id), "ASSIGNED",
+                        assignment_id=assignment_id, timestamp=timestamp,
+                        detail={
+                            "batch_id": batch_id,
+                            "scope_key": scope_key,
+                            "strategy_id": strategy_id,
+                            "variant_id": variant_id,
+                        })
+                rows.append(conn.execute(
+                    "SELECT * FROM strategy_experiment_assignments "
+                    "WHERE assignment_id=?", (assignment_id,)).fetchone())
+            conn.commit()
+            return [self._assignment_dict(conn, row, timestamp) for row in rows]
+
     def record_experiment_observations(
             self, assignment_id: str, observations: list[dict], *,
             now: float | None = None) -> dict:
@@ -6200,6 +6868,30 @@ class FindingsStore:
                      float(observation.get("observed_ts", timestamp)),
                      _canonical_json(observation.get("detail") or {})))
             return self._assignment_dict(conn, row, timestamp)
+
+    @staticmethod
+    def _refresh_batch_status_conn(
+            conn: sqlite3.Connection, assignment_id: str) -> None:
+        batch = conn.execute(
+            "SELECT batch_id FROM strategy_experiment_batch_members "
+            "WHERE assignment_id=?", (assignment_id,)).fetchone()
+        if batch is None:
+            return
+        rows = conn.execute(
+            "SELECT member.assignment_id, "
+            "(SELECT event.status FROM strategy_experiment_assignment_events AS event "
+            " WHERE event.assignment_id=member.assignment_id "
+            " ORDER BY event.event_ts DESC, event.rowid DESC LIMIT 1) AS status "
+            "FROM strategy_experiment_batch_members AS member "
+            "WHERE member.batch_id=?", (batch["batch_id"],)).fetchall()
+        if rows and all(str(row["status"]) in {"COMPLETED", "REJECTED"}
+                        for row in rows):
+            status = ("REJECTED" if any(str(row["status"]) == "REJECTED"
+                                        for row in rows) else "COMPLETED")
+            conn.execute(
+                "UPDATE strategy_experiment_batches SET status=? "
+                "WHERE batch_id=? AND status='ACTIVE'",
+                (status, batch["batch_id"]))
 
     def maybe_complete_experiment_assignment(
             self, assignment_id: str, *, now: float | None = None,
@@ -6272,6 +6964,7 @@ class FindingsStore:
                     })
             if _table_exists(conn, "experiment_outcomes"):
                 _ensure_experiment_outcome_conn(conn, assignment_id)
+            self._refresh_batch_status_conn(conn, assignment_id)
             return self._assignment_dict(conn, row, timestamp)
 
     def reject_experiment_assignment(
@@ -6321,6 +7014,7 @@ class FindingsStore:
                     timestamp=timestamp, detail=detail or {})
             if _table_exists(conn, "experiment_outcomes"):
                 _ensure_experiment_outcome_conn(conn, assignment_id)
+            self._refresh_batch_status_conn(conn, assignment_id)
             return self._assignment_dict(conn, row, timestamp)
 
     # Experiment learning
@@ -6781,6 +7475,12 @@ class FindingsStore:
 
     def set_status(self, variant_id: str, status: str) -> None:
         with _connect(self.path) as conn:
+            variant = self._require_variant(conn, variant_id)
+            if (str(variant["strategy_id"]) == "staged"
+                    and str(status) == "promoted"):
+                raise ValueError(
+                    "staged mechanisms are research-only and cannot be "
+                    "promoted")
             conn.execute(
                 "UPDATE variants SET status=?, updated_ts=? "
                 "WHERE variant_id=?", (status, time.time(), variant_id))

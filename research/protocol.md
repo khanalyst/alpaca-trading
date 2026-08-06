@@ -6,7 +6,7 @@ an edge to live trading.
 
 There are two verdict layers:
 
-1. the current baseline-plus-one real-time experiment loop produces immutable
+1. the current baseline-plus-bounded-batch real-time experiment loop produces immutable
    `WORKED`, `FAILED`, or `INCONCLUSIVE` outcomes; and
 2. the older multi-setting `forward-qualify` path produces `PROMOTE`, `REJECT`,
    `CONTINUE`, or `INSUFFICIENT_SAMPLE` as research qualification verdicts.
@@ -33,6 +33,7 @@ amendment, it is a result being negotiated.
 | 2026-07-30 | **Criterion 10 added**: a Holm correction across every axis evaluated in one qualification run. **Criterion 5 reclassified** as a selection screen rather than an independent test. | The correction existed only for conditioning cells, so the path that actually qualifies an edge corrected nothing while this document claimed the corrected figure was the only quotable one. Five axes are registered and the count grows with the registry. No variant had forward evidence at the time, so nothing was pending on either criterion. |
 | 2026-07-31 | **Real-time rotation outcomes documented separately.** Every strategy now keeps one baseline and at most one candidate; inadequacy is checked before performance and terminal outcomes are immutable. | The previous text said every setting ran continuously, which no longer matched the durable per-strategy rotation or the closed learning loop. |
 | 2026-07-31 | **Forward qualification now reconstructs every setting from all eligible completed assignment attempts and its own contemporaneous baseline. Axis correction uses a calibrated paired six-hour-cluster sign-flip p-value.** | A common latest-ledger watermark erased earlier serial settings, and interval geometry is not a p-value. Existing v2 analyses remain readable but cannot authorize a new qualification. |
+| 2026-08-06 | **Real-time rotation now runs one shared baseline with a bounded pre-registered candidate batch per strategy (four shipped, hard cap eight); each assignment still tests one setting.** | Priority 1 increases discovery throughput without mixing adaptive selections into a static family or changing the downstream family-correction and held-out gates. |
 
 ---
 
@@ -55,7 +56,10 @@ finding, it is an opinion with a timestamp.
 ## Real-time assignment outcomes
 
 The four realtime strategies advance from the same cycle snapshot/timestamp.
-Each keeps its stable baseline and tests no more than one candidate at a time.
+Each keeps its stable baseline and tests a bounded batch of pre-registered
+candidates in parallel; every individual assignment still tests no more than
+one candidate setting. The active analyst's adaptive selections remain
+isolated from the static batch.
 The registered `funding-carry`, `funding-unwind`, and `trend-multiday` models
 are offline-only; their candidates do not occupy realtime lanes.
 
@@ -299,12 +303,13 @@ positive one. A programme that records only what worked records only noise.
 
 ## From collection to reviewed evidence
 
-The current realtime path is baseline plus one candidate for each realtime
-strategy, not every setting at once. Four strategy evaluators advance on every
-available shared snapshot using deterministic contracts and no per-strategy LLM
-calls. The three long-horizon registered models are offline-only. The active
-momentum analyst's actual choices are retained in a separate `:llm` scope.
-Durable writes remain serialized.
+The current realtime path is one shared baseline plus a bounded candidate batch
+for each realtime strategy, not every setting at once. Four strategy evaluators
+advance on every available shared snapshot using deterministic contracts and no
+per-strategy LLM calls. The three long-horizon registered models are offline-
+only. The active momentum analyst's actual choices are retained in a separate
+`:llm` scope. Packet computation may run concurrently, while durable writes
+remain serialized.
 
 The model decision throttle is elapsed-time based: with
 `cycle.decision_interval_seconds: 300`, the engine waits for at least 95% of

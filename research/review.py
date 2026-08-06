@@ -463,10 +463,16 @@ class ResearchReviewLLM:
 
 def process_pending_review(
         store: FindingsStore, cfg: dict, *, reviewer=None,
-        now: float | None = None) -> dict:
-    """Process at most one outcome; failures remain pending for retry."""
-    store.ensure_terminal_experiment_outcomes()
-    outcome = store.pending_experiment_outcome()
+        now: float | None = None, outcome: dict | None = None) -> dict:
+    """Process one outcome; failures remain pending for retry.
+
+    ``outcome`` is an internal batch-loop escape hatch.  The original public
+    behaviour remains unchanged when it is omitted: the oldest pending
+    outcome is selected from the store.
+    """
+    if outcome is None:
+        store.ensure_terminal_experiment_outcomes()
+        outcome = store.pending_experiment_outcome()
     if outcome is None:
         return {"status": "IDLE", "processed": 0}
     requested_ts = time.time() if now is None else float(now)
@@ -531,3 +537,63 @@ def process_pending_review(
     return {"status": "REVIEWED", "processed": 1,
             "outcome_id": outcome["outcome_id"], "review": review,
             "hypothesis_draft": parsed["hypothesis_draft"]}
+
+
+def process_pending_reviews(
+        store: FindingsStore, cfg: dict, *, max_reviews: int = 8,
+        reviewer=None, now: float | None = None) -> dict:
+    """Process a bounded snapshot of pending terminal outcomes.
+
+    Each outcome is attempted at most once per invocation.  A provider/parse
+    failure is persisted by :func:`process_pending_review` and does not stop
+    later outcomes in this batch; an unexpected per-item exception is also
+    captured so the nightly loop remains nonfatal and the item stays pending.
+    """
+    try:
+        limit = int(max_reviews)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_reviews must be a positive integer") from exc
+    if limit <= 0:
+        raise ValueError("max_reviews must be a positive integer")
+
+    store.ensure_terminal_experiment_outcomes()
+    pending = [
+        outcome for outcome in store.experiment_outcomes()
+        if store.experiment_review(outcome["outcome_id"]) is None
+    ][:limit]
+
+    results = []
+    for outcome in pending:
+        try:
+            result = process_pending_review(
+                store, cfg, reviewer=reviewer, now=now, outcome=outcome)
+        except Exception as exc:  # noqa: BLE001 - isolate one bad item
+            result = {
+                "status": "FAILED",
+                "processed": 1,
+                "outcome_id": outcome["outcome_id"],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        results.append(result)
+
+    reviewed = sum(item.get("status") == "REVIEWED" for item in results)
+    retry_pending = sum(
+        item.get("status") == "RETRY_PENDING" for item in results)
+    failed = sum(item.get("status") == "FAILED" for item in results)
+    if not results:
+        status = "IDLE"
+    elif reviewed == len(results):
+        status = "REVIEWED"
+    elif retry_pending == len(results):
+        status = "RETRY_PENDING"
+    else:
+        status = "PARTIAL"
+    return {
+        "status": status,
+        "processed": len(results),
+        "reviewed": reviewed,
+        "retry_pending": retry_pending,
+        "failed": failed,
+        "max_reviews": limit,
+        "results": results,
+    }
