@@ -158,6 +158,10 @@ if [ -f "$JOURNAL" ]; then
   "$PY" research.py prepare-review-artifacts --store "$STORE" --db "$JOURNAL" \
     || echo "WARNING: review artifact preparation deferred" >&2
 
+  echo "=== $(date -u +%FT%TZ) candidate shortlist ==="
+  "$PY" research.py shortlist --store "$STORE" \
+    --out "$ROOT/research/results/shortlist.md" || true
+
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
   "$PY" research.py report --store "$STORE"
 else

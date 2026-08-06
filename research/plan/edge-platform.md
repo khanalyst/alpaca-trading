@@ -140,7 +140,7 @@ collection answers that question with data instead of a guess.
       replacing serial one-candidate-per-lane rotation
 - [ ] B2.5 Reason-coded verdicts so the reviewer learns why a candidate died,
       not merely that it did
-- [ ] B2.6 Ranked shortlist report: mechanism, payer, configuration,
+- [x] B2.6 Ranked shortlist report: mechanism, payer, configuration,
       observations, after-cost expectancy with interval, nulls beaten,
       held-out result, honest confidence label
 
@@ -227,7 +227,7 @@ vetoed a quiet hour, with no code written for it.
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control
 - [ ] B2.5 Reason-coded verdicts
-- [ ] B2.6 Ranked shortlist report
+- [x] B2.6 Ranked shortlist report
 - [ ] B2.7 Deterministic order path
 
 B2.8 needs one design decision first. A staged contract produces a signal but
@@ -301,7 +301,45 @@ own variant id.
 
 ### Remaining
 
-- [ ] B2.6 Ranked shortlist report
+- [x] B2.6 Ranked shortlist report
+- [ ] B2.5 Reason-coded verdicts
+- [ ] B2.3 Three-stage funnel
+- [ ] B2.4 Parallel arms with false-discovery control
+- [ ] B2.7 Deterministic order path
+
+
+### B2.6: the report a human acts on, or declines to act on
+
+`research.py shortlist` ranks every measured arm and states how far the
+evidence goes. Six labels, and the strongest one stops short of a
+recommendation: `SUPPORTED` means an adequate sample whose 95% interval
+excludes zero with a held-out window agreeing in sign, not that the edge will
+persist. The report says so in its own header, and a test asserts the words
+"proven", "guaranteed" and "risk-free" never appear.
+
+Two properties the labels enforce. A label cannot outrun its sample, so a
++1.0 R mean on five trades reads `INSUFFICIENT` rather than as the best
+candidate on the list. And a result that dies out of sample is
+`INCONCLUSIVE`, not `SUPPORTED`: the confirmation window is the last 30% of a
+candidate's trades in time rather than a random split, because an edge that
+only works where it was found is what that split exists to catch.
+
+Starvation is reported separately from failure. An arm with no closed trades
+appears with the reason - never evaluated for missing data, or the contract
+declined and never fired - because those are opposite conclusions about
+whether the claim was tested at all.
+
+Verified against the 7-day VM corpus rather than fixtures. 66 arms, 0
+supported, and `scalp_maker.baseline` at n=84 correctly labelled `NEGATIVE`
+on an interval of -0.644..-0.374 R and ranked near the bottom, with less-bad
+results above worse ones. Two display defects surfaced only because it was
+run on real data: baselines were excluded from the ranking, which hid the
+single most informative result in the corpus, and identical variant ids recur
+across feed scopes, so a table without a scope column invited reading two
+populations as one.
+
+### Remaining
+
 - [ ] B2.5 Reason-coded verdicts
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control

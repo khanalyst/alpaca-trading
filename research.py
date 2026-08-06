@@ -119,6 +119,9 @@ def _price_cache(args: argparse.Namespace):
     return prices_mod.PriceCache(path)
 
 
+DEFAULT_STAGING_PATH = "research/cache/staging.db"
+
+
 def _corpus_for(db: Path):
     cycles, report = corpus.load_cycles(db)
     outputs, _ = corpus.load_model_outputs(db)
@@ -1463,6 +1466,43 @@ def cmd_staged(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_shortlist(args: argparse.Namespace) -> int:
+    """Rank what the evidence supports, and say how far it goes.
+
+    Reports every measured arm including the ones with nothing to show, so a
+    mechanism that was starved of data is visible as untested rather than
+    silently absent from the ranking.
+    """
+    from research import shortlist as shortlist_mod
+
+    store = findings_mod.FindingsStore(
+        findings_mod.resolve_store_path(args.store))
+    staging = None
+    staging_path = args.staging or DEFAULT_STAGING_PATH
+    if Path(staging_path).is_file():
+        from agent.staging import StagingStore
+
+        staging = StagingStore(staging_path)
+    candidates = shortlist_mod.from_store(
+        store, staging, scope_key=args.scope)
+    if args.json:
+        import dataclasses
+
+        print(json.dumps(
+            [dataclasses.asdict(item)
+             for item in shortlist_mod.rank(candidates)],
+            indent=2, sort_keys=True, default=str))
+        return 0
+    report = shortlist_mod.render(candidates)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(report, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(report, end="")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -1631,6 +1671,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="findings.db to inspect read-only; absent stores are not created")
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
+
+    shortlist_parser = sub.add_parser(
+        "shortlist", help="rank measured candidates and state the evidence")
+    shortlist_parser.add_argument("--store", default=None,
+                                  help="findings.db path")
+    shortlist_parser.add_argument("--staging", default=None,
+                                  help="staging.db path")
+    shortlist_parser.add_argument("--scope", default=None,
+                                  help="limit to one scope key")
+    shortlist_parser.add_argument("--out", default=None,
+                                  help="write the report to this path")
+    shortlist_parser.add_argument("--json", action="store_true",
+                                  help="emit structured rows instead of prose")
+    shortlist_parser.set_defaults(func=cmd_shortlist)
 
     author = sub.add_parser(
         "author",

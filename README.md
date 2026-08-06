@@ -255,6 +255,7 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py author
 ./.venv/bin/python research.py author --dry-run
 ./.venv/bin/python research.py staged
+./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts
@@ -264,6 +265,30 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py backup --target <mounted-directory> --require-external
 ./.venv/bin/python research.py verify-backup <backup-directory>
 ```
+
+### Reading the shortlist
+
+`research.py shortlist` ranks every measured arm and states how far the
+evidence goes. It reports arms with nothing to show as well as the ones with
+results, because a mechanism starved of market data is untested rather than
+unsupported, and a report that omitted it would read as though it had been
+tried and failed.
+
+| Label | What it means |
+| --- | --- |
+| `SUPPORTED` | Adequate sample, 95% interval excludes zero, held-out window agrees in sign |
+| `PRELIMINARY` | Positive but under the 100-trade floor |
+| `INCONCLUSIVE` | Adequate sample whose interval still includes zero, or a result that does not persist out of sample |
+| `INSUFFICIENT` | Under the 30-trade floor; no reading means much |
+| `NO_EVIDENCE` | No closed trades, with the reason: starved of data, or the contract never fired |
+| `NEGATIVE` | The whole interval is at or below zero |
+
+`SUPPORTED` is the strongest statement the system makes and it is not a
+recommendation to trade. The confirmation window is the last 30% of a
+candidate's trades in time, not a random split, because an edge that only
+works where it was found is exactly what that split exists to catch. The
+nightly run writes the report as `shortlist.md` under `research/results`,
+which is generated output rather than a committed file.
 
 ### Proposing new mechanisms
 
