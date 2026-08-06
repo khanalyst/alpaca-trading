@@ -44,6 +44,7 @@ def snapshot(**overrides):
         "funding_interval_hours": 8.0, "next_funding_minutes": 60.0,
         "taker_fee_pct_per_side": 0.05, "atr_1h_pct": 1.0,
         "ema20_1h_dist_pct": 0.2, "signal_ts": 1_800_000_000,
+        "swing_low_pct": 1.2, "swing_high_pct": 1.2,
         "liq_notional_1h_usd": 900_000.0,
         "_enrichment": {
             "book_ts": 1_800_000_000_000, "book_best_bid": 99.99,

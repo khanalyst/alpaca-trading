@@ -103,20 +103,22 @@ is treated as durably backed up.
 2. `review-staged`, which gives each machine-authored mechanism a coded
    verdict and retires the ones that are finished;
 3. `author`, which proposes new mechanisms and stages the ones that validate.
-   It runs after the verdicts and before the reviewer on purpose: a proposer
-   that has not been told why the last batch died restates a dead claim at a
-   different threshold, and it needs no terminal outcome to run at all;
-4. `research-loop`, which creates missing deterministic outcomes and reviews
-   at most one pending result;
-5. corpus statistics and G2 replay when the journal exists;
-6. funnel, cadence, sweeps, three-arm analysis, forward qualification,
+   It runs after the verdicts so the next generation sees the latest coded
+   failures;
+4. `qualify-staged`, which starts isolated local PAPER only for staged
+   mechanisms whose fixed-harness evidence is supported;
+5. `research-loop`, which creates missing deterministic outcomes and reviews a
+   bounded queue (default eight) of pending results; one failed provider call
+   is persisted and does not stop later items;
+6. corpus statistics and G2 replay when the journal exists;
+7. funnel, cadence, sweeps, three-arm analysis, forward qualification,
    fail-closed draft review-artifact preparation, the candidate shortlist,
    and scorecard regeneration;
-7. one fresh immutable market-history snapshot under
+8. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
-8. the exploratory tournament, with immutable per-run artifacts;
-9. one new verified backup.
+9. the exploratory tournament, with immutable per-run artifacts;
+10. one new verified backup.
 
 Exact exit behavior:
 
@@ -148,10 +150,12 @@ Run manually:
 
 The four realtime strategies receive the same cycle snapshot and timestamp and
 use deterministic contract proposals. Each has an isolated paper account and
-durable assignment state. The configured two workers bound computation; they
-do not reduce the realtime lane set. The lanes are logically isolated but
-intentionally evaluated in a bounded sequence with serialized durable writes.
-Four simultaneous SQLite writers are not required for correctness. The
+durable assignment state. A bounded batch of pre-registered candidates shares
+one stable baseline in each lane (four by shipped config, hard cap eight).
+Four packet workers bound computation; they do not reduce the realtime lane
+set. The lanes are logically isolated, and packet computation may overlap while
+durable writes remain serialized. Four simultaneous SQLite writers are not
+required for correctness. The
 registered `funding-carry`, `funding-unwind`, and `trend-multiday` models are
 offline-only because their holding horizons cannot reach the closed-trade floor
 in a practical realtime assignment.
@@ -182,12 +186,14 @@ deterministic four-lane fork; no older evidence is migrated or pooled with v8.
 Within each strategy:
 
 1. the stable baseline always remains active;
-2. at most one candidate setting is active;
+2. a bounded batch of pre-registered candidate settings is active, sharing
+   that baseline (four by shipped config, hard cap eight per lane);
 3. an assignment is not complete until both ten elapsed days and 100
    comparable paired observations are recorded (unless configuration raises
    those floors);
-4. accepted LLM selections queue without preempting the active assignment;
-5. restart reconstructs the same active assignment from schema 16;
+4. each individual assignment still tests only one candidate setting, and
+   accepted LLM selections queue without preempting active assignments;
+5. restart reconstructs the same active batch from schema 16;
 6. terminal assignments produce one immutable `WORKED`, `FAILED`, or
    `INCONCLUSIVE` outcome with reasons and limitations.
 
@@ -210,7 +216,7 @@ Run the deterministic closure without an LLM call:
 ./.venv/bin/python research.py research-loop --no-review
 ```
 
-Run closure plus one research-only LLM review:
+Run closure plus a bounded batch of research-only LLM reviews (default eight):
 
 ```bash
 ./.venv/bin/python research.py research-loop
@@ -472,6 +478,7 @@ hand-written contracts implement.
 ./.venv/bin/python research.py author --dry-run   # what the proposer is asked
 ./.venv/bin/python research.py staged             # what is registered
 ./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py qualify-staged
 ./.venv/bin/python research.py shortlist
 ```
 
@@ -485,12 +492,13 @@ fire. Unlike `author`, a rejected entry here exits nonzero: a broken
 pre-registration is a mistake in version control, not a transient provider
 failure.
 
-Staged mechanisms run in their own `:staged` scope, one paper account each, on
-a single fixed measurement harness: first observed price after the signal, a
-structure stop at one ATR, a 2R target, observed taker costs both sides and a
-24h timeout. The harness is identical for every mechanism on purpose, so a
-difference between two of them is a difference in the mechanism rather than in
-a lucky stop distance.
+Staged mechanisms run in their own `:staged` scope, with one isolated
+candidate paper account and one paired neutral baseline account per
+mechanism, on a single fixed measurement harness: first observed price after
+the signal, a structure stop with a one-ATR minimum, a 2R target, observed
+taker costs both sides and a 24h timeout. The harness and proposal identities
+are identical across the pair, so a difference is attributable to the
+mechanism rather than a lucky stop distance.
 
 They enter at `T1_HYPOTHESIS` and cannot rise. Live still requires
 `T3_VALIDATED` and a reviewed content-addressed packet, so nothing here
@@ -514,6 +522,24 @@ look stricter than the search actually was.
 A registered claim is immutable at the database level. Rewording one after
 results exist is refused by a trigger, because a claim that can be edited
 afterwards cannot be told apart from one retro-fitted to the result.
+
+The authoring model receives bounded persisted evidence rather than only field
+names: opportunity and firing rates, conditional returns, missing-data and
+null/near-miss reasons, fit versus held-out results, segment summaries, feature
+correlations when persisted, and tested mechanism families. It may use only
+the deterministic contract DSL. Supported bounded primitives include lagged
+values, rolling changes, percentile ranks, volatility/regime filters, event
+sequences, feature interactions, order-book imbalance and liquidity states.
+Cross-sectional rank is rejected until a valid multi-symbol context exists.
+The proposer cannot choose exits, horizons, stops, targets, sizing, or network
+operations.
+
+Opportunity quality is scored before a mechanism can be supported: eligible
+declines contribute zero return, firing and coverage floors must be met,
+candidate results must be matched to a contemporaneous neutral baseline, and
+family-level multiple-testing correction and held-out confirmation still apply.
+The fixed staged harness is a signal screen; automatic strategy-specific exit
+and holding-period optimization is not yet wired as a second stage.
 
 ### 7.3 Running a contract without an analyst
 

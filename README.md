@@ -26,6 +26,9 @@ research:
   findings_store: research/cache/findings.db
   experiment_min_duration_days: 10
   experiment_min_observations: 100
+  experiment_candidate_batch_size: 4
+  shadow_workers: 4
+  collector: {top_n: 50, workers: 4}
 ```
 
 | Area | Current value |
@@ -39,8 +42,9 @@ research:
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
 | Research feed | `forward_feed_version: 8`; feed v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; feeds v1-v7 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane realtime fork, and v7 added the liquidation flow and conditioning axes) |
-| Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
-| Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
+| Realtime comparison arms | Each deterministic lane keeps one shared baseline and a bounded batch of up to 4 pre-registered candidates (hard cap 8 per lane); the separate `:llm` sibling remains non-comparable |
+| Shadow workers | `4` bounded workers per evaluator; durable FindingsStore commits remain serialized |
+| Research collector | Separate recorder scans up to 50 instruments with 4 public-read workers; it does not alter the active universe or risk limits |
 | Experiment floor | both 10 elapsed days and 100 comparable paired observations |
 | Local paper balance | 10,000 USDT per isolated strategy/variant account |
 
@@ -57,9 +61,11 @@ On each eligible decision cycle:
 
 1. The engine records one market snapshot and timestamp. `book_state` and
    `snapshot_enrichment` preserve the market inputs needed by research.
-2. The active momentum analyst makes at most one live-path LLM call. The parsed
-   decisions, optional bounded hypothesis proposal, and optional
-   `research_selection` are recorded.
+2. If the configured strategy uses `analyst` mode, the momentum analyst makes
+   at most one live-path LLM call. With the shipped deterministic
+   `ls-ratio-fade` path, no LLM call decides an order. Whenever the analyst path
+   is used, its parsed decisions, optional bounded hypothesis proposal, and
+   optional `research_selection` are recorded.
 3. The order path applies deterministic contracts, risk rules, and execution
    controls to the configured main strategy only.
 4. The `StrategyShadowCoordinator` gives the same snapshot/timestamp to four
@@ -69,18 +75,17 @@ On each eligible decision cycle:
 5. Each evaluator owns its own paper cash, positions, exposure, cooldowns,
    circuit breakers, decisions, and trades. `shadow_decision` rows include
    accepted actions and policy vetoes as explicit zero-return actions.
-6. Every realtime strategy keeps its stable baseline running and tests at most
-   one candidate setting at a time. The four deterministic realtime lanes are
-   logically isolated over the same frozen input, but the coordinator
-   intentionally evaluates them in a bounded sequence and serializes durable
-   writes rather than creating four simultaneous SQLite writers. Physical
-   wall-clock concurrency is not a
-   correctness requirement. Settings rotate serially within each strategy and
-   survive process restarts.
+6. Every realtime strategy keeps one stable baseline running while a bounded
+   batch of pre-registered candidates tests one axis family in parallel. Each
+   candidate has its own durable assignment/account, all candidates share the
+   same baseline input, and the batch is capped at eight candidates per lane.
+   Each individual assignment still tests at most one candidate setting.
+   Workers compute isolated packets concurrently; durable SQLite writes remain
+   serialized. Assignments drain independently and survive process restarts.
 
-The deterministic comparison set is therefore eight arms. The active analyst's
-separate `:llm` scope may also hold its own baseline and candidate, adding two
-non-comparable arms; when that sibling is present, the runtime maximum is ten.
+The deterministic comparison set is therefore batched per lane rather than
+serially evaluating one candidate at a time. The active analyst's separate
+`:llm` scope remains a distinct, non-comparable population.
 
 Isolation runs both ways: research state and decisions are withheld from
 everything on the live path, while live account positions do not leak into a
@@ -301,8 +306,9 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py author --dry-run
 ./.venv/bin/python research.py staged
 ./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py qualify-staged
 ./.venv/bin/python research.py shortlist
-./.venv/bin/python research.py research-loop
+./.venv/bin/python research.py research-loop --max-reviews 8
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet --variant <qualified-variant-id>
@@ -369,10 +375,13 @@ which is generated output rather than a committed file.
 `research.py author` asks the configured model for new candidate mechanisms
 and stages the ones that validate. A proposal is data, not code: a mechanism,
 the payer, a falsifier, and comparisons over fields the validated forward
-models already declare. Anything naming an unknown field, using an operator
-other than the four comparisons, setting a threshold outside a field's
-observed range, or stating a claim too thin to name a cause is refused, and
-one bad proposal never discards the rest of a generation.
+models already declare or one bounded deterministic primitive over persisted
+market data. Unknown fields, unsupported context (such as cross-sectional
+rank without a universe), unsafe operators or ranges, exit/sizing authority,
+and claims too thin to name a cause are refused; one bad proposal never
+discards the rest of a generation. The prompt also receives bounded summaries
+from the persisted findings store, including opportunity rates, conditional
+returns, null/near-miss reasons, held-out results, and tested families.
 
 It is deliberately not gated on a terminal outcome. The nightly reviewer needs
 a finished assignment to have something to explain, so on a corpus where none

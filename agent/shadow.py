@@ -96,6 +96,16 @@ class ShadowBudget:
 
 STAGED_STRATEGY_ID = "staged"
 DEFAULT_STAGING_STORE = "research/cache/staging.db"
+MAX_SHADOW_WORKERS = 32
+DEFAULT_ROTATION_BATCH_SIZE = 1
+MAX_ROTATION_CANDIDATES = 8
+
+
+def _resolve_staging_path(configured: str | Path | None) -> Path:
+    """Resolve staging.db exactly as the research CLI resolves it."""
+    path = Path(configured or DEFAULT_STAGING_STORE)
+    return (path if path.is_absolute()
+            else Path(__file__).resolve().parent.parent / path)
 
 
 def _model_for(strategy_id: str):
@@ -157,13 +167,22 @@ class ShadowEvaluator:
             rotation_candidates: list[dict] | None = None,
             # The default exceeds the minimum reachable confirmation window.
             rotation_min_duration_seconds: float = 10 * 86_400,
-            rotation_min_observations: int = 100) -> None:
+            rotation_min_observations: int = 100,
+            rotation_batch_size: int = DEFAULT_ROTATION_BATCH_SIZE,
+            rotation_hard_cap: int = MAX_ROTATION_CANDIDATES) -> None:
         self.budget_ms = float(budget_ms)
         self.base_cfg = base_cfg
         self.scope_key = str(scope_key)
         self.initial_balance_usdt = float(initial_balance_usdt)
         self.max_failures = int(max_failures)
-        self.workers = max(1, int(workers))
+        try:
+            requested_workers = int(workers)
+        except (TypeError, ValueError):
+            requested_workers = 1
+        # Bound per-lane CPU/network pressure. Worker threads only compute
+        # isolated account packets; FindingsStore commits stay serialized in
+        # ``evaluate`` below, after all workers return.
+        self.workers = max(1, min(MAX_SHADOW_WORKERS, requested_workers))
         # Direct callers get an isolated store; build() supplies durable state.
         self._temporary_store = None
         if store is None:
@@ -183,8 +202,19 @@ class ShadowEvaluator:
         self._rotation_baseline = rotation_baseline
         self._rotation_candidates: dict[str, dict] = {}
         self._rotation_assignment: dict | None = None
+        self._rotation_assignments: dict[str, dict] = {}
         self._active_rotation_ids: set[str] = set()
         self._retired_variant_ids: set[str] = set()
+        self._rotation_batch_size = max(
+            1, min(int(rotation_batch_size), MAX_ROTATION_CANDIDATES))
+        self._rotation_hard_cap = max(
+            1, min(int(rotation_hard_cap), MAX_ROTATION_CANDIDATES))
+        self._rotation_batch_size = min(
+            self._rotation_batch_size, self._rotation_hard_cap)
+        # One shared baseline plus at most eight candidate accounts is the
+        # resource envelope for a strategy rotation.
+        self._rotation_resource_cap = 1 + self._rotation_hard_cap
+        self._rotation_batch_id: str | None = None
         self._rotation_min_duration_seconds = float(
             rotation_min_duration_seconds)
         self._rotation_min_observations = int(rotation_min_observations)
@@ -296,50 +326,142 @@ class ShadowEvaluator:
         if not self._rotation_enabled:
             return
         baseline_id = self._rotation_baseline.variant_id
-        assignment = self.store.active_experiment_assignment(
-            self.scope_key, self._rotation_baseline.strategy_id, now=timestamp)
-        if assignment is None:
-            candidates = self.store.prioritized_experiment_candidates(
-                self.scope_key, self._rotation_baseline.strategy_id,
-                list(self._rotation_candidates.values()), now=timestamp)
-            assignment = self.store.ensure_experiment_assignment(
-                self.scope_key, self._rotation_baseline.strategy_id,
-                baseline_id, candidates,
-                minimum_duration_seconds=self._rotation_min_duration_seconds,
-                minimum_observations=self._rotation_min_observations,
-                initial_balance_usdt=self.initial_balance_usdt,
-                now=timestamp)
-        if assignment is None:
-            self._rotation_assignment = None
-            self._active_rotation_ids = {baseline_id}
-            return
-        descriptor = self._candidate_for_assignment(assignment)
-        if descriptor is None:
-            self.store.reject_experiment_assignment(
-                assignment["assignment_id"],
-                "assigned exact variant is unavailable after restart",
-                now=timestamp)
-            self._rotation_assignment = None
-            self._active_rotation_ids = {baseline_id}
-            return
-        if (assignment["code_identity"] != descriptor["code_identity"]
-                or assignment["config_identity"]
-                != descriptor["config_identity"]):
-            self.store.reject_experiment_assignment(
-                assignment["assignment_id"],
-                "code/config identity changed before assignment completed",
-                now=timestamp)
-            self._rotation_assignment = None
-            self._active_rotation_ids = {baseline_id}
-            return
-        previous = (self._rotation_assignment or {}).get(
-            "candidate_variant_id")
-        current = assignment["candidate_variant_id"]
-        if previous and previous != current and previous != baseline_id:
-            self._retired_variant_ids.add(previous)
-        self._enroll_variant(descriptor["variant"])
-        self._rotation_assignment = assignment
-        self._active_rotation_ids = {baseline_id, current}
+        strategy_id = self._rotation_baseline.strategy_id
+        previous_ids = {
+            str(assignment.get("candidate_variant_id"))
+            for assignment in self._rotation_assignments.values()
+            if assignment.get("candidate_variant_id")
+        }
+
+        active_assignments: list[dict] = []
+        active_many = getattr(self.store, "active_experiment_assignments", None)
+        if callable(active_many):
+            active_assignments = list(active_many(
+                self.scope_key, strategy_id, now=timestamp) or [])
+        else:
+            assignment = self.store.active_experiment_assignment(
+                self.scope_key, strategy_id, now=timestamp)
+            if assignment is not None:
+                active_assignments = [assignment]
+
+        if not active_assignments:
+            candidates = list(self._rotation_candidates.values())
+            ensure_batch = getattr(self.store, "ensure_experiment_batch", None)
+            if callable(ensure_batch):
+                static_candidates = [
+                    item for item in candidates
+                    if str(item.get("source") or "static") == "static"]
+                adaptive_candidates = [
+                    item for item in candidates
+                    if str(item.get("source") or "static") == "adaptive"]
+                # Batched rotation is reserved for the pre-registered axis
+                # catalog. A pending adaptive proposal still needs the
+                # legacy one-arm path so it is not silently stranded while a
+                # static catalog is absent; adaptive values are never mixed
+                # into a static batch.
+                # An explicitly accepted adaptive selection gets its own
+                # single-arm turn ahead of untouched static settings. It is
+                # still never mixed into the static multi-arm batch.
+                if adaptive_candidates:
+                    batch_candidates = adaptive_candidates
+                    static_batch = False
+                else:
+                    batch_candidates = static_candidates or candidates
+                    static_batch = bool(static_candidates)
+                batch_size = (self._rotation_batch_size
+                              if static_batch else 1)
+                active_assignments = list(ensure_batch(
+                    self.scope_key, strategy_id, baseline_id, batch_candidates,
+                    minimum_duration_seconds=self._rotation_min_duration_seconds,
+                    minimum_observations=self._rotation_min_observations,
+                    target_candidates=batch_size,
+                    hard_cap=(self._rotation_hard_cap
+                              if static_batch else 1),
+                    initial_balance_usdt=self.initial_balance_usdt,
+                    pre_registered_only=static_batch,
+                    now=timestamp) or [])
+                # Legacy stores may contain an exact adaptive proposal but no
+                # preregistered axis at all. Preserve that one-candidate
+                # migration path without allowing adaptive arms into a normal
+                # static batch.
+                if (not active_assignments
+                        and not static_batch):
+                    prioritized = self.store.prioritized_experiment_candidates(
+                        self.scope_key, strategy_id, candidates, now=timestamp)
+                    assignment = self.store.ensure_experiment_assignment(
+                        self.scope_key, strategy_id, baseline_id, prioritized,
+                        minimum_duration_seconds=(
+                            self._rotation_min_duration_seconds),
+                        minimum_observations=self._rotation_min_observations,
+                        initial_balance_usdt=self.initial_balance_usdt,
+                        now=timestamp)
+                    if assignment is not None:
+                        active_assignments = [assignment]
+            else:
+                # Compatibility with pre-batch stores and test doubles.
+                candidates = self.store.prioritized_experiment_candidates(
+                    self.scope_key, strategy_id, candidates, now=timestamp)
+                assignment = self.store.ensure_experiment_assignment(
+                    self.scope_key, strategy_id, baseline_id, candidates,
+                    minimum_duration_seconds=self._rotation_min_duration_seconds,
+                    minimum_observations=self._rotation_min_observations,
+                    initial_balance_usdt=self.initial_balance_usdt,
+                    now=timestamp)
+                if assignment is not None:
+                    active_assignments = [assignment]
+
+        valid: dict[str, dict] = {}
+        for assignment in active_assignments:
+            if assignment.get("status") in {"COMPLETED", "REJECTED"}:
+                continue
+            assignment_id = str(assignment.get("assignment_id") or "")
+            candidate_id = str(assignment.get("candidate_variant_id") or "")
+            if not assignment_id or not candidate_id:
+                continue
+            descriptor = self._candidate_for_assignment(assignment)
+            if descriptor is None:
+                self.store.reject_experiment_assignment(
+                    assignment_id,
+                    "assigned exact variant is unavailable after restart",
+                    now=timestamp)
+                continue
+            if (assignment.get("code_identity") != descriptor["code_identity"]
+                    or assignment.get("config_identity")
+                    != descriptor["config_identity"]):
+                self.store.reject_experiment_assignment(
+                    assignment_id,
+                    "code/config identity changed before assignment completed",
+                    now=timestamp)
+                continue
+            try:
+                self._enroll_variant(descriptor["variant"])
+            except Exception as exc:                       # noqa: BLE001
+                self.store.reject_experiment_assignment(
+                    assignment_id,
+                    f"assigned variant could not be enrolled: {exc}",
+                    now=timestamp)
+                continue
+            valid.setdefault(assignment_id, assignment)
+
+        current_ids = {
+            str(assignment.get("candidate_variant_id"))
+            for assignment in valid.values()
+            if assignment.get("candidate_variant_id")
+        }
+        for variant_id in previous_ids - current_ids:
+            if variant_id != baseline_id:
+                self._retired_variant_ids.add(variant_id)
+        self._rotation_assignments = valid
+        ordered = sorted(
+            valid.values(),
+            key=lambda item: (
+                int(item.get("batch_ordinal", 0)),
+                str(item.get("assignment_id") or "")))
+        self._rotation_assignment = ordered[0] if ordered else None
+        self._rotation_batch_id = (
+            str(ordered[0].get("batch_id"))
+            if ordered and ordered[0].get("batch_id") else None)
+        self._active_rotation_ids = {baseline_id} | current_ids
 
     def _proposal_lifecycle(
             self, proposal: dict, status: str, detail: dict,
@@ -469,12 +591,31 @@ class ShadowEvaluator:
                    if advance_accounts else [])
         recorded_opens = [dict(decision) for decision in (proposals or [])
                           if decision.get("action") == "open"]
-        if (self._rotation_assignment is not None
-                and self._rotation_assignment.get("status") == "DRAINING"):
-            # The common collection boundary is closed. ``advance`` above
-            # still resolves positions, but neither arm may add a decision or
-            # trade that was not part of the frozen assignment window.
-            recorded_opens = []
+        proposals_by_variant: dict[str, list[dict]] = {}
+        if self._rotation_enabled:
+            active_assignments = list(self._rotation_assignments.values())
+            candidate_assignments = {
+                str(assignment["candidate_variant_id"]): assignment
+                for assignment in active_assignments
+            }
+            baseline_id = self._rotation_baseline.variant_id
+            # A shared baseline continues to see proposals while at least one
+            # candidate collection window is open. Each candidate receives the
+            # same decisions unless its own assignment is draining.
+            baseline_open = any(
+                assignment.get("status") != "DRAINING"
+                for assignment in active_assignments)
+            if not active_assignments:
+                baseline_open = True
+            proposals_by_variant[baseline_id] = (
+                recorded_opens if baseline_open else [])
+            for candidate_id, assignment in candidate_assignments.items():
+                proposals_by_variant[candidate_id] = (
+                    recorded_opens
+                    if assignment.get("status") != "DRAINING" else [])
+        else:
+            proposals_by_variant = {
+                variant_id: recorded_opens for variant_id in self.variant_ids}
 
         accounts: dict[str, tuple[dict, int]] = {}
         for variant_id in self.variant_ids:
@@ -498,7 +639,9 @@ class ShadowEvaluator:
             if variant_id not in accounts:
                 skipped.append(variant_id)
                 continue
-            pending.append((variant_id, accounts[variant_id]))
+            pending.append((variant_id, accounts[variant_id],
+                            proposals_by_variant.get(variant_id,
+                                                     recorded_opens)))
 
         # Workers never touch FindingsStore. They own one copied account state
         # and return a commit packet; SQLite writes and scheduler accounting
@@ -509,15 +652,17 @@ class ShadowEvaluator:
                                     thread_name_prefix="shadow") as pool:
                 results = list(pool.map(
                     lambda item: self._evaluate_variant(
-                        item[0], item[1], snapshot, recorded_opens,
+                        item[0], item[1], snapshot, item[2],
                         timestamp, cycle_id), pending))
         else:
             results = [self._evaluate_variant(
-                variant_id, account, snapshot, recorded_opens,
-                timestamp, cycle_id) for variant_id, account in pending]
+                variant_id, account, snapshot, variant_proposals,
+                timestamp, cycle_id)
+                       for variant_id, account, variant_proposals in pending]
 
         decision_keys_by_variant: dict[str, set[str]] = {}
-        for variant_id, result in zip((item[0] for item in pending), results):
+        for (variant_id, _account, variant_proposals), result in zip(
+                pending, results):
             try:
                 if isinstance(result, Exception):
                     raise result
@@ -540,22 +685,21 @@ class ShadowEvaluator:
                             {"source": "paper_portfolio",
                              "reason": state.get("revoked_reason")},
                             scope_key=self.scope_key)
-                    if (self._rotation_enabled
-                            and self._rotation_assignment is not None
-                            and variant_id in {
-                                self._rotation_assignment[
-                                    "baseline_variant_id"],
-                                self._rotation_assignment[
-                                    "candidate_variant_id"],
-                            }):
-                        self._rotation_assignment = (
-                            self.store.reject_experiment_assignment(
-                                self._rotation_assignment["assignment_id"],
-                                str(state.get("revoked_reason")
-                                    or "paper portfolio revoked"),
-                                detail={"variant_id": variant_id},
-                                now=timestamp))
-                (evaluated if len(variant_records) == len(recorded_opens)
+                    if self._rotation_enabled:
+                        reason = str(state.get("revoked_reason")
+                                     or "paper portfolio revoked")
+                        for assignment_id, assignment in list(
+                                self._rotation_assignments.items()):
+                            if variant_id not in {
+                                    assignment["baseline_variant_id"],
+                                    assignment["candidate_variant_id"]}:
+                                continue
+                            self._rotation_assignments[assignment_id] = (
+                                self.store.reject_experiment_assignment(
+                                    assignment_id, reason,
+                                    detail={"variant_id": variant_id},
+                                    now=timestamp))
+                (evaluated if len(variant_records) == len(variant_proposals)
                  and variant_records else skipped).append(variant_id)
             except Exception as exc:                       # noqa: BLE001
                 skipped.append(variant_id)
@@ -570,36 +714,52 @@ class ShadowEvaluator:
             if variant_id not in evaluated and variant_id not in skipped)
         self.store.record_scheduler_cycle(
             self.scope_key, evaluated, skipped, timestamp)
-        if self._rotation_enabled and self._rotation_assignment is not None:
-            assignment = self._rotation_assignment
-            baseline_keys = decision_keys_by_variant.get(
-                assignment["baseline_variant_id"], set())
-            candidate_keys = decision_keys_by_variant.get(
-                assignment["candidate_variant_id"], set())
-            comparable = sorted(baseline_keys & candidate_keys)
-            if (assignment["status"] not in {"COMPLETED", "REJECTED"}
-                    and comparable):
-                assignment = self.store.record_experiment_observations(
-                    assignment["assignment_id"], [{
-                        "observation_key": key,
-                        "observed_ts": timestamp,
-                        "detail": {
-                            "scope_key": self.scope_key,
-                            "baseline_variant_id": assignment[
-                                "baseline_variant_id"],
-                            "candidate_variant_id": assignment[
-                                "candidate_variant_id"],
-                        },
-                    } for key in comparable], now=timestamp)
-            assignment = self.store.maybe_complete_experiment_assignment(
-                assignment["assignment_id"], now=timestamp)
-            self._rotation_assignment = assignment
-            if assignment["status"] in {"COMPLETED", "REJECTED"}:
-                candidate_id = assignment["candidate_variant_id"]
-                if candidate_id != assignment["baseline_variant_id"]:
-                    self._retired_variant_ids.add(candidate_id)
-                self._active_rotation_ids = {
-                    assignment["baseline_variant_id"]}
+        if self._rotation_enabled and self._rotation_assignments:
+            for assignment_id, assignment in list(
+                    self._rotation_assignments.items()):
+                baseline_keys = decision_keys_by_variant.get(
+                    assignment["baseline_variant_id"], set())
+                candidate_keys = decision_keys_by_variant.get(
+                    assignment["candidate_variant_id"], set())
+                comparable = sorted(baseline_keys & candidate_keys)
+                if (assignment["status"] not in {"COMPLETED", "REJECTED"}
+                        and comparable):
+                    assignment = self.store.record_experiment_observations(
+                        assignment_id, [{
+                            "observation_key": key,
+                            "observed_ts": timestamp,
+                            "detail": {
+                                "scope_key": self.scope_key,
+                                "baseline_variant_id": assignment[
+                                    "baseline_variant_id"],
+                                "candidate_variant_id": assignment[
+                                    "candidate_variant_id"],
+                                "batch_id": assignment.get("batch_id"),
+                            },
+                        } for key in comparable], now=timestamp)
+                if assignment["status"] not in {"COMPLETED", "REJECTED"}:
+                    assignment = self.store.maybe_complete_experiment_assignment(
+                        assignment_id, now=timestamp)
+                self._rotation_assignments[assignment_id] = assignment
+                if assignment["status"] in {"COMPLETED", "REJECTED"}:
+                    candidate_id = assignment["candidate_variant_id"]
+                    if candidate_id != assignment["baseline_variant_id"]:
+                        self._retired_variant_ids.add(candidate_id)
+            active = {
+                str(assignment["candidate_variant_id"]): assignment
+                for assignment in self._rotation_assignments.values()
+                if assignment["status"] not in {"COMPLETED", "REJECTED"}
+            }
+            self._active_rotation_ids = {
+                self._rotation_baseline.variant_id} | set(active)
+            ordered = sorted(
+                active.values(),
+                key=lambda item: (
+                    int(item.get("batch_ordinal", 0)),
+                    str(item.get("assignment_id") or "")))
+            self._rotation_assignment = ordered[0] if ordered else None
+            if ordered and ordered[0].get("batch_id"):
+                self._rotation_batch_id = str(ordered[0]["batch_id"])
         coverage = self.store.scheduler_coverage(self.scope_key)
         self.last_coverage = {
             "scope_key": self.scope_key,
@@ -610,6 +770,10 @@ class ShadowEvaluator:
                              if order else 100.0),
             "cumulative": coverage,
             "experiment_assignment": self._rotation_assignment,
+            "experiment_assignments": list(self._rotation_assignments.values()),
+            "experiment_batch_id": self._rotation_batch_id,
+            "resource_cap": self._rotation_resource_cap
+            if self._rotation_enabled else None,
         }
         self.last_budget = budget
         return records
@@ -646,6 +810,10 @@ class ShadowEvaluator:
             pending_decisions = []
             variant_records = []
             for decision in proposals:
+                target_variant_id = decision.get("target_variant_id")
+                if (target_variant_id is not None
+                        and str(target_variant_id) != str(variant_id)):
+                    continue
                 record = self._evaluate_one(
                     variant_id, snapshot, decision, state, timestamp,
                     cycle_id, pending_opens)
@@ -1764,7 +1932,9 @@ class StrategyShadowCoordinator:
                  active_strategy_id: str,
                  llm_evaluator: ShadowEvaluator | None = None,
                  staged_evaluators: dict | None = None,
-                 staged_contracts: list | None = None) -> None:
+                 staged_contracts: list | None = None,
+                 staged_store_path: str | Path | None = None,
+                 staged_cfg: dict | None = None) -> None:
         if not evaluators:
             raise ValueError("strategy shadow coordinator needs an evaluator")
         self.evaluators = dict(evaluators)
@@ -1777,6 +1947,22 @@ class StrategyShadowCoordinator:
         # counted among the registered strategies' comparison arms.
         self.staged_evaluators = dict(staged_evaluators or {})
         self.staged_contracts = list(staged_contracts or [])
+        # Retired staged lanes remain here until their local paper positions
+        # are flat. They never receive new proposals. Keeping the evaluator
+        # object (rather than rebuilding it) preserves the persisted account
+        # identity and lets the normal exit model drain positions safely.
+        self._staged_retired_evaluators: dict[str, ShadowEvaluator] = {}
+        self._staged_refresh_errors: dict[str, str] = {}
+        self._staged_store_path = (
+            str(staged_store_path) if staged_store_path is not None else None)
+        self._staged_cfg = deepcopy(staged_cfg) if staged_cfg is not None else None
+        self.last_staged_refresh: dict = {
+            "status": "not_configured",
+            "active_contracts": sorted(
+                str(contract.contract_id) for contract in self.staged_contracts),
+            "added": [], "reused": [], "retired": [], "drained": [],
+            "errors": {},
+        }
         self.store = next(iter(self.evaluators.values())).store
         self.scope_key = next(iter(self.evaluators.values())).scope_key
         self.last_coverage: dict = {}
@@ -1799,9 +1985,164 @@ class StrategyShadowCoordinator:
                        for variant_id in evaluator.variant_ids})
 
     def held_symbols(self) -> list[str]:
-        return sorted({symbol
-                       for evaluator in self.evaluators.values()
-                       for symbol in evaluator.held_symbols()})
+        held = set()
+        for evaluator in self.evaluators.values():
+            held.update(evaluator.held_symbols())
+        staged = list(self.staged_evaluators.items())
+        staged.extend(self._staged_retired_evaluators.items())
+        for contract_id, evaluator in staged:
+            try:
+                held.update(evaluator.held_symbols())
+            except Exception as exc:                       # noqa: BLE001
+                # One broken research lane must not hide symbols held by the
+                # other lanes from the market-data fetch. The next refresh or
+                # evaluation exposes the same failure in its report.
+                self._staged_refresh_errors.setdefault(
+                    str(contract_id),
+                    f"held-symbol inspection failed: {type(exc).__name__}: {exc}")
+        return sorted(held)
+
+    def refresh_staged_lanes(self, now: float | None = None) -> dict:
+        """Reload active staged contracts at a safe cycle boundary.
+
+        The staging registry is read completely before any in-memory lane is
+        changed. Existing evaluators are reused (and therefore keep their
+        paper-account identity and local positions); contracts that vanished
+        from the active registry move to a drain-only set until flat. New
+        contracts get isolated evaluators. A failed read or enrollment leaves
+        the previous lanes intact and is returned in ``errors`` rather than
+        silently dropping a candidate.
+
+        This method only changes shadow bookkeeping. It never touches the
+        registered strategy evaluators or live order state. Call it once at a
+        cycle boundary before ``advance``/``evaluate``.
+        """
+        timestamp = time.time() if now is None else float(now)
+        current_ids = {
+            str(contract.contract_id) for contract in self.staged_contracts}
+        report = {
+            "timestamp": timestamp,
+            "status": "unchanged",
+            "active_contracts": sorted(current_ids),
+            "added": [],
+            "reused": [],
+            "retired": [],
+            "draining": sorted(self._staged_retired_evaluators),
+            "drained": [],
+            "errors": {},
+        }
+        path = self._staged_store_path
+        if not path:
+            report["status"] = "not_configured"
+            report["errors"]["__store__"] = (
+                "staged contract store path is not configured")
+            self.last_staged_refresh = report
+            return dict(report)
+        store_path = Path(path)
+        if not store_path.is_file():
+            report["status"] = "unavailable"
+            report["errors"]["__store__"] = (
+                f"staged contract store does not exist: {store_path}")
+            self.last_staged_refresh = report
+            return dict(report)
+        try:
+            from .staging import StagingStore
+
+            active_contracts = StagingStore(store_path).active()
+        except Exception as exc:                           # noqa: BLE001
+            report["status"] = "error"
+            report["errors"]["__store__"] = (
+                f"{type(exc).__name__}: {exc}")
+            self.last_staged_refresh = report
+            return dict(report)
+
+        # Build against a stable config snapshot. If a caller constructed a
+        # coordinator manually, fall back to an existing staged evaluator's
+        # config; no active lane means there is no safe config to invent.
+        staged_cfg = deepcopy(self._staged_cfg)
+        if staged_cfg is None:
+            for evaluator in self.staged_evaluators.values():
+                candidate_cfg = getattr(evaluator, "base_cfg", None)
+                if isinstance(candidate_cfg, dict):
+                    staged_cfg = deepcopy(candidate_cfg)
+                    break
+        old_evaluators = dict(self.staged_evaluators)
+        active_ids = {str(contract.contract_id) for contract in active_contracts}
+        next_evaluators: dict[str, ShadowEvaluator] = {}
+        next_contracts = list(active_contracts)
+
+        for contract in active_contracts:
+            contract_id = str(contract.contract_id)
+            existing = old_evaluators.get(contract_id)
+            if existing is None:
+                # Staging is append-only, but reusing a drain-only evaluator
+                # here keeps the position/version invariant safe if a caller
+                # restores an archived registry snapshot.
+                existing = self._staged_retired_evaluators.pop(
+                    contract_id, None)
+            if existing is not None:
+                next_evaluators[contract_id] = existing
+                report["reused"].append(contract_id)
+                self._staged_refresh_errors.pop(contract_id, None)
+                continue
+            if staged_cfg is None:
+                report["errors"][contract_id] = (
+                    "cannot enroll staged contract: no staged evaluator config")
+                continue
+            try:
+                next_evaluators[contract_id] = _build_staged_evaluator(
+                    contract, staged_cfg, self.scope_key, self.store)
+                report["added"].append(contract_id)
+                self._staged_refresh_errors.pop(contract_id, None)
+            except Exception as exc:                         # noqa: BLE001
+                # Keep the contract visible in ``staged_contracts`` so the
+                # next evaluation reports it as unavailable and the next
+                # refresh can retry it. Never silently discard a candidate.
+                report["errors"][contract_id] = (
+                    f"{type(exc).__name__}: {exc}")
+                self._staged_refresh_errors[contract_id] = (
+                    report["errors"][contract_id])
+
+        for contract_id, evaluator in old_evaluators.items():
+            if contract_id in active_ids:
+                continue
+            self._staged_retired_evaluators[contract_id] = evaluator
+            report["retired"].append(contract_id)
+            self._staged_refresh_errors.pop(contract_id, None)
+
+        # Commit the complete active set only after the registry read and all
+        # possible enrollments have been attempted. Existing positions remain
+        # on their original evaluator; failed new lanes stay visible by id.
+        self.staged_contracts = next_contracts
+        self.staged_evaluators = next_evaluators
+        report["active_contracts"] = sorted(
+            str(contract.contract_id) for contract in next_contracts)
+        report["draining"] = sorted(self._staged_retired_evaluators)
+        report["status"] = (
+            "partial" if report["errors"] else
+            "changed" if report["added"] or report["retired"] else
+            "unchanged")
+        self.last_staged_refresh = report
+        return dict(report)
+
+    # Short alias for callers that use the lane name rather than the plural
+    # coordinator terminology. Both names intentionally share one contract.
+    def refresh_staged(self, now: float | None = None) -> dict:
+        return self.refresh_staged_lanes(now=now)
+
+    def refresh_staged_contracts(self, now: float | None = None) -> dict:
+        """Compatibility alias for integrations naming the registry object."""
+        return self.refresh_staged_lanes(now=now)
+
+    def _mark_staged_drained(self, contract_id: str) -> None:
+        """Keep refresh telemetry aligned after a drain reaches flat."""
+        report = dict(self.last_staged_refresh)
+        drained = list(report.get("drained") or [])
+        if contract_id not in drained:
+            drained.append(contract_id)
+        report["drained"] = sorted(drained)
+        report["draining"] = sorted(self._staged_retired_evaluators)
+        self.last_staged_refresh = report
 
     def record_research_selection(
             self, selection: dict, attribution: dict) -> dict:
@@ -1854,6 +2195,31 @@ class StrategyShadowCoordinator:
                     f"{type(exc).__name__}: {exc}")
                 records.extend(self._isolate_failure(
                     evaluator, strategy_id, "advance", exc, timestamp))
+        records.extend(self._advance_staged_lanes(snapshot, timestamp))
+        return records
+
+    def _advance_staged_lanes(
+            self, snapshot: dict, timestamp: float) -> list[ShadowRecord]:
+        """Advance active and drain-only staged accounts without opening."""
+        records: list[ShadowRecord] = []
+        for contract_id, evaluator in list(self.staged_evaluators.items()):
+            try:
+                records.extend(evaluator.advance(snapshot, now=timestamp))
+            except Exception as exc:                       # noqa: BLE001
+                records.extend(self._isolate_failure(
+                    evaluator, f"staged:{contract_id}", "advance",
+                    exc, timestamp))
+        for contract_id, evaluator in list(
+                self._staged_retired_evaluators.items()):
+            try:
+                records.extend(evaluator.advance(snapshot, now=timestamp))
+                if not evaluator.held_symbols():
+                    self._staged_retired_evaluators.pop(contract_id, None)
+                    self._mark_staged_drained(contract_id)
+            except Exception as exc:                       # noqa: BLE001
+                records.extend(self._isolate_failure(
+                    evaluator, f"staged:{contract_id}", "drain",
+                    exc, timestamp))
         return records
 
     def evaluate(
@@ -1929,12 +2295,16 @@ class StrategyShadowCoordinator:
         mechanism evaluated on a snapshot it could not read has not been
         tested and must not be recorded as having declined.
         """
-        if not self.staged_evaluators or not self.staged_contracts:
+        if (not self.staged_contracts
+                and not self._staged_retired_evaluators):
             return {"_records": []}
         lane: dict = {
             "scope_key": f"{self.scope_key}:staged",
             "proposal_source": "staged_contract",
             "contracts": len(self.staged_contracts),
+            "draining_contracts": sorted(
+                self._staged_retired_evaluators),
+            "refresh": dict(self.last_staged_refresh),
         }
         records: list = []
         per_contract: dict = {}
@@ -1943,10 +2313,15 @@ class StrategyShadowCoordinator:
         for contract in self.staged_contracts:
             evaluator = self.staged_evaluators.get(contract.contract_id)
             if evaluator is None:
+                errors[contract.contract_id] = self._staged_refresh_errors.get(
+                    contract.contract_id,
+                    "staged evaluator is unavailable after refresh")
                 continue
             try:
                 proposals = staged_lane.proposals_for(
                     [contract], snapshot, evaluator.base_cfg)
+                proposals.extend(staged_lane.proposals_for(
+                    [contract], snapshot, evaluator.base_cfg, baseline=True))
                 proposals_total += len(proposals)
                 per_contract.update(staged_lane.coverage(proposals))
                 records.extend(evaluator.evaluate(
@@ -1955,8 +2330,26 @@ class StrategyShadowCoordinator:
                     advance_accounts=advance_accounts))
             except Exception as exc:                       # noqa: BLE001
                 errors[contract.contract_id] = f"{type(exc).__name__}: {exc}"
+        # A direct caller may evaluate without first calling ``advance``. In
+        # that mode drain retired accounts here; the engine's normal path
+        # advances once before evaluating and passes ``advance_accounts=False``.
+        if advance_accounts:
+            for contract_id, evaluator in list(
+                    self._staged_retired_evaluators.items()):
+                try:
+                    records.extend(evaluator.advance(
+                        snapshot, now=timestamp))
+                    if not evaluator.held_symbols():
+                        self._staged_retired_evaluators.pop(contract_id, None)
+                        self._mark_staged_drained(contract_id)
+                        lane.setdefault("drained_contracts", []).append(
+                            contract_id)
+                except Exception as exc:                   # noqa: BLE001
+                    errors[contract_id] = (
+                        f"{type(exc).__name__}: {exc}")
         lane["proposals"] = proposals_total
         lane["per_contract"] = per_contract
+        lane["refresh"] = dict(self.last_staged_refresh)
         if errors:
             lane["errors"] = errors
         lane["_records"] = records
@@ -2111,6 +2504,10 @@ def _build_strategy_evaluator(
         rotation_min_observations=int(
             block.get("experiment_min_observations")
             or block.get("paper_min_closed_trades") or 100),
+        rotation_batch_size=int(
+            block.get("experiment_candidate_batch_size")
+            or DEFAULT_ROTATION_BATCH_SIZE),
+        rotation_hard_cap=MAX_ROTATION_CANDIDATES,
     )
 
 
@@ -2163,7 +2560,9 @@ def build(
         evaluators, active_strategy_id=active_id,
         llm_evaluator=llm_evaluator,
         staged_evaluators=staged_evaluators,
-        staged_contracts=staged_contracts)
+        staged_contracts=staged_contracts,
+        staged_store_path=_resolve_staging_path(block.get("staging_store")),
+        staged_cfg=_staged_runtime_cfg(cfg))
 
 
 def staged_variant_id(contract_id: str) -> str:
@@ -2173,8 +2572,12 @@ def staged_variant_id(contract_id: str) -> str:
     ``staged.`` prefix keeps a machine-authored arm visibly distinct from a
     hand-registered one in every report that lists variants.
     """
-    slug = re.sub(r"[^a-z0-9]+", "_", str(contract_id).lower()).strip("_")
-    return f"staged.{slug}"
+    return staged_lane.candidate_variant_id(contract_id)
+
+
+def staged_baseline_variant_id(contract_id: str) -> str:
+    """Stable neutral baseline paired with one staged contract."""
+    return staged_lane.baseline_variant_id(contract_id)
 
 
 def _build_staged_lane(cfg: dict, resolved_scope: str,
@@ -2191,7 +2594,7 @@ def _build_staged_lane(cfg: dict, resolved_scope: str,
     this lane before it existed and must keep running if the store is gone.
     """
     block = cfg.get("research") or {}
-    path = block.get("staging_store") or DEFAULT_STAGING_STORE
+    path = _resolve_staging_path(block.get("staging_store"))
     try:
         from .staging import StagingStore
 
@@ -2209,32 +2612,12 @@ def _build_staged_lane(cfg: dict, resolved_scope: str,
     # are overridden, exactly as _research_cfg does for the other lanes. The
     # staged identity lives on the variant, which is what resolves the
     # harness and what every result is attributed to.
-    staged_cfg = deepcopy(cfg)
-    staged_cfg["strategy"] = {
-        **dict(staged_cfg["strategy"]),
-        "signal_timeframe": STAGED_HARNESS.signal_timeframe,
-        "min_stop_atr_multiple": STAGED_HARNESS.stop_atr_multiple,
-        "fixed_reward_risk": STAGED_HARNESS.reward_risk,
-        "forward_horizon_hours": STAGED_HARNESS.horizon_hours,
-    }
+    staged_cfg = _staged_runtime_cfg(cfg)
     evaluators, enrolled = {}, []
     for contract in contracts:
-        variant = Variant(
-            variant_id=staged_variant_id(contract.contract_id),
-            strategy_id=STAGED_STRATEGY_ID,
-            base_version=STAGED_HARNESS.model_id,
-            overrides={},
-            hypothesis=contract.mechanism,
-            status="candidate")
         try:
-            evaluators[contract.contract_id] = ShadowEvaluator(
-                [variant], staged_cfg,
-                budget_ms=float(block.get("shadow_budget_ms") or 0),
-                store=findings_store,
-                scope_key=f"{resolved_scope}:staged",
-                initial_balance_usdt=float(
-                    block.get("paper_initial_balance_usdt") or 10_000),
-                max_failures=int(block.get("paper_max_failures") or 3))
+            evaluators[contract.contract_id] = _build_staged_evaluator(
+                contract, staged_cfg, resolved_scope, findings_store)
         except Exception as exc:                           # noqa: BLE001
             # One unbuildable mechanism must not cost the others their lane.
             log.warning("staged mechanism %s could not be enrolled: %s",
@@ -2242,3 +2625,46 @@ def _build_staged_lane(cfg: dict, resolved_scope: str,
             continue
         enrolled.append(contract)
     return evaluators, enrolled
+
+
+def _staged_runtime_cfg(cfg: dict) -> dict:
+    """Copy runtime config and pin staged lanes to the shared harness."""
+    staged_cfg = deepcopy(cfg)
+    staged_cfg["strategy"] = {
+        **dict(staged_cfg["strategy"]),
+        "min_stop_atr_multiple": STAGED_HARNESS.stop_atr_multiple,
+        "fixed_reward_risk": STAGED_HARNESS.reward_risk,
+        "forward_horizon_hours": STAGED_HARNESS.horizon_hours,
+    }
+    return staged_cfg
+
+
+def _build_staged_evaluator(
+        contract: object, staged_cfg: dict, resolved_scope: str,
+        findings_store: FindingsStore | None) -> ShadowEvaluator:
+    """Build one isolated evaluator for one staged contract."""
+    block = staged_cfg.get("research") or {}
+    variant = Variant(
+        variant_id=staged_variant_id(contract.contract_id),
+        strategy_id=STAGED_STRATEGY_ID,
+        base_version=STAGED_HARNESS.model_id,
+        overrides={},
+        hypothesis=contract.mechanism,
+        status="candidate")
+    baseline = Variant(
+        variant_id=staged_baseline_variant_id(contract.contract_id),
+        strategy_id=STAGED_STRATEGY_ID,
+        base_version=STAGED_HARNESS.model_id,
+        overrides={},
+        hypothesis=("The neutral fixed-harness policy is the paired baseline "
+                    "for this staged mechanism."),
+        status="testing")
+    return ShadowEvaluator(
+        [variant, baseline], staged_cfg,
+        budget_ms=float(block.get("shadow_budget_ms") or 0),
+        store=findings_store,
+        scope_key=f"{resolved_scope}:staged",
+        initial_balance_usdt=float(
+            block.get("paper_initial_balance_usdt") or 10_000),
+        max_failures=int(block.get("paper_max_failures") or 3),
+        workers=int(block.get("shadow_workers") or 1))

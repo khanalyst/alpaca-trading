@@ -68,7 +68,8 @@ def stage_of(candidate) -> str:
 
 def verdict_for(candidate) -> tuple[str, str]:
     """Return ``(code, explanation)`` for one measured staged mechanism."""
-    evaluated = candidate.declined_decisions + candidate.trades
+    evaluated = (getattr(candidate, "eligible_opportunities", 0)
+                 or candidate.declined_decisions + candidate.trades)
     starved = candidate.starved_decisions
     total = evaluated + starved
 
@@ -107,18 +108,58 @@ def verdict_for(candidate) -> tuple[str, str]:
             "the shape of an edge fitted to where it was found.")
 
     if (candidate.trades == 0
-            and candidate.declined_decisions >= NEVER_FIRED_DECISION_FLOOR):
+            and evaluated >= NEVER_FIRED_DECISION_FLOOR):
         return NEVER_FIRED, (
-            f"evaluated {candidate.declined_decisions} times and never fired. "
+            f"evaluated {evaluated} times and never fired. "
             "The thresholds do not describe a state this market reaches, so "
             "the claim is unreachable rather than wrong. Propose the same "
             "mechanism at a condition the market actually visits.")
+
+    # ``Candidate.label`` is normally produced by shortlist._label, but this
+    # guard is intentionally repeated at the immutable staged-verdict
+    # boundary. A hand-built/legacy candidate cannot claim support when its
+    # persisted opportunity coverage is known to be inadequate.
+    coverage = getattr(candidate, "coverage_pct", None)
+    pair_coverage = getattr(candidate, "pair_coverage_pct", None)
+    firing_rate = getattr(candidate, "firing_rate", None)
+    support_gap = None
+    if (coverage is not None
+            and coverage < shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT):
+        support_gap = (
+            f"resolved opportunity coverage is {coverage:.1f}%, below the "
+            f"{shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT:.0f}% floor")
+    elif (firing_rate is not None
+          and firing_rate < shortlist_mod.MIN_FIRING_RATE):
+        support_gap = (
+            f"firing rate is {firing_rate * 100:.2f}%, below the "
+            f"{shortlist_mod.MIN_FIRING_RATE * 100:.1f}% floor")
+    elif (pair_coverage is not None
+          and pair_coverage < shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT):
+        support_gap = (
+            f"candidate/baseline opportunity coverage is "
+            f"{pair_coverage:.1f}%, below the "
+            f"{shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT:.0f}% floor")
+    elif (pair_coverage is not None
+          and getattr(candidate, "delta_ci_low", None) is None):
+        support_gap = "matched baseline delta evidence is unavailable"
+    elif (pair_coverage is not None
+          and getattr(candidate, "delta_ci_low", 0.0) <= 0):
+        support_gap = "matched baseline delta interval does not clear zero"
+
+    if candidate.label == shortlist_mod.SUPPORTED and support_gap:
+        return COLLECTING, (
+            f"{support_gap}. The result remains evidence-gated and cannot "
+            "be called supported until the opportunity ledger is adequate.")
 
     if candidate.label == shortlist_mod.SUPPORTED:
         return SUPPORTED, (
             f"{candidate.trades} trades, interval {candidate.ci_low:+.3f}.."
             f"{candidate.ci_high:+.3f} R excludes zero and the held-out "
-            "window agrees. Kept running; this is evidence, not authority.")
+            "window agrees"
+            + (f"; {firing_rate * 100:.2f}% firing and "
+               f"{coverage:.1f}% opportunity coverage"
+               if firing_rate is not None and coverage is not None else "")
+            + ". Kept running; this is evidence, not authority.")
 
     return COLLECTING, (
         f"{candidate.trades} closed trades so far ({candidate.label}). "
@@ -138,41 +179,88 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
     from agent.shadow import staged_variant_id
 
     timestamp = time.time() if now is None else float(now)
+    active = staging_store.active()
+    variant_ids = {
+        staged_variant_id(contract.contract_id) for contract in active}
+    measured = shortlist_mod.from_store(
+        findings_store, staging_store, scope_key=scope_key)
+
+    # A variant id is stable across feed/account scopes.  Keying only by that
+    # id silently replaced one population with whichever scope happened to be
+    # iterated last, so a bad staged arm in one account could be reported as a
+    # good arm from another.  Keep scope in the identity all the way through
+    # adjudication and only retire globally when the decision is unambiguous.
     candidates = {
-        item.variant_id: item
-        for item in shortlist_mod.from_store(
-            findings_store, staging_store, scope_key=scope_key)
+        (str(item.scope_key), str(item.variant_id)): item
+        for item in measured
+        if item.variant_id in variant_ids
     }
+    if scope_key is not None:
+        scopes = [str(scope_key)]
+    else:
+        scopes = sorted({scope for scope, _ in candidates})
+        # No paper portfolio exists yet. Preserve the old one verdict per
+        # active contract so callers still get a useful COLLECTING result.
+        if not scopes:
+            scopes = [None]
+
     verdicts, retired = [], []
-    for contract in staging_store.active():
-        variant_id = staged_variant_id(contract.contract_id)
-        candidate = candidates.get(variant_id)
-        if candidate is None:
-            # Registered but never evaluated: the lane has not run yet.
-            code, explanation = COLLECTING, (
-                "no evaluations recorded yet; the lane has not run.")
-        else:
-            code, explanation = verdict_for(candidate)
-        entry = {
-            "contract_id": contract.contract_id,
-            "variant_id": variant_id,
-            "stage": (stage_of(candidate) if candidate is not None else SCREEN),
-            "code": code,
-            "explanation": explanation,
-            "mechanism": contract.mechanism,
-            "payer": contract.payer,
-            "trades": getattr(candidate, "trades", 0),
-            "mean_r": getattr(candidate, "mean_r", 0.0),
-        }
-        verdicts.append(entry)
-        if retire and code in RETIRING:
+    by_contract: dict[str, list[dict]] = {}
+    for scope in scopes:
+        for contract in active:
+            variant_id = staged_variant_id(contract.contract_id)
+            candidate = (candidates.get((scope, variant_id))
+                         if scope is not None else None)
+            if candidate is None:
+                # Registered but never evaluated in this exact scope: the
+                # lane has not run yet.
+                code, explanation = COLLECTING, (
+                    "no evaluations recorded yet; the lane has not run.")
+            else:
+                code, explanation = verdict_for(candidate)
+            entry = {
+                "contract_id": contract.contract_id,
+                "variant_id": variant_id,
+                "scope_key": scope,
+                "stage": (stage_of(candidate)
+                           if candidate is not None else SCREEN),
+                "code": code,
+                "explanation": explanation,
+                "mechanism": contract.mechanism,
+                "payer": contract.payer,
+                "trades": getattr(candidate, "trades", 0),
+                "mean_r": getattr(candidate, "mean_r", 0.0),
+                "eligible_opportunities": getattr(
+                    candidate, "eligible_opportunities", 0),
+                "firing_rate": getattr(candidate, "firing_rate", None),
+                "coverage_pct": getattr(candidate, "coverage_pct", None),
+                "pair_coverage_pct": getattr(
+                    candidate, "pair_coverage_pct", None),
+            }
+            verdicts.append(entry)
+            by_contract.setdefault(contract.contract_id, []).append(entry)
+
+    if retire:
+        for contract in active:
+            entries = by_contract.get(contract.contract_id, [])
+            # An explicit scope is an operator request to adjudicate that
+            # account.  Without one, require every observed scope to agree;
+            # one scope's negative result must not retire a claim still
+            # collecting or supported in another isolated account.
+            should_retire = bool(entries) and all(
+                entry["code"] in RETIRING for entry in entries)
+            if not should_retire:
+                continue
+            entry = entries[0]
             try:
                 staging_store.retire(
-                    contract.contract_id, f"{code}: {explanation}",
+                    contract.contract_id,
+                    f"{entry['code']}: {entry['explanation']}",
                     now=timestamp)
                 retired.append(contract.contract_id)
             except Exception as exc:  # noqa: BLE001 - one failure is not fatal
-                entry["retire_error"] = f"{type(exc).__name__}: {exc}"
+                for item in entries:
+                    item["retire_error"] = f"{type(exc).__name__}: {exc}"
     return {
         "reviewed": len(verdicts),
         "retired": retired,

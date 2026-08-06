@@ -202,6 +202,9 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     if direction not in {"long", "short"}:
         return None, "setup direction is invalid"
     setup_type = str(decision.get("setup_type") or "")
+    if (str(decision.get("strategy_id") or "") == "staged"
+            and setup_type == "staged_mechanism"):
+        return _build_staged_setup_plan(decision, symbol_snapshot, cfg)
     # A setup type belongs to a strategy. Checking against the registered
     # spec rather than a module-level set stops one strategy's archetypes
     # from being labellable while a different strategy is running.
@@ -332,6 +335,72 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
         "leverage": int(cfg["risk"]["entry_leverage"]),
     })
     return enriched, None
+
+
+def _build_staged_setup_plan(decision: dict, symbol_snapshot: dict,
+                             cfg: dict) -> tuple[dict | None, str | None]:
+    """Build the fixed neutral paper policy for a staged signal.
+
+    Staged DSL contracts own only entry conditions. Their exit, horizon and
+    risk assumptions stay in ``STAGED_HARNESS`` so an authored signal cannot
+    fit its own payoff. This path deliberately bypasses registered strategy
+    setup-type evidence and hard no-chase rules; those belong to the active
+    strategy, not to the shared signal screen.
+    """
+    from .forward_models import STAGED_HARNESS
+
+    direction = str(decision.get("direction") or "")
+    signal_ts = _finite(symbol_snapshot.get("signal_ts"))
+    if signal_ts is None or signal_ts < 0:
+        return None, "completed signal candle timestamp is unavailable"
+    atr = _finite(symbol_snapshot.get("atr_1h_pct"))
+    if atr is None or atr <= 0:
+        return None, "ATR is unavailable for staged neutral stop placement"
+    anchor = str(decision.get("invalidation_anchor") or "")
+    if anchor != STAGED_HARNESS.invalidation_anchor:
+        return None, "staged signal uses an unsupported invalidation anchor"
+    exit_policy = str(decision.get("exit_policy") or "")
+    if exit_policy != STAGED_HARNESS.exit_policy:
+        return None, "staged signal uses an unsupported exit policy"
+    structure_field = (
+        "swing_low_pct" if direction == "long" else "swing_high_pct")
+    structure_distance = _finite(symbol_snapshot.get(structure_field))
+    if structure_distance is None or structure_distance < 0:
+        return None, "staged neutral structure distance is unavailable"
+
+    stop_pct = max(
+        atr * float(STAGED_HARNESS.stop_atr_multiple), structure_distance)
+    take_pct = stop_pct * float(STAGED_HARNESS.reward_risk)
+    strategy_id = "staged"
+    strategy_version = STAGED_HARNESS.model_id
+    setup_key = _hash({
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "symbol": decision.get("symbol"),
+        "direction": direction,
+        "setup_type": "staged_mechanism",
+        "contract_id": decision.get("contract_id"),
+    })
+    setup_id = _hash({"setup_key": setup_key, "signal_ts": signal_ts})
+    plan = dict(decision)
+    plan.update({
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "setup_id": setup_id,
+        "setup_key": setup_key,
+        "setup_type": "staged_mechanism",
+        "signal_ts": signal_ts,
+        "invalidation_anchor": STAGED_HARNESS.invalidation_anchor,
+        "exit_policy": STAGED_HARNESS.exit_policy,
+        "execution_choice": "normal",
+        "entry_evidence_fingerprint": evidence_fingerprint(symbol_snapshot),
+        "entry_signal_1h_ts": None,
+        "stop_loss_pct": round(stop_pct, 6),
+        "take_profit_pct": round(take_pct, 6),
+        "size_pct_equity": 0.0,
+        "leverage": int(cfg["risk"]["entry_leverage"]),
+    })
+    return plan, None
 
 
 def new_setup_record(plan: dict, cfg: dict,

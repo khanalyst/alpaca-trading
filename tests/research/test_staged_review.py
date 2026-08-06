@@ -74,6 +74,16 @@ class VerdictsExplainThemselvesTests(unittest.TestCase):
         self.assertNotIn(code, staged_review.RETIRING)
         self.assertIn("evidence, not authority", why)
 
+    def test_supported_label_is_rejected_when_persisted_coverage_is_inadequate(self):
+        code, why = staged_review.verdict_for(candidate(
+            trades=200, mean_r=0.4, ci_low=0.2, ci_high=0.6,
+            label=shortlist.SUPPORTED, confirmation_mean_r=0.3,
+            eligible_opportunities=1_000, resolved_opportunities=500,
+            coverage_pct=50.0, firing_rate=0.2,
+            pair_coverage_pct=100.0, declined_decisions=800))
+        self.assertEqual(code, staged_review.COLLECTING)
+        self.assertIn("coverage", why)
+
     def test_a_thin_sample_keeps_collecting_rather_than_concluding(self):
         code, _ = staged_review.verdict_for(candidate(
             trades=8, mean_r=0.4, ci_low=-0.2, ci_high=1.0,

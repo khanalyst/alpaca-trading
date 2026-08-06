@@ -27,6 +27,18 @@ from .stats import (benjamini_hochberg, bootstrap_difference,
 # the same as the same number on two hundred.
 MIN_FOR_PRELIMINARY = 30
 MIN_FOR_SUPPORTED = 100
+# A positive conditional result on a vanishingly rare signal is not enough
+# to support the claim.  The rate is measured over eligible ledger
+# opportunities (PROPOSED + eligible VETOED rows), not over market bars.
+MIN_FIRING_RATE = 0.01
+MIN_FIRE_RATE = MIN_FIRING_RATE
+# Candidate and baseline arms must resolve the same opportunity population.
+# Keep this aligned with the immutable promotion protocol's pair gate.
+MIN_OPPORTUNITY_COVERAGE_PCT = 80.0
+# Compatibility names for report/selector integrations that use the protocol
+# vocabulary for the same persisted proposal-union gate.
+MIN_COVERAGE_PCT = MIN_OPPORTUNITY_COVERAGE_PCT
+MIN_PAIR_COVERAGE_PCT = MIN_OPPORTUNITY_COVERAGE_PCT
 # Expected proportion of false discoveries tolerated among declared ones.
 FDR_ALPHA = 0.05
 # The confirmation window is the last 30% of a candidate's trades in time,
@@ -71,6 +83,23 @@ class Candidate:
     delta_ci_high: float | None = None
     starved_decisions: int = 0
     declined_decisions: int = 0
+    # Opportunity-level evidence.  ``trades`` remains the count of closed,
+    # valid accepted trades; the fields below describe the larger decision
+    # population that the policy was asked to act on.
+    eligible_opportunities: int = 0
+    resolved_opportunities: int = 0
+    firing_rate: float | None = None
+    coverage_pct: float | None = None
+    baseline_eligible_opportunities: int = 0
+    baseline_resolved_opportunities: int = 0
+    baseline_firing_rate: float | None = None
+    baseline_coverage_pct: float | None = None
+    matched_opportunities: int = 0
+    pair_coverage_pct: float | None = None
+    opportunity_mean_r: float | None = None
+    opportunity_ci_low: float | None = None
+    opportunity_ci_high: float | None = None
+    trade_mean_r: float | None = None
     p_value: float = 1.0
     p_adjusted: float | None = None
     family_size: int = 0
@@ -81,10 +110,37 @@ class Candidate:
     def win_rate(self) -> float:
         return self.wins / self.trades if self.trades else 0.0
 
+    @property
+    def firing_rate_pct(self) -> float | None:
+        """Human-readable firing rate, as a percentage."""
+        return (None if self.firing_rate is None else self.firing_rate * 100.0)
+
+    @property
+    def firing_rate_percent(self) -> float | None:
+        """Descriptive alias for integrations that spell out ``percent``."""
+        return self.firing_rate_pct
+
+    @property
+    def opportunity_count(self) -> int:
+        """Alias for the eligible decision/opportunity denominator."""
+        return self.eligible_opportunities
+
+    @property
+    def opportunity_coverage_pct(self) -> float | None:
+        """Alias used by callers that distinguish pair coverage."""
+        return self.coverage_pct
+
+    @property
+    def mean_opportunity_r(self) -> float:
+        """Opportunity-normalized mean (the value used for labels)."""
+        return (self.mean_r if self.opportunity_mean_r is None
+                else self.opportunity_mean_r)
+
     def rank_key(self) -> tuple:
         # Within a label, the lower confidence bound orders candidates: it is
         # the value the evidence supports rather than the one it produced.
-        return (LABEL_ORDER.index(self.label), -self.ci_low, -self.mean_r)
+        return (LABEL_ORDER.index(self.label), 1 if self.is_baseline else 0,
+                -self.ci_low, -self.mean_r)
 
 
 def _closed(trades: list) -> list:
@@ -106,6 +162,150 @@ def _closed(trades: list) -> list:
         if math.isfinite(number):
             out.append({**row, "r_multiple": number})
     return sorted(out, key=lambda row: float(row.get("entry_ts") or 0.0))
+
+
+def _value(row, key: str, default=None):
+    if isinstance(row, dict):
+        return row.get(key, default)
+    return getattr(row, key, default)
+
+
+def _proposal_key(row):
+    """Return the immutable proposal identity used by the decision ledger."""
+    proposal_id = _value(row, "proposal_id")
+    if proposal_id is not None:
+        return ("proposal", str(proposal_id))
+    # Older rows may not carry the generated id.  The replay identity is the
+    # stable fallback and intentionally excludes variant/wall-clock fields.
+    return ("identity", _value(row, "cycle_id"), _value(row, "symbol"),
+            _value(row, "signal_ts"), _value(row, "direction"),
+            _value(row, "setup_type"))
+
+
+def _starved_reason(reason: object) -> bool:
+    text = str(reason or "").strip().lower()
+    return text.startswith("data missing") or text.startswith(
+        "market data invalid") or text.startswith("market data missing")
+
+
+def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
+    """Build returns and coverage from the immutable decision/trade rows.
+
+    A non-starved VETOED decision is an eligible opportunity with a literal
+    zero return.  A PROPOSED decision contributes its closed valid trade when
+    one exists; unresolved/open/invalid accepted actions stay in the
+    denominator but are not silently converted to a zero.  That distinction
+    prevents missing close data from becoming performance evidence.
+    """
+    closed = _closed(trades)
+    by_key = {_proposal_key(row): row for row in closed}
+    by_trade_id = {str(_value(row, "trade_id")): row for row in closed
+                   if _value(row, "trade_id") is not None}
+
+    # Direct callers and old fixtures have no ledger.  Preserve the original
+    # trade-only behaviour while still allowing a supplied declined count to
+    # add explicit zero-return opportunities in ``measure``.
+    if decisions is None:
+        returns = [row["r_multiple"] for row in closed]
+        keys = [_proposal_key(row) for row in closed]
+        return {
+            "closed": closed, "returns": returns, "keys": keys,
+            "eligible": len(closed), "resolved": len(closed),
+            "fired": len(closed), "declined": 0, "starved": 0,
+            "resolved_by_key": dict(zip(keys, returns)),
+            "eligible_keys": set(keys), "coverage_known": False,
+        }
+
+    returns: list[float] = []
+    keys: list[object] = []
+    resolved_by_key: dict[object, float] = {}
+    eligible_keys: set = set()
+    eligible = resolved = fired = declined = starved = 0
+    def _decision_ts(row):
+        value = _value(row, "decision_ts",
+                       _value(row, "entry_ts", _value(row, "signal_ts", 0.0)))
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ordered_decisions = sorted(decisions or [], key=_decision_ts)
+    for row in ordered_decisions:
+        outcome = str(_value(row, "decision_outcome", "") or "").upper()
+        key = _proposal_key(row)
+        if outcome == "VETOED":
+            if _starved_reason(_value(row, "reason")):
+                starved += 1
+                continue
+            eligible += 1
+            declined += 1
+            eligible_keys.add(key)
+            resolved += 1
+            returns.append(0.0)
+            keys.append(key)
+            resolved_by_key[key] = 0.0
+            continue
+        if outcome != "PROPOSED":
+            continue
+        eligible += 1
+        # The signal fired when the decision was accepted, even if its paper
+        # trade is still open or later becomes invalid for inference. Those
+        # rows remain unresolved for return/coverage purposes, but they still
+        # belong in the firing-rate denominator and numerator.
+        fired += 1
+        eligible_keys.add(key)
+        trade = by_key.get(key)
+        if trade is None and _value(row, "paper_trade_id") is not None:
+            trade = by_trade_id.get(str(_value(row, "paper_trade_id")))
+        if trade is None:
+            # Protocol/replay callers may pass the decision ledger after its
+            # trade join rather than separate paper-trade rows.
+            joined_status = str(_value(row, "trade_status") or "").upper()
+            joined_value = _value(row, "trade_r_multiple")
+            if (joined_status == "CLOSED"
+                    and str(_value(row, "trade_result") or "")
+                    != "unfilled"
+                    and int(_value(row, "trade_valid_for_inference", 1)
+                            or 0) == 1
+                    and joined_value is not None):
+                try:
+                    joined_value = float(joined_value)
+                except (TypeError, ValueError):
+                    joined_value = None
+                if joined_value is not None and math.isfinite(joined_value):
+                    trade = {"r_multiple": joined_value}
+        if trade is None:
+            # The row is still an opportunity, but no valid close is evidence
+            # yet.  Leave it unresolved rather than inventing a return.
+            continue
+        value = float(trade["r_multiple"])
+        resolved += 1
+        returns.append(value)
+        keys.append(key)
+        resolved_by_key[key] = value
+
+    return {
+        "closed": closed, "returns": returns, "keys": keys,
+        "eligible": eligible, "resolved": resolved,
+        "fired": fired, "declined": declined, "starved": starved,
+        "resolved_by_key": resolved_by_key,
+        "eligible_keys": eligible_keys, "coverage_known": True,
+    }
+
+
+def _paired_opportunity_evidence(left: dict, right: dict) -> dict:
+    """Match resolved candidate/baseline opportunities by immutable identity."""
+    union = left["eligible_keys"] | right["eligible_keys"]
+    common = sorted(set(left["resolved_by_key"]) &
+                    set(right["resolved_by_key"]), key=repr)
+    deltas = [left["resolved_by_key"][key] -
+              right["resolved_by_key"][key] for key in common]
+    return {
+        "deltas": deltas, "matched": len(common),
+        "union": len(union),
+        "coverage_pct": (len(common) / len(union) * 100.0
+                          if union else 0.0),
+    }
 
 
 def _label(candidate: Candidate) -> tuple[str, list]:
@@ -143,6 +343,44 @@ def _label(candidate: Candidate) -> tuple[str, list]:
             f"{MIN_FOR_SUPPORTED} is the floor for a supported one")
         return PRELIMINARY, reasons
 
+    # Once ledger evidence is available, a conditional trade result is not
+    # enough. Require adequate resolved opportunity coverage and a minimum
+    # firing rate before allowing the strongest label. Legacy trade-only
+    # callers leave these fields unknown and retain descriptive behaviour.
+    if candidate.coverage_pct is not None \
+            and candidate.coverage_pct < MIN_OPPORTUNITY_COVERAGE_PCT:
+        reasons.append(
+            f"only {candidate.coverage_pct:.1f}% of eligible opportunities "
+            f"resolved; {MIN_OPPORTUNITY_COVERAGE_PCT:.0f}% coverage is "
+            "required before a supported label")
+        return INCONCLUSIVE, reasons
+    if (candidate.firing_rate is not None
+            and candidate.firing_rate < MIN_FIRING_RATE):
+        reasons.append(
+            f"the arm fired on only {candidate.firing_rate * 100:.2f}% of "
+            f"eligible opportunities; {MIN_FIRING_RATE * 100:.1f}% is the "
+            "minimum firing rate for a supported claim")
+        return INCONCLUSIVE, reasons
+    if candidate.pair_coverage_pct is not None \
+            and candidate.pair_coverage_pct < MIN_OPPORTUNITY_COVERAGE_PCT:
+        reasons.append(
+            "matched candidate/baseline opportunities cover only "
+            f"{candidate.pair_coverage_pct:.1f}% of the proposal union; "
+            f"{MIN_OPPORTUNITY_COVERAGE_PCT:.0f}% is required")
+        return INCONCLUSIVE, reasons
+    if candidate.pair_coverage_pct is not None:
+        if candidate.delta_ci_low is None:
+            reasons.append(
+                "the matched baseline delta is unavailable, so the arm "
+                "cannot be supported on its unconditional return")
+            return INCONCLUSIVE, reasons
+        if candidate.delta_ci_low <= 0:
+            reasons.append(
+                f"the matched baseline delta interval includes zero "
+                f"({candidate.delta_ci_low:+.3f}.."
+                f"{candidate.delta_ci_high:+.3f} R)")
+            return INCONCLUSIVE, reasons
+
     if candidate.ci_low <= 0:
         reasons.append(
             f"the 95% interval still includes zero "
@@ -170,6 +408,11 @@ def _label(candidate: Candidate) -> tuple[str, list]:
     reasons.append(
         f"{n} closed trades, interval {candidate.ci_low:+.3f}.."
         f"{candidate.ci_high:+.3f} R excludes zero")
+    if candidate.firing_rate is not None and candidate.coverage_pct is not None:
+        reasons.append(
+            f"{candidate.eligible_opportunities} eligible opportunities, "
+            f"{candidate.firing_rate * 100:.2f}% firing and "
+            f"{candidate.coverage_pct:.1f}% resolved coverage")
     if candidate.p_adjusted is not None:
         reasons.append(
             f"survives false-discovery control across "
@@ -189,11 +432,30 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
             mechanism: str = "", payer: str = "", configuration: str = "",
             source: str = "registered", is_baseline: bool = False,
             baseline_trades: list | None = None,
+            decisions: list | None = None,
+            baseline_decisions: list | None = None,
             baseline_variant_id: str | None = None,
             starved: int = 0, declined: int = 0) -> Candidate:
     """Summarise one arm without deciding anything about it yet."""
-    closed = _closed(trades)
-    returns = [row["r_multiple"] for row in closed]
+    evidence = _opportunity_evidence(trades, decisions)
+    closed = evidence["closed"]
+    returns = list(evidence["returns"])
+    # Direct callers predate the decision ledger. A supplied declined count is
+    # still an explicit zero-return opportunity when the arm has fired; with
+    # no trades it remains NO_EVIDENCE rather than a synthetic negative sample.
+    if decisions is None and declined and returns:
+        returns.extend([0.0] * int(declined))
+        evidence["eligible"] += int(declined)
+        evidence["resolved"] += int(declined)
+        evidence["declined"] += int(declined)
+        evidence["coverage_known"] = True
+    elif decisions is None and starved and returns:
+        # The caller supplied an explicit starvation count but no ledger.
+        # Starved observations are excluded from the opportunity denominator;
+        # retain a known firing/coverage rate for the eligible closed arm.
+        evidence["coverage_known"] = True
+    starved_count = evidence["starved"] + int(starved)
+    declined_count = evidence["declined"] + int(declined)
     candidate = Candidate(
         variant_id=variant_id, scope_key=scope_key, mechanism=mechanism,
         payer=payer, configuration=configuration, source=source,
@@ -201,14 +463,29 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
         trades=len(closed), wins=sum(1 for r in returns if r > 0),
         net_pnl_usd=round(sum(
             float(row.get("net_pnl_usd") or 0.0) for row in closed), 2),
-        starved_decisions=int(starved), declined_decisions=int(declined),
+        starved_decisions=starved_count, declined_decisions=declined_count,
+        eligible_opportunities=int(evidence["eligible"]),
+        resolved_opportunities=int(evidence["resolved"]),
         baseline_variant_id=baseline_variant_id)
+    if evidence["coverage_known"]:
+        candidate.firing_rate = (evidence["fired"] / evidence["eligible"]
+                                 if evidence["eligible"] else 0.0)
+        candidate.coverage_pct = (
+            evidence["resolved"] / evidence["eligible"] * 100.0
+            if evidence["eligible"] else 0.0)
+    if returns:
+        candidate.opportunity_mean_r = round(sum(returns) / len(returns), 4)
+        if closed:
+            candidate.trade_mean_r = round(
+                sum(row["r_multiple"] for row in closed) / len(closed), 4)
     if returns:
         candidate.p_value = round(bootstrap_p_value(returns), 5)
         interval = bootstrap_mean(returns)
         candidate.mean_r = round(interval.point, 4)
         candidate.ci_low = round(interval.low, 4)
         candidate.ci_high = round(interval.high, 4)
+        candidate.opportunity_ci_low = candidate.ci_low
+        candidate.opportunity_ci_high = candidate.ci_high
         # Split in time, not at random: an edge that only works in the window
         # it was found in is the failure this split exists to catch.
         cut = max(1, int(round(len(returns) * (1 - CONFIRMATION_FRACTION))))
@@ -216,12 +493,52 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
             candidate.fit_mean_r = round(sum(returns[:cut]) / cut, 4)
             tail = returns[cut:]
             candidate.confirmation_mean_r = round(sum(tail) / len(tail), 4)
-    baseline_returns = [row["r_multiple"] for row in _closed(baseline_trades)]
-    if returns and baseline_returns:
-        delta = bootstrap_difference(returns, baseline_returns)
-        candidate.delta_vs_baseline = round(delta.point, 4)
-        candidate.delta_ci_low = round(delta.low, 4)
-        candidate.delta_ci_high = round(delta.high, 4)
+    baseline_evidence = None
+    if baseline_decisions is not None or baseline_trades is not None:
+        baseline_evidence = _opportunity_evidence(
+            baseline_trades or [], baseline_decisions)
+        candidate.baseline_eligible_opportunities = int(
+            baseline_evidence["eligible"])
+        candidate.baseline_resolved_opportunities = int(
+            baseline_evidence["resolved"])
+        if baseline_evidence["coverage_known"]:
+            candidate.baseline_firing_rate = (
+                baseline_evidence["fired"] /
+                baseline_evidence["eligible"]
+                if baseline_evidence["eligible"] else 0.0)
+            candidate.baseline_coverage_pct = (
+                baseline_evidence["resolved"] /
+                baseline_evidence["eligible"] * 100.0
+                if baseline_evidence["eligible"] else 0.0)
+    if returns and baseline_evidence and baseline_evidence["returns"]:
+        if decisions is not None and baseline_decisions is not None:
+            paired = _paired_opportunity_evidence(evidence,
+                                                   baseline_evidence)
+            candidate.matched_opportunities = paired["matched"]
+            candidate.pair_coverage_pct = paired["coverage_pct"]
+            delta = (bootstrap_mean(paired["deltas"])
+                     if paired["deltas"] else None)
+        else:
+            # Legacy trade-only evidence has no proposal identity to match;
+            # retain the historical independent comparison and leave pair
+            # coverage unknown rather than manufacturing a match.
+            delta = bootstrap_difference(
+                returns, baseline_evidence["returns"])
+        if delta is not None:
+            candidate.delta_vs_baseline = round(delta.point, 4)
+            candidate.delta_ci_low = round(delta.low, 4)
+            candidate.delta_ci_high = round(delta.high, 4)
+    elif baseline_decisions is not None:
+        # Explicitly supplied empty baseline evidence is inadequate, not an
+        # absent legacy argument. This makes SUPPORTED fail closed when a
+        # persisted candidate has no matched baseline opportunity set.
+        candidate.pair_coverage_pct = 0.0
+    elif decisions is not None and not is_baseline:
+        # A decision ledger without a baseline ledger is also an explicit
+        # absence of matched opportunity evidence. Keep the legacy
+        # trade-only path above for old callers, but never call a persisted
+        # candidate SUPPORTED without this comparison population.
+        candidate.pair_coverage_pct = 0.0
     candidate.label, candidate.reasons = _label(candidate)
     return candidate
 
@@ -247,7 +564,8 @@ def apply_family_correction(candidates: list, alpha: float = FDR_ALPHA) -> list:
     """
     eligible = {
         f"{c.scope_key}|{c.variant_id}": c.p_value
-        for c in candidates if c.trades >= MIN_FOR_PRELIMINARY
+        for c in candidates
+        if not c.is_baseline and c.trades >= MIN_FOR_PRELIMINARY
     }
     if not eligible:
         return candidates
@@ -288,19 +606,25 @@ def render(candidates: list, *, generated_ts: float | None = None) -> str:
         "whose mechanism is not understood cannot be told apart from "
         "overfitting and gives no warning when it stops.")
     lines.append("")
-    lines.append("| Rank | Candidate | Scope | Label | Trades | Mean R "
-                 "| 95% interval | Held-out | Win rate | Net USD |")
-    lines.append("| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: "
-                 "| ---: |")
+    lines.append("| Rank | Candidate | Scope | Label | Trades | Opportunities "
+                 "| Fire rate | Coverage | Mean R | 95% interval | Held-out "
+                 "| Win rate | Net USD |")
+    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: "
+                 "| --- | ---: | ---: | ---: |")
     for index, candidate in enumerate(ordered, start=1):
         held = ("-" if candidate.confirmation_mean_r is None
                 else f"{candidate.confirmation_mean_r:+.3f}")
+        firing = ("-" if candidate.firing_rate is None
+                  else f"{candidate.firing_rate:.1%}")
+        coverage = ("-" if candidate.coverage_pct is None
+                    else f"{candidate.coverage_pct:.1f}%")
         name = candidate.variant_id + (" (baseline)"
                                        if candidate.is_baseline else "")
         lines.append(
             f"| {index} | `{name}` | {_scope_tag(candidate.scope_key)} "
             f"| {candidate.label} "
-            f"| {candidate.trades} | {candidate.mean_r:+.3f} "
+            f"| {candidate.trades} | {candidate.eligible_opportunities} "
+            f"| {firing} | {coverage} | {candidate.mean_r:+.3f} "
             f"| {candidate.ci_low:+.3f}..{candidate.ci_high:+.3f} "
             f"| {held} | {candidate.win_rate:.1%} "
             f"| {candidate.net_pnl_usd:,.2f} |")
@@ -332,6 +656,11 @@ def render(candidates: list, *, generated_ts: float | None = None) -> str:
                 f"- {candidate.starved_decisions} further decisions were "
                 "never evaluated because the market data was absent; those "
                 "are not evidence against the claim")
+        if candidate.pair_coverage_pct is not None:
+            lines.append(
+                f"- matched candidate/baseline opportunity coverage: "
+                f"{candidate.pair_coverage_pct:.1f}% "
+                f"({candidate.matched_opportunities} matched opportunities)")
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -366,10 +695,23 @@ def from_store(findings_store, staging_store=None, *,
         baseline_trades = (
             findings_store.paper_trades_for(scope, baseline_id)
             if baseline_id else None)
+        if baseline_id:
+            try:
+                baseline_decisions = findings_store.paper_decisions_for(
+                    scope, baseline_id)
+            except Exception:  # noqa: BLE001 - legacy pre-ledger store
+                baseline_decisions = None
+        else:
+            baseline_decisions = []
         for variant_id in sorted(variants):
             is_baseline = variant_id in baselines
             contract = staged_claims.get(variant_id)
             decisions = _decision_counts(findings_store, scope, variant_id)
+            try:
+                decision_rows = findings_store.paper_decisions_for(
+                    scope, variant_id)
+            except Exception:  # noqa: BLE001 - legacy pre-ledger store
+                decision_rows = None
             candidates.append(measure(
                 variant_id, scope,
                 findings_store.paper_trades_for(scope, variant_id),
@@ -380,8 +722,12 @@ def from_store(findings_store, staging_store=None, *,
                 is_baseline=is_baseline,
                 # A baseline is not compared with itself.
                 baseline_trades=(None if is_baseline else baseline_trades),
+                baseline_decisions=(None if is_baseline else baseline_decisions),
                 baseline_variant_id=(None if is_baseline else baseline_id),
-                starved=decisions["starved"], declined=decisions["declined"]))
+                decisions=decision_rows,
+                # ``decision_rows`` is the source of truth for both counts;
+                # passing the summary too would count every veto twice.
+                starved=0, declined=0))
     return apply_family_correction(candidates)
 
 
@@ -391,9 +737,19 @@ def _variants_in(findings_store, scope_key: str) -> set:
     try:
         with sqlite3.connect(f"file:{findings_store.path}?mode=ro",
                              uri=True) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT variant_id FROM paper_portfolios "
-                "WHERE scope_key=?", (scope_key,)).fetchall()
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT variant_id FROM paper_portfolios "
+                    "WHERE scope_key=? UNION SELECT DISTINCT variant_id "
+                    "FROM paper_decisions WHERE scope_key=?",
+                    (scope_key, scope_key)).fetchall()
+            except sqlite3.Error:
+                # Pre-ledger stores still have useful trade portfolios. Keep
+                # the legacy shortlist readable rather than dropping the
+                # whole scope because the optional decision table is absent.
+                rows = conn.execute(
+                    "SELECT DISTINCT variant_id FROM paper_portfolios "
+                    "WHERE scope_key=?", (scope_key,)).fetchall()
     except sqlite3.Error:
         return set()
     return {str(row[0]) for row in rows}
@@ -410,8 +766,7 @@ def _decision_counts(findings_store, scope_key: str, variant_id: str) -> dict:
         if str(row.get("decision_outcome") or "") != "VETOED":
             continue
         reason = str(row.get("reason") or "")
-        if reason.startswith("data missing") or reason.startswith(
-                "market data invalid"):
+        if _starved_reason(reason):
             counts["starved"] += 1
         else:
             counts["declined"] += 1

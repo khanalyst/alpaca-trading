@@ -7,6 +7,13 @@ from tests.research.test_shadow_isolation import proposal, snapshot, variant
 
 
 class ShadowParallelTests(unittest.TestCase):
+    def test_parallelism_accepts_more_than_two_workers(self):
+        evaluator = shadow.ShadowEvaluator(
+            [variant(), variant("momentum.rr.fixed_3_0",
+                                {"strategy.fixed_reward_risk": 3.0})],
+            valid_config(), workers=4)
+        self.assertEqual(evaluator.workers, 4)
+
     def test_independent_variants_overlap_without_sharing_account_state(self):
         evaluator = shadow.ShadowEvaluator(
             [variant(), variant("momentum.rr.fixed_3_0",

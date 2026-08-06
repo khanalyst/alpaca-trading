@@ -17,7 +17,7 @@ deduplicate, survive restarts, never block on a failure.
 
 Run it alongside the agent:
 
-    nohup python research/record_flow.py --out runtime/research/recorded &
+    nohup python research/record_flow.py --config config.yaml &
 
 Storage is roughly 20 MB per month at the defaults.
 """
@@ -30,11 +30,14 @@ import json
 import logging
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+import yaml
 
 BASE = "https://www.okx.com"
 log = logging.getLogger("recorder")
@@ -50,6 +53,18 @@ log = logging.getLogger("recorder")
 # measurement.
 DEPTH_BANDS_BPS = (1, 2, 5, 10, 25)
 BOOK_LEVELS = "400"
+DEFAULT_COLLECTOR_WORKERS = 4
+MAX_COLLECTOR_WORKERS = 32
+DEFAULT_COLLECTOR_CONFIG = {
+    "enabled": True,
+    "out": Path("runtime/research/recorded"),
+    "top_n": 12,
+    "min_volume_usd": 30e6,
+    "book_interval_seconds": 300,
+    "hourly_interval_seconds": 900,
+    "refresh_minutes": 60,
+    "workers": DEFAULT_COLLECTOR_WORKERS,
+}
 
 BOOK_FIELDS = [
     "ts", "inst_id", "mid", "bid", "ask", "spread_bps",
@@ -94,9 +109,17 @@ def _stop(signum, frame):  # noqa: ARG001
 
 
 class Recorder:
-    def __init__(self, out: Path):
+    def __init__(self, out: Path, *, workers: int = DEFAULT_COLLECTOR_WORKERS):
         self.out = out
         self.session = requests.Session()
+        self._thread_local = threading.local()
+        self._append_lock = threading.Lock()
+        self._contract_size_lock = threading.Lock()
+        try:
+            requested_workers = int(workers)
+        except (TypeError, ValueError):
+            requested_workers = DEFAULT_COLLECTOR_WORKERS
+        self.workers = max(1, min(MAX_COLLECTOR_WORKERS, requested_workers))
         self.seen: dict[str, set] = {}
         # Order-book sizes are quoted in CONTRACTS, not base units, and the
         # contract multiplier differs per instrument (0.01 BTC, 1000 DOGE...).
@@ -116,12 +139,25 @@ class Recorder:
             if value > 0:
                 self.contract_size[row["instId"]] = value
 
+    def _session(self) -> requests.Session:
+        """Return one HTTP session per request worker.
+
+        ``requests.Session`` is not documented as thread-safe. The collector
+        can parallelize public reads, so each worker gets its own connection
+        pool while the durable CSV append remains serialized below.
+        """
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
+
     # Plumbing
 
     def get(self, path: str, params: dict) -> list | dict | None:
         for attempt in range(3):
             try:
-                response = self.session.get(
+                response = self._session().get(
                     f"{BASE}{path}", params=params, timeout=15)
                 if response.status_code == 429:
                     time.sleep(1.0 * (attempt + 1))
@@ -186,49 +222,50 @@ class Recorder:
         Day-partitioned files keep any single file small and make a partial
         write cost at most one day, not the whole archive.
         """
-        if not rows:
-            return 0
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        path = self.out / series / f"{day}.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if series == "funding":
-            self._upgrade_legacy_funding_header(path, fields)
-        # History returns the latest settlements on every poll.  Funding
-        # identity must therefore span day partitions or every new UTC day
-        # would write the same realized rows again.
-        seen_name = series if series == "funding" else f"{series}:{day}"
-        key_set = self.seen.setdefault(seen_name, set())
-        if not key_set:
-            existing_paths = (
-                sorted((self.out / series).glob("*.csv"))
-                if series == "funding" else [path]
-            )
-            for existing_path in existing_paths:
-                if not existing_path.exists():
+        with self._append_lock:
+            if not rows:
+                return 0
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = self.out / series / f"{day}.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if series == "funding":
+                self._upgrade_legacy_funding_header(path, fields)
+            # History returns the latest settlements on every poll. Funding
+            # identity must therefore span day partitions or every new UTC
+            # day would write the same realized rows again.
+            seen_name = series if series == "funding" else f"{series}:{day}"
+            key_set = self.seen.setdefault(seen_name, set())
+            if not key_set:
+                existing_paths = (
+                    sorted((self.out / series).glob("*.csv"))
+                    if series == "funding" else [path]
+                )
+                for existing_path in existing_paths:
+                    if not existing_path.exists():
+                        continue
+                    try:
+                        with existing_path.open() as handle:
+                            for row in csv.DictReader(handle):
+                                key_set.add(self._row_key(series, row))
+                    except Exception:
+                        pass
+            fresh = []
+            for row in rows:
+                key = self._row_key(series, row)
+                if key in key_set:
                     continue
-                try:
-                    with existing_path.open() as handle:
-                        for row in csv.DictReader(handle):
-                            key_set.add(self._row_key(series, row))
-                except Exception:
-                    pass
-        fresh = []
-        for row in rows:
-            key = self._row_key(series, row)
-            if key in key_set:
-                continue
-            key_set.add(key)
-            fresh.append(row)
-        if not fresh:
-            return 0
-        write_header = not path.exists()
-        with path.open("a", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields,
-                                    extrasaction="ignore")
-            if write_header:
-                writer.writeheader()
-            writer.writerows(fresh)
-        return len(fresh)
+                key_set.add(key)
+                fresh.append(row)
+            if not fresh:
+                return 0
+            write_header = not path.exists()
+            with path.open("a", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields,
+                                        extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(fresh)
+            return len(fresh)
 
     # Capture
 
@@ -249,8 +286,11 @@ class Recorder:
         # Convert contracts to base units before valuing the book.
         multiplier = self.contract_size.get(inst_id)
         if multiplier is None:
-            self.load_contract_sizes()
-            multiplier = self.contract_size.get(inst_id, 1.0)
+            with self._contract_size_lock:
+                multiplier = self.contract_size.get(inst_id)
+                if multiplier is None:
+                    self.load_contract_sizes()
+                    multiplier = self.contract_size.get(inst_id, 1.0)
         bids = [(price, size * multiplier) for price, size in bids]
         asks = [(price, size * multiplier) for price, size in asks]
         row = {
@@ -284,7 +324,16 @@ class Recorder:
         return row
 
     def capture_books(self, instruments: list[str]) -> int:
-        rows = [row for row in (self.order_book(i) for i in instruments) if row]
+        if self.workers <= 1 or len(instruments) <= 1:
+            fetched = [self.order_book(i) for i in instruments]
+        else:
+            # Only public reads run in parallel. ``append`` is called once,
+            # below, so a wider collector cannot interleave durable writes.
+            with ThreadPoolExecutor(
+                    max_workers=min(self.workers, len(instruments)),
+                    thread_name_prefix="research-book") as pool:
+                fetched = list(pool.map(self.order_book, instruments))
+        rows = [row for row in fetched if row]
         return self.append("order_book", BOOK_FIELDS, rows)
 
     def capture_hourly(self, instruments: list[str],
@@ -440,16 +489,113 @@ def discover(recorder: Recorder, top_n: int, min_volume: float) -> list[str]:
     return [inst_id for _, inst_id in ranked[:top_n]]
 
 
+def _collector_number(value, *, name: str, lo: float, hi: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"collector.{name} must be a number")
+    value = float(value)
+    if not lo <= value <= hi:
+        raise ValueError(
+            f"collector.{name} must be between {lo:g} and {hi:g}")
+    return value
+
+
+def _collector_integer(value, *, name: str, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"collector.{name} must be an integer")
+    if not lo <= value <= hi:
+        raise ValueError(f"collector.{name} must be between {lo} and {hi}")
+    return value
+
+
+def load_collector_config_from_mapping(raw: dict) -> dict:
+    """Validate one merged research-only collector settings mapping."""
+    allowed = set(DEFAULT_COLLECTOR_CONFIG)
+    unknown = sorted(set(raw or {}) - allowed)
+    if unknown:
+        raise ValueError(
+            "collector has unknown field(s): " + ", ".join(unknown))
+    settings = dict(DEFAULT_COLLECTOR_CONFIG)
+    settings.update(raw or {})
+
+    enabled = settings.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("collector.enabled must be true or false")
+    out = settings.get("out")
+    if not isinstance(out, (str, Path)) or not str(out).strip():
+        raise ValueError("collector.out must be a path string")
+    settings["out"] = Path(out)
+    settings["top_n"] = _collector_integer(
+        settings.get("top_n"), name="top_n", lo=1, hi=500)
+    settings["min_volume_usd"] = _collector_number(
+        settings.get("min_volume_usd"), name="min_volume_usd", lo=0,
+        hi=1_000_000_000_000)
+    settings["book_interval_seconds"] = _collector_integer(
+        settings.get("book_interval_seconds"), name="book_interval_seconds",
+        lo=1, hi=86_400)
+    settings["hourly_interval_seconds"] = _collector_integer(
+        settings.get("hourly_interval_seconds"),
+        name="hourly_interval_seconds", lo=60, hi=7 * 86_400)
+    settings["refresh_minutes"] = _collector_integer(
+        settings.get("refresh_minutes"), name="refresh_minutes", lo=1,
+        hi=7 * 24 * 60)
+    settings["workers"] = _collector_integer(
+        settings.get("workers"), name="workers", lo=1,
+        hi=MAX_COLLECTOR_WORKERS)
+    return settings
+
+
+def load_collector_config(path: Path | None = None) -> dict:
+    """Load research-only collector settings without touching trading config.
+
+    The collector reads public market endpoints and writes its own CSV tree;
+    it never constructs ``Engine``/``RiskEngine`` or receives exchange order
+    credentials. Keeping these settings under ``research.collector`` lets the
+    recorder widen its universe/cadence without changing ``universe`` or any
+    active account risk policy.
+    """
+    raw_settings = {}
+    if path is not None and Path(path).is_file():
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        research = raw.get("research") or {}
+        if not isinstance(research, dict):
+            raise ValueError("config.research must be a mapping")
+        collector = research.get("collector") or {}
+        if not isinstance(collector, dict):
+            raise ValueError("config.research.collector must be a mapping")
+        raw_settings = collector
+    return load_collector_config_from_mapping(raw_settings)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=Path,
-                        default=Path("runtime/research/recorded"))
-    parser.add_argument("--book-interval", type=int, default=300,
+    parser.add_argument("--config", type=Path, default=Path("config.yaml"),
+                        help="config containing research.collector settings")
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--book-interval", type=int, default=None,
                         help="seconds between order-book snapshots")
-    parser.add_argument("--top-n", type=int, default=12)
-    parser.add_argument("--min-volume-usd", type=float, default=30e6)
-    parser.add_argument("--refresh-minutes", type=int, default=60)
+    parser.add_argument("--hourly-interval", type=int, default=None,
+                        help="seconds between hourly-series polls")
+    parser.add_argument("--top-n", type=int, default=None)
+    parser.add_argument("--min-volume-usd", type=float, default=None)
+    parser.add_argument("--refresh-minutes", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=None,
+                        help=f"bounded public-read workers (1-{MAX_COLLECTOR_WORKERS})")
     args = parser.parse_args()
+
+    settings = load_collector_config(args.config)
+    overrides = {
+        "out": args.out,
+        "book_interval_seconds": args.book_interval,
+        "hourly_interval_seconds": args.hourly_interval,
+        "top_n": args.top_n,
+        "min_volume_usd": args.min_volume_usd,
+        "refresh_minutes": args.refresh_minutes,
+        "workers": args.workers,
+    }
+    settings.update({key: value for key, value in overrides.items()
+                     if value is not None})
+    # Revalidate CLI overrides using the same bounded collector contract.
+    settings = load_collector_config_from_mapping(settings)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -457,11 +603,15 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    recorder = Recorder(args.out)
+    if not settings["enabled"]:
+        log.info("research collector disabled by config")
+        return 0
+
+    recorder = Recorder(settings["out"], workers=settings["workers"])
     instruments: list[str] = []
     universe_at = 0.0
     last_hourly = 0.0
-    (args.out / "README.txt").write_text(
+    (settings["out"] / "README.txt").write_text(
         "OKX market data recorded because the exchange deletes it.\n"
         "order_book/       depth snapshots; never served historically\n"
         "long_short_ratio/ retail positioning; ~30 day retention upstream\n"
@@ -473,12 +623,13 @@ def main() -> int:
         "observed_at and settlement_time; realized rows are deduplicated by "
         "settlement and instrument.\n")
 
-    log.info("recording to %s", args.out)
+    log.info("recording to %s", settings["out"])
     while _running:
         cycle_start = time.time()
         try:
-            if cycle_start - universe_at > args.refresh_minutes * 60:
-                found = discover(recorder, args.top_n, args.min_volume_usd)
+            if cycle_start - universe_at > settings["refresh_minutes"] * 60:
+                found = discover(recorder, settings["top_n"],
+                                 settings["min_volume_usd"])
                 if found:
                     instruments = found
                     universe_at = cycle_start
@@ -489,7 +640,8 @@ def main() -> int:
                 continue
 
             written = recorder.capture_books(instruments)
-            if cycle_start - last_hourly > 900:
+            if (cycle_start - last_hourly
+                    > settings["hourly_interval_seconds"]):
                 currencies = sorted({i.split("-")[0] for i in instruments})
                 hourly = recorder.capture_hourly(instruments, currencies)
                 last_hourly = cycle_start
@@ -503,7 +655,8 @@ def main() -> int:
             log.warning("cycle failed: %s", exc)
 
         elapsed = time.time() - cycle_start
-        for _ in range(int(max(1.0, args.book_interval - elapsed))):
+        for _ in range(int(max(
+                1.0, settings["book_interval_seconds"] - elapsed))):
             if not _running:
                 break
             time.sleep(1)

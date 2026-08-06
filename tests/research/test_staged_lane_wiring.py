@@ -15,6 +15,7 @@ from unittest.mock import Mock
 from agent import shadow
 from agent.contract_dsl import validate
 from agent.forward_models import STAGED_HARNESS
+from agent import staged_lane
 from agent.staging import StagingStore
 from tests.helpers import valid_config
 
@@ -41,12 +42,16 @@ def snapshot(liq=900_000.0):
         "funding_interval_hours": 8.0, "next_funding_minutes": 60.0,
         "taker_fee_pct_per_side": 0.05, "atr_1h_pct": 1.0,
         "ema20_1h_dist_pct": 0.2, "signal_ts": 1_800_000_000,
+        "swing_low_pct": 1.2, "swing_high_pct": 1.2,
         "liq_notional_1h_usd": liq,
         "_enrichment": {
-            "book_ts": 1_800_000_000_000, "book_best_bid": 99.99,
-            "book_best_ask": 100.01, "book_spread_pct": 0.02,
-            "book_bid_levels": [[99.99, 500.0]],
-            "book_ask_levels": [[100.01, 500.0]],
+            "ticker_ts": 1_800_000_100_000,
+            "ticker_best_bid": 99.99, "ticker_best_ask": 100.01,
+            "book_ts": 1_800_000_100_000, "book_mid": 100.0,
+            "book_best_bid": 99.99, "book_best_ask": 100.01,
+            "book_spread_pct": 0.02,
+            "book_bid_levels": [[99.99, 5000.0]],
+            "book_ask_levels": [[100.01, 5000.0]],
             "book_contract_size": 0.01, "book_observation_error": None,
         },
     }}
@@ -98,9 +103,41 @@ class StagedLaneIsWiredTests(unittest.TestCase):
         self.assertTrue(evaluator.scope_key.endswith(":staged"))
         variant_id = shadow.staged_variant_id("liq-absorption")
         self.assertEqual(variant_id, "staged.liq_absorption")
+        self.assertIn(
+            shadow.staged_baseline_variant_id("liq-absorption"),
+            evaluator.variant_ids)
         # Measured on the shared harness, not on momentum's.
         self.assertEqual(evaluator._models[variant_id].model_id,
                          STAGED_HARNESS.model_id)
+
+    def test_a_staged_signal_reaches_the_paper_planner(self):
+        store = StagingStore(self.staging)
+        base = contract()
+        store.register({
+            "contract_id": base.contract_id, "mechanism": base.mechanism,
+            "payer": base.payer, "falsifier": base.falsifier,
+            "direction": "both",
+            "conditions": [{"field": "liq_notional_1h_usd", "op": ">=",
+                            "value": 250_000.0}],
+        }, generation=0)
+        from research.findings import FindingsStore
+
+        findings = FindingsStore(Path(self.tmp.name) / "findings.db")
+        cfg = self._cfg(staged=True)
+        evaluators, _ = shadow._build_staged_lane(
+            cfg, "demo:test", findings)
+        evaluator = evaluators[base.contract_id]
+        variant_id = shadow.staged_variant_id(base.contract_id)
+        self.assertFalse(evaluator.registration_errors)
+        proposals = staged_lane.proposals_for(
+            [base], snapshot(), cfg)
+        records = evaluator.evaluate(snapshot(), proposals=proposals,
+                                     now=1_800_000_100.0)
+        decisions = findings.paper_decisions_for(
+            evaluator.scope_key, variant_id)
+        self.assertTrue(records)
+        self.assertTrue(any(
+            row.get("decision_outcome") == "PROPOSED" for row in decisions))
 
     def test_each_mechanism_gets_its_own_evaluator(self):
         store = StagingStore(self.staging)

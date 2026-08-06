@@ -49,7 +49,9 @@ def _load_config() -> dict:
 def _resolve_cfg(variant_id: str) -> dict:
     from agent import variants as variant_mod
     base = _load_config()
-    if variant_id in (None, "", "live", "momentum.baseline"):
+    baseline_id = variant_mod.baseline_variant_id(
+        str(base["strategy"]["id"]))
+    if variant_id in (None, "", "live", baseline_id):
         return base
     registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
     if variant_id not in registry:
@@ -124,6 +126,32 @@ def _price_cache(args: argparse.Namespace):
 
 
 DEFAULT_STAGING_PATH = "research/cache/staging.db"
+DEFAULT_RESEARCH_REVIEW_CAP = 8
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _configured_path(
+        cfg: dict, key: str, requested: str | Path | None,
+        fallback: str | Path) -> Path:
+    """Resolve one research path from an explicit override or config."""
+    configured = requested or (cfg.get("research") or {}).get(key) or fallback
+    path = Path(configured)
+    return path if path.is_absolute() else REPO / path
+
+
+def _configured_staging(cfg: dict,
+                       requested: str | Path | None = None) -> Path:
+    return _configured_path(cfg, "staging_store", requested,
+                            DEFAULT_STAGING_PATH)
 
 
 def _corpus_for(db: Path):
@@ -308,9 +336,12 @@ def _require_g2(db: Path, cfg: dict, cycles: list, outputs: list) -> int:
                   "the replay window: " + ", ".join(changed))
         print(f"G2 capture stale: {reason}", file=sys.stderr)
         return 2
+    from agent.variants import baseline_variant_id
+
+    baseline_id = baseline_variant_id(str(cfg["strategy"]["id"]))
     baseline = replay_mod.Replay(
-        cfg, variant_id="momentum.baseline", mode="recorded_llm").run(
-            cycles, outputs)
+        cfg, variant_id=baseline_id, mode="recorded_llm").run(
+        cycles, outputs)
     baseline.g2_metadata = captured_metadata
     report = replay_mod.fidelity(
         baseline, db, captured_metadata=captured_metadata)
@@ -359,7 +390,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
     if not db.exists():
         print(f"no journal at {db}", file=sys.stderr)
         return 1
-    cfg = _resolve_cfg(args.variant)
+    cfg = _load_config()
+    from agent.variants import baseline_variant_id
+
+    variant_id = args.variant or baseline_variant_id(
+        str(cfg["strategy"]["id"]))
+    cfg = _resolve_cfg(variant_id)
     captured_metadata = None
     if args.check_fidelity:
         cycles, outputs, captured_metadata, changed = _g2_captured_corpus(db)
@@ -371,7 +407,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
     else:
         cycles, outputs = _corpus_for(db)
     result = replay_mod.Replay(
-        cfg, variant_id=args.variant, mode=args.replay_mode,
+        cfg, variant_id=variant_id, mode=args.replay_mode,
         price_cache=_price_cache(args)).run(cycles, outputs)
     result.g2_metadata = captured_metadata
 
@@ -390,9 +426,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     if args.check_fidelity:
         persist_fidelity = not bool(getattr(args, "no_persist", False))
-        if (args.variant not in ("live", "momentum.baseline")
+        baseline_id = baseline_variant_id(str(cfg["strategy"]["id"]))
+        if (variant_id not in ("live", baseline_id)
                 or args.replay_mode != "recorded_llm"):
-            print("G2 must use momentum.baseline in recorded_llm mode.",
+            print(f"G2 must use {baseline_id} in recorded_llm mode.",
                   file=sys.stderr)
             return 2
         report = replay_mod.fidelity(
@@ -507,18 +544,18 @@ def cmd_three_arm(args: argparse.Namespace) -> int:
               f"right-only {comparison['right_only_proposals']:,}, "
               f"duplicates {comparison['left_duplicates'] + comparison['right_duplicates']:,}")
 
-    store = findings_mod.FindingsStore(
-        args.store or findings_mod.DEFAULT_STORE)
-    analysis_id = store.record_analysis("three_arm", "momentum", {
-        "journal": str(db),
-        "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
-        "arms": {
-            mode: {"executed": data["result"].funnel["executed"],
-                   "resolved": len(data["returns"])}
-            for mode, data in arms.items()
-        },
-        "comparisons": comparisons,
-    })
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
+    analysis_id = store.record_analysis(
+        "three_arm", str(cfg["strategy"]["id"]), {
+            "journal": str(db),
+            "fidelity_code_version": replay_mod.fidelity_code_fingerprint(),
+            "arms": {
+                mode: {"executed": data["result"].funnel["executed"],
+                       "resolved": len(data["returns"])}
+                for mode, data in arms.items()
+            },
+            "comparisons": comparisons,
+        })
     print(f"\npersisted paired three-arm analysis {analysis_id} to {store.path}")
 
     print("\nIf all three intervals overlap at the sample available, the "
@@ -594,8 +631,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     from agent import variants as variant_mod
     registry = variant_mod.load_registry(REPO / "research" / "variants.yaml")
-    store = findings_mod.FindingsStore(
-        args.store or findings_mod.DEFAULT_STORE)
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
 
     if spec.is_conditioning():
         axis = spec.condition_axis
@@ -726,9 +762,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 def cmd_forward_qualify(args: argparse.Namespace) -> int:
     """Select an edge from paired real-time shadow outcomes, then paper it."""
     cfg = _load_config()
-    store = findings_mod.FindingsStore(
-        Path(args.store) if args.store else findings_mod.resolve_store_path(
-            (cfg.get("research") or {}).get("findings_store")))
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     registry = _load_experiment_registry(cfg, store)
     for variant in registry.values():
         store.register(variant)
@@ -750,7 +784,8 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
         return 2
     from agent.variants import baseline_variant_id, strategy_variant_prefix
 
-    strategy_id = args.strategy
+    strategy_id = str(getattr(args, "strategy", None)
+                      or cfg["strategy"]["id"])
     # A strategy id and a variant id are different alphabets: hyphens are
     # legal in the first and not in the second.
     variant_prefix = strategy_variant_prefix(strategy_id)
@@ -1080,9 +1115,7 @@ def cmd_t3_packet(args: argparse.Namespace) -> int:
               "together", file=sys.stderr)
         return 2
     cfg = _load_config()
-    store = findings_mod.FindingsStore(
-        Path(args.store) if args.store else findings_mod.resolve_store_path(
-            (cfg.get("research") or {}).get("findings_store")))
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     registry = _load_experiment_registry(cfg, store)
     if args.variant not in registry:
         print(f"unknown variant {args.variant}", file=sys.stderr)
@@ -1117,9 +1150,7 @@ def cmd_t3_packet(args: argparse.Namespace) -> int:
 def cmd_prepare_review_artifacts(args: argparse.Namespace) -> int:
     """Idempotently persist a draft T3 artifact for each ready evidence state."""
     cfg = _load_config()
-    store = findings_mod.FindingsStore(
-        Path(args.store) if args.store else findings_mod.resolve_store_path(
-            (cfg.get("research") or {}).get("findings_store")))
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     db = Path(args.db) if args.db else default_db(args.mode)
     scopes = [args.scope] if args.scope else sorted(store.paper_scopes())
     non_manual = findings_mod.T3_REQUIRED_CHECKS - {
@@ -1172,9 +1203,7 @@ def cmd_prepare_review_artifacts(args: argparse.Namespace) -> int:
 def cmd_report(args: argparse.Namespace) -> int:
     """Regenerate every scorecard from the store, deterministically."""
     cfg = _load_config()
-    store = findings_mod.FindingsStore(
-        Path(args.store) if args.store else findings_mod.resolve_store_path(
-            (cfg.get("research") or {}).get("findings_store")))
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     # Registered-but-unrun variants still get a card: "no sample yet" is a
     # state worth being able to see. Persisted adaptive variants are included
     # so the report cannot hide the exact values the live path tried.
@@ -1193,10 +1222,8 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def _configured_store(cfg: dict, requested: str | Path | None) -> Path:
-    if requested:
-        return Path(requested)
-    return findings_mod.resolve_store_path(
-        (cfg.get("research") or {}).get("findings_store"))
+    return _configured_path(
+        cfg, "findings_store", requested, findings_mod.DEFAULT_STORE)
 
 
 def _latest_verified_external_backup_readonly(
@@ -1395,17 +1422,19 @@ def cmd_readiness(args: argparse.Namespace) -> int:
 
 
 def cmd_research_loop(args: argparse.Namespace) -> int:
-    """Backfill deterministic outcomes and review at most one pending result."""
+    """Backfill outcomes and review a bounded queue of pending results."""
     cfg = _load_config()
-    store = findings_mod.FindingsStore(
-        findings_mod.resolve_store_path(args.store))
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     if args.no_review:
         result = {
             "status": "OUTCOMES_ONLY",
             "outcomes": store.ensure_terminal_experiment_outcomes(),
         }
     else:
-        result = review_mod.process_pending_review(store, cfg)
+        result = review_mod.process_pending_reviews(
+            store, cfg,
+            max_reviews=getattr(
+                args, "max_reviews", DEFAULT_RESEARCH_REVIEW_CAP))
     print(json.dumps(result, sort_keys=True, default=str))
     # Provider and parse failures are persisted and deliberately nonfatal so
     # a nightly invocation can retry without losing the deterministic result.
@@ -1424,21 +1453,36 @@ def cmd_author(args: argparse.Namespace) -> int:
     from research import authoring
 
     cfg = _load_config()
-    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    store = StagingStore(_configured_staging(cfg, args.staging))
+    findings_store = None
     history = {}
     if not args.no_history:
         findings_store = findings_mod.FindingsStore(
-            findings_mod.resolve_store_path(args.store))
+            _configured_store(cfg, args.store))
         try:
             context = findings_store.research_history_context()
         except Exception as exc:  # noqa: BLE001 - history is an input, not a gate
             print(f"history unavailable, proposing without it: {exc}",
                   file=sys.stderr)
             context = {}
+        completed = list((context or {}).get("completed_outcomes", []))
+        failed = list((context or {}).get("failed_exact_settings", []))
+        retryable = list((context or {}).get(
+            "retryable_inconclusive_assignments", []))
+        # ``completed_outcomes`` is the durable compatibility surface; the
+        # narrower keys are preferred when present, with verdict filtering as
+        # a safe fallback for stores written before those projections existed.
+        if not failed:
+            failed = [item for item in completed
+                      if str(item.get("verdict") or "").upper() == "FAILED"]
+        if not retryable:
+            retryable = [item for item in completed
+                         if str(item.get("verdict") or "").upper()
+                         == "INCONCLUSIVE"]
         history = {
-            "falsified": list((context or {}).get("failed_outcomes", [])),
-            "inconclusive": list((context or {}).get(
-                "retryable_inconclusive_assignments", [])),
+            "falsified": failed,
+            "inconclusive": retryable,
+            "completed_outcomes": completed,
         }
         # What previous generations of authored mechanisms learned. Without
         # this the proposer sees which of its own claims are staged but not
@@ -1455,11 +1499,13 @@ def cmd_author(args: argparse.Namespace) -> int:
             print(f"staged history unavailable: {exc}", file=sys.stderr)
     if args.dry_run:
         request = authoring.build_request(
-            store, history=history, max_proposals=args.max_proposals)
+            store, history=history, max_proposals=args.max_proposals,
+            findings_store=findings_store)
         print(json.dumps(request, indent=2, sort_keys=True, default=str))
         return 0
     result = authoring.author_generation(
-        store, cfg, history=history, max_proposals=args.max_proposals)
+        store, cfg, history=history, max_proposals=args.max_proposals,
+        findings_store=findings_store)
     print(json.dumps(result, sort_keys=True, default=str))
     # A failed provider call is recorded and retried on the next cadence
     # rather than failing the nightly run around it.
@@ -1476,7 +1522,8 @@ def cmd_stage_seed(args: argparse.Namespace) -> int:
     from agent.staging import StagingStore
     from research import staging_seed
 
-    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    cfg = _load_config()
+    store = StagingStore(_configured_staging(cfg, args.staging))
     try:
         entries = staging_seed.load(args.file)
     except staging_seed.SeedError as exc:
@@ -1499,7 +1546,8 @@ def cmd_staged(args: argparse.Namespace) -> int:
     """List staged mechanisms and what each one claims."""
     from agent.staging import StagingStore
 
-    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    cfg = _load_config()
+    store = StagingStore(_configured_staging(cfg, args.staging))
     contracts = store.active()
     if not contracts:
         print("no staged mechanisms")
@@ -1526,10 +1574,10 @@ def cmd_shortlist(args: argparse.Namespace) -> int:
     """
     from research import shortlist as shortlist_mod
 
-    store = findings_mod.FindingsStore(
-        findings_mod.resolve_store_path(args.store))
+    cfg = _load_config()
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     staging = None
-    staging_path = args.staging or DEFAULT_STAGING_PATH
+    staging_path = _configured_staging(cfg, args.staging)
     if Path(staging_path).is_file():
         from agent.staging import StagingStore
 
@@ -1563,17 +1611,90 @@ def cmd_review_staged(args: argparse.Namespace) -> int:
     from agent.staging import StagingStore
     from research import staged_review
 
-    staging_path = args.staging or DEFAULT_STAGING_PATH
+    cfg = _load_config()
+    staging_path = _configured_staging(cfg, args.staging)
     if not Path(staging_path).is_file():
         print("no staged mechanisms")
         return 0
-    store = findings_mod.FindingsStore(
-        findings_mod.resolve_store_path(args.store))
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
     result = staged_review.review(
         StagingStore(staging_path), store, scope_key=args.scope,
         retire=not args.dry_run)
     print(json.dumps(result, sort_keys=True, default=str))
     return 0
+
+
+def cmd_qualify_staged(args: argparse.Namespace) -> int:
+    """Start isolated local PAPER for supported staged mechanisms only."""
+    from agent.staging import StagingStore
+    from research import staged_review
+
+    cfg = _load_config()
+    staging_path = _configured_staging(cfg, args.staging)
+    if not staging_path.is_file():
+        print(json.dumps({"status": "NO_STAGING_STORE"}, sort_keys=True))
+        return 0
+
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
+    staging = StagingStore(staging_path)
+    requested_scope = str(args.scope or "").strip() or None
+    if requested_scope is not None and not requested_scope.endswith(":staged"):
+        print("--scope must identify a staged shadow lane", file=sys.stderr)
+        return 2
+
+    if requested_scope is not None:
+        scopes = [requested_scope]
+    else:
+        scopes = sorted(
+            scope for scope in store.paper_scopes()
+            if str(scope).endswith(":staged"))
+
+    qualified, skipped, errors = [], [], []
+    for scope in scopes:
+        review = staged_review.review(
+            staging, store, scope_key=scope, retire=False)
+        for entry in review.get("verdicts", []):
+            if entry.get("code") != staged_review.SUPPORTED:
+                skipped.append({
+                    "scope_key": scope,
+                    "variant_id": entry.get("variant_id"),
+                    "code": entry.get("code"),
+                })
+                continue
+            variant_id = str(entry.get("variant_id") or "")
+            if not variant_id:
+                errors.append({"scope_key": scope, "error": "missing variant_id"})
+                continue
+            try:
+                event_id = store.qualify_staged_variant(
+                    variant_id,
+                    detail={"review": entry},
+                    scope_key=scope,
+                )
+            except Exception as exc:                       # noqa: BLE001
+                errors.append({
+                    "scope_key": scope,
+                    "variant_id": variant_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            qualified.append({
+                "scope_key": scope,
+                "variant_id": variant_id,
+                "event_id": event_id,
+                "paper_mode": "isolated_local",
+                "live_promotion": False,
+            })
+
+    result = {
+        "status": "QUALIFIED" if qualified else "NO_SUPPORTED_STAGED_EDGES",
+        "scopes": scopes,
+        "qualified": qualified,
+        "skipped": skipped,
+        "errors": errors,
+    }
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 2 if errors else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1602,8 +1723,8 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument("--mode", default="demo",
                                choices=["demo", "live"])
     replay_parser.add_argument(
-        "--variant", default="momentum.baseline",
-        help="registered variant id (see research/variants.yaml)")
+        "--variant", default=None,
+        help="registered variant id; defaults to config.strategy.id baseline")
     replay_parser.add_argument(
         "--replay-mode", default="recorded_llm", choices=replay_mod.MODES,
         help="proposer mode")
@@ -1660,7 +1781,9 @@ def build_parser() -> argparse.ArgumentParser:
     forward = sub.add_parser(
         "forward-qualify",
         help="select an edge from paired real-time shadow outcomes")
-    forward.add_argument("--strategy", default="momentum")
+    forward.add_argument(
+        "--strategy", default=None,
+        help="strategy id; defaults to validated config.strategy.id")
     forward.add_argument("--scope", default=None,
                          help="runtime/account scope; auto-detected if unique")
     forward.add_argument("--store", default=None,
@@ -1755,6 +1878,18 @@ def build_parser() -> argparse.ArgumentParser:
                                help="report verdicts without retiring")
     review_staged.set_defaults(func=cmd_review_staged)
 
+    qualify_staged = sub.add_parser(
+        "qualify-staged",
+        help="start isolated local PAPER for supported staged mechanisms")
+    qualify_staged.add_argument("--store", default=None,
+                                help="findings.db path")
+    qualify_staged.add_argument("--staging", default=None,
+                                help="staging.db path")
+    qualify_staged.add_argument(
+        "--scope", default=None,
+        help="one deterministic staged scope; otherwise process all staged scopes")
+    qualify_staged.set_defaults(func=cmd_qualify_staged)
+
     shortlist_parser = sub.add_parser(
         "shortlist", help="rank measured candidates and state the evidence")
     shortlist_parser.add_argument("--store", default=None,
@@ -1801,9 +1936,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     learning = sub.add_parser(
         "research-loop",
-        help="backfill terminal outcomes and review one pending result")
+        help="backfill terminal outcomes and review a bounded pending queue")
     learning.add_argument("--store", default=None,
                           help="findings.db path")
+    learning.add_argument(
+        "--max-reviews", type=_positive_int,
+        default=DEFAULT_RESEARCH_REVIEW_CAP,
+        help=("maximum terminal experiment reviews per invocation "
+              f"(default: {DEFAULT_RESEARCH_REVIEW_CAP})"))
     learning.add_argument(
         "--no-review", action="store_true",
         help="only create missing deterministic outcomes; do not call an LLM")

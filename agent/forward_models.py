@@ -476,7 +476,8 @@ STAGED_HARNESS = ForwardOutcomeModel(
     cost_assumption="observed depth-VWAP taker entry, fee and exit "
                     "spread/stop slippage, realized funding events",
     holding_assumption="stop/target first, otherwise a 24h timeout",
-    required_fields=_COMMON_COST_FIELDS + ("signal_ts",),
+    required_fields=_COMMON_COST_FIELDS + (
+        "signal_ts", "swing_low_pct", "swing_high_pct"),
     signal_timestamp_field="signal_ts", invalidation_anchor="structure",
     exit_policy="fixed_rr", stop_atr_multiple=1.0, reward_risk=2.0,
     contract_complete=True,

@@ -25,14 +25,28 @@ from .forward_models import STAGED_HARNESS, _field, _finite
 STAGED_SETUP_TYPE = "staged_mechanism"
 
 
+def candidate_variant_id(contract_id: str) -> str:
+    """Stable staged candidate identity shared by proposal and paper lanes."""
+    import re
+
+    slug = re.sub(r"[^a-z0-9]+", "_", str(contract_id).lower()).strip("_")
+    return f"staged.{slug}"
+
+
+def baseline_variant_id(contract_id: str) -> str:
+    """Stable neutral baseline identity paired with one staged contract."""
+    return f"{candidate_variant_id(contract_id)}.baseline"
+
+
 def proposals_for(contracts: list[ProposedContract], snapshot: dict,
-                  cfg: dict) -> list[dict]:
-    """Emit one proposal per staged mechanism, symbol and eligible direction.
+                  cfg: dict, *, baseline: bool = False) -> list[dict]:
+    """Emit candidate or paired-baseline proposals per symbol/direction.
 
     Both directions are emitted for a two-sided contract even when only one
     can fire, matching what the registered contracts do: a baseline and a
     candidate must see the same proposal identity so the comparison stays
-    paired when one side vetoes.
+    paired when one side vetoes. ``baseline=True`` makes the same opportunity
+    unconditional while retaining all market-data starvation checks.
     """
     del cfg  # thresholds live on the contract, not in configuration
     model = STAGED_HARNESS
@@ -67,6 +81,10 @@ def proposals_for(contracts: list[ProposedContract], snapshot: dict,
                     "model_id": model.model_id,
                     "signal_ts": signal_ts,
                 }
+                candidate_id = candidate_variant_id(contract.contract_id)
+                target_variant_id = (baseline_variant_id(contract.contract_id)
+                                     if baseline else candidate_id)
+                proposal["target_variant_id"] = target_variant_id
                 # Data problems outrank the contract's own opinion: a
                 # mechanism that "declined" on a snapshot it could not read
                 # has not been tested, and recording it as a decline would
@@ -77,6 +95,12 @@ def proposals_for(contracts: list[ProposedContract], snapshot: dict,
                 elif missing:
                     proposal["research_refusal_reason"] = (
                         "data missing: " + ", ".join(missing))
+                elif baseline:
+                    # The neutral arm is deliberately unconditional on the
+                    # same eligible opportunity. It receives the same
+                    # proposal identity and fixed exit policy as the
+                    # candidate, but never evaluates the candidate's signal.
+                    pass
                 else:
                     fired, reason = compiled[contract.contract_id](
                         row, direction, {}, {})
@@ -96,6 +120,10 @@ def coverage(proposals: list[dict]) -> dict:
     """
     per: dict[str, dict] = {}
     for proposal in proposals:
+        # The paired neutral account is persisted for inference, but lane
+        # coverage is reported for the authored mechanism only.
+        if str(proposal.get("target_variant_id") or "").endswith(".baseline"):
+            continue
         contract_id = str(proposal.get("contract_id") or "unknown")
         bucket = per.setdefault(
             contract_id, {"fired": 0, "declined": 0, "starved": 0})

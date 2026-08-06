@@ -29,15 +29,60 @@ else
 fi
 MODE="${AGENT_MODE:-demo}"
 DAYS="${HISTORY_DAYS:-730}"
+# Bound the LLM review queue so one nightly run cannot monopolise the
+# provider or starve the rest of the evidence pipeline. Override explicitly
+# for an operator-run batch; the shipped nightly cap is eight outcomes.
+RESEARCH_REVIEW_CAP="${RESEARCH_REVIEW_CAP:-8}"
 
 if [ ! -x "$PY" ]; then
   echo "no interpreter at $PY (set PYTHON=/path/to/python)" >&2
   exit 2
 fi
 
+# Resolve research paths and the active strategy through the same validated
+# config used by ``research.py``. Environment overrides remain explicit
+# operator choices, but the defaults must not drift from config.yaml.
+CONFIG_PATH="$ROOT/config.yaml"
+CONFIG_VALUES="$($PY - "$CONFIG_PATH" "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+from agent.config import validate_config
+from agent.variants import baseline_variant_id
+
+config_path, repo = sys.argv[1:]
+with open(config_path, encoding="utf-8") as handle:
+    cfg = validate_config(yaml.safe_load(handle) or {})
+research = cfg.get("research") or {}
+root = Path(repo)
+
+def resolve(value, fallback):
+    path = Path(value or fallback)
+    return path if path.is_absolute() else root / path
+
+print("\t".join((
+    str(resolve(research.get("findings_store"),
+                "research/cache/findings.db")),
+    str(resolve(research.get("staging_store"),
+                "research/cache/staging.db")),
+    str(cfg["strategy"]["id"]),
+    baseline_variant_id(str(cfg["strategy"]["id"])),
+)))
+PY
+)"
+IFS=$'\t' read -r CONFIG_FINDINGS CONFIG_STAGING CONFIG_STRATEGY \
+  CONFIG_BASELINE <<<"$CONFIG_VALUES"
+
 PRICES="${PRICE_CACHE:-$ROOT/research/cache/prices.db}"
 JOURNAL="${JOURNAL_DB:-$ROOT/runtime/$MODE/journal.db}"
-STORE="${FINDINGS_DB:-$ROOT/research/cache/findings.db}"
+# These stores are part of runtime identity. Do not allow a nightly-only
+# environment override to point research at a different database than the
+# running trader uses.
+STORE="$CONFIG_FINDINGS"
+STAGING="$CONFIG_STAGING"
+STRATEGY_ID="$CONFIG_STRATEGY"
+BASELINE_VARIANT="$CONFIG_BASELINE"
 
 # Qualification must name the deterministic feed lane. A wildcard shadow
 # build also creates a sibling ``:llm`` scope, and guessing between the two
@@ -85,26 +130,32 @@ fi
 echo "=== $(date -u +%FT%TZ) readiness ==="
 # Readiness runs first because it detects a possibly resting passive order;
 # nonzero is an operational failure, not a collection delay.
-"$PY" research.py readiness --db "$JOURNAL" || readiness_failed=1
+"$PY" research.py readiness --db "$JOURNAL" --store "$STORE" \
+  || readiness_failed=1
 
-# Generation runs before review and is not gated on a terminal outcome.
-# The reviewer needs a finished assignment to have something to explain;
-# when nothing has finished, generation is exactly what the loop needs.
-# Verdicts before generation, deliberately: a proposer that has not yet been
-# told why the last batch died will restate a dead claim at a slightly
-# different threshold, which is the same claim wearing a different number.
+# Staged verdicts run before generation, deliberately: a proposer that has
+# not yet been told why the last batch died will restate a dead claim at a
+# slightly different threshold, which is the same claim wearing a different
+# number. Generation is still not gated on a terminal outcome; when nothing
+# has finished, it is exactly what the loop needs.
 echo "=== $(date -u +%FT%TZ) adjudicating staged mechanisms ==="
-"$PY" research.py review-staged --store "$STORE" \
+"$PY" research.py review-staged --store "$STORE" --staging "$STAGING" \
   || echo "  (staged review unavailable this cycle)"
 
+echo "=== $(date -u +%FT%TZ) starting supported staged PAPER lanes ==="
+"$PY" research.py qualify-staged --store "$STORE" --staging "$STAGING" \
+  || echo "  (staged PAPER qualification unavailable this cycle)"
+
 echo "=== $(date -u +%FT%TZ) authoring new candidate mechanisms ==="
-"$PY" research.py author --store "$STORE" \
+"$PY" research.py author --store "$STORE" --staging "$STAGING" \
   || echo "  (authoring unavailable this cycle; retried next run)"
 
 echo "=== $(date -u +%FT%TZ) research learning loop ==="
-# One invocation reviews at most one completed outcome. Provider or parse
-# failures are persisted for retry and must not abort the wider nightly run.
+# One invocation reviews a bounded queue of completed outcomes. Provider or
+# parse failures are persisted per item and must not abort later reviews or
+# the wider nightly run.
 "$PY" research.py research-loop --store "$STORE" \
+  --max-reviews "$RESEARCH_REVIEW_CAP" \
   || echo "WARNING: research review deferred; deterministic outcomes remain stored" >&2
 
 if [ -f "$JOURNAL" ]; then
@@ -115,7 +166,7 @@ if [ -f "$JOURNAL" ]; then
   # Hard gate. Nothing below this line means anything if the replay cannot
   # reproduce what the agent actually decided.
   set +e
-  "$PY" research.py replay --db "$JOURNAL" --variant momentum.baseline \
+  "$PY" research.py replay --db "$JOURNAL" --variant "$BASELINE_VARIANT" \
     --replay-mode recorded_llm --check-fidelity
   g2=$?
   set -e
@@ -144,14 +195,16 @@ if [ -f "$JOURNAL" ]; then
     # A sweep that refuses an underpowered grid exits 3. That is a correct
     # outcome, not a failure of the run.
     "$PY" research.py sweep "$spec" --db "$JOURNAL" --prices "$PRICES" \
+      --store "$STORE" \
       || echo "  (refused or incomplete; see above)"
   done
 
   echo "=== $(date -u +%FT%TZ) three-arm H-E ==="
-  "$PY" research.py three-arm --db "$JOURNAL" --prices "$PRICES" || true
+  "$PY" research.py three-arm --db "$JOURNAL" --prices "$PRICES" \
+    --store "$STORE" || true
 
   echo "=== $(date -u +%FT%TZ) paired real-time variant qualification ==="
-  forward_args=(forward-qualify --store "$STORE")
+  forward_args=(forward-qualify --store "$STORE" --strategy "$STRATEGY_ID")
   if [ -n "$FORWARD_SCOPE" ]; then
     forward_args+=(--scope "$FORWARD_SCOPE")
   fi
@@ -166,7 +219,7 @@ if [ -f "$JOURNAL" ]; then
     || echo "WARNING: review artifact preparation deferred" >&2
 
   echo "=== $(date -u +%FT%TZ) candidate shortlist ==="
-  "$PY" research.py shortlist --store "$STORE" \
+  "$PY" research.py shortlist --store "$STORE" --staging "$STAGING" \
     --out "$ROOT/research/results/shortlist.md" || true
 
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="

@@ -13,30 +13,33 @@ and `scalp-maker`. `funding-carry`, `funding-unwind`, and `trend-multiday` are
 registered offline-only models. Only the configured main strategy can reach the
 demo exchange.
 
-Each realtime strategy continuously keeps its baseline and at most one candidate
-setting. The four lanes use one snapshot/timestamp and deterministic contract
-proposals. They are logically isolated, but the coordinator intentionally
-evaluates them in a bounded sequence and serializes durable writes rather than
-creating four simultaneous SQLite writers. Candidate rotation is serial per
-strategy. The default assignment floor is both ten elapsed days and 100
-comparable paired observations. State survives restart in the schema-16
-findings store.
+Each realtime strategy continuously keeps one shared baseline and a bounded
+batch of pre-registered candidate settings (four by shipped config, hard cap
+eight per lane). Every assignment still tests only one candidate setting. The
+four lanes use one snapshot/timestamp and deterministic contract proposals.
+Packet computation is bounded and may run concurrently; durable SQLite writes
+remain serialized. Candidate batches are isolated per strategy and survive
+restart in the schema-16 findings store. The default assignment floor is both
+ten elapsed days and 100 comparable paired observations.
 
-These four lanes produce eight deterministic comparison arms. The separate
-`:llm` sibling may hold its own baseline and candidate, adding two
-non-comparable arms for a runtime maximum of ten when present.
+At shipped configuration, these four lanes can produce up to twenty
+deterministic comparison arms (one baseline plus four candidates per lane).
+The hard cap permits up to thirty-six deterministic arms if every lane uses
+eight candidates. The separate `:llm` sibling remains a distinct,
+non-comparable population.
 
-The LLM can submit one bounded research-only selection. Invalid selections and
-their reasons persist. Accepted selections queue and never preempt an active
-assignment. A separate nightly research prompt explains one immutable terminal
-outcome and may nominate one next registered setting; it cannot alter the
-verdict or authorize execution. That same single review may preserve one
-strictly declarative, non-executable hypothesis draft against allowlisted
-numeric snapshot keys from the immutable persisted `llm_input` corpus consumed
-through `research.corpus`; those keys need not appear in terminal aggregates.
-The draft creates no variant or selection, changes no configuration, tier,
-portfolio, or order authority, and must be manually reviewed and registered in
-a later code change before research can use it.
+The LLM can submit one bounded research-only selection per decision context.
+Invalid selections and their reasons persist. Accepted selections queue and
+never preempt an active assignment. A nightly run processes a bounded queue of
+terminal outcomes (default eight); each research-only review explains one
+immutable outcome and may nominate one next registered setting. It cannot alter
+the verdict or authorize execution. A review may also preserve one strictly
+declarative, non-executable hypothesis draft against allowlisted numeric
+snapshot keys from the immutable persisted `llm_input` corpus consumed through
+`research.corpus`; those keys need not appear in terminal aggregates. The draft
+creates no variant or selection, changes no configuration, tier, portfolio, or
+order authority, and must be manually reviewed and registered in a later code
+change before research can use it.
 
 The active simulator scope is `forward_feed_version: 8`. Feed v8 makes the
 four realtime lanes deterministic; the three long-horizon models remain
@@ -49,8 +52,9 @@ Staged mechanisms are a separate population. They arrive either from
 `research.py author`, which proposes from what the evidence has killed, or
 from `research.py stage-seed`, which registers the hand-written
 pre-registrations kept in `research/staged/pre-registered.yaml`. They live in
-`research/cache/staging.db`, run in a `:staged` scope with one paper account
-each on a single fixed measurement harness, and receive their own coded
+`research/cache/staging.db`, run in a `:staged` scope with an isolated paper
+account plus a paired neutral baseline per mechanism on a single fixed
+measurement harness, and receive their own coded
 verdicts from `research.py review-staged`: `NEGATIVE_EXPECTANCY`,
 `DIED_OUT_OF_SAMPLE` and `NEVER_FIRED` retire a mechanism, while
 `STARVED_OF_DATA` never does because a claim evaluated on snapshots it could
@@ -64,6 +68,32 @@ checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
 current v8 forward qualification is still required and there is no automatic
 live promotion.
+
+### Authoring context and contract boundary
+
+The authoring model receives a bounded projection of persisted findings. When
+the store contains the relevant fields, the request includes firing rates,
+conditional returns, feature distributions, missing-data rates, regime/asset/
+time segments, null-model results, near-miss candidates, held-out degradation,
+feature correlations, and mechanism families already tested. Missing raw
+feature or regime observations are omitted rather than reconstructed or
+invented.
+
+The accepted contract language is deterministic and bounded. It supports
+lagged values, rolling changes, percentile ranks, volatility and regime
+filters, event sequences, bounded feature interactions, order-book imbalance,
+and liquidity states. Cross-sectional rank fails closed because a staged
+evaluation currently has one symbol row rather than a complete universe. The
+authoring model cannot author exits, horizons, stops, targets, sizing, or
+network/file operations.
+
+Staged qualification is deliberately two-layered only in its first step: the
+signal is screened under the fixed neutral harness (one-ATR minimum structure
+stop, fixed 2R target, observed costs, 24-hour timeout). A later
+strategy-specific horizon/exit optimization stage is not yet automatically
+connected. Support also requires minimum firing and opportunity coverage,
+matched baseline evidence, zero-return treatment for eligible declines,
+held-out confirmation, and family-level multiple-testing correction.
 
 ## Authoritative journal path
 
@@ -118,6 +148,13 @@ research workflow, and is never a current runtime or findings-store input.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify
+./.venv/bin/python research.py author --dry-run
+./.venv/bin/python research.py author
+./.venv/bin/python research.py stage-seed
+./.venv/bin/python research.py staged
+./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py qualify-staged
+./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts

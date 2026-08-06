@@ -3,6 +3,11 @@
 Written before the evidence exists, so the decision cannot be made by
 whoever is looking at the numbers when they arrive.
 
+> Historical order-path decision record. Its corpus measurements and
+> pre-commitment language remain immutable evidence. For the current active
+> configuration and P0-P2 research flow, use the root `README.md`,
+> `SETUP.md`, `OPERATIONS.md`, and `research/README.md`.
+
 ## The state this replaces
 
 `momentum` occupied the order path because it was the only strategy with

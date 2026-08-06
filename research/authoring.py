@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 from agent.contract_dsl import (MAX_CONDITIONS, OBSERVABLE_FIELDS,
+                                SUPPORTED_PRIMITIVES,
                                 ContractProposalError, validate)
 from agent.staging import StagingError, StagingStore
 
@@ -41,10 +43,21 @@ go up after X" is not a mechanism; it is a pattern, and patterns at this \
 sample size are noise. State the participant on the other side, why they are \
 transacting at a price that is bad for them, and why they cannot simply stop.
 
-You may only compare observed market fields. The exact fields available are \
+You may compare observed market fields or use one bounded deterministic signal \
+primitive. The exact scalar fields available are \
 supplied in the request; naming anything else is rejected. Operators are >, \
 >=, < and <=. A threshold outside a field's observed range fires always or \
 never, so it measures nothing while occupying a research lane for weeks.
+
+Supported primitives are lagged_value and rolling_change over persisted \
+execution_bars; percentile_rank over persisted funding/positioning percentile \
+fields; volatility_filter over atr_1h_ratio; regime_filter over the persisted \
+regime label; event_sequence over realized funding events; a two-field \
+feature_interaction; order_book_imbalance; and liquidity_state. The staged \
+runtime has one symbol row, so cross_sectional_rank is rejected until a full \
+universe context is explicitly wired. Do not author exits, horizons, stops, \
+targets, sizing, or network/file operations: the fixed neutral staged harness \
+owns those.\
 
 The request tells you which mechanisms have already been falsified and why. \
 Do not repropose a killed mechanism with a cosmetic change: if crowded \
@@ -55,7 +68,9 @@ Respond with JSON only:
 {"proposals": [{"contract_id": "lowercase-id", "mechanism": "...", \
 "payer": "...", "falsifier": "...", "direction": "long|short|both", \
 "conditions": [{"field": "...", "op": ">=", "value": 0.0, \
-"when_direction": "long|short (optional)"}], "notes": "..."}], \
+"when_direction": "long|short (optional)"}], \
+"primitives": [{"primitive": "rolling_change", "field": "close", \
+"window": 3, "mode": "pct", "op": ">", "value": 0.5}], "notes": "..."}], \
 "reasoning": "why these, given what has already failed"}
 
 Each of mechanism, payer and falsifier must be a real sentence. A falsifier \
@@ -64,14 +79,26 @@ must name the observation that would end the claim, not an intention to look.\
 
 
 def build_request(store: StagingStore, *, history: dict | None = None,
-                  max_proposals: int = 4) -> dict:
-    """Assemble what a proposer needs: the field list, and what has died."""
+                  max_proposals: int = 4, findings_store=None,
+                  evidence: dict | None = None) -> dict:
+    """Assemble the bounded research context a proposer needs.
+
+    The staging store remains the source of registration state.  Evidence is
+    read separately from the append-only findings store (or supplied by a
+    caller that already loaded it), so authoring cannot mutate or reinterpret
+    an immutable claim while preparing a prompt.
+    """
     active = store.active()
+    if evidence is None:
+        from .authoring_context import build_evidence_context
+
+        evidence = build_evidence_context(findings_store, history=history)
     return {
         "task": "propose_mechanisms",
         "max_proposals": min(int(max_proposals), MAX_PER_GENERATION),
         "generation": store.generation() + 1,
         "observable_fields": sorted(OBSERVABLE_FIELDS),
+        "supported_primitives": list(SUPPORTED_PRIMITIVES),
         "max_conditions_per_contract": MAX_CONDITIONS,
         "already_staged": [
             {"contract_id": contract.contract_id,
@@ -84,6 +111,7 @@ def build_request(store: StagingStore, *, history: dict | None = None,
         "falsified": (history or {}).get("falsified", []),
         "inconclusive": (history or {}).get("inconclusive", []),
         "notes": (history or {}).get("notes", ""),
+        "evidence": evidence,
     }
 
 
@@ -146,10 +174,15 @@ def register_generation(store: StagingStore, proposals: list,
 
 def author_generation(store: StagingStore, cfg: dict, *, author=None,
                       history: dict | None = None, max_proposals: int = 4,
+                      findings_store=None, evidence: dict | None = None,
                       now: float | None = None) -> dict:
     """One authoring pass. Provider failure is recorded, never fatal."""
     generation = store.generation() + 1
-    request = build_request(store, history=history, max_proposals=max_proposals)
+    if findings_store is None:
+        findings_store = _findings_store_from_config(cfg)
+    request = build_request(
+        store, history=history, max_proposals=max_proposals,
+        findings_store=findings_store, evidence=evidence)
     raw = None
     try:
         proposer = author or _default_author(cfg)
@@ -170,6 +203,25 @@ def author_generation(store: StagingStore, cfg: dict, *, author=None,
     result["status"] = "AUTHORED" if result["accepted"] else "NOTHING_ACCEPTED"
     result["reasoning"] = reasoning
     return result
+
+
+def _findings_store_from_config(cfg: dict):
+    """Best-effort read-only evidence source for the nightly author path."""
+    try:
+        from .findings import FindingsStore, resolve_store_path
+
+        research_cfg = (cfg or {}).get("research") or {}
+        if not research_cfg:
+            return None
+        configured = research_cfg.get("findings_store")
+        if not configured:
+            return None
+        path = resolve_store_path(configured)
+        if not Path(path).is_file():
+            return None
+        return FindingsStore(path)
+    except Exception:  # noqa: BLE001 - evidence must never block authoring
+        return None
 
 
 def _default_author(cfg: dict):

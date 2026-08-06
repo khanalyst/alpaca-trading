@@ -530,6 +530,8 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         _keys(research, {"shadow_enabled", "shadow_variants",
                          "shadow_budget_ms",
                          "shadow_workers",
+                         "experiment_candidate_batch_size",
+                         "collector",
                          "findings_store", "backup_target",
                          # Optional. Machine-authored mechanisms live in a
                          # separate append-only store so a proposed claim can
@@ -545,6 +547,42 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         _number(research, "shadow_budget_ms", 0, 60_000, "research")
         if "shadow_workers" in research:
             _integer(research, "shadow_workers", 1, 32, "research")
+        if "experiment_candidate_batch_size" in research:
+            _integer(research, "experiment_candidate_batch_size", 1, 8,
+                     "research")
+        if "collector" in research:
+            collector = _mapping(research["collector"],
+                                 "research.collector")
+            _keys(collector, {
+                "enabled", "out", "top_n", "min_volume_usd",
+                "book_interval_seconds", "hourly_interval_seconds",
+                "refresh_minutes", "workers",
+            }, "research.collector")
+            if "enabled" in collector:
+                _boolean(collector, "enabled", "research.collector")
+            if "out" in collector and (
+                    not isinstance(collector["out"], str)
+                    or not collector["out"].strip()):
+                raise ConfigError(
+                    "research.collector.out must be a path string")
+            if "top_n" in collector:
+                _integer(collector, "top_n", 1, 500,
+                         "research.collector")
+            if "min_volume_usd" in collector:
+                _number(collector, "min_volume_usd", 0, 1_000_000_000_000,
+                        "research.collector")
+            if "book_interval_seconds" in collector:
+                _integer(collector, "book_interval_seconds", 1, 86_400,
+                         "research.collector")
+            if "hourly_interval_seconds" in collector:
+                _integer(collector, "hourly_interval_seconds", 60,
+                         7 * 86_400, "research.collector")
+            if "refresh_minutes" in collector:
+                _integer(collector, "refresh_minutes", 1, 7 * 24 * 60,
+                         "research.collector")
+            if "workers" in collector:
+                _integer(collector, "workers", 1, 32,
+                         "research.collector")
         if "paper_initial_balance_usdt" in research:
             _number(research, "paper_initial_balance_usdt", 100,
                     1_000_000_000, "research")

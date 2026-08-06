@@ -1,6 +1,7 @@
 """Funding provenance for the forward market-data recorder."""
 
 import csv
+import threading
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -8,11 +9,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from research.record_flow import (
+    MAX_COLLECTOR_WORKERS,
     FUNDING_FIELDS,
     FUNDING_FORECAST_SOURCE,
     FUNDING_REALIZED_SOURCE,
     LEGACY_FUNDING_FIELDS,
     Recorder,
+    load_collector_config,
+    load_collector_config_from_mapping,
 )
 
 
@@ -193,6 +197,63 @@ class FundingCaptureTests(unittest.TestCase):
         self.assertEqual(
             recorder.append("funding", FUNDING_FIELDS, [realized]), 0)
         self.assertEqual(len(list((self.root / "funding").glob("*.csv"))), 1)
+
+
+class CollectorIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def test_collector_settings_are_separate_from_active_universe(self):
+        config = self.root / "config.yaml"
+        config.write_text(
+            "mode: demo\n"
+            "universe:\n"
+            "  top_n: 2\n"
+            "research:\n"
+            "  collector:\n"
+            "    out: collected\n"
+            "    top_n: 80\n"
+            "    workers: 7\n",
+            encoding="utf-8")
+
+        settings = load_collector_config(config)
+
+        self.assertEqual(settings["top_n"], 80)
+        self.assertEqual(settings["workers"], 7)
+        self.assertEqual(settings["out"], Path("collected"))
+
+    def test_book_reads_can_parallelize_but_append_is_serialized(self):
+        recorder = Recorder(self.root, workers=4)
+        entered = threading.Barrier(4)
+        worker_ids = set()
+        append_ids = []
+
+        def fake_book(inst_id):
+            worker_ids.add(threading.get_ident())
+            entered.wait(timeout=2)
+            return {"ts": 1, "inst_id": inst_id}
+
+        def fake_append(series, fields, rows):  # noqa: ARG001
+            append_ids.append(threading.get_ident())
+            return len(rows)
+
+        recorder.order_book = fake_book
+        recorder.append = fake_append
+        written = recorder.capture_books(["A", "B", "C", "D"])
+
+        self.assertEqual(written, 4)
+        self.assertGreaterEqual(len(worker_ids), 2)
+        self.assertEqual(append_ids, [threading.get_ident()])
+
+    def test_worker_limit_is_bounded(self):
+        recorder = Recorder(self.root, workers=MAX_COLLECTOR_WORKERS * 4)
+        self.assertEqual(recorder.workers, MAX_COLLECTOR_WORKERS)
+
+    def test_unknown_collector_setting_is_rejected(self):
+        with self.assertRaises(ValueError):
+            load_collector_config_from_mapping({"place_orders": True})
 
 
 if __name__ == "__main__":

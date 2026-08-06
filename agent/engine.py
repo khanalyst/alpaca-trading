@@ -931,6 +931,34 @@ class Engine:
         # Refresh their held symbols even after the live universe reranks, and
         # advance them before every pause/day-stop/cadence/LLM early return.
         evaluator = getattr(self, "shadow", None)
+        if evaluator is not None:
+            # The nightly authoring process may add or retire staged research
+            # mechanisms while this long-running trader stays up. Refresh
+            # only the research coordinator at the cycle boundary; the
+            # method reuses existing paper accounts and never touches the
+            # registered strategy evaluators or live order state.
+            refresh = getattr(evaluator, "refresh_staged_lanes", None)
+            if callable(refresh):
+                try:
+                    refresh_report = refresh(now=now)
+                    if refresh_report.get("status") in {
+                            "changed", "partial", "error"}:
+                        state.log_event(
+                            "shadow_staged_refresh",
+                            self._audit_json(refresh_report))
+                except Exception as exc:                  # noqa: BLE001
+                    # Research refresh is auxiliary. Keep trading and make
+                    # the failure visible in the durable audit trail.
+                    log.warning("Staged shadow refresh failed: %s", exc)
+                    try:
+                        state.log_event(
+                            "shadow_staged_refresh",
+                            self._audit_json({
+                                "status": "error",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }))
+                    except Exception:                       # noqa: BLE001
+                        pass
         shadow_symbols = []
         if evaluator is not None:
             try:
