@@ -3373,13 +3373,30 @@ class Engine:
         input or output. The proposals are journalled as ``decisions`` like
         any other cycle, tagged with their source.
         """
+        budget = max(0, int(max_new))
+        if not budget:
+            return []
         model = require_complete_contract(self.strategy_id)
         proposals = model.deterministic_proposals(snapshot, self.cfg)
         accepted = []
         for proposal in proposals:
-            if len(accepted) >= max(0, int(max_new)):
+            if len(accepted) >= budget:
                 break
             if proposal.get("research_refusal_reason"):
+                continue
+            # The contract decides BEFORE the budget does. ``deterministic_
+            # proposals`` emits a probe for every symbol and both directions -
+            # 50 of them on a 25-symbol universe - and applies no contract at
+            # all; the contract runs downstream in _prepare_setup_decision.
+            # Capping the probes first would therefore spend the whole
+            # new-position budget on the alphabetically first symbols
+            # whatever their signal, and a strategy whose setups are anywhere
+            # else in the universe would essentially never open.
+            # build_setup_plan is pure, so asking it here costs a recomputation
+            # and nothing else; the open path asks it again for real.
+            if strategy.build_setup_plan(
+                    proposal, snapshot.get(proposal.get("symbol")) or {},
+                    self.cfg)[0] is None:
                 continue
             entry = dict(proposal)
             entry["proposal_source"] = "deterministic_contract"

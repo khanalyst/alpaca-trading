@@ -13,8 +13,18 @@ llm:
                                # GPT-5.x / o-series reasoning models)
   max_tokens: 2000
 strategy:
-  id: momentum
-  version: phase1-v3
+  # momentum is T0_REJECTED: -8.97% over 2026-07-29..08-05, and the only
+  # strategy the recorded corpus says something significant about (mean
+  # -0.428R over 43 independent 48h episodes, t=-2.45). ls-ratio-fade
+  # replaces it on the order path. Its 48h model horizon matches
+  # risk.max_hold_hours, it is realtime-eligible, its contract is complete
+  # so it can trade deterministically, and its derivation is independent of
+  # this corpus. Measured at -0.235R over 34 episodes (t=-1.22) at the
+  # registered 80/20 thresholds - not significant, i.e. unproven rather
+  # than rejected, which is the honest status of every available option.
+  # research/plan/order-path-succession.md holds the full comparison.
+  id: ls-ratio-fade
+  version: v1
   # analyst | deterministic | shadow_only.
   #
   # A strategy earns promotion on evidence its deterministic contract
@@ -25,19 +35,17 @@ strategy:
   # is what lets a shadow-only strategy occupy the order path once its
   # evidence justifies it.
   #
-  # `shadow_only` is set here because no mechanism currently justifies it.
-  # momentum is T0_REJECTED and returned -8.97% over 2026-07-29..08-05, and
-  # at that rate it reaches risk.max_drawdown_pct, which flattens the book
-  # and self-kills the process - ending the research collection every other
-  # lane depends on. Nothing opens a position in this mode. Research lanes
-  # are untouched: every registered and staged contract is still evaluated
-  # on every snapshot. Open positions still exit through exchange stops and
-  # targets, max_hold_hours, and every risk reduction path.
+  # `shadow_only` is the third value: no order path at all, research lanes
+  # untouched. It is what to set when nothing should be trading.
   #
-  # research/plan/order-path-succession.md states, pre-committed, what a
-  # successor has to show before this goes back to `deterministic`.
-  execution_mode: shadow_only
-  signal_timeframe: 15m          # fixed for this version; one evaluation/bar
+  # `deterministic` is set here because ls-ratio-fade has no analyst prompt -
+  # no strategy except momentum does - so the contract itself proposes, and
+  # risk and execution apply unchanged. This is also the honest way to run
+  # it: the evidence that will judge it comes from the same contract in the
+  # shadow lane, so an analyst layer on top would trade something other than
+  # the thing being measured.
+  execution_mode: deterministic
+  signal_timeframe: 1h           # ls-ratio-fade's signal bar; one evaluation/bar
   # The three registered hypotheses (volume-thrust, oi-divergence,
   # basis-stretch) reach the book only through experimental setups. While
   # this was false they never fired: 3,556 vetoes over 2026-07-29..08-05
@@ -50,8 +58,19 @@ strategy:
   loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence
   min_stop_atr_multiple: 1.0
   structure_buffer_atr_multiple: 0.15
-  # Maximum entry extension from the 1h EMA20, in ATRs.
-  hard_max_entry_extension_atr: 1.2
+  # Retail long/short percentile tails that arm the contract. The registered
+  # defaults are 80/20; these are the argmax of a 7x4 grid replayed over the
+  # recorded corpus, and 70/30 beat 80/20 at every extension cap tested, so
+  # it is not one lucky cell. Tightening to 85/15 or 90/10 was worst
+  # everywhere - a tail that carries less signal than the body is what a
+  # percentile with no information looks like, and worth knowing before the
+  # LLM sweeps this axis.
+  ls_high_percentile: 70.0
+  ls_low_percentile: 30.0
+  # Maximum entry extension from the 1h EMA20, in ATRs. 1.5 was best at every
+  # percentile pair; below it the measure flattens rather than improving, so
+  # this is a plateau edge and not a sharp optimum.
+  hard_max_entry_extension_atr: 1.5
   # Minimum age for discretionary closes; exchange exits and risk reduction
   # closes are unaffected.
   min_hold_minutes: 90

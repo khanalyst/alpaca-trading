@@ -68,8 +68,12 @@ def _load_experiment_registry(cfg: dict, store) -> dict:
     strategy_id = str(strategy.get("id") or "")
     base_version = str(strategy.get("version") or "")
     if strategy_id and base_version:
+        # Six of the seven registered strategy ids contain a hyphen, which is
+        # not legal in a variant id. The prefix helper is the one place that
+        # conversion lives; keying this by the raw id would file the baseline
+        # under a name nothing else ever looks up.
         registry.setdefault(
-            f"{strategy_id}.baseline",
+            variant_mod.baseline_variant_id(strategy_id),
             variant_mod.baseline(strategy_id, base_version),
         )
         for variant in variant_mod.hypothesis_variants(
@@ -744,8 +748,13 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
         print("--scope must identify a deterministic forward lane; the "
               "analyst :llm scope is not eligible", file=sys.stderr)
         return 2
+    from agent.variants import baseline_variant_id, strategy_variant_prefix
+
     strategy_id = args.strategy
-    baseline_id = f"{strategy_id}.baseline"
+    # A strategy id and a variant id are different alphabets: hyphens are
+    # legal in the first and not in the second.
+    variant_prefix = strategy_variant_prefix(strategy_id)
+    baseline_id = baseline_variant_id(strategy_id)
     axes: dict[str, dict] = {}
     hypothesis_groups: dict[str, list] = {}
     for variant_id, variant in sorted(registry.items()):
@@ -753,7 +762,7 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
                 or variant.status not in {"candidate", "testing"}):
             continue
         if variant.hypothesis_id and variant_id.startswith(
-                f"{strategy_id}.hyp."):
+                f"{variant_prefix}.hyp."):
             hypothesis_groups.setdefault(str(variant.hypothesis_id), []).append(
                 variant)
             continue

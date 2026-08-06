@@ -209,10 +209,15 @@ class PromptVersionIsUnchanged(unittest.TestCase):
         # 608188bfb1314d2e -> 86d91dc0c41fee7d: retired nine momentum
         # reward:risk, stop-distance and net-direction arms after the order
         # path closed 35 live-demo trades at 11.4% wins and -0.974% each.
+        # 86d91dc0c41fee7d -> 4de4227728e0275e: the order path moved off
+        # momentum to ls-ratio-fade, and ls-ratio-fade gained six schedulable
+        # settings, so the selector fragment in the prompt lists a different
+        # decision space. Forked deliberately: analyst evidence from before
+        # this point must not pool with evidence after it.
         # Each transition changes the decision space; evidence must not pool.
         self.assertEqual(
             brain.prompt_version(system),
-            "86d91dc0c41fee7d",
+            "4de4227728e0275e",
             "the system prompt changed; enrichment must never touch it. "
             "If a later batch versions the prompt deliberately, update this "
             "constant in that batch and fork attribution on purpose.")

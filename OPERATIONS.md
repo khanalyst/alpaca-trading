@@ -543,17 +543,20 @@ forward contract, and the value must be exactly `analyst`, `deterministic` or
 mode change nobody reviewed. Tier gating is unchanged: live still requires
 `T3_VALIDATED` and a reviewed packet.
 
-`shadow_only` is the shipped state because no mechanism currently justifies
-the seat: `momentum` is `T0_REJECTED` and returned -8.97% over
-2026-07-29..08-05, and at that rate it reaches `risk.max_drawdown_pct`, which
-flattens the book and self-kills the process - ending the research collection
-every other lane depends on. Research lanes run unchanged in this mode, and
-open positions still exit through exchange stops and targets,
-`max_hold_hours` and every risk reduction path. Only discretionary opens and
-closes have no source. `research/plan/order-path-succession.md` states,
-pre-committed, what a successor has to show before this returns to
-`deterministic`; it is deliberately not a judgement to be made while looking
-at the numbers.
+`deterministic` is the shipped state, running `ls-ratio-fade/v1`. It replaced
+`momentum`, which is `T0_REJECTED`, returned -8.97% over 2026-07-29..08-05,
+and at that rate reaches `risk.max_drawdown_pct` - which flattens the book and
+self-kills the process, ending the research collection every other lane
+depends on. The replacement is a choice among unproven mechanisms rather than
+a promotion: `ls-ratio-fade` measures -0.153R at its shipped thresholds over
+independent 48h episodes, which is not significantly different from random.
+`research/plan/order-path-succession.md` holds the comparison and states,
+pre-committed, what would earn the seat on evidence.
+
+`shadow_only` is the state to set when nothing should trade at all. Research
+lanes run unchanged in it, and open positions still exit through exchange
+stops and targets, `max_hold_hours` and every risk reduction path; only
+discretionary opens and closes have no source.
 
 ## 8. Interpreting results
 

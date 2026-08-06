@@ -22,10 +22,10 @@ The executable sources remain authoritative when prose and code disagree:
 | Layer | Current shipped count/use |
 | --- | --- |
 | Registered strategies | 7 mechanism/falsification claims |
-| Pre-registered YAML setting rows | 32 across 7 strategy files |
+| Pre-registered YAML setting rows | 38 across 7 strategy files |
 | Hand-authored momentum variants | 24 immutable identities including baseline |
-| Materialized static identities | 71 including all 7 baselines |
-| Bounded LLM selector candidates | 27 eligible single-axis candidates |
+| Materialized static identities | 77 including all 7 baselines |
+| Bounded LLM selector candidates | 33 eligible single-axis candidates |
 | Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes |
 | Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
 
@@ -41,14 +41,14 @@ uses deterministic contract proposals in four realtime lanes: `momentum`,
 `flush-fade`, `ls-ratio-fade`, and `scalp-maker`. Each lane receives the same
 market snapshot and timestamp and owns independent paper cash, positions, risk
 state, decisions, and trades. `funding-carry`, `funding-unwind`, and
-`trend-multiday` remain registered offline-only models. **No strategy is
-connected to the configured demo order path**: `strategy.execution_mode` is
-`shadow_only`. `momentum/phase1-v3` was the only strategy that ever occupied
-it and is `T0_REJECTED`; the seat now goes to whatever first meets the
-pre-committed criterion in `research/plan/order-path-succession.md`. The
-research lanes are unaffected - they were always the measuring instrument,
-and every registered and staged contract is still evaluated on every
-snapshot.
+`trend-multiday` remain registered offline-only models. **`ls-ratio-fade/v1`
+occupies the configured demo order path** under `execution_mode:
+deterministic`, replacing `momentum/phase1-v3`, which is `T0_REJECTED` and is
+the only strategy the recorded corpus says something significant about
+(-0.428R over 43 independent 48h episodes, t=-2.45). The replacement is a
+choice among unproven mechanisms, not a promotion:
+`research/plan/order-path-succession.md` holds the comparison and the
+pre-committed criterion for what would earn the seat on evidence.
 
 Feeds v1-v7 remain immutable historical rows and must not be pooled with v8
 outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the
@@ -284,7 +284,32 @@ only.
 - `higher_long_tail`: long threshold rises to the 90th percentile;
 - `lower_short_tail`: short threshold falls to the 10th percentile;
 - `extreme_long_tail`: long threshold rises to the 95th percentile;
-- `extreme_short_tail`: short threshold falls to the 5th percentile.
+- `extreme_short_tail`: short threshold falls to the 5th percentile;
+- `wider_tails`: 70th/30th, the shipped order-path setting;
+- `widest_tails`: 60th/40th, the end of the widening axis;
+- `no_chase_tight`: entry extension capped at 1.0 ATR;
+- `no_chase_loose`: the registered 3.0 ATR cap, kept as the comparison point.
+
+**Shipped order-path setting.** This strategy occupies the demo order path
+under `execution_mode: deterministic`, with `ls_high_percentile: 70`,
+`ls_low_percentile: 30` and `hard_max_entry_extension_atr: 1.5`. Those come
+from replaying the contract over the recorded corpus across a 7x4 grid, scored
+as R-multiples on independent 48-hour episodes against a direction-matched
+random baseline. Two results are worth stating because they shape what the
+selector should search:
+
+- widening the tails helped and tightening hurt. 70/30 beat 80/20 at every
+  extension cap, and 85/15 and 90/10 were the worst cells everywhere. A tail
+  that carries less signal than the body is what a percentile with no
+  tail-concentrated information looks like;
+- `long_short_percentile_30` has a median of 97.1 and a 75th percentile of 100
+  over 13,637 observations, so "above the 80th percentile" describes most of
+  the corpus rather than an elevated reading.
+
+The setting is the argmax of that grid at -0.153R, not a positive result. The
+contract is unproven on this evidence rather than supported, and the reason it
+holds the order path is that every alternative is unproven too while momentum
+is measurably worse.
 
 ### Maker spread capture (`scalp-maker`, version `v1`)
 

@@ -20,23 +20,103 @@ That would end the shadow and staged collection every other lane depends on.
 The order path is not the measuring instrument — the research lanes are — so
 the mechanism that would kill the instrument does not get to keep the seat.
 
+## What every candidate actually measures
+
+Before choosing, each contract was replayed over the recorded corpus (13,637
+symbol observations, 2026-07-29..08-05, 15 instruments) and scored as
+R-multiples under one common outcome rule: structure stop at 1 ATR + 0.15
+buffer, 3R target, 48h timeout, 0.10% round-trip taker cost. Fires were
+collapsed to **independent episodes** first — one entry per symbol and
+direction per non-overlapping 48h window — because the corpus re-observes
+every symbol every five minutes and 5,867 raw fires is not 5,867 tests. The
+baseline is the same rule applied at unselected times with the same direction
+mix, so the week's own drift is charged to both alike.
+
+| Candidate | Episodes | Mean R | Win % | t | vs baseline |
+| --- | --- | --- | --- | --- | --- |
+| `oi-buildup-fade` (staged) | 13 | +0.629 | 46.2 | 1.19 | +0.734 |
+| `basis-crowd-fade` (staged) | 6 | +0.250 | 66.7 | 0.64 | +0.369 |
+| `funding-crowd-unwind` (staged) | 16 | -0.164 | 37.5 | -0.55 | -0.055 |
+| `funding-unwind` | 45 | -0.191 | 35.6 | -1.04 | -0.070 |
+| `ls-ratio-fade` | 34 | -0.235 | 32.4 | -1.22 | -0.126 |
+| `momentum` | 43 | -0.428 | 23.3 | -2.45 | -0.329 |
+
+Nothing here is significant except `momentum`, which is significantly
+**negative** — consistent with its -8.97% live result, and a useful check that
+the harness measures something real. The two positive point estimates sit on
+13 and 6 episodes and were calibrated on this same corpus, so they are not
+evidence of an edge; they are the reason those contracts are worth measuring
+forward in the staged lane, which is exactly where they are.
+
 ## The state now
 
-`strategy.execution_mode: shadow_only`. Nothing opens a position. Research
-lanes are untouched: every registered contract and every staged contract is
-still evaluated on every snapshot, on the same fixed 24h harness, and still
-accumulates forward evidence. Open positions still exit through exchange
-stops and targets, the `max_hold_hours` force-close, and every risk
-reduction path. Only discretionary opens and closes have no source.
+`strategy.id: ls-ratio-fade`, `execution_mode: deterministic`. It replaces
+`momentum` on the demo order path and places real demo orders.
 
-`strategy.id` stays `momentum`. It is the registry anchor for the shadow
-lanes and does not participate in the evidence scope key, so changing it
-would fork nothing and clarify nothing.
+This is a choice among unproven mechanisms, not a promotion. What ruled the
+others out:
 
-## What earns the seat
+- **`momentum`** is the one option the data rejects rather than merely fails
+  to support.
+- **`funding-unwind`** is the least-refuted registered contract, but its model
+  horizon is 240h against `risk.max_hold_hours: 48`. The account would force
+  every position closed at a fifth of the contract's holding assumption, so it
+  would trade something other than the thing being measured. It is also
+  `realtime_eligible=False` for exactly this reason.
+- **`trend-multiday`** has the same problem more severely (336h) and is also
+  offline-only.
+- **The staged contracts** are not registered strategies, so they cannot be
+  named in `strategy.id` at all. Promoting a contract whose thresholds were
+  fit on 13 episodes of this corpus straight onto the account is the failure
+  mode this platform exists to prevent; they stay in the staged lane and
+  earn the seat through the criterion below or not at all.
 
-The successor is decided by the shortlist, not by a reading of it. All four
-conditions, on one candidate, at the same time:
+That leaves `ls-ratio-fade`: complete contract so it can trade
+deterministically, 48h horizon matching `risk.max_hold_hours`,
+realtime-eligible, adequate throughput (34 episodes/week at 15 symbols, so
+roughly 57 at the configured 25), and a derivation independent of this corpus
+(~210 observations from the edge-discovery study). Its measured -0.235R at
+t=-1.22 is unproven rather than rejected.
+
+### The shipped thresholds
+
+`ls_high_percentile: 70`, `ls_low_percentile: 30`,
+`hard_max_entry_extension_atr: 1.5` — the argmax of a 7x4 grid over the same
+episode-level measure, at -0.153R.
+
+Two findings from that grid matter more than the argmax itself:
+
+- **Widening helped, tightening hurt.** 70/30 beat 80/20 at every extension
+  cap tested, and 85/15 and 90/10 were the worst cells everywhere. A tail
+  carrying less signal than the body is what a percentile with no
+  tail-concentrated information looks like.
+- **`long_short_percentile_30` is barely a discriminator.** Its median over
+  13,637 observations is 97.1 and its 75th percentile is 100, so "above the
+  80th percentile" describes most of the corpus rather than an elevated
+  reading. This is the same measurement artifact that makes
+  `funding_percentile_30 >= 80` fire on 56.3% of observations.
+
+The extension cap is a plateau rather than an optimum: 1.5 beat 2.0 and 3.0 at
+every percentile pair, and 0.8/1.0/1.2 were flat below it.
+
+### Where the LLM takes over
+
+`research/hypotheses/ls-ratio-fade.yaml` gained four settings so the selector
+searches the axes that matter rather than only the five that move the tails
+tighter — the direction the corpus says is worst. `wider_tails` (70/30) and
+`widest_tails` (60/40) open the axis downward; `no_chase_tight` (1.0) and
+`no_chase_loose` (3.0) make the extension cap a first-class axis with the
+registered value kept as the comparison point. The nightly reviewer nominates
+from this catalog and may propose exact intermediate values through the
+adaptive-variant path, so tuning from here is the loop's job rather than an
+edit.
+
+## What earns the seat on evidence
+
+`ls-ratio-fade` holds the order path by elimination, which is a weaker claim
+than earning it. The criterion below is what a successor has to show to take
+the seat on evidence instead — decided by the shortlist, not by a reading of
+it. All four conditions, on one candidate, at the same time:
 
 1. `research.py shortlist` labels it **`SUPPORTED`**. That requires at least
    100 closed forward trades (`MIN_FOR_SUPPORTED`), a positive mean, a
@@ -70,17 +150,19 @@ packet.
 
 ## What does not earn it
 
-- Being the best of a bad set. `SUPPORTED` is an absolute bar, not a ranking
-  position. If the shortlist's top entry is `PRELIMINARY`, the seat stays
-  empty.
+- Being the best of a bad set. That is how the current occupant got there, and
+  it is why it holds the seat provisionally rather than being promoted:
+  `SUPPORTED` is an absolute bar, not a ranking position. If the shortlist's
+  top entry is `PRELIMINARY`, nothing changes hands.
 - A promising partial window. Point 1 exists because 30 trades of positive
-  mean is the sample size at which noise looks like an edge.
-- Being untested. `funding-unwind`, `ls-ratio-fade` and `trend-multiday` have
-  no negative evidence because they have no evidence. Swapping a known-bad
-  mechanism for an unmeasured one is the exact substitution this platform was
-  built to stop.
-- Urgency. An empty order path costs nothing that the research lanes were
-  producing. It costs demo P&L that was negative.
+  mean is the sample size at which noise looks like an edge — and it is
+  roughly the sample every candidate above sits on.
+- A positive point estimate on a corpus its own thresholds were fitted to.
+  `oi-buildup-fade` at +0.629R over 13 episodes is the clearest example: worth
+  measuring forward, not worth trading.
+- Urgency. Demo P&L is not the deliverable; the evidence is. A seat change
+  costs a `code_fingerprint` fork and restarts the collection window, so it
+  needs to buy more than a better-looking week.
 
 ## The three staged replacements
 

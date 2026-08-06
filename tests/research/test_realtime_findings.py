@@ -1691,7 +1691,13 @@ class ForwardQualificationCommandTests(StoreFixture):
 
         args = argparse.Namespace(
             store=str(self.path), scope=scope, strategy="momentum")
+        # The hypothesis axes this asserts on are generated for the CONFIGURED
+        # strategy, and momentum no longer occupies the order path. Pinning
+        # the config keeps the test about axis pooling rather than about which
+        # strategy config.yaml happens to name.
         with patch.object(
+                research_cli, "_load_config",
+                return_value=valid_config()), patch.object(
                 findings.FindingsStore, "record_forward_analysis",
                 autospec=True, side_effect=record_axis), patch.object(
                 findings.FindingsStore, "analysis",

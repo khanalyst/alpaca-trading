@@ -31,8 +31,8 @@ research:
 | Area | Current value |
 | --- | --- |
 | Account mode | `demo` (OKX Demo Trading) |
-| Order-executing strategy | none; `execution_mode: shadow_only`. `strategy.id` stays `momentum/phase1-v3` as the registry anchor for the shadow lanes, but nothing opens a position |
-| Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
+| Order-executing strategy | `ls-ratio-fade/v1`, `execution_mode: deterministic` at `ls_high_percentile: 70` / `ls_low_percentile: 30` / `hard_max_entry_extension_atr: 1.5`. It replaced `momentum/phase1-v3`, which is `T0_REJECTED` |
+| Runtime tier | `T1_HYPOTHESIS`; demo rehearsal only, and unproven rather than supported |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol-coding` |
 | Housekeeping cadence | `cycle.interval_seconds: 60` |
 | Decision throttle | `cycle.decision_interval_seconds: 300` elapsed seconds (with a 95% jitter tolerance); safety/mark cycles stay faster |
@@ -119,9 +119,9 @@ verdict, change account settings, or authorize an order.
 
 - `analyst`: the momentum analyst makes one LLM call per decision cycle and
   its parsed decisions go through contracts, risk and execution;
-- `deterministic`: the strategy's own forward contract proposes, and no LLM
-  call is made at all;
-- `shadow_only` (shipped): nothing proposes and nothing opens.
+- `deterministic` (shipped): the strategy's own forward contract proposes, and
+  no LLM call is made at all;
+- `shadow_only`: nothing proposes and nothing opens; research lanes run on.
 
 A strategy earns promotion on evidence its deterministic contract produced in
 a shadow lane. Running it live under an analyst trades something other than
@@ -139,19 +139,23 @@ requires `T3_VALIDATED` and a reviewed packet.
 Only the source of the decisions differs. Research recording, risk vetting,
 execution controls and the close path are one code path in every mode.
 
-`shadow_only` is shipped because no mechanism currently justifies the seat.
-`momentum` is `T0_REJECTED` and returned -8.97% over 2026-07-29..08-05 across
-35 closes; every other registered strategy is falsified or has never been
-measured. Leaving a falsified mechanism trading is not neutral - at that rate
+`ls-ratio-fade` replaced `momentum` on the order path. `momentum` is
+`T0_REJECTED`, returned -8.97% over 2026-07-29..08-05 across 35 closes, and is
+the only strategy the recorded corpus says anything significant about
+(-0.428R over 43 independent 48h episodes, t=-2.45). Left running at that rate
 it reaches `risk.max_drawdown_pct`, which flattens the book and self-kills the
-process, ending the research collection every other lane depends on. The order
-path is not the measuring instrument; the research lanes are, and they run
-unchanged in this mode. Open positions still exit through exchange stops and
-targets, `max_hold_hours` and every risk reduction path; only discretionary
-opens and closes have no source.
+process, ending the research collection every other lane depends on.
+
+The replacement is a choice among unproven mechanisms, not a promotion.
+`ls-ratio-fade` measures -0.235R over 34 episodes (t=-1.22) at its registered
+thresholds and -0.153R at the shipped ones: not significant, which is the
+honest status of every available option. It was chosen because its 48h model
+horizon matches `risk.max_hold_hours`, it is realtime-eligible, its contract is
+complete so it can trade deterministically, and its derivation is independent
+of this corpus.
 [research/plan/order-path-succession.md](research/plan/order-path-succession.md)
-states, pre-committed, what a successor has to show before this goes back to
-`deterministic`.
+holds the full comparison and states, pre-committed, what would earn the seat
+on evidence rather than on elimination.
 
 ## Experiment outcomes and edge evidence
 

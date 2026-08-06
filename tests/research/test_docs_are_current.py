@@ -231,12 +231,16 @@ class VersionClaimsTests(unittest.TestCase):
                       f"README does not mention the live version {version}")
 
     def test_the_documented_version_matches_the_shipped_config(self):
+        # Whichever strategy is configured, its version must be that
+        # strategy's registered one. Pinning momentum here only worked while
+        # momentum was the one strategy that could be configured.
         from agent import registry
 
         raw = yaml.safe_load((REPO / "config.yaml").read_text())
 
-        self.assertEqual(raw["strategy"]["version"],
-                         registry.spec_for("momentum").version)
+        self.assertEqual(
+            raw["strategy"]["version"],
+            registry.spec_for(raw["strategy"]["id"]).version)
 
     def test_a_removed_exit_policy_is_not_advertised_as_available(self):
         """structure_target was deleted in 6.1."""

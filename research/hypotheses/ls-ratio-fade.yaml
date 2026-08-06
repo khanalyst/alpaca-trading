@@ -1,9 +1,20 @@
 # Pre-registration: ls-ratio-fade / v1
-# Written BEFORE the first run. This one is SHADOW-ONLY by construction.
+# Written BEFORE the first run. It was shadow-only by construction until
+# 2026-08-06, when it took over the demo order path from momentum; the
+# original claims below are unchanged, which is the point of a
+# pre-registration.
 
 strategy_id: ls-ratio-fade
 version: v1
-status: registered_shadow_only
+# No longer shadow-only. It occupies the demo order path under
+# execution_mode: deterministic, because momentum is T0_REJECTED and this is
+# the least-refuted registered strategy with a horizon that matches
+# risk.max_hold_hours. That is a decision about which unproven mechanism gets
+# the account, not a claim that this one works: measured over the recorded
+# corpus it is -0.235R across 34 independent 48h episodes (t=-1.22), which is
+# unproven rather than supported. Nothing here changes tier gating - it is
+# T1_HYPOTHESIS and live still requires T3_VALIDATED and a signed packet.
+status: registered_demo_order_path
 
 mechanism: |
   Within an instrument, when the retail long/short account ratio rises
@@ -62,8 +73,60 @@ settings:
     claim: >-
       A registered fifth-percentile short-tail point tests the mirrored
       positioning effect without changing the long-side threshold.
+  # The five settings above all move the tails TIGHTER. Replaying the
+  # contract over the recorded corpus says that is the wrong direction:
+  # 85/15 and 90/10 were the worst cells of a 7x4 grid at every extension
+  # cap, and 70/30 the best. A catalog that only searches upward can never
+  # find that, so the axis is opened downward here. It is also the reason
+  # long_short_percentile_30 deserves suspicion as a discriminator at all:
+  # its median over 13,637 observations is 97.1 and its 75th percentile is
+  # 100, so "above the 80th percentile" describes most of the corpus rather
+  # than an elevated reading.
+  # One parameter each. Real-time rotation schedules only single-axis
+  # settings, so a pair that moves both tails at once is a valid tournament
+  # question the selector can never run - which is how the two settings the
+  # corpus actually favoured would have sat unschedulable.
+  - id: widest_long_tail
+    params:
+      ls_high_percentile: 60.0
+    claim: >-
+      Widening past the shipped 70th percentile. If 60 matches 70 the contract
+      is selecting on something other than the positioning tail, and the claim
+      needs restating rather than retuning.
+  - id: widest_short_tail
+    params:
+      ls_low_percentile: 40.0
+    claim: >-
+      The mirrored widening test, isolating the short threshold.
+  - id: registered_long_tail
+    params:
+      ls_high_percentile: 80.0
+    claim: >-
+      The originally registered 80th-percentile long threshold, kept as the
+      comparison point the shipped 70 has to beat. It lost to 70 at every
+      extension cap on the recorded corpus.
+  - id: registered_short_tail
+    params:
+      ls_low_percentile: 20.0
+    claim: >-
+      The originally registered 20th-percentile short threshold, as the
+      mirrored comparison point.
+  - id: no_chase_tight
+    params:
+      hard_max_entry_extension_atr: 1.0
+    claim: >-
+      A mean-reversion thesis over 16-48h should not be entered far from the
+      1h EMA20. Tighter than the 1.5 the corpus preferred, to find whether
+      the preference is a plateau or an optimum.
+  - id: no_chase_loose
+    params:
+      hard_max_entry_extension_atr: 3.0
+    claim: >-
+      The registered no-chase limit. It was worst at every percentile pair
+      on the corpus, so it is kept as the comparison point the tighter caps
+      have to beat rather than as a candidate.
 
-hypotheses_tested: 5
+hypotheses_tested: 11
 
 backtestable: false
 why_not_backtestable: |
