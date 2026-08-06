@@ -61,9 +61,11 @@ On each eligible decision cycle:
 
 1. The engine records one market snapshot and timestamp. `book_state` and
    `snapshot_enrichment` preserve the market inputs needed by research.
-2. The active momentum analyst makes at most one live-path LLM call. The parsed
-   decisions, optional bounded hypothesis proposal, and optional
-   `research_selection` are recorded.
+2. If the configured strategy uses `analyst` mode, the momentum analyst makes
+   at most one live-path LLM call. With the shipped deterministic
+   `ls-ratio-fade` path, no LLM call decides an order. Whenever the analyst path
+   is used, its parsed decisions, optional bounded hypothesis proposal, and
+   optional `research_selection` are recorded.
 3. The order path applies deterministic contracts, risk rules, and execution
    controls to the configured main strategy only.
 4. The `StrategyShadowCoordinator` gives the same snapshot/timestamp to four
@@ -81,9 +83,9 @@ On each eligible decision cycle:
    Workers compute isolated packets concurrently; durable SQLite writes remain
    serialized. Assignments drain independently and survive process restarts.
 
-The deterministic comparison set is therefore bounded per lane rather than
-serially fixed at one candidate. The active analyst's separate `:llm` scope
-remains a distinct, non-comparable population.
+The deterministic comparison set is therefore batched per lane rather than
+serially evaluating one candidate at a time. The active analyst's separate
+`:llm` scope remains a distinct, non-comparable population.
 
 Isolation runs both ways: research state and decisions are withheld from
 everything on the live path, while live account positions do not leak into a

@@ -7,6 +7,13 @@ so one can be chosen for promotion.
 Reference branch: `main`. Batch 1 lands on
 `fix/research-pipe-and-throughput`.
 
+> Historical design and evidence record. The corpus figures, early order-path
+> constraints, and implementation notes below describe the state before the
+> cumulative P0-P2 work. Current runtime behavior is defined by the root
+> `README.md`, `SETUP.md`, `OPERATIONS.md`, and `research/README.md`; in
+> particular, current realtime lanes use a shared baseline plus a bounded
+> candidate batch rather than the former single-candidate rotation.
+
 ## What the 7-day VM corpus established
 
 Journal 2026-07-29 to 2026-08-05: 1,440 decision cycles, 295,497 events,

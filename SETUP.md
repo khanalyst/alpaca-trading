@@ -4,10 +4,11 @@ This is the installation and deployment authority for the shipped demo
 configuration. Day-to-day research, backup, and recovery procedures are in
 [OPERATIONS.md](OPERATIONS.md).
 
-Current defaults are OKX `demo`, strategy `momentum/phase1-v3`, LLM provider
-`openai`, and model/deployment identifier `gpt-5.6-sol-coding`. No credential is
-stored in the repository. Use an OKX demo API key with Read and Trade only;
-never enable Withdraw.
+Current defaults are OKX `demo`, strategy `ls-ratio-fade/v1` in deterministic
+mode, LLM provider `openai`, and model/deployment identifier
+`gpt-5.6-sol-coding`. `momentum/phase1-v3` remains the rejected benchmark. No
+credential is stored in the repository. Use an OKX demo API key with Read and
+Trade only; never enable Withdraw.
 
 ## 1. Mac/local setup
 
@@ -50,8 +51,9 @@ In another terminal:
 ./.venv/bin/python research.py replay --check-fidelity
 ```
 
-The configured momentum strategy is `T0_REJECTED`; demo use is an operations
-rehearsal and data-collection path, not a profitable-edge claim. G2 must pass
+The configured `ls-ratio-fade/v1` strategy is unproven; demo use is an
+operations rehearsal and data-collection path, not a profitable-edge claim.
+`momentum/phase1-v3` is retained as the `T0_REJECTED` benchmark. G2 must pass
 before authoritative downstream research is trusted. G2 compares the full
 canonical pre-risk proposal identity symmetrically with replay keys, requires
 a non-vacuous exact match, and fails closed on malformed, duplicate, missing,
@@ -90,7 +92,7 @@ authorize live mode. The complete operating and rollback procedure is in
 | Key | Shipped value/behavior |
 | --- | --- |
 | `mode` | `demo` |
-| `strategy.id` / `strategy.version` | `momentum` / `phase1-v3` |
+| `strategy.id` / `strategy.version` | `ls-ratio-fade` / `v1` (deterministic demo path) |
 | `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol-coding` |
 | `cycle.interval_seconds` | `60` seconds for marks, paper exits, housekeeping, and reconciliation |
 | `cycle.decision_interval_seconds` | `300` elapsed seconds (95% jitter tolerance); model decisions remain slower than safety/mark cycles |
@@ -99,9 +101,11 @@ authorize live mode. The complete operating and rollback procedure is in
 | `research.shadow_enabled` | `true` |
 | `research.shadow_variants` | `[*]` |
 | `research.shadow_budget_ms` | `0` |
-| `research.shadow_workers` | `2` |
+| `research.shadow_workers` | `4` bounded packet-computation workers per evaluator |
+| `research.experiment_candidate_batch_size` | `4` pre-registered candidates per lane; hard cap `8` |
 | `research.findings_store` | `research/cache/findings.db` |
-| `strategy.execution_mode` | `deterministic` (shipped): trades the strategy's own forward contract with no LLM call, which is how a strategy other than `momentum` can occupy the order path. `analyst` makes one LLM call per decision cycle; `shadow_only` runs no order path at all, leaving the research lanes unchanged |
+| `research.collector` | Separate public-data recorder; up to 50 instruments and 4 workers |
+| `strategy.execution_mode` | `deterministic` (shipped): trades the named strategy's own forward contract with no LLM call. `analyst` makes one LLM call per decision cycle; `shadow_only` runs no order path at all, leaving the research lanes unchanged |
 | `research.staging_store` | `research/cache/staging.db`; machine-authored mechanisms, created by `research.py author` and absent until one is staged |
 | `research.forward_feed_version` | `8`; v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; three long-horizon models are offline-only; v1-v7 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane fork, and v7 the liquidation-flow and conditioning-axis fork |
 | `research.experiment_min_duration_days` | `10` |
@@ -110,10 +114,14 @@ authorize live mode. The complete operating and rollback procedure is in
 
 The four realtime strategies receive the same cycle snapshot/timestamp and
 deterministic contract proposals, with independent paper accounts. Each
-realtime strategy runs a baseline plus at most one candidate; both ten elapsed
-days and 100 comparable paired observations must be met before rotation. The
-three long-horizon registered models are offline-only. Only the configured main
-strategy can reach the demo exchange.
+realtime strategy keeps one shared baseline and a bounded batch of candidates:
+four by default and at most eight per lane. Each individual assignment still
+tests one exact setting; adaptive LLM selections remain isolated single-arm
+assignments. Both ten elapsed days and 100 comparable paired observations must
+be met before an assignment can close. The separate collector may scan a wider
+public universe without changing the active account's universe or risk limits.
+The three long-horizon registered models are offline-only. Only the configured
+main strategy can reach the demo exchange.
 
 The available exit policies are `fixed_rr`, `extended_rr`, and
 `carry_until_normalised` (for `funding-carry`).

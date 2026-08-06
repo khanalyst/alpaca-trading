@@ -216,7 +216,7 @@ Run the deterministic closure without an LLM call:
 ./.venv/bin/python research.py research-loop --no-review
 ```
 
-Run closure plus one research-only LLM review:
+Run closure plus a bounded batch of research-only LLM reviews (default eight):
 
 ```bash
 ./.venv/bin/python research.py research-loop
@@ -495,10 +495,10 @@ failure.
 Staged mechanisms run in their own `:staged` scope, with one isolated
 candidate paper account and one paired neutral baseline account per
 mechanism, on a single fixed measurement harness: first observed price after
-the signal, a structure stop at one ATR, a 2R target, observed taker costs both
-sides and a 24h timeout. The harness and proposal identities are identical
-across the pair, so a difference is attributable to the mechanism rather than
-a lucky stop distance.
+the signal, a structure stop with a one-ATR minimum, a 2R target, observed
+taker costs both sides and a 24h timeout. The harness and proposal identities
+are identical across the pair, so a difference is attributable to the
+mechanism rather than a lucky stop distance.
 
 They enter at `T1_HYPOTHESIS` and cannot rise. Live still requires
 `T3_VALIDATED` and a reviewed content-addressed packet, so nothing here
@@ -522,6 +522,24 @@ look stricter than the search actually was.
 A registered claim is immutable at the database level. Rewording one after
 results exist is refused by a trigger, because a claim that can be edited
 afterwards cannot be told apart from one retro-fitted to the result.
+
+The authoring model receives bounded persisted evidence rather than only field
+names: opportunity and firing rates, conditional returns, missing-data and
+null/near-miss reasons, fit versus held-out results, segment summaries, feature
+correlations when persisted, and tested mechanism families. It may use only
+the deterministic contract DSL. Supported bounded primitives include lagged
+values, rolling changes, percentile ranks, volatility/regime filters, event
+sequences, feature interactions, order-book imbalance and liquidity states.
+Cross-sectional rank is rejected until a valid multi-symbol context exists.
+The proposer cannot choose exits, horizons, stops, targets, sizing, or network
+operations.
+
+Opportunity quality is scored before a mechanism can be supported: eligible
+declines contribute zero return, firing and coverage floors must be met,
+candidate results must be matched to a contemporaneous neutral baseline, and
+family-level multiple-testing correction and held-out confirmation still apply.
+The fixed staged harness is a signal screen; automatic strategy-specific exit
+and holding-period optimization is not yet wired as a second stage.
 
 ### 7.3 Running a contract without an analyst
 

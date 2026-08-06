@@ -33,8 +33,9 @@ The superseded `14 maximum` wording described seven realtime strategies; it is
 not a current arm count.
 
 The active analyst's separate `:llm` scope can hold its own baseline and
-candidate, adding two non-comparable arms. When that sibling is present, the
-runtime maximum is 10 (8 deterministic comparison arms plus 2 LLM-scope arms).
+candidate, adding up to two non-comparable arms. At shipped configuration the
+combined maximum is therefore 22 arms (20 deterministic plus 2 `:llm` arms);
+at the hard cap it is 38 (36 deterministic plus 2 `:llm` arms).
 
 The active realtime simulator identity is `forward_feed_version: 8`. Feed v8
 uses deterministic contract proposals in four realtime lanes: `momentum`,
@@ -430,12 +431,13 @@ validated forward models already declare - validated by `agent/contract_dsl.py`
 and compiled into the same callable the hand-written contracts implement.
 
 These live apart from everything above. They are registered in
-`research/cache/staging.db`, run in a `:staged` scope with one paper account
-each, and are measured on one fixed harness rather than on their own exits:
-first observed price after the signal, a structure stop at one ATR, a 2R
-target, observed taker costs both sides, a 24h timeout. Holding the outcome
-contract constant is what makes a difference between two authored mechanisms
-a difference in the mechanism rather than in a lucky stop distance.
+`research/cache/staging.db`, run in a `:staged` scope with one isolated
+candidate paper account and one paired neutral baseline account per mechanism,
+and are measured on one fixed harness rather than on their own exits: first
+observed price after the signal, a structure stop with a one-ATR minimum, a 2R
+target, observed taker costs both sides, and a 24h timeout. Holding the outcome
+contract constant is what makes a difference between two authored mechanisms a
+difference in the mechanism rather than in a lucky stop distance.
 
 They enter at `T1_HYPOTHESIS` and cannot rise from there. Their claims are
 immutable once registered, they are never pooled with the registered
@@ -449,6 +451,16 @@ evidence has killed; `research.py stage-seed` registers the hand-written
 pre-registrations in `research/staged/pre-registered.yaml`, which are kept in
 version control so the wording cannot drift after results exist. The `author`
 column is what distinguishes them.
+
+The authoring request includes bounded persisted evidence when it exists:
+firing and opportunity rates, conditional returns, missing-data and null-model
+results, near misses, fit/held-out degradation, segment summaries, feature
+distributions and correlations, and mechanism families already tested. The
+system omits unavailable raw feature or regime values rather than inventing
+them. Authored conditions compile through the bounded deterministic DSL; exits,
+horizons, stops, targets, sizing, and network/file operations remain outside
+the contract. Cross-sectional rank is rejected until a complete universe
+context is wired.
 
 ### Shipped pre-registrations
 
@@ -499,8 +511,13 @@ but they are not silently treated as one runtime axis. Each strategy therefore
 keeps:
 
 - one stable baseline;
-- zero or one active single-axis candidate;
-- a durable queue of remaining candidates and accepted LLM selections.
+- a bounded batch of pre-registered single-axis candidates (four by shipped
+  configuration, hard cap eight per lane);
+- a durable queue of remaining candidates and accepted adaptive LLM selections.
+
+Each individual assignment still tests one exact setting. Adaptive exact-value
+selections are kept as isolated single-arm assignments and are not mixed into a
+static candidate batch.
 
 The default assignment closes only after both ten elapsed days and 100
 comparable paired observations. Restart restores the active assignment.
