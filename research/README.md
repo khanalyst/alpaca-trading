@@ -51,8 +51,9 @@ Staged mechanisms are a separate population. They arrive either from
 `research.py author`, which proposes from what the evidence has killed, or
 from `research.py stage-seed`, which registers the hand-written
 pre-registrations kept in `research/staged/pre-registered.yaml`. They live in
-`research/cache/staging.db`, run in a `:staged` scope with one paper account
-each on a single fixed measurement harness, and receive their own coded
+`research/cache/staging.db`, run in a `:staged` scope with an isolated paper
+account plus a paired neutral baseline per mechanism on a single fixed
+measurement harness, and receive their own coded
 verdicts from `research.py review-staged`: `NEGATIVE_EXPECTANCY`,
 `DIED_OUT_OF_SAMPLE` and `NEVER_FIRED` retire a mechanism, while
 `STARVED_OF_DATA` never does because a claim evaluated on snapshots it could

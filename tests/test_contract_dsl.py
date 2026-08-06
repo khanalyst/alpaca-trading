@@ -63,6 +63,10 @@ class AuthoredContractsExecuteTests(unittest.TestCase):
                 self.assertFalse(fired)
                 self.assertIn("unavailable", reason)
 
+    def test_malformed_condition_lists_fail_as_proposals_not_runtime_errors(self):
+        with self.assertRaises(ContractProposalError):
+            validate(proposal(conditions=None))
+
     def test_a_threshold_can_be_swept_like_a_registered_axis(self):
         _, fire = build(proposal())
         crowded = {"funding_percentile_30": 92.0, "funding_samples_30": 30}
@@ -78,6 +82,55 @@ class AuthoredContractsExecuteTests(unittest.TestCase):
         fired, reason = fire({"mom_1h_pct": 1.0}, "short", {}, {})
         self.assertFalse(fired)
         self.assertIn("long-only", reason)
+
+    def test_bounded_primitives_use_only_persisted_snapshot_sources(self):
+        bars = [
+            {"complete": True, "timestamp_ms": 1, "close": 100.0},
+            {"complete": True, "timestamp_ms": 2, "close": 110.0},
+        ]
+        primitive = proposal(
+            conditions=[],
+            primitives=[{
+                "primitive": "rolling_change", "field": "close",
+                "window": 1, "mode": "pct", "op": ">", "value": 5.0,
+            }],
+        )
+        _, fire = build(primitive)
+        row = {
+            "regime": "trend_up",
+            "_enrichment": {
+                "execution_bars": bars,
+                "book_bid_depth_usd": 1200.0,
+                "book_ask_depth_usd": 800.0,
+                "book_top_bid_size": 12.0,
+                "book_top_ask_size": 8.0,
+                "book_spread_pct": 0.02,
+                "realized_funding_events": [
+                    {"rate_pct": 0.1}, {"rate_pct": 0.2},
+                ],
+            },
+        }
+        self.assertEqual(fire(row, "short", {}, {}), (True, None))
+
+        _, regime_fire = build(proposal(
+            conditions=[],
+            primitives=[{"primitive": "regime_filter", "state": "trend_up"}],
+        ))
+        self.assertEqual(regime_fire(row, "short", {}, {}), (True, None))
+
+        _, book_fire = build(proposal(
+            conditions=[],
+            primitives=[{"primitive": "order_book_imbalance", "metric": "depth",
+                         "op": ">", "value": 0.1}],
+        ))
+        self.assertEqual(book_fire(row, "short", {}, {}), (True, None))
+
+        _, event_fire = build(proposal(
+            conditions=[],
+            primitives=[{"primitive": "event_sequence",
+                         "events": ["funding_positive", "funding_positive"]}],
+        ))
+        self.assertEqual(event_fire(row, "short", {}, {}), (True, None))
 
 
 class AuthoredContractsAreBoundedTests(unittest.TestCase):
@@ -141,6 +194,14 @@ class AuthoredContractsAreBoundedTests(unittest.TestCase):
                 with self.assertRaises(ContractProposalError):
                     validate(proposal(conditions=[
                         {"field": "mom_1h_pct", "op": ">", "value": value}]))
+
+    def test_cross_sectional_rank_fails_closed_without_universe_context(self):
+        with self.assertRaises(ContractProposalError) as caught:
+            validate(proposal(conditions=[], primitives=[{
+                "primitive": "cross_sectional_rank", "field": "atr_1h_ratio",
+                "op": ">", "value": 80.0,
+            }]))
+        self.assertIn("full-universe runtime context", str(caught.exception))
 
 
 class StagedContractsCannotReachCapitalTests(unittest.TestCase):

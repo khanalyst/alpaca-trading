@@ -492,11 +492,12 @@ fire. Unlike `author`, a rejected entry here exits nonzero: a broken
 pre-registration is a mistake in version control, not a transient provider
 failure.
 
-Staged mechanisms run in their own `:staged` scope, one paper account each, on
-a single fixed measurement harness: first observed price after the signal, a
-structure stop at one ATR, a 2R target, observed taker costs both sides and a
-24h timeout. The harness is identical for every mechanism on purpose, so a
-difference between two of them is a difference in the mechanism rather than in
+Staged mechanisms run in their own `:staged` scope, with one isolated
+candidate paper account and one paired neutral baseline account per
+mechanism, on a single fixed measurement harness: first observed price after
+the signal, a structure stop at one ATR, a 2R target, observed taker costs both
+sides and a 24h timeout. The harness and proposal identities are identical
+across the pair, so a difference is attributable to the mechanism rather than
 a lucky stop distance.
 
 They enter at `T1_HYPOTHESIS` and cannot rise. Live still requires

@@ -1454,6 +1454,7 @@ def cmd_author(args: argparse.Namespace) -> int:
 
     cfg = _load_config()
     store = StagingStore(_configured_staging(cfg, args.staging))
+    findings_store = None
     history = {}
     if not args.no_history:
         findings_store = findings_mod.FindingsStore(
@@ -1498,11 +1499,13 @@ def cmd_author(args: argparse.Namespace) -> int:
             print(f"staged history unavailable: {exc}", file=sys.stderr)
     if args.dry_run:
         request = authoring.build_request(
-            store, history=history, max_proposals=args.max_proposals)
+            store, history=history, max_proposals=args.max_proposals,
+            findings_store=findings_store)
         print(json.dumps(request, indent=2, sort_keys=True, default=str))
         return 0
     result = authoring.author_generation(
-        store, cfg, history=history, max_proposals=args.max_proposals)
+        store, cfg, history=history, max_proposals=args.max_proposals,
+        findings_store=findings_store)
     print(json.dumps(result, sort_keys=True, default=str))
     # A failed provider call is recorded and retried on the next cadence
     # rather than failing the nightly run around it.

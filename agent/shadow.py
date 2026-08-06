@@ -810,6 +810,10 @@ class ShadowEvaluator:
             pending_decisions = []
             variant_records = []
             for decision in proposals:
+                target_variant_id = decision.get("target_variant_id")
+                if (target_variant_id is not None
+                        and str(target_variant_id) != str(variant_id)):
+                    continue
                 record = self._evaluate_one(
                     variant_id, snapshot, decision, state, timestamp,
                     cycle_id, pending_opens)
@@ -2316,6 +2320,8 @@ class StrategyShadowCoordinator:
             try:
                 proposals = staged_lane.proposals_for(
                     [contract], snapshot, evaluator.base_cfg)
+                proposals.extend(staged_lane.proposals_for(
+                    [contract], snapshot, evaluator.base_cfg, baseline=True))
                 proposals_total += len(proposals)
                 per_contract.update(staged_lane.coverage(proposals))
                 records.extend(evaluator.evaluate(
@@ -2566,8 +2572,12 @@ def staged_variant_id(contract_id: str) -> str:
     ``staged.`` prefix keeps a machine-authored arm visibly distinct from a
     hand-registered one in every report that lists variants.
     """
-    slug = re.sub(r"[^a-z0-9]+", "_", str(contract_id).lower()).strip("_")
-    return f"staged.{slug}"
+    return staged_lane.candidate_variant_id(contract_id)
+
+
+def staged_baseline_variant_id(contract_id: str) -> str:
+    """Stable neutral baseline paired with one staged contract."""
+    return staged_lane.baseline_variant_id(contract_id)
 
 
 def _build_staged_lane(cfg: dict, resolved_scope: str,
@@ -2622,7 +2632,6 @@ def _staged_runtime_cfg(cfg: dict) -> dict:
     staged_cfg = deepcopy(cfg)
     staged_cfg["strategy"] = {
         **dict(staged_cfg["strategy"]),
-        "signal_timeframe": STAGED_HARNESS.signal_timeframe,
         "min_stop_atr_multiple": STAGED_HARNESS.stop_atr_multiple,
         "fixed_reward_risk": STAGED_HARNESS.reward_risk,
         "forward_horizon_hours": STAGED_HARNESS.horizon_hours,
@@ -2642,8 +2651,16 @@ def _build_staged_evaluator(
         overrides={},
         hypothesis=contract.mechanism,
         status="candidate")
+    baseline = Variant(
+        variant_id=staged_baseline_variant_id(contract.contract_id),
+        strategy_id=STAGED_STRATEGY_ID,
+        base_version=STAGED_HARNESS.model_id,
+        overrides={},
+        hypothesis=("The neutral fixed-harness policy is the paired baseline "
+                    "for this staged mechanism."),
+        status="testing")
     return ShadowEvaluator(
-        [variant], staged_cfg,
+        [variant, baseline], staged_cfg,
         budget_ms=float(block.get("shadow_budget_ms") or 0),
         store=findings_store,
         scope_key=f"{resolved_scope}:staged",

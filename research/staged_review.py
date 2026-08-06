@@ -68,7 +68,8 @@ def stage_of(candidate) -> str:
 
 def verdict_for(candidate) -> tuple[str, str]:
     """Return ``(code, explanation)`` for one measured staged mechanism."""
-    evaluated = candidate.declined_decisions + candidate.trades
+    evaluated = (getattr(candidate, "eligible_opportunities", 0)
+                 or candidate.declined_decisions + candidate.trades)
     starved = candidate.starved_decisions
     total = evaluated + starved
 
@@ -107,18 +108,58 @@ def verdict_for(candidate) -> tuple[str, str]:
             "the shape of an edge fitted to where it was found.")
 
     if (candidate.trades == 0
-            and candidate.declined_decisions >= NEVER_FIRED_DECISION_FLOOR):
+            and evaluated >= NEVER_FIRED_DECISION_FLOOR):
         return NEVER_FIRED, (
-            f"evaluated {candidate.declined_decisions} times and never fired. "
+            f"evaluated {evaluated} times and never fired. "
             "The thresholds do not describe a state this market reaches, so "
             "the claim is unreachable rather than wrong. Propose the same "
             "mechanism at a condition the market actually visits.")
+
+    # ``Candidate.label`` is normally produced by shortlist._label, but this
+    # guard is intentionally repeated at the immutable staged-verdict
+    # boundary. A hand-built/legacy candidate cannot claim support when its
+    # persisted opportunity coverage is known to be inadequate.
+    coverage = getattr(candidate, "coverage_pct", None)
+    pair_coverage = getattr(candidate, "pair_coverage_pct", None)
+    firing_rate = getattr(candidate, "firing_rate", None)
+    support_gap = None
+    if (coverage is not None
+            and coverage < shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT):
+        support_gap = (
+            f"resolved opportunity coverage is {coverage:.1f}%, below the "
+            f"{shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT:.0f}% floor")
+    elif (firing_rate is not None
+          and firing_rate < shortlist_mod.MIN_FIRING_RATE):
+        support_gap = (
+            f"firing rate is {firing_rate * 100:.2f}%, below the "
+            f"{shortlist_mod.MIN_FIRING_RATE * 100:.1f}% floor")
+    elif (pair_coverage is not None
+          and pair_coverage < shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT):
+        support_gap = (
+            f"candidate/baseline opportunity coverage is "
+            f"{pair_coverage:.1f}%, below the "
+            f"{shortlist_mod.MIN_OPPORTUNITY_COVERAGE_PCT:.0f}% floor")
+    elif (pair_coverage is not None
+          and getattr(candidate, "delta_ci_low", None) is None):
+        support_gap = "matched baseline delta evidence is unavailable"
+    elif (pair_coverage is not None
+          and getattr(candidate, "delta_ci_low", 0.0) <= 0):
+        support_gap = "matched baseline delta interval does not clear zero"
+
+    if candidate.label == shortlist_mod.SUPPORTED and support_gap:
+        return COLLECTING, (
+            f"{support_gap}. The result remains evidence-gated and cannot "
+            "be called supported until the opportunity ledger is adequate.")
 
     if candidate.label == shortlist_mod.SUPPORTED:
         return SUPPORTED, (
             f"{candidate.trades} trades, interval {candidate.ci_low:+.3f}.."
             f"{candidate.ci_high:+.3f} R excludes zero and the held-out "
-            "window agrees. Kept running; this is evidence, not authority.")
+            "window agrees"
+            + (f"; {firing_rate * 100:.2f}% firing and "
+               f"{coverage:.1f}% opportunity coverage"
+               if firing_rate is not None and coverage is not None else "")
+            + ". Kept running; this is evidence, not authority.")
 
     return COLLECTING, (
         f"{candidate.trades} closed trades so far ({candidate.label}). "
@@ -189,6 +230,12 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
                 "payer": contract.payer,
                 "trades": getattr(candidate, "trades", 0),
                 "mean_r": getattr(candidate, "mean_r", 0.0),
+                "eligible_opportunities": getattr(
+                    candidate, "eligible_opportunities", 0),
+                "firing_rate": getattr(candidate, "firing_rate", None),
+                "coverage_pct": getattr(candidate, "coverage_pct", None),
+                "pair_coverage_pct": getattr(
+                    candidate, "pair_coverage_pct", None),
             }
             verdicts.append(entry)
             by_contract.setdefault(contract.contract_id, []).append(entry)

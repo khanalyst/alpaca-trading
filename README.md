@@ -373,10 +373,13 @@ which is generated output rather than a committed file.
 `research.py author` asks the configured model for new candidate mechanisms
 and stages the ones that validate. A proposal is data, not code: a mechanism,
 the payer, a falsifier, and comparisons over fields the validated forward
-models already declare. Anything naming an unknown field, using an operator
-other than the four comparisons, setting a threshold outside a field's
-observed range, or stating a claim too thin to name a cause is refused, and
-one bad proposal never discards the rest of a generation.
+models already declare or one bounded deterministic primitive over persisted
+market data. Unknown fields, unsupported context (such as cross-sectional
+rank without a universe), unsafe operators or ranges, exit/sizing authority,
+and claims too thin to name a cause are refused; one bad proposal never
+discards the rest of a generation. The prompt also receives bounded summaries
+from the persisted findings store, including opportunity rates, conditional
+returns, null/near-miss reasons, held-out results, and tested families.
 
 It is deliberately not gated on a terminal outcome. The nightly reviewer needs
 a finished assignment to have something to explain, so on a corpus where none

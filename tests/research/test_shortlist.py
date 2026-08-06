@@ -214,3 +214,86 @@ class FalseDiscoveryControlTests(unittest.TestCase):
             "staged.bad", "demo:s", trades([-0.5] * 120))
         shortlist.apply_family_correction([negative])
         self.assertEqual(negative.label, shortlist.NEGATIVE)
+
+
+class OpportunityEvidenceTests(unittest.TestCase):
+    """The shortlist estimand is per eligible opportunity, not per fill."""
+
+    @staticmethod
+    def _trade(index, value, proposal):
+        return {
+            "status": "CLOSED", "result": "target",
+            "valid_for_inference": 1, "r_multiple": value,
+            "net_pnl_usd": value, "entry_ts": float(index),
+            "proposal_id": proposal,
+        }
+
+    @staticmethod
+    def _decision(proposal, outcome="PROPOSED", reason=""):
+        return {"proposal_id": proposal, "decision_outcome": outcome,
+                "reason": reason}
+
+    def _paired_arms(self, *, declines=0, unresolved=0):
+        trade_rows = [self._trade(i, 1.0, f"p{i}") for i in range(100)]
+        candidate = [self._decision(f"p{i}") for i in range(100)]
+        baseline = [self._decision(f"p{i}") for i in range(100)]
+        for i in range(declines):
+            candidate.append(self._decision(f"d{i}", "VETOED",
+                                            "contract declined"))
+            baseline.append(self._decision(f"d{i}", "VETOED",
+                                           "contract declined"))
+        for i in range(unresolved):
+            candidate.append(self._decision(f"u{i}"))
+        return trade_rows, candidate, baseline
+
+    def test_vetoes_are_zero_returns_in_the_opportunity_mean(self):
+        trades_, decisions, baseline = self._paired_arms(declines=100)
+        candidate = shortlist.measure(
+            "staged.x", "demo:s", trades_, decisions=decisions,
+            baseline_trades=trades_, baseline_decisions=baseline,
+            baseline_variant_id="momentum.baseline")
+        self.assertEqual(candidate.eligible_opportunities, 200)
+        self.assertAlmostEqual(candidate.mean_r, 0.5, places=3)
+        self.assertEqual(candidate.pair_coverage_pct, 100.0)
+
+    def test_a_rare_fill_rate_cannot_be_supported(self):
+        trades_, decisions, baseline = self._paired_arms(declines=10_000)
+        candidate = shortlist.measure(
+            "staged.x", "demo:s", trades_, decisions=decisions,
+            baseline_trades=trades_, baseline_decisions=baseline,
+            baseline_variant_id="momentum.baseline")
+        self.assertLess(candidate.firing_rate, shortlist.MIN_FIRING_RATE)
+        self.assertEqual(candidate.label, shortlist.INCONCLUSIVE)
+        self.assertIn("minimum firing rate", " ".join(candidate.reasons))
+
+    def test_a_ledger_candidate_without_a_baseline_cannot_be_supported(self):
+        trades_ = [self._trade(i, 1.0, f"p{i}") for i in range(100)]
+        decisions = [self._decision(f"p{i}") for i in range(100)]
+        candidate = shortlist.measure(
+            "staged.x", "demo:s", trades_, decisions=decisions)
+        self.assertEqual(candidate.pair_coverage_pct, 0.0)
+        self.assertEqual(candidate.label, shortlist.INCONCLUSIVE)
+
+    def test_unresolved_opportunities_reduce_coverage_and_block_support(self):
+        trades_, decisions, baseline = self._paired_arms(unresolved=100)
+        candidate = shortlist.measure(
+            "staged.x", "demo:s", trades_, decisions=decisions,
+            baseline_trades=trades_, baseline_decisions=baseline,
+            baseline_variant_id="momentum.baseline")
+        self.assertEqual(candidate.coverage_pct, 50.0)
+        self.assertEqual(candidate.pair_coverage_pct, 50.0)
+        self.assertEqual(candidate.label, shortlist.INCONCLUSIVE)
+
+    def test_starved_decisions_are_not_zero_return_opportunities(self):
+        trades_, decisions, baseline = self._paired_arms(declines=10)
+        decisions.extend(self._decision(f"s{i}", "VETOED", "data missing")
+                         for i in range(100))
+        baseline.extend(self._decision(f"s{i}", "VETOED", "data missing")
+                        for i in range(100))
+        candidate = shortlist.measure(
+            "staged.x", "demo:s", trades_, decisions=decisions,
+            baseline_trades=trades_, baseline_decisions=baseline,
+            baseline_variant_id="momentum.baseline")
+        self.assertEqual(candidate.starved_decisions, 100)
+        self.assertEqual(candidate.eligible_opportunities, 110)
+        self.assertAlmostEqual(candidate.mean_r, 100 / 110, places=3)
