@@ -90,6 +90,13 @@ echo "=== $(date -u +%FT%TZ) readiness ==="
 # Generation runs before review and is not gated on a terminal outcome.
 # The reviewer needs a finished assignment to have something to explain;
 # when nothing has finished, generation is exactly what the loop needs.
+# Verdicts before generation, deliberately: a proposer that has not yet been
+# told why the last batch died will restate a dead claim at a slightly
+# different threshold, which is the same claim wearing a different number.
+echo "=== $(date -u +%FT%TZ) adjudicating staged mechanisms ==="
+"$PY" research.py review-staged --store "$STORE" \
+  || echo "  (staged review unavailable this cycle)"
+
 echo "=== $(date -u +%FT%TZ) authoring new candidate mechanisms ==="
 "$PY" research.py author --store "$STORE" \
   || echo "  (authoring unavailable this cycle; retried next run)"

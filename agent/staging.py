@@ -174,6 +174,21 @@ class StagingStore:
                 (str(contract_id),)).fetchone()
         return self._row_to_contract(row) if row is not None else None
 
+    def retired(self) -> list[dict]:
+        """Retired mechanisms with the reason they were retired for.
+
+        A proposer told only that something failed will restate it with a
+        different threshold, which is the same claim wearing a different
+        number, so the claim and the reason travel together.
+        """
+        with _connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT contract_id, mechanism, payer, falsifier, generation, "
+                "retired_ts, retired_reason FROM staged_contracts "
+                "WHERE retired_ts IS NOT NULL "
+                "ORDER BY retired_ts ASC").fetchall()
+        return [dict(row) for row in rows]
+
     def evaluators(self) -> dict[str, object]:
         """Compiled callables keyed by contract id, ready for a shadow lane."""
         return {contract.contract_id: compile_contract(contract)

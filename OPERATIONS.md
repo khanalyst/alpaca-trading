@@ -100,16 +100,23 @@ is treated as durably backed up.
 `research/nightly.sh` runs in this order:
 
 1. readiness; failure is remembered while the run continues;
-2. `research-loop`, which creates missing deterministic outcomes and reviews
+2. `review-staged`, which gives each machine-authored mechanism a coded
+   verdict and retires the ones that are finished;
+3. `author`, which proposes new mechanisms and stages the ones that validate.
+   It runs after the verdicts and before the reviewer on purpose: a proposer
+   that has not been told why the last batch died restates a dead claim at a
+   different threshold, and it needs no terminal outcome to run at all;
+4. `research-loop`, which creates missing deterministic outcomes and reviews
    at most one pending result;
-3. corpus statistics and G2 replay when the journal exists;
-4. funnel, cadence, sweeps, three-arm analysis, forward qualification,
-   fail-closed draft review-artifact preparation, and scorecard regeneration;
-5. one fresh immutable market-history snapshot under
+5. corpus statistics and G2 replay when the journal exists;
+6. funnel, cadence, sweeps, three-arm analysis, forward qualification,
+   fail-closed draft review-artifact preparation, the candidate shortlist,
+   and scorecard regeneration;
+7. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
-6. the exploratory tournament, with immutable per-run artifacts;
-7. one new verified backup.
+8. the exploratory tournament, with immutable per-run artifacts;
+9. one new verified backup.
 
 Exact exit behavior:
 
@@ -451,6 +458,37 @@ To stop the rehearsal, use `./.venv/bin/python main.py pause --flatten` and
 verify OKX has no remaining positions or orders. If flattening is incomplete,
 close them manually in OKX and keep the agent paused. A local test pass does
 not replace one real credentialed OKX demo smoke test.
+
+### 7.2 Machine-authored mechanisms
+
+Every registered mechanism used to be a hand-written Python function, which
+capped the registry at three hypotheses attached to one strategy. A mechanism
+is now expressible as data - a claim, the payer, a falsifier and comparisons
+over named market fields - and compiles into the same callable the
+hand-written contracts implement.
+
+```bash
+./.venv/bin/python research.py author --dry-run   # what the proposer is asked
+./.venv/bin/python research.py staged             # what is registered
+./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py shortlist
+```
+
+Staged mechanisms run in their own `:staged` scope, one paper account each, on
+a single fixed measurement harness: first observed price after the signal, a
+structure stop at one ATR, a 2R target, observed taker costs both sides and a
+24h timeout. The harness is identical for every mechanism on purpose, so a
+difference between two of them is a difference in the mechanism rather than in
+a lucky stop distance.
+
+They enter at `T1_HYPOTHESIS` and cannot rise. Live still requires
+`T3_VALIDATED` and a reviewed content-addressed packet, so nothing here
+shortens the path to capital; what it removes is the developer in the middle
+of measuring an idea.
+
+A registered claim is immutable at the database level. Rewording one after
+results exist is refused by a trigger, because a claim that can be edited
+afterwards cannot be told apart from one retro-fitted to the result.
 
 ## 8. Interpreting results
 

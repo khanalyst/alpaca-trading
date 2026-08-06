@@ -45,6 +45,17 @@ scope for planner history and are never pooled with lane comparisons. Feeds
 v1-v7 remain historical (v4 is the market-data plumbing repair feed and v5 the
 immutable-provenance fork).
 
+Machine-authored mechanisms are a separate population. They live in
+`research/cache/staging.db`, run in a `:staged` scope with one paper account
+each on a single fixed measurement harness, and receive their own coded
+verdicts from `research.py review-staged`: `NEGATIVE_EXPECTANCY`,
+`DIED_OUT_OF_SAMPLE` and `NEVER_FIRED` retire a mechanism, while
+`STARVED_OF_DATA` never does because a claim evaluated on snapshots it could
+not read has not been tested. Retirement keeps the claim, the payer and the
+reason together so the next generation is not told merely that something
+failed. They enter at `T1_HYPOTHESIS` and are never pooled with the registered
+strategies' comparison arms.
+
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;

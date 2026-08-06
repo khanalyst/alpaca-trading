@@ -1427,10 +1427,23 @@ def cmd_author(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             context = {}
         history = {
-            "falsified": (context or {}).get("failed_outcomes", []),
-            "inconclusive": (context or {}).get(
-                "retryable_inconclusive_assignments", []),
+            "falsified": list((context or {}).get("failed_outcomes", [])),
+            "inconclusive": list((context or {}).get(
+                "retryable_inconclusive_assignments", [])),
         }
+        # What previous generations of authored mechanisms learned. Without
+        # this the proposer sees which of its own claims are staged but not
+        # what happened to them, and restates a dead one at a slightly
+        # different threshold - the same claim wearing a different number.
+        try:
+            from research import staged_review
+
+            staged_history = staged_review.authoring_history(
+                store, findings_store)
+            history["falsified"].extend(staged_history["falsified"])
+            history["inconclusive"].extend(staged_history["inconclusive"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"staged history unavailable: {exc}", file=sys.stderr)
     if args.dry_run:
         request = authoring.build_request(
             store, history=history, max_proposals=args.max_proposals)
@@ -1500,6 +1513,28 @@ def cmd_shortlist(args: argparse.Namespace) -> int:
         print(f"wrote {args.out}")
     else:
         print(report, end="")
+    return 0
+
+
+def cmd_review_staged(args: argparse.Namespace) -> int:
+    """Adjudicate staged mechanisms and retire the ones that are finished.
+
+    Retirement frees a lane; the claim and the reason stay recorded so the
+    next generation can see what has already been tried.
+    """
+    from agent.staging import StagingStore
+    from research import staged_review
+
+    staging_path = args.staging or DEFAULT_STAGING_PATH
+    if not Path(staging_path).is_file():
+        print("no staged mechanisms")
+        return 0
+    store = findings_mod.FindingsStore(
+        findings_mod.resolve_store_path(args.store))
+    result = staged_review.review(
+        StagingStore(staging_path), store, scope_key=args.scope,
+        retire=not args.dry_run)
+    print(json.dumps(result, sort_keys=True, default=str))
     return 0
 
 
@@ -1671,6 +1706,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="findings.db to inspect read-only; absent stores are not created")
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
+
+    review_staged = sub.add_parser(
+        "review-staged",
+        help="verdict every staged mechanism and retire the finished ones")
+    review_staged.add_argument("--store", default=None, help="findings.db path")
+    review_staged.add_argument("--staging", default=None, help="staging.db path")
+    review_staged.add_argument("--scope", default=None, help="limit to one scope")
+    review_staged.add_argument("--dry-run", action="store_true",
+                               help="report verdicts without retiring")
+    review_staged.set_defaults(func=cmd_review_staged)
 
     shortlist_parser = sub.add_parser(
         "shortlist", help="rank measured candidates and state the evidence")

@@ -138,7 +138,7 @@ collection answers that question with data instead of a guess.
       strictest adequacy gate to every candidate from the first bar
 - [ ] B2.4 Parallel arms with false-discovery control per axis family,
       replacing serial one-candidate-per-lane rotation
-- [ ] B2.5 Reason-coded verdicts so the reviewer learns why a candidate died,
+- [x] B2.5 Reason-coded verdicts so the reviewer learns why a candidate died,
       not merely that it did
 - [x] B2.6 Ranked shortlist report: mechanism, payer, configuration,
       observations, after-cost expectancy with interval, nulls beaten,
@@ -226,7 +226,7 @@ vetoed a quiet hour, with no code written for it.
       one on the shared harness every cycle, in its own scope
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control
-- [ ] B2.5 Reason-coded verdicts
+- [x] B2.5 Reason-coded verdicts
 - [x] B2.6 Ranked shortlist report
 - [ ] B2.7 Deterministic order path
 
@@ -302,7 +302,7 @@ own variant id.
 ### Remaining
 
 - [x] B2.6 Ranked shortlist report
-- [ ] B2.5 Reason-coded verdicts
+- [x] B2.5 Reason-coded verdicts
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control
 - [ ] B2.7 Deterministic order path
@@ -340,7 +340,51 @@ populations as one.
 
 ### Remaining
 
-- [ ] B2.5 Reason-coded verdicts
+- [x] B2.5 Reason-coded verdicts
+- [ ] B2.3 Three-stage funnel
+- [ ] B2.4 Parallel arms with false-discovery control
+- [ ] B2.7 Deterministic order path
+
+
+### B2.5: a dead mechanism says why, in terms the next generation can use
+
+Registered variants already get a coded terminal verdict the planner reads
+back. Machine-authored ones had nothing equivalent: they accumulated trades
+and were never adjudicated, so a proposer could see what was staged but not
+what had happened to it - and a proposer told only that something failed
+restates it at a different threshold, which is the same claim wearing a
+different number.
+
+`research.py review-staged` adjudicates each staged mechanism:
+
+| Code | Retires? | Meaning |
+| --- | --- | --- |
+| `NEGATIVE_EXPECTANCY` | yes | Fired enough and lost; a nearby threshold on the same fields is the same claim |
+| `DIED_OUT_OF_SAMPLE` | yes | Positive while fitting, negative held out |
+| `NEVER_FIRED` | yes | Evaluated repeatedly, never triggered; unreachable rather than wrong |
+| `STARVED_OF_DATA` | no | Mostly never evaluated; a pipeline result, so the claim stays staged |
+| `COLLECTING` / `SUPPORTED` | no | Kept running |
+
+Starvation outranks every other verdict, tested explicitly: a mechanism with
+four losing trades and nine hundred unevaluated decisions reads
+`STARVED_OF_DATA`, not `NEGATIVE_EXPECTANCY`. Retiring it would record a
+verdict the pipeline caused rather than the market, which is precisely what
+made six strategies look falsified for a week.
+
+Demonstrated end to end: generation 0 proposed a funding-crowding mechanism,
+it was retired `NEGATIVE_EXPECTANCY`, and generation 1's request carried the
+mechanism, the payer, the code and the sentence "a nearby threshold on the
+same fields is the same claim". Verdicts run before authoring in `nightly.sh`
+for exactly that reason.
+
+Documentation updated with it: README gained the verdict table and the
+shortlist labels, OPERATIONS gained a machine-authored-mechanisms runbook
+section and a corrected nightly order, SETUP gained `research.staging_store`,
+and `research/README.md` records that staged mechanisms are a separate
+population never pooled with the registered arms.
+
+### Remaining
+
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control
 - [ ] B2.7 Deterministic order path

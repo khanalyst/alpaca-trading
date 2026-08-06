@@ -255,6 +255,7 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py author
 ./.venv/bin/python research.py author --dry-run
 ./.venv/bin/python research.py staged
+./.venv/bin/python research.py review-staged --dry-run
 ./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
@@ -304,6 +305,25 @@ It is deliberately not gated on a terminal outcome. The nightly reviewer needs
 a finished assignment to have something to explain, so on a corpus where none
 has finished it never runs at all - which is exactly the state in which new
 ideas matter most.
+
+`research.py review-staged` gives each staged mechanism a coded verdict and
+retires the ones that are finished, so the next generation is told what has
+already been tried and why:
+
+| Code | Meaning |
+| --- | --- |
+| `NEGATIVE_EXPECTANCY` | Fired enough, lost; a nearby threshold on the same fields is the same claim |
+| `DIED_OUT_OF_SAMPLE` | Positive while fitting, negative held out |
+| `NEVER_FIRED` | Evaluated repeatedly and never triggered; unreachable rather than wrong |
+| `STARVED_OF_DATA` | Mostly never evaluated; a pipeline result, so the claim is kept staged |
+| `COLLECTING` / `SUPPORTED` | Kept running |
+
+Only the first three retire a mechanism. `STARVED_OF_DATA` never does, because
+a claim evaluated on snapshots it could not read has not been tested - the
+distinction that made six strategies look falsified for a week. Retirement
+frees the lane and keeps the claim, the payer and the reason recorded together,
+because a proposer told only that something failed will restate it with a
+different number.
 
 Staged mechanisms enter at `T1_HYPOTHESIS` and are append-only: a registered
 claim cannot be reworded once results exist, which is the difference between a

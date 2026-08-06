@@ -101,6 +101,7 @@ authorize live mode. The complete operating and rollback procedure is in
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `2` |
 | `research.findings_store` | `research/cache/findings.db` |
+| `research.staging_store` | `research/cache/staging.db`; machine-authored mechanisms, created by `research.py author` and absent until one is staged |
 | `research.forward_feed_version` | `8`; v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; three long-horizon models are offline-only; v1-v7 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane fork, and v7 the liquidation-flow and conditioning-axis fork |
 | `research.experiment_min_duration_days` | `10` |
 | `research.experiment_min_observations` | `100` |
@@ -120,6 +121,8 @@ The available exit policies are `fixed_rr`, `extended_rr`, and
 
 ```bash
 ./.venv/bin/python research.py corpus stats
+./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py report
