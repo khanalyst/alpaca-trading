@@ -9,24 +9,31 @@ method. Failures are contained by the engine after live decisions commit.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
+import re
 import tempfile
 import time
 import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from research.findings import (FindingsStore, _content_hash,
                                resolve_store_path, variant_identity_hash)
 
 from . import (brain, hypotheses, registry as strategy_registry,
                state as runtime_state, strategy)
-from .forward_models import (_field as _row_field,
+from . import staged_lane
+from .forward_models import (STAGED_HARNESS,
+                             _field as _row_field,
                              _finite as _row_finite,
                              require_complete_contract)
 from .risk import RiskEngine
 from .variants import (Variant, apply, declared_research_setting, from_record)
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -87,9 +94,26 @@ class ShadowBudget:
         return False
 
 
+STAGED_STRATEGY_ID = "staged"
+DEFAULT_STAGING_STORE = "research/cache/staging.db"
+
+
+def _model_for(strategy_id: str):
+    """Resolve the outcome contract, including the staged harness.
+
+    Machine-authored mechanisms share one fixed harness rather than each
+    carrying its own exits, so a difference between two of them is a
+    difference in the mechanism. The harness is not in ``BY_STRATEGY``
+    because it is a measurement instrument, not a registered strategy.
+    """
+    if str(strategy_id) == STAGED_STRATEGY_ID:
+        return STAGED_HARNESS
+    return require_complete_contract(strategy_id)
+
+
 def _variant_runtime(variant: Variant, base_cfg: dict) -> tuple[dict, object, dict]:
     cfg = apply(variant, base_cfg, allow_shadow_strategy=True)
-    model = require_complete_contract(variant.strategy_id)
+    model = _model_for(variant.strategy_id)
     provenance = {
         "variant_definition_hash": variant_identity_hash(variant),
         "strategy_config_version": runtime_state.experiment_fingerprint(cfg),
@@ -1738,7 +1762,9 @@ class StrategyShadowCoordinator:
 
     def __init__(self, evaluators: dict[str, ShadowEvaluator], *,
                  active_strategy_id: str,
-                 llm_evaluator: ShadowEvaluator | None = None) -> None:
+                 llm_evaluator: ShadowEvaluator | None = None,
+                 staged_evaluators: dict | None = None,
+                 staged_contracts: list | None = None) -> None:
         if not evaluators:
             raise ValueError("strategy shadow coordinator needs an evaluator")
         self.evaluators = dict(evaluators)
@@ -1746,6 +1772,11 @@ class StrategyShadowCoordinator:
         # LLM decisions use a separate scope from deterministic comparisons;
         # the two proposal sources must never be pooled into one verdict.
         self.llm_evaluator = llm_evaluator
+        # Machine-authored mechanisms run in their own lane on one fixed
+        # harness. Kept out of self.evaluators so a staged claim can never be
+        # counted among the registered strategies' comparison arms.
+        self.staged_evaluators = dict(staged_evaluators or {})
+        self.staged_contracts = list(staged_contracts or [])
         self.store = next(iter(self.evaluators.values())).store
         self.scope_key = next(iter(self.evaluators.values())).scope_key
         self.last_coverage: dict = {}
@@ -1870,14 +1901,66 @@ class StrategyShadowCoordinator:
         llm_lane = self._evaluate_llm_lane(
             snapshot, timestamp, cycle_id, proposals, advance_accounts)
         records.extend(llm_lane.pop("_records"))
+        staged_lane_result = self._evaluate_staged_lane(
+            snapshot, timestamp, cycle_id, advance_accounts)
+        records.extend(staged_lane_result.pop("_records"))
         self.last_coverage = {
             "scope_key": self.scope_key,
             "strategies": coverage,
             "strategy_count": len(self.evaluators),
             "llm_lane": llm_lane or None,
+            "staged_lane": staged_lane_result or None,
         }
         self.last_budget = aggregate_budget
         return records
+
+    def _evaluate_staged_lane(
+            self, snapshot: dict, timestamp: float, cycle_id: str | None,
+            advance_accounts: bool) -> dict:
+        """Evaluate machine-authored mechanisms on the shared harness.
+
+        Each contract is given only its own proposals: two staged mechanisms
+        are different claims, and letting one trade on another's signals
+        would make every staged result unattributable.
+
+        Isolated exactly like every other lane. A fault here is recorded and
+        swallowed rather than costing the registered strategies their cycle,
+        and coverage separates fired, declined and starved because a
+        mechanism evaluated on a snapshot it could not read has not been
+        tested and must not be recorded as having declined.
+        """
+        if not self.staged_evaluators or not self.staged_contracts:
+            return {"_records": []}
+        lane: dict = {
+            "scope_key": f"{self.scope_key}:staged",
+            "proposal_source": "staged_contract",
+            "contracts": len(self.staged_contracts),
+        }
+        records: list = []
+        per_contract: dict = {}
+        errors: dict = {}
+        proposals_total = 0
+        for contract in self.staged_contracts:
+            evaluator = self.staged_evaluators.get(contract.contract_id)
+            if evaluator is None:
+                continue
+            try:
+                proposals = staged_lane.proposals_for(
+                    [contract], snapshot, evaluator.base_cfg)
+                proposals_total += len(proposals)
+                per_contract.update(staged_lane.coverage(proposals))
+                records.extend(evaluator.evaluate(
+                    snapshot, now=timestamp, cycle_id=cycle_id,
+                    proposals=proposals,
+                    advance_accounts=advance_accounts))
+            except Exception as exc:                       # noqa: BLE001
+                errors[contract.contract_id] = f"{type(exc).__name__}: {exc}"
+        lane["proposals"] = proposals_total
+        lane["per_contract"] = per_contract
+        if errors:
+            lane["errors"] = errors
+        lane["_records"] = records
+        return lane
 
     def _evaluate_llm_lane(
             self, snapshot: dict, timestamp: float, cycle_id: str | None,
@@ -2074,6 +2157,88 @@ def build(
     llm_evaluator = _build_strategy_evaluator(
         _research_cfg(cfg, active_id), registry, ["*"],
         scope_key=f"{resolved_scope}:llm", findings_store=findings_store)
+    staged_evaluators, staged_contracts = _build_staged_lane(
+        cfg, resolved_scope, findings_store)
     return StrategyShadowCoordinator(
         evaluators, active_strategy_id=active_id,
-        llm_evaluator=llm_evaluator)
+        llm_evaluator=llm_evaluator,
+        staged_evaluators=staged_evaluators,
+        staged_contracts=staged_contracts)
+
+
+def staged_variant_id(contract_id: str) -> str:
+    """Namespace a contract as a variant id the registry format accepts.
+
+    Hyphens are legal in a contract id and not in a variant id, and the
+    ``staged.`` prefix keeps a machine-authored arm visibly distinct from a
+    hand-registered one in every report that lists variants.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", str(contract_id).lower()).strip("_")
+    return f"staged.{slug}"
+
+
+def _build_staged_lane(cfg: dict, resolved_scope: str,
+                       findings_store: FindingsStore):
+    """Enrol each machine-authored mechanism on the shared harness.
+
+    One evaluator per contract, deliberately. ``ShadowEvaluator.evaluate``
+    applies one common proposal set to every variant it holds, which is right
+    for a baseline and its candidate but wrong here: two staged mechanisms
+    are different claims, so sharing an evaluator would have each one trading
+    on the other's signals and destroy attribution entirely.
+
+    Absent or unreadable staging is not an error. The platform ran without
+    this lane before it existed and must keep running if the store is gone.
+    """
+    block = cfg.get("research") or {}
+    path = block.get("staging_store") or DEFAULT_STAGING_STORE
+    try:
+        from .staging import StagingStore
+
+        if not path or not Path(path).is_file():
+            return {}, []
+        contracts = StagingStore(path).active()
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("staged mechanisms unavailable: %s", exc)
+        return {}, []
+    if not contracts:
+        return {}, []
+    # The config keeps a registered strategy.id because configuration
+    # validation resolves it against the registry, and "staged" is a research
+    # family rather than a registered strategy. Only the outcome parameters
+    # are overridden, exactly as _research_cfg does for the other lanes. The
+    # staged identity lives on the variant, which is what resolves the
+    # harness and what every result is attributed to.
+    staged_cfg = deepcopy(cfg)
+    staged_cfg["strategy"] = {
+        **dict(staged_cfg["strategy"]),
+        "signal_timeframe": STAGED_HARNESS.signal_timeframe,
+        "min_stop_atr_multiple": STAGED_HARNESS.stop_atr_multiple,
+        "fixed_reward_risk": STAGED_HARNESS.reward_risk,
+        "forward_horizon_hours": STAGED_HARNESS.horizon_hours,
+    }
+    evaluators, enrolled = {}, []
+    for contract in contracts:
+        variant = Variant(
+            variant_id=staged_variant_id(contract.contract_id),
+            strategy_id=STAGED_STRATEGY_ID,
+            base_version=STAGED_HARNESS.model_id,
+            overrides={},
+            hypothesis=contract.mechanism,
+            status="candidate")
+        try:
+            evaluators[contract.contract_id] = ShadowEvaluator(
+                [variant], staged_cfg,
+                budget_ms=float(block.get("shadow_budget_ms") or 0),
+                store=findings_store,
+                scope_key=f"{resolved_scope}:staged",
+                initial_balance_usdt=float(
+                    block.get("paper_initial_balance_usdt") or 10_000),
+                max_failures=int(block.get("paper_max_failures") or 3))
+        except Exception as exc:                           # noqa: BLE001
+            # One unbuildable mechanism must not cost the others their lane.
+            log.warning("staged mechanism %s could not be enrolled: %s",
+                        contract.contract_id, exc)
+            continue
+        enrolled.append(contract)
+    return evaluators, enrolled

@@ -222,9 +222,8 @@ vetoed a quiet hour, with no code written for it.
 
 ### Still open, and why the loop is not yet closed
 
-- [~] B2.8 Give staged contracts shadow lanes. The fixed harness and the
-      proposal emitter are in `agent/staged_lane.py`; the remaining step is
-      the coordinator calling it each cycle
+- [x] B2.8 Staged contracts get shadow lanes: the coordinator evaluates each
+      one on the shared harness every cycle, in its own scope
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control
 - [ ] B2.5 Reason-coded verdicts
@@ -271,3 +270,39 @@ Data problems outrank the contract's own opinion for exactly the reason six
 strategies looked falsified for a week: a mechanism evaluated on a snapshot it
 could not read has not been tested, and counting that as a decline turns
 starvation into apparent evidence against the claim.
+
+
+### B2.8: the loop is closed
+
+`StrategyShadowCoordinator` now evaluates staged mechanisms each cycle, in
+`<scope>:staged`, isolated the same way every other lane is: a fault is
+recorded and swallowed rather than costing the registered strategies their
+cycle.
+
+One evaluator per contract, not one shared evaluator. `ShadowEvaluator`
+applies one common proposal set to every variant it holds, which is right for
+a baseline and its candidate and wrong here: two staged mechanisms are
+different claims, so a shared evaluator would have each one trading on the
+other's signals and destroy attribution entirely. That is the kind of mistake
+that produces confident, meaningless results, so it is held by a test.
+
+Enrolment needed three corrections the suite surfaced in turn: a contract id
+may contain hyphens and a variant id may not, so a contract enrols as
+`staged.<slug>`; configuration resolves `strategy.id` against the registry, so
+the staged config keeps a registered id and only overrides the outcome
+parameters exactly as `_research_cfg` does, with the staged identity carried
+on the variant; and `research.staging_store` had to be declared before the
+config would accept it.
+
+The end-to-end path now runs: `research.py author` proposes, validation and
+staging register, the coordinator evaluates each mechanism on the fixed
+harness every cycle, and results accrue to its own paper account under its
+own variant id.
+
+### Remaining
+
+- [ ] B2.6 Ranked shortlist report
+- [ ] B2.5 Reason-coded verdicts
+- [ ] B2.3 Three-stage funnel
+- [ ] B2.4 Parallel arms with false-discovery control
+- [ ] B2.7 Deterministic order path

@@ -157,6 +157,11 @@ research:
   shadow_budget_ms: 0
   shadow_workers: 2
   findings_store: research/cache/findings.db
+  # Machine-authored mechanisms, kept apart from the hand-registered ones so
+  # a proposed claim can never be mistaken for a reviewed one. Created by
+  # `research.py author`; absent until something is staged, and the shadow
+  # lane is simply absent while it does not exist.
+  staging_store: research/cache/staging.db
   # Optional pre-existing destination. It is external only when its mounted
   # filesystem/device differs from every repository/source device; an explicit
   # same-device path remains configured-local. The path is never auto-created.

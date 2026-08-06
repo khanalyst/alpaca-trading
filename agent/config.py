@@ -497,6 +497,10 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                          "shadow_budget_ms",
                          "shadow_workers",
                          "findings_store", "backup_target",
+                         # Optional. Machine-authored mechanisms live in a
+                         # separate append-only store so a proposed claim can
+                         # never be confused with a hand-registered one.
+                         "staging_store",
                          "paper_initial_balance_usdt",
                          "paper_max_failures", "paper_min_closed_trades",
                          "experiment_min_duration_days",
