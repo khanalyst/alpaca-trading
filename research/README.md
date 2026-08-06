@@ -38,17 +38,31 @@ The draft creates no variant or selection, changes no configuration, tier,
 portfolio, or order authority, and must be manually reviewed and registered in
 a later code change before research can use it.
 
-The active simulator scope is `forward_feed_version: 7`. Feed v7 makes the
+The active simulator scope is `forward_feed_version: 8`. Feed v8 makes the
 four realtime lanes deterministic; the three long-horizon models remain
 offline-only. The active analyst's actual choices remain in a sibling `:llm`
 scope for planner history and are never pooled with lane comparisons. Feeds
-v1-v6 remain historical (v4 is the market-data plumbing repair feed and v5 the
+v1-v7 remain historical (v4 is the market-data plumbing repair feed and v5 the
 immutable-provenance fork).
+
+Staged mechanisms are a separate population. They arrive either from
+`research.py author`, which proposes from what the evidence has killed, or
+from `research.py stage-seed`, which registers the hand-written
+pre-registrations kept in `research/staged/pre-registered.yaml`. They live in
+`research/cache/staging.db`, run in a `:staged` scope with one paper account
+each on a single fixed measurement harness, and receive their own coded
+verdicts from `research.py review-staged`: `NEGATIVE_EXPECTANCY`,
+`DIED_OUT_OF_SAMPLE` and `NEVER_FIRED` retire a mechanism, while
+`STARVED_OF_DATA` never does because a claim evaluated on snapshots it could
+not read has not been tested. Retirement keeps the claim, the payer and the
+reason together so the next generation is not told merely that something
+failed. They enter at `T1_HYPOTHESIS` and are never pooled with the registered
+strategies' comparison arms.
 
 Terminal verdicts are `WORKED`, `FAILED`, and `INCONCLUSIVE`. Adequacy is
 checked before performance, and every reason/limitation is stored. `WORKED`
 creates only a `RESEARCH_ONLY` edge candidate with `promotion_allowed: false`;
-current v7 forward qualification is still required and there is no automatic
+current v8 forward qualification is still required and there is no automatic
 live promotion.
 
 ## Authoritative journal path
@@ -60,7 +74,7 @@ baseline variant) symmetrically with replay keys and requires a non-vacuous
 exact match before downstream authoritative evidence is trusted. Malformed,
 duplicate, missing, or extra identities fail closed; outcome-resolution gaps
 remain diagnostics rather than proposal mismatches. It does not reproduce full
-contract or execution semantics. The current v7
+contract or execution semantics. The current v8
 `forward-qualify` path uses
 eligible completed assignments and each setting's contemporaneous baseline.
 Its paired cluster sign-flip result is valid only under the documented

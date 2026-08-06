@@ -446,6 +446,49 @@ MODELS: dict[str, ForwardOutcomeModel] = {
 BY_STRATEGY = {model.strategy_id: model for model in MODELS.values()}
 
 
+# One measurement harness, shared by every machine-authored mechanism.
+#
+# A staged contract states when to enter and nothing else. It could be given
+# its own exits, but then two proposals would differ in both the mechanism and
+# the exit policy at once, and a winner could as easily be a lucky stop
+# distance as a real edge. Holding entry, stop, target, costs and horizon
+# fixed across the whole staged population is what makes a difference between
+# two authored mechanisms attributable to the mechanism.
+#
+# The values are deliberately the ordinary ones rather than favourable ones: a
+# structure stop at one ATR, a 2R target, observed taker costs on both sides,
+# realized funding, and a 24-hour timeout. A mechanism that cannot clear this
+# has not been treated unfairly - it has been measured against the same bar as
+# everything else.
+# Deliberately absent from MODELS and BY_STRATEGY: those map registered
+# strategies to their contracts, and the harness is a measurement
+# instrument rather than a strategy. Adding it there would make every
+# "one model per registered strategy" invariant false.
+STAGED_HARNESS_ID = "staged.fixed_rr.15m.v1"
+
+STAGED_HARNESS = ForwardOutcomeModel(
+    model_id=STAGED_HARNESS_ID,
+    strategy_id="staged", signal_timeframe="15m",
+    horizon_hours=24.0,
+    entry_assumption="first observed snapshot price after the signal",
+    stop_assumption="structure stop with a one-ATR minimum",
+    target_assumption="fixed 2R target, identical for every staged mechanism",
+    cost_assumption="observed depth-VWAP taker entry, fee and exit "
+                    "spread/stop slippage, realized funding events",
+    holding_assumption="stop/target first, otherwise a 24h timeout",
+    required_fields=_COMMON_COST_FIELDS + ("signal_ts",),
+    signal_timestamp_field="signal_ts", invalidation_anchor="structure",
+    exit_policy="fixed_rr", stop_atr_multiple=1.0, reward_risk=2.0,
+    contract_complete=True,
+    contract_evidence=(
+        "agent/contract_dsl.py",
+        "tests/test_contract_dsl.py",
+        "tests/test_staged_harness.py",
+    ),
+)
+
+
+
 def model_for(strategy_id: str) -> ForwardOutcomeModel:
     try:
         return BY_STRATEGY[strategy_id]

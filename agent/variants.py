@@ -190,7 +190,12 @@ def hypothesis_variants(strategy_id: str, base_version: str) -> list[Variant]:
         for setting in sorted(spec.settings, key=lambda item: str(item["id"])):
             setting_id = str(setting["id"])
             safe_hypothesis_id = spec.id.replace("-", "_")
-            variant_id = f"{strategy_id}.hyp.{safe_hypothesis_id}.{setting_id}"
+            # The hypothesis id was sanitised here and the strategy id was
+            # not, which held only while momentum - the one registered id
+            # without a hyphen - was the only strategy that could reach the
+            # order path. Six of the seven registered ids contain one.
+            variant_id = (f"{strategy_variant_prefix(strategy_id)}.hyp."
+                          f"{safe_hypothesis_id}.{setting_id}")
             params = dict(spec.contract_params)
             params.update(setting.get("params") or {})
             out.append(Variant(
@@ -225,7 +230,8 @@ def adaptive_hypothesis_variant(strategy_id: str, base_version: str,
     safe = str(hypothesis_id).replace("-", "_")
     value_id = format(number, ".15g").replace("-", "m").replace(".", "_")
     return Variant(
-        variant_id=f"{strategy_id}.hyp.{safe}.{setting_id}.adaptive_{value_id}",
+        variant_id=(f"{strategy_variant_prefix(strategy_id)}.hyp.{safe}."
+                    f"{setting_id}.adaptive_{value_id}"),
         strategy_id=strategy_id, base_version=base_version,
         hypothesis=(f"Adaptive value {number:g} for {hypothesis_id}/{setting_id}: "
                     "test the registered mechanism at this exact point."),

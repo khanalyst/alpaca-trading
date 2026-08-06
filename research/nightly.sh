@@ -87,6 +87,20 @@ echo "=== $(date -u +%FT%TZ) readiness ==="
 # nonzero is an operational failure, not a collection delay.
 "$PY" research.py readiness --db "$JOURNAL" || readiness_failed=1
 
+# Generation runs before review and is not gated on a terminal outcome.
+# The reviewer needs a finished assignment to have something to explain;
+# when nothing has finished, generation is exactly what the loop needs.
+# Verdicts before generation, deliberately: a proposer that has not yet been
+# told why the last batch died will restate a dead claim at a slightly
+# different threshold, which is the same claim wearing a different number.
+echo "=== $(date -u +%FT%TZ) adjudicating staged mechanisms ==="
+"$PY" research.py review-staged --store "$STORE" \
+  || echo "  (staged review unavailable this cycle)"
+
+echo "=== $(date -u +%FT%TZ) authoring new candidate mechanisms ==="
+"$PY" research.py author --store "$STORE" \
+  || echo "  (authoring unavailable this cycle; retried next run)"
+
 echo "=== $(date -u +%FT%TZ) research learning loop ==="
 # One invocation reviews at most one completed outcome. Provider or parse
 # failures are persisted for retry and must not abort the wider nightly run.
@@ -150,6 +164,10 @@ if [ -f "$JOURNAL" ]; then
   # and any capital-enabling change remain explicit operator actions.
   "$PY" research.py prepare-review-artifacts --store "$STORE" --db "$JOURNAL" \
     || echo "WARNING: review artifact preparation deferred" >&2
+
+  echo "=== $(date -u +%FT%TZ) candidate shortlist ==="
+  "$PY" research.py shortlist --store "$STORE" \
+    --out "$ROOT/research/results/shortlist.md" || true
 
   echo "=== $(date -u +%FT%TZ) regenerating scorecards ==="
   "$PY" research.py report --store "$STORE"

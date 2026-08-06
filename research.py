@@ -68,8 +68,12 @@ def _load_experiment_registry(cfg: dict, store) -> dict:
     strategy_id = str(strategy.get("id") or "")
     base_version = str(strategy.get("version") or "")
     if strategy_id and base_version:
+        # Six of the seven registered strategy ids contain a hyphen, which is
+        # not legal in a variant id. The prefix helper is the one place that
+        # conversion lives; keying this by the raw id would file the baseline
+        # under a name nothing else ever looks up.
         registry.setdefault(
-            f"{strategy_id}.baseline",
+            variant_mod.baseline_variant_id(strategy_id),
             variant_mod.baseline(strategy_id, base_version),
         )
         for variant in variant_mod.hypothesis_variants(
@@ -117,6 +121,9 @@ def _price_cache(args: argparse.Namespace):
     if not path:
         return None
     return prices_mod.PriceCache(path)
+
+
+DEFAULT_STAGING_PATH = "research/cache/staging.db"
 
 
 def _corpus_for(db: Path):
@@ -741,8 +748,13 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
         print("--scope must identify a deterministic forward lane; the "
               "analyst :llm scope is not eligible", file=sys.stderr)
         return 2
+    from agent.variants import baseline_variant_id, strategy_variant_prefix
+
     strategy_id = args.strategy
-    baseline_id = f"{strategy_id}.baseline"
+    # A strategy id and a variant id are different alphabets: hyphens are
+    # legal in the first and not in the second.
+    variant_prefix = strategy_variant_prefix(strategy_id)
+    baseline_id = baseline_variant_id(strategy_id)
     axes: dict[str, dict] = {}
     hypothesis_groups: dict[str, list] = {}
     for variant_id, variant in sorted(registry.items()):
@@ -750,7 +762,7 @@ def cmd_forward_qualify(args: argparse.Namespace) -> int:
                 or variant.status not in {"candidate", "testing"}):
             continue
         if variant.hypothesis_id and variant_id.startswith(
-                f"{strategy_id}.hyp."):
+                f"{variant_prefix}.hyp."):
             hypothesis_groups.setdefault(str(variant.hypothesis_id), []).append(
                 variant)
             continue
@@ -1400,6 +1412,170 @@ def cmd_research_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_author(args: argparse.Namespace) -> int:
+    """Ask for new candidate mechanisms and stage the ones that validate.
+
+    Deliberately not gated on a terminal outcome. The reviewer needs one to
+    have something to explain; generation is what a loop with nothing left to
+    nominate needs most, and that is exactly the state with no terminal
+    outcome in it.
+    """
+    from agent.staging import StagingStore
+    from research import authoring
+
+    cfg = _load_config()
+    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    history = {}
+    if not args.no_history:
+        findings_store = findings_mod.FindingsStore(
+            findings_mod.resolve_store_path(args.store))
+        try:
+            context = findings_store.research_history_context()
+        except Exception as exc:  # noqa: BLE001 - history is an input, not a gate
+            print(f"history unavailable, proposing without it: {exc}",
+                  file=sys.stderr)
+            context = {}
+        history = {
+            "falsified": list((context or {}).get("failed_outcomes", [])),
+            "inconclusive": list((context or {}).get(
+                "retryable_inconclusive_assignments", [])),
+        }
+        # What previous generations of authored mechanisms learned. Without
+        # this the proposer sees which of its own claims are staged but not
+        # what happened to them, and restates a dead one at a slightly
+        # different threshold - the same claim wearing a different number.
+        try:
+            from research import staged_review
+
+            staged_history = staged_review.authoring_history(
+                store, findings_store)
+            history["falsified"].extend(staged_history["falsified"])
+            history["inconclusive"].extend(staged_history["inconclusive"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"staged history unavailable: {exc}", file=sys.stderr)
+    if args.dry_run:
+        request = authoring.build_request(
+            store, history=history, max_proposals=args.max_proposals)
+        print(json.dumps(request, indent=2, sort_keys=True, default=str))
+        return 0
+    result = authoring.author_generation(
+        store, cfg, history=history, max_proposals=args.max_proposals)
+    print(json.dumps(result, sort_keys=True, default=str))
+    # A failed provider call is recorded and retried on the next cadence
+    # rather than failing the nightly run around it.
+    return 0
+
+
+def cmd_stage_seed(args: argparse.Namespace) -> int:
+    """Register the version-controlled pre-registrations into staging.
+
+    Idempotent: a claim already in the store is reported and skipped, so this
+    can run on every deploy without a human deciding whether the second run's
+    failure mattered.
+    """
+    from agent.staging import StagingStore
+    from research import staging_seed
+
+    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    try:
+        entries = staging_seed.load(args.file)
+    except staging_seed.SeedError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(json.dumps(
+            [{"contract_id": entry.get("contract_id"),
+              "status": entry.get("status")} for entry in entries],
+            indent=2, sort_keys=True))
+        return 0
+    result = staging_seed.seed(store, entries, generation=args.generation)
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    # A rejected pre-registration is a broken claim in version control, not a
+    # transient failure, so unlike the authoring path this one fails loudly.
+    return 1 if result["rejected"] else 0
+
+
+def cmd_staged(args: argparse.Namespace) -> int:
+    """List staged mechanisms and what each one claims."""
+    from agent.staging import StagingStore
+
+    store = StagingStore(args.staging or DEFAULT_STAGING_PATH)
+    contracts = store.active()
+    if not contracts:
+        print("no staged mechanisms")
+        return 0
+    for contract in contracts:
+        print(f"{contract.contract_id}  [{contract.direction}]")
+        print(f"  mechanism: {contract.mechanism}")
+        print(f"  payer:     {contract.payer}")
+        print(f"  falsifier: {contract.falsifier}")
+        print(f"  fires when {contract.describe()}")
+        print()
+    summary = store.summary()
+    print(f"{summary['active']} active, {summary['retired']} retired, "
+          f"tiers {', '.join(summary['tiers'])}")
+    return 0
+
+
+def cmd_shortlist(args: argparse.Namespace) -> int:
+    """Rank what the evidence supports, and say how far it goes.
+
+    Reports every measured arm including the ones with nothing to show, so a
+    mechanism that was starved of data is visible as untested rather than
+    silently absent from the ranking.
+    """
+    from research import shortlist as shortlist_mod
+
+    store = findings_mod.FindingsStore(
+        findings_mod.resolve_store_path(args.store))
+    staging = None
+    staging_path = args.staging or DEFAULT_STAGING_PATH
+    if Path(staging_path).is_file():
+        from agent.staging import StagingStore
+
+        staging = StagingStore(staging_path)
+    candidates = shortlist_mod.from_store(
+        store, staging, scope_key=args.scope)
+    if args.json:
+        import dataclasses
+
+        print(json.dumps(
+            [dataclasses.asdict(item)
+             for item in shortlist_mod.rank(candidates)],
+            indent=2, sort_keys=True, default=str))
+        return 0
+    report = shortlist_mod.render(candidates)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(report, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(report, end="")
+    return 0
+
+
+def cmd_review_staged(args: argparse.Namespace) -> int:
+    """Adjudicate staged mechanisms and retire the ones that are finished.
+
+    Retirement frees a lane; the claim and the reason stay recorded so the
+    next generation can see what has already been tried.
+    """
+    from agent.staging import StagingStore
+    from research import staged_review
+
+    staging_path = args.staging or DEFAULT_STAGING_PATH
+    if not Path(staging_path).is_file():
+        print("no staged mechanisms")
+        return 0
+    store = findings_mod.FindingsStore(
+        findings_mod.resolve_store_path(args.store))
+    result = staged_review.review(
+        StagingStore(staging_path), store, scope_key=args.scope,
+        retire=not args.dry_run)
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research.py", description=__doc__,
@@ -1568,6 +1744,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="findings.db to inspect read-only; absent stores are not created")
     ready.add_argument("--mode", default="demo", choices=["demo", "live"])
     ready.set_defaults(func=cmd_readiness)
+
+    review_staged = sub.add_parser(
+        "review-staged",
+        help="verdict every staged mechanism and retire the finished ones")
+    review_staged.add_argument("--store", default=None, help="findings.db path")
+    review_staged.add_argument("--staging", default=None, help="staging.db path")
+    review_staged.add_argument("--scope", default=None, help="limit to one scope")
+    review_staged.add_argument("--dry-run", action="store_true",
+                               help="report verdicts without retiring")
+    review_staged.set_defaults(func=cmd_review_staged)
+
+    shortlist_parser = sub.add_parser(
+        "shortlist", help="rank measured candidates and state the evidence")
+    shortlist_parser.add_argument("--store", default=None,
+                                  help="findings.db path")
+    shortlist_parser.add_argument("--staging", default=None,
+                                  help="staging.db path")
+    shortlist_parser.add_argument("--scope", default=None,
+                                  help="limit to one scope key")
+    shortlist_parser.add_argument("--out", default=None,
+                                  help="write the report to this path")
+    shortlist_parser.add_argument("--json", action="store_true",
+                                  help="emit structured rows instead of prose")
+    shortlist_parser.set_defaults(func=cmd_shortlist)
+
+    author = sub.add_parser(
+        "author",
+        help="propose new candidate mechanisms and stage the valid ones")
+    author.add_argument("--staging", default=None, help="staging.db path")
+    author.add_argument("--store", default=None, help="findings.db path")
+    author.add_argument("--max-proposals", type=int, default=4)
+    author.add_argument("--no-history", action="store_true",
+                        help="propose without prior falsification context")
+    author.add_argument("--dry-run", action="store_true",
+                        help="print the request without calling a provider")
+    author.set_defaults(func=cmd_author)
+
+    stage_seed = sub.add_parser(
+        "stage-seed",
+        help="register the version-controlled pre-registrations into staging")
+    stage_seed.add_argument("--staging", default=None, help="staging.db path")
+    stage_seed.add_argument("--file", default=None,
+                            help="seed YAML; defaults to "
+                                 "research/staged/pre-registered.yaml")
+    stage_seed.add_argument("--generation", type=int, default=0,
+                            help="generation label for these claims; 0 marks "
+                                 "them as founding rather than loop-produced")
+    stage_seed.add_argument("--dry-run", action="store_true",
+                            help="list what the file contains without writing")
+    stage_seed.set_defaults(func=cmd_stage_seed)
+
+    staged = sub.add_parser("staged", help="list staged candidate mechanisms")
+    staged.add_argument("--staging", default=None, help="staging.db path")
+    staged.set_defaults(func=cmd_staged)
 
     learning = sub.add_parser(
         "research-loop",

@@ -24,6 +24,20 @@ variants:
   # Exit policy
   # findings.md: the 2R target has never been validated against any
   # alternative. Three settings minimum before this axis may be rejected.
+  # Retired 2026-08-05 on live demo evidence, status only; the registered
+  # claims stay as written. Over 2026-07-29..08-05 the momentum order path
+  # closed 35 trades for 4 wins (11.4%) at -0.974% per trade, taking the demo
+  # account from 71,099 to 64,720. At a 3.0R target breakeven needs about 25%
+  # wins. That is consistent with the 2024-2026 audit, where 0 of 79
+  # walk-forward variants were positive out of sample and both random entry
+  # timing and the inverted signal beat the contract at zero cost.
+  #
+  # Reward:risk, stop distance and net-direction caps all tune the sizing of
+  # a contract whose directional edge measures negative, so each arm would
+  # occupy a research lane for weeks to re-measure a settled result. The
+  # momentum.hyp.* arms are deliberately NOT retired: those test three
+  # independent registered mechanisms that merely run on this lane, and they
+  # have never fired at all because experimental setups were disabled.
   - variant_id: momentum.rr.fixed_1_5
     strategy_id: momentum
     base_version: phase1-v3
@@ -32,7 +46,7 @@ variants:
     hypothesis: >-
       A 1.5R target trades a lower average win for a higher hit rate, and at
       this cost ratio the higher hit rate wins.
-    status: candidate
+    status: superseded
 
   # The claim below names 2.0R as "the default" because that is what shipped
   # when this arm was registered; the shipped target is now 3.0R. The text is
@@ -51,7 +65,7 @@ variants:
     hypothesis: >-
       A 2.5R fixed target outperforms the default 2.0R because the default was
       chosen by convention rather than measured.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.rr.fixed_2_0
     strategy_id: momentum
@@ -61,7 +75,7 @@ variants:
     hypothesis: >-
       A 2.0R target converts more excursions into wins than the shipped 3.0R
       target, and the higher hit rate outweighs the truncated right tail.
-    status: candidate
+    status: superseded
 
   # Superseded because 3.0R is now the shipped baseline, so this arm duplicates
   # momentum.baseline and is not an independent comparison. Only the status is
@@ -88,7 +102,7 @@ variants:
     hypothesis: >-
       A modestly wider 1.25 ATR floor removes ordinary-noise stop-outs without
       paying the full position-size and target-distance cost of a 1.5 ATR stop.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.stop.atr_1_5
     strategy_id: momentum
@@ -98,7 +112,7 @@ variants:
     hypothesis: >-
       A 1.0 ATR stop sits inside ordinary noise, so a materially wider floor
       converts stop-outs into trades that were right but too early.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.stop.atr_2_0
     strategy_id: momentum
@@ -108,7 +122,7 @@ variants:
     hypothesis: >-
       The same claim at twice the default, to establish whether the effect is
       monotonic or has an interior optimum.
-    status: candidate
+    status: superseded
 
   # Net-direction veto
   # findings.md section 5 flags the net-direction cap as the step that kills
@@ -123,7 +137,7 @@ variants:
       Tightening the net-direction cap costs little, because the entries it
       refuses are correlated expressions of one market-wide move rather than
       independent trades.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.net_direction.80
     strategy_id: momentum
@@ -133,7 +147,7 @@ variants:
     hypothesis: >-
       An 80 percent net-direction cap removes the most correlated marginal
       entry while retaining more independent opportunities than the 60 cap.
-    status: candidate
+    status: superseded
 
   - variant_id: momentum.net_direction.120
     strategy_id: momentum
@@ -143,7 +157,7 @@ variants:
     hypothesis: >-
       A looser 120 percent cap reveals whether the shipped 100 percent ceiling
       suppresses genuinely independent signals rather than correlated bets.
-    status: candidate
+    status: superseded
 
   # Confidence floor
   # The live prompt already suppresses proposals below the shipped 0.65
@@ -370,6 +384,26 @@ variants:
       charge against a 1.5 percent risk budget and they fall fastest with
       volume. Falsified if expectancy at top_n 5 does not exceed the shipped 10
       by more than the MDE at 100 round trips per setting.
+    status: superseded
+
+  # The shipped universe moved from 10 to 25 on 2026-08-05, which left this
+  # axis with only two distinct points because top_25 became the baseline.
+  # The previous shipped breadth is registered here as the third so the axis
+  # can still conclude. Its claim is written against the new baseline; the
+  # older rows keep their original wording because a registered hypothesis is
+  # immutable identity.
+  - variant_id: momentum.universe.top_10
+    strategy_id: momentum
+    base_version: phase1-v3
+    overrides:
+      universe.top_n: 10
+    hypothesis: >-
+      Restricting the universe from the shipped 25 back to the ten
+      highest-volume USDT perpetuals raises expectancy per trade, because
+      spread, depth and stop slippage are a fixed charge against the risk
+      budget and fall fastest with volume. Falsified if expectancy at top_n 10
+      does not exceed the shipped 25 by more than the MDE at 100 round trips
+      per setting.
     status: superseded
 
   - variant_id: momentum.universe.top_25

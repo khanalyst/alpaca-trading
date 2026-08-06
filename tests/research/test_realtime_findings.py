@@ -1691,7 +1691,13 @@ class ForwardQualificationCommandTests(StoreFixture):
 
         args = argparse.Namespace(
             store=str(self.path), scope=scope, strategy="momentum")
+        # The hypothesis axes this asserts on are generated for the CONFIGURED
+        # strategy, and momentum no longer occupies the order path. Pinning
+        # the config keeps the test about axis pooling rather than about which
+        # strategy config.yaml happens to name.
         with patch.object(
+                research_cli, "_load_config",
+                return_value=valid_config()), patch.object(
                 findings.FindingsStore, "record_forward_analysis",
                 autospec=True, side_effect=record_axis), patch.object(
                 findings.FindingsStore, "analysis",
@@ -1699,7 +1705,12 @@ class ForwardQualificationCommandTests(StoreFixture):
             result = research_cli.cmd_forward_qualify(args)
 
         self.assertEqual(result, 0)
-        self.assertGreaterEqual(len(calls), 4)
+        # Three, not four, since 2026-08-05: momentum's reward:risk, stop and
+        # net-direction arms were the only hand-authored parameter axes in
+        # this registry, and retiring them on live evidence left the
+        # conditioning and hypothesis axes behind. The floor exists so the
+        # loop below runs on a non-trivial sample, not to assert breadth.
+        self.assertGreaterEqual(len(calls), 3)
         for axis, ids in calls:
             registered_ids = [variant_id for variant_id in ids
                               if variant_id in registry]

@@ -163,6 +163,14 @@ class ObservationRecordingTests(unittest.TestCase):
         enrichment = snapshot["BTC/USDT:USDT"]["_enrichment"]
         self.assertIsNone(enrichment["book_bid_levels"])
         self.assertEqual(enrichment["book_ask_levels"], [[100.01, 12.0]])
+        # Rejecting depth silently is what let six of seven strategies sit
+        # 63-100% starved for a week with nothing logged, so the reason must
+        # travel with the observation rather than being inferred later.
+        self.assertIsNotNone(enrichment["book_observation_error"])
+        self.assertIn("level 0", enrichment["book_observation_error"])
+        self.assertIn("bid depth", enrichment["book_observation_error"])
+        self.assertEqual(enrichment["book_bid_levels_observed"], 1)
+        self.assertEqual(enrichment["book_ask_levels_observed"], 1)
 
 
 class ObservationNeverInterruptsTrading(unittest.TestCase):

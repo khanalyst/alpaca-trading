@@ -309,3 +309,69 @@ def holm_bonferroni(pvalues: dict, alpha: float = 0.05) -> dict:
             "significant": adjusted <= alpha,
         }
     return out
+
+
+def bootstrap_p_value(values: list, iterations: int = 2000,
+                      seed: int = 20260728) -> float:
+    """Two-sided bootstrap p-value for "the mean is zero".
+
+    Seeded for the same reason ``bootstrap_mean`` is: an unseeded p-value
+    differs on every run, so two readings of one result disagree and neither
+    can be checked. R-multiples are heavy-tailed and bounded below at -1,
+    which is exactly where a normal approximation is least trustworthy, so
+    the resampling distribution is used rather than a t statistic.
+    """
+    clean = [float(v) for v in values
+             if v is not None and math.isfinite(float(v))]
+    n = len(clean)
+    if n < 2:
+        return 1.0
+    point = sum(clean) / n
+    if point == 0:
+        return 1.0
+    rng = random.Random(seed)
+    # Centre the sample so the resampling distribution is under the null.
+    centred = [value - point for value in clean]
+    extreme = 0
+    for _ in range(iterations):
+        mean = sum(centred[rng.randrange(n)] for _ in range(n)) / n
+        if abs(mean) >= abs(point):
+            extreme += 1
+    # Add-one smoothing: a p of exactly zero claims more precision than
+    # ``iterations`` resamples can support.
+    return (extreme + 1) / (iterations + 1)
+
+
+def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
+    """False-discovery control across a family of screened candidates.
+
+    Holm controls the chance of *any* false positive, which is right for a
+    handful of pre-registered comparisons and far too conservative for a
+    screening population: at fifty candidates it would reject almost
+    everything real. Benjamini-Hochberg instead bounds the expected
+    proportion of false discoveries among those declared, which is the
+    quantity that matters when the output is a shortlist rather than a single
+    verdict.
+
+    Test fifty candidates at alpha 0.05 and roughly two or three will look
+    significant with no edge at all. This is what separates them.
+    """
+    ordered = sorted(pvalues.items(), key=lambda kv: kv[1])
+    total = len(ordered)
+    if not total:
+        return {}
+    # Step-up, then enforce monotonicity from the largest p downward so a
+    # candidate can never be adjusted below a less significant neighbour.
+    adjusted = {}
+    running = 1.0
+    for index in range(total - 1, -1, -1):
+        name, p = ordered[index]
+        value = min(1.0, float(p) * total / (index + 1))
+        running = min(running, value)
+        adjusted[name] = running
+    return {
+        name: {"p": float(pvalues[name]), "p_adjusted": adjusted[name],
+               "significant": adjusted[name] <= alpha,
+               "family_size": total}
+        for name in pvalues
+    }

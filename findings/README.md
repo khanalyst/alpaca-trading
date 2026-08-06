@@ -34,4 +34,5 @@ Every registered variant, including the rejected ones. A rejection is a row here
 | [momentum.stop.atr_1_5](momentum/momentum.stop.atr_1_5.md) | candidate | 0 | - | 2026-07-28 |
 | [momentum.stop.atr_2_0](momentum/momentum.stop.atr_2_0.md) | candidate | 0 | - | 2026-07-28 |
 | [momentum.universe.top_25](momentum/momentum.universe.top_25.md) | superseded | 0 | - | 2026-08-05 |
+| [momentum.universe.top_10](momentum/momentum.universe.top_10.md) | superseded | 0 | - | 2026-08-05 |
 | [momentum.universe.top_5](momentum/momentum.universe.top_5.md) | superseded | 0 | - | 2026-08-05 |

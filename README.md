@@ -31,14 +31,14 @@ research:
 | Area | Current value |
 | --- | --- |
 | Account mode | `demo` (OKX Demo Trading) |
-| Order-executing strategy | `momentum/phase1-v3` |
-| Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
+| Order-executing strategy | `ls-ratio-fade/v1`, `execution_mode: deterministic` at `ls_high_percentile: 70` / `ls_low_percentile: 30` / `hard_max_entry_extension_atr: 1.5`. It replaced `momentum/phase1-v3`, which is `T0_REJECTED` |
+| Runtime tier | `T1_HYPOTHESIS`; demo rehearsal only, and unproven rather than supported |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol-coding` |
 | Housekeeping cadence | `cycle.interval_seconds: 60` |
 | Decision throttle | `cycle.decision_interval_seconds: 300` elapsed seconds (with a 95% jitter tolerance); safety/mark cycles stay faster |
 | Journal | `runtime/demo/journal.db` in the shipped mode |
 | Findings store | `research/cache/findings.db`, SQLite schema 16 |
-| Research feed | `forward_feed_version: 7`; feed v7 adds the real liquidation flow and the pre-registered conditioning axes; feeds v1-v6 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, and v6 the deterministic four-lane realtime fork) |
+| Research feed | `forward_feed_version: 8`; feed v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; feeds v1-v7 remain historical (v4 is the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane realtime fork, and v7 added the liquidation flow and conditioning axes) |
 | Realtime comparison arms | 8 deterministic arms: one baseline and at most one candidate for each of 4 realtime lanes; the separate `:llm` sibling adds 2 non-comparable arms, for a runtime maximum of 10 when present |
 | Shadow workers | `2`; the four realtime lanes advance on the same cycle snapshot |
 | Experiment floor | both 10 elapsed days and 100 comparable paired observations |
@@ -113,6 +113,50 @@ research reviewer receives an already immutable deterministic outcome. It may
 explain the result and nominate one bounded next selection; it cannot alter the
 verdict, change account settings, or authorize an order.
 
+## Trading a contract without an analyst
+
+`strategy.execution_mode` selects what decides on the order path:
+
+- `analyst`: the momentum analyst makes one LLM call per decision cycle and
+  its parsed decisions go through contracts, risk and execution;
+- `deterministic` (shipped): the strategy's own forward contract proposes, and
+  no LLM call is made at all;
+- `shadow_only`: nothing proposes and nothing opens; research lanes run on.
+
+A strategy earns promotion on evidence its deterministic contract produced in
+a shadow lane. Running it live under an analyst trades something other than
+the thing that earned the promotion, and the evidence stops describing what
+the account is doing. The deterministic path removes the analyst rather than
+the evidence.
+
+It also unblocks a practical constraint: `momentum` is the only strategy with
+`analyst_ready=True`, so under `analyst` no other registered strategy can
+occupy the order path whatever its evidence says. Under `deterministic` any
+strategy with a complete forward contract can, and configuration refuses to
+start when that contract is missing. Tier gating is unchanged - live still
+requires `T3_VALIDATED` and a reviewed packet.
+
+Only the source of the decisions differs. Research recording, risk vetting,
+execution controls and the close path are one code path in every mode.
+
+`ls-ratio-fade` replaced `momentum` on the order path. `momentum` is
+`T0_REJECTED`, returned -8.97% over 2026-07-29..08-05 across 35 closes, and is
+the only strategy the recorded corpus says anything significant about
+(-0.428R over 43 independent 48h episodes, t=-2.45). Left running at that rate
+it reaches `risk.max_drawdown_pct`, which flattens the book and self-kills the
+process, ending the research collection every other lane depends on.
+
+The replacement is a choice among unproven mechanisms, not a promotion.
+`ls-ratio-fade` measures -0.235R over 34 episodes (t=-1.22) at its registered
+thresholds and -0.153R at the shipped ones: not significant, which is the
+honest status of every available option. It was chosen because its 48h model
+horizon matches `risk.max_hold_hours`, it is realtime-eligible, its contract is
+complete so it can trade deterministically, and its derivation is independent
+of this corpus.
+[research/plan/order-path-succession.md](research/plan/order-path-succession.md)
+holds the full comparison and states, pre-committed, what would earn the seat
+on evidence rather than on elimination.
+
 ## Experiment outcomes and edge evidence
 
 Assignment completion requires both configured rotation floors: by default,
@@ -137,7 +181,7 @@ Success and failure reasons, limitations, analyses, review attempts, and LLM
 explanations persist. `WORKED` creates an `EDGE_CANDIDATE` whose authority is
 explicitly `RESEARCH_ONLY` and whose `promotion_allowed` flag is false. There
 is no automatic live deployment, strategy switch, tier change, or edge
-promotion. It is an immutable research lead, and current v7 forward
+promotion. It is an immutable research lead, and current v8 forward
 qualification is still required.
 
 The current `forward-qualify` path reconstructs v6 evidence from eligible
@@ -151,10 +195,10 @@ assumption-free p-value.
 Feed v6 is a clean fork in which the four realtime lanes use deterministic
 contract proposals; the three long-horizon models remain offline-only. The
 analyst's own decisions remain in a separate `:llm` scope and are never pooled
-with lane evidence. Feeds v1-v6 remain historical and are never migrated or
+with lane evidence. Feeds v1-v7 remain historical and are never migrated or
 pooled; feed v4 remains the market-data plumbing repair feed and v5 the
 immutable-provenance fork. `research.py
-prepare-review-artifacts` runs only after v7 qualification. It
+prepare-review-artifacts` runs only after v8 qualification. It
 fails closed unless the saved edge evidence and every non-manual T3 check
 validate, then idempotently creates an immutable, content-addressed draft
 review artifact. It cannot complete manual review, edit the registry or
@@ -252,6 +296,12 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify
+./.venv/bin/python research.py stage-seed
+./.venv/bin/python research.py author
+./.venv/bin/python research.py author --dry-run
+./.venv/bin/python research.py staged
+./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-review-artifacts
@@ -261,6 +311,111 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py backup --target <mounted-directory> --require-external
 ./.venv/bin/python research.py verify-backup <backup-directory>
 ```
+
+### Screening many candidates at once
+
+Test fifty candidates at 5% and two or three will look significant with no
+edge at all. `SUPPORTED` therefore requires surviving Benjamini-Hochberg
+false-discovery control across every candidate screened alongside it, and the
+report states the family size and the adjusted p-value. Holm is used elsewhere
+for a handful of pre-registered comparisons; it is far too conservative for a
+screening population, where the quantity that matters is the expected
+proportion of false discoveries among those declared rather than the chance of
+any false positive at all.
+
+Arms too thin to judge do not count toward the family. Including tests that
+were never run would make the correction look stricter than the search
+actually was.
+
+Candidates move through three stages rather than facing the strictest gate
+from the first bar, which is why nothing used to finish:
+
+| Stage | Trades | What can happen |
+| --- | --- | --- |
+| `SCREEN` | under 30 | Retire a clearly adverse mechanism early; never promote one |
+| `MEASURE` | 30-99 | Accumulate with full costs |
+| `CONFIRM` | 100+ | Held-out window and family correction decide |
+
+The screen is decisive in one direction only. Passing it means "not yet
+excluded", not evidence of an edge, and a borderline loser is given the longer
+look because that is exactly where a small sample misleads.
+
+### Reading the shortlist
+
+`research.py shortlist` ranks every measured arm and states how far the
+evidence goes. It reports arms with nothing to show as well as the ones with
+results, because a mechanism starved of market data is untested rather than
+unsupported, and a report that omitted it would read as though it had been
+tried and failed.
+
+| Label | What it means |
+| --- | --- |
+| `SUPPORTED` | Adequate sample, 95% interval excludes zero, held-out window agrees in sign, and survives false-discovery control across everything screened alongside it |
+| `PRELIMINARY` | Positive but under the 100-trade floor |
+| `INCONCLUSIVE` | Adequate sample whose interval still includes zero, or a result that does not persist out of sample |
+| `INSUFFICIENT` | Under the 30-trade floor; no reading means much |
+| `NO_EVIDENCE` | No closed trades, with the reason: starved of data, or the contract never fired |
+| `NEGATIVE` | The whole interval is at or below zero |
+
+`SUPPORTED` is the strongest statement the system makes and it is not a
+recommendation to trade. The confirmation window is the last 30% of a
+candidate's trades in time, not a random split, because an edge that only
+works where it was found is exactly what that split exists to catch. The
+nightly run writes the report as `shortlist.md` under `research/results`,
+which is generated output rather than a committed file.
+
+### Proposing new mechanisms
+
+`research.py author` asks the configured model for new candidate mechanisms
+and stages the ones that validate. A proposal is data, not code: a mechanism,
+the payer, a falsifier, and comparisons over fields the validated forward
+models already declare. Anything naming an unknown field, using an operator
+other than the four comparisons, setting a threshold outside a field's
+observed range, or stating a claim too thin to name a cause is refused, and
+one bad proposal never discards the rest of a generation.
+
+It is deliberately not gated on a terminal outcome. The nightly reviewer needs
+a finished assignment to have something to explain, so on a corpus where none
+has finished it never runs at all - which is exactly the state in which new
+ideas matter most.
+
+`research.py review-staged` gives each staged mechanism a coded verdict and
+retires the ones that are finished, so the next generation is told what has
+already been tried and why:
+
+| Code | Meaning |
+| --- | --- |
+| `NEGATIVE_EXPECTANCY` | Fired enough, lost; a nearby threshold on the same fields is the same claim |
+| `DIED_OUT_OF_SAMPLE` | Positive while fitting, negative held out |
+| `NEVER_FIRED` | Evaluated repeatedly and never triggered; unreachable rather than wrong |
+| `STARVED_OF_DATA` | Mostly never evaluated; a pipeline result, so the claim is kept staged |
+| `COLLECTING` / `SUPPORTED` | Kept running |
+
+Only the first three retire a mechanism. `STARVED_OF_DATA` never does, because
+a claim evaluated on snapshots it could not read has not been tested - the
+distinction that made six strategies look falsified for a week. Retirement
+frees the lane and keeps the claim, the payer and the reason recorded together,
+because a proposer told only that something failed will restate it with a
+different number.
+
+`research.py stage-seed` is the other entry point to the same store, for
+claims that came out of analysis rather than out of the proposer.
+`research/staged/pre-registered.yaml` holds them in version control so the
+wording cannot drift after results exist, and the command is idempotent: a
+claim already registered is reported and skipped, so it can run on every
+deploy. Both paths land in the same table under the same immutability
+triggers at the same tier; only the `author` column differs, which is what
+keeps a reviewed claim distinguishable from a proposed one. An entry marked
+`deferred` is parsed and reported but never registered - a staged contract
+that cannot fire is worse than a missing one, because in the evidence it
+looks exactly like one that fired and lost.
+
+Staged mechanisms enter at `T1_HYPOTHESIS` and are append-only: a registered
+claim cannot be reworded once results exist, which is the difference between a
+pre-registered hypothesis and a retro-fitted one. Live still requires
+`T3_VALIDATED` and a reviewed content-addressed packet, so nothing here
+shortens the path to capital. `research.py staged` lists what is registered
+and what each mechanism claims.
 
 `research.findings_store` never falls back to a temporary database. If the
 configured path cannot be used, the operation fails.
@@ -337,7 +492,9 @@ source.
 | [research/protocol.md](research/protocol.md) | Statistical and operational evidence rules for `WORKED`, `FAILED`, `INCONCLUSIVE`, qualification, rejection, pairing, held-out confirmation, and multiple testing. |
 | [research/plan/RECONCILIATION.md](research/plan/RECONCILIATION.md) | Current authority policy separating journal evidence, exploratory tournament evidence, configuration exceptions, and VM handoff requirements. |
 | [research/plan/B7.5-record.md](research/plan/B7.5-record.md) | Current status and completion conditions for the optional maker-first order primitive. It distinguishes that execution experiment from `scalp-maker`. |
+| [research/plan/edge-platform.md](research/plan/edge-platform.md) | What the 7-day demo corpus established, the silent depth-ladder rejection it exposed, and the batched plan for turning the research loop into an edge-producing platform. |
 | [research/plan/autonomous-loop-integration.md](research/plan/autonomous-loop-integration.md) | Batched plan and checklist for merging the G2/promotion and audit-remediation work into one unattended loop. Records why runtime code settles before collection opens. |
+| [research/plan/order-path-succession.md](research/plan/order-path-succession.md) | Why the order path is empty, and the pre-committed criterion a mechanism has to meet before it trades the account. Written before the evidence exists. |
 | [research/plan/batched-implementation.md](research/plan/batched-implementation.md) | Historical implementation pointer; current flow and commands are in the primary guides. |
 | [research/plan/findings.md](research/plan/findings.md) | Historical findings pointer; current evidence boundaries are in RECONCILIATION and protocol. |
 
@@ -371,6 +528,7 @@ source.
 | [findings/momentum/momentum.cond.session.md](findings/momentum/momentum.cond.session.md) | Conditioning-axis scorecard. It partitions existing trades by UTC session window and may only be quoted after the out-of-sample split. |
 | [findings/momentum/momentum.universe.top_5.md](findings/momentum/momentum.universe.top_5.md) | Scorecard for a five-instrument universe. It asks whether the edge lives in the liquid majors. |
 | [findings/momentum/momentum.universe.top_25.md](findings/momentum/momentum.universe.top_25.md) | Scorecard for a twenty-five-instrument universe. It asks the opposite question: whether the edge lives in the tail. |
+| [findings/momentum/momentum.universe.top_10.md](findings/momentum/momentum.universe.top_10.md) | Scorecard for a twenty-five-instrument universe. It asks the opposite question: whether the edge lives in the tail. |
 
 ### Research result snapshots
 

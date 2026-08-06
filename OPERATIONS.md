@@ -100,16 +100,23 @@ is treated as durably backed up.
 `research/nightly.sh` runs in this order:
 
 1. readiness; failure is remembered while the run continues;
-2. `research-loop`, which creates missing deterministic outcomes and reviews
+2. `review-staged`, which gives each machine-authored mechanism a coded
+   verdict and retires the ones that are finished;
+3. `author`, which proposes new mechanisms and stages the ones that validate.
+   It runs after the verdicts and before the reviewer on purpose: a proposer
+   that has not been told why the last batch died restates a dead claim at a
+   different threshold, and it needs no terminal outcome to run at all;
+4. `research-loop`, which creates missing deterministic outcomes and reviews
    at most one pending result;
-3. corpus statistics and G2 replay when the journal exists;
-4. funnel, cadence, sweeps, three-arm analysis, forward qualification,
-   fail-closed draft review-artifact preparation, and scorecard regeneration;
-5. one fresh immutable market-history snapshot under
+5. corpus statistics and G2 replay when the journal exists;
+6. funnel, cadence, sweeps, three-arm analysis, forward qualification,
+   fail-closed draft review-artifact preparation, the candidate shortlist,
+   and scorecard regeneration;
+7. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
-6. the exploratory tournament, with immutable per-run artifacts;
-7. one new verified backup.
+8. the exploratory tournament, with immutable per-run artifacts;
+9. one new verified backup.
 
 Exact exit behavior:
 
@@ -164,13 +171,13 @@ identities. Outcome-resolution gaps remain diagnostics rather than proposal
 mismatches. A failed, stale, or vacuous G2 blocks downstream journal evidence
 from being treated as authoritative.
 
-The active research scope is `forward_feed_version: 7`. Feed v7 keeps the
+The active research scope is `forward_feed_version: 8`. Feed v8 keeps the
 deterministic four realtime lanes and adds the real liquidation flow and the
 pre-registered conditioning axes; the active analyst's own decisions remain in
-a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v6
+a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v7
 remain immutable historical evidence. Feed v4 is the market-data plumbing
 repair feed, feed v5 is the immutable-provenance fork, and feed v6 is the
-deterministic four-lane fork; no older evidence is migrated or pooled with v7.
+deterministic four-lane fork; no older evidence is migrated or pooled with v8.
 
 Within each strategy:
 
@@ -190,7 +197,7 @@ coverage is insufficient, two time segments cannot be formed, provenance is
 mixed, or a model/operational check failed.
 
 A `WORKED` outcome saves an immutable `RESEARCH_ONLY` `EDGE_CANDIDATE` lead
-with `promotion_allowed: false`; it does not satisfy the current v7
+with `promotion_allowed: false`; it does not satisfy the current v8
 forward-qualification protocol by itself. Qualification still requires the
 eligible completed assignment attempts, their contemporaneous baselines,
 held-out confirmation, and family correction. The paired cluster sign-flip
@@ -400,7 +407,7 @@ included.
 ./.venv/bin/python research.py report
 ```
 
-`prepare-review-artifacts` considers only variants with current v7
+`prepare-review-artifacts` considers only variants with current v8
 qualification. It fails closed unless persisted edge evidence and every
 non-manual T3 checklist item validate, and it creates only an idempotent,
 immutable/content-addressed `DRAFT_REVIEW_REQUIRED` artifact. It cannot mark
@@ -452,6 +459,105 @@ verify OKX has no remaining positions or orders. If flattening is incomplete,
 close them manually in OKX and keep the agent paused. A local test pass does
 not replace one real credentialed OKX demo smoke test.
 
+### 7.2 Staged mechanisms
+
+Every registered mechanism used to be a hand-written Python function, which
+capped the registry at three hypotheses attached to one strategy. A mechanism
+is now expressible as data - a claim, the payer, a falsifier and comparisons
+over named market fields - and compiles into the same callable the
+hand-written contracts implement.
+
+```bash
+./.venv/bin/python research.py stage-seed         # the version-controlled ones
+./.venv/bin/python research.py author --dry-run   # what the proposer is asked
+./.venv/bin/python research.py staged             # what is registered
+./.venv/bin/python research.py review-staged --dry-run
+./.venv/bin/python research.py shortlist
+```
+
+`stage-seed` registers the hand-written pre-registrations in
+`research/staged/pre-registered.yaml`. It is idempotent - an already
+registered claim is reported and skipped - so it belongs in the deploy
+sequence rather than being run once by hand. An entry marked `deferred` is
+reported and never registered, which is how a claim whose threshold cannot
+yet be calibrated stays visible without occupying a lane that would never
+fire. Unlike `author`, a rejected entry here exits nonzero: a broken
+pre-registration is a mistake in version control, not a transient provider
+failure.
+
+Staged mechanisms run in their own `:staged` scope, one paper account each, on
+a single fixed measurement harness: first observed price after the signal, a
+structure stop at one ATR, a 2R target, observed taker costs both sides and a
+24h timeout. The harness is identical for every mechanism on purpose, so a
+difference between two of them is a difference in the mechanism rather than in
+a lucky stop distance.
+
+They enter at `T1_HYPOTHESIS` and cannot rise. Live still requires
+`T3_VALIDATED` and a reviewed content-addressed packet, so nothing here
+shortens the path to capital; what it removes is the developer in the middle
+of measuring an idea.
+
+Mechanisms move through three funnel stages rather than facing the strictest
+gate from the first bar, which is why nothing used to finish: `SCREEN` under
+30 trades can retire a clearly adverse mechanism early and can never promote
+one, `MEASURE` accumulates to 100 with full costs, and `CONFIRM` applies the
+held-out window and the family correction.
+
+`SUPPORTED` additionally requires surviving Benjamini-Hochberg false-discovery
+control across every candidate screened alongside it. Screening fifty
+candidates at 5% produces two or three that look significant with no edge at
+all; the report states the family size and adjusted p-value so a reader can
+see how much search was paid for. Arms too thin to judge are excluded from the
+family, because counting tests that were never run would make the correction
+look stricter than the search actually was.
+
+A registered claim is immutable at the database level. Rewording one after
+results exist is refused by a trigger, because a claim that can be edited
+afterwards cannot be told apart from one retro-fitted to the result.
+
+### 7.3 Running a contract without an analyst
+
+`strategy.execution_mode` selects what decides on the order path. `analyst`
+makes one LLM call per decision cycle. `deterministic` makes no LLM call at
+all: the strategy's own forward contract proposes, and risk and execution
+apply unchanged. `shadow_only` is shipped and has no order path: nothing
+proposes and nothing opens.
+
+Use `deterministic` when a strategy has earned promotion on shadow evidence. That evidence
+was produced by its deterministic contract, so trading it under an analyst
+would put an unmeasured layer on top of the thing that justified the
+promotion. It is also the only way a strategy other than `momentum` can occupy
+the order path at all: every other registered strategy has no analyst prompt.
+
+```yaml
+strategy:
+  id: ls-ratio-fade
+  version: v1
+  signal_timeframe: 1h
+  execution_mode: deterministic
+```
+
+Configuration refuses to start when the named strategy has no complete
+forward contract, and the value must be exactly `analyst`, `deterministic` or
+`shadow_only` - no case or whitespace normalisation, so a typo cannot become a
+mode change nobody reviewed. Tier gating is unchanged: live still requires
+`T3_VALIDATED` and a reviewed packet.
+
+`deterministic` is the shipped state, running `ls-ratio-fade/v1`. It replaced
+`momentum`, which is `T0_REJECTED`, returned -8.97% over 2026-07-29..08-05,
+and at that rate reaches `risk.max_drawdown_pct` - which flattens the book and
+self-kills the process, ending the research collection every other lane
+depends on. The replacement is a choice among unproven mechanisms rather than
+a promotion: `ls-ratio-fade` measures -0.153R at its shipped thresholds over
+independent 48h episodes, which is not significantly different from random.
+`research/plan/order-path-succession.md` holds the comparison and states,
+pre-committed, what would earn the seat on evidence.
+
+`shadow_only` is the state to set when nothing should trade at all. Research
+lanes run unchanged in it, and open positions still exit through exchange
+stops and targets, `max_hold_hours` and every risk reduction path; only
+discretionary opens and closes have no source.
+
 ## 8. Interpreting results
 
 - `candidate`/`testing`: registered research identity, not an edge.
@@ -459,7 +565,7 @@ not replace one real credentialed OKX demo smoke test.
   `RESEARCH_ONLY` edge evidence.
 - `FAILED`: adequate evidence or a persisted gate showed failure.
 - `INCONCLUSIVE`: evidence cannot support success or failure.
-- `QUALIFIED`: current v7 forward-axis research event, not an order instruction.
+- `QUALIFIED`: current v8 forward-axis research event, not an order instruction.
 - `REVOKED`: that evidence/account window is invalid and must not be reused.
 
 Both positive and negative findings remain in the store. Never infer an edge
@@ -495,7 +601,7 @@ Before deleting or rebuilding the VM:
 | Review deferred | Deterministic outcome is safe; retry `research-loop` later |
 | Tournament benchmark failed | Keep the run as failure evidence; do not interpret rankings |
 | Findings DB missing | Check `research.findings_store`; there is no temporary fallback |
-| All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, feed v5 is the immutable-provenance fork, feed v6 is the deterministic four-lane realtime fork, feed v7 adds the real liquidation flow and conditioning axes, and all v1-v6 rows remain historical. |
+| All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, feed v5 is the immutable-provenance fork, feed v6 is the deterministic four-lane realtime fork, feed v7 added the real liquidation flow and conditioning axes, feed v8 repairs the depth-ladder delivery that silently starved six of seven strategies, and all v1-v7 rows remain historical. |
 | Trader stopped after Compose update | Expected safe `SIGTERM` pause; run `main.py check`, then explicitly `main.py resume` |
 | Recorder unhealthy | Trader startup remains blocked until a fresh recorder CSV exists |
 | Dashboard unreachable remotely | Expected loopback binding; use an SSH tunnel or private VPN |

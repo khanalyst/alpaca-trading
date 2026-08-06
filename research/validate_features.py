@@ -303,11 +303,23 @@ def contract_agreement(frames: dict, samples: int, seed: int) -> dict:
     from agent.strategy import build_setup_plan, setup_evidence
     import yaml
 
+    from agent.registry import spec_for
+
     repo = Path(__file__).resolve().parents[1]
-    cfg = validate_config(yaml.safe_load((repo / "config.yaml").read_text()))
-    # Built from the same config that drives the authoritative code path, so
-    # a parameter change in config.yaml cannot silently make this comparison
-    # test two different strategies against each other.
+    raw = yaml.safe_load((repo / "config.yaml").read_text())
+    # The vectorized masks this checks are momentum's three setups, so the
+    # comparison is pinned to momentum rather than to whatever occupies the
+    # order path. Every other configured parameter is kept, which is the part
+    # that has to agree: a threshold change in config.yaml must not silently
+    # make this test compare two differently parameterised contracts. Reading
+    # strategy.id from the file was only coherent while momentum was the one
+    # strategy that could be configured there.
+    raw["strategy"] = dict(raw.get("strategy") or {})
+    raw["strategy"]["id"] = "momentum"
+    raw["strategy"]["version"] = spec_for("momentum").version
+    raw["strategy"]["signal_timeframe"] = "15m"
+    raw["strategy"]["execution_mode"] = "analyst"
+    cfg = validate_config(raw)
     contract = Contract.from_config(cfg)
     rng = np.random.default_rng(seed)
     issues = []

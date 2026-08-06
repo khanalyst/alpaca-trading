@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
+from .forward_models import require_complete_contract
 from . import (brain, contracts, deployment, hypotheses, market, registry,
                shadow, state, strategy, variants)
 from .alerts import AlertManager
@@ -1006,21 +1007,33 @@ class Engine:
         # The model is the one nondeterministic component in the pipeline.
         # Journal the exact provider request and the raw provider result so
         # every parsed decision - and every silent hold - can be reconstructed.
-        self._journal_llm_input(live_snapshot, portfolio, max_new)
-        try:
-            decisions = self.llm.decide(live_snapshot, portfolio, max_new)
-        except Exception as e:
+        # Only the SOURCE of the decisions differs between the two modes.
+        # Everything after this - research recording, risk, execution, the
+        # close path - stays one code path, because a second copy of the
+        # order logic is a second place for it to diverge.
+        if self._shadow_only_order_path():
+            # No source of entries at all. Observations were already recorded
+            # above and the research lanes below still run, so the platform
+            # keeps measuring every contract while the account opens nothing.
+            decisions = []
+        elif self._deterministic_order_path():
+            decisions = self._deterministic_decisions(live_snapshot, max_new)
+        else:
+            self._journal_llm_input(live_snapshot, portfolio, max_new)
+            try:
+                decisions = self.llm.decide(live_snapshot, portfolio, max_new)
+            except Exception as e:
+                self._journal_llm_output()
+                log.error("LLM call failed; holding this cycle: %s", e)
+                state.log_event("error", f"llm: {e}")
+                self._run_shadow_variants(
+                    live_snapshot, equity, positions, st, 0.0, decisions=[],
+                    advance_accounts=False)
+                self.alerts.send(
+                    "error", "llm_call_failed",
+                    "LLM call failed; holding this cycle", {"error": str(e)})
+                return
             self._journal_llm_output()
-            log.error("LLM call failed; holding this cycle: %s", e)
-            state.log_event("error", f"llm: {e}")
-            self._run_shadow_variants(
-                live_snapshot, equity, positions, st, 0.0, decisions=[],
-                advance_accounts=False)
-            self.alerts.send(
-                "error", "llm_call_failed",
-                "LLM call failed; holding this cycle", {"error": str(e)})
-            return
-        self._journal_llm_output()
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
@@ -3256,30 +3269,53 @@ class Engine:
 
     @staticmethod
     def _plain_levels(value):
-        """Return a JSON-safe executable depth ladder, or None.
+        """Return a JSON-safe executable depth ladder and why it was cut.
 
-        ``_plain`` is intentionally scalar-only.  Order-book depth is the
-        one research field that must retain its two-dimensional shape so the
+        ``_plain`` is intentionally scalar-only. Order-book depth is the one
+        research field that must retain its two-dimensional shape so the
         forward simulator can walk observed prices and contract amounts.
-        Reject the whole ladder when any level is malformed rather than
-        silently changing the executable book.
+
+        Truncating at the first malformed level replaces an earlier rule that
+        discarded the whole ladder. A ladder is ordered outward from the
+        touch, so a valid prefix is a true book that is merely shallower than
+        the one observed: it understates available depth, which is the
+        conservative direction for a simulator deciding whether size could
+        have filled. Discarding it instead produced a data-missing veto, and
+        on the 2026-07-29..08-05 corpus that silently rejected 6,184 of 8,727
+        ladders while the fetch itself never once failed, starving six of
+        seven strategies of 63-100% of their decisions with no error recorded.
+
+        Returns ``(levels, reason)``. ``reason`` is None only when the whole
+        observed ladder survived, so a caller can never mistake a truncated
+        book for a complete one.
         """
         if not isinstance(value, (list, tuple)):
-            return None
-        levels = []
-        for raw in value:
+            return None, f"depth ladder is {type(value).__name__}, not a list"
+        levels: list[list[float]] = []
+        for index, raw in enumerate(value):
+            reason = None
             if not isinstance(raw, (list, tuple)) or len(raw) < 2:
-                return None
-            try:
-                price = float(raw[0])
-                amount = float(raw[1])
-            except (TypeError, ValueError):
-                return None
-            if (not math.isfinite(price) or price <= 0
-                    or not math.isfinite(amount) or amount < 0):
-                return None
+                reason = f"level {index} is not a [price, amount] pair"
+            else:
+                try:
+                    price = float(raw[0])
+                    amount = float(raw[1])
+                except (TypeError, ValueError):
+                    reason = f"level {index} has non-numeric price or amount"
+                else:
+                    if not math.isfinite(price) or price <= 0:
+                        reason = f"level {index} has invalid price {raw[0]!r}"
+                    elif not math.isfinite(amount) or amount < 0:
+                        reason = f"level {index} has invalid amount {raw[1]!r}"
+            if reason is not None:
+                note = f"{reason}; kept {len(levels)} of {len(value)} levels"
+                # Zero surviving levels is not a shallow book, it is no book.
+                # ``missing_fields`` treats only None as absent, so returning
+                # an empty list here would present unusable depth to a
+                # contract as though it were observed.
+                return (levels or None), note
             levels.append([price, amount])
-        return levels
+        return levels, None
 
     def _shadow_cfg(self, spec) -> dict:
         """Config a shadow strategy's contract is evaluated against.
@@ -3297,6 +3333,79 @@ class Engine:
         block["id"] = spec.id
         block["version"] = spec.version
         return {**self.cfg, "strategy": block}
+
+    def _execution_mode(self) -> str:
+        # Configuration validation already guarantees an exact value.
+        return (self.cfg.get("strategy") or {}).get(
+            "execution_mode", "analyst")
+
+    def _deterministic_order_path(self) -> bool:
+        """True when the contract decides and no analyst call is made."""
+        return self._execution_mode() == "deterministic"
+
+    def _shadow_only_order_path(self) -> bool:
+        """True when nothing may open a position this cycle.
+
+        The research lanes are the measuring instrument; the order path is
+        not. Holding the order path empty while no mechanism has earned it
+        keeps the instrument running instead of spending the account - and
+        the drawdown breaker - on a claim the evidence has already rejected.
+
+        Open positions are unaffected: exchange stops and targets, the
+        max_hold_hours force-close and every risk reduction path run exactly
+        as before. Only discretionary opens and closes have no source.
+        """
+        return self._execution_mode() == "shadow_only"
+
+    def _deterministic_decisions(self, snapshot: dict,
+                                 max_new: int) -> list[dict]:
+        """Trade the contract that was measured, with no analyst layer.
+
+        A strategy earns promotion on evidence produced by its deterministic
+        contract in a shadow lane. Running it live under an analyst would
+        trade something other than the thing that earned the promotion, and
+        the evidence would no longer describe what the account is doing. This
+        path therefore uses the same proposals the lane used - the contract's
+        own output on the same snapshot - and lets risk and execution apply
+        unchanged.
+
+        No LLM call happens at all, so there is nothing to journal as model
+        input or output. The proposals are journalled as ``decisions`` like
+        any other cycle, tagged with their source.
+        """
+        budget = max(0, int(max_new))
+        if not budget:
+            return []
+        model = require_complete_contract(self.strategy_id)
+        proposals = model.deterministic_proposals(snapshot, self.cfg)
+        accepted = []
+        for proposal in proposals:
+            if len(accepted) >= budget:
+                break
+            if proposal.get("research_refusal_reason"):
+                continue
+            # The contract decides BEFORE the budget does. ``deterministic_
+            # proposals`` emits a probe for every symbol and both directions -
+            # 50 of them on a 25-symbol universe - and applies no contract at
+            # all; the contract runs downstream in _prepare_setup_decision.
+            # Capping the probes first would therefore spend the whole
+            # new-position budget on the alphabetically first symbols
+            # whatever their signal, and a strategy whose setups are anywhere
+            # else in the universe would essentially never open.
+            # build_setup_plan is pure, so asking it here costs a recomputation
+            # and nothing else; the open path asks it again for real.
+            if strategy.build_setup_plan(
+                    proposal, snapshot.get(proposal.get("symbol")) or {},
+                    self.cfg)[0] is None:
+                continue
+            entry = dict(proposal)
+            entry["proposal_source"] = "deterministic_contract"
+            # Confidence is not a model opinion here. The contract either
+            # fired or it did not, so a fabricated score would let the
+            # min_confidence gate look like it was doing work it is not.
+            entry["confidence"] = 1.0
+            accepted.append(entry)
+        return accepted
 
     def _record_shadow_decisions(self, snapshot: dict) -> dict:
         """Journal what every registered contract would have done.
@@ -3477,6 +3586,27 @@ class Engine:
                     "age_seconds": None,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+            # A truncated ladder must say so. The observation error carries
+            # both the exchange-side problem and any depth we could not keep,
+            # so a silently shortened book cannot reach a contract as if it
+            # were the full observed one.
+            bid_levels, bid_cut = self._plain_levels(
+                observed.get("bid_levels"))
+            ask_levels, ask_cut = self._plain_levels(
+                observed.get("ask_levels"))
+
+            def _observed_len(raw) -> int | None:
+                return len(raw) if isinstance(raw, (list, tuple)) else None
+
+            # Coerced, not trusted: ``error`` reaches here from an exchange
+            # response and must never turn an observation into an exception.
+            notes = [
+                str(observed.get("error") or ""),
+                f"bid depth: {bid_cut}" if bid_cut else "",
+                f"ask depth: {ask_cut}" if ask_cut else "",
+            ]
+            observation_error = " | ".join(n for n in notes if n) or None
+
             enrichment = dict(row.get(brain.ENRICHMENT_KEY) or {})
             enrichment.update({
                 "book_mid": self._plain(observed.get("mid")),
@@ -3491,9 +3621,11 @@ class Engine:
                     observed.get("top_bid_size")),
                 "book_top_ask_size": self._plain(
                     observed.get("top_ask_size")),
-                "book_bid_levels": self._plain_levels(
+                "book_bid_levels": bid_levels,
+                "book_ask_levels": ask_levels,
+                "book_bid_levels_observed": _observed_len(
                     observed.get("bid_levels")),
-                "book_ask_levels": self._plain_levels(
+                "book_ask_levels_observed": _observed_len(
                     observed.get("ask_levels")),
                 "book_contract_size": self._plain(
                     observed.get("contract_size")),
@@ -3501,7 +3633,7 @@ class Engine:
                 "book_ts": self._plain(observed.get("book_ts")),
                 "book_age_seconds": self._plain(
                     observed.get("age_seconds")),
-                "book_observation_error": observed.get("error"),
+                "book_observation_error": observation_error,
             })
             row[brain.ENRICHMENT_KEY] = enrichment
 
