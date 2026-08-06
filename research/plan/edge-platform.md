@@ -185,8 +185,8 @@ attribution deliberately.
 
 - [x] B2.7 Deterministic order path so a promoted contract can trade as
       measured, replacing blanket `analyst_ready`
-- [ ] B2.8 Wire `StagingStore.evaluators()` into the shadow coordinator so a
-      staged contract gets a lane on the next cycle
+- [x] B2.8 Wire the staging store into the shadow coordinator so a staged
+      contract gets a lane on the next cycle
 - [x] B2.9 Authoring prompt and response schema, on its own cadence
 
 ## What 30 days can and cannot deliver
