@@ -222,9 +222,9 @@ vetoed a quiet hour, with no code written for it.
 
 ### Still open, and why the loop is not yet closed
 
-- [ ] B2.8 Give staged contracts shadow lanes. This is the critical link:
-      a staged mechanism is executable but nothing evaluates it yet, so
-      proposals accumulate without being measured
+- [~] B2.8 Give staged contracts shadow lanes. The fixed harness and the
+      proposal emitter are in `agent/staged_lane.py`; the remaining step is
+      the coordinator calling it each cycle
 - [ ] B2.3 Three-stage funnel
 - [ ] B2.4 Parallel arms with false-discovery control
 - [ ] B2.5 Reason-coded verdicts
@@ -238,3 +238,36 @@ harness shared by every staged mechanism rather than letting a proposer choose
 its own exits: holding the outcome contract constant is what makes differences
 between mechanisms attributable to the mechanism instead of to the exit
 policy. That harness is the first task of the next batch.
+
+
+### The fixed harness, and one distinction it enforces
+
+`forward_models.STAGED_HARNESS` is a single outcome contract shared by every
+staged mechanism: first observed price after the signal, structure stop at one
+ATR, fixed 2R target, observed taker costs both sides, realized funding, 24h
+timeout. A staged contract states when to enter and nothing else, so holding
+the exits fixed is what makes a difference between two authored mechanisms
+attributable to the mechanism instead of to a lucky stop distance. The values
+are the ordinary ones, not favourable ones: a mechanism that cannot clear this
+has been measured against the same bar as everything else.
+
+It is deliberately absent from `MODELS` and `BY_STRATEGY`. Those map registered
+strategies to their contracts, and adding a measurement instrument there made
+four existing "one model per registered strategy" invariants quietly false -
+which the suite caught.
+
+`staged_lane.proposals_for` emits the same proposal shape the registered
+contracts emit, so a staged mechanism flows through the existing paper path
+rather than a parallel one, and `coverage()` separates three outcomes that a
+single refusal string would blur:
+
+| Outcome | Meaning |
+| --- | --- |
+| fired | the mechanism triggered |
+| declined | the mechanism was evaluated and said no |
+| starved | the mechanism was never evaluated; the data was absent |
+
+Data problems outrank the contract's own opinion for exactly the reason six
+strategies looked falsified for a week: a mechanism evaluated on a snapshot it
+could not read has not been tested, and counting that as a decline turns
+starvation into apparent evidence against the claim.
