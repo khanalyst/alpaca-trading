@@ -32,6 +32,22 @@ STARVED_OF_DATA = "STARVED_OF_DATA"
 COLLECTING = "COLLECTING"
 SUPPORTED = "SUPPORTED"
 
+# The funnel. Applying the strictest adequacy gate from the first bar is why
+# nothing ever finished: a candidate needed a hundred paired observations
+# before anything could be said about it, so an obviously dead mechanism
+# occupied a lane for weeks to establish what thirty trades already showed.
+#
+# SCREEN is cheap and decisive only in one direction. It can retire a
+# mechanism that is clearly losing, and it can never promote one: passing a
+# screen means "not yet excluded", which is not evidence of an edge.
+SCREEN, MEASURE, CONFIRM = "SCREEN", "MEASURE", "CONFIRM"
+SCREEN_FLOOR = 30
+MEASURE_FLOOR = 100
+# At the screen stage a mechanism is retired only when the whole interval is
+# clearly adverse, not merely negative. A borderline loser at n=30 is exactly
+# the case where a small sample misleads, so it is given the longer look.
+SCREEN_RETIRE_CI_HIGH = -0.10
+
 # A mechanism that has never fired despite this many evaluated decisions is
 # not selective, it is unreachable: its thresholds do not describe a state
 # this market reaches. Retiring it frees the lane; the claim stays recorded.
@@ -39,6 +55,15 @@ NEVER_FIRED_DECISION_FLOOR = 2_000
 # Below this, an absent result is far more likely to be missing data than an
 # unreachable threshold, so it is never held against the claim.
 STARVED_FRACTION = 0.5
+
+
+def stage_of(candidate) -> str:
+    """Which funnel stage a candidate's evidence currently supports."""
+    if candidate.trades >= MEASURE_FLOOR:
+        return CONFIRM
+    if candidate.trades >= SCREEN_FLOOR:
+        return MEASURE
+    return SCREEN
 
 
 def verdict_for(candidate) -> tuple[str, str]:
@@ -52,6 +77,16 @@ def verdict_for(candidate) -> tuple[str, str]:
             f"{starved} of {total} decisions were never evaluated because the "
             "market data was absent. This is a pipeline result, not a market "
             "one: the claim has not been tested and is kept staged.")
+
+    stage = stage_of(candidate)
+    if (stage == SCREEN and candidate.trades >= SCREEN_FLOOR // 2
+            and candidate.ci_high <= SCREEN_RETIRE_CI_HIGH):
+        return NEGATIVE_EXPECTANCY, (
+            f"screened out at {candidate.trades} trades: mean "
+            f"{candidate.mean_r:+.3f} R with the whole 95% interval "
+            f"{candidate.ci_low:+.3f}..{candidate.ci_high:+.3f} clearly "
+            f"adverse. Waiting for {MEASURE_FLOOR} would spend weeks of lane "
+            "time to establish what this already shows.")
 
     if candidate.label == shortlist_mod.NEGATIVE:
         return NEGATIVE_EXPECTANCY, (
@@ -121,6 +156,7 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
         entry = {
             "contract_id": contract.contract_id,
             "variant_id": variant_id,
+            "stage": (stage_of(candidate) if candidate is not None else SCREEN),
             "code": code,
             "explanation": explanation,
             "mechanism": contract.mechanism,

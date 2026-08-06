@@ -175,3 +175,50 @@ class ReviewRetiresAndFeedsTheNextGenerationTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class FunnelStagesTests(unittest.TestCase):
+    """The strictest gate applied from the first bar is why nothing finished."""
+
+    def test_stages_follow_the_sample(self):
+        for n, expected in ((0, staged_review.SCREEN),
+                            (29, staged_review.SCREEN),
+                            (30, staged_review.MEASURE),
+                            (99, staged_review.MEASURE),
+                            (100, staged_review.CONFIRM),
+                            (400, staged_review.CONFIRM)):
+            with self.subTest(n=n):
+                self.assertEqual(
+                    staged_review.stage_of(candidate(trades=n)), expected)
+
+    def test_a_clearly_dead_mechanism_is_screened_out_early(self):
+        # Under the old rule this occupied a lane until 100 trades to
+        # establish what 20 already showed.
+        code, why = staged_review.verdict_for(candidate(
+            trades=20, mean_r=-0.6, ci_low=-0.9, ci_high=-0.3,
+            label=shortlist.INSUFFICIENT, declined_decisions=200))
+        self.assertEqual(code, staged_review.NEGATIVE_EXPECTANCY)
+        self.assertIn("screened out at 20 trades", why)
+        self.assertIn("weeks of lane time", why)
+
+    def test_a_borderline_loser_gets_the_longer_look(self):
+        # Exactly where a small sample misleads, so the screen does not act.
+        code, _ = staged_review.verdict_for(candidate(
+            trades=20, mean_r=-0.04, ci_low=-0.12, ci_high=-0.02,
+            label=shortlist.INSUFFICIENT, declined_decisions=200))
+        self.assertEqual(code, staged_review.COLLECTING)
+
+    def test_the_screen_can_never_promote(self):
+        # Passing a screen means "not yet excluded", not evidence of an edge.
+        code, _ = staged_review.verdict_for(candidate(
+            trades=20, mean_r=1.5, ci_low=1.2, ci_high=1.8,
+            label=shortlist.INSUFFICIENT, declined_decisions=200))
+        self.assertEqual(code, staged_review.COLLECTING)
+        self.assertNotEqual(code, staged_review.SUPPORTED)
+
+    def test_starvation_still_outranks_an_early_screen_out(self):
+        code, _ = staged_review.verdict_for(candidate(
+            trades=20, mean_r=-0.6, ci_low=-0.9, ci_high=-0.3,
+            label=shortlist.INSUFFICIENT,
+            declined_decisions=10, starved_decisions=900))
+        self.assertEqual(code, staged_review.STARVED_OF_DATA)

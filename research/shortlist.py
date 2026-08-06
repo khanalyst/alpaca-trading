@@ -19,13 +19,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .stats import bootstrap_difference, bootstrap_mean
+from .stats import (benjamini_hochberg, bootstrap_difference,
+                    bootstrap_mean, bootstrap_p_value)
 
 # Sample floors. These are not significance thresholds; they gate what a
 # label is allowed to say, so a promising number on nine trades cannot read
 # the same as the same number on two hundred.
 MIN_FOR_PRELIMINARY = 30
 MIN_FOR_SUPPORTED = 100
+# Expected proportion of false discoveries tolerated among declared ones.
+FDR_ALPHA = 0.05
 # The confirmation window is the last 30% of a candidate's trades in time,
 # matching the split the deterministic outcome evaluator already uses.
 CONFIRMATION_FRACTION = 0.30
@@ -68,6 +71,9 @@ class Candidate:
     delta_ci_high: float | None = None
     starved_decisions: int = 0
     declined_decisions: int = 0
+    p_value: float = 1.0
+    p_adjusted: float | None = None
+    family_size: int = 0
     label: str = NO_EVIDENCE
     reasons: list = field(default_factory=list)
 
@@ -151,9 +157,24 @@ def _label(candidate: Candidate) -> tuple[str, list]:
             "persist out of sample")
         return INCONCLUSIVE, reasons
 
+    if candidate.p_adjusted is not None and candidate.p_adjusted > FDR_ALPHA:
+        reasons.append(
+            f"the raw interval excludes zero (p={candidate.p_value:.4f}) but "
+            f"does not survive false-discovery control across the "
+            f"{candidate.family_size} candidates screened alongside it "
+            f"(p_adj {candidate.p_adjusted:.3f} > {FDR_ALPHA}). Screening "
+            "many candidates produces a few that look significant with no "
+            "edge at all; this is what separates them")
+        return INCONCLUSIVE, reasons
+
     reasons.append(
         f"{n} closed trades, interval {candidate.ci_low:+.3f}.."
         f"{candidate.ci_high:+.3f} R excludes zero")
+    if candidate.p_adjusted is not None:
+        reasons.append(
+            f"survives false-discovery control across "
+            f"{candidate.family_size} candidates "
+            f"(p={candidate.p_value:.4f}, p_adj {candidate.p_adjusted:.3f})")
     if confirmation is not None:
         reasons.append(
             f"held-out confirmation agrees in sign ({confirmation:+.3f} R)")
@@ -183,6 +204,7 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
         starved_decisions=int(starved), declined_decisions=int(declined),
         baseline_variant_id=baseline_variant_id)
     if returns:
+        candidate.p_value = round(bootstrap_p_value(returns), 5)
         interval = bootstrap_mean(returns)
         candidate.mean_r = round(interval.point, 4)
         candidate.ci_low = round(interval.low, 4)
@@ -213,6 +235,33 @@ def _scope_tag(scope_key: str) -> str:
     """
     parts = [part for part in str(scope_key).split(":") if part]
     return parts[-1] if parts else "?"
+
+
+def apply_family_correction(candidates: list, alpha: float = FDR_ALPHA) -> list:
+    """Correct across everything screened together, then relabel.
+
+    The family is every candidate with enough trades to be judged at all.
+    Including the ones too thin to conclude about would inflate the family
+    size with tests that were never run, which makes the correction look
+    stricter than the search actually was.
+    """
+    eligible = {
+        f"{c.scope_key}|{c.variant_id}": c.p_value
+        for c in candidates if c.trades >= MIN_FOR_PRELIMINARY
+    }
+    if not eligible:
+        return candidates
+    corrected = benjamini_hochberg(eligible, alpha=alpha)
+    for candidate in candidates:
+        key = f"{candidate.scope_key}|{candidate.variant_id}"
+        row = corrected.get(key)
+        if row is None:
+            continue
+        candidate.p_adjusted = round(row["p_adjusted"], 5)
+        candidate.family_size = row["family_size"]
+        # Relabel: the correction can only ever demote, never promote.
+        candidate.label, candidate.reasons = _label(candidate)
+    return candidates
 
 
 def rank(candidates: list) -> list:
@@ -333,7 +382,7 @@ def from_store(findings_store, staging_store=None, *,
                 baseline_trades=(None if is_baseline else baseline_trades),
                 baseline_variant_id=(None if is_baseline else baseline_id),
                 starved=decisions["starved"], declined=decisions["declined"]))
-    return candidates
+    return apply_family_correction(candidates)
 
 
 def _variants_in(findings_store, scope_key: str) -> set:

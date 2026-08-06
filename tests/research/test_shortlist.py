@@ -152,3 +152,65 @@ class RankingAndReportTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class FalseDiscoveryControlTests(unittest.TestCase):
+    """Screening many candidates produces winners with no edge at all."""
+
+    def test_a_lone_real_result_survives_correction(self):
+        population = [
+            shortlist.measure("staged.real", "demo:s",
+                              trades([0.5, 0.4, 0.6] * 40)),
+            *[shortlist.measure(f"staged.noise{i}", "demo:s",
+                                trades([1.0, -1.0] * 60))
+              for i in range(10)],
+        ]
+        shortlist.apply_family_correction(population)
+        real = population[0]
+        self.assertEqual(real.label, shortlist.SUPPORTED)
+        self.assertIsNotNone(real.p_adjusted)
+        self.assertLessEqual(real.p_adjusted, shortlist.FDR_ALPHA)
+        self.assertIn("survives false-discovery control",
+                      " ".join(real.reasons))
+
+    def test_correction_demotes_a_marginal_winner_found_among_many(self):
+        # SUPPORTED on its own at p=0.0085. One of forty-one screened
+        # together it is not: this is the candidate that would have headed
+        # an uncorrected shortlist purely because enough things were tried.
+        alternating = [value for _ in range(55) for value in (0.75, -0.45)]
+        marginal = shortlist.measure(
+            "staged.marginal", "demo:s", trades(alternating))
+        self.assertEqual(marginal.label, shortlist.SUPPORTED)
+        self.assertLess(marginal.p_value, shortlist.FDR_ALPHA)
+
+        family = [marginal] + [
+            shortlist.measure(f"staged.noise{i}", "demo:s",
+                              trades([0.9, -0.9] * 55))
+            for i in range(40)
+        ]
+        shortlist.apply_family_correction(family)
+        self.assertEqual(marginal.family_size, 41)
+        self.assertGreater(marginal.p_adjusted, shortlist.FDR_ALPHA)
+        self.assertEqual(marginal.label, shortlist.INCONCLUSIVE)
+        joined = " ".join(marginal.reasons)
+        self.assertIn("does not survive false-discovery control", joined)
+        self.assertIn("41 candidates", joined)
+
+    def test_thin_arms_do_not_inflate_the_family(self):
+        # Counting tests that were never run would make the correction look
+        # stricter than the search actually was.
+        population = [
+            shortlist.measure("staged.real", "demo:s",
+                              trades([0.5, 0.4, 0.6] * 40)),
+            *[shortlist.measure(f"staged.thin{i}", "demo:s", trades([0.5] * 3))
+              for i in range(50)],
+        ]
+        shortlist.apply_family_correction(population)
+        self.assertEqual(population[0].family_size, 1)
+        self.assertEqual(population[0].label, shortlist.SUPPORTED)
+
+    def test_correction_never_promotes(self):
+        negative = shortlist.measure(
+            "staged.bad", "demo:s", trades([-0.5] * 120))
+        shortlist.apply_family_correction([negative])
+        self.assertEqual(negative.label, shortlist.NEGATIVE)

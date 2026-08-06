@@ -15,6 +15,14 @@ llm:
 strategy:
   id: momentum
   version: phase1-v3
+  # analyst | deterministic. A strategy earns promotion on evidence its
+  # deterministic contract produced in a shadow lane, so running it live
+  # under an analyst would trade something other than the thing that earned
+  # the promotion. `deterministic` removes the analyst call entirely: the
+  # contract proposes, risk vets, execution places. It needs no analyst
+  # prompt, which is what lets a shadow-only strategy occupy the order path
+  # once its evidence justifies it.
+  execution_mode: analyst
   signal_timeframe: 15m          # fixed for this version; one evaluation/bar
   # The three registered hypotheses (volume-thrust, oi-divergence,
   # basis-stretch) reach the book only through experimental setups. While

@@ -31,7 +31,7 @@ research:
 | Area | Current value |
 | --- | --- |
 | Account mode | `demo` (OKX Demo Trading) |
-| Order-executing strategy | `momentum/phase1-v3` |
+| Order-executing strategy | `momentum/phase1-v3`, `execution_mode: analyst` |
 | Runtime tier | `T0_REJECTED`; demo rehearsal and comparison baseline only |
 | LLM route | provider `openai`, model/deployment identifier `gpt-5.6-sol-coding` |
 | Housekeeping cadence | `cycle.interval_seconds: 60` |
@@ -112,6 +112,31 @@ The live-order prompt and the research-review prompt are separate. The nightly
 research reviewer receives an already immutable deterministic outcome. It may
 explain the result and nominate one bounded next selection; it cannot alter the
 verdict, change account settings, or authorize an order.
+
+## Trading a contract without an analyst
+
+`strategy.execution_mode` selects what decides on the order path:
+
+- `analyst` (shipped): the momentum analyst makes one LLM call per decision
+  cycle and its parsed decisions go through contracts, risk and execution;
+- `deterministic`: the strategy's own forward contract proposes, and no LLM
+  call is made at all.
+
+A strategy earns promotion on evidence its deterministic contract produced in
+a shadow lane. Running it live under an analyst trades something other than
+the thing that earned the promotion, and the evidence stops describing what
+the account is doing. The deterministic path removes the analyst rather than
+the evidence.
+
+It also unblocks a practical constraint: `momentum` is the only strategy with
+`analyst_ready=True`, so under `analyst` no other registered strategy can
+occupy the order path whatever its evidence says. Under `deterministic` any
+strategy with a complete forward contract can, and configuration refuses to
+start when that contract is missing. Tier gating is unchanged - live still
+requires `T3_VALIDATED` and a reviewed packet.
+
+Only the source of the decisions differs. Research recording, risk vetting,
+execution controls and the close path are one code path in both modes.
 
 ## Experiment outcomes and edge evidence
 
@@ -267,6 +292,34 @@ snapshot file is size- and SHA-256-verified.
 ./.venv/bin/python research.py verify-backup <backup-directory>
 ```
 
+### Screening many candidates at once
+
+Test fifty candidates at 5% and two or three will look significant with no
+edge at all. `SUPPORTED` therefore requires surviving Benjamini-Hochberg
+false-discovery control across every candidate screened alongside it, and the
+report states the family size and the adjusted p-value. Holm is used elsewhere
+for a handful of pre-registered comparisons; it is far too conservative for a
+screening population, where the quantity that matters is the expected
+proportion of false discoveries among those declared rather than the chance of
+any false positive at all.
+
+Arms too thin to judge do not count toward the family. Including tests that
+were never run would make the correction look stricter than the search
+actually was.
+
+Candidates move through three stages rather than facing the strictest gate
+from the first bar, which is why nothing used to finish:
+
+| Stage | Trades | What can happen |
+| --- | --- | --- |
+| `SCREEN` | under 30 | Retire a clearly adverse mechanism early; never promote one |
+| `MEASURE` | 30-99 | Accumulate with full costs |
+| `CONFIRM` | 100+ | Held-out window and family correction decide |
+
+The screen is decisive in one direction only. Passing it means "not yet
+excluded", not evidence of an edge, and a borderline loser is given the longer
+look because that is exactly where a small sample misleads.
+
 ### Reading the shortlist
 
 `research.py shortlist` ranks every measured arm and states how far the
@@ -277,7 +330,7 @@ tried and failed.
 
 | Label | What it means |
 | --- | --- |
-| `SUPPORTED` | Adequate sample, 95% interval excludes zero, held-out window agrees in sign |
+| `SUPPORTED` | Adequate sample, 95% interval excludes zero, held-out window agrees in sign, and survives false-discovery control across everything screened alongside it |
 | `PRELIMINARY` | Positive but under the 100-trade floor |
 | `INCONCLUSIVE` | Adequate sample whose interval still includes zero, or a result that does not persist out of sample |
 | `INSUFFICIENT` | Under the 30-trade floor; no reading means much |

@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 
+from .forward_models import require_complete_contract
 from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
                        runnable_ids, spec_for)
 from .provider import normalize_provider_endpoint
@@ -90,7 +91,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
 
     strategy = _mapping(cfg.get("strategy"), "strategy")
     _keys(strategy, {
-        "id", "version", "signal_timeframe",
+        "id", "version", "signal_timeframe", "execution_mode",
         "breakout_discriminator", "breakout_compression_max_atr_ratio",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
         "setup_memory_hours", "loss_reentry_min_minutes",
@@ -126,7 +127,28 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             f"strategy.id {spec.id!r} is registered for research but has no "
             f"live contract implementation. Runnable strategies: "
             f"{', '.join(runnable_ids())}")
-    if not spec.analyst_ready and not allow_shadow_strategy:
+    # A strategy earns promotion on evidence its deterministic contract
+    # produced in a shadow lane. Running it live under an analyst trades
+    # something other than the thing that earned the promotion, so the
+    # contract can drive the order path directly instead. That path needs no
+    # analyst prompt, which is why analyst_ready is not required for it.
+    # Exact, like mode: two configuration files that look different must not
+    # behave identically, and silently normalising case or whitespace is how
+    # a typo becomes a mode change nobody reviewed.
+    execution_mode = strategy.get("execution_mode", "analyst")
+    if execution_mode not in {"analyst", "deterministic"}:
+        raise ConfigError(
+            "strategy.execution_mode must be exactly 'analyst' or "
+            "'deterministic'")
+    strategy["execution_mode"] = execution_mode
+    if execution_mode == "deterministic":
+        try:
+            require_complete_contract(spec.id)
+        except Exception as exc:  # noqa: BLE001
+            raise ConfigError(
+                f"strategy.execution_mode is deterministic but {spec.id!r} "
+                f"has no complete forward contract to trade: {exc}") from None
+    elif not spec.analyst_ready and not allow_shadow_strategy:
         raise ConfigError(
             f"strategy.id {spec.id!r} has no live contract implementation; "
             "its deterministic shadow contract is research-only because the "

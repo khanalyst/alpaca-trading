@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
+from .forward_models import require_complete_contract
 from . import (brain, contracts, deployment, hypotheses, market, registry,
                shadow, state, strategy, variants)
 from .alerts import AlertManager
@@ -1006,21 +1007,28 @@ class Engine:
         # The model is the one nondeterministic component in the pipeline.
         # Journal the exact provider request and the raw provider result so
         # every parsed decision - and every silent hold - can be reconstructed.
-        self._journal_llm_input(live_snapshot, portfolio, max_new)
-        try:
-            decisions = self.llm.decide(live_snapshot, portfolio, max_new)
-        except Exception as e:
+        # Only the SOURCE of the decisions differs between the two modes.
+        # Everything after this - research recording, risk, execution, the
+        # close path - stays one code path, because a second copy of the
+        # order logic is a second place for it to diverge.
+        if self._deterministic_order_path():
+            decisions = self._deterministic_decisions(live_snapshot, max_new)
+        else:
+            self._journal_llm_input(live_snapshot, portfolio, max_new)
+            try:
+                decisions = self.llm.decide(live_snapshot, portfolio, max_new)
+            except Exception as e:
+                self._journal_llm_output()
+                log.error("LLM call failed; holding this cycle: %s", e)
+                state.log_event("error", f"llm: {e}")
+                self._run_shadow_variants(
+                    live_snapshot, equity, positions, st, 0.0, decisions=[],
+                    advance_accounts=False)
+                self.alerts.send(
+                    "error", "llm_call_failed",
+                    "LLM call failed; holding this cycle", {"error": str(e)})
+                return
             self._journal_llm_output()
-            log.error("LLM call failed; holding this cycle: %s", e)
-            state.log_event("error", f"llm: {e}")
-            self._run_shadow_variants(
-                live_snapshot, equity, positions, st, 0.0, decisions=[],
-                advance_accounts=False)
-            self.alerts.send(
-                "error", "llm_call_failed",
-                "LLM call failed; holding this cycle", {"error": str(e)})
-            return
-        self._journal_llm_output()
         # An empty list is a real decision ("no trade"); journal it too so
         # the audit trail distinguishes a deliberate hold from a failed call.
         state.log_event("decisions", json.dumps(decisions))
@@ -3320,6 +3328,45 @@ class Engine:
         block["id"] = spec.id
         block["version"] = spec.version
         return {**self.cfg, "strategy": block}
+
+    def _deterministic_order_path(self) -> bool:
+        """True when the contract decides and no analyst call is made."""
+        # Configuration validation already guarantees an exact value.
+        return (self.cfg.get("strategy") or {}).get(
+            "execution_mode", "analyst") == "deterministic"
+
+    def _deterministic_decisions(self, snapshot: dict,
+                                 max_new: int) -> list[dict]:
+        """Trade the contract that was measured, with no analyst layer.
+
+        A strategy earns promotion on evidence produced by its deterministic
+        contract in a shadow lane. Running it live under an analyst would
+        trade something other than the thing that earned the promotion, and
+        the evidence would no longer describe what the account is doing. This
+        path therefore uses the same proposals the lane used - the contract's
+        own output on the same snapshot - and lets risk and execution apply
+        unchanged.
+
+        No LLM call happens at all, so there is nothing to journal as model
+        input or output. The proposals are journalled as ``decisions`` like
+        any other cycle, tagged with their source.
+        """
+        model = require_complete_contract(self.strategy_id)
+        proposals = model.deterministic_proposals(snapshot, self.cfg)
+        accepted = []
+        for proposal in proposals:
+            if len(accepted) >= max(0, int(max_new)):
+                break
+            if proposal.get("research_refusal_reason"):
+                continue
+            entry = dict(proposal)
+            entry["proposal_source"] = "deterministic_contract"
+            # Confidence is not a model opinion here. The contract either
+            # fired or it did not, so a fabricated score would let the
+            # min_confidence gate look like it was doing work it is not.
+            entry["confidence"] = 1.0
+            accepted.append(entry)
+        return accepted
 
     def _record_shadow_decisions(self, snapshot: dict) -> dict:
         """Journal what every registered contract would have done.

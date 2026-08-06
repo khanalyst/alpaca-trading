@@ -133,10 +133,10 @@ collection answers that question with data instead of a guess.
       without hand-written Python, bounded to known snapshot fields
 - [x] B2.2 Staging tier: LLM-authored hypotheses register at T1, get shadow
       lanes immediately, and remain barred from capital by `LIVE_MIN_TIER`
-- [ ] B2.3 Three-stage funnel - screen on ~30 observations, measure on 100
+- [x] B2.3 Three-stage funnel - screen on ~30 observations, measure on 100
       with full costs, confirm on held-out evidence - instead of applying the
       strictest adequacy gate to every candidate from the first bar
-- [ ] B2.4 Parallel arms with false-discovery control per axis family,
+- [x] B2.4 Parallel arms with false-discovery control per axis family,
       replacing serial one-candidate-per-lane rotation
 - [x] B2.5 Reason-coded verdicts so the reviewer learns why a candidate died,
       not merely that it did
@@ -183,7 +183,7 @@ attribution deliberately.
 
 ### Remaining in Batch 2
 
-- [ ] B2.7 Deterministic order path so a promoted contract can trade as
+- [x] B2.7 Deterministic order path so a promoted contract can trade as
       measured, replacing blanket `analyst_ready`
 - [ ] B2.8 Wire `StagingStore.evaluators()` into the shadow coordinator so a
       staged contract gets a lane on the next cycle
@@ -224,11 +224,11 @@ vetoed a quiet hour, with no code written for it.
 
 - [x] B2.8 Staged contracts get shadow lanes: the coordinator evaluates each
       one on the shared harness every cycle, in its own scope
-- [ ] B2.3 Three-stage funnel
-- [ ] B2.4 Parallel arms with false-discovery control
+- [x] B2.3 Three-stage funnel
+- [x] B2.4 Parallel arms with false-discovery control
 - [x] B2.5 Reason-coded verdicts
 - [x] B2.6 Ranked shortlist report
-- [ ] B2.7 Deterministic order path
+- [x] B2.7 Deterministic order path
 
 B2.8 needs one design decision first. A staged contract produces a signal but
 not a paper trade, because a trade needs entry, stop, target, cost and holding
@@ -303,9 +303,9 @@ own variant id.
 
 - [x] B2.6 Ranked shortlist report
 - [x] B2.5 Reason-coded verdicts
-- [ ] B2.3 Three-stage funnel
-- [ ] B2.4 Parallel arms with false-discovery control
-- [ ] B2.7 Deterministic order path
+- [x] B2.3 Three-stage funnel
+- [x] B2.4 Parallel arms with false-discovery control
+- [x] B2.7 Deterministic order path
 
 
 ### B2.6: the report a human acts on, or declines to act on
@@ -341,9 +341,9 @@ populations as one.
 ### Remaining
 
 - [x] B2.5 Reason-coded verdicts
-- [ ] B2.3 Three-stage funnel
-- [ ] B2.4 Parallel arms with false-discovery control
-- [ ] B2.7 Deterministic order path
+- [x] B2.3 Three-stage funnel
+- [x] B2.4 Parallel arms with false-discovery control
+- [x] B2.7 Deterministic order path
 
 
 ### B2.5: a dead mechanism says why, in terms the next generation can use
@@ -385,6 +385,72 @@ population never pooled with the registered arms.
 
 ### Remaining
 
-- [ ] B2.3 Three-stage funnel
-- [ ] B2.4 Parallel arms with false-discovery control
-- [ ] B2.7 Deterministic order path
+- [x] B2.3 Three-stage funnel
+- [x] B2.4 Parallel arms with false-discovery control
+- [x] B2.7 Deterministic order path
+
+
+### B2.4: the search has to be paid for
+
+`SUPPORTED` now requires surviving Benjamini-Hochberg false-discovery control
+across every candidate screened alongside it. Holm already existed for a
+handful of pre-registered comparisons and is far too conservative for a
+screening population: at fifty candidates it rejects almost everything real.
+BH bounds the expected proportion of false discoveries among those declared,
+which is the quantity that matters when the output is a shortlist.
+
+The p-value is a seeded two-sided bootstrap rather than a t statistic, because
+R-multiples are heavy-tailed and bounded below at -1 - exactly where a normal
+approximation is least trustworthy.
+
+Held by a calibrated test rather than an assertion that happens to pass: a
+candidate that is genuinely `SUPPORTED` alone at p=0.0085 is demoted to
+`INCONCLUSIVE` at p_adj 0.349 when screened among 41. Arms too thin to judge
+are excluded from the family, since counting tests that were never run would
+make the correction look stricter than the search actually was.
+
+### B2.3: the funnel
+
+Applying the strictest adequacy gate from the first bar is why nothing
+finished: an obviously dead mechanism occupied a lane for weeks to establish
+what thirty trades already showed. `SCREEN` (under 30 trades) can retire a
+clearly adverse mechanism and can never promote one - passing a screen means
+"not yet excluded". `MEASURE` accumulates to 100 with full costs. `CONFIRM`
+applies the held-out window and the family correction.
+
+The screen acts only when the whole interval is clearly adverse, not merely
+negative: a borderline loser at n=20 is exactly where a small sample misleads,
+so it gets the longer look. Starvation still outranks an early screen-out.
+
+### B2.7: trading what was measured
+
+`strategy.execution_mode` selects `analyst` or `deterministic`. The
+deterministic path makes no LLM call: the strategy's own forward contract
+proposes, and risk and execution apply unchanged.
+
+Only the source of the decisions differs. Research recording, risk vetting,
+execution controls and the close path stay one code path, because a second
+copy of the order logic is a second place for it to diverge.
+
+This is what makes a promoted strategy tradeable as the thing that earned the
+promotion, and it resolves the constraint recorded in Batch 1: `momentum` was
+the only strategy with `analyst_ready=True`, so no other registered strategy
+could occupy the order path whatever its evidence said. Under `deterministic`,
+`ls-ratio-fade` validates and starts; under `analyst` it is still refused for
+having no analyst prompt. Configuration refuses `deterministic` when the named
+strategy has no complete forward contract, and the value must be exact - no
+case or whitespace normalisation, so a typo cannot become an unreviewed mode
+change.
+
+### Documentation updated
+
+`config.yaml` declares `execution_mode`; README gained the deterministic
+order-path section, the screening/funnel tables and the corrected `SUPPORTED`
+definition; OPERATIONS gained runbook sections 7.2 and 7.3 and the funnel and
+false-discovery paragraphs; SETUP gained `strategy.execution_mode` and
+`research.staging_store`; `research/HYPOTHESES_AND_VARIANTS.md` gained a
+machine-authored mechanisms section recording that they are a separate
+population on a fixed harness, never pooled with the registered arms; and
+`research/README.md` records their coded verdicts.
+
+Batch 2 is complete.

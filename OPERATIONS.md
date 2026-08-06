@@ -486,9 +486,50 @@ They enter at `T1_HYPOTHESIS` and cannot rise. Live still requires
 shortens the path to capital; what it removes is the developer in the middle
 of measuring an idea.
 
+Mechanisms move through three funnel stages rather than facing the strictest
+gate from the first bar, which is why nothing used to finish: `SCREEN` under
+30 trades can retire a clearly adverse mechanism early and can never promote
+one, `MEASURE` accumulates to 100 with full costs, and `CONFIRM` applies the
+held-out window and the family correction.
+
+`SUPPORTED` additionally requires surviving Benjamini-Hochberg false-discovery
+control across every candidate screened alongside it. Screening fifty
+candidates at 5% produces two or three that look significant with no edge at
+all; the report states the family size and adjusted p-value so a reader can
+see how much search was paid for. Arms too thin to judge are excluded from the
+family, because counting tests that were never run would make the correction
+look stricter than the search actually was.
+
 A registered claim is immutable at the database level. Rewording one after
 results exist is refused by a trigger, because a claim that can be edited
 afterwards cannot be told apart from one retro-fitted to the result.
+
+### 7.3 Running a contract without an analyst
+
+`strategy.execution_mode` selects what decides on the order path. `analyst`
+is shipped and makes one LLM call per decision cycle. `deterministic` makes no
+LLM call at all: the strategy's own forward contract proposes, and risk and
+execution apply unchanged.
+
+Use it when a strategy has earned promotion on shadow evidence. That evidence
+was produced by its deterministic contract, so trading it under an analyst
+would put an unmeasured layer on top of the thing that justified the
+promotion. It is also the only way a strategy other than `momentum` can occupy
+the order path at all: every other registered strategy has no analyst prompt.
+
+```yaml
+strategy:
+  id: ls-ratio-fade
+  version: v1
+  signal_timeframe: 1h
+  execution_mode: deterministic
+```
+
+Configuration refuses to start when the named strategy has no complete
+forward contract, and the value must be exactly `analyst` or `deterministic` -
+no case or whitespace normalisation, so a typo cannot become a mode change
+nobody reviewed. Tier gating is unchanged: live still requires
+`T3_VALIDATED` and a reviewed packet.
 
 ## 8. Interpreting results
 

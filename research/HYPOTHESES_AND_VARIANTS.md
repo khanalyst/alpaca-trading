@@ -391,6 +391,28 @@ variant IDs in the live system prompt through
 `research_selection_prompt_fragment()`, forking `prompt_version` and every
 attribution downstream in exchange for no measurement.
 
+## Machine-authored mechanisms
+
+A mechanism no longer has to be a hand-written Python function. A proposal is
+data - a claim, the payer, a falsifier, and comparisons over fields the
+validated forward models already declare - validated by `agent/contract_dsl.py`
+and compiled into the same callable the hand-written contracts implement.
+
+These live apart from everything above. They are registered in
+`research/cache/staging.db`, run in a `:staged` scope with one paper account
+each, and are measured on one fixed harness rather than on their own exits:
+first observed price after the signal, a structure stop at one ATR, a 2R
+target, observed taker costs both sides, a 24h timeout. Holding the outcome
+contract constant is what makes a difference between two authored mechanisms
+a difference in the mechanism rather than in a lucky stop distance.
+
+They enter at `T1_HYPOTHESIS` and cannot rise from there. Their claims are
+immutable once registered, they are never pooled with the registered
+strategies' comparison arms, and `research.py review-staged` gives each a
+coded verdict - `NEGATIVE_EXPECTANCY`, `DIED_OUT_OF_SAMPLE` and `NEVER_FIRED`
+retire one, `STARVED_OF_DATA` never does because a claim evaluated on
+snapshots it could not read has not been tested.
+
 ## Which settings can rotate in real time
 
 Real-time rotation accepts only one exact setting axis at a time. Settings that
