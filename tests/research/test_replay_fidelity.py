@@ -20,6 +20,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 
@@ -35,24 +36,20 @@ class FidelityFixture(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.db = Path(self.dir.name) / "journal.db"
-        conn = sqlite3.connect(self.db)
-        conn.execute(
-            "CREATE TABLE events (ts REAL, kind TEXT, payload TEXT, "
-            "run_id TEXT, cycle_id TEXT, setup_id TEXT)")
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute(
+                "CREATE TABLE events (ts REAL, kind TEXT, payload TEXT, "
+                "run_id TEXT, cycle_id TEXT, setup_id TEXT)")
 
     def record(self, cycle_id: str, symbol: str, direction: str,
                ts: float = 1.0) -> None:
         """Write a setup_proposed event as the live engine would have."""
-        conn = sqlite3.connect(self.db)
-        conn.execute(
-            "INSERT INTO events VALUES (?,?,?,?,?,?)",
-            (ts, "setup_proposed",
-             json.dumps({"symbol": symbol, "direction": direction}),
-             "run-a", cycle_id, f"s-{cycle_id}-{symbol}"))
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (ts, "setup_proposed",
+                 json.dumps({"symbol": symbol, "direction": direction}),
+                 "run-a", cycle_id, f"s-{cycle_id}-{symbol}"))
 
     def record_modern(self, decision, *, ts: float = 1.0) -> None:
         """Record the full proposal-stage identity used by current G2."""
@@ -68,13 +65,11 @@ class FidelityFixture(unittest.TestCase):
             "variant_id": "live",
             "cycle_id": decision.cycle_id,
         }
-        conn = sqlite3.connect(self.db)
-        conn.execute(
-            "INSERT INTO events VALUES (?,?,?,?,?,?)",
-            (ts, "setup_proposed", json.dumps(payload), "run-a",
-             decision.cycle_id, decision.proposal_id))
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute(
+                "INSERT INTO events VALUES (?,?,?,?,?,?)",
+                (ts, "setup_proposed", json.dumps(payload), "run-a",
+                 decision.cycle_id, decision.proposal_id))
 
     def replay_baseline(self, cycles, outputs):
         return replay.Replay(
@@ -173,7 +168,7 @@ class ReproductionTests(FidelityFixture):
         """A replay is bound to the corpus fingerprint captured before it ran."""
         result = self._synthetic(1, 0)
         captured = replay.g2_evidence_metadata(self.db)
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO events VALUES (?,?,?,?,?,?)",
                 (2.0, "llm_input", json.dumps({"decision": "hold"}),
@@ -405,7 +400,7 @@ class ComparisonStageTests(FidelityFixture):
                         "comparing against executions alone would fail G2")
 
 
-class StrictIdentityTests(FidelityFixture):
+class _StrictIdentityFixture(FidelityFixture):
     """Current journals use the full proposal identity at the G2 boundary."""
 
     def record_modern(self, cycle_id="c1", *, setup_type="trend_continuation",
@@ -418,7 +413,7 @@ class StrictIdentityTests(FidelityFixture):
             "strategy_id": "momentum", "strategy_version": "v1",
             "variant_id": variant_id,
         }
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO events VALUES (?,?,?,?,?,?)",
                 (ts, "setup_proposed", json.dumps(payload), "run-a",
@@ -435,6 +430,10 @@ class StrictIdentityTests(FidelityFixture):
             setup_type=setup_type, proposal_id=setup_id,
             strategy_id="momentum", strategy_version="v1",
             setup_key=setup_key, contract_passed=True)
+
+
+class StrictIdentityTests(_StrictIdentityFixture):
+    """Distinct modern proposal identities must never collapse together."""
 
     def test_setup_type_change_does_not_collapse_to_same_key(self):
         self.record_modern()
@@ -474,7 +473,7 @@ class StrictIdentityTests(FidelityFixture):
     def test_duplicate_and_malformed_rows_fail_closed(self):
         self.record_modern()
         self.record_modern()
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO events VALUES (?,?,?,?,?,?)",
                 (2.0, "setup_proposed", "not-json", "run-a", "c2",
@@ -489,7 +488,7 @@ class StrictIdentityTests(FidelityFixture):
         self.assertFalse(report["passes_g2"])
 
 
-class ModernBoundaryTests(StrictIdentityTests):
+class ModernBoundaryTests(_StrictIdentityFixture):
     """Legacy rows are readable, but never dilute modern strict evidence."""
 
     def _result(self, *decisions):
@@ -561,14 +560,14 @@ class ModernBoundaryTests(StrictIdentityTests):
     def test_pre_boundary_replay_is_ignored_but_post_boundary_hold_is_extra(self):
         # The pre-boundary model input was appended before the legacy proposal;
         # the later HOLD cycle has no setup proposal and must remain visible.
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO events (ts, kind, payload, run_id, cycle_id, setup_id) "
                 "VALUES (?,?,?,?,?,?)",
                 (1.0, "llm_input", "{}", "run-a", "legacy-cycle", None))
         self.record("legacy-cycle", "BTC/USDT:USDT", "long", ts=2.0)
         self.record_modern(cycle_id="modern-cycle", ts=3.0)
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.executemany(
                 "INSERT INTO events (ts, kind, payload, run_id, cycle_id, setup_id) "
                 "VALUES (?,?,?,?,?,?)", [

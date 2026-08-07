@@ -205,6 +205,8 @@ class Engine:
                     "account_fingerprint"],
                 preflight=self.demo_preflight,
             )
+        execution_mode = str(
+            (cfg.get("strategy") or {}).get("execution_mode") or "analyst")
         if not light:
             llm_kwargs = {}
             if self.research_selection_catalog is not None:
@@ -212,14 +214,16 @@ class Engine:
                     "catalog": self.research_selection_catalog,
                     "system": self.system_prompt,
                 }
-            self.llm = brain.LLM(cfg, **llm_kwargs)
-            self.llm.preflight()
+            if execution_mode == "analyst":
+                self.llm = brain.LLM(cfg, **llm_kwargs)
+                self.llm.preflight()
             self.risk = RiskEngine(cfg)
         # Disabled shadow evaluation remains a complete no-op.
         self._research_failure_count = 0
         self._research_consecutive_failures = 0
         self._research_last_failure: dict | None = None
         self._research_last_success_ts: float | None = None
+        self._strategy_shadow_errors: dict[str, dict] = {}
         self.shadow = self._build_shadow(cfg)
         self.universe: list[str] = []
         self.universe_ts = 0.0
@@ -341,6 +345,8 @@ class Engine:
         expected = bool(research_cfg.get("shadow_enabled"))
         available = getattr(self, "shadow", None) is not None
         failures = int(getattr(self, "_research_consecutive_failures", 0))
+        strategy_errors = dict(getattr(
+            self, "_strategy_shadow_errors", {}) or {})
         try:
             state.write_heartbeat(
                 status,
@@ -352,7 +358,7 @@ class Engine:
                 research_status=(
                     "disabled" if not expected else
                     "unavailable" if not available else
-                    "degraded" if failures else "healthy"),
+                    "degraded" if failures or strategy_errors else "healthy"),
                 research_failure_count=int(getattr(
                     self, "_research_failure_count", 0)),
                 research_consecutive_failures=failures,
@@ -360,6 +366,7 @@ class Engine:
                     self, "_research_last_failure", None),
                 research_last_success_ts=getattr(
                     self, "_research_last_success_ts", None),
+                strategy_shadow_errors=strategy_errors,
                 **detail,
             )
         except Exception as exc:                           # noqa: BLE001
@@ -3516,9 +3523,30 @@ class Engine:
                     state.log_event(
                         "strategy_shadow_decision", self._audit_json(signal),
                         strategy_id=spec.id, strategy_version=spec.version)
+                getattr(self, "_strategy_shadow_errors", {}).pop(
+                    strategy_id, None)
             except Exception as exc:                       # noqa: BLE001
                 log.warning("Shadow evaluation failed for %s: %s",
                             strategy_id, exc)
+                errors = getattr(self, "_strategy_shadow_errors", None)
+                if errors is None:
+                    errors = {}
+                    self._strategy_shadow_errors = errors
+                previous = errors.get(strategy_id) or {}
+                errors[strategy_id] = {
+                    "type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                    "ts": time.time(),
+                    "consecutive_failures": int(
+                        previous.get("consecutive_failures") or 0) + 1,
+                }
+                try:
+                    state.log_event(
+                        "strategy_shadow_failed",
+                        self._audit_json(errors[strategy_id]),
+                        strategy_id=strategy_id)
+                except Exception:                          # noqa: BLE001
+                    pass
         return breadth_by_strategy
 
     def _record_observations(self, snapshot: dict) -> None:

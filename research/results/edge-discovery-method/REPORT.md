@@ -1,5 +1,9 @@
 # How to infer an edge, and where to look for one
 
+> **ARCHIVED / FROZEN EVIDENCE SNAPSHOT.** This report records the data and
+> methodology available when it ran. Its recommendations are not current
+> runtime configuration and do not authorize capital.
+
 > ## ⚠ Cost basis correction — 2026-08-04
 >
 > **Every number below was produced against the `base` cost scenario:

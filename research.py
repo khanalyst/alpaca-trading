@@ -21,6 +21,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -126,6 +127,7 @@ def _price_cache(args: argparse.Namespace):
 
 
 DEFAULT_STAGING_PATH = "research/cache/staging.db"
+DEFAULT_STAGING_HANDOFF_DIR = "research/results/staged-handoffs"
 DEFAULT_RESEARCH_REVIEW_CAP = 8
 
 
@@ -152,6 +154,54 @@ def _configured_staging(cfg: dict,
                        requested: str | Path | None = None) -> Path:
     return _configured_path(cfg, "staging_store", requested,
                             DEFAULT_STAGING_PATH)
+
+
+def _staging_store(cfg: dict, requested: str | Path | None = None):
+    """Open staging under the single validated active-configuration budget."""
+    from agent.staging import DEFAULT_MAX_ACTIVE, StagingStore
+
+    block = (cfg.get("research") or {})
+    max_active = int(block.get("staging_max_active", DEFAULT_MAX_ACTIVE))
+    return StagingStore(
+        _configured_staging(cfg, requested), max_active=max_active)
+
+
+def _lifecycle_policy(cfg: dict):
+    from research.staged_lifecycle import LifecyclePolicy
+
+    block = ((cfg.get("research") or {}).get("staging_lifecycle") or {})
+    return LifecyclePolicy(
+        never_fired_decisions=int(
+            block.get("never_fired_decisions", 2_000)),
+        never_fired_max_age_seconds=float(
+            block.get("never_fired_max_age_hours", 7 * 24)) * 3600,
+        no_observation_max_age_seconds=float(
+            block.get("no_observation_max_age_hours", 3 * 24)) * 3600,
+        starved_max_age_seconds=float(
+            block.get("starved_max_age_hours", 3 * 24)) * 3600,
+        starved_fraction=float(block.get("starved_fraction", 0.5)),
+    )
+
+
+def _refinement_policy(cfg: dict):
+    from research.staged_refinement import RefinementPolicy
+
+    block = ((cfg.get("research") or {}).get("staging_refinement") or {})
+    return RefinementPolicy(
+        max_attempts=int(block.get("max_attempts", 1)),
+        max_variants_per_attempt=int(
+            block.get("max_variants_per_attempt", 2)),
+        max_configurations_per_mechanism=int(
+            block.get("max_configurations_per_mechanism", 5)),
+        relative_step=float(block.get("relative_step", 0.10)),
+    )
+
+
+def _configured_handoff_dir(
+        cfg: dict, requested: str | Path | None = None) -> Path:
+    return _configured_path(
+        cfg, "staging_handoff_dir", requested,
+        DEFAULT_STAGING_HANDOFF_DIR)
 
 
 def _corpus_for(db: Path):
@@ -1233,7 +1283,7 @@ def _latest_verified_external_backup_readonly(
     if not path.is_file():
         return None
     uri = f"{path.resolve().as_uri()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         tables = {
@@ -1436,9 +1486,9 @@ def cmd_research_loop(args: argparse.Namespace) -> int:
             max_reviews=getattr(
                 args, "max_reviews", DEFAULT_RESEARCH_REVIEW_CAP))
     print(json.dumps(result, sort_keys=True, default=str))
-    # Provider and parse failures are persisted and deliberately nonfatal so
-    # a nightly invocation can retry without losing the deterministic result.
-    return 0
+    # The deterministic outcome remains pending and retryable, but the job
+    # must still report that its provider/parse work did not complete.
+    return 2 if (result.get("retry_pending") or result.get("failed")) else 0
 
 
 def cmd_author(args: argparse.Namespace) -> int:
@@ -1449,11 +1499,18 @@ def cmd_author(args: argparse.Namespace) -> int:
     nominate needs most, and that is exactly the state with no terminal
     outcome in it.
     """
-    from agent.staging import StagingStore
     from research import authoring
 
     cfg = _load_config()
-    store = StagingStore(_configured_staging(cfg, args.staging))
+    store = _staging_store(cfg, args.staging)
+    capacity = store.capacity()
+    if capacity["backpressured"] and not args.dry_run:
+        print(json.dumps({
+            "status": "CAPACITY",
+            "accepted_count": 0,
+            "capacity": capacity,
+        }, sort_keys=True))
+        return 0
     findings_store = None
     history = {}
     if not args.no_history:
@@ -1505,11 +1562,14 @@ def cmd_author(args: argparse.Namespace) -> int:
         return 0
     result = authoring.author_generation(
         store, cfg, history=history, max_proposals=args.max_proposals,
-        findings_store=findings_store)
+        findings_store=findings_store,
+        refinement_policy=_refinement_policy(cfg))
     print(json.dumps(result, sort_keys=True, default=str))
-    # A failed provider call is recorded and retried on the next cadence
-    # rather than failing the nightly run around it.
-    return 0
+    hard_rejections = [
+        item for item in result.get("rejected", [])
+        if item.get("code") == "VALIDATION_FAILED"]
+    return 2 if (result.get("status") in {"FAILED", "NOTHING_ACCEPTED"}
+                 or hard_rejections) else 0
 
 
 def cmd_stage_seed(args: argparse.Namespace) -> int:
@@ -1519,11 +1579,10 @@ def cmd_stage_seed(args: argparse.Namespace) -> int:
     can run on every deploy without a human deciding whether the second run's
     failure mattered.
     """
-    from agent.staging import StagingStore
     from research import staging_seed
 
     cfg = _load_config()
-    store = StagingStore(_configured_staging(cfg, args.staging))
+    store = _staging_store(cfg, args.staging)
     try:
         entries = staging_seed.load(args.file)
     except staging_seed.SeedError as exc:
@@ -1544,10 +1603,8 @@ def cmd_stage_seed(args: argparse.Namespace) -> int:
 
 def cmd_staged(args: argparse.Namespace) -> int:
     """List staged mechanisms and what each one claims."""
-    from agent.staging import StagingStore
-
     cfg = _load_config()
-    store = StagingStore(_configured_staging(cfg, args.staging))
+    store = _staging_store(cfg, args.staging)
     contracts = store.active()
     if not contracts:
         print("no staged mechanisms")
@@ -1579,9 +1636,7 @@ def cmd_shortlist(args: argparse.Namespace) -> int:
     staging = None
     staging_path = _configured_staging(cfg, args.staging)
     if Path(staging_path).is_file():
-        from agent.staging import StagingStore
-
-        staging = StagingStore(staging_path)
+        staging = _staging_store(cfg, staging_path)
     candidates = shortlist_mod.from_store(
         store, staging, scope_key=args.scope)
     if args.json:
@@ -1602,13 +1657,71 @@ def cmd_shortlist(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refine_persisted_retirements(staging, policy) -> list[dict]:
+    """Retry each coded retirement at most once, safely across CLI reruns."""
+    from agent.staging import StagingCapacityError
+    from research.staged_refinement import (REFINABLE_FAILURES,
+                                            plan_refinement,
+                                            register_refinement)
+
+    records = staging.records()
+    refinements = []
+    for retired in [row for row in records if row.get("retired_ts") is not None]:
+        reason = str(retired.get("retired_reason") or "")
+        failure_code = reason.split(":", 1)[0].strip()
+        if failure_code not in REFINABLE_FAILURES:
+            continue
+        next_attempt = int(retired.get("refinement_attempt") or 0) + 1
+        prior = sorted(
+            row["contract_id"] for row in records
+            if (str(row.get("parent_contract_id") or "")
+                == str(retired["contract_id"])
+                and int(row.get("refinement_attempt") or 0) == next_attempt))
+        if prior:
+            refinements.append({
+                "status": "ALREADY_REGISTERED",
+                "contract_id": retired["contract_id"],
+                "attempt": next_attempt,
+                "registered_contract_ids": prior,
+            })
+            continue
+        try:
+            plan = plan_refinement(
+                staging, retired["contract_id"], failure_code,
+                policy=policy)
+            outcome = register_refinement(staging, plan)
+        except StagingCapacityError as exc:
+            # Backpressure is an expected bounded state. Leaving the coded
+            # retirement persisted makes the same work retryable next run.
+            outcome = {
+                "status": "CAPACITY",
+                "contract_id": retired["contract_id"],
+                "attempt": next_attempt,
+                "registered_contract_ids": [],
+                "reason": str(exc),
+                "capacity": staging.capacity(),
+            }
+        except Exception as exc:  # noqa: BLE001 - expose a true job failure
+            outcome = {
+                "status": "ERROR",
+                "contract_id": retired["contract_id"],
+                "attempt": next_attempt,
+                "registered_contract_ids": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        refinements.append(outcome)
+        # Newly registered children participate in idempotency checks for
+        # later retirements in this same invocation.
+        records = staging.records()
+    return refinements
+
+
 def cmd_review_staged(args: argparse.Namespace) -> int:
     """Adjudicate staged mechanisms and retire the ones that are finished.
 
     Retirement frees a lane; the claim and the reason stay recorded so the
     next generation can see what has already been tried.
     """
-    from agent.staging import StagingStore
     from research import staged_review
 
     cfg = _load_config()
@@ -1617,16 +1730,150 @@ def cmd_review_staged(args: argparse.Namespace) -> int:
         print("no staged mechanisms")
         return 0
     store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
+    staging = _staging_store(cfg, staging_path)
     result = staged_review.review(
-        StagingStore(staging_path), store, scope_key=args.scope,
-        retire=not args.dry_run)
+        staging, store, scope_key=args.scope,
+        retire=not args.dry_run, policy=_lifecycle_policy(cfg))
+    if not args.dry_run:
+        result["refinements"] = _refine_persisted_retirements(
+            staging, _refinement_policy(cfg))
     print(json.dumps(result, sort_keys=True, default=str))
+    retire_errors = any(
+        entry.get("retire_error") for entry in result.get("verdicts", []))
+    refinement_errors = any(
+        item.get("status") == "ERROR"
+        for item in result.get("refinements", []))
+    return 2 if retire_errors or refinement_errors else 0
+
+
+def cmd_prepare_handoff(args: argparse.Namespace) -> int:
+    """Write content-addressed staged specs for explicit human review only."""
+    from research import staged_review
+    from research.staged_handoff import (HandoffError,
+                                         build_registration_handoff,
+                                         render_registration_handoff,
+                                         validate_registration_handoff)
+
+    cfg = _load_config()
+    staging_path = _configured_staging(cfg, args.staging)
+    if not staging_path.is_file():
+        print(json.dumps({
+            "status": "NO_STAGING_STORE", "prepared": [],
+        }, sort_keys=True))
+        return 0
+    findings_path = _configured_store(cfg, args.store)
+    if not findings_path.is_file():
+        print(json.dumps({
+            "status": "NO_FINDINGS_STORE", "prepared": [],
+        }, sort_keys=True))
+        return 0
+    staging = _staging_store(cfg, staging_path)
+    # FindingsStore performs additive migrations on connect. A handoff
+    # command is a read/validate/export boundary, so run those reads against a
+    # transactionally consistent temporary SQLite backup and leave the
+    # authoritative evidence database byte-for-byte untouched.
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="staged-handoff-") as directory:
+            snapshot = Path(directory) / "findings.db"
+            uri = f"{findings_path.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as source, \
+                    closing(sqlite3.connect(snapshot)) as destination:
+                source.backup(destination)
+            store = findings_mod.FindingsStore(snapshot)
+            review = staged_review.review(
+                staging, store, scope_key=args.scope, retire=False,
+                policy=_lifecycle_policy(cfg))
+    except (OSError, sqlite3.Error) as exc:
+        print(json.dumps({
+            "status": "VALIDATION_FAILED", "prepared": [],
+            "error": f"could not snapshot persisted findings: {exc}",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+    # Evidence content, not the wall clock of this rendering command, owns
+    # the address. Unchanged evidence therefore maps to the same artifact.
+    review = {**review, "reviewed_ts": None}
+    requested = str(args.mechanism or "").strip() or None
+    supported = [
+        item for item in review.get("mechanisms", [])
+        if item.get("code") == staged_review.SUPPORTED
+        and (requested is None
+             or str(item.get("mechanism_id")) == requested)
+    ]
+    if requested is not None and not supported:
+        print(json.dumps({
+            "status": "VALIDATION_FAILED", "prepared": [],
+            "error": (f"mechanism {requested!r} is not SUPPORTED by the "
+                      "selected persisted evidence"),
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+    if not supported:
+        print(json.dumps({
+            "status": "NO_SUPPORTED_MECHANISMS", "prepared": [],
+        }, sort_keys=True))
+        return 0
+
+    rendered = []
+    try:
+        for mechanism in supported:
+            handoff = build_registration_handoff(
+                staging, review, str(mechanism["mechanism_id"]))
+            validate_registration_handoff(handoff)
+            rendered.append((handoff, render_registration_handoff(handoff)))
+    except HandoffError as exc:
+        print(json.dumps({
+            "status": "VALIDATION_FAILED", "prepared": [],
+            "error": str(exc),
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+    out = _configured_handoff_dir(cfg, args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    prepared = []
+    for handoff, content in rendered:
+        target = out / f"sha256-{handoff['content_sha256']}.json"
+        status = "CREATED"
+        if target.exists():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+                validate_registration_handoff(existing)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(json.dumps({
+                    "status": "VALIDATION_FAILED", "prepared": prepared,
+                    "error": f"existing handoff {target} is invalid: {exc}",
+                }, sort_keys=True), file=sys.stderr)
+                return 2
+            if existing != handoff:
+                print(json.dumps({
+                    "status": "VALIDATION_FAILED", "prepared": prepared,
+                    "error": f"content-address collision at {target}",
+                }, sort_keys=True), file=sys.stderr)
+                return 2
+            status = "EXISTING"
+        else:
+            temporary = target.with_name(
+                f".{target.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(target)
+        prepared.append({
+            "mechanism_id": handoff["mechanism_id"],
+            "handoff_id": handoff["handoff_id"],
+            "path": str(target),
+            "status": status,
+            "live_eligible": False,
+        })
+    print(json.dumps({
+        "status": "PREPARED", "prepared": prepared,
+        "registry_mutation_performed": False,
+        "code_mutation_performed": False,
+        "config_mutation_performed": False,
+    }, sort_keys=True))
     return 0
 
 
 def cmd_qualify_staged(args: argparse.Namespace) -> int:
     """Start isolated local PAPER for supported staged mechanisms only."""
-    from agent.staging import StagingStore
     from research import staged_review
 
     cfg = _load_config()
@@ -1636,7 +1883,7 @@ def cmd_qualify_staged(args: argparse.Namespace) -> int:
         return 0
 
     store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
-    staging = StagingStore(staging_path)
+    staging = _staging_store(cfg, staging_path)
     requested_scope = str(args.scope or "").strip() or None
     if requested_scope is not None and not requested_scope.endswith(":staged"):
         print("--scope must identify a staged shadow lane", file=sys.stderr)
@@ -1652,7 +1899,8 @@ def cmd_qualify_staged(args: argparse.Namespace) -> int:
     qualified, skipped, errors = [], [], []
     for scope in scopes:
         review = staged_review.review(
-            staging, store, scope_key=scope, retire=False)
+            staging, store, scope_key=scope, retire=False,
+            policy=_lifecycle_policy(cfg))
         for entry in review.get("verdicts", []):
             if entry.get("code") != staged_review.SUPPORTED:
                 skipped.append({
@@ -1877,6 +2125,20 @@ def build_parser() -> argparse.ArgumentParser:
     review_staged.add_argument("--dry-run", action="store_true",
                                help="report verdicts without retiring")
     review_staged.set_defaults(func=cmd_review_staged)
+
+    handoff = sub.add_parser(
+        "prepare-handoff",
+        help="write non-authorizing staged specs for explicit human review")
+    handoff.add_argument("--store", default=None, help="findings.db path")
+    handoff.add_argument("--staging", default=None, help="staging.db path")
+    handoff.add_argument("--scope", default=None,
+                         help="limit supporting evidence to one scope")
+    handoff.add_argument("--mechanism", default=None,
+                         help="one supported mechanism id; otherwise all")
+    handoff.add_argument(
+        "--out", default=None,
+        help="artifact directory; defaults to research.staging_handoff_dir")
+    handoff.set_defaults(func=cmd_prepare_handoff)
 
     qualify_staged = sub.add_parser(
         "qualify-staged",

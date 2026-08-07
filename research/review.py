@@ -432,11 +432,14 @@ class ResearchReviewLLM:
 
     def complete(self, request: dict) -> str:
         user = json.dumps(request, sort_keys=True, separators=(",", ":"))
+        system = str(getattr(self, "system_override", RESEARCH_REVIEW_SYSTEM))
+        effective_prompt_version = hashlib.sha256(
+            system.encode("utf-8")).hexdigest()[:16]
         if self.provider == "anthropic":
             kwargs = {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "system": RESEARCH_REVIEW_SYSTEM,
+                "system": system,
                 "messages": [{"role": "user", "content": user}],
             }
             if not self._no_temperature:
@@ -449,11 +452,12 @@ class ResearchReviewLLM:
             "model": self.model,
             "max_completion_tokens": self.max_tokens,
             "messages": [
-                {"role": "system", "content": RESEARCH_REVIEW_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
-            "prompt_cache_key": f"okx-research-review-{self.prompt_version}",
+            "prompt_cache_key": (
+                f"okx-research-review-{effective_prompt_version}"),
         }
         if not self._no_temperature:
             kwargs["temperature"] = 0.0

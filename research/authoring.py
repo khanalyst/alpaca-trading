@@ -21,13 +21,15 @@ content-addressed packet, which only a human signature produces.
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from pathlib import Path
 
 from agent.contract_dsl import (MAX_CONDITIONS, OBSERVABLE_FIELDS,
                                 SUPPORTED_PRIMITIVES,
                                 ContractProposalError, validate)
-from agent.staging import StagingError, StagingStore
+from agent.staging import (StagingCapacityError, StagingError,
+                           StagingNoveltyError, StagingStore)
 
 MAX_PER_GENERATION = 8
 MAX_RAW_RESPONSE_CHARS = 20_000
@@ -78,6 +80,11 @@ must name the observation that would end the claim, not an intention to look.\
 """
 
 
+def prompt_version() -> str:
+    """Content identity for the exact authoring instruction sent upstream."""
+    return hashlib.sha256(AUTHORING_SYSTEM.encode("utf-8")).hexdigest()[:16]
+
+
 def build_request(store: StagingStore, *, history: dict | None = None,
                   max_proposals: int = 4, findings_store=None,
                   evidence: dict | None = None) -> dict:
@@ -89,6 +96,19 @@ def build_request(store: StagingStore, *, history: dict | None = None,
     an immutable claim while preparing a prompt.
     """
     active = store.active()
+    try:
+        # A deterministic neighborhood is one mechanism, not three ideas.
+        # Showing every configuration to the proposer would make the prompt
+        # imply that threshold changes are novel mechanisms.
+        root_ids = {
+            str(row["contract_id"])
+            for row in store.records(active_only=True)
+            if row.get("parent_contract_id") is None
+        }
+        active = [contract for contract in active
+                  if contract.contract_id in root_ids]
+    except (AttributeError, TypeError):  # compatibility with small test doubles
+        pass
     if evidence is None:
         from .authoring_context import build_evidence_context
 
@@ -137,7 +157,7 @@ def parse_response(raw: str) -> tuple[list[dict], str]:
 
 
 def register_generation(store: StagingStore, proposals: list,
-                        *, generation: int,
+                        *, generation: int, refinement_policy=None,
                         now: float | None = None) -> dict:
     """Validate each proposal independently and keep the ones that hold.
 
@@ -149,12 +169,36 @@ def register_generation(store: StagingStore, proposals: list,
     accepted, rejected = [], []
     for index, proposal in enumerate(proposals[:MAX_PER_GENERATION]):
         try:
-            contract = store.register(proposal, generation=generation, now=now)
-        except (ContractProposalError, StagingError) as exc:
+            from .staged_refinement import stage_initial_neighborhood
+
+            family = stage_initial_neighborhood(
+                store, proposal, generation=generation,
+                policy=refinement_policy, now=now)
+            contract = store.contract(family["root_contract_id"])
+        except StagingNoveltyError as exc:
             rejected.append({
                 "index": index,
                 "contract_id": (proposal or {}).get("contract_id")
                 if isinstance(proposal, dict) else None,
+                "code": "NO_NOVEL_CANDIDATE",
+                "reason": str(exc),
+            })
+            continue
+        except StagingCapacityError as exc:
+            rejected.append({
+                "index": index,
+                "contract_id": (proposal or {}).get("contract_id")
+                if isinstance(proposal, dict) else None,
+                "code": "CAPACITY",
+                "reason": str(exc),
+            })
+            continue
+        except (ContractProposalError, StagingError, ValueError) as exc:
+            rejected.append({
+                "index": index,
+                "contract_id": (proposal or {}).get("contract_id")
+                if isinstance(proposal, dict) else None,
+                "code": "VALIDATION_FAILED",
                 "reason": str(exc),
             })
             continue
@@ -162,6 +206,9 @@ def register_generation(store: StagingStore, proposals: list,
             "contract_id": contract.contract_id,
             "direction": contract.direction,
             "conditions": contract.describe(),
+            "mechanism_id": family["mechanism_id"],
+            "registered_contract_ids": family["registered_contract_ids"],
+            "configuration_count": family["configuration_count"],
         })
     return {
         "generation": generation,
@@ -175,8 +222,11 @@ def register_generation(store: StagingStore, proposals: list,
 def author_generation(store: StagingStore, cfg: dict, *, author=None,
                       history: dict | None = None, max_proposals: int = 4,
                       findings_store=None, evidence: dict | None = None,
+                      refinement_policy=None,
                       now: float | None = None) -> dict:
-    """One authoring pass. Provider failure is recorded, never fatal."""
+    """One authoring pass with an immutable record for every model attempt."""
+    from .provenance import record_authoring_attempt
+
     generation = store.generation() + 1
     if findings_store is None:
         findings_store = _findings_store_from_config(cfg)
@@ -184,24 +234,104 @@ def author_generation(store: StagingStore, cfg: dict, *, author=None,
         store, history=history, max_proposals=max_proposals,
         findings_store=findings_store, evidence=evidence)
     raw = None
+    proposals: list = []
+    returned_contract_ids: list[str] = []
+    parser_status = "NOT_RUN"
+    validation_status = "NOT_RUN"
+    requested_ts = time.time() if now is None else float(now)
+    configured = (cfg or {}).get("llm") or {}
+    provider = str(getattr(author, "provider", None)
+                   or configured.get("provider") or "unknown")
+    model_id = str(getattr(author, "model", None)
+                   or configured.get("model") or "unknown")
+    author_prompt_version = str(
+        getattr(author, "prompt_version", None) or prompt_version())
+    error = None
     try:
         proposer = author or _default_author(cfg)
+        provider = str(getattr(proposer, "provider", provider))
+        model_id = str(getattr(proposer, "model", model_id))
+        author_prompt_version = str(
+            getattr(proposer, "prompt_version", None) or prompt_version())
         raw = proposer.complete(request)
         proposals, reasoning = parse_response(raw)
+        parser_status = "SUCCEEDED"
     except Exception as exc:  # noqa: BLE001 - a nightly pass must not abort
-        return {
+        parser_status = "FAILED" if raw is not None else "NOT_RUN"
+        error = f"{type(exc).__name__}: {exc}"
+        result = {
             "status": "FAILED",
             "generation": generation,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": error,
             "raw": (raw[:MAX_RAW_RESPONSE_CHARS] if isinstance(raw, str)
                     else None),
             "accepted_count": 0,
         }
-    result = register_generation(
-        store, proposals, generation=generation,
-        now=time.time() if now is None else now)
-    result["status"] = "AUTHORED" if result["accepted"] else "NOTHING_ACCEPTED"
-    result["reasoning"] = reasoning
+    else:
+        returned_contract_ids = [
+            str(proposal.get("contract_id"))
+            for proposal in proposals
+            if isinstance(proposal, dict) and proposal.get("contract_id")]
+        result = register_generation(
+            store, proposals, generation=generation,
+            refinement_policy=refinement_policy,
+            now=time.time() if now is None else now)
+        audit_rejections = list(result["rejected"])
+        audit_rejections.extend({
+            "index": index,
+            "contract_id": (proposal or {}).get("contract_id")
+            if isinstance(proposal, dict) else None,
+            "code": "VALIDATION_FAILED",
+            "reason": f"generation exceeds the {MAX_PER_GENERATION} proposal cap",
+        } for index, proposal in enumerate(
+            proposals[MAX_PER_GENERATION:], start=MAX_PER_GENERATION))
+        validation_failures = [
+            item for item in audit_rejections
+            if item.get("code") == "VALIDATION_FAILED"]
+        validation_status = (
+            "PARTIAL" if result["accepted"] and validation_failures else
+            "REJECTED" if validation_failures else "ACCEPTED")
+        if result["accepted"]:
+            result["status"] = "AUTHORED"
+        else:
+            rejection_codes = {
+                str(item.get("code")) for item in audit_rejections}
+            if (not proposals or
+                    (rejection_codes
+                     and rejection_codes <= {"NO_NOVEL_CANDIDATE"})):
+                result["status"] = "NO_NOVEL_CANDIDATE"
+            elif rejection_codes and rejection_codes <= {
+                    "NO_NOVEL_CANDIDATE", "CAPACITY"}:
+                result["status"] = "CAPACITY"
+            else:
+                result["status"] = "NOTHING_ACCEPTED"
+        result["reasoning"] = reasoning
+    if parser_status != "SUCCEEDED":
+        audit_rejections = []
+    attempt_error = error
+    if validation_status == "REJECTED" and attempt_error is None:
+        attempt_error = "no authored contract passed validation"
+    completed_ts = time.time() if now is None else float(now)
+    accepted_contract_ids = [
+        str(item["contract_id"]) for item in result.get("accepted", [])]
+    audit = record_authoring_attempt(
+        store.path, generation=generation, requested_ts=requested_ts,
+        completed_ts=completed_ts, provider=provider, model_id=model_id,
+        prompt_version=author_prompt_version,
+        request={"system": AUTHORING_SYSTEM, "user": request},
+        context={key: value for key, value in request.items()
+                 if key != "evidence"},
+        evidence=request.get("evidence"), raw_response=raw,
+        parser_status=parser_status, validation_status=validation_status,
+        error=attempt_error, returned_contract_ids=returned_contract_ids,
+        accepted_contract_ids=accepted_contract_ids,
+        rejections=audit_rejections, result=result,
+        status=("FAILED" if result["status"] in {
+            "FAILED", "NOTHING_ACCEPTED"} else "SUCCEEDED"))
+    result["attempt_id"] = audit["attempt_id"]
+    result["request_hash"] = audit["request_hash"]
+    result["context_hash"] = audit["context_hash"]
+    result["evidence_hash"] = audit["evidence_hash"]
     return result
 
 
@@ -231,6 +361,7 @@ def _default_author(cfg: dict):
     # Same provider adapter, different instruction. Reusing the client keeps
     # one place where credentials and model routing are resolved.
     proposer.system_override = AUTHORING_SYSTEM
+    proposer.prompt_version = prompt_version()
     return _SystemSwapped(proposer)
 
 
@@ -241,13 +372,7 @@ class _SystemSwapped:
         self.inner = inner
         self.provider = inner.provider
         self.model = inner.model
+        self.prompt_version = inner.prompt_version
 
     def complete(self, request: dict) -> str:
-        from . import review as review_mod
-
-        original = review_mod.RESEARCH_REVIEW_SYSTEM
-        review_mod.RESEARCH_REVIEW_SYSTEM = AUTHORING_SYSTEM
-        try:
-            return self.inner.complete(request)
-        finally:
-            review_mod.RESEARCH_REVIEW_SYSTEM = original
+        return self.inner.complete(request)

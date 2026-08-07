@@ -45,6 +45,7 @@ sys.path.insert(0, str(REPO / "research"))
 
 import yaml  # noqa: E402
 
+from agent.forward_models import BY_STRATEGY  # noqa: E402
 from agent.registry import REGISTRY, TIERS  # noqa: E402
 try:  # support both `python -m research.tournament` and legacy imports
     from . import gates as gate_mod  # noqa: E402
@@ -515,14 +516,29 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
             "registered_tier": spec.tier,
         }
 
+    effective_exit_policy = exit_policy
+    if spec.id in {"funding-carry", "funding-unwind"}:
+        model = BY_STRATEGY.get(spec.id)
+        if model is None or not model.contract_complete:
+            return {
+                "strategy_id": spec.id, "version": spec.version,
+                "scored": False,
+                "reason": ("funding tournament refused: no complete "
+                           "authoritative forward exit contract"),
+                "registered_tier": spec.tier,
+            }
+        effective_exit_policy = model.exit_policy
+
     for setting in settings:
         setting["results"] = gate_mod.run_all(
             spec, frames, membership, setting["contract"],
-            cost_name=cost_name, exit_policy=exit_policy, prereg=prereg)
+            cost_name=cost_name, exit_policy=effective_exit_policy,
+            prereg=prereg)
         setting["tier"], setting["why"] = gate_mod.tier_from_gates(
             setting["results"])
         setting["headline"] = gate_mod.headline(
-            frames, membership, setting["contract"], cost_name, exit_policy)
+            frames, membership, setting["contract"], cost_name,
+            effective_exit_policy)
 
     # The unit of decision is the hypothesis, not the parameterisation that
     # happened to be tried first.
@@ -571,6 +587,8 @@ def score_strategy(spec, frames, membership, cfg, cost_name: str,
         "hypotheses_tested": prereg.get("hypotheses_tested"),
         "mechanism": spec.mechanism,
         "falsification": spec.falsification,
+        "requested_exit_policy": exit_policy,
+        "exit_policy": effective_exit_policy,
         "headline": stats,
         # The registered point's gates, so the report's per-strategy gate table
         # keeps describing the parameterisation the register names.
@@ -864,7 +882,12 @@ def write_report(path: Path, payload: dict) -> None:
             continue
         lines += [f"## {row['strategy_id']}/{row['version']}", "",
                   f"**Measured tier: {row['measured_tier']}** - "
-                  f"{row['tier_reason']}", ""]
+                  f"{row['tier_reason']}", "",
+                  f"Executable exit policy: "
+                  f"`{row.get('exit_policy', payload['exit_policy'])}` "
+                  f"(run default requested "
+                  f"`{row.get('requested_exit_policy', payload['exit_policy'])}`).",
+                  ""]
         if row.get("beyond_exploratory_authority"):
             lines += [
                 f"> Registered {row['registered_tier']} is above this "

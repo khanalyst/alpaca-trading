@@ -10,6 +10,7 @@ tier the promotion path refuses to trade.
 
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from agent import registry as strategy_registry
@@ -223,7 +224,7 @@ class StagedContractsCannotReachCapitalTests(unittest.TestCase):
     def test_a_registered_claim_cannot_be_rewritten(self):
         self.store.register(proposal(), generation=0)
         import sqlite3
-        with sqlite3.connect(self.store.path) as conn:
+        with closing(sqlite3.connect(self.store.path)) as conn, conn:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
                     "UPDATE staged_contracts SET mechanism='something else' "

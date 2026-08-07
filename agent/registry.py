@@ -14,7 +14,7 @@ Three ideas are encoded here, and they are the point of the module:
 state both is not ready to be registered, let alone traded.
 
 **Confidence is evidenced, not asserted.** ``tier`` records how far a strategy
-has actually got through the evidence gates, from T0_REJECTED to T4_CONFIRMED.
+has actually progressed through qualification, from T0_REJECTED to T4_CONFIRMED.
 It is backed by persisted research, changed through review, read by policy,
 and never moved by a hunch or by an exploratory command editing code.
 
@@ -31,23 +31,23 @@ editing one line of config.
 this module currently rests on a *recomputed* backtest over downloaded OHLCV
 - ``research/edge_lab.py`` and its dependents - which reconstructs indicators
 after the fact rather than reading the snapshot the agent actually decided
-from. findings.md section 9.2 is explicit that this is a different system
-than the one you run: some snapshot fields come from the live 24h ticker and
-cannot be reconstructed, so a recomputed backtest silently mixes revised data
-with the original.
+from. ``research/AUTONOMOUS_RESEARCH.md`` is explicit that this is a different
+system than the one you run: some snapshot fields come from the live 24h ticker
+and cannot be reconstructed, so a recomputed backtest silently mixes revised
+data with the original.
 
 That does not make the evidence worthless, and the direction of the bias is
 against the strategy rather than for it, so a T0_REJECTED verdict is the
 conservative reading. It does mean the verdict is **exploratory and not yet
 confirmed by the faithful path**: the replay harness in ``research/replay.py``
 re-derives decisions from the recorded snapshot using the production contract
-and risk engine, and gate G2 requires it to reproduce the live agent's own
-decisions before any number downstream is trusted.
+and risk engine, and proposal fidelity requires it to reproduce the live
+agent's own decisions before any number downstream is trusted.
 
 The tier gate stays as it is. Keeping momentum away from live capital on
 exploratory evidence is the right way to be wrong. But a tier may only be
 *raised* on journal-replay evidence, never on a recomputed backtest. See
-``research/plan/RECONCILIATION.md``.
+``research/AUTONOMOUS_RESEARCH.md``.
 """
 
 from __future__ import annotations
@@ -251,8 +251,8 @@ REGISTRY: dict[str, StrategySpec] = {
                 "The T0 verdict rests on a recomputed OHLCV backtest, which "
                 "is exploratory evidence: it is enough to withhold capital "
                 "and not enough to raise a tier. Confirmation requires the "
-                "journal replay to pass gate G2 and the three-arm H-E test "
-                "to run - see research/plan/RECONCILIATION.md."),
+                "proposal-fidelity journal replay and three-arm analyst-effect "
+                "analysis - see research/AUTONOMOUS_RESEARCH.md."),
             evidence=("research/results/edge-audit-2024-2026/REPORT.md",),
             contract_params={
                 "breakout_range_threshold_pct": 85.0,

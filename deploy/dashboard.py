@@ -123,7 +123,7 @@ def _readiness(path: Path, config: dict) -> dict:
 def _findings(path: Path) -> dict:
     result = {
         "available": False, "assignments": [], "outcomes": [],
-        "backup": None,
+        "review_attempts": [], "backup": None,
     }
     if not path.is_file():
         return result
@@ -163,6 +163,15 @@ def _findings(path: Path) -> dict:
                     ORDER BY created_ts DESC LIMIT 50
                 """).fetchall()
                 result["outcomes"] = [dict(row) for row in rows]
+            if "experiment_review_attempts" in tables:
+                rows = connection.execute("""
+                    SELECT attempt_id, outcome_id, requested_ts, completed_ts,
+                           provider, model_id, prompt_version, parse_error,
+                           status
+                    FROM experiment_review_attempts
+                    ORDER BY completed_ts DESC, attempt_id DESC LIMIT 50
+                """).fetchall()
+                result["review_attempts"] = [dict(row) for row in rows]
             if {"backup_runs", "backup_run_events"} <= tables:
                 row = connection.execute("""
                     SELECT run.backup_id, run.started_ts, run.target_kind,
@@ -194,6 +203,40 @@ def _findings(path: Path) -> dict:
     return result
 
 
+def _authoring(path: Path) -> dict:
+    """Safe authoring audit projection; prompts and raw output stay in SQLite."""
+    result = {"available": False, "attempts": []}
+    if not path.is_file():
+        return result
+    try:
+        with _ro_connect(path) as connection:
+            if "authoring_attempts" not in _tables(connection):
+                return result
+            rows = connection.execute("""
+                SELECT attempt_id, generation, requested_ts, completed_ts,
+                       provider, model_id, prompt_version, request_hash,
+                       context_hash, evidence_hash, parser_status,
+                       validation_status, error, status,
+                       returned_contract_ids_json,
+                       accepted_contract_ids_json, rejections_json
+                FROM authoring_attempts
+                ORDER BY completed_ts DESC, attempt_id DESC LIMIT 50
+            """).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["returned_contract_ids"] = json.loads(
+                    item.pop("returned_contract_ids_json"))
+                item["accepted_contract_ids"] = json.loads(
+                    item.pop("accepted_contract_ids_json"))
+                item["rejection_count"] = len(json.loads(
+                    item.pop("rejections_json")))
+                result["attempts"].append(item)
+        result["available"] = True
+    except Exception as exc:                               # noqa: BLE001
+        result["reason"] = type(exc).__name__
+    return result
+
+
 def _reports(root: Path) -> list[dict]:
     candidates = set((root / "findings").glob("**/*.md"))
     candidates.update((root / "research" / "results").glob("**/REPORT.md"))
@@ -214,9 +257,15 @@ def _safe_heartbeat(path: Path) -> dict:
     allowed = {
         "schema", "status", "updated_ts", "pid", "runtime_mode", "run_id",
         "strategy_id", "strategy_version", "research_expected",
-        "research_available", "trading_state", "last_cycle_ts",
+        "research_available", "research_status", "research_failure_count",
+        "research_consecutive_failures", "research_last_failure",
+        "research_last_success_ts", "strategy_shadow_errors",
+        "trading_state", "last_cycle_ts",
         "last_cycle_error", "stop_reason", "next_run_ts", "last_run_date",
-        "last_exit_code", "started_ts", "completed_ts",
+        "last_exit_code", "started_ts", "completed_ts", "job_id",
+        "run_date", "timeout_seconds", "deadline_ts",
+        "structured_failures", "stdout_chars", "stderr_chars",
+        "stdout_truncated", "stderr_truncated",
     }
     return {key: value for key, value in raw.items() if key in allowed}
 
@@ -228,7 +277,16 @@ def snapshot(root: Path) -> dict:
     runtime = root / "runtime"
     journal = runtime / mode / "journal.db"
     recorder_path = runtime / "research" / "recorded"
-    findings_path = root / "research" / "cache" / "findings.db"
+    research_config = config.get("research") or {}
+
+    def configured_path(key: str, default: str) -> Path:
+        path = Path(research_config.get(key) or default)
+        return path if path.is_absolute() else root / path
+
+    findings_path = configured_path(
+        "findings_store", "research/cache/findings.db")
+    staging_path = configured_path(
+        "staging_store", "research/cache/staging.db")
     trader_heartbeat = runtime / mode / "heartbeat.json"
     research_heartbeat = runtime / "health" / "research.json"
     cycle_seconds = float(config.get("cycle", {}).get("interval_seconds") or 60)
@@ -265,6 +323,9 @@ def snapshot(root: Path) -> dict:
             f"performance:{journal}", 30, lambda: _performance(journal)),
         "research": _cached(
             f"findings:{findings_path}", 30, lambda: _findings(findings_path)),
+        "authoring": _cached(
+            f"authoring:{staging_path}", 30,
+            lambda: _authoring(staging_path)),
         "reports": _cached(
             f"reports:{root}", 30, lambda: _reports(root)),
     }
@@ -307,14 +368,17 @@ const good=x=>x?'ok':'bad'; const when=x=>x?new Date(x*1000).toISOString():'—'
 function table(parent,rows,cols){const t=el('table'),h=el('tr');cols.forEach(c=>h.append(el('th',c)));t.append(h);rows.forEach(r=>{const tr=el('tr');cols.forEach(c=>tr.append(el('td',String(r[c]??'—'))));t.append(tr)});parent.append(t)}
 async function showReport(path){const r=await fetch('/api/report?path='+encodeURIComponent(path));const j=await r.json();const p=card(path,true);p.append(el('pre',j.text||j.error||'unavailable'));p.scrollIntoView({behavior:'smooth'})}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
- let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'research feed','v'+d.research_feed_version);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'research attached',d.trader.heartbeat.research_available,good(d.trader.heartbeat.research_available));
- c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);
+ let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'research feed','v'+d.research_feed_version);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'research attached',d.trader.heartbeat.research_available,good(d.trader.heartbeat.research_available));row(c,'research state',d.trader.heartbeat.research_status,good(d.trader.heartbeat.research_status==='healthy'||d.trader.heartbeat.research_status==='disabled'));
+ c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
  c=card('Performance');row(c,'available',d.performance.available,good(d.performance.available));row(c,'round trips',d.performance.round_trips);row(c,'expectancy R',d.performance.overall?.expectancy_r);row(c,'total R',d.performance.overall?.total_r);row(c,'max drawdown R',d.performance.overall?.max_drawdown_r);
  c=card('Backup');const b=d.research.backup||{};row(c,'latest status',b.status||'none',good(b.status==='VERIFIED'));row(c,'target class',b.target_kind);row(c,'different device claimed',b.different_device_claimed);row(c,'off-host verified',b.off_host_verified,'warn');c.append(el('p',b.off_host_note||'No backup evidence yet.','muted'));
  c=card('Readiness',true);table(c,d.readiness.gates||[],['name','status','title','detail']);
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
  c=card('Experiment assignments',true);table(c,d.research.assignments||[],['strategy_id','candidate_variant_id','status','observed_count','minimum_observations','started_ts']);
  c=card('Outcomes',true);table(c,d.research.outcomes||[],['strategy_id','candidate_variant_id','verdict','terminal_status','created_ts']);
+ c=card('Per-strategy shadow errors',true);const se=d.trader.heartbeat.strategy_shadow_errors||{};table(c,Object.keys(se).map(k=>({strategy_id:k,...se[k]})),['strategy_id','type','error','consecutive_failures','ts']);
+ c=card('Authoring attempts',true);table(c,d.authoring.attempts||[],['generation','status','parser_status','validation_status','provider','model_id','accepted_contract_ids','rejection_count','completed_ts']);
+ c=card('Review attempts',true);table(c,d.research.review_attempts||[],['outcome_id','status','provider','model_id','parse_error','completed_ts']);
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}
 refresh();setInterval(refresh,30000);

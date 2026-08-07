@@ -108,6 +108,14 @@ def _resolve_staging_path(configured: str | Path | None) -> Path:
             else Path(__file__).resolve().parent.parent / path)
 
 
+def _staging_max_active(cfg: dict | None) -> int:
+    """Read the same validated staged-configuration budget as the CLI."""
+    from .staging import DEFAULT_MAX_ACTIVE
+
+    block = ((cfg or {}).get("research") or {})
+    return int(block.get("staging_max_active", DEFAULT_MAX_ACTIVE))
+
+
 def _model_for(strategy_id: str):
     """Resolve the outcome contract, including the staged harness.
 
@@ -322,6 +330,64 @@ class ShadowEvaluator:
         return self._rotation_candidates.get(
             assignment["candidate_variant_id"])
 
+    def _rotation_candidate_queue(self) -> list[dict]:
+        """Overlay durable, accepted selector requests on the local catalog.
+
+        Candidate descriptors are rebuilt from configuration on restart, while
+        selector requests live in the findings store.  Keeping ``selection_id``
+        only on an in-memory descriptor therefore loses the exact request at
+        the next process boundary.  Rehydrate it whenever a new assignment is
+        about to be chosen so the requested arm is both first in the batch and
+        linked to the assignment's terminal lifecycle.
+
+        Stores predating research selections retain their deterministic catalog
+        order.  Modern-store read failures are allowed to fail the research
+        lane closed rather than silently assigning a different arm.
+        """
+        candidates = [dict(item) for item in self._rotation_candidates.values()]
+        read_selections = getattr(self.store, "research_selections", None)
+        if not callable(read_selections):
+            return candidates
+        pending = sorted(
+            (item for item in read_selections(
+                self.scope_key, self._rotation_baseline.strategy_id)
+             if str(item.get("current_status") or "") == "ACCEPTED"
+             and item.get("resolved_variant_id")),
+            key=lambda item: (
+                float(item.get("requested_ts") or 0.0),
+                str(item.get("selection_id") or "")),
+        )
+        by_variant = {
+            str(item.get("variant_id") or ""): item for item in candidates}
+        read_events = getattr(self.store, "research_selection_events", None)
+        for selection in pending:
+            variant_id = str(selection["resolved_variant_id"])
+            descriptor = by_variant.get(variant_id)
+            if descriptor is None:
+                raise ValueError(
+                    "pending exact research selection references an "
+                    f"unavailable candidate: {variant_id}")
+            if descriptor.get("selection_id"):
+                continue
+            selection_id = str(selection["selection_id"])
+            descriptor.update({
+                "selection_id": selection_id,
+                # Explicit analyst selections precede untouched catalog arms.
+                "priority": -100,
+                "order_key": (
+                    f"{float(selection.get('requested_ts') or 0.0):020.6f}:"
+                    f"{selection_id}"),
+            })
+            if callable(read_events):
+                accepted = next((
+                    event for event in read_events(selection_id)
+                    if str(event.get("status") or "") == "ACCEPTED"), None)
+                retry_of = ((accepted or {}).get("detail") or {}).get(
+                    "retry_of_assignment_id")
+                if retry_of:
+                    descriptor["retry_of_assignment_id"] = str(retry_of)
+        return candidates
+
     def _refresh_rotation(self, timestamp: float) -> None:
         if not self._rotation_enabled:
             return
@@ -345,7 +411,7 @@ class ShadowEvaluator:
                 active_assignments = [assignment]
 
         if not active_assignments:
-            candidates = list(self._rotation_candidates.values())
+            candidates = self._rotation_candidate_queue()
             ensure_batch = getattr(self.store, "ensure_experiment_batch", None)
             if callable(ensure_batch):
                 static_candidates = [
@@ -2048,7 +2114,9 @@ class StrategyShadowCoordinator:
         try:
             from .staging import StagingStore
 
-            active_contracts = StagingStore(store_path).active()
+            active_contracts = StagingStore(
+                store_path,
+                max_active=_staging_max_active(self._staged_cfg)).active()
         except Exception as exc:                           # noqa: BLE001
             report["status"] = "error"
             report["errors"]["__store__"] = (
@@ -2550,10 +2618,17 @@ def build(
     if not evaluators:
         return None
     active_id = str(cfg["strategy"]["id"])
-    # Preserve analyst decisions in a sibling scope for learning history.
-    llm_evaluator = _build_strategy_evaluator(
-        _research_cfg(cfg, active_id), registry, ["*"],
-        scope_key=f"{resolved_scope}:llm", findings_store=findings_store)
+    # Preserve genuine analyst decisions in a sibling scope for learning
+    # history. Deterministic and shadow-only order paths never made an analyst
+    # decision, so manufacturing a ``:llm``/``recorded_llm`` lane for them
+    # would mislabel deterministic proposals as human-model evidence.
+    execution_mode = str(
+        (cfg.get("strategy") or {}).get("execution_mode") or "analyst")
+    llm_evaluator = None
+    if execution_mode == "analyst":
+        llm_evaluator = _build_strategy_evaluator(
+            _research_cfg(cfg, active_id), registry, ["*"],
+            scope_key=f"{resolved_scope}:llm", findings_store=findings_store)
     staged_evaluators, staged_contracts = _build_staged_lane(
         cfg, resolved_scope, findings_store)
     return StrategyShadowCoordinator(
@@ -2600,7 +2675,8 @@ def _build_staged_lane(cfg: dict, resolved_scope: str,
 
         if not path or not Path(path).is_file():
             return {}, []
-        contracts = StagingStore(path).active()
+        contracts = StagingStore(
+            path, max_active=_staging_max_active(cfg)).active()
     except Exception as exc:                               # noqa: BLE001
         log.warning("staged mechanisms unavailable: %s", exc)
         return {}, []

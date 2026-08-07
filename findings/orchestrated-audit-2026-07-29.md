@@ -1,10 +1,10 @@
 # Orchestrated strategy audit — 2026-07-29
 
-> **Historical snapshot.** This audit records the repository as reviewed on
-> July 29, 2026. Its older-schema and single-backup descriptions are retained as
-> historical findings, not current instructions. See `README.md` and
-> `OPERATIONS.md` for the schema-14 seven-strategy pipeline and versioned
-> verified backups.
+> **ARCHIVED / FROZEN REVIEW SNAPSHOT.** This audit records the repository as
+> reviewed on July 29, 2026. Its finding IDs, schema/feed descriptions, and
+> remediation states are historical evidence, not current instructions. Use
+> `README.md`, `OPERATIONS.md`, and `research/AUTONOMOUS_RESEARCH.md` for
+> current behavior.
 
 This is the missing consolidated record of the repository review performed on
 the isolated branch `codex/orchestrated-strategy-audit` in

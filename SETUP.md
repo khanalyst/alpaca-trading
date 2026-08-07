@@ -2,7 +2,9 @@
 
 This is the installation and deployment authority for the shipped demo
 configuration. Day-to-day research, backup, and recovery procedures are in
-[OPERATIONS.md](OPERATIONS.md).
+[OPERATIONS.md](OPERATIONS.md). The canonical autonomous lifecycle and its
+human authority boundaries are in
+[research/AUTONOMOUS_RESEARCH.md](research/AUTONOMOUS_RESEARCH.md).
 
 Current defaults are OKX `demo`, strategy `ls-ratio-fade/v1` in deterministic
 mode, LLM provider `openai`, and model/deployment identifier
@@ -12,9 +14,10 @@ Trade only; never enable Withdraw.
 
 ## 1. Mac/local setup
 
-Requirements: Python 3.12+, Git, an OKX demo account, a supported model key,
-and disk space for SQLite journals, recorder data, findings, tournament runs,
-and backups.
+Requirements: Python 3.12+, Git, an OKX demo account, and disk space for SQLite
+journals, recorder data, findings, tournament runs, and backups. A supported
+model key is needed for analyst execution and the independent research
+author/reviewer, but not to start the shipped deterministic trader.
 
 ```bash
 git clone <repository> okx-agent-crypto
@@ -25,7 +28,8 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Fill `.env` with the demo credentials and selected model key. For an
+Fill `.env` with the demo credentials. Add the selected model key when analyst
+execution or LLM-backed research authoring/review is required. For an
 OpenAI-compatible Azure AI Foundry endpoint, set the Azure key as
 `OPENAI_API_KEY` and add:
 
@@ -53,12 +57,13 @@ In another terminal:
 
 The configured `ls-ratio-fade/v1` strategy is unproven; demo use is an
 operations rehearsal and data-collection path, not a profitable-edge claim.
-`momentum/phase1-v3` is retained as the `T0_REJECTED` benchmark. G2 must pass
-before authoritative downstream research is trusted. G2 compares the full
+`momentum/phase1-v3` is retained as the `T0_REJECTED` benchmark. The
+proposal-fidelity replay must pass before authoritative downstream research is
+trusted. It compares the full
 canonical pre-risk proposal identity symmetrically with replay keys, requires
 a non-vacuous exact match, and fails closed on malformed, duplicate, missing,
 or extra identities. Outcome-resolution gaps remain diagnostics rather than
-proposal mismatches; G2 does not reproduce full contract or execution
+proposal mismatches; the check does not reproduce full contract or execution
 semantics. `INSUFFICIENT_SAMPLE` means collection is still open.
 
 ### Reviewed candidate demo startup
@@ -96,7 +101,7 @@ authorize live mode. The complete operating and rollback procedure is in
 | `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol-coding` |
 | `cycle.interval_seconds` | `60` seconds for marks, paper exits, housekeeping, and reconciliation |
 | `cycle.decision_interval_seconds` | `300` elapsed seconds (95% jitter tolerance); model decisions remain slower than safety/mark cycles |
-| `execution.maker_first_enabled` | `true` in shipped demo (B7.5); rejected in live mode |
+| `execution.maker_first_enabled` | `true` in shipped demo for measurement; rejected in live mode |
 | `execution.maker_first_wait_seconds` | `20` seconds before IOC fallback |
 | `research.shadow_enabled` | `true` |
 | `research.shadow_variants` | `[*]` |
@@ -105,7 +110,7 @@ authorize live mode. The complete operating and rollback procedure is in
 | `research.experiment_candidate_batch_size` | `4` pre-registered candidates per lane; hard cap `8` |
 | `research.findings_store` | `research/cache/findings.db` |
 | `research.collector` | Separate public-data recorder; up to 50 instruments and 4 workers |
-| `strategy.execution_mode` | `deterministic` (shipped): trades the named strategy's own forward contract with no LLM call. `analyst` makes one LLM call per decision cycle; `shadow_only` runs no order path at all, leaving the research lanes unchanged |
+| `strategy.execution_mode` | `deterministic` (shipped): trades the named strategy's own forward contract with no LLM client, preflight, decision call, or `:llm` lane. `analyst` makes one LLM call per decision cycle; `shadow_only` runs no order path at all, leaving the research lanes unchanged |
 | `research.staging_store` | `research/cache/staging.db`; machine-authored mechanisms, created by `research.py author` and absent until one is staged |
 | `research.forward_feed_version` | `8`; v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; three long-horizon models are offline-only; v1-v7 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane fork, and v7 the liquidation-flow and conditioning-axis fork |
 | `research.experiment_min_duration_days` | `10` |
@@ -133,6 +138,7 @@ The available exit policies are `fixed_rr`, `extended_rr`, and
 ./.venv/bin/python research.py review-staged --dry-run
 ./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop --no-review
+./.venv/bin/python research.py prepare-handoff
 ./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py report
 ./.venv/bin/python research.py backup
@@ -680,10 +686,27 @@ empty snapshot directory. The downloader refuses non-empty output, and the
 tournament accepts only an `okx-history-snapshot.v1` manifest whose exact file
 identities still match the directory.
 
-## 9. B7.5 boundary
+## 9. Maker-first entry boundary
 
-B7.5 is the maker-first order primitive, not the `scalp-maker` shadow strategy.
+The maker-first order primitive is not the `scalp-maker` shadow strategy.
 The shipped demo configuration enables it for measurement: validate its
 fill/cancel/timeout evidence before any live-mode consideration. Configuration
 validation rejects maker-first in live mode; exchange-only passive-order races
 are not proven by historical data.
+
+## 10. Staged registration handoff
+
+After paired staged evidence is supported, prepare the non-authorizing artifact
+for human implementation and registry review:
+
+```bash
+./.venv/bin/python research.py prepare-handoff \
+  --store research/cache/findings.db \
+  --staging research/cache/staging.db
+```
+
+The default output is a content-addressed JSON file under
+`research/results/staged-handoffs/`. It declares that no source, registry, or
+configuration mutation occurred and that the mechanism is not live-eligible.
+An operator reviews and implements/registers the contract separately; this
+command does not authorize demo or live trading.

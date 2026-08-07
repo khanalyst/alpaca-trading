@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,7 +77,8 @@ def _manifest_content_id(manifest: dict) -> str:
 
 
 def _sqlite_verification(path: Path) -> dict:
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+    with closing(sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True)) as conn:
         integrity_rows = [str(row[0]) for row in conn.execute(
             "PRAGMA integrity_check").fetchall()]
         foreign_keys = [list(row) for row in conn.execute(
@@ -92,10 +94,12 @@ def _sqlite_verification(path: Path) -> dict:
 def _online_sqlite_backup(source: Path, destination: Path) -> None:
     """Capture a WAL-consistent snapshot without copying live DB bytes."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(
-            f"file:{source}?mode=ro", uri=True, timeout=30) as source_conn:
-        with sqlite3.connect(destination, timeout=30) as destination_conn:
-            source_conn.backup(destination_conn)
+    with closing(sqlite3.connect(
+            f"file:{source}?mode=ro", uri=True,
+            timeout=30)) as source_conn, closing(sqlite3.connect(
+                destination, timeout=30)) as destination_conn:
+        source_conn.backup(destination_conn)
+        destination_conn.commit()
 
 
 def _looks_like_sqlite(path: Path) -> bool:

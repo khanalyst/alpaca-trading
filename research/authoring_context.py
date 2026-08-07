@@ -121,11 +121,13 @@ def _outcome_context(outcomes: list[dict]) -> tuple[list, list, list, list, list
         codes = _reason_codes(outcome)
         base = {
             "outcome_id": _text(outcome.get("outcome_id")),
+            "analysis_id": "",
             "scope_key": _text(outcome.get("scope_key")),
             "strategy_id": _text(outcome.get("strategy_id")),
             "variant_id": _text(outcome.get("candidate_variant_id")),
             "verdict": _text(outcome.get("verdict")),
             "reason_codes": codes,
+            "created_ts": _finite(outcome.get("created_ts")),
         }
         if codes and set(codes) & _NULL_CODES:
             nulls.append({
@@ -267,9 +269,87 @@ def _family_record(value: Mapping) -> dict:
     return result
 
 
+def _recency(item: Mapping) -> float:
+    for key in (
+            "created_ts", "retired_ts", "registered_ts", "updated_ts",
+            "event_ts", "ts"):
+        value = _finite(item.get(key))
+        if value is not None:
+            return value
+    return 0.0
+
+
+def _identity_key(item: Mapping) -> tuple[str, ...]:
+    return tuple(_text(item.get(key)) for key in (
+        "scope_key", "strategy_id", "variant_id", "outcome_id", "event_id",
+        "contract_id", "configuration_id", "dimension", "value"))
+
+
+def _representative_group(item: Mapping) -> tuple[str, ...]:
+    codes = item.get("reason_codes")
+    if isinstance(codes, list) and codes:
+        reason = _text(codes[0])
+    else:
+        reason = _text(item.get("code"))
+    return (
+        _text(item.get("verdict")) or _text(item.get("status")) or reason,
+        reason,
+        _text(item.get("strategy_id")),
+        _text(item.get("dimension")),
+    )
+
+
 def _cap_sorted(items: list[dict], limit: int) -> list[dict]:
-    return sorted(items, key=lambda item: tuple(
-        _text(item.get(key)) for key in ("scope_key", "variant_id", "outcome_id")))[:limit]
+    """Keep recent rows while round-robining distinct evidence classes."""
+    ordered = sorted(
+        items, key=lambda item: (-_recency(item), _identity_key(item)))
+    groups: dict[tuple[str, ...], list[dict]] = defaultdict(list)
+    for item in ordered:
+        groups[_representative_group(item)].append(item)
+    group_order = sorted(
+        groups, key=lambda key: (-_recency(groups[key][0]), key))
+    selected = []
+    offset = 0
+    while len(selected) < limit:
+        added = False
+        for key in group_order:
+            rows = groups[key]
+            if offset < len(rows):
+                selected.append(rows[offset])
+                added = True
+                if len(selected) >= limit:
+                    break
+        if not added:
+            break
+        offset += 1
+    return selected
+
+
+def _staged_history_context(history: Mapping | None) -> list[dict]:
+    """Surface both failed-market and untested-pipeline staged outcomes."""
+    rows = []
+    for category, key in (("negative", "falsified"),
+                          ("starved_or_inconclusive", "inconclusive")):
+        for item in (history or {}).get(key, []) or []:
+            if not isinstance(item, Mapping):
+                continue
+            reason = _text(item.get("reason") or item.get("explanation"))
+            code = _text(item.get("code"))
+            if not code and ":" in reason:
+                code = reason.split(":", 1)[0].strip()
+            rows.append({
+                "category": category,
+                "contract_id": _text(item.get("contract_id")),
+                "mechanism_id": _text(item.get("mechanism_id")),
+                "configuration_id": _text(item.get("configuration_id")),
+                "mechanism": _text(item.get("mechanism")),
+                "payer": _text(item.get("payer")),
+                "code": code,
+                "reason": reason,
+                "registered_ts": _finite(item.get("registered_ts")),
+                "retired_ts": _finite(item.get("retired_ts")),
+            })
+    return _cap_sorted(rows, MAX_CONTEXT_ROWS)
 
 
 def _paper_context(findings_store, scopes: list[str], variant_ids: list[str]):
@@ -581,9 +661,17 @@ def build_evidence_context(
     if supplied is None:
         supplied = (history or {}).get("evidence")
     if isinstance(supplied, Mapping):
-        return _bound_supplied(supplied)
+        result = _bound_supplied(supplied)
+        staged = _staged_history_context(history)
+        if staged:
+            result["staged_results"] = staged
+        return _bounded_value(_json_safe(result))
     if findings_store is None:
-        return {"schema": "authoring_evidence.v1", "source": "none"}
+        result = {"schema": "authoring_evidence.v1", "source": "none"}
+        staged = _staged_history_context(history)
+        if staged:
+            result["staged_results"] = staged
+        return _bounded_value(_json_safe(result))
 
     try:
         scopes = [str(value) for value in findings_store.paper_scopes()]
@@ -596,28 +684,45 @@ def build_evidence_context(
         outcomes = list(findings_store.experiment_outcomes(scope_key))
     except Exception:  # noqa: BLE001
         outcomes = []
-    outcomes = sorted(
-        (item for item in outcomes if isinstance(item, Mapping)),
-        key=lambda item: (_finite(item.get("created_ts")) or 0.0,
-                          _text(item.get("outcome_id"))))[-MAX_OUTCOMES:]
-
-    variant_ids = set()
+    outcome_rows = []
     for item in outcomes:
+        if not isinstance(item, Mapping):
+            continue
+        payload = item.get("payload") or {}
+        enriched = dict(item)
+        enriched["reason_codes"] = _reason_codes(item)
+        enriched["verdict"] = _text(item.get("verdict"))
+        # Keep classification fields outside the potentially large payload;
+        # the original immutable row remains available to downstream readers.
+        if isinstance(payload, Mapping):
+            enriched["payload"] = payload
+        outcome_rows.append(enriched)
+    outcomes = _cap_sorted(outcome_rows, MAX_OUTCOMES)
+
+    variant_ids_ordered = []
+
+    def add_variant(value):
+        if value:
+            variant_id = str(value)
+            if (not variant_id.endswith(".baseline")
+                    and variant_id not in variant_ids_ordered):
+                variant_ids_ordered.append(variant_id)
+
+    for item in sorted(outcomes, key=lambda row: (
+            -_recency(row), _identity_key(row))):
         for key in ("baseline_variant_id", "candidate_variant_id"):
-            if item.get(key):
-                variant_id = str(item[key])
-                if not variant_id.endswith(".baseline"):
-                    variant_ids.add(variant_id)
+            add_variant(item.get(key))
     try:
         registered = findings_store.variants()
     except Exception:  # noqa: BLE001
         registered = []
-    for row in registered or []:
+    registered_rows = sorted(
+        (row for row in (registered or []) if isinstance(row, Mapping)),
+        key=lambda row: (-_recency(row), _identity_key(row)))
+    for row in registered_rows:
         if isinstance(row, Mapping) and row.get("variant_id"):
-            variant_id = str(row["variant_id"])
-            if not variant_id.endswith(".baseline"):
-                variant_ids.add(variant_id)
-    variant_ids = sorted(variant_ids)[:MAX_VARIANTS]
+            add_variant(row["variant_id"])
+    variant_ids = variant_ids_ordered[:MAX_VARIANTS]
 
     rates, conditional = _paper_context(findings_store, scopes, variant_ids)
     fallback_rates, fallback_conditional = _outcome_paper_context(outcomes)
@@ -650,6 +755,9 @@ def build_evidence_context(
         "segment_context": segments,
         "family_context": _cap_sorted(family, MAX_CONTEXT_ROWS),
     }
+    staged = _staged_history_context(history)
+    if staged:
+        result["staged_results"] = staged
     if feature_context:
         result["feature_context"] = feature_context
     if regime_context:
@@ -686,7 +794,8 @@ def _bound_supplied(value: Mapping) -> dict:
             ("segment_context", MAX_CONTEXT_ROWS),
             ("family_context", MAX_CONTEXT_ROWS),
             ("feature_context", MAX_CONTEXT_ROWS),
-            ("regime_context", MAX_CONTEXT_ROWS)):
+            ("regime_context", MAX_CONTEXT_ROWS),
+            ("staged_results", MAX_CONTEXT_ROWS)):
         rows = result.get(key)
         if isinstance(rows, list):
             result[key] = _cap_sorted(

@@ -4,6 +4,9 @@ The current research system has three related but separate paths. Executable
 code and `config.yaml` are authoritative; this guide is the compact research
 orientation. Installation belongs to [`../SETUP.md`](../SETUP.md), and
 operation belongs to [`../OPERATIONS.md`](../OPERATIONS.md).
+The canonical authority chain, contract/economics fidelity, bounded authoring,
+handoff, scheduler, demo, and live-approval boundaries are in
+[`AUTONOMOUS_RESEARCH.md`](AUTONOMOUS_RESEARCH.md).
 
 ## Realtime four-lane experiments
 
@@ -25,8 +28,10 @@ ten elapsed days and 100 comparable paired observations.
 At shipped configuration, these four lanes can produce up to twenty
 deterministic comparison arms (one baseline plus four candidates per lane).
 The hard cap permits up to thirty-six deterministic arms if every lane uses
-eight candidates. The separate `:llm` sibling remains a distinct,
-non-comparable population.
+eight candidates. The shipped deterministic runtime creates no `:llm` sibling.
+Analyst mode may retain genuine analyst decisions in a distinct,
+non-comparable population; deterministic proposals are never relabeled as
+analyst evidence.
 
 The LLM can submit one bounded research-only selection per decision context.
 Invalid selections and their reasons persist. Accepted selections queue and
@@ -41,12 +46,13 @@ creates no variant or selection, changes no configuration, tier, portfolio, or
 order authority, and must be manually reviewed and registered in a later code
 change before research can use it.
 
-The active simulator scope is `forward_feed_version: 8`. Feed v8 makes the
-four realtime lanes deterministic; the three long-horizon models remain
-offline-only. The active analyst's actual choices remain in a sibling `:llm`
-scope for planner history and are never pooled with lane comparisons. Feeds
-v1-v7 remain historical (v4 is the market-data plumbing repair feed and v5 the
-immutable-provenance fork).
+The active simulator scope is `forward_feed_version: 8`. Feed v8 retains the
+four deterministic realtime lanes and repairs depth-ladder delivery across the
+wider 25-instrument universe; the three long-horizon models remain offline-only.
+Analyst mode may retain its actual choices in a sibling `:llm` scope for planner
+history; the shipped deterministic mode does not create that lane. Such choices
+are never pooled with lane comparisons. Feeds v1-v7 remain historical and are
+not pooled into feed v8.
 
 Staged mechanisms are a separate population. They arrive either from
 `research.py author`, which proposes from what the evidence has killed, or
@@ -98,7 +104,7 @@ held-out confirmation, and family-level multiple-testing correction.
 ## Authoritative journal path
 
 The journal contains the snapshots and decision ledger the agent actually
-used. Replay/G2 compares the full canonical pre-risk proposal identity (cycle,
+used. The proposal-fidelity replay compares the full canonical pre-risk proposal identity (cycle,
 symbol, direction, setup identity/type, signal timestamp, strategy version, and
 baseline variant) symmetrically with replay keys and requires a non-vacuous
 exact match before downstream authoritative evidence is trusted. Malformed,
@@ -114,6 +120,11 @@ cluster-delta sign-exchangeability/symmetric-null assumption.
 closed unless persisted edge evidence and every non-manual T3 check validate.
 It creates only an immutable/content-addressed draft: it cannot complete manual
 review, edit registry/configuration, or enable live trading.
+
+`research.py prepare-handoff` is the earlier boundary for supported staged
+mechanisms: it writes a content-addressed, explicitly non-authorizing proposal
+for human implementation/registry review. It does not create a reviewed packet,
+mutate code, or authorize demo/live orders.
 
 ## Exploratory tournament path
 
@@ -154,6 +165,7 @@ research workflow, and is never a current runtime or findings-store input.
 ./.venv/bin/python research.py staged
 ./.venv/bin/python research.py review-staged --dry-run
 ./.venv/bin/python research.py qualify-staged
+./.venv/bin/python research.py prepare-handoff
 ./.venv/bin/python research.py shortlist
 ./.venv/bin/python research.py research-loop
 ./.venv/bin/python research.py research-loop --no-review
@@ -163,6 +175,12 @@ research workflow, and is never a current runtime or findings-store input.
 ./.venv/bin/python research.py backup
 ./.venv/bin/python research.py backup --target <mounted-directory> --require-external
 ./.venv/bin/python research.py verify-backup <backup-directory>
+
+./.venv/bin/python -m research.evidence_cli verify-package \
+  <evidence-package> --code-root . --config config.yaml
+./.venv/bin/python -m research.evidence_cli verify-golden \
+  tests/fixtures/evidence/golden_replay_synthetic.json \
+  tests/fixtures/evidence/golden_replay_expected.json
 ```
 
 Backups are versioned, checksummed, immediately verified, and never pruned by

@@ -852,7 +852,10 @@ def code_fingerprint() -> str:
     """Hash trading-runtime sources without depending on git metadata."""
     root = Path(__file__).resolve().parent.parent
     digest = hashlib.sha256()
-    files = sorted((root / "agent").glob("*.py"))
+    # Contracts are executable paper-trading inputs too.  Recursive discovery
+    # keeps their package modules (and any future nested forward-model helpers)
+    # inside the same provenance boundary as the top-level runtime modules.
+    files = sorted((root / "agent").rglob("*.py"))
     if (root / "main.py").exists():
         files.append(root / "main.py")
     for path in files:

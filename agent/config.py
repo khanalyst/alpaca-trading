@@ -537,6 +537,8 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                          # separate append-only store so a proposed claim can
                          # never be confused with a hand-registered one.
                          "staging_store",
+                         "staging_handoff_dir", "staging_max_active",
+                         "staging_lifecycle", "staging_refinement",
                          "paper_initial_balance_usdt",
                          "paper_max_failures", "paper_min_closed_trades",
                          "experiment_min_duration_days",
@@ -614,6 +616,74 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         if "forward_feed_version" in research:
             _integer(research, "forward_feed_version", 1, 1_000,
                      "research")
+        if "staging_max_active" in research:
+            _integer(research, "staging_max_active", 1, 256, "research")
+        else:
+            # Keep every staging-store caller on one explicit validated
+            # budget, including configs written before bounded staging.
+            research["staging_max_active"] = 32
+        lifecycle = research.get("staging_lifecycle")
+        if lifecycle is None:
+            lifecycle = {}
+        else:
+            lifecycle = _mapping(lifecycle, "research.staging_lifecycle")
+        _keys(lifecycle, {
+            "never_fired_decisions", "never_fired_max_age_hours",
+            "no_observation_max_age_hours", "starved_max_age_hours",
+            "starved_fraction",
+        }, "research.staging_lifecycle")
+        lifecycle.setdefault("never_fired_decisions", 2_000)
+        lifecycle.setdefault("never_fired_max_age_hours", 7 * 24)
+        lifecycle.setdefault("no_observation_max_age_hours", 3 * 24)
+        lifecycle.setdefault("starved_max_age_hours", 3 * 24)
+        lifecycle.setdefault("starved_fraction", 0.5)
+        _integer(lifecycle, "never_fired_decisions", 1, 10_000_000,
+                 "research.staging_lifecycle")
+        for key in ("never_fired_max_age_hours",
+                    "no_observation_max_age_hours",
+                    "starved_max_age_hours"):
+            _number(lifecycle, key, 1, 365 * 24,
+                    "research.staging_lifecycle")
+        _number(lifecycle, "starved_fraction", 0.01, 1,
+                "research.staging_lifecycle")
+        research["staging_lifecycle"] = lifecycle
+
+        refinement = research.get("staging_refinement")
+        if refinement is None:
+            refinement = {}
+        else:
+            refinement = _mapping(
+                refinement, "research.staging_refinement")
+        _keys(refinement, {
+            "max_attempts", "max_variants_per_attempt",
+            "max_configurations_per_mechanism", "relative_step",
+        }, "research.staging_refinement")
+        # One retry of at most two one-dimensional neighbours is the shipped
+        # ceiling. Operators may turn it off, but cannot configure a grid.
+        refinement.setdefault("max_attempts", 1)
+        refinement.setdefault("max_variants_per_attempt", 2)
+        refinement.setdefault("max_configurations_per_mechanism", 5)
+        refinement.setdefault("relative_step", 0.10)
+        _integer(refinement, "max_attempts", 0, 2,
+                 "research.staging_refinement")
+        _integer(refinement, "max_variants_per_attempt", 1, 2,
+                 "research.staging_refinement")
+        _integer(refinement, "max_configurations_per_mechanism", 1, 16,
+                 "research.staging_refinement")
+        _number(refinement, "relative_step", 0.001, 0.5,
+                "research.staging_refinement")
+        if (refinement["max_configurations_per_mechanism"]
+                < 1 + refinement["max_variants_per_attempt"]):
+            raise ConfigError(
+                "research.staging_refinement."
+                "max_configurations_per_mechanism must cover the root plus "
+                "max_variants_per_attempt")
+        if (research["staging_max_active"]
+                < 1 + refinement["max_variants_per_attempt"]):
+            raise ConfigError(
+                "research.staging_max_active must cover one initial "
+                "configuration neighborhood")
+        research["staging_refinement"] = refinement
         findings_store = research.get("findings_store")
         if findings_store is not None and (
                 not isinstance(findings_store, str)
@@ -624,6 +694,12 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                 not isinstance(backup_target, str)
                 or not backup_target.strip()):
             raise ConfigError("research.backup_target must be a path string")
+        handoff_dir = research.get("staging_handoff_dir")
+        if handoff_dir is not None and (
+                not isinstance(handoff_dir, str)
+                or not handoff_dir.strip()):
+            raise ConfigError(
+                "research.staging_handoff_dir must be a path string")
         for key in ("shadow_variants",):
             names = research.get(key)
             if names is None:

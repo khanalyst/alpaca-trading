@@ -178,7 +178,8 @@ def beat_nulls(frames, membership, contract, cost_name: str = "base",
 
 
 def survive_costs(frames, membership, contract,
-                  exit_policy: str = "fixed_rr") -> GateResult:
+                  exit_policy: str = "fixed_rr",
+                  cost_name: str = "base") -> GateResult:
     """Gate 2. Report the breakeven cost, not the net at one assumption.
 
     Round-trip taker is 0.10% before spread, and measured gross spreads in
@@ -187,30 +188,52 @@ def survive_costs(frames, membership, contract,
     much cost the edge can absorb before it dies.
     """
     results = {}
-    for name in ("frictionless", "optimistic", "base", "realistic_alt",
-                 "stress"):
+    scenarios = list(dict.fromkeys((
+        "frictionless", "optimistic", "base", cost_name,
+        "realistic_alt", "stress")))
+    for name in scenarios:
         trades = non_overlapping(
             build_trades(frames, membership, contract, COST_SCENARIOS[name],
                          exit_policy=exit_policy))
         results[name] = _expectancy(trades)
 
-    gross = results.get("frictionless", float("nan"))
-    # Round-trip cost actually charged by the base scenario, in percent.
-    base = COST_SCENARIOS["base"]
-    base_cost = 2 * base.fee_per_side + base.entry_slippage + base.exit_slippage
+    # Use the exact same explicit economics as the headline evaluation.  The
+    # historical implementation silently judged survival at cheaper ``base``
+    # costs while the report headline used the account's taker rate.
+    headline_costs = COST_SCENARIOS[cost_name]
+    execution_free = Costs(
+        "execution_frictionless_same_funding", fee_per_side=0.0,
+        entry_slippage=0.0, exit_slippage=0.0, stop_slippage=0.0,
+        include_funding=headline_costs.include_funding,
+        funding_model=headline_costs.funding_model)
+    execution_free_trades = non_overlapping(build_trades(
+        frames, membership, contract, execution_free,
+        exit_policy=exit_policy))
+    gross = _expectancy(execution_free_trades)
+    results[execution_free.name] = gross
+    round_trip_cost = (2 * headline_costs.fee_per_side
+                       + headline_costs.entry_slippage
+                       + headline_costs.exit_slippage)
     breakeven = gross if _finite(gross) else float("nan")
-    passed = (_finite(results.get("base", float("nan")))
-              and results["base"] > 0
-              and _finite(breakeven) and breakeven > 2 * base_cost)
+    headline_net = results.get(cost_name, float("nan"))
+    passed = (_finite(headline_net) and headline_net > 0
+              and _finite(breakeven)
+              and breakeven > 2 * round_trip_cost)
     return GateResult(
         "survive_costs", passed,
-        (f"net {results['base']:+.4f}% at base costs, breakeven cost "
-         f"{breakeven:.4f}% vs {base_cost:.2f}% charged"
-         if _finite(results.get("base", float("nan")))
-         else "no trades at base costs"),
+        (f"net {headline_net:+.4f}% at {cost_name} costs, breakeven cost "
+         f"{breakeven:.4f}% vs {round_trip_cost:.2f}% charged"
+         if _finite(headline_net)
+         else f"no trades at {cost_name} costs"),
         {"expectancy_pct_by_scenario": results,
          "breakeven_cost_pct": breakeven,
-         "base_round_trip_cost_pct": base_cost,
+         "headline_cost_scenario": cost_name,
+         "headline_fee_per_side_pct": headline_costs.fee_per_side,
+         "headline_entry_slippage_pct": headline_costs.entry_slippage,
+         "headline_exit_slippage_pct": headline_costs.exit_slippage,
+         "headline_stop_slippage_pct": headline_costs.stop_slippage,
+         "headline_round_trip_cost_pct": round_trip_cost,
+         "breakeven_preserves_headline_funding": True,
          "required_headroom_x": 2.0},
     )
 
@@ -598,7 +621,8 @@ def run_all(spec, frames, membership, contract,
                               exit_policy))
     results.append(survive_oos(frames, membership, contract, cost_name,
                                exit_policy))
-    results.append(survive_costs(frames, membership, contract, exit_policy))
+    results.append(survive_costs(
+        frames, membership, contract, exit_policy, cost_name=cost_name))
     results.append(survive_placebo(frames, membership, contract, cost_name,
                                    exit_policy))
     results.append(mechanism_is_the_source(frames, membership, contract,

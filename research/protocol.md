@@ -31,7 +31,7 @@ amendment, it is a result being negotiated.
 | Date | Amendment | Reason |
 | --- | --- | --- |
 | 2026-07-30 | **Criterion 10 added**: a Holm correction across every axis evaluated in one qualification run. **Criterion 5 reclassified** as a selection screen rather than an independent test. | The correction existed only for conditioning cells, so the path that actually qualifies an edge corrected nothing while this document claimed the corrected figure was the only quotable one. Five axes are registered and the count grows with the registry. No variant had forward evidence at the time, so nothing was pending on either criterion. |
-| 2026-07-31 | **Real-time rotation outcomes documented separately.** Every strategy now keeps one baseline and at most one candidate; inadequacy is checked before performance and terminal outcomes are immutable. | The previous text said every setting ran continuously, which no longer matched the durable per-strategy rotation or the closed learning loop. |
+| 2026-07-31 | **Real-time rotation outcomes documented separately.** The initial durable design paired a stable baseline with a serial candidate assignment; inadequacy was checked before performance and terminal outcomes became immutable. | The previous text said every setting ran continuously. The 2026-08-06 amendment below superseded serial assignment with bounded batches. |
 | 2026-07-31 | **Forward qualification now reconstructs every setting from all eligible completed assignment attempts and its own contemporaneous baseline. Axis correction uses a calibrated paired six-hour-cluster sign-flip p-value.** | A common latest-ledger watermark erased earlier serial settings, and interval geometry is not a p-value. Existing v2 analyses remain readable but cannot authorize a new qualification. |
 | 2026-08-06 | **Real-time rotation now runs one shared baseline with a bounded pre-registered candidate batch per strategy (four shipped, hard cap eight); each assignment still tests one setting.** | Priority 1 increases discovery throughput without mixing adaptive selections into a static family or changing the downstream family-correction and held-out gates. |
 
@@ -307,9 +307,10 @@ The current realtime path is one shared baseline plus a bounded candidate batch
 for each realtime strategy, not every setting at once. Four strategy evaluators
 advance on every available shared snapshot using deterministic contracts and no
 per-strategy LLM calls. The three long-horizon registered models are offline-
-only. The active momentum analyst's actual choices are retained in a separate
-`:llm` scope. Packet computation may run concurrently, while durable writes
-remain serialized.
+only. The shipped deterministic runtime creates no `:llm` scope. Analyst mode
+may retain its genuine choices in a separate, non-comparable scope; those rows
+are planner history rather than qualification evidence. Packet computation may
+run concurrently, while durable writes remain serialized.
 
 The model decision throttle is elapsed-time based: with
 `cycle.decision_interval_seconds: 300`, the engine waits for at least 95% of
@@ -329,13 +330,13 @@ setting uses all eligible completed assignment windows and the baseline from
 those same windows; an operational failure invalidates its assignment evidence
 rather than becoming missing data.
 
-Gate G2 is narrower than risk or execution validation: replay compares the
+The proposal-fidelity replay is narrower than risk or execution validation: it compares the
 full canonical pre-risk proposal identity (cycle, symbol, direction, setup
 identity/type, signal timestamp, strategy version, and baseline variant)
 symmetrically with replay keys. It requires a non-vacuous exact match and
 fails closed on malformed, duplicate, missing, or extra identities. Outcome
 resolution gaps remain diagnostics rather than proposal mismatches. A failed,
-stale, or vacuous G2 blocks treating journal-derived evidence as authoritative.
+stale, or vacuous result blocks treating journal-derived evidence as authoritative.
 
 Forward qualification proves one strategy version and one declared axis,
 verifies identical non-axis executable inputs, persists family correction, and
@@ -343,7 +344,7 @@ recomputes claims from embedded source evidence. A qualifying result can begin
 a clean isolated local PAPER account only when flat.
 
 PAPER success still does not edit the strategy registry. `research.py
-t3-packet` builds an immutable SHA-256-addressed review bundle containing G2,
+`t3-packet` builds an immutable SHA-256-addressed review bundle containing proposal fidelity,
 configuration/code/corpus provenance, held-out forward evidence, and the paper
 result. Neither a packet nor any other research artifact automatically changes
 the configured strategy, registry tier, account mode, risk, or capital.

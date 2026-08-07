@@ -1,14 +1,15 @@
 # Main repository review — 2026-07-30
 
-> **Historical snapshot.** This document preserves the code and evidence state
-> observed on July 30, 2026. Statements about the then-current schema, missing variants, or
-> partially implemented items are not current operating claims. The reconciled
-> implementation is schema 16 and is documented in `README.md`,
-> `OPERATIONS.md`, and `MAIN_REPO_REVIEW_PLAN.md`.
+> **ARCHIVED / FROZEN REVIEW SNAPSHOT.** This document preserves the code and
+> evidence state observed on July 30, 2026. Review labels, gate names,
+> schema/feed claims, and follow-up items below are not a current checklist.
+> Use `README.md`, `OPERATIONS.md`, and
+> `research/AUTONOMOUS_RESEARCH.md` for current behavior.
 
-> Preserved detailed review record. The current implementation status is
-> maintained in [`../MAIN_REPO_REVIEW_PLAN.md`](../MAIN_REPO_REVIEW_PLAN.md);
-> this document retains the full findings and reasoning behind that plan.
+> Preserved detailed review record. Current implementation status and authority
+> boundaries are maintained in
+> [`../research/AUTONOMOUS_RESEARCH.md`](../research/AUTONOMOUS_RESEARCH.md);
+> this document retains the historical findings and reasoning.
 
 Reviewed at `4791dda` against four requirements. The status notes below also
 include subsequent changes now present on `main`.

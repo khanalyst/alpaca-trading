@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,18 +53,22 @@ def _connect(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS bars ("
-        "symbol TEXT, day TEXT, ts INTEGER, open REAL, high REAL, "
-        "low REAL, close REAL, volume REAL, "
-        "PRIMARY KEY (symbol, ts))")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS fetched ("
-        "symbol TEXT, day TEXT, fetched_ts REAL, bars INTEGER, "
-        "PRIMARY KEY (symbol, day))")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS bars_symbol_ts ON bars (symbol, ts)")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bars ("
+            "symbol TEXT, day TEXT, ts INTEGER, open REAL, high REAL, "
+            "low REAL, close REAL, volume REAL, "
+            "PRIMARY KEY (symbol, ts))")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fetched ("
+            "symbol TEXT, day TEXT, fetched_ts REAL, bars INTEGER, "
+            "PRIMARY KEY (symbol, day))")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS bars_symbol_ts ON bars (symbol, ts)")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -74,10 +79,15 @@ class PriceCache:
         self.path = Path(path)
         self.fetcher = fetcher
         self.network_calls = 0
+        # Avoid hammering a known-empty endpoint repeatedly within one run,
+        # without persisting the false claim that an empty day is complete.
+        self._attempted_empty_ranges: set[
+            tuple[str, str, int, int]
+        ] = set()
 
     def bars(self, symbol: str, start_ms: int, end_ms: int) -> list[Bar]:
         """Bars with ``start_ms <= ts < end_ms``, ascending, from cache only."""
-        with _connect(self.path) as conn:
+        with closing(_connect(self.path)) as conn, conn:
             rows = conn.execute(
                 "SELECT ts, open, high, low, close, volume FROM bars "
                 "WHERE symbol=? AND ts>=? AND ts<? ORDER BY ts ASC",
@@ -85,11 +95,23 @@ class PriceCache:
         return [Bar(int(r[0]), *(float(v) for v in r[1:])) for r in rows]
 
     def has_day(self, symbol: str, day: str) -> bool:
-        with _connect(self.path) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM fetched WHERE symbol=? AND day=?",
-                (symbol, day)).fetchone()
-        return row is not None
+        day_start = int(datetime.strptime(day, "%Y-%m-%d")
+                        .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        return self.covers(symbol, day_start, day_start + DAY_MS)
+
+    def covers(self, symbol: str, start_ms: int, end_ms: int) -> bool:
+        """Whether every requested one-minute bar exists without a gap."""
+        start = int(start_ms)
+        end = int(end_ms)
+        first = ((start + MINUTE_MS - 1) // MINUTE_MS) * MINUTE_MS
+        if first >= end:
+            return True
+        expected = list(range(first, end, MINUTE_MS))
+        with closing(_connect(self.path)) as conn, conn:
+            rows = conn.execute(
+                "SELECT ts FROM bars WHERE symbol=? AND ts>=? AND ts<? "
+                "ORDER BY ts ASC", (symbol, first, end)).fetchall()
+        return [int(row[0]) for row in rows] == expected
 
     def days_covering(self, start_ms: int, end_ms: int) -> list[str]:
         out, cursor = [], int(start_ms) - (int(start_ms) % DAY_MS)
@@ -113,7 +135,7 @@ class PriceCache:
                       bar.volume))
             rows.append((symbol, day, int(ts), float(o), float(h),
                          float(low), float(c), float(v)))
-        with _connect(self.path) as conn:
+        with closing(_connect(self.path)) as conn, conn:
             conn.executemany(
                 "INSERT OR IGNORE INTO bars "
                 "(symbol, day, ts, open, high, low, close, volume) "
@@ -134,15 +156,28 @@ class PriceCache:
         for day in self.days_covering(start_ms, end_ms):
             if self.has_day(symbol, day):
                 continue
+            day_start = int(datetime.strptime(day, "%Y-%m-%d")
+                            .replace(tzinfo=timezone.utc).timestamp() * 1000)
+            requested_start = max(int(start_ms), day_start)
+            requested_end = min(int(end_ms), day_start + DAY_MS)
+            if (requested_start < requested_end
+                    and self.covers(symbol, requested_start, requested_end)):
+                continue
+            attempt_key = (
+                str(symbol), day, requested_start, requested_end)
+            if attempt_key in self._attempted_empty_ranges:
+                continue
             if self.fetcher is None:
                 raise RuntimeError(
                     f"{symbol} {day} is not cached and no fetcher was given. "
                     "Research runs offline by default; pass a fetcher "
                     "explicitly to allow network access.")
-            day_start = int(datetime.strptime(day, "%Y-%m-%d")
-                            .replace(tzinfo=timezone.utc).timestamp() * 1000)
             bars = self.fetcher(symbol, day_start, day_start + DAY_MS)
             self.network_calls += 1
+            if bars:
+                self._attempted_empty_ranges.discard(attempt_key)
+            else:
+                self._attempted_empty_ranges.add(attempt_key)
             self.store(symbol, day, bars or [])
             fetched += 1
         return fetched

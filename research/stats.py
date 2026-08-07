@@ -22,6 +22,8 @@ from dataclasses import dataclass
 INSUFFICIENT_SAMPLE = "INSUFFICIENT_SAMPLE"
 PAIRED_SIGN_FLIP_NULL_ASSUMPTION = (
     "cluster_delta_sign_exchangeability_under_symmetric_null")
+CLUSTER_SIGN_FLIP_NULL_ASSUMPTION = (
+    "cluster_return_sign_exchangeability_under_symmetric_null")
 
 
 @dataclass(frozen=True)
@@ -243,6 +245,71 @@ def paired_cluster_sign_flip(
         "resamples": resamples, "seed": int(seed),
         "p_value": (extreme + 1) / (resamples + 1),
     }
+
+
+def clustered_sign_flip_mean(
+        values: list, cluster_ids: list, *, exact_max_clusters: int = 16,
+        iterations: int = 20_000, seed: int = 20260728) -> dict:
+    """One-sided sign-flip test for a mean with dependent observations.
+
+    Observations sharing ``cluster_id`` receive one sign.  The test therefore
+    treats a market regime/month as the resampling unit instead of pretending
+    that every overlapping trade is independent.  It is used by the offline
+    tournament, whose confidence intervals already use the same clusters.
+    """
+    grouped: dict[object, list[float]] = {}
+    observations = 0
+    for value, cluster_id in zip(values, cluster_ids):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number):
+            continue
+        grouped.setdefault(cluster_id, []).append(number)
+        observations += 1
+    contributions = [sum(grouped[key]) for key in sorted(grouped, key=repr)]
+    observed_sum = sum(contributions)
+    cluster_count = len(contributions)
+    common = {
+        "kind": "cluster_sign_flip_mean",
+        "null_assumption": CLUSTER_SIGN_FLIP_NULL_ASSUMPTION,
+        "alternative": "greater",
+        "clusters": cluster_count,
+        "n": observations,
+        "observed_mean": (observed_sum / observations
+                          if observations else 0.0),
+    }
+    if not observations or not contributions:
+        return {**common, "method": "unavailable", "exact": False,
+                "resamples": 0, "seed": None, "p_value": 1.0}
+
+    tolerance = 1e-15 * max(1.0, abs(observed_sum))
+    if cluster_count <= max(0, int(exact_max_clusters)):
+        resamples = 1 << cluster_count
+        extreme = 0
+        for mask in range(resamples):
+            randomized = sum(
+                contribution if mask & (1 << index) else -contribution
+                for index, contribution in enumerate(contributions))
+            if randomized >= observed_sum - tolerance:
+                extreme += 1
+        return {**common, "method": "exact_enumeration", "exact": True,
+                "resamples": resamples, "seed": None,
+                "p_value": extreme / resamples}
+
+    resamples = max(1, int(iterations))
+    rng = random.Random(seed)
+    extreme = 0
+    for _ in range(resamples):
+        randomized = sum(
+            contribution if rng.getrandbits(1) else -contribution
+            for contribution in contributions)
+        if randomized >= observed_sum - tolerance:
+            extreme += 1
+    return {**common, "method": "monte_carlo", "exact": False,
+            "resamples": resamples, "seed": int(seed),
+            "p_value": (extreme + 1) / (resamples + 1)}
 
 
 def stdev(values: list) -> float:

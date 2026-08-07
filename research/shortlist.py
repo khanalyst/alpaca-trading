@@ -20,7 +20,9 @@ import math
 from dataclasses import dataclass, field
 
 from .stats import (benjamini_hochberg, bootstrap_difference,
-                    bootstrap_mean, bootstrap_p_value)
+                    bootstrap_mean, bootstrap_p_value,
+                    cluster_block_bootstrap_difference,
+                    paired_cluster_sign_flip)
 
 # Sample floors. These are not significance thresholds; they gate what a
 # label is allowed to say, so a promising number on nine trades cannot read
@@ -44,6 +46,12 @@ FDR_ALPHA = 0.05
 # The confirmation window is the last 30% of a candidate's trades in time,
 # matching the split the deterministic outcome evaluator already uses.
 CONFIRMATION_FRACTION = 0.30
+# Keep the persisted shortlist's paired-evidence floor aligned with the
+# registered promotion protocol.  A hundred trades inside one afternoon are
+# not a hundred independent observations.
+MIN_CONFIRMATION_PAIRS = 30
+MIN_PAIRED_CLUSTERS = 8
+PAIR_CLUSTER_SECONDS = 21_600
 
 NO_EVIDENCE = "NO_EVIDENCE"
 INSUFFICIENT = "INSUFFICIENT"
@@ -81,6 +89,13 @@ class Candidate:
     delta_vs_baseline: float | None = None
     delta_ci_low: float | None = None
     delta_ci_high: float | None = None
+    paired_clusters: int = 0
+    confirmation_pairs: int = 0
+    confirmation_clusters: int = 0
+    confirmation_delta_vs_baseline: float | None = None
+    confirmation_delta_ci_low: float | None = None
+    confirmation_delta_ci_high: float | None = None
+    confirmation_p_value: float | None = None
     starved_decisions: int = 0
     declined_decisions: int = 0
     # Opportunity-level evidence.  ``trades`` remains the count of closed,
@@ -213,12 +228,16 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
             "eligible": len(closed), "resolved": len(closed),
             "fired": len(closed), "declined": 0, "starved": 0,
             "resolved_by_key": dict(zip(keys, returns)),
+            "resolved_ts_by_key": {
+                key: float(row.get("entry_ts") or 0.0)
+                for key, row in zip(keys, closed)},
             "eligible_keys": set(keys), "coverage_known": False,
         }
 
     returns: list[float] = []
     keys: list[object] = []
     resolved_by_key: dict[object, float] = {}
+    resolved_ts_by_key: dict[object, float] = {}
     eligible_keys: set = set()
     eligible = resolved = fired = declined = starved = 0
     def _decision_ts(row):
@@ -244,6 +263,7 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
             returns.append(0.0)
             keys.append(key)
             resolved_by_key[key] = 0.0
+            resolved_ts_by_key[key] = _decision_ts(row)
             continue
         if outcome != "PROPOSED":
             continue
@@ -283,12 +303,14 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
         returns.append(value)
         keys.append(key)
         resolved_by_key[key] = value
+        resolved_ts_by_key[key] = _decision_ts(row)
 
     return {
         "closed": closed, "returns": returns, "keys": keys,
         "eligible": eligible, "resolved": resolved,
         "fired": fired, "declined": declined, "starved": starved,
         "resolved_by_key": resolved_by_key,
+        "resolved_ts_by_key": resolved_ts_by_key,
         "eligible_keys": eligible_keys, "coverage_known": True,
     }
 
@@ -296,12 +318,20 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
 def _paired_opportunity_evidence(left: dict, right: dict) -> dict:
     """Match resolved candidate/baseline opportunities by immutable identity."""
     union = left["eligible_keys"] | right["eligible_keys"]
-    common = sorted(set(left["resolved_by_key"]) &
-                    set(right["resolved_by_key"]), key=repr)
+    common = list(set(left["resolved_by_key"]) &
+                  set(right["resolved_by_key"]))
+    common.sort(key=lambda key: (
+        left["resolved_ts_by_key"].get(
+            key, right["resolved_ts_by_key"].get(key, 0.0)), repr(key)))
     deltas = [left["resolved_by_key"][key] -
               right["resolved_by_key"][key] for key in common]
+    pairs = [(
+        left["resolved_ts_by_key"].get(
+            key, right["resolved_ts_by_key"].get(key, 0.0)),
+        left["resolved_by_key"][key], right["resolved_by_key"][key])
+        for key in common]
     return {
-        "deltas": deltas, "matched": len(common),
+        "deltas": deltas, "pairs": pairs, "matched": len(common),
         "union": len(union),
         "coverage_pct": (len(common) / len(union) * 100.0
                           if union else 0.0),
@@ -343,6 +373,14 @@ def _label(candidate: Candidate) -> tuple[str, list]:
             f"{MIN_FOR_SUPPORTED} is the floor for a supported one")
         return PRELIMINARY, reasons
 
+    if (candidate.source == "staged" and not candidate.is_baseline
+            and candidate.pair_coverage_pct is None):
+        reasons.append(
+            "staged support requires matched candidate/baseline decisions; "
+            "trade-only or independently sampled arms cannot supply paired "
+            "held-out evidence")
+        return INCONCLUSIVE, reasons
+
     # Once ledger evidence is available, a conditional trade result is not
     # enough. Require adequate resolved opportunity coverage and a minimum
     # firing rate before allowing the strongest label. Legacy trade-only
@@ -373,6 +411,40 @@ def _label(candidate: Candidate) -> tuple[str, list]:
             reasons.append(
                 "the matched baseline delta is unavailable, so the arm "
                 "cannot be supported on its unconditional return")
+            return INCONCLUSIVE, reasons
+        if candidate.paired_clusters < MIN_PAIRED_CLUSTERS:
+            reasons.append(
+                f"the paired comparison spans only "
+                f"{candidate.paired_clusters} independent market episodes; "
+                f"{MIN_PAIRED_CLUSTERS} are required")
+            return INCONCLUSIVE, reasons
+        if candidate.confirmation_pairs < MIN_CONFIRMATION_PAIRS:
+            reasons.append(
+                f"the held-out candidate/baseline comparison has only "
+                f"{candidate.confirmation_pairs} pairs; "
+                f"{MIN_CONFIRMATION_PAIRS} are required")
+            return INCONCLUSIVE, reasons
+        if candidate.confirmation_clusters < MIN_PAIRED_CLUSTERS:
+            reasons.append(
+                f"the held-out candidate/baseline comparison spans only "
+                f"{candidate.confirmation_clusters} market episodes; "
+                f"{MIN_PAIRED_CLUSTERS} are required")
+            return INCONCLUSIVE, reasons
+        if (candidate.confirmation_delta_ci_low is None
+                or candidate.confirmation_delta_ci_low <= 0):
+            low = candidate.confirmation_delta_ci_low
+            high = candidate.confirmation_delta_ci_high
+            interval = ("unavailable" if low is None or high is None else
+                        f"{low:+.3f}..{high:+.3f} R")
+            reasons.append(
+                "the held-out paired candidate-minus-baseline interval does "
+                f"not clear zero ({interval})")
+            return INCONCLUSIVE, reasons
+        if (candidate.confirmation_p_value is None
+                or candidate.confirmation_p_value > FDR_ALPHA):
+            reasons.append(
+                "the held-out clustered paired test is unavailable or not "
+                f"significant (p={candidate.confirmation_p_value})")
             return INCONCLUSIVE, reasons
         if candidate.delta_ci_low <= 0:
             reasons.append(
@@ -425,6 +497,14 @@ def _label(candidate: Candidate) -> tuple[str, list]:
         reasons.append(
             f"beats its baseline by {candidate.delta_vs_baseline:+.3f} R "
             f"({candidate.delta_ci_low:+.3f}..{candidate.delta_ci_high:+.3f})")
+    if candidate.confirmation_delta_ci_low is not None:
+        reasons.append(
+            "held-out paired delta is positive at "
+            f"{candidate.confirmation_delta_vs_baseline:+.3f} R "
+            f"({candidate.confirmation_delta_ci_low:+.3f}.."
+            f"{candidate.confirmation_delta_ci_high:+.3f}; "
+            f"{candidate.confirmation_clusters} clusters, "
+            f"p={candidate.confirmation_p_value:.4f})")
     return SUPPORTED, reasons
 
 
@@ -516,8 +596,35 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
                                                    baseline_evidence)
             candidate.matched_opportunities = paired["matched"]
             candidate.pair_coverage_pct = paired["coverage_pct"]
-            delta = (bootstrap_mean(paired["deltas"])
-                     if paired["deltas"] else None)
+            delta = (cluster_block_bootstrap_difference(
+                paired["pairs"], cluster_seconds=PAIR_CLUSTER_SECONDS)
+                     if paired["pairs"] else None)
+            if delta is not None:
+                candidate.paired_clusters = delta.clusters
+            cut = max(1, int(round(
+                len(paired["pairs"]) * (1 - CONFIRMATION_FRACTION))))
+            confirmation_pairs = paired["pairs"][cut:]
+            candidate.confirmation_pairs = len(confirmation_pairs)
+            if confirmation_pairs:
+                confirmation_delta = cluster_block_bootstrap_difference(
+                    confirmation_pairs,
+                    cluster_seconds=PAIR_CLUSTER_SECONDS)
+                confirmation_test = paired_cluster_sign_flip(
+                    confirmation_pairs,
+                    cluster_seconds=PAIR_CLUSTER_SECONDS)
+                candidate.confirmation_clusters = (
+                    confirmation_delta.clusters)
+                candidate.confirmation_delta_vs_baseline = round(
+                    confirmation_delta.point, 4)
+                candidate.confirmation_delta_ci_low = round(
+                    confirmation_delta.low, 4)
+                candidate.confirmation_delta_ci_high = round(
+                    confirmation_delta.high, 4)
+                candidate.confirmation_p_value = round(
+                    float(confirmation_test["p_value"]), 5)
+                # Multiplicity correction must consume the confirmatory
+                # paired test, not a candidate-vs-zero exploratory test.
+                candidate.p_value = candidate.confirmation_p_value
         else:
             # Legacy trade-only evidence has no proposal identity to match;
             # retain the historical independent comparison and leave pair
@@ -601,19 +708,22 @@ def render(candidates: list, *, generated_ts: float | None = None) -> str:
     lines.append("")
     lines.append(
         "No entry here is a recommendation to trade. `SUPPORTED` means the "
-        "measured interval excludes zero on an adequate sample and the "
-        "held-out window agrees - not that the edge will persist. A result "
+        "measured interval excludes zero on an adequate sample and a paired "
+        "held-out candidate-minus-baseline interval also clears zero - not "
+        "that the edge will persist. A result "
         "whose mechanism is not understood cannot be told apart from "
         "overfitting and gives no warning when it stops.")
     lines.append("")
     lines.append("| Rank | Candidate | Scope | Label | Trades | Opportunities "
-                 "| Fire rate | Coverage | Mean R | 95% interval | Held-out "
+                 "| Fire rate | Coverage | Mean R | 95% interval | Held-out ΔR "
                  "| Win rate | Net USD |")
     lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: "
                  "| --- | ---: | ---: | ---: |")
     for index, candidate in enumerate(ordered, start=1):
-        held = ("-" if candidate.confirmation_mean_r is None
-                else f"{candidate.confirmation_mean_r:+.3f}")
+        held_value = (candidate.confirmation_delta_vs_baseline
+                      if candidate.confirmation_delta_vs_baseline is not None
+                      else candidate.confirmation_mean_r)
+        held = "-" if held_value is None else f"{held_value:+.3f}"
         firing = ("-" if candidate.firing_rate is None
                   else f"{candidate.firing_rate:.1%}")
         coverage = ("-" if candidate.coverage_pct is None

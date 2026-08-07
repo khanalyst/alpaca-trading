@@ -220,6 +220,24 @@ research:
   # `research.py author`; absent until something is staged, and the shadow
   # lane is simply absent while it does not exist.
   staging_store: research/cache/staging.db
+  # One budget is shared by authoring, CLI review and runtime shadow reloads.
+  # Each new mechanism starts as a root plus at most two one-dimensional
+  # neighbours, so the budget is configuration count rather than idea count.
+  staging_max_active: 32
+  staging_lifecycle:
+    never_fired_decisions: 2000
+    never_fired_max_age_hours: 168
+    no_observation_max_age_hours: 72
+    starved_max_age_hours: 72
+    starved_fraction: 0.5
+  staging_refinement:
+    max_attempts: 1
+    max_variants_per_attempt: 2
+    max_configurations_per_mechanism: 5
+    relative_step: 0.10
+  # Content-addressed proposals for explicit human implementation/review.
+  # Preparing one never edits the registry, source, or running configuration.
+  staging_handoff_dir: research/results/staged-handoffs
   # Optional pre-existing destination. It is external only when its mounted
   # filesystem/device differs from every repository/source device; an explicit
   # same-device path remains configured-local. The path is never auto-created.

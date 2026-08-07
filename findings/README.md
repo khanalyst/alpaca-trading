@@ -4,7 +4,6 @@ Every registered variant, including the rejected ones. A rejection is a row here
 
 ## Repository audits
 
-- [Current main-repository implementation plan](../MAIN_REPO_REVIEW_PLAN.md)
 - [Detailed main repository review — 2026-07-30](main-repo-review-2026-07-30.md)
 - [Orchestrated strategy audit — 2026-07-29](orchestrated-audit-2026-07-29.md)
 

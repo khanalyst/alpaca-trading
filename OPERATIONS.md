@@ -2,7 +2,9 @@
 
 This is the operational authority. The shipped system uses one demo order path,
 four isolated deterministic realtime research evaluators, and three registered
-models that are offline-only.
+models that are offline-only. The semantic authority chain and human approval
+boundaries are in
+[research/AUTONOMOUS_RESEARCH.md](research/AUTONOMOUS_RESEARCH.md).
 
 ## 1. Runtime locations
 
@@ -100,33 +102,28 @@ is treated as durably backed up.
 `research/nightly.sh` runs in this order:
 
 1. readiness; failure is remembered while the run continues;
-2. `review-staged`, which gives each machine-authored mechanism a coded
-   verdict and retires the ones that are finished;
-3. `author`, which proposes new mechanisms and stages the ones that validate.
-   It runs after the verdicts so the next generation sees the latest coded
-   failures;
-4. `qualify-staged`, which starts isolated local PAPER only for staged
-   mechanisms whose fixed-harness evidence is supported;
-5. `research-loop`, which creates missing deterministic outcomes and reviews a
-   bounded queue (default eight) of pending results; one failed provider call
-   is persisted and does not stop later items;
-6. corpus statistics and G2 replay when the journal exists;
-7. funnel, cadence, sweeps, three-arm analysis, forward qualification,
-   fail-closed draft review-artifact preparation, the candidate shortlist,
+2. when the journal exists, corpus statistics and the proposal-fidelity replay;
+3. funnel, cadence, sweeps, three-arm analyst-effect analysis, and paired
+   forward qualification;
+4. only after proposal fidelity passes: `review-staged`, bounded refinement,
+   `qualify-staged`, the bounded `research-loop`, `author`, and
+   `prepare-handoff`;
+5. fail-closed draft review-artifact preparation, the candidate shortlist,
    and scorecard regeneration;
-8. one fresh immutable market-history snapshot under
+6. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
-9. the exploratory tournament, with immutable per-run artifacts;
-10. one new verified backup.
+7. the exploratory tournament, with immutable per-run artifacts; and
+8. one new verified backup.
 
 Exact exit behavior:
 
-- a real G2 failure stops immediately with exit 3 before later research;
-- G2 exit 4 means collecting; gated commands may refuse, but the workflow
+- a real proposal-fidelity mismatch stops immediately with exit 3 before later research;
+- proposal-fidelity exit 4 means collecting; dependent lifecycle commands are
+  skipped, while the workflow
   continues to tournament and backup;
-- an LLM review/provider/parse failure is persisted for retry and does not
-  discard the deterministic outcome or abort the workflow;
+- an LLM author/review/provider/parse failure is persisted for retry and makes
+  the nightly child nonzero; it never discards the deterministic outcome;
 - backup failure makes the research service nonzero (exit 5 unless readiness
   was already nonzero);
 - a remembered readiness failure produces final exit 4 after the backup;
@@ -138,7 +135,14 @@ state and does not authorize trading or disappear into trader logs.
 While the nightly child is running, the scheduler atomically refreshes
 `runtime/health/research.json` every 30 seconds. The 180-second health window
 therefore remains green for a legitimate long run and turns stale only when
-the scheduler can no longer supervise and refresh the child.
+the scheduler can no longer supervise and refresh the child. The default job
+deadline is four hours. Timeout terminates the child process group and records
+`timed_out`; bounded stdout/stderr tails, truncation counts, job ID, deadline,
+exit code, and structured author/review failures remain in the status file.
+Even if a wrapper masks a structured provider/review failure with exit zero,
+the scheduler marks the effective job failed. Health is green only for fresh
+`waiting`, `running`, or `completed` state with no nonzero last exit and no
+deadline overrun.
 
 Run manually:
 
@@ -167,21 +171,23 @@ the prior decision. It is not aligned to wall-clock or signal-bar boundaries;
 safety, marks, exits, reconciliation, and shadow advancement continue on the
 shorter loop.
 
-G2 compares the full canonical pre-risk proposal identity (cycle, symbol,
+The proposal-fidelity replay compares the full canonical pre-risk proposal identity (cycle, symbol,
 direction, setup identity/type, signal timestamp, strategy version, and
 baseline variant) symmetrically with replay keys. It requires a non-vacuous
 exact match and fails closed on malformed, duplicate, missing, or extra
 identities. Outcome-resolution gaps remain diagnostics rather than proposal
-mismatches. A failed, stale, or vacuous G2 blocks downstream journal evidence
+mismatches. A failed, stale, or vacuous result blocks downstream journal evidence
 from being treated as authoritative.
 
 The active research scope is `forward_feed_version: 8`. Feed v8 keeps the
-deterministic four realtime lanes and adds the real liquidation flow and the
-pre-registered conditioning axes; the active analyst's own decisions remain in
-a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v7
+deterministic four realtime lanes and repairs depth-ladder delivery across the
+wider 25-instrument universe. The shipped deterministic runtime creates no
+`:llm` lane. Analyst mode may retain genuine analyst decisions in a separate
+non-comparable scope; they are not pooled with lane evidence. Feeds v1-v7
 remain immutable historical evidence. Feed v4 is the market-data plumbing
-repair feed, feed v5 is the immutable-provenance fork, and feed v6 is the
-deterministic four-lane fork; no older evidence is migrated or pooled with v8.
+repair feed, feed v5 is the immutable-provenance fork, feed v6 is the
+deterministic four-lane fork, and feed v7 added liquidation flow and
+conditioning axes; no older evidence is migrated or pooled with v8.
 
 Within each strategy:
 
@@ -406,11 +412,24 @@ included.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify --scope <scope>
+./.venv/bin/python research.py prepare-handoff \
+  --store research/cache/findings.db \
+  --staging research/cache/staging.db
 ./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet \
   --variant <qualified-variant-id> --scope <scope> \
   --reviewed-by <reviewer> --registry-change-ref <change-reference>
 ./.venv/bin/python research.py report
+
+./.venv/bin/python -m research.evidence_cli verify-package \
+  <evidence-package> --code-root . --config config.yaml
+./.venv/bin/python -m research.evidence_cli verify-golden \
+  tests/fixtures/evidence/golden_replay_synthetic.json \
+  tests/fixtures/evidence/golden_replay_expected.json
+./.venv/bin/python -m research.evidence_cli run-replay \
+  tests/fixtures/evidence/golden_replay_synthetic.json
+./.venv/bin/python -m research.evidence_cli import-replay \
+  <source> <new-fixture> --classification synthetic
 ```
 
 `prepare-review-artifacts` considers only variants with current v8
@@ -479,6 +498,7 @@ hand-written contracts implement.
 ./.venv/bin/python research.py staged             # what is registered
 ./.venv/bin/python research.py review-staged --dry-run
 ./.venv/bin/python research.py qualify-staged
+./.venv/bin/python research.py prepare-handoff
 ./.venv/bin/python research.py shortlist
 ```
 
@@ -523,6 +543,13 @@ A registered claim is immutable at the database level. Rewording one after
 results exist is refused by a trigger, because a claim that can be edited
 afterwards cannot be told apart from one retro-fitted to the result.
 
+`prepare-handoff` considers only a staged mechanism whose configuration-level
+verdicts support it. It writes an idempotent content-addressed JSON proposal
+under `research/results/staged-handoffs/` for human implementation and registry
+review. The artifact explicitly says that no code or registry mutation occurred
+and that it is not live-eligible. It is not a reviewed strategy packet and does
+not authorize either demo or live orders.
+
 The authoring model receives bounded persisted evidence rather than only field
 names: opportunity and firing rates, conditional returns, missing-data and
 null/near-miss reasons, fit versus held-out results, segment summaries, feature
@@ -545,9 +572,9 @@ and holding-period optimization is not yet wired as a second stage.
 
 `strategy.execution_mode` selects what decides on the order path. `analyst`
 makes one LLM call per decision cycle. `deterministic` makes no LLM call at
-all: the strategy's own forward contract proposes, and risk and execution
-apply unchanged. `shadow_only` is shipped and has no order path: nothing
-proposes and nothing opens.
+all and constructs no LLM client, preflight, or `:llm` lane: the strategy's own
+forward contract proposes, and risk and execution apply unchanged.
+`shadow_only` has no order path: nothing proposes and nothing opens.
 
 Use `deterministic` when a strategy has earned promotion on shadow evidence. That evidence
 was produced by its deterministic contract, so trading it under an analyst
@@ -619,7 +646,7 @@ Before deleting or rebuilding the VM:
 
 | Symptom | Meaning/action |
 | --- | --- |
-| G2 failed | Stop authoritative interpretation and investigate proposal-key replay mismatch |
+| Proposal-fidelity replay failed | Stop authoritative interpretation and investigate proposal-key replay mismatch |
 | `INSUFFICIENT_SAMPLE` | Keep collecting; no edge verdict exists yet |
 | External backup BLOCKED | Provision/mount a different-device destination and run a required external backup |
 | `configured_local` | Explicit path shares a source filesystem; not VM-loss protection |
@@ -647,7 +674,9 @@ Before deleting or rebuilding the VM:
 | Compose warns that config/secret UID/GID/mode are ignored | Expected for file-backed local Compose. Enforce host permissions: secret `10001:10001` mode `0400`; tracked `config.yaml` mode `0644`. |
 | `docker compose ps` is empty after an update | The updater failed before `compose up`; fix the first journal/preflight error and rerun the same revision. |
 
-The B7.5 maker-first order primitive is enabled in the shipped demo
+### Maker-first entry boundary
+
+The maker-first order primitive is enabled in the shipped demo
 configuration and rejected in live mode. `cycle.decision_interval_seconds`, `maker_first_enabled`,
 `maker_first_wait_seconds`, `research.shadow_enabled`,
 `research.shadow_variants`, and `research.shadow_budget_ms` are documented

@@ -188,9 +188,21 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
 
     mae = mfe = 0.0
     held = 0
+    minute_ms = TIMEFRAME_MS["1m"]
+    signal_close = int(plan.signal_ts) + TIMEFRAME_MS[plan.signal_timeframe]
+    # Keep the one-minute grid on the signal bar's phase. Exchange timestamps
+    # are normally epoch-aligned, while synthetic and migrated fixtures may
+    # use a different but still internally consistent origin.
+    expected_ts = signal_close + (
+        (floor_ts - signal_close + minute_ms - 1) // minute_ms
+    ) * minute_ms
     for bar in bars:
         if int(bar.ts) >= deadline:
             break
+        # Missing minutes make elapsed time, excursions and funding unknowable.
+        # Do not turn a sparse path into a shorter, cheaper completed trade.
+        if int(bar.ts) != expected_ts:
+            return Outcome(result="no_data")
         held += 1
         adverse = ((entry - bar.low) if long else (bar.high - entry))
         favourable = ((bar.high - entry) if long else (entry - bar.low))
@@ -211,6 +223,7 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
         if hit_target:
             return _finish(plan, costs, "target", bar.close_ts, target,
                            held, mae, mfe)
+        expected_ts = int(bar.ts) + 60_000
 
     if held == 0:
         return Outcome(result="no_data")
@@ -248,6 +261,16 @@ def resolve_from_cache(plan: SetupPlan, cache, max_hold_hours: float = 24.0,
                        costs: CostModel | None = None) -> Outcome:
     """``resolve`` against a :class:`~research.prices.PriceCache`."""
     start = plan.first_visible_ts
-    end = start + int(max(0.0, max_hold_hours) * 3_600_000) + 60_000
-    return resolve(plan, cache.bars(plan.symbol, start, end),
-                   max_hold_hours=max_hold_hours, costs=costs)
+    deadline = start + int(max(0.0, max_hold_hours) * 3_600_000)
+    end = deadline + 60_000
+    outcome = resolve(plan, cache.bars(plan.symbol, start, end),
+                      max_hold_hours=max_hold_hours, costs=costs)
+    # A stop/target is attributable once the continuous path reaches it. A
+    # timeout, however, asserts that the whole holding window elapsed without
+    # either event, so every minute through the deadline must be present.
+    covers = getattr(cache, "covers", None)
+    if (outcome.result == "timeout"
+            and callable(covers)
+            and not covers(plan.symbol, start, deadline)):
+        return Outcome(result="no_data")
+    return outcome

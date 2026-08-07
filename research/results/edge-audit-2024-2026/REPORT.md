@@ -1,5 +1,9 @@
 # Independent edge audit — phase1-v2 momentum strategy
 
+> **ARCHIVED / FROZEN EVIDENCE SNAPSHOT.** The version, universe, costs, and
+> conclusions below belong to this historical run and its `MANIFEST.json`.
+> They do not describe current runtime configuration or authorize capital.
+
 > ## ⚠ Cost basis correction — 2026-08-04
 >
 > **Every number below was produced against the `base` cost scenario:
