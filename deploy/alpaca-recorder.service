@@ -1,0 +1,25 @@
+[Unit]
+Description=Alpaca market-data recorder (paper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpaca
+Group=alpaca
+WorkingDirectory=/opt/alpaca-agent-trading
+EnvironmentFile=-/etc/alpaca-agent-trading/agent.env
+Environment=ALPACA_PAPER=true
+ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/recorder.py --out /opt/alpaca-agent-trading/runtime/research/recorded --interval 60
+Restart=always
+RestartSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alpaca-agent-trading/runtime
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

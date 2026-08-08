@@ -1,756 +1,197 @@
-"""Configuration loading and fail-closed validation.
-
-Trading configuration is executable risk policy.  Accepting a typo such as
-``mode: demos`` as live trading is therefore unsafe; every supported field is
-validated before an exchange client or model is created.
-"""
+"""Fail-closed configuration for the Alpaca paper-trading runtime."""
 
 from __future__ import annotations
 
-import math
 from copy import deepcopy
-
-from .forward_models import require_complete_contract
-from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
-                       runnable_ids, spec_for, validate_contract_config)
-from .provider import normalize_provider_endpoint
-
-
-# "none" preserves overlapping breakout and continuation classifications.
-BREAKOUT_DISCRIMINATORS = {"none", "trend_alignment", "volatility_regime"}
-
+from pathlib import Path
+from typing import Any, Mapping
+import os
 
 class ConfigError(ValueError):
-    """Raised when configuration is missing, malformed, or outside safe bounds."""
+    pass
 
 
-def _mapping(value, path: str) -> dict:
-    if not isinstance(value, dict):
+def _map(value: Any, path: str) -> dict:
+    if not isinstance(value, Mapping):
         raise ConfigError(f"{path} must be a mapping")
-    return value
+    return dict(value)
 
 
-def _keys(block: dict, allowed: set[str], path: str) -> None:
-    unknown = sorted(set(block) - allowed)
-    if unknown:
-        raise ConfigError(f"{path} has unknown field(s): {', '.join(unknown)}")
+def _unknown(block: Mapping[str, Any], allowed: set[str], path: str) -> None:
+    extra = sorted(set(block) - allowed)
+    if extra:
+        raise ConfigError(f"{path} has unknown field(s): {', '.join(extra)}")
 
 
-def _number(block: dict, key: str, lo: float, hi: float, path: str) -> float:
-    value = block.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigError(f"{path}.{key} must be a number")
-    value = float(value)
-    if not lo <= value <= hi:
-        raise ConfigError(f"{path}.{key} must be between {lo:g} and {hi:g}")
-    return value
-
-
-def _integer(block: dict, key: str, lo: int, hi: int, path: str) -> int:
-    value = block.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError(f"{path}.{key} must be an integer")
-    if not lo <= value <= hi:
-        raise ConfigError(f"{path}.{key} must be between {lo} and {hi}")
-    return value
-
-
-def _boolean(block: dict, key: str, path: str) -> bool:
-    value = block.get(key)
+def _bool(block: Mapping[str, Any], key: str, path: str, default=None) -> bool:
+    value = block.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"{path}.{key} must be true or false")
     return value
 
 
-def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
-    """Return a validated defensive copy of *raw* or raise ``ConfigError``."""
-    cfg = deepcopy(_mapping(raw, "config"))
-    _keys(cfg, {"mode", "llm", "strategy", "universe", "cycle", "risk",
-                "execution", "trading_costs", "alerts", "research"}, "config")
+def _num(block: Mapping[str, Any], key: str, path: str, lo: float, hi: float, default=None) -> float:
+    value = block.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not lo <= float(value) <= hi:
+        raise ConfigError(f"{path}.{key} must be a number between {lo:g} and {hi:g}")
+    return float(value)
 
-    mode = cfg.get("mode")
-    if mode not in {"demo", "live"}:
-        raise ConfigError("mode must be exactly 'demo' or 'live'")
 
-    llm = _mapping(cfg.get("llm"), "llm")
-    _keys(llm, {"provider", "model", "temperature", "max_tokens",
-                "base_url"}, "llm")
-    if llm.get("provider") not in {"anthropic", "openai"}:
-        raise ConfigError("llm.provider must be 'anthropic' or 'openai'")
+def _int(block: Mapping[str, Any], key: str, path: str, lo: int, hi: int, default=None) -> int:
+    value = block.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+        raise ConfigError(f"{path}.{key} must be an integer between {lo} and {hi}")
+    return value
+
+
+def _feed(value: Any, *, options: bool = False) -> str:
+    raw = str(value or ("indicative" if options else "iex")).strip().lower().replace("-", "_")
+    if raw == "delayed":
+        raw = "delayed_sip"
+    allowed = {"indicative", "opra"} if options else {"iex", "sip", "delayed_sip"}
+    if raw not in allowed:
+        raise ConfigError(f"unsupported {'option' if options else 'equity'} data feed: {value!r}")
+    return raw
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "mode": "paper",
+    "broker": {"paper": True, "data_feed": "iex", "options_feed": "indicative"},
+    "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
+    "universe": {"symbols": ["SPY", "QQQ"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
+    "strategy": {"id": "ibr", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
+    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0},
+    "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "ibr", "max_slippage_bps": 50},
+    "llm": {"provider": "openai", "model": "gpt-5.6-sol-coding", "temperature": 0.2, "max_tokens": 2000},
+}
+
+
+def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = False) -> dict:
+    del allow_shadow_strategy
+    cfg = deepcopy(_map(raw, "config"))
+    allowed = {"mode", "broker", "data", "session", "universe", "strategy", "risk", "execution", "llm", "alerts", "research", "cycle"}
+    _unknown(cfg, allowed, "config")
+    mode = cfg.get("mode", "paper")
+    if mode != "paper":
+        raise ConfigError("only paper mode is supported; live trading is disabled")
+    out = deepcopy(DEFAULT_CONFIG)
+    for key, value in cfg.items():
+        if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
+            merged = deepcopy(out[key])
+            merged.update(value)
+            out[key] = merged
+        else:
+            out[key] = value
+    out["mode"] = mode
+
+    broker = _map(out.get("broker"), "broker")
+    _unknown(broker, {"paper", "data_feed", "options_feed", "api_key", "secret_key", "endpoint"}, "broker")
+    paper = _bool(broker, "paper", "broker", True)
+    if not paper:
+        raise ConfigError("paper mode requires broker.paper=true")
+    paper_env = os.getenv("ALPACA_PAPER")
+    if paper_env is not None and paper_env.strip().lower() not in {"1", "true", "yes", "on"}:
+        raise ConfigError("ALPACA_PAPER must be true; live trading is disabled")
+    if broker.get("endpoint"):
+        raise ConfigError("broker.endpoint overrides are disabled")
+    broker.update(paper=True)
+    broker["data_feed"] = _feed(os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED") or broker.get("data_feed"))
+    broker["options_feed"] = _feed(os.getenv("ALPACA_OPTIONS_FEED") or broker.get("options_feed"), options=True)
+    out["broker"] = broker
+
+    data = out.get("data")
+    if data is not None:
+        data = _map(data, "data")
+        _unknown(data, {"feed", "options_feed", "adjustment", "delayed"}, "data")
+        if "feed" in data:
+            data["feed"] = _feed(data["feed"])
+        if "options_feed" in data:
+            data["options_feed"] = _feed(data["options_feed"], options=True)
+        out["data"] = data
+    session = _map(out.get("session"), "session")
+    _unknown(session, {"timezone", "entries_regular_session_only", "allow_exits_outside_session", "force_flat_minutes_before_close", "reject_new_entries_minutes_before_close"}, "session")
+    if session.get("timezone") != "America/New_York":
+        raise ConfigError("session.timezone must be America/New_York")
+    session["entries_regular_session_only"] = _bool(session, "entries_regular_session_only", "session", True)
+    session["allow_exits_outside_session"] = _bool(session, "allow_exits_outside_session", "session", True)
+    session["force_flat_minutes_before_close"] = _int(session, "force_flat_minutes_before_close", "session", 0, 240, 10)
+    session["reject_new_entries_minutes_before_close"] = _int(session, "reject_new_entries_minutes_before_close", "session", 0, 240, 5)
+    out["session"] = session
+
+    universe = _map(out.get("universe"), "universe")
+    _unknown(universe, {"symbols", "asset_classes", "min_price", "max_symbols", "denylist", "top_n", "refresh_minutes"}, "universe")
+    symbols = universe.get("symbols", [])
+    if not isinstance(symbols, list) or any(not isinstance(x, str) or not x.strip() for x in symbols):
+        raise ConfigError("universe.symbols must be a list of non-empty symbols")
+    universe["symbols"] = [x.strip().upper() for x in symbols]
+    classes = universe.get("asset_classes", ["us_equity"])
+    if not isinstance(classes, list) or any(x not in {"us_equity", "us_option", "option"} for x in classes):
+        raise ConfigError("universe.asset_classes must contain us_equity and/or us_option")
+    universe["asset_classes"] = classes
+    universe["min_price"] = _num(universe, "min_price", "universe", 0, 1_000_000, 1.0)
+    universe["max_symbols"] = _int(universe, "max_symbols", "universe", 1, 10_000, 50)
+    if not isinstance(universe.get("denylist", []), list):
+        raise ConfigError("universe.denylist must be a list")
+    out["universe"] = universe
+
+    strategy = _map(out.get("strategy"), "strategy")
+    _unknown(strategy, {"id", "version", "variant_id", "execution_mode", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "latest_entry_time", "force_flat_minutes_before_close", "signal_timeframe"}, "strategy")
+    if not isinstance(strategy.get("id"), str) or not strategy["id"].strip():
+        raise ConfigError("strategy.id must be a non-empty string")
+    strategy["range_minutes"] = _int(strategy, "range_minutes", "strategy", 1, 240, 15)
+    strategy["breakout_buffer_bps"] = _num(strategy, "breakout_buffer_bps", "strategy", 0, 500, 5)
+    strategy["min_relative_volume"] = _num(strategy, "min_relative_volume", "strategy", 0, 100, 1)
+    strategy["target_r"] = _num(strategy, "target_r", "strategy", 0.1, 100, 2)
+    strategy["max_entry_extension_r"] = _num(strategy, "max_entry_extension_r", "strategy", 0, 100, 1)
+    strategy["min_ibr_width_atr"] = _num(strategy, "min_ibr_width_atr", "strategy", 0, 100, .25)
+    strategy["max_ibr_width_atr"] = _num(strategy, "max_ibr_width_atr", "strategy", 0, 100, 3)
+    if strategy["min_ibr_width_atr"] > strategy["max_ibr_width_atr"]:
+        raise ConfigError("strategy.min_ibr_width_atr cannot exceed max_ibr_width_atr")
+    if not isinstance(strategy.get("latest_entry_time"), str):
+        raise ConfigError("strategy.latest_entry_time must be HH:MM")
+    out["strategy"] = strategy
+
+    risk = _map(out.get("risk"), "risk")
+    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_drawdown_pct", "max_gross_exposure_pct", "max_hold_hours"}, "risk")
+    risk["risk_per_trade_pct"] = _num(risk, "risk_per_trade_pct", "risk", .001, 100, .5)
+    risk["daily_loss_limit_pct"] = _num(risk, "daily_loss_limit_pct", "risk", .01, 100, 2)
+    risk["max_open_risk_pct"] = _num(risk, "max_open_risk_pct", "risk", .01, 100, 2)
+    risk["max_concurrent_positions"] = _int(risk, "max_concurrent_positions", "risk", 1, 100, 3)
+    risk["max_position_notional_pct"] = _num(risk, "max_position_notional_pct", "risk", .1, 1000, 25)
+    risk["options_min_dte"] = _int(risk, "options_min_dte", "risk", 0, 3650, 7)
+    risk["options_max_dte"] = _int(risk, "options_max_dte", "risk", 1, 3650, 60)
+    if risk["options_min_dte"] > risk["options_max_dte"]:
+        raise ConfigError("risk.options_min_dte cannot exceed options_max_dte")
+    risk["options_max_spread_pct"] = _num(risk, "options_max_spread_pct", "risk", 0, 100, 10)
+    out["risk"] = risk
+
+    execution = _map(out.get("execution"), "execution")
+    _unknown(execution, {"order_type", "time_in_force", "client_order_id_prefix", "max_slippage_bps", "maker_first_enabled"}, "execution")
+    if execution.get("order_type", "market") not in {"market", "limit"}:
+        raise ConfigError("execution.order_type must be market or limit")
+    if execution.get("time_in_force", "day") not in {"day", "gtc", "ioc", "fok"}:
+        raise ConfigError("execution.time_in_force is unsupported")
+    if not isinstance(execution.get("client_order_id_prefix", "ibr"), str) or not execution["client_order_id_prefix"]:
+        raise ConfigError("execution.client_order_id_prefix must be non-empty")
+    execution["max_slippage_bps"] = _num(execution, "max_slippage_bps", "execution", 0, 10_000, 50)
+    out["execution"] = execution
+
+    llm = _map(out.get("llm"), "llm")
+    _unknown(llm, {"provider", "model", "temperature", "max_tokens", "base_url"}, "llm")
+    if llm.get("provider") not in {"openai", "anthropic"}:
+        raise ConfigError("llm.provider must be openai or anthropic")
     if not isinstance(llm.get("model"), str) or not llm["model"].strip():
         raise ConfigError("llm.model must be a non-empty string")
-    if "base_url" in llm:
-        if not isinstance(llm["base_url"], str) or not llm["base_url"].strip():
-            raise ConfigError("llm.base_url must be a non-empty URL")
-        try:
-            normalize_provider_endpoint(llm["base_url"], allow_sensitive=False)
-        except ValueError as exc:
-            raise ConfigError("llm.base_url must be an absolute HTTP(S) URL") from exc
-    _number(llm, "temperature", 0, 2, "llm")
-    _integer(llm, "max_tokens", 128, 32000, "llm")
+    llm["temperature"] = _num(llm, "temperature", "llm", 0, 2, .2)
+    llm["max_tokens"] = _int(llm, "max_tokens", "llm", 128, 32_000, 2_000)
+    out["llm"] = llm
+    return out
 
-    strategy = _mapping(cfg.get("strategy"), "strategy")
-    _keys(strategy, {
-        "id", "version", "variant_id", "signal_timeframe", "execution_mode",
-        "breakout_discriminator", "breakout_compression_max_atr_ratio",
-        "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
-        "setup_memory_hours", "loss_reentry_min_minutes",
-        "min_stop_atr_multiple", "min_hold_minutes", "min_hold_adverse_r",
-        "structure_buffer_atr_multiple", "hard_max_entry_extension_atr",
-        "breakout_range_threshold_pct", "breakout_min_relative_volume",
-        "funding_extreme_pct_per_8h", "fixed_reward_risk",
-        "extended_reward_risk", "forward_horizon_hours",
-        "flush_min_move_atr", "flush_min_oi_drop_pct",
-        "flush_min_relative_volume", "carry_percentile",
-        "carry_min_samples", "unwind_percentile", "unwind_min_samples",
-        "trend_min_range_pos_pct", "trend_max_atr_ratio",
-        "ls_high_percentile", "ls_low_percentile",
-        "scalp_max_spread_pct", "scalp_min_abs_imbalance",
-        "scalp_min_depth_usd",
-    }, "strategy")
-    for key in ("id", "version", "signal_timeframe"):
-        if (not isinstance(strategy.get(key), str)
-                or not strategy[key].strip()):
-            raise ConfigError(f"strategy.{key} must be a non-empty string")
-    if "variant_id" in strategy and (
-            not isinstance(strategy["variant_id"], str)
-            or not strategy["variant_id"].strip()):
-        raise ConfigError("strategy.variant_id must be a non-empty string")
-    # The registry is authoritative for runnable strategies.
+
+def load_config(path: str | Path) -> dict:
     try:
-        spec = spec_for(strategy["id"])
-    except UnknownStrategy as exc:
-        raise ConfigError(str(exc)) from None
-    if strategy["version"] != spec.version:
-        raise ConfigError(
-            f"strategy.version must be {spec.version!r} for strategy.id "
-            f"{spec.id!r}; a different version is a different strategy and "
-            "needs its own registry entry")
-    if not spec.implemented:
-        raise ConfigError(
-            f"strategy.id {spec.id!r} is registered for research but has no "
-            f"live contract implementation. Runnable strategies: "
-            f"{', '.join(runnable_ids())}")
-    # A strategy earns promotion on evidence its deterministic contract
-    # produced in a shadow lane. Running it live under an analyst trades
-    # something other than the thing that earned the promotion, so the
-    # contract can drive the order path directly instead. That path needs no
-    # analyst prompt, which is why analyst_ready is not required for it.
-    # Exact, like mode: two configuration files that look different must not
-    # behave identically, and silently normalising case or whitespace is how
-    # a typo becomes a mode change nobody reviewed.
-    # ``shadow_only`` is the third state the two modes could not express: no
-    # order path at all. It exists because the only analyst-ready strategy is
-    # falsified, and leaving a falsified mechanism on the account is not
-    # neutral - a sustained drawdown trips max_drawdown_pct, which flattens
-    # and self-kills the process, ending the research collection every other
-    # lane depends on. Research lanes are unaffected by this setting: they
-    # evaluate every registered and staged contract on the same snapshots
-    # whether or not anything occupies the order path.
-    execution_mode = strategy.get("execution_mode", "analyst")
-    if execution_mode not in {"analyst", "deterministic", "shadow_only"}:
-        raise ConfigError(
-            "strategy.execution_mode must be exactly 'analyst', "
-            "'deterministic' or 'shadow_only'")
-    strategy["execution_mode"] = execution_mode
-    if execution_mode == "deterministic":
-        try:
-            require_complete_contract(spec.id)
-        except Exception as exc:  # noqa: BLE001
-            raise ConfigError(
-                f"strategy.execution_mode is deterministic but {spec.id!r} "
-                f"has no complete forward contract to trade: {exc}") from None
-    elif execution_mode == "shadow_only":
-        # Nothing is analysed and nothing is traded, so neither an analyst
-        # prompt nor a complete forward contract is required of strategy.id.
-        pass
-    elif not spec.analyst_ready and not allow_shadow_strategy:
-        raise ConfigError(
-            f"strategy.id {spec.id!r} has no live contract implementation; "
-            "its deterministic shadow contract is research-only because the "
-            "analyst prompt/schema is not implemented. Runnable "
-            f"strategies: {', '.join(runnable_ids())}")
-    # Demo is an operations rehearsal, but it still needs a complete analyst
-    # contract. Live capital additionally requires a strategy that has
-    # cleared the evidence gates.
-    if cfg["mode"] == "live" and not spec.meets(LIVE_MIN_TIER):
-        eligible = live_eligible_ids()
-        raise ConfigError(
-            f"strategy.id {spec.id!r} is tier {spec.tier} and mode is live, "
-            f"which requires {LIVE_MIN_TIER} or better. "
-            + (f"Live-eligible strategies: {', '.join(eligible)}"
-               if eligible else
-               "No registered strategy currently meets that bar.")
-            + f" Reason: {spec.falsification}")
-    _boolean(
-        strategy, "allow_experimental_setups_in_demo", "strategy")
-    # The discriminator is explicit so classification remains attributable.
-    discriminator = strategy.get("breakout_discriminator")
-    if discriminator is None:
-        strategy["breakout_discriminator"] = "none"
-    elif discriminator not in BREAKOUT_DISCRIMINATORS:
-        raise ConfigError(
-            "strategy.breakout_discriminator must be one of: "
-            + ", ".join(sorted(BREAKOUT_DISCRIMINATORS)))
-    if strategy.get("breakout_compression_max_atr_ratio") is None:
-        strategy["breakout_compression_max_atr_ratio"] = 1.0
-    else:
-        _number(strategy, "breakout_compression_max_atr_ratio",
-                0.1, 5.0, "strategy")
-    _number(strategy, "setup_cooldown_minutes", 0, 1440, "strategy")
-    _number(strategy, "setup_memory_hours", 1, 720, "strategy")
-    _number(strategy, "loss_reentry_min_minutes", 0, 10080, "strategy")
-    _number(strategy, "min_stop_atr_multiple", 0.5, 5, "strategy")
-    _number(strategy, "min_hold_minutes", 0, 1440, "strategy")
-    # Below 1.0 by construction: at 1R the exchange stop has already filled,
-    # so a release set at or above it can never be reached and the floor
-    # silently reverts to the unconditional clock it replaced.
-    if "min_hold_adverse_r" in strategy:
-        _number(strategy, "min_hold_adverse_r", 0.05, 0.95, "strategy")
-    _number(strategy, "structure_buffer_atr_multiple", 0, 2, "strategy")
-    _number(strategy, "hard_max_entry_extension_atr", 0.5, 10, "strategy")
-    _number(strategy, "breakout_range_threshold_pct", 50, 99, "strategy")
-    _number(strategy, "breakout_min_relative_volume", 0.5, 10, "strategy")
-    # Compared against a funding rate normalized to an 8h equivalent, so an
-    # instrument settling every 4h is not held to a bar twice as strict in
-    # economic terms as one settling every 8h.
-    _number(strategy, "funding_extreme_pct_per_8h", 0, 1, "strategy")
-    fixed_rr = _number(
-        strategy, "fixed_reward_risk", 1, 10, "strategy")
-    extended_rr = _number(
-        strategy, "extended_reward_risk", 1, 15, "strategy")
-    if extended_rr < fixed_rr:
-        raise ConfigError(
-            "strategy.extended_reward_risk cannot be below "
-            "fixed_reward_risk")
-    if "forward_horizon_hours" in strategy:
-        horizon = _number(
-            strategy, "forward_horizon_hours", 0.01,
-            spec.max_hold_hours_ceiling, "strategy")
-        if horizon > spec.max_hold_hours_ceiling:
-            raise ConfigError(
-                "strategy.forward_horizon_hours exceeds the registry ceiling")
-    for key in ("flush_min_move_atr", "flush_min_relative_volume"):
-        if key in strategy:
-            _number(strategy, key, 0.01, 20, "strategy")
-    if "flush_min_oi_drop_pct" in strategy:
-        _number(strategy, "flush_min_oi_drop_pct", 0, 100, "strategy")
-    for key in ("carry_percentile", "unwind_percentile"):
-        if key in strategy:
-            _number(strategy, key, 50, 100, "strategy")
-    for key in ("carry_min_samples", "unwind_min_samples"):
-        if key in strategy:
-            _integer(strategy, key, 1, 10_000, "strategy")
-    if "trend_min_range_pos_pct" in strategy:
-        _number(strategy, "trend_min_range_pos_pct", 50, 100, "strategy")
-    if "trend_max_atr_ratio" in strategy:
-        _number(strategy, "trend_max_atr_ratio", 0.01, 20, "strategy")
-    if "ls_high_percentile" in strategy:
-        _number(strategy, "ls_high_percentile", 50, 100, "strategy")
-    if "ls_low_percentile" in strategy:
-        _number(strategy, "ls_low_percentile", 0, 50, "strategy")
-    if ("ls_high_percentile" in strategy and "ls_low_percentile" in strategy
-            and float(strategy["ls_low_percentile"])
-            >= float(strategy["ls_high_percentile"])):
-        raise ConfigError(
-            "strategy.ls_low_percentile must be below ls_high_percentile")
-    if "scalp_max_spread_pct" in strategy:
-        _number(strategy, "scalp_max_spread_pct", 0.000001, 2, "strategy")
-    if "scalp_min_abs_imbalance" in strategy:
-        _number(strategy, "scalp_min_abs_imbalance", 0, 1, "strategy")
-    if "scalp_min_depth_usd" in strategy:
-        _number(strategy, "scalp_min_depth_usd", 0, 1_000_000_000,
-                "strategy")
-    if (float(strategy["setup_memory_hours"]) * 60
-            < float(strategy["setup_cooldown_minutes"])):
-        raise ConfigError(
-            "strategy.setup_memory_hours must cover setup_cooldown_minutes")
-
-    universe = _mapping(cfg.get("universe"), "universe")
-    _keys(universe, {"top_n", "min_24h_quote_volume_usd",
-                     "min_history_candles", "denylist",
-                     "refresh_minutes"}, "universe")
-    _integer(universe, "top_n", 1, 100, "universe")
-    _number(universe, "min_24h_quote_volume_usd", 0, 1e15, "universe")
-    _integer(universe, "min_history_candles", 60, 1000, "universe")
-    _number(universe, "refresh_minutes", 1, 1440, "universe")
-    denylist = universe.get("denylist")
-    if not isinstance(denylist, list) or not all(isinstance(x, str) for x in denylist):
-        raise ConfigError("universe.denylist must be a list of symbols")
-
-    cycle = _mapping(cfg.get("cycle"), "cycle")
-    _keys(cycle, {"interval_seconds", "decision_interval_seconds",
-                  "candles", "timeframes"}, "cycle")
-    _integer(cycle, "interval_seconds", 30, 86400, "cycle")
-    # Absent means decisions run at the housekeeping cadence.
-    if cycle.get("decision_interval_seconds") is not None:
-        _integer(cycle, "decision_interval_seconds", 30, 86400, "cycle")
-        if (cycle["decision_interval_seconds"]
-                < cycle["interval_seconds"]):
-            raise ConfigError(
-                "cycle.decision_interval_seconds cannot be below "
-                "cycle.interval_seconds: the decision cadence is a multiple "
-                "of the housekeeping cadence, never a fraction of it")
-        if (int(cycle["decision_interval_seconds"])
-                % int(cycle["interval_seconds"]) != 0):
-            raise ConfigError(
-                "cycle.decision_interval_seconds must be an exact multiple "
-                "of cycle.interval_seconds")
-    _integer(cycle, "candles", 60, 1000, "cycle")
-    timeframes = cycle.get("timeframes")
-    if not isinstance(timeframes, list) or not all(
-            isinstance(x, str) and x for x in timeframes):
-        raise ConfigError("cycle.timeframes must be a non-empty list of strings")
-    missing = [tf for tf in spec.required_timeframes if tf not in timeframes]
-    if missing and not allow_shadow_strategy:
-        raise ConfigError(
-            f"cycle.timeframes must include {', '.join(spec.required_timeframes)} "
-            f"for strategy.id {spec.id!r} (missing: {', '.join(missing)})")
-    if int(universe["min_history_candles"]) > int(cycle["candles"]):
-        raise ConfigError(
-            "universe.min_history_candles cannot exceed cycle.candles")
-    if strategy["signal_timeframe"] != spec.signal_timeframe:
-        raise ConfigError(
-            f"strategy.signal_timeframe must be exactly "
-            f"{spec.signal_timeframe!r} for strategy.id {spec.id!r}")
-    if (strategy["signal_timeframe"] not in timeframes
-            and not allow_shadow_strategy):
-        raise ConfigError(
-            "strategy.signal_timeframe must appear in cycle.timeframes")
-
-    # A named semantic variant is immutable.  Check it after normal field
-    # validation so a malformed number gets the precise config error above,
-    # while a stale 70/30 or payoff value is attributed to the exact variant
-    # rather than silently scored under the registered base contract.
-    if strategy.get("variant_id"):
-        try:
-            validate_contract_config(cfg)
-        except (KeyError, ValueError) as exc:
-            raise ConfigError(str(exc)) from None
-
-    risk = _mapping(cfg.get("risk"), "risk")
-    _keys(risk, {"max_leverage", "entry_leverage", "risk_per_trade_pct",
-                 "experimental_risk_per_trade_pct",
-                 "max_total_open_risk_pct",
-                 "max_position_notional_pct", "max_gross_exposure_pct",
-                 "max_net_direction_pct", "max_btc_beta_exposure_pct",
-                 "min_btc_beta_samples", "max_concurrent_positions",
-                 "max_same_direction_positions",
-                 "max_setups_firing_for_entry",
-                 "min_confidence", "max_hold_hours", "daily_loss_limit_pct",
-                 "flatten_on_daily_stop", "max_drawdown_pct",
-                 "max_margin_usage_pct", "min_maintenance_margin_ratio",
-                 "min_stop_liquidation_buffer_pct",
-                 "cooldown_minutes_after_loss"},
-          "risk")
-    _integer(risk, "max_leverage", 1, 10, "risk")
-    _integer(risk, "entry_leverage", 1, 10, "risk")
-    if int(risk["entry_leverage"]) > int(risk["max_leverage"]):
-        raise ConfigError(
-            "risk.entry_leverage cannot exceed risk.max_leverage")
-    _number(risk, "risk_per_trade_pct", 0.01, 5, "risk")
-    _number(risk, "experimental_risk_per_trade_pct", 0.01, 5, "risk")
-    if (float(risk["experimental_risk_per_trade_pct"])
-            > float(risk["risk_per_trade_pct"])):
-        raise ConfigError(
-            "risk.experimental_risk_per_trade_pct cannot exceed "
-            "risk_per_trade_pct")
-    _number(risk, "max_total_open_risk_pct", 0.1, 20, "risk")
-    _number(risk, "max_position_notional_pct", 1, 100, "risk")
-    _number(risk, "max_gross_exposure_pct", 1, 300, "risk")
-    _number(risk, "max_net_direction_pct", 1, 300, "risk")
-    _number(risk, "max_btc_beta_exposure_pct", 1, 300, "risk")
-    _integer(risk, "min_btc_beta_samples", 0, 200, "risk")
-    _integer(risk, "max_concurrent_positions", 1, 20, "risk")
-    _integer(risk, "max_same_direction_positions", 1, 20, "risk")
-    if (int(risk["max_same_direction_positions"])
-            > int(risk["max_concurrent_positions"])):
-        raise ConfigError(
-            "risk.max_same_direction_positions cannot exceed "
-            "max_concurrent_positions")
-    # Simultaneous setups are one market-wide move expressed many ways. This
-    # is the count of instruments whose contract fires in a cycle, above
-    # which no new entry is allowed at all.
-    _integer(risk, "max_setups_firing_for_entry", 1, 100, "risk")
-    _number(risk, "min_confidence", 0, 1, "risk")
-    # Holding time is a property of the strategy, not a free parameter. The
-    # ceiling comes from the registered spec, so a day-trading contract still
-    # cannot be turned into a multi-day one by nudging a number - but a
-    # strategy that is genuinely multi-day (carry, multi-week trend) declares
-    # its own ceiling instead of being blocked by the momentum-era 48h limit.
-    _number(risk, "max_hold_hours", 0.25, spec.max_hold_hours_ceiling, "risk")
-    # A discretionary-close floor above the force-close ceiling would trap
-    # every position until the clock closed it at whatever price was
-    # available, which is the opposite of what the floor is for.
-    if (float(strategy["min_hold_minutes"])
-            >= float(risk["max_hold_hours"]) * 60):
-        raise ConfigError(
-            "strategy.min_hold_minutes must be below risk.max_hold_hours "
-            "expressed in minutes, otherwise no model close is ever "
-            "permitted before the max-hold timer fires")
-    _number(risk, "daily_loss_limit_pct", 0.1, 20, "risk")
-    _boolean(risk, "flatten_on_daily_stop", "risk")
-    _number(risk, "max_drawdown_pct", 1, 50, "risk")
-    _number(risk, "max_margin_usage_pct", 1, 95, "risk")
-    _number(risk, "min_maintenance_margin_ratio", 1.01, 100, "risk")
-    _number(risk, "min_stop_liquidation_buffer_pct", 0.1, 50, "risk")
-    _number(risk, "cooldown_minutes_after_loss", 0, 10080, "risk")
-    if (float(risk["max_total_open_risk_pct"])
-            > float(risk["daily_loss_limit_pct"])):
-        raise ConfigError(
-            "risk.max_total_open_risk_pct cannot exceed "
-            "daily_loss_limit_pct")
-    if float(risk["max_net_direction_pct"]) > float(risk["max_gross_exposure_pct"]):
-        raise ConfigError("risk.max_net_direction_pct cannot exceed max_gross_exposure_pct")
-
-    # A fully loaded book must not sit on top of the margin guard.
-    #
-    # Initial margin per position is max_position_notional_pct / entry_leverage
-    # of equity, and the guard compares total initial margin against
-    # mark-to-market equity. If a full book already uses the whole allowance,
-    # any unrealized loss pushes usage past the threshold and the engine
-    # force-closes its largest position for margin reasons rather than
-    # strategy ones - a realized loss plus a taker round trip caused purely by
-    # configuration arithmetic.
-    #
-    # Requiring 20% headroom means the book can lose about a fifth of its
-    # value before the guard engages, because usage grows as M / (1 - loss).
-    full_book_margin_pct = (
-        int(risk["max_concurrent_positions"])
-        * float(risk["max_position_notional_pct"])
-        / int(risk["entry_leverage"])
-    )
-    margin_ceiling_pct = float(risk["max_margin_usage_pct"]) * 0.8
-    if full_book_margin_pct > margin_ceiling_pct:
-        raise ConfigError(
-            "a full book would use "
-            f"{full_book_margin_pct:.1f}% initial margin "
-            f"({risk['max_concurrent_positions']} positions x "
-            f"{float(risk['max_position_notional_pct']):g}% notional / "
-            f"{risk['entry_leverage']}x leverage), which leaves no safe "
-            f"headroom under risk.max_margin_usage_pct="
-            f"{float(risk['max_margin_usage_pct']):g}%. Keep it at or below "
-            f"{margin_ceiling_pct:.1f}% by lowering "
-            "risk.max_position_notional_pct or risk.max_concurrent_positions, "
-            "or by raising risk.max_margin_usage_pct")
-
-    execution = _mapping(cfg.get("execution"), "execution")
-    _keys(execution, {"maker_first_enabled", "maker_first_wait_seconds",
-                      "slippage_guard_pct", "max_spread_pct",
-                      "max_order_book_slippage_pct",
-                      "max_market_data_age_seconds", "fill_timeout_seconds",
-                      "paper_maker_fill_penetration_bps",
-                      "paper_maker_order_ttl_seconds",
-                      "liquidity_feedback_ttl_minutes",
-                      "liquidity_retries_before_backoff",
-                      "liquidity_backoff_minutes",
-                      "liquidity_depth_buffer_pct",
-                      "entry_failure_backoff_minutes",
-                      "entry_failure_backoff_max_minutes",
-                      "entry_failure_ttl_minutes"},
-          "execution")
-    # Maker-first changes the entry path and must be enabled explicitly.
-    if execution.get("maker_first_enabled") is not None:
-        _boolean(execution, "maker_first_enabled", "execution")
-    else:
-        execution["maker_first_enabled"] = False
-    # Live configuration rejects this demo-only entry path.
-    if cfg.get("mode") == "live" and execution["maker_first_enabled"]:
-        raise ConfigError(
-            "execution.maker_first_enabled is true and mode is live. The "
-            "maker-first entry path is the B7.5 experiment and is validated "
-            "on demo; run `python research.py readiness` and see "
-            "research/plan/maker-first-entry-boundary.md before enabling it "
-            "against real "
-            "capital.")
-    if execution.get("maker_first_wait_seconds") is not None:
-        # Bounded well inside a 15m signal bar. A passive order must resolve
-        # within the bar it was signalled on, or the setup it was based on is
-        # no longer the setup being traded.
-        _number(execution, "maker_first_wait_seconds", 1, 120, "execution")
-    else:
-        execution["maker_first_wait_seconds"] = 20
-    _number(execution, "slippage_guard_pct", 0, 5, "execution")
-    _number(execution, "max_spread_pct", 0.001, 2, "execution")
-    _number(execution, "max_order_book_slippage_pct", 0.001, 5, "execution")
-    _number(execution, "max_market_data_age_seconds", 1, 60, "execution")
-    if execution.get("paper_maker_fill_penetration_bps") is None:
-        execution["paper_maker_fill_penetration_bps"] = 1.0
-    if execution.get("paper_maker_order_ttl_seconds") is None:
-        execution["paper_maker_order_ttl_seconds"] = 120.0
-    _number(execution, "paper_maker_fill_penetration_bps", 0.01, 100,
-            "execution")
-    _number(execution, "paper_maker_order_ttl_seconds", 120, 300,
-            "execution")
-    _number(execution, "fill_timeout_seconds", 1, 60, "execution")
-    _number(execution, "liquidity_feedback_ttl_minutes", 5, 1440,
-            "execution")
-    _integer(execution, "liquidity_retries_before_backoff", 0, 10,
-             "execution")
-    _number(execution, "liquidity_backoff_minutes", 1, 1440, "execution")
-    _number(execution, "liquidity_depth_buffer_pct", 10, 100, "execution")
-    _number(execution, "entry_failure_backoff_minutes", 1, 1440,
-            "execution")
-    _number(execution, "entry_failure_backoff_max_minutes", 1, 10080,
-            "execution")
-    _number(execution, "entry_failure_ttl_minutes", 1, 10080,
-            "execution")
-    if (float(execution["entry_failure_backoff_max_minutes"])
-            < float(execution["entry_failure_backoff_minutes"])):
-        raise ConfigError(
-            "execution.entry_failure_backoff_max_minutes cannot be below "
-            "entry_failure_backoff_minutes")
-    if (float(execution["entry_failure_ttl_minutes"])
-            < float(execution["entry_failure_backoff_max_minutes"])):
-        raise ConfigError(
-            "execution.entry_failure_ttl_minutes cannot be below "
-            "entry_failure_backoff_max_minutes")
-    if (float(execution["max_spread_pct"])
-            > float(execution["max_order_book_slippage_pct"]) * 2):
-        raise ConfigError(
-            "execution.max_spread_pct cannot exceed twice "
-            "max_order_book_slippage_pct")
-
-    costs = _mapping(cfg.get("trading_costs"), "trading_costs")
-    _keys(costs, {"taker_fee_pct_per_side", "expected_stop_slippage_pct",
-                  "expected_funding_intervals_held", "expected_hold_hours",
-                  "fee_divergence_tolerance_pct"},
-          "trading_costs")
-    _number(costs, "taker_fee_pct_per_side", 0, 1, "trading_costs")
-    # Absent uses fee_divergence()'s compatibility default.
-    if "fee_divergence_tolerance_pct" in costs:
-        _number(costs, "fee_divergence_tolerance_pct", 1, 100,
-                "trading_costs")
-    _number(costs, "expected_stop_slippage_pct", 0, 5, "trading_costs")
-    _number(costs, "expected_funding_intervals_held", 0, 24, "trading_costs")
-    _number(costs, "expected_hold_hours", 0, 168, "trading_costs")
-
-    alerts = _mapping(cfg.get("alerts"), "alerts")
-    _keys(alerts, {"enabled", "webhook_url_env", "format", "minimum_level",
-                   "timeout_seconds"}, "alerts")
-    _boolean(alerts, "enabled", "alerts")
-    env_name = alerts.get("webhook_url_env")
-    if not isinstance(env_name, str) or not env_name.strip():
-        raise ConfigError("alerts.webhook_url_env must be a non-empty string")
-    if alerts.get("format") not in {"generic", "slack", "discord"}:
-        raise ConfigError("alerts.format must be generic, slack, or discord")
-    if alerts.get("minimum_level") not in {"warning", "error", "critical"}:
-        raise ConfigError("alerts.minimum_level must be warning, error, or critical")
-    _number(alerts, "timeout_seconds", 1, 30, "alerts")
-
-    # Absent means shadow evaluation is a complete no-op.
-    research = cfg.get("research")
-    if research is not None:
-        research = _mapping(research, "research")
-        _keys(research, {"shadow_enabled", "shadow_variants",
-                         "shadow_budget_ms",
-                         "shadow_workers",
-                         "experiment_candidate_batch_size",
-                         "collector",
-                         "discovery",
-                         "findings_store", "backup_target",
-                         # Optional. Machine-authored mechanisms live in a
-                         # separate append-only store so a proposed claim can
-                         # never be confused with a hand-registered one.
-                         "staging_store",
-                         "staging_handoff_dir", "staging_max_active",
-                         "staging_lifecycle", "staging_refinement",
-                         "paper_initial_balance_usdt",
-                         "paper_max_failures", "paper_min_closed_trades",
-                         "experiment_min_duration_days",
-                         "experiment_min_observations",
-                         "forward_feed_version"},
-              "research")
-        _boolean(research, "shadow_enabled", "research")
-        _number(research, "shadow_budget_ms", 0, 60_000, "research")
-        if "shadow_workers" in research:
-            _integer(research, "shadow_workers", 1, 32, "research")
-        if "experiment_candidate_batch_size" in research:
-            _integer(research, "experiment_candidate_batch_size", 1, 8,
-                     "research")
-        if "collector" in research:
-            collector = _mapping(research["collector"],
-                                 "research.collector")
-            _keys(collector, {
-                "enabled", "out", "top_n", "min_volume_usd",
-                "book_interval_seconds", "hourly_interval_seconds",
-                "refresh_minutes", "workers",
-            }, "research.collector")
-            if "enabled" in collector:
-                _boolean(collector, "enabled", "research.collector")
-            if "out" in collector and (
-                    not isinstance(collector["out"], str)
-                    or not collector["out"].strip()):
-                raise ConfigError(
-                    "research.collector.out must be a path string")
-            if "top_n" in collector:
-                _integer(collector, "top_n", 1, 500,
-                         "research.collector")
-            if "min_volume_usd" in collector:
-                _number(collector, "min_volume_usd", 0, 1_000_000_000_000,
-                        "research.collector")
-            if "book_interval_seconds" in collector:
-                _integer(collector, "book_interval_seconds", 1, 86_400,
-                         "research.collector")
-            if "hourly_interval_seconds" in collector:
-                _integer(collector, "hourly_interval_seconds", 60,
-                         7 * 86_400, "research.collector")
-            if "refresh_minutes" in collector:
-                _integer(collector, "refresh_minutes", 1, 7 * 24 * 60,
-                         "research.collector")
-            if "workers" in collector:
-                _integer(collector, "workers", 1, 32,
-                         "research.collector")
-        discovery = research.get("discovery")
-        if discovery is None:
-            discovery = {}
-        else:
-            discovery = _mapping(discovery, "research.discovery")
-        _keys(discovery, {
-            "enabled", "max_rows", "max_nodes", "max_depth", "max_window",
-            "discovery_artifacts", "discovery_results",
-        }, "research.discovery")
-        discovery.setdefault("enabled", True)
-        discovery.setdefault("max_rows", 50_000)
-        discovery.setdefault("max_nodes", 32)
-        discovery.setdefault("max_depth", 8)
-        discovery.setdefault("max_window", 256)
-        discovery.setdefault("discovery_artifacts",
-                             "research/results/discovery-artifacts")
-        discovery.setdefault("discovery_results", "research/results/discovery")
-        _boolean(discovery, "enabled", "research.discovery")
-        _integer(discovery, "max_rows", 1, 50_000, "research.discovery")
-        _integer(discovery, "max_nodes", 1, 32, "research.discovery")
-        _integer(discovery, "max_depth", 1, 8, "research.discovery")
-        _integer(discovery, "max_window", 1, 256, "research.discovery")
-        for key in ("discovery_artifacts", "discovery_results"):
-            if not isinstance(discovery[key], str) or not discovery[key].strip():
-                raise ConfigError(f"research.discovery.{key} must be a path string")
-        research["discovery"] = discovery
-        if "paper_initial_balance_usdt" in research:
-            _number(research, "paper_initial_balance_usdt", 100,
-                    1_000_000_000, "research")
-        if "paper_max_failures" in research:
-            _integer(research, "paper_max_failures", 1, 1_000, "research")
-        if "paper_min_closed_trades" in research:
-            _integer(research, "paper_min_closed_trades", 1, 100_000,
-                     "research")
-        if "experiment_min_duration_days" in research:
-            days = _integer(research, "experiment_min_duration_days", 1, 365,
-                            "research")
-            # The final 30% must contain the protocol's minimum cluster count;
-            # shorter assignments can only return INCONCLUSIVE.
-            from research.protocol import (MIN_BOOTSTRAP_CLUSTERS,
-                                           PAIR_CLUSTER_SECONDS)
-            minimum_days = math.ceil(
-                MIN_BOOTSTRAP_CLUSTERS * PAIR_CLUSTER_SECONDS
-                / 0.30 / 86_400)
-            if days < minimum_days:
-                raise ConfigError(
-                    f"research.experiment_min_duration_days must be at least "
-                    f"{minimum_days}: the confirmation window is 30% of the "
-                    f"assignment and needs {MIN_BOOTSTRAP_CLUSTERS} distinct "
-                    f"{PAIR_CLUSTER_SECONDS // 3600}h episodes, so a shorter "
-                    f"assignment can only ever return INCONCLUSIVE")
-        if "experiment_min_observations" in research:
-            _integer(research, "experiment_min_observations", 1, 100_000,
-                     "research")
-        if "forward_feed_version" in research:
-            _integer(research, "forward_feed_version", 1, 1_000,
-                     "research")
-        if "staging_max_active" in research:
-            _integer(research, "staging_max_active", 1, 256, "research")
-        else:
-            # Keep every staging-store caller on one explicit validated
-            # budget, including configs written before bounded staging.
-            research["staging_max_active"] = 32
-        lifecycle = research.get("staging_lifecycle")
-        if lifecycle is None:
-            lifecycle = {}
-        else:
-            lifecycle = _mapping(lifecycle, "research.staging_lifecycle")
-        _keys(lifecycle, {
-            "never_fired_decisions", "never_fired_max_age_hours",
-            "no_observation_max_age_hours", "starved_max_age_hours",
-            "starved_fraction",
-        }, "research.staging_lifecycle")
-        lifecycle.setdefault("never_fired_decisions", 2_000)
-        lifecycle.setdefault("never_fired_max_age_hours", 7 * 24)
-        lifecycle.setdefault("no_observation_max_age_hours", 3 * 24)
-        lifecycle.setdefault("starved_max_age_hours", 3 * 24)
-        lifecycle.setdefault("starved_fraction", 0.5)
-        _integer(lifecycle, "never_fired_decisions", 1, 10_000_000,
-                 "research.staging_lifecycle")
-        for key in ("never_fired_max_age_hours",
-                    "no_observation_max_age_hours",
-                    "starved_max_age_hours"):
-            _number(lifecycle, key, 1, 365 * 24,
-                    "research.staging_lifecycle")
-        _number(lifecycle, "starved_fraction", 0.01, 1,
-                "research.staging_lifecycle")
-        research["staging_lifecycle"] = lifecycle
-
-        refinement = research.get("staging_refinement")
-        if refinement is None:
-            refinement = {}
-        else:
-            refinement = _mapping(
-                refinement, "research.staging_refinement")
-        _keys(refinement, {
-            "max_attempts", "max_variants_per_attempt",
-            "max_configurations_per_mechanism", "relative_step",
-        }, "research.staging_refinement")
-        # One retry of at most two one-dimensional neighbours is the shipped
-        # ceiling. Operators may turn it off, but cannot configure a grid.
-        refinement.setdefault("max_attempts", 1)
-        refinement.setdefault("max_variants_per_attempt", 2)
-        refinement.setdefault("max_configurations_per_mechanism", 5)
-        refinement.setdefault("relative_step", 0.10)
-        _integer(refinement, "max_attempts", 0, 2,
-                 "research.staging_refinement")
-        _integer(refinement, "max_variants_per_attempt", 1, 2,
-                 "research.staging_refinement")
-        _integer(refinement, "max_configurations_per_mechanism", 1, 16,
-                 "research.staging_refinement")
-        _number(refinement, "relative_step", 0.001, 0.5,
-                "research.staging_refinement")
-        if (refinement["max_configurations_per_mechanism"]
-                < 1 + refinement["max_variants_per_attempt"]):
-            raise ConfigError(
-                "research.staging_refinement."
-                "max_configurations_per_mechanism must cover the root plus "
-                "max_variants_per_attempt")
-        if (research["staging_max_active"]
-                < 1 + refinement["max_variants_per_attempt"]):
-            raise ConfigError(
-                "research.staging_max_active must cover one initial "
-                "configuration neighborhood")
-        research["staging_refinement"] = refinement
-        findings_store = research.get("findings_store")
-        if findings_store is not None and (
-                not isinstance(findings_store, str)
-                or not findings_store.strip()):
-            raise ConfigError("research.findings_store must be a path string")
-        backup_target = research.get("backup_target")
-        if backup_target is not None and (
-                not isinstance(backup_target, str)
-                or not backup_target.strip()):
-            raise ConfigError("research.backup_target must be a path string")
-        handoff_dir = research.get("staging_handoff_dir")
-        if handoff_dir is not None and (
-                not isinstance(handoff_dir, str)
-                or not handoff_dir.strip()):
-            raise ConfigError(
-                "research.staging_handoff_dir must be a path string")
-        for key in ("shadow_variants",):
-            names = research.get(key)
-            if names is None:
-                research[key] = []
-                continue
-            if not isinstance(names, list) or not all(
-                    isinstance(n, str) and n.strip() for n in names):
-                raise ConfigError(
-                    f"research.{key} must be a list of variant id strings")
-        cfg["research"] = research
-
-    return cfg
+        import yaml
+    except ImportError as exc:
+        raise ConfigError("PyYAML is required to load YAML configuration files") from exc
+    with open(path, encoding="utf-8") as handle:
+        return validate_config(yaml.safe_load(handle) or {})

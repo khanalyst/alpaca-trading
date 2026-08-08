@@ -15,13 +15,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import yaml
-
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from deploy import health
+from deploy import health, load_config
 
 
 SAFE_STATE_FIELDS = (
@@ -99,144 +97,6 @@ def _performance(path: Path) -> dict:
         return {"available": False, "reason": type(exc).__name__}
 
 
-def _readiness(path: Path, config: dict) -> dict:
-    if not path.is_file():
-        return {"available": False, "gates": [], "stats": {}}
-    try:
-        from research import readiness
-        gates, stats = readiness.report(path, config)
-        return {
-            "available": True,
-            "gates": [
-                {"name": gate.name, "title": gate.title,
-                 "status": gate.status, "detail": gate.detail,
-                 "next_step": gate.next_step, "blocks": gate.blocks}
-                for gate in gates
-            ],
-            "stats": stats,
-        }
-    except Exception as exc:                               # noqa: BLE001
-        return {"available": False, "gates": [], "stats": {},
-                "reason": type(exc).__name__}
-
-
-def _findings(path: Path) -> dict:
-    result = {
-        "available": False, "assignments": [], "outcomes": [],
-        "review_attempts": [], "backup": None,
-    }
-    if not path.is_file():
-        return result
-    try:
-        with _ro_connect(path) as connection:
-            tables = _tables(connection)
-            if {"strategy_experiment_assignments",
-                    "strategy_experiment_assignment_events"} <= tables:
-                rows = connection.execute("""
-                    SELECT assignment.assignment_id, assignment.strategy_id,
-                           assignment.baseline_variant_id,
-                           assignment.candidate_variant_id,
-                           assignment.started_ts,
-                           assignment.minimum_duration_seconds,
-                           assignment.minimum_observations,
-                           event.status, event.event_ts,
-                           (SELECT COUNT(*) FROM
-                                strategy_experiment_observations AS observation
-                            WHERE observation.assignment_id=
-                                assignment.assignment_id) AS observed_count
-                    FROM strategy_experiment_assignments AS assignment
-                    JOIN strategy_experiment_assignment_events AS event
-                      ON event.rowid=(
-                        SELECT latest.rowid
-                        FROM strategy_experiment_assignment_events AS latest
-                        WHERE latest.assignment_id=assignment.assignment_id
-                        ORDER BY latest.event_ts DESC, latest.rowid DESC LIMIT 1)
-                    ORDER BY assignment.started_ts DESC LIMIT 50
-                """).fetchall()
-                result["assignments"] = [dict(row) for row in rows]
-            if "experiment_outcomes" in tables:
-                rows = connection.execute("""
-                    SELECT outcome_id, assignment_id, strategy_id,
-                           baseline_variant_id, candidate_variant_id,
-                           terminal_status, verdict, created_ts, payload_hash
-                    FROM experiment_outcomes
-                    ORDER BY created_ts DESC LIMIT 50
-                """).fetchall()
-                result["outcomes"] = [dict(row) for row in rows]
-            if "experiment_review_attempts" in tables:
-                rows = connection.execute("""
-                    SELECT attempt_id, outcome_id, requested_ts, completed_ts,
-                           provider, model_id, prompt_version, parse_error,
-                           status
-                    FROM experiment_review_attempts
-                    ORDER BY completed_ts DESC, attempt_id DESC LIMIT 50
-                """).fetchall()
-                result["review_attempts"] = [dict(row) for row in rows]
-            if {"backup_runs", "backup_run_events"} <= tables:
-                row = connection.execute("""
-                    SELECT run.backup_id, run.started_ts, run.target_kind,
-                           run.require_external, event.status,
-                           event.event_ts AS status_ts
-                    FROM backup_runs AS run
-                    JOIN backup_run_events AS event ON event.rowid=(
-                        SELECT latest.rowid FROM backup_run_events AS latest
-                        WHERE latest.backup_id=run.backup_id
-                        ORDER BY latest.event_ts DESC, latest.rowid DESC LIMIT 1)
-                    ORDER BY run.started_ts DESC LIMIT 1
-                """).fetchone()
-                if row:
-                    result["backup"] = {
-                        **dict(row),
-                        "different_device_claimed": (
-                            row["target_kind"] == "external_mounted"),
-                        # The application has no independent remote-storage
-                        # attestation. A container mount boundary is not proof
-                        # that the copy survives deletion of the VM.
-                        "off_host_verified": False,
-                        "off_host_note": (
-                            "A different-device/container mount is not proof "
-                            "that this backup survives VM deletion."),
-                    }
-        result["available"] = True
-    except Exception as exc:                               # noqa: BLE001
-        result["reason"] = type(exc).__name__
-    return result
-
-
-def _authoring(path: Path) -> dict:
-    """Safe authoring audit projection; prompts and raw output stay in SQLite."""
-    result = {"available": False, "attempts": []}
-    if not path.is_file():
-        return result
-    try:
-        with _ro_connect(path) as connection:
-            if "authoring_attempts" not in _tables(connection):
-                return result
-            rows = connection.execute("""
-                SELECT attempt_id, generation, requested_ts, completed_ts,
-                       provider, model_id, prompt_version, request_hash,
-                       context_hash, evidence_hash, parser_status,
-                       validation_status, error, status,
-                       returned_contract_ids_json,
-                       accepted_contract_ids_json, rejections_json
-                FROM authoring_attempts
-                ORDER BY completed_ts DESC, attempt_id DESC LIMIT 50
-            """).fetchall()
-            for row in rows:
-                item = dict(row)
-                item["returned_contract_ids"] = json.loads(
-                    item.pop("returned_contract_ids_json"))
-                item["accepted_contract_ids"] = json.loads(
-                    item.pop("accepted_contract_ids_json"))
-                item["rejection_count"] = len(json.loads(
-                    item.pop("rejections_json")))
-                result["attempts"].append(item)
-        result["available"] = True
-    except Exception as exc:                               # noqa: BLE001
-        result["reason"] = type(exc).__name__
-    return result
-
-
 def _reports(root: Path) -> list[dict]:
     candidates = set((root / "findings").glob("**/*.md"))
     candidates.update((root / "research" / "results").glob("**/REPORT.md"))
@@ -259,7 +119,7 @@ def _safe_heartbeat(path: Path) -> dict:
         "strategy_id", "strategy_version", "research_expected",
         "research_available", "research_status", "research_failure_count",
         "research_consecutive_failures", "research_last_failure",
-        "research_last_success_ts", "strategy_shadow_errors",
+        "research_last_success_ts",
         "trading_state", "last_cycle_ts",
         "last_cycle_error", "stop_reason", "next_run_ts", "last_run_date",
         "last_exit_code", "started_ts", "completed_ts", "job_id",
@@ -272,21 +132,11 @@ def _safe_heartbeat(path: Path) -> dict:
 
 def snapshot(root: Path) -> dict:
     config_path = root / "config.yaml"
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    mode = str(config.get("mode") or "_unconfigured")
+    config = load_config(config_path)
+    mode = str(config.get("mode") or "paper").lower()
     runtime = root / "runtime"
     journal = runtime / mode / "journal.db"
     recorder_path = runtime / "research" / "recorded"
-    research_config = config.get("research") or {}
-
-    def configured_path(key: str, default: str) -> Path:
-        path = Path(research_config.get(key) or default)
-        return path if path.is_absolute() else root / path
-
-    findings_path = configured_path(
-        "findings_store", "research/cache/findings.db")
-    staging_path = configured_path(
-        "staging_store", "research/cache/staging.db")
     trader_heartbeat = runtime / mode / "heartbeat.json"
     research_heartbeat = runtime / "health" / "research.json"
     cycle_seconds = float(config.get("cycle", {}).get("interval_seconds") or 60)
@@ -303,8 +153,7 @@ def snapshot(root: Path) -> dict:
             key: config.get("cycle", {}).get(key)
             for key in ("interval_seconds", "decision_interval_seconds")
         },
-        "research_feed_version": config.get("research", {}).get(
-            "forward_feed_version"),
+        "research_feed_version": None,
         "trader": {
             "health": health.trader(trader_heartbeat, trader_max_age),
             "heartbeat": _safe_heartbeat(trader_heartbeat),
@@ -312,20 +161,22 @@ def snapshot(root: Path) -> dict:
         },
         "recorder": health.recorder(recorder_path, 900),
         "research_service": {
-            "health": health.research(research_heartbeat, 180),
+            "health": (
+                health.research(research_heartbeat, 180)
+                if research_heartbeat.exists() else {
+                    "ok": True, "component": "research", "status": "disabled",
+                    "optional": True, "fresh": False, "hung": False,
+                    "structured_failures": [],
+                }),
             "heartbeat": _safe_heartbeat(research_heartbeat),
         },
-        # Readiness reconstructs the corpus and is intentionally not executed
-        # on every browser refresh. Operational state remains uncached.
-        "readiness": _cached(
-            f"readiness:{journal}", 300, lambda: _readiness(journal, config)),
         "performance": _cached(
             f"performance:{journal}", 30, lambda: _performance(journal)),
-        "research": _cached(
-            f"findings:{findings_path}", 30, lambda: _findings(findings_path)),
-        "authoring": _cached(
-            f"authoring:{staging_path}", 30,
-            lambda: _authoring(staging_path)),
+        "research": {
+            "available": False,
+            "optional": True,
+            "note": "offline research is dataset-gated; no promotion metrics are computed",
+        },
         "reports": _cached(
             f"reports:{root}", 30, lambda: _reports(root)),
     }
@@ -347,7 +198,7 @@ def report_file(root: Path, relative: str) -> tuple[str, str]:
 HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OKX Agent — read-only state</title>
+<title>Alpaca Agent — read-only state</title>
 <style>
 :root{color-scheme:dark;font:14px system-ui,sans-serif;background:#0b1020;color:#e7ecf7}
 body{margin:0 auto;max-width:1440px;padding:24px}h1{margin:0 0 4px}.muted{color:#9aa7bd}
@@ -358,7 +209,7 @@ body{margin:0 auto;max-width:1440px;padding:24px}h1{margin:0 0 4px}.muted{color:
 th,td{text-align:left;padding:6px;border-bottom:1px solid #28334b}button{background:#263652;color:#e7ecf7;border:0;border-radius:6px;padding:6px 9px;cursor:pointer}
 pre{white-space:pre-wrap;max-height:70vh;overflow:auto;background:#090d18;padding:12px;border-radius:8px}
 </style></head><body>
-<h1>OKX agent</h1><div class="muted">Read-only operational view. Auto-refreshes every 30 seconds.</div>
+<h1>Alpaca agent</h1><div class="muted">Read-only operational view. Auto-refreshes every 30 seconds.</div>
 <div id="error" class="bad"></div><main class="grid" id="cards"></main>
 <script>
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
@@ -370,15 +221,9 @@ async function showReport(path){const r=await fetch('/api/report?path='+encodeUR
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
  let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'research feed','v'+d.research_feed_version);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'research attached',d.trader.heartbeat.research_available,good(d.trader.heartbeat.research_available));row(c,'research state',d.trader.heartbeat.research_status,good(d.trader.heartbeat.research_status==='healthy'||d.trader.heartbeat.research_status==='disabled'));
  c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
- c=card('Performance');row(c,'available',d.performance.available,good(d.performance.available));row(c,'round trips',d.performance.round_trips);row(c,'expectancy R',d.performance.overall?.expectancy_r);row(c,'total R',d.performance.overall?.total_r);row(c,'max drawdown R',d.performance.overall?.max_drawdown_r);
- c=card('Backup');const b=d.research.backup||{};row(c,'latest status',b.status||'none',good(b.status==='VERIFIED'));row(c,'target class',b.target_kind);row(c,'different device claimed',b.different_device_claimed);row(c,'off-host verified',b.off_host_verified,'warn');c.append(el('p',b.off_host_note||'No backup evidence yet.','muted'));
- c=card('Readiness',true);table(c,d.readiness.gates||[],['name','status','title','detail']);
+ c=card('Paper journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
+ c=card('Research');row(c,'status',d.research.optional?'optional / dataset-gated':'disabled');c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
- c=card('Experiment assignments',true);table(c,d.research.assignments||[],['strategy_id','candidate_variant_id','status','observed_count','minimum_observations','started_ts']);
- c=card('Outcomes',true);table(c,d.research.outcomes||[],['strategy_id','candidate_variant_id','verdict','terminal_status','created_ts']);
- c=card('Per-strategy shadow errors',true);const se=d.trader.heartbeat.strategy_shadow_errors||{};table(c,Object.keys(se).map(k=>({strategy_id:k,...se[k]})),['strategy_id','type','error','consecutive_failures','ts']);
- c=card('Authoring attempts',true);table(c,d.authoring.attempts||[],['generation','status','parser_status','validation_status','provider','model_id','accepted_contract_ids','rejection_count','completed_ts']);
- c=card('Review attempts',true);table(c,d.research.review_attempts||[],['outcome_id','status','provider','model_id','parse_error','completed_ts']);
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}
 refresh();setInterval(refresh,30000);

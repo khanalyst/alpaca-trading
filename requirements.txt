@@ -1,4 +1,4 @@
-ccxt==4.5.67
+alpaca-py==0.43.5
 anthropic==0.117.1
 openai==2.46.0
 pandas==3.0.3

@@ -15,9 +15,9 @@ COPY requirements.lock.txt ./requirements.lock.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check \
     -r requirements.lock.txt
 
-RUN groupadd --gid 10001 okx \
+RUN groupadd --gid 10001 alpaca \
     && useradd --uid 10001 --gid 10001 --no-create-home \
-       --home-dir /app --shell /usr/sbin/nologin okx
+       --home-dir /app --shell /usr/sbin/nologin alpaca
 COPY --chown=10001:10001 . /app
 RUN mkdir -p runtime research/cache research/results findings \
     && chown -R 10001:10001 runtime research/cache research/results findings

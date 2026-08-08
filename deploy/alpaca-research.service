@@ -1,0 +1,23 @@
+[Unit]
+Description=Alpaca intraday research cycle
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=alpaca
+Group=alpaca
+WorkingDirectory=/opt/alpaca-agent-trading
+EnvironmentFile=-/etc/alpaca-agent-trading/agent.env
+Environment=ALPACA_PAPER=true
+Environment=ALPACA_AGENT_SECRETS_FILE=/etc/alpaca-agent-trading/agent.env
+Environment=PYTHON=/opt/alpaca-agent-trading/.venv/bin/python
+ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/scheduler.py --once --root /opt/alpaca-agent-trading --config /opt/alpaca-agent-trading/config.yaml --script /opt/alpaca-agent-trading/deploy/research-cycle.sh --status-file /opt/alpaca-agent-trading/runtime/health/research.json --hour 3 --minute 0 --timeout-seconds 14400
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alpaca-agent-trading/runtime /opt/alpaca-agent-trading/research/cache /opt/alpaca-agent-trading/research/results /opt/alpaca-agent-trading/findings
+TimeoutStartSec=4h10m
+StandardOutput=journal
+StandardError=journal

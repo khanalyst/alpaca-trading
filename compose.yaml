@@ -1,11 +1,11 @@
-name: okx-agent-crypto
+name: alpaca-agent-trading
 
 x-app: &app
-  image: okx-agent-crypto:${OKX_AGENT_IMAGE_TAG:-local}
+  image: alpaca-agent-trading:${ALPACA_AGENT_IMAGE_TAG:-local}
   build:
     context: .
     args:
-      PYTHON_IMAGE: ${OKX_PYTHON_IMAGE:-python:3.13.5-slim-bookworm}
+      PYTHON_IMAGE: ${ALPACA_PYTHON_IMAGE:-python:3.13.5-slim-bookworm}
   user: "10001:10001"
   working_dir: /app
   read_only: true
@@ -25,14 +25,19 @@ x-app: &app
 services:
   recorder:
     <<: *app
-    container_name: okx-recorder
+    container_name: alpaca-recorder
     command:
       - python
-      - research/record_flow.py
+      - deploy/recorder.py
       - --out
       - runtime/research/recorded
-      - --book-interval
-      - ${OKX_RECORDER_INTERVAL_SECONDS:-60}
+      - --interval
+      - ${ALPACA_RECORDER_INTERVAL_SECONDS:-60}
+    environment:
+      ALPACA_PAPER: "true"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
     volumes:
       - runtime-data:/app/runtime
     configs:
@@ -52,10 +57,14 @@ services:
 
   trader:
     <<: *app
-    container_name: okx-trader
+    container_name: alpaca-trader
     command: ["python", "main.py", "run"]
     environment:
-      OKX_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
+      ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
+      ALPACA_PAPER: "true"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -84,7 +93,8 @@ services:
 
   research:
     <<: *app
-    container_name: okx-research
+    profiles: [research]
+    container_name: alpaca-research
     command:
       - python
       - deploy/scheduler.py
@@ -93,9 +103,17 @@ services:
       - --minute
       - "0"
       - --timeout-seconds
-      - ${OKX_RESEARCH_TIMEOUT_SECONDS:-14400}
+      - ${ALPACA_RESEARCH_TIMEOUT_SECONDS:-14400}
+      - --script
+      - deploy/research-cycle.sh
     environment:
-      OKX_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
+      ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
+      ALPACA_PAPER: "true"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
+      ALPACA_RESEARCH_BACKTEST: ${ALPACA_RESEARCH_BACKTEST:-1}
       PYTHON: /usr/local/bin/python
     secrets:
       - source: agent_credentials
@@ -125,10 +143,13 @@ services:
 
   dashboard:
     <<: *app
-    container_name: okx-dashboard
+    container_name: alpaca-dashboard
     command: ["python", "deploy/dashboard.py", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      ALPACA_PAPER: "true"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
     ports:
-      - "127.0.0.1:${OKX_DASHBOARD_PORT:-8080}:8080"
+      - "127.0.0.1:${ALPACA_DASHBOARD_PORT:-8080}:8080"
     configs:
       - source: agent_config
         target: /app/config.yaml
@@ -155,7 +176,7 @@ configs:
 
 secrets:
   agent_credentials:
-    file: ${OKX_AGENT_SECRET_FILE:-.env}
+    file: ${ALPACA_AGENT_SECRET_FILE:-.env}
 
 volumes:
   runtime-data:

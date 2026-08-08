@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/opt/okx-agent-crypto}"
-SECRET_FILE="${OKX_AGENT_SECRET_FILE:-/etc/okx-agent-crypto/agent.env}"
-BACKUP_PATH="${OKX_EXTERNAL_BACKUP_PATH:-}"
+APP_DIR="${APP_DIR:-/opt/alpaca-agent-trading}"
+SECRET_FILE="${ALPACA_AGENT_SECRET_FILE:-/etc/alpaca-agent-trading/agent.env}"
+BACKUP_PATH="${ALPACA_EXTERNAL_BACKUP_PATH:-}"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "Run this helper on the Ubuntu VM, not on the Mac." >&2
@@ -22,17 +22,17 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 2
 fi
 if command -v systemctl >/dev/null 2>&1 && \
-   systemctl is-active --quiet okx-trader.service; then
-  echo "okx-trader.service is active; refusing to start a second trader." >&2
+   systemctl is-active --quiet alpaca-trader.service; then
+  echo "alpaca-trader.service is active; refusing to start a second trader." >&2
   echo "Complete the one-time migration in SETUP.md first." >&2
   exit 3
 fi
 
 cd "$APP_DIR"
-export OKX_AGENT_SECRET_FILE="$SECRET_FILE"
+export ALPACA_AGENT_SECRET_FILE="$SECRET_FILE"
 compose=(docker compose -f compose.yaml)
 if [ -n "$BACKUP_PATH" ]; then
-  export OKX_EXTERNAL_BACKUP_PATH="$BACKUP_PATH"
+  export ALPACA_EXTERNAL_BACKUP_PATH="$BACKUP_PATH"
   compose+=(-f deploy/compose.external-backup.yaml)
 fi
 
@@ -43,4 +43,4 @@ fi
 "${compose[@]}" exec -T trader python main.py check
 "${compose[@]}" ps
 
-echo "Update complete. If status is PAUSED, explicitly run main.py resume."
+echo "Update complete. Keep the trader paper-only and confirm the session-close flatten check."

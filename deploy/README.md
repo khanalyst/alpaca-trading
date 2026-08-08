@@ -1,63 +1,54 @@
 # Deployment topology
 
-Installation, host provisioning, migration, and update commands are the
-authority in [`../SETUP.md`](../SETUP.md). Daily checks, safe restarts, backup,
-and recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). This file records
-which process owns which responsibility and which deployment lanes may coexist.
+Installation is in [`../SETUP.md`](../SETUP.md); operation, backup, and
+recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). This file records
+process ownership and the two supported launch lanes.
 
-## Production Docker Compose
+## Docker Compose (recommended)
 
-[`../compose.yaml`](../compose.yaml) runs four services from one image and one
-locked dependency set on the Ubuntu VM:
+[`../compose.yaml`](../compose.yaml) runs one least-privilege image:
 
 | Service | Responsibility | Durable state |
 | --- | --- | --- |
-| `recorder` | Collects short-retention OKX market observations independently | `runtime-data` volume / recorder output |
-| `trader` | The only order-capable process; exactly one replica; shipped account is demo with `shadow_only` entry behavior | `runtime-data` volume / journal |
-| `research` | Runs `research/nightly.sh`, catches up one missed schedule, ingests `event-plane.v1` before bounded discovery, and writes a new immutable snapshot per run | `runtime-data`, `research-cache`, `research-results`, `findings-reports` |
-| `dashboard` | Read-only health, state, assignments, outcomes, reports, and readiness view | Read-only mounts of the volumes above |
+| `recorder` | Paper/public Alpaca bars, quotes, and session observations | `runtime-data` |
+| `trader` | Exactly one intraday paper loop and broker reconciliation | `runtime-data`, `research-cache` |
+| `research` (profile `research`) | Scheduled offline validation/replay; no broker authority | `runtime-data`, research volumes |
+| `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
-The dashboard binds only to host `127.0.0.1`; use an SSH tunnel or private VPN,
-not a public firewall rule. It receives no credential secret. Named volumes
-survive ordinary `docker compose down`; `down -v`, volume pruning, or a second
-trader can destroy or duplicate operational state and are not update steps.
+All services run as UID/GID 10001, drop Linux capabilities, use a read-only
+root filesystem, and receive only the secret/config mounts they need. The
+dashboard receives no credentials. Health checks monitor recorder freshness,
+trader state, research progress, and dashboard availability. Recorder health is
+reported independently and does not gate trader startup.
 
-Compose has no recorder dependency on `trader` or `research`. Recorder health
-is reported independently because a gap loses short-retention evidence, but it
-does not block runtime startup.
+The research profile is disabled by default because it requires an explicit
+normalized JSONL dataset (`ALPACA_RESEARCH_DATASET`). Start it with
+`docker compose --profile research up -d research` only when that dataset is
+mounted. It cannot place orders or mutate paper state.
 
-The recorder's confirmed `execution_bar_1m` series and funding rows are joined
-into exact-as-of episodes for discovery. Signal features use their own cutoff;
-closed outcome bars use a later bounded cutoff. Incomplete bars cannot become a
-timeout, and discovery remains research-only. `prepare-discovery-handoff`
-writes a content-addressed `HUMAN_DECISION_REQUIRED` packet only; it cannot
-mutate registry, configuration, code, demo, or live authority.
-
-The checkout/build context is `/opt/okx-agent-crypto`. Credentials are outside
-Git at `/etc/okx-agent-crypto/agent.env`. A verified external research backup
-is mounted at `/srv/okx-agent-research-backup` only when the operator has
-provisioned a destination that survives VM loss; a Docker bind mount or a
-different container `st_dev` alone is not off-host proof.
-
-The production VM uses Docker Compose for all four application processes.
-Legacy application systemd units stay disabled; systemd manages Docker and the
-separate `okx-agent-update.timer`/`okx-agent-update.service` updater. The
-updater accepts clean fast-forward changes from GitHub `main`, runs the
-preflight/build flow, and records the successful SHA at
-`/var/lib/okx-agent-updater/deployed-revision`. It must not automatically
-resume a paused trader.
+The Alpaca paper endpoint and feed settings are passed explicitly through
+`ALPACA_PAPER`, `ALPACA_DATA_FEED`, and `ALPACA_OPTIONS_FEED`. Credentials are
+mounted from `ALPACA_AGENT_SECRET_FILE`, never copied into the image. Named
+volumes survive ordinary `docker compose down`; a second trader or `down -v`
+can corrupt/delete operational state.
 
 ## Legacy systemd lane
 
-The unit files remain supported for an existing non-Compose VM only:
+For an existing non-Compose host, install these units as the restricted
+`alpaca` user:
 
-- `okx-recorder.service` — market recorder;
-- `okx-trader.service` — one demo-first order process;
-- `okx-research.service` and `okx-research.timer` — one research cycle and its
-  schedule.
+- `alpaca-recorder.service` — recorder;
+- `alpaca-trader.service` — one paper trader process;
+- `alpaca-research.service` and `alpaca-research.timer` — scheduled research.
 
-Start the recorder early when practical to retain more data; the units do not
-make it a trader/research startup gate. Do not enable this lane on the same VM as
-Compose. Configure `BACKUP_TARGET` and `REQUIRE_EXTERNAL_BACKUP=1` through the
-systemd override described in [`../SETUP.md`](../SETUP.md), and run the
-operational checks in [`../OPERATIONS.md`](../OPERATIONS.md).
+The units are alternatives to Compose. Do not enable both lanes on one host or
+run a second trader against the same paper account. Keep the EnvironmentFile
+outside Git and set `ALPACA_AGENT_SECRETS_FILE` only for the processes that
+need it. Disable the lane before migrating to Compose.
+
+## Backup override
+
+`compose.external-backup.yaml` is optional and only valid when
+`ALPACA_EXTERNAL_BACKUP_PATH` is a verified different-device or off-host mount.
+A normal directory on the VM does not prove recovery from VM loss. See the
+backup verification steps in [`../OPERATIONS.md`](../OPERATIONS.md).

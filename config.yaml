@@ -1,269 +1,56 @@
-# OKX AI Trading Agent configuration. Restart the agent after edits.
+# Lean Alpaca runtime. Paper trading is fail-closed by default.
+mode: paper
 
-mode: demo            # demo | live
-                      # demo uses OKX Demo Trading (paper money). You must create
-                      # SEPARATE demo API keys inside OKX's Demo Trading section.
+broker:
+  paper: true
+  data_feed: iex                 # iex | sip | delayed_sip
+  options_feed: indicative
 
-llm:
-  provider: openai          # anthropic | openai
-  model: gpt-5.6-sol-coding       # e.g. claude-sonnet-4-6, claude-opus-4-8,
-                               #      gpt-4.1, gpt-4o, o4-mini
-  temperature: 0.2             # ignored automatically on models that reject
-                               # sampling params (Sonnet 5, Opus 4.7+, and
-                               # GPT-5.x / o-series reasoning models)
-  max_tokens: 2000
-strategy:
-  # momentum is T0_REJECTED: -8.97% over 2026-07-29..08-05, and the only
-  # strategy the recorded corpus says something significant about (mean
-  # -0.428R over 43 independent 48h episodes, t=-2.45). ls-ratio-fade
-  # remains off the order path. Its 48h model horizon matches
-  # risk.max_hold_hours, it is realtime-eligible, and its contract is complete
-  # for deterministic shadow/replay. This shipped config keeps it
-  # shadow-only pending valid evidence and clean contract/version identity;
-  # mismatched rows are quarantined. Measured at -0.235R over 34 episodes
-  # (t=-1.22) at the registered 80/20 thresholds - not significant, i.e.
-  # unproven rather than rejected, which is the honest status of every
-  # available option.
-  # research/plan/order-path-succession.md holds the full comparison.
-  id: ls-ratio-fade
-  version: v1
-  # This is an explicit, immutable tuning identity.  It is not the registered
-  # 80/20, 3 ATR-extension, 2 ATR/2R base contract.
-  variant_id: ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3
-  # analyst | deterministic | shadow_only.
-  #
-  # A strategy earns promotion on evidence its deterministic contract
-  # produced in a shadow lane, so running it live under an analyst would
-  # trade something other than the thing that earned the promotion.
-  # `deterministic` remains a future explicitly authorized mode. When
-  # authorized, it removes the analyst call entirely: the contract proposes,
-  # risk vets, and execution places. It needs no analyst prompt, but valid
-  # evidence and clean contract identity are required before that mode may
-  # occupy the order path.
-  #
-  # `shadow_only` is the third value: no order path at all, research lanes
-  # untouched. It is what to set when nothing should be trading.
-  #
-  # The shipped mode is intentionally `shadow_only`: ls-ratio-fade is measured
-  # under its own deterministic contract without placing orders. An explicitly
-  # authorized future `deterministic` mode may use the same contract after
-  # valid evidence clears the promotion and identity gates.
-  execution_mode: shadow_only
-  signal_timeframe: 1h           # ls-ratio-fade's signal bar; one evaluation/bar
-  # The three registered hypotheses (volume-thrust, oi-divergence,
-  # basis-stretch) reach the book only through experimental setups. While
-  # this was false they never fired: 3,556 vetoes over 2026-07-29..08-05
-  # read "experimental setups are allowed only in demo mode". Demo is
-  # where they are supposed to be measured, and live mode still refuses
-  # them regardless of this flag.
-  allow_experimental_setups_in_demo: true
-  setup_cooldown_minutes: 45    # after a completed setup/trade before reuse
-  setup_memory_hours: 72        # bounded operational idempotency history
-  loss_reentry_min_minutes: 60  # after a loss, plus a fresh 1h bar/evidence
-  min_stop_atr_multiple: 1.0
-  structure_buffer_atr_multiple: 0.15
-  # Retail long/short percentile tails that arm the contract. The registered
-  # defaults are 80/20; these are the argmax of a 7x4 grid replayed over the
-  # recorded corpus, and 70/30 beat 80/20 at every extension cap tested, so
-  # it is not one lucky cell. Tightening to 85/15 or 90/10 was worst
-  # everywhere - a tail that carries less signal than the body is what a
-  # percentile with no information looks like, and worth knowing before the
-  # LLM sweeps this axis.
-  ls_high_percentile: 70.0
-  ls_low_percentile: 30.0
-  # Maximum entry extension from the 1h EMA20, in ATRs. 1.5 was best at every
-  # percentile pair; below it the measure flattens rather than improving, so
-  # this is a plateau edge and not a sharp optimum.
-  hard_max_entry_extension_atr: 1.5
-  # Minimum age for discretionary closes; exchange exits and risk reduction
-  # closes are unaffected.
-  min_hold_minutes: 90
-  # Allow an earlier discretionary close after this fraction of planned-stop
-  # adverse movement.
-  min_hold_adverse_r: 0.5
-  # Optional discriminator for overlapping breakout and trend contracts.
-  breakout_discriminator: none
-  breakout_compression_max_atr_ratio: 1.0   # volatility_regime only
-  breakout_range_threshold_pct: 85
-  breakout_min_relative_volume: 1.0
-  # Absolute funding floor, normalized to an 8h interval.
-  funding_extreme_pct_per_8h: 0.01
-  # Default take-profit reward:risk multiple.
-  fixed_reward_risk: 3.0
-  extended_reward_risk: 4.0
+session:
+  timezone: America/New_York
+  entries_regular_session_only: true
+  allow_exits_outside_session: true
+  force_flat_minutes_before_close: 10
+  reject_new_entries_minutes_before_close: 5
 
 universe:
-  # Signal supply scales with the universe, and every research lane draws
-  # from the same snapshot, so this is the cheapest throughput lever
-  # available. Raised from 10 after seven days produced only 238 paper
-  # trades across seven strategies. Watch cycle duration and OKX rate
-  # limits on the first deploy: each symbol costs one order-book read.
-  top_n: 25                          # trade only the N highest-volume USDT perpetuals
-  min_24h_quote_volume_usd: 50000000 # $50m floor before account/category/history checks
-  min_history_candles: 60            # required completed bars on every configured timeframe
-  denylist: []                       # e.g. ["DOGE/USDT:USDT"]
-  refresh_minutes: 60                # how often the volume ranking is rebuilt
+  symbols: [SPY, QQQ, IWM, DIA]
+  asset_classes: [us_equity, us_option]
+  min_price: 1.0
+  max_symbols: 50
+  denylist: []
 
-cycle:
-  interval_seconds: 60               # marks, shadow fills, breakers, reconciliation
-  decision_interval_seconds: 300     # no extra LLM call on the 60s mark cycles
-  timeframes: ["15m", "1h", "4h"]    # multi-timeframe context fed to the model.
-                                     # Keep these names aligned with the model prompt.
-  candles: 120                       # candles per timeframe (also excludes brand-new
-                                     # listings that lack 4h history)
+strategy:
+  id: ibr
+  version: v1
+  range_minutes: 15
+  breakout_buffer_bps: 5
+  min_relative_volume: 1.0
+  target_r: 2.0
+  max_entry_extension_r: 1.0
+  min_ibr_width_atr: 0.25
+  max_ibr_width_atr: 3.0
+  latest_entry_time: "15:00"
+  force_flat_minutes_before_close: 10
 
 risk:
-  max_leverage: 3                # per position; hard ceiling of 10 enforced in code
-  entry_leverage: 2              # deterministic; the LLM cannot choose leverage
-  risk_per_trade_pct: 1.5        # max all-in equity loss at the stop
-  experimental_risk_per_trade_pct: 0.5  # demo-only experimental setup budget
-  max_total_open_risk_pct: 3.0   # sum of planned stop losses across the book
-  # Per-position notional cap; configuration validates the full-book margin.
-  max_position_notional_pct: 30
-  max_gross_exposure_pct: 150    # total notional across all positions, % of equity
-  max_net_direction_pct: 100     # cap on |long minus short| notional, % of equity.
-                                 # Separate from measured BTC-beta exposure.
-  max_btc_beta_exposure_pct: 100 # cap signed BTC-beta-weighted notional
-  min_btc_beta_samples: 24       # otherwise assume conservative beta=1
+  risk_per_trade_pct: 0.5
+  daily_loss_limit_pct: 2.0
+  max_open_risk_pct: 2.0
   max_concurrent_positions: 3
-  # Cap on positions held in the same direction.
-  max_same_direction_positions: 2
-  # Simultaneous setups can be correlated expressions of one market-wide move.
-  # The risk guard rejects new entries when the per-strategy count exceeds this cutoff.
-  max_setups_firing_for_entry: 4
-  min_confidence: 0.65           # model decisions below this are discarded
-  # Position-age force-close ceiling, bounded by the strategy's registry limit.
-  max_hold_hours: 48
-
-  daily_loss_limit_pct: 5        # down this much on the day -> no new entries until next UTC day
-  flatten_on_daily_stop: false   # true = also close open positions when the daily stop trips
-  max_drawdown_pct: 15           # from the high-water mark -> flatten everything and self-kill
-  max_margin_usage_pct: 60       # if exceeded (e.g. after a withdrawal) reduce positions
-  min_maintenance_margin_ratio: 3.0  # conservative adjEq/MMR floor; OKX liquidates at <= 1
-  min_stop_liquidation_buffer_pct: 1.0  # stop must precede valid liqPx by this % of mark
-  cooldown_minutes_after_loss: 45  # per-symbol timeout after a losing close
+  max_position_notional_pct: 25.0
+  options_min_dte: 7
+  options_max_dte: 60
+  options_max_spread_pct: 10.0
 
 execution:
-  # Demo-only; configuration rejects this path in live mode.
-  # Rest passively for the configured interval, then fall back to IOC.
-  maker_first_enabled: true
-  maker_first_wait_seconds: 20   # bounded well inside the 15m signal bar
-  slippage_guard_pct: 0.5        # abort an entry if price moved more than this
-                                 # between analysis and execution
-  max_spread_pct: 0.15           # reject entries when the live bid/ask is wider
-  max_order_book_slippage_pct: 0.35  # IOC cap vs mid; reserved in risk sizing
-  max_market_data_age_seconds: 10    # reject stale exchange order books
-  paper_maker_fill_penetration_bps: 1 # require later trade-through, never touch=fill
-  paper_maker_order_ttl_seconds: 120  # permits one fully observed later 1m candle before cancellation
-  fill_timeout_seconds: 12       # wait for market orders to reach a terminal fill state
-  # A depth rejection is fed back to the LLM instead of becoming an immediate
-  # hard ban. It may make one explicit smaller-size retry on a later cycle.
-  liquidity_feedback_ttl_minutes: 30
-  liquidity_retries_before_backoff: 1
-  liquidity_backoff_minutes: 15
-  liquidity_depth_buffer_pct: 70  # retry may use at most 70% of observed safe depth
-  # Non-liquidity entry failures use persisted exponential backoff. Instrument
-  # incompatibilities remain blocked until at least the next universe refresh.
-  entry_failure_backoff_minutes: 15
-  entry_failure_backoff_max_minutes: 60
-  entry_failure_ttl_minutes: 240
+  order_type: market
+  time_in_force: day
+  client_order_id_prefix: ibr
+  max_slippage_bps: 50
 
-# Cost assumptions are sent to the LLM and enforced by deterministic sizing.
-# Price loss plus fees, spread, adverse funding and expected stop slippage
-# are kept inside risk_per_trade_pct instead of being added on afterward.
-trading_costs:
-  # Conservative fallback when the account fee cannot be fetched. `main.py
-  # check` rejects excessive divergence from the fetched account rate.
-  taker_fee_pct_per_side: 0.25
-  # Maximum accepted relative gap between this configured rate and the rate
-  # OKX reports for the account, as a percentage of the fetched rate. Beyond
-  # it the configured cost model no longer describes the account being traded
-  # and every research number computed from it is void.
-  fee_divergence_tolerance_pct: 25.0
-  expected_stop_slippage_pct: 0.15
-  expected_funding_intervals_held: 1  # floor when funding schedule is unknown
-  # The measured mean was about 21h under the 48h/3R policy. This estimate
-  # converts each instrument's funding cadence into reserved settlement costs.
-  expected_hold_hours: 20
-
-# Optional human alerts. The URL remains in .env, never in this file.
-alerts:
-  enabled: false
-  webhook_url_env: ALERT_WEBHOOK_URL
-  format: generic                 # generic | slack | discord
-  minimum_level: error            # warning | error | critical
-  timeout_seconds: 5
-
-# Shadow evaluations use isolated accounts and cannot place exchange orders.
-# Results remain research-only and are never promoted automatically.
-research:
-  shadow_enabled: true
-  shadow_variants: ["*"]
-  shadow_budget_ms: 0
-  # Bounded research-only variant work; durable paper writes remain serialized
-  # by each shadow evaluator and never share the active account/order path.
-  shadow_workers: 4
-  # Four pre-registered candidates share one baseline per strategy rotation;
-  # the hard safety cap remains eight in code.
-  experiment_candidate_batch_size: 4
-  findings_store: research/cache/findings.db
-  # Bounded research-only observable discovery. It never edits strategy
-  # registry/configuration and emits only content-addressed handoffs.
-  discovery:
-    enabled: true
-    max_rows: 50000
-    max_nodes: 32
-    max_depth: 8
-    max_window: 256
-    discovery_artifacts: research/results/discovery-artifacts
-    discovery_results: research/results/discovery
-  # Standalone public-data collection is intentionally separate from the live
-  # universe/risk settings above. It may scan more instruments or poll books
-  # more often without changing what the active account can trade.
-  collector:
-    enabled: true
-    out: runtime/research/recorded
-    top_n: 50
-    min_volume_usd: 30000000
-    book_interval_seconds: 300
-    hourly_interval_seconds: 900
-    refresh_minutes: 60
-    workers: 4
-  # Machine-authored mechanisms, kept apart from the hand-registered ones so
-  # a proposed claim can never be mistaken for a reviewed one. Created by
-  # `research.py author`; absent until something is staged, and the shadow
-  # lane is simply absent while it does not exist.
-  staging_store: research/cache/staging.db
-  # One budget is shared by authoring, CLI review and runtime shadow reloads.
-  # Each new mechanism starts as a root plus at most two one-dimensional
-  # neighbours, so the budget is configuration count rather than idea count.
-  staging_max_active: 32
-  staging_lifecycle:
-    never_fired_decisions: 2000
-    never_fired_max_age_hours: 168
-    no_observation_max_age_hours: 72
-    starved_max_age_hours: 72
-    starved_fraction: 0.5
-  staging_refinement:
-    max_attempts: 1
-    max_variants_per_attempt: 2
-    max_configurations_per_mechanism: 5
-    relative_step: 0.10
-  # Content-addressed proposals for explicit human implementation/review.
-  # Preparing one never edits the registry, source, or running configuration.
-  staging_handoff_dir: research/results/staged-handoffs
-  # Optional pre-existing destination. It is external only when its mounted
-  # filesystem/device differs from every repository/source device; an explicit
-  # same-device path remains configured-local. The path is never auto-created.
-  # Without it, backups stay under runtime/backups/research as local-default.
-  # backup_target: /mnt/off-host/okx-agent-research
-  paper_initial_balance_usdt: 10000
-  paper_max_failures: 3
-  paper_min_closed_trades: 100
-  # Increment when executable provenance changes; evidence from different
-  # feed versions must never be pooled.
-  forward_feed_version: 8
-  # Assignments require both duration and comparable observations. Validation
-  # enforces the minimum duration needed for the confirmation window.
-  experiment_min_duration_days: 10
-  experiment_min_observations: 100
+llm:
+  provider: openai
+  model: gpt-5.6-sol-coding
+  temperature: 0.2
+  max_tokens: 2000

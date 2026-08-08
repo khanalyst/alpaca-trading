@@ -17,13 +17,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import yaml
-
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from agent import state as agent_state  # noqa: E402
+from deploy import load_config  # noqa: E402
 
 
 _running = True
@@ -194,10 +193,11 @@ def _load_last(path: Path) -> dict:
 
 def configured_mode(path: Path) -> str:
     """Bind every nightly path to the same mode as the mounted config."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    mode = str(raw.get("mode") or "")
-    if mode not in {"demo", "live"}:
-        raise ValueError("config.mode must be demo or live")
+    raw = load_config(path)
+    broker = raw.get("broker") if isinstance(raw.get("broker"), dict) else {}
+    mode = str(raw.get("mode") or broker.get("mode") or "paper").lower()
+    if mode != "paper":
+        raise ValueError("config must select the Alpaca paper endpoint")
     os.environ["AGENT_MODE"] = mode
     return mode
 
@@ -248,12 +248,9 @@ def _wait_for_child_with_heartbeats(
 
 def run_scheduler(args) -> int:
     global _child
-    from main import load_secrets
-
     status_path = Path(args.status_file)
     try:
         mode = configured_mode(Path(args.config))
-        load_secrets(mode)
     except Exception as exc:                               # noqa: BLE001
         write_status(
             status_path, "failed", last_exit_code=2,

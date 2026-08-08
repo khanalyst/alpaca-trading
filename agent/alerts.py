@@ -16,7 +16,7 @@ log = logging.getLogger("alerts")
 LEVELS = {"warning": 1, "error": 2, "critical": 3}
 DELIVERY_ATTEMPTS = 3
 # Tests may override this path. Normal operation resolves it dynamically after
-# main.py has selected the demo/live runtime scope.
+# main.py has selected the paper runtime scope.
 FAILED_ALERTS_FILE: Path | None = None
 
 
@@ -36,14 +36,14 @@ class AlertManager:
     def ready(self) -> bool:
         return self.enabled and bool(self.url)
 
-    def require_live_ready(self, probe: bool = False) -> None:
+    def require_paper_ready(self, probe: bool = False) -> None:
         if not self.ready:
             raise RuntimeError(
-                "live trading requires alerts.enabled: true and a configured "
+                "paper trading requires alerts.enabled: true and a configured "
                 f"{self.cfg.get('webhook_url_env', 'ALERT_WEBHOOK_URL')}")
         if probe and not self.send(
-                "critical", "live_preflight",
-                "OKX agent live alert delivery preflight"):
+                "critical", "paper_preflight",
+                "Alpaca paper alert delivery preflight"):
             raise RuntimeError(
                 "live alert webhook did not acknowledge the preflight message")
 

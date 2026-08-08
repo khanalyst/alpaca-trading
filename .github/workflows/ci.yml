@@ -29,4 +29,16 @@ jobs:
           cp .env.example .env
           chmod 600 .env
           docker compose config --quiet
-          docker build --build-arg PYTHON_IMAGE=python:3.13.5-slim-bookworm -t okx-agent-crypto:ci .
+          docker compose --profile research config --quiet
+          docker compose build
+      - name: Reject stale crypto-provider terms in active source and tests
+        run: |
+          if rg -n -i '\b(okx|ccxt|usdt|funding|perpetual)\b' \
+              agent deploy research tests README.md SETUP.md OPERATIONS.md \
+              AZURE_DEPLOYMENT.md .env.example requirements.txt \
+              requirements.lock.txt Dockerfile compose.yaml \
+              --glob '*.py' --glob '*.md' --glob '*.yaml' --glob '*.yml' \
+              --glob '*.sh' --glob '*.txt'; then
+            echo 'stale crypto-provider term found in active source/tests/docs' >&2
+            exit 1
+          fi

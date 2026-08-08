@@ -9,7 +9,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-import yaml
+from deploy import load_config
 
 
 def _read_json(path: Path) -> dict:
@@ -32,13 +32,10 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
     heartbeat = _read_json(path)
     status = str(heartbeat.get("status") or "missing")
     fresh = _fresh(heartbeat.get("updated_ts"), max_age, now)
-    strategy_shadow_errors = heartbeat.get("strategy_shadow_errors")
-    if not isinstance(strategy_shadow_errors, dict):
-        strategy_shadow_errors = {}
     research_ok = not (
         heartbeat.get("research_expected") is True
         and (heartbeat.get("research_available") is not True
-             or bool(strategy_shadow_errors)))
+             or heartbeat.get("research_status") not in {"healthy", "disabled"}))
     ok = fresh and status in {"starting", "running", "paused"} and research_ok
     return {
         "ok": ok,
@@ -47,7 +44,6 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "fresh": fresh,
         "research_available": heartbeat.get("research_available"),
         "research_status": heartbeat.get("research_status"),
-        "strategy_shadow_errors": strategy_shadow_errors,
     }
 
 
@@ -107,10 +103,11 @@ def dashboard(url: str, timeout: float = 3.0) -> dict:
 def _trader_path(args) -> Path:
     if args.path:
         return Path(args.path)
-    raw = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
-    mode = raw.get("mode")
-    if mode not in {"demo", "live"}:
-        raise ValueError("config.mode must be demo or live")
+    raw = load_config(args.config)
+    broker = raw.get("broker") if isinstance(raw.get("broker"), dict) else {}
+    mode = str(raw.get("mode") or broker.get("mode") or "paper").lower()
+    if mode != "paper":
+        raise ValueError("config mode must select the Alpaca paper endpoint")
     return Path(args.runtime_root) / mode / "heartbeat.json"
 
 

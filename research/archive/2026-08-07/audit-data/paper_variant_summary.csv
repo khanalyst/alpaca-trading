@@ -1,9 +1,0 @@
-variant_id,trades,avg_r,pnl
-scalp_maker.prereg.stronger_imbalance,97,-0.309,-782.03
-scalp_maker.baseline,97,-0.286,-821.89
-momentum.rr.fixed_1_5,5,-0.7,-310.82
-momentum.baseline,3,-0.991,-193.36
-ls_ratio_fade.prereg.higher_long_tail,2,-0.989,-109.41
-ls_ratio_fade.baseline,2,-0.989,-109.41
-flush_fade.prereg.move_2_atr,1,0.218,31.53
-flush_fade.baseline,1,0.218,31.53

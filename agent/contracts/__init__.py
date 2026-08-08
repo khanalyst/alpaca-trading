@@ -1,17 +1,9 @@
-"""Per-strategy evidence contracts.
+"""Deterministic trading contracts.
 
-A contract answers one question for one strategy: given a symbol snapshot,
-which setups are valid right now, in which direction, and how extended is the
-entry. It is the deterministic half of the decision - the LLM may only choose
-among setups a contract has already declared valid, and may never invent one.
-
-Each strategy owns a module here and registers its builder in
-``EVIDENCE_BUILDERS``. ``agent.strategy.setup_evidence`` dispatches on the
-active ``strategy.id``, so adding a strategy means adding a module and a
-registry entry rather than editing shared code.
-
-The helpers below are shared because every contract needs them and because a
-second copy of a numeric guard is a second chance to get it wrong.
+The order path has one alpha family: the initial-breakout-range (IBR)
+contract.  Shares and defined-risk options are execution profiles of the
+same underlying signal; they are deliberately not registered as separate
+strategies.
 """
 
 from __future__ import annotations
@@ -19,23 +11,16 @@ from __future__ import annotations
 import math
 
 
-def finite(value, default: float | None = None) -> float | None:
-    """Return ``value`` as a float, or ``default`` if it is not finite.
-
-    Snapshot fields arrive from an exchange and may be ``None``, a string, or
-    NaN. Comparisons against NaN are silently false, which would turn a
-    missing measurement into a passed check, so nothing numeric enters a
-    contract without going through here first.
-    """
+def finite(value, default=None):
+    """Return a finite float or *default* (used by protocol boundaries)."""
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if math.isfinite(number) else default
 
 
-# Populated by the contract modules at import time. Keyed by strategy id.
-EVIDENCE_BUILDERS: dict = {}
+EVIDENCE_BUILDERS: dict[str, object] = {}
 
 
 def register(strategy_id: str, builder) -> None:
@@ -44,20 +29,26 @@ def register(strategy_id: str, builder) -> None:
     EVIDENCE_BUILDERS[strategy_id] = builder
 
 
-from . import (flush_fade, funding_carry,  # noqa: E402,F401
-               funding_unwind, ls_ratio_fade,
-               momentum_phase1v2, scalp_maker,
-               trend_multiday)                            # (register on import)
+from .ibr import (  # noqa: E402,F401
+    DEFAULT_IBR_TIMEZONE,
+    DEFAULT_SESSION_END,
+    DEFAULT_SESSION_START,
+    IBRConfig,
+    build_ibr_range,
+    build_initial_breakout_range,
+    check_ibr_breakout,
+    construct_ibr_range,
+    evaluate_exit,
+    evaluate_ibr_breakout,
+    generate_ibr_signal,
+    ibr_signal,
+    setup_evidence,
+)
 
 
-def __getattr__(name: str):
-    """Lazily expose the canonical composite contract from the registry.
-
-    Keeping this a lazy compatibility export avoids importing the registry
-    while its evidence-builder modules are still registering themselves.
-    """
-    if name in {"StrategyContract", "contract_for", "contract_for_variant",
-                "contract_catalog_manifest"}:
-        from .. import registry
-        return getattr(registry, name)
-    raise AttributeError(name)
+__all__ = [
+    "EVIDENCE_BUILDERS", "IBRConfig", "build_ibr_range",
+    "build_initial_breakout_range", "construct_ibr_range",
+    "evaluate_ibr_breakout", "check_ibr_breakout", "evaluate_exit",
+    "generate_ibr_signal", "ibr_signal", "setup_evidence",
+]
