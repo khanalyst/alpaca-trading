@@ -2,13 +2,18 @@
 
 This repository is a research and execution skeleton for US equities, ETFs,
 and listed options through Alpaca. The intended workflow is paper-only:
-collect regular-session data, calculate an initial balance range (IBR), test a
-breakout hypothesis, and record every decision and fill for review. Options
+collect regular-session data, evaluate multiple strategy hypotheses and their
+variants, and record every decision and fill for review. Options
 are single-leg long calls or puts (buy-to-open, sell-to-close); multi-leg and
 naked/short option structures are unsupported. It is not a live-trading system
 and makes no claim of a profitable edge.
 
-The order path has one alpha family, IBR. A trader process selects one
+The research factory starts with seven audited rule families and four isolated
+simulated-account variants per family. It evaluates the seven families in
+parallel, diagnoses failures from chronological fit data, mutates bounded
+data-only rule specifications, and judges them on untouched held-out data.
+Adequately tested failures are retired and replaced by a new hypothesis for a
+later cycle. A trader process selects one validated/champion rule and one
 execution profile (`shares` or `options`) in `strategy.execution_mode`; do not
 mix profiles in one process. The market
 calendar is America/New_York (NYSE regular session). New entries are rejected
@@ -37,8 +42,10 @@ read as a performance claim.
 `agent/alpaca_provider.py` is the small boundary around `alpaca-py`. It
 normalizes account, asset, quote/bar, calendar, option-chain, order, and trade
 update data for the rest of the application. `agent/alpaca_session.py` owns
-the NYSE calendar and session policy. `agent/contracts/ibr.py` builds the
-opening range and evaluates one breakout per symbol/day. Risk and execution
+the NYSE calendar and session policy. `agent/contracts/rule.py` is the safe
+strategy grammar shared by research and runtime; generated specifications can
+never contain executable code. `agent/contracts/ibr.py` remains the explicit
+IBR replay/baseline. Risk and execution
 profiles enforce sizing, single-leg long-option checks, idempotent client
 order IDs, and end-of-day flattening.
 
@@ -56,7 +63,9 @@ run it long enough to produce a champion before the trader can open risk. It
 consumes the recorder's append-only mixed
 `runtime/research/recorded/market.csv` by default (bars, quotes, and option
 snapshots), or an explicit normalized JSONL path from
-`ALPACA_RESEARCH_DATASET`. Its edge-lab lifecycle is kept in the SQLite ledger
+`ALPACA_RESEARCH_DATASET`. By default each cycle schedules seven strategies,
+four isolated accounts per strategy, and up to seven worker processes. Its
+edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
 status and the paper journal.
 
@@ -70,6 +79,7 @@ chmod 600 .env
 ./.venv/bin/python main.py check --offline
 ./.venv/bin/python main.py check
 ./.venv/bin/python research.py edge status
+./.venv/bin/python research.py factory status
 ./.venv/bin/python main.py run
 ```
 
@@ -77,11 +87,11 @@ Set `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER=true`, and the
 selected `ALPACA_DATA_FEED`/`ALPACA_OPTIONS_FEED` in `.env`. `check` is the
 authenticated paper preflight by default; use `check --offline` only for local
 configuration validation. Unit tests use fakes and do not need credentials.
-The deterministic strategy is the default and LLM use is disabled by default;
+The deterministic rule champion is the default and LLM use is disabled by default;
 setting `llm.enabled: true` is an explicit, credentialed opt-in. The default
 stock feed is IEX. Long options remain subject to liquidity and contract
 checks. On a fresh ledger, `run` starts safely but will not submit entries:
-first collect an initial corpus, let the research cycle pass its backtest, and
+first collect an initial corpus, let the strategy factory pass its backtest, and
 then collect a strictly later unseen tail for shadow validation and automatic
 champion selection. This delay is an intentional evidence gate, not a startup
 error.
@@ -107,6 +117,6 @@ blocker. Root discovery includes the deployment and research suites.
 ## What is deliberately not included
 
 There is no overnight strategy, withdrawal flow, unattended live deployment,
-multi-leg/naked option path, or assertion that an IBR signal has positive
+multi-leg/naked option path, or assertion that any generated signal has positive
 expectancy. Any future live work requires a separate review of the provider
 guard, risk policy, session-close behaviour, tests, and operational controls.

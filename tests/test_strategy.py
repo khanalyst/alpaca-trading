@@ -2,7 +2,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from agent import strategy
+from agent.config import validate_config
 from agent.contracts.ibr import build_ibr_range, evaluate_exit, evaluate_ibr_breakout
+from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate_rule_spec
 
 
 def bars(start, *, high=100.5, low=99.5, close=100.0, volume=10.0):
@@ -92,6 +94,43 @@ class IBRContractTests(unittest.TestCase):
         self.assertEqual(plan["stop_price"], 99.5)
         self.assertTrue(plan["force_flat"])
         self.assertIsNotNone(plan["force_flat_at"])
+
+    def test_validated_rule_signal_uses_the_same_runtime_plan_boundary(self):
+        spec = validate_rule_spec({
+            "family": "momentum_continuation", "lookback": 3,
+            "slow_lookback": 8, "atr_period": 3,
+            "threshold_bps": 1.0, "confirmation": "none",
+        })
+        variant_id = rule_variant_id(spec)
+        cfg = validate_config({"strategy": {
+            "id": "rule", "version": "v1", "variant_id": variant_id,
+            "rule_spec": spec,
+        }})
+        base = datetime.now(timezone.utc) - timedelta(minutes=12)
+        market_bars = []
+        price = 100.0
+        for index in range(10):
+            opened = price
+            price += .2
+            market_bars.append({
+                "symbol": "SPY", "timestamp": base + timedelta(minutes=index),
+                "open": opened, "high": price + .05, "low": opened - .05,
+                "close": price, "volume": 1000 + index * 10,
+            })
+        signal = generate_rule_signal(
+            "SPY", market_bars, config=cfg, now=datetime.now(timezone.utc))
+        self.assertIsNotNone(signal)
+        snapshot = {
+            "price": signal["entry_price"], "signal_ts": signal["signal_ts"],
+            "session": signal["session"], "spread_bps": 1.0,
+            "stale": False, "quote_stale": False,
+        }
+        plan, why = strategy.build_setup_plan(signal, snapshot, cfg)
+        self.assertIsNone(why)
+        self.assertEqual(plan["strategy_id"], "rule")
+        self.assertEqual(plan["variant_id"], variant_id)
+        self.assertLess(plan["stop_price"], plan["entry_price"])
+        self.assertGreater(plan["target_price"], plan["entry_price"])
 
 
 if __name__ == "__main__":

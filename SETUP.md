@@ -35,8 +35,8 @@ ALPACA_OPTIONS_FEED=indicative
 Use paper credentials only. Keep withdrawal permissions disabled and do not
 put the file in Git. `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` are optional. LLM use
 is disabled by default and those keys are needed only when `llm.enabled: true`
-is explicitly set for an analyst feature. Deterministic IBR execution remains
-the default.
+is explicitly set for an analyst feature. Deterministic, content-addressed
+rule execution remains the default.
 
 Run the local checks before starting a loop:
 
@@ -58,7 +58,9 @@ to Compose or systemd.
 
 ## Behavioural defaults
 
-- Strategy: initial balance range (IBR), normally 09:30–09:45 America/New_York.
+- Strategy: `rule/auto`; the runtime accepts only a validated/champion rule
+  selected from the autonomous research ledger. IBR remains an explicit
+  baseline and replay contract.
 - Instruments: liquid US equities/ETFs, or single-leg long options selected
   from a validated chain, according to the configured execution profile.
 - Entries: regular NYSE session only, with a close-time cutoff.
@@ -68,8 +70,12 @@ to Compose or systemd.
 - Data: `iex` stock feed by default; set an entitled feed explicitly if the
   paper account supports one. Record the feed in run metadata.
 
-The IBR hypothesis is unproven. The research cycle records an autonomous,
-forward-only edge lifecycle: an initial corpus backtest must pass before a
+Every generated hypothesis is unproven. The research cycle runs seven strategy
+families in parallel by default, with four isolated simulated accounts per
+family. Fit-only diagnostics create bounded variants; untouched held-out data
+decides whether they pass. An adequately tested family with no positive edge
+is retired and a replacement hypothesis is queued automatically. The edge
+lifecycle remains forward-only for proof: an initial corpus backtest must pass before a
 later unseen shadow tail can validate and select a champion; paper outcomes
 are appended for forward monitoring and may demote a champion. Runtime entries
 remain blocked without a validated/champion SQLite record.

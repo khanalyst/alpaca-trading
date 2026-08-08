@@ -38,10 +38,12 @@ vehicle and may not pool option and underlying returns.
 
 ## Autonomous edge lane
 
-The bounded registry in `research/variants.yaml` is the complete proposal
-surface for IBR. Each setting is evaluated as two independent vehicle arms.
-No arbitrary variant string is executable: `agent.edge` resolves only a
-pre-registered id whose SQLite candidate is `validated` or `champion`.
+The bounded registry in `research/variants.yaml` remains the complete proposal
+surface for the explicit IBR baseline. Autonomous multi-strategy research uses
+the finite, validated data-only grammar in `agent/contracts/rule.py`; generated
+variant ids are content hashes of those specifications. Arbitrary source code
+or unbounded fields are rejected. `agent.edge` resolves only a SQLite candidate
+whose status is `validated` or `champion` for the configured strategy/vehicle.
 
 Backtests and forward-shadow runs are persisted with immutable hashes and
 trade/evidence rows. The autonomous lane first evaluates the initial corpus as
@@ -54,6 +56,14 @@ outcomes are append-only and may demote a champion. Normal operation needs no
 manual promotion; explicit `edge promote`/rollback commands are supported only
 as audited controls subject to lifecycle/evidence rules. Demote, retire, and
 rollback are operator safety actions.
+
+Factory mutations may inspect only the chronological fit partition. Held-out
+and later-forward sessions must not influence hypothesis or parameter
+generation. Each variant is evaluated in an isolated simulated account.
+Multiple-test correction covers every variant evaluated in the cycle. A
+replacement hypothesis may be generated only after the root family has an
+adequate trade/session sample and no variant passes; underpowered data must not
+cause autonomous hypothesis churn.
 
 Each transition requires a chronological fit/held-out boundary, minimum trades
 and sessions in each window, matched baseline deltas, cluster-level sign

@@ -43,7 +43,7 @@ def resolve_validated_variant(config: Mapping, vehicle: str | None = None,
     ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
     requested = str(strategy.get("variant_id") or "").strip()
     if requested and requested.lower() != "auto":
-        if requested not in set(known_variant_ids(strategy_id)):
+        if strategy_id != "rule" and requested not in set(known_variant_ids(strategy_id)):
             return None
         record = ledger.candidate_by_variant(requested, selected_vehicle)
     else:
@@ -51,8 +51,10 @@ def resolve_validated_variant(config: Mapping, vehicle: str | None = None,
         confidence = float(research.get("champion_min_confidence", .95) or .95) \
             if isinstance(research, Mapping) else .95
         record = ledger.select_champion(
-            vehicle=selected_vehicle, min_confidence=confidence)
-    if record is None or record.get("status") not in {"validated", "champion"}:
+            vehicle=selected_vehicle, min_confidence=confidence,
+            strategy_id=strategy_id)
+    if (record is None or record.get("strategy_id") != strategy_id or
+            record.get("status") not in {"validated", "champion"}):
         return None
     try:
         record["config"] = json.loads(record.get("config_json") or "{}")
@@ -70,6 +72,29 @@ def apply_variant(config: Mapping, record: Mapping) -> dict:
     if not variant_id:
         raise ValueError("validated record has no variant_id")
     strategy_id = str(record.get("strategy_id") or "ibr")
+    if strategy_id == "rule":
+        from .config import validate_config
+        from .contracts.rule import rule_variant_id, validate_rule_spec
+        record_config = record.get("config")
+        if not isinstance(record_config, Mapping):
+            try:
+                record_config = json.loads(record.get("config_json") or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("validated rule record has invalid config") from exc
+        raw_spec = (record_config.get("strategy") or {}).get("rule_spec") \
+            if isinstance(record_config, Mapping) else None
+        spec = validate_rule_spec(raw_spec or {})
+        if rule_variant_id(spec) != variant_id:
+            raise ValueError("validated rule record does not match its content hash")
+        applied = dict(config)
+        applied["strategy"] = dict(applied.get("strategy") or {})
+        applied["strategy"].update({"id": "rule", "version": "v1",
+                                    "variant_id": variant_id, "rule_spec": spec})
+        vehicle = str(record.get("vehicle") or "")
+        if vehicle in {"equity", "option"}:
+            applied["strategy"]["execution_mode"] = (
+                "options" if vehicle == "option" else "shares")
+        return validate_config(applied)
     if variant_id not in set(known_variant_ids(strategy_id)):
         raise ValueError(f"variant {variant_id!r} is not pre-registered")
     overrides = record.get("overrides") or {}

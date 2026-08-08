@@ -142,7 +142,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     out["universe"] = universe
 
     strategy = _map(out.get("strategy"), "strategy")
-    _unknown(strategy, {"id", "version", "variant_id", "execution_mode", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "atr_period", "max_ibr_width_pct", "max_spread_bps", "stale_minutes", "latest_entry_time", "force_flat_minutes_before_close", "setup_memory_hours", "setup_cooldown_minutes"}, "strategy")
+    _unknown(strategy, {"id", "version", "variant_id", "execution_mode", "rule_spec", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "atr_period", "max_ibr_width_pct", "max_spread_bps", "stale_minutes", "latest_entry_time", "force_flat_minutes_before_close", "setup_memory_hours", "setup_cooldown_minutes"}, "strategy")
     if not isinstance(strategy.get("id"), str) or not strategy["id"].strip():
         raise ConfigError("strategy.id must be a non-empty string")
     if strategy.get("execution_mode", "shares") not in {"shares", "options"}:

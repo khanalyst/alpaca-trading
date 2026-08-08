@@ -111,6 +111,7 @@ def _edge_status(path: Path) -> dict:
         return {"available": False, "status": "not_initialized",
                 "candidates": 0, "by_status": {}, "by_vehicle": {}}
     try:
+        factory = {"hypotheses": 0, "accounts": 0, "cycles": 0}
         with closing(_ro_connect(path)) as connection:
             tables = _tables(connection)
             if not {"candidates", "candidate_state"}.issubset(tables):
@@ -122,6 +123,15 @@ def _edge_status(path: Path) -> dict:
                      ON s.candidate_id=c.candidate_id
                    GROUP BY c.vehicle, s.status
                    ORDER BY c.vehicle, s.status""").fetchall()
+            if {"factory_hypotheses", "factory_accounts", "factory_cycles"}.issubset(tables):
+                factory = {
+                    "hypotheses": int(connection.execute(
+                        "SELECT COUNT(*) FROM factory_hypotheses").fetchone()[0]),
+                    "accounts": int(connection.execute(
+                        "SELECT COUNT(*) FROM factory_accounts").fetchone()[0]),
+                    "cycles": int(connection.execute(
+                        "SELECT COUNT(*) FROM factory_cycles").fetchone()[0]),
+                }
         by_status: dict[str, int] = {}
         by_vehicle: dict[str, int] = {}
         for row in rows:
@@ -132,7 +142,8 @@ def _edge_status(path: Path) -> dict:
             by_vehicle[vehicle] = by_vehicle.get(vehicle, 0) + count
         return {"available": True, "status": "ready",
                 "candidates": sum(by_status.values()),
-                "by_status": by_status, "by_vehicle": by_vehicle}
+                "by_status": by_status, "by_vehicle": by_vehicle,
+                "factory": factory}
     except (OSError, sqlite3.Error, ValueError):
         return {"available": False, "status": "unreadable",
                 "candidates": 0, "by_status": {}, "by_vehicle": {}}
@@ -269,7 +280,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
  c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
  c=card('Paper journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
- c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));c.append(el('p',d.research.note||'No research status.','muted'));
+ c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}

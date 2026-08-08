@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline validation, IBR replay, and bounded autonomous edge discovery."""
+"""Offline validation, replay, edge discovery, and autonomous strategy research."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from research.market_data import (
     normalize_quote,
     normalize_underlying_bar,
 )
+from research.strategy_factory import factory_status, run_factory
 
 
 def _json_rows(path: str | Path) -> list[dict[str, Any]]:
@@ -195,6 +196,43 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
     return 0 if promoted else 2
 
 
+def cmd_factory_run(args: argparse.Namespace) -> int:
+    result = run_factory(
+        args.data, db_path=_db(args), vehicle=args.vehicle,
+        strategies=args.strategies, variants_per_strategy=args.variants,
+        workers=args.workers, starting_cash=args.starting_cash,
+        min_trades=args.min_trades, min_sessions=args.min_sessions,
+        alpha=args.alpha, max_generations=args.max_generations)
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0
+
+
+def cmd_factory_status(args: argparse.Namespace) -> int:
+    print(json.dumps(factory_status(_db(args)), sort_keys=True, default=str))
+    return 0
+
+
+def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
+    parser = sub.add_parser(name, help=f"autonomous strategy factory {command}")
+    parser.add_argument("--db", default=None)
+    if command == "status":
+        parser.set_defaults(func=cmd_factory_status)
+    else:
+        parser.add_argument("--data", required=True, help="normalized mixed market JSONL")
+        parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")
+        parser.add_argument("--strategies", type=int, default=7)
+        parser.add_argument("--variants", type=int, default=4,
+                            help="isolated variants/accounts per strategy")
+        parser.add_argument("--workers", type=int, default=7)
+        parser.add_argument("--starting-cash", type=float, default=100000.0)
+        parser.add_argument("--min-trades", type=int, default=100)
+        parser.add_argument("--min-sessions", type=int, default=10)
+        parser.add_argument("--alpha", type=float, default=.05)
+        parser.add_argument("--max-generations", type=int, default=5)
+        parser.set_defaults(func=cmd_factory_run)
+    return parser
+
+
 def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
     parser = sub.add_parser(name, help=f"edge ledger {command}")
     parser.add_argument("--db", default=None)
@@ -252,6 +290,12 @@ def build_parser() -> argparse.ArgumentParser:
         _edge_parser(edge_sub, name, name)
     for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest", "edge-discover"):
         _edge_parser(sub, name, name.split("-", 1)[1])
+    factory = sub.add_parser("factory", help="parallel autonomous strategy factory")
+    factory_sub = factory.add_subparsers(dest="factory_command", required=True)
+    for name in ("run", "status"):
+        _factory_parser(factory_sub, name, name)
+    for name in ("factory-run", "factory-status"):
+        _factory_parser(sub, name, name.split("-", 1)[1])
     return parser
 
 

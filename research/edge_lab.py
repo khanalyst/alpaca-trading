@@ -527,12 +527,14 @@ class EdgeLedger:
             result.append(item)
         return result
 
-    def select_champion(self, *, vehicle: str, min_confidence: float = .95) -> dict | None:
+    def select_champion(self, *, vehicle: str, min_confidence: float = .95,
+                        strategy_id: str | None = None) -> dict | None:
         """Select one conservative validated candidate for a vehicle only."""
         if vehicle not in VEHICLES:
             raise ValueError("vehicle must be equity or option")
         rows = self.status(vehicle=vehicle)
-        eligible = [r for r in rows if r["status"] in {"validated", "champion"}]
+        eligible = [r for r in rows if r["status"] in {"validated", "champion"}
+                    and (strategy_id is None or r["strategy_id"] == strategy_id)]
         scored = []
         for candidate in eligible:
             runs = self._runs(candidate["candidate_id"], lane="shadow")

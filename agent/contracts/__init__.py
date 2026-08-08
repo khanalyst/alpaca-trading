@@ -1,10 +1,4 @@
-"""Deterministic trading contracts.
-
-The order path has one alpha family: the initial-breakout-range (IBR)
-contract.  Shares and single-leg long options are execution profiles of the
-same underlying signal; they are deliberately not registered as separate
-strategies.
-"""
+"""Deterministic trading contracts used by research and paper execution."""
 
 from __future__ import annotations
 
@@ -37,10 +31,18 @@ from .ibr import (  # noqa: E402,F401
     generate_ibr_signal,
     setup_evidence,
 )
+from .rule import (  # noqa: E402,F401
+    RULE_FAMILIES,
+    evaluate_rule_signal,
+    generate_rule_signal,
+    rule_variant_id,
+    validate_rule_spec,
+)
 
 
 __all__ = [
     "EVIDENCE_BUILDERS", "IBRConfig", "build_ibr_range",
     "evaluate_ibr_breakout", "evaluate_exit", "generate_ibr_signal",
-    "setup_evidence",
+    "setup_evidence", "RULE_FAMILIES", "evaluate_rule_signal",
+    "generate_rule_signal", "rule_variant_id", "validate_rule_spec",
 ]

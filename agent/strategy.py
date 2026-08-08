@@ -12,11 +12,13 @@ from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
 from .contracts.ibr import build_ibr_range, setup_evidence as _ibr_evidence
+from .contracts.rule import (rule_variant_id, setup_evidence as _rule_evidence,
+                             validate_rule_spec)
 
 from .registry import (baseline_variant_id, contract_for_variant,
                        validate_contract_config)
 
-SETUP_TYPES = {"ibr_breakout", "range_breakout"}
+SETUP_TYPES = {"ibr_breakout", "range_breakout", "rule_signal"}
 INVALIDATION_ANCHORS = {"structure", "range"}
 EXIT_POLICIES = {"fixed_rr", "force_flat", "fixed_target_r"}
 EXECUTION_CHOICES = {"normal", "retry_smaller"}
@@ -58,6 +60,9 @@ def signal_probe(decision: Mapping, symbol_snapshot: Mapping, cfg: Mapping) -> d
 
 
 def setup_evidence(snapshot: Mapping, cfg: Mapping) -> dict:
+    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
+    if str(strategy.get("id")) == "rule":
+        return _rule_evidence(snapshot, cfg)
     return _ibr_evidence(snapshot, cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {})
 
 
@@ -123,16 +128,96 @@ def _default_force_flat(signal_ts: float, strategy: Mapping) -> str | None:
         return None
 
 
+def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
+                           cfg: Mapping):
+    """Validate a content-addressed autonomous rule signal for paper risk."""
+    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
+    try:
+        spec = validate_rule_spec(strategy.get("rule_spec") or {})
+    except ValueError as exc:
+        return None, f"invalid autonomous rule: {exc}"
+    variant_id = str(strategy.get("variant_id") or "")
+    if variant_id != rule_variant_id(spec):
+        return None, "autonomous rule variant does not match its content hash"
+    try:
+        contract = contract_for_variant("rule", variant_id)
+        validate_contract_config(cfg)
+    except (KeyError, ValueError) as exc:
+        return None, f"strategy contract mismatch: {exc}"
+    direction = decision.get("direction")
+    if direction not in {"long", "short"}:
+        return None, "setup direction is invalid"
+    setup_type = str(decision.get("setup_type") or "rule_signal")
+    if not setup_type.startswith("rule_"):
+        return None, "autonomous setup type is not recognised"
+    signal_ts = _finite(decision.get("signal_ts", symbol_snapshot.get("signal_ts")))
+    if signal_ts is None or signal_ts < 0:
+        return None, "completed signal candle timestamp is unavailable"
+    if signal_ts > time.time() + 1.0:
+        return None, "signal timestamp is in the future"
+    entry = _finite(symbol_snapshot.get("price", decision.get("entry_price")))
+    if entry is None or entry <= 0:
+        entry = _finite(decision.get("entry_price"))
+    stop = _finite(decision.get("stop_price"))
+    target = _finite(decision.get("target_price"))
+    if entry is None or entry <= 0 or stop is None or target is None:
+        return None, "autonomous entry, stop, or target is unavailable"
+    if (direction == "long" and not (stop < entry < target)) or (
+            direction == "short" and not (target < entry < stop)):
+        return None, "stop/target side validation failed"
+    spread = _finite(symbol_snapshot.get("spread_bps"))
+    max_spread = _finite(strategy.get("max_spread_bps"), 25.0) or 25.0
+    if spread is None or spread > max_spread:
+        return None, "spread is unavailable or too wide"
+    if symbol_snapshot.get("stale") is not False or symbol_snapshot.get("quote_stale") is not False:
+        return None, "market data freshness is unavailable"
+    session = str(decision.get("session") or symbol_snapshot.get("session") or "")
+    setup_key = _hash({"strategy_id": "rule", "strategy_version": "v1",
+                       "variant_id": variant_id, "symbol": decision.get("symbol"),
+                       "direction": direction, "setup_type": setup_type,
+                       "session": session})
+    force_flat_at = (decision.get("force_flat_at") or
+                     symbol_snapshot.get("force_flat_at") or
+                     _default_force_flat(signal_ts, strategy))
+    try:
+        force_flat_ts = datetime.fromisoformat(str(force_flat_at)).timestamp() \
+            if force_flat_at else None
+    except (TypeError, ValueError, OverflowError):
+        force_flat_ts = None
+    distance = abs(entry - stop)
+    plan = dict(decision)
+    plan.update({
+        "strategy_id": "rule", "strategy_version": "v1",
+        "variant_id": variant_id, "contract_hash": contract.semantic_hash,
+        "setup_type": setup_type, "setup_key": setup_key,
+        "setup_id": _hash({"setup_key": setup_key, "signal_ts": signal_ts}),
+        "signal_ts": signal_ts, "session": session,
+        "entry_price": entry, "stop_price": stop, "target_price": target,
+        "stop_distance": distance, "target_r": float(spec["target_r"]),
+        "stop_loss_pct": round(distance / entry * 100.0, 8),
+        "take_profit_pct": round(abs(target - entry) / entry * 100.0, 8),
+        "invalidation_anchor": "structure", "exit_policy": "fixed_target_r",
+        "execution_choice": str(decision.get("execution_choice") or "normal"),
+        "force_flat": True, "force_flat_at": force_flat_at,
+        "force_flat_ts": force_flat_ts,
+        "force_flat_reason": "regular_session_close", "size_pct_equity": 0.0,
+        "rule_spec_hash": decision.get("rule_spec_hash"),
+    })
+    return plan, None
+
+
 def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
                      cfg: Mapping, *, hypothesis_params: Mapping | None = None):
     """Validate one close-confirmed IBR signal and derive all exits."""
+    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
+    if str(strategy.get("id")) == "rule":
+        return _build_rule_setup_plan(decision, symbol_snapshot, cfg)
     direction = decision.get("direction")
     if direction not in {"long", "short"}:
         return None, "setup direction is invalid"
     setup_type = str(decision.get("setup_type") or "ibr_breakout")
     if setup_type not in SETUP_TYPES:
         return None, "setup type is not recognised"
-    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
     try:
         contract = contract_for_variant(str(strategy.get("id") or "ibr"), strategy.get("variant_id"))
         if strategy.get("variant_id"):

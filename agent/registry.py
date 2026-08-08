@@ -1,4 +1,4 @@
-"""Single-strategy registry and fail-closed variant authorization.
+"""Strategy registry and fail-closed variant authorization.
 
 The append-only edge ledger owns evidence and promotion state.  This module
 only defines the IBR semantic contract and the bounded variant namespace used
@@ -92,6 +92,15 @@ REGISTRY: dict[str, StrategySpec] = {
         setup_types=("ibr_breakout",),
         contract_params={"range_minutes": 15, "breakout_buffer_bps": 5.0,
                          "min_relative_volume": 1.0, "target_r": 2.0}),
+    "rule": StrategySpec(
+        id="rule", version="v1",
+        mechanism=(
+            "A bounded completed-bar rule composed from the audited strategy "
+            "grammar may capture a repeatable intraday behavior."),
+        falsification=(
+            "The generated rule has no positive held-out and later-forward "
+            "expectancy after costs and family-wise correction."),
+        setup_types=("rule_signal",), contract_params={}),
 }
 
 
@@ -116,10 +125,15 @@ def _builder(strategy_id: str):
 def contract_for(strategy_id: str) -> StrategyContract:
     spec = spec_for(strategy_id)
     return StrategyContract(
-        spec, "agent.contracts.ibr:setup_evidence", _builder(strategy_id))
+        spec, ("agent.contracts.rule:setup_evidence" if strategy_id == "rule"
+              else "agent.contracts.ibr:setup_evidence"), _builder(strategy_id))
 
 
 def known_variant_ids(strategy_id: str = "ibr") -> tuple[str, ...]:
+    if strategy_id == "rule":
+        # Autonomous rule ids are content-addressed in the edge ledger rather
+        # than a mutable source-controlled allow-list.
+        return ()
     ids = {baseline_variant_id(strategy_id)}
     try:
         from .variants import load_registry
@@ -133,6 +147,14 @@ def known_variant_ids(strategy_id: str = "ibr") -> tuple[str, ...]:
 
 
 def validate_variant_id(strategy_id: str, variant_id: str) -> str:
+    if strategy_id == "rule":
+        if not variant_id or variant_id == "auto":
+            return "auto"
+        parts = str(variant_id).split(".")
+        if len(parts) != 3 or parts[0] != "rule" or len(parts[2]) != 16 or any(
+                character not in "0123456789abcdef" for character in parts[2]):
+            raise ValueError("autonomous rule variant id must be content-addressed")
+        return str(variant_id)
     if not variant_id:
         return baseline_variant_id(strategy_id)
     if variant_id == baseline_variant_id(strategy_id):
@@ -149,6 +171,8 @@ def validate_variant_id(strategy_id: str, variant_id: str) -> str:
 
 def _parameters_for(spec: StrategySpec, variant_id: str) -> tuple[tuple[str, Any], ...]:
     parameters = dict(spec.contract_params)
+    if spec.id == "rule":
+        return ()
     if variant_id != baseline_variant_id(spec.id):
         try:
             from .variants import load_registry
@@ -178,4 +202,19 @@ def validate_contract_config(cfg: dict) -> None:
     strategy = cfg.get("strategy") or {}
     strategy_id = str(strategy.get("id") or "")
     spec_for(strategy_id)
-    validate_variant_id(strategy_id, str(strategy.get("variant_id") or ""))
+    selected = validate_variant_id(strategy_id, str(strategy.get("variant_id") or ""))
+    if strategy_id == "rule":
+        from .contracts.rule import rule_variant_id, validate_rule_spec
+        research = cfg.get("research") or {}
+        if not isinstance(research, dict) or not research.get("enabled", False) or not \
+                research.get("require_validated_variant", True):
+            raise ValueError("autonomous rule execution requires the validated edge gate")
+        raw_spec = strategy.get("rule_spec")
+        if raw_spec is None:
+            if selected != "auto":
+                raise ValueError("a selected rule variant requires rule_spec")
+            return
+        spec = validate_rule_spec(raw_spec)
+        expected = rule_variant_id(spec)
+        if selected not in {"auto", expected}:
+            raise ValueError("strategy.variant_id does not match rule_spec content hash")

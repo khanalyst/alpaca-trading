@@ -17,6 +17,7 @@ from .alpaca_provider import AlpacaError, AlpacaProvider
 from .alpaca_session import SessionPolicy
 from .brain import DecisionBrain
 from .contracts.ibr import generate_ibr_signal
+from .contracts.rule import generate_rule_signal
 from .market import MarketData
 from .risk import RiskEngine
 from .strategy import build_setup_plan
@@ -721,7 +722,11 @@ class Engine:
             if not row:
                 continue
             bars = row.get("bars", [])
-            signal = generate_ibr_signal(symbol, bars, config=self.cfg.get("strategy", {}), now=now)
+            if str(self.cfg.get("strategy", {}).get("id")) == "rule":
+                signal = generate_rule_signal(symbol, bars, config=self.cfg, now=now)
+            else:
+                signal = generate_ibr_signal(
+                    symbol, bars, config=self.cfg.get("strategy", {}), now=now)
             if signal is None:
                 continue
             # Complete signal evidence must carry the latest quote controls.

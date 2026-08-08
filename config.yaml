@@ -20,8 +20,9 @@
     "denylist": []
   },
   "strategy": {
-    "id": "ibr",
+    "id": "rule",
     "version": "v1",
+    "variant_id": "auto",
     "execution_mode": "shares",
     "range_minutes": 15,
     "breakout_buffer_bps": 5,
@@ -46,7 +47,7 @@
   "execution": {
     "order_type": "market",
     "time_in_force": "day",
-    "client_order_id_prefix": "ibr",
+    "client_order_id_prefix": "edge",
     "max_slippage_bps": 50,
     "max_market_data_age_seconds": 30,
     "max_spread_bps": 100

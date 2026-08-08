@@ -152,9 +152,29 @@ run_discovery() {
   fi
 }
 
+run_factory() {
+  local vehicle="$1"
+  "$python_bin" "$repo_root/research.py" factory run \
+    --data "$validated_input" --vehicle "$vehicle" --db "$edge_db" \
+    --strategies "${ALPACA_FACTORY_STRATEGIES:-7}" \
+    --variants "${ALPACA_FACTORY_VARIANTS:-4}" \
+    --workers "${ALPACA_FACTORY_WORKERS:-7}" \
+    --starting-cash "${ALPACA_FACTORY_STARTING_CASH:-100000}" \
+    --min-trades "${ALPACA_FACTORY_MIN_TRADES:-100}" \
+    --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-10}" \
+    --alpha "${ALPACA_FACTORY_ALPHA:-0.05}" \
+    --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}"
+}
+
 if [ -s "$bars_input" ]; then
   run_discovery equity
+  if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
+    run_factory equity
+  fi
 fi
 if [ -s "$options_input" ]; then
   run_discovery option
+  if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
+    run_factory option
+  fi
 fi

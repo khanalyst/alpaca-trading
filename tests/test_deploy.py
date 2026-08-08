@@ -195,6 +195,11 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIn('"vehicle": "option"', result.stdout)
             self.assertTrue(edge_db.is_file())
+            with closing(sqlite3.connect(edge_db)) as db:
+                vehicles = dict(db.execute(
+                    "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
+                ).fetchall())
+            self.assertEqual(vehicles, {"equity": 7, "option": 7})
 
     def test_recorder_passes_feed_and_deduplicates_overlapping_windows(self):
         fake = _MarketFake()

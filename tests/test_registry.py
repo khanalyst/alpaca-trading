@@ -4,10 +4,12 @@ from agent import registry
 
 
 class IBRRegistryTests(unittest.TestCase):
-    def test_only_ibr_alpha_is_registered(self):
-        self.assertEqual(tuple(registry.REGISTRY), ("ibr",))
+    def test_only_audited_strategy_contracts_are_registered(self):
+        self.assertEqual(tuple(registry.REGISTRY), ("ibr", "rule"))
         self.assertEqual(registry.spec_for("ibr").setup_types,
                          ("ibr_breakout",))
+        self.assertEqual(registry.spec_for("rule").setup_types,
+                         ("rule_signal",))
 
     def test_contract_identity_and_semantics_are_stable(self):
         contract = registry.contract_for_variant("ibr", "ibr.baseline")

@@ -148,8 +148,11 @@ time, and check output in the deployment log.
 Research is read-only with respect to broker authority. It discovers the
 recorder's mixed bars/quotes/options dataset at
 `runtime/research/recorded/market.csv` by default (or uses
-`ALPACA_RESEARCH_DATASET`), replays IBR signals, scores the configured shares
-or single-leg long-option vehicle, and writes reports. The edge ledger is
+`ALPACA_RESEARCH_DATASET`), runs the seven-family autonomous strategy factory
+plus the explicit IBR baseline, scores shares and single-leg long-option
+vehicles separately, and writes evidence. Each variant has its own simulated
+cash/equity account; default capacity is seven parallel strategy workers and
+four variants per strategy. The edge ledger is
 initialized at `runtime/research/edge_lab.sqlite3`; inspect it with
 `python research.py edge status`. The autonomous lifecycle requires an initial
 corpus backtest followed by later unseen shadow evidence; paper outcomes are
@@ -160,6 +163,11 @@ subject to lifecycle/evidence rules; demote, retire, and rollback are operator
 safety actions. Keep data provenance, session date, feed, contract
 identity, and costs with each result. Do not combine regular-session evidence
 with pre/post-market or overnight data.
+
+Inspect autonomous lineage and isolated-account counts with
+`python research.py factory status`. Tune bounded capacity with
+`ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`, and
+`ALPACA_FACTORY_WORKERS`; hard validation caps these at 16, 8, and 16.
 
 The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this

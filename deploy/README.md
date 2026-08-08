@@ -12,7 +12,7 @@ process ownership and the two supported launch lanes.
 | --- | --- | --- |
 | `recorder` | Paper/public Alpaca bars, quotes, and session observations | `runtime-data` |
 | `trader` | Exactly one intraday paper loop in one configured execution profile and broker reconciliation | `runtime-data`, `research-cache` |
-| `research` (profile `research`) | Scheduled offline validation/replay; no broker authority | `runtime-data`, research volumes |
+| `research` (profile `research`) | Scheduled seven-strategy parallel factory, validation, and replay; no broker authority | `runtime-data`, research volumes |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
 All services run as UID/GID 10001, drop Linux capabilities, use a read-only
@@ -29,7 +29,9 @@ source with normalized JSONL. Start it with
 `docker compose --profile research up -d research`. The edge ledger is stored
 at `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate paper
-state.
+state. Defaults are seven concurrent strategy workers and four isolated
+variant accounts per strategy; capacity is configurable through the
+`ALPACA_FACTORY_*` environment variables.
 
 The Alpaca paper endpoint and feed settings are passed explicitly through
 `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and `ALPACA_OPTIONS_FEED`. Credentials are
@@ -39,7 +41,7 @@ can corrupt/delete operational state.
 
 Before market-data or order calls, run `python main.py check`; this is the
 authenticated paper preflight by default (`--offline` is local-only). The
-deterministic strategy is the default and LLM use is disabled by default;
+deterministic validated rule champion is the default and LLM use is disabled by default;
 enabling `llm.enabled` is an explicit credentialed opt-in. A non-zero
 `main.py flatten` result means paper positions remain and requires broker
 reconciliation. The trader opens entries only when the SQLite ledger has a

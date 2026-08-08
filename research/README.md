@@ -21,6 +21,9 @@ accept raw provider dictionaries.
 The deployment recorder appends bars, quotes, and option snapshots to one
 mixed market dataset. `deploy/research-cycle.sh` validates that dataset and
 routes the available bar/option events to the vehicle-local discovery lanes.
+It also invokes `research.strategy_factory`, which evaluates seven distinct
+rule families concurrently by default. Each generated variant owns an
+isolated simulated account; no capital or P&L is shared between arms.
 
 The default session timezone is `America/New_York`. Session dates are derived
 after timezone conversion, so the daylight-saving transitions in March and
@@ -86,6 +89,28 @@ used in conservative champion ranking. Normal
 operation needs no manual promotion; the `edge promote`/rollback CLI is only
 for explicit, audited controls and remains subject to lifecycle/evidence
 rules. Demote, retire, and rollback are operator safety actions.
+
+## Autonomous strategy factory
+
+`research.strategy_factory` owns safe hypothesis generation. Its proposal
+language is the finite grammar in `agent.contracts.rule`: opening-range
+breakout/fade, momentum continuation, mean reversion, trend pullback,
+volatility breakout, and volume breakout, with bounded confirmations and exit
+parameters. It never generates or imports source code.
+
+On a fresh corpus, each worker diagnoses its baseline only from the
+chronological fit partition, creates bounded variants based on the observed
+failure mode, and evaluates those variants on untouched held-out sessions.
+Every variant has a separate simulated cash/equity account. An adequately
+powered family whose variants all fail is retired; a content-addressed new
+hypothesis is immediately queued for the next independent corpus. Insufficient
+data is not treated as failure. Backtest winners must still pass strictly later
+forward data before runtime can select them.
+
+```bash
+python research.py factory run --data market.jsonl --strategies 7 --variants 4 --workers 7
+python research.py factory status
+```
 
 ```bash
 python research.py edge init
