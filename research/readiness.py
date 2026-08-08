@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -64,7 +65,8 @@ class Gate:
 
 def _count(db, kind: str) -> int:
     try:
-        with sqlite3.connect(f"file:{Path(db)}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(
+                f"file:{Path(db)}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE kind=?", (kind,)).fetchone()
         return int(row[0]) if row else 0
@@ -76,7 +78,8 @@ def _count(db, kind: str) -> int:
 
 def _proposal_snapshot(db) -> tuple[int, float]:
     try:
-        with sqlite3.connect(f"file:{Path(db)}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(
+                f"file:{Path(db)}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM events "
                 "WHERE kind='setup_proposed'").fetchone()
@@ -87,7 +90,8 @@ def _proposal_snapshot(db) -> tuple[int, float]:
 
 def _latest_g2_result(db) -> dict | None:
     try:
-        with sqlite3.connect(f"file:{Path(db)}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(
+                f"file:{Path(db)}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 "SELECT payload FROM events "
                 "WHERE kind='research_gate_result' "
@@ -241,35 +245,35 @@ def gate_b75(db, cfg: dict, g2: Gate) -> Gate:
 
     if resting:
         return Gate(
-            "B7.5", "Passive entry validated on a live account", FAILED,
+            "B7.5", "Passive entry validated in a demo-account experiment", FAILED,
             f"{len(resting)} attempt(s) could not be cancelled and may have "
             "rested. That is the one failure mode the design forbids",
             "investigate before re-enabling; see research/plan/"
-            "B7.5-record.md")
+            "maker-first-entry-boundary.md")
 
     if g2.status != PASS:
         return Gate(
-            "B7.5", "Passive entry validated on a live account", BLOCKED,
+            "B7.5", "Passive entry validated in a demo-account experiment", BLOCKED,
             "gate G2 must pass first, so a working replay can detect any "
             "change in decision behaviour the entry path causes",
             "see G2 above")
 
     if not enabled:
         return Gate(
-            "B7.5", "Passive entry validated on a live account", READY,
+            "B7.5", "Passive entry validated in a demo-account experiment", READY,
             "G2 is reachable and nothing is resting. The flag is off, which "
             "is correct until it has been exercised on demo",
             "set execution.maker_first_enabled: true in demo, then re-check")
 
     if len(attempts) < MIN_MAKER_ATTEMPTS:
         return Gate(
-            "B7.5", "Passive entry validated on a live account", COLLECTING,
+            "B7.5", "Passive entry validated in a demo-account experiment", COLLECTING,
             f"{len(attempts)} of {MIN_MAKER_ATTEMPTS} passive attempts "
             "recorded, none resting so far",
             "keep running on demo")
 
     return Gate(
-        "B7.5", "Passive entry validated on a live account", PASS,
+        "B7.5", "Passive entry validated in a demo-account experiment", PASS,
         f"{len(attempts)} attempts, {len(filled)} filled, none left resting",
         "measure fill rate against the IOC counterfactual")
 

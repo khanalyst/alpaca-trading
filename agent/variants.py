@@ -36,6 +36,7 @@ import yaml
 from research.protocol import MIN_AXIS_SETTINGS
 
 from .config import ConfigError, validate_config
+from .registry import TUNED_LS_VARIANT_ID
 
 
 LIVE_VARIANT_ID = "live"
@@ -126,6 +127,17 @@ def apply(variant: Variant, base_cfg: dict, *,
     variants rather than a bug.
     """
     cfg = copy.deepcopy(base_cfg)
+    # The tuned ls-ratio-fade run changed several coupled semantics.  Make its
+    # identity explicit before validation so it can never be replayed under
+    # the ambiguous ``live`` bucket or mistaken for a one-axis arm.
+    if variant.variant_id == TUNED_LS_VARIANT_ID:
+        cfg.setdefault("strategy", {})["variant_id"] = TUNED_LS_VARIANT_ID
+    elif str((cfg.get("strategy") or {}).get("variant_id") or "") == (
+            baseline_variant_id(variant.strategy_id)):
+        # A one-axis arm is not itself an immutable semantic contract.  Drop
+        # the baseline label so its single override can be evaluated without
+        # being mistaken for a full contract identity.
+        cfg["strategy"].pop("variant_id", None)
     for path, value in variant.overrides.items():
         _set_dotted(cfg, path, value, variant.variant_id)
     try:
@@ -438,27 +450,30 @@ def _selection_baseline_config(strategy_id: str) -> dict:
     path = Path(__file__).resolve().parents[1] / "config.yaml"
     cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     spec = strategy_registry.spec_for(strategy_id)
-    if strategy_id != str((cfg.get("strategy") or {}).get("id") or ""):
-        model = spec.forward_model
-        cfg = copy.deepcopy(cfg)
-        strategy = dict(cfg["strategy"])
-        strategy.update(spec.contract_params)
-        strategy.update({
-            "id": spec.id,
-            "version": spec.version,
-            "signal_timeframe": spec.signal_timeframe,
-            "min_stop_atr_multiple": model.stop_atr_multiple,
-            "fixed_reward_risk": model.reward_risk,
-            "forward_horizon_hours": model.horizon_hours,
-        })
-        cfg["strategy"] = strategy
-        risk = dict(cfg["risk"])
-        risk["max_hold_hours"] = min(
-            float(risk["max_hold_hours"]), spec.max_hold_hours_ceiling)
-        cfg["risk"] = risk
-        costs = dict(cfg["trading_costs"])
-        costs["expected_hold_hours"] = min(model.horizon_hours, 168.0)
-        cfg["trading_costs"] = costs
+    # This helper defines the registered comparison floor, never the shipped
+    # order-path tuning.  Always rebuild it from the canonical spec/model so a
+    # tuned ``config.yaml`` cannot leak into the baseline arm.
+    model = spec.forward_model
+    cfg = copy.deepcopy(cfg)
+    strategy = dict(cfg["strategy"])
+    strategy.update(spec.contract_params)
+    strategy.update({
+        "id": spec.id,
+        "version": spec.version,
+        "variant_id": strategy_registry.baseline_variant_id(spec.id),
+        "signal_timeframe": spec.signal_timeframe,
+        "min_stop_atr_multiple": model.stop_atr_multiple,
+        "fixed_reward_risk": model.reward_risk,
+        "forward_horizon_hours": model.horizon_hours,
+    })
+    cfg["strategy"] = strategy
+    risk = dict(cfg["risk"])
+    risk["max_hold_hours"] = min(
+        float(risk["max_hold_hours"]), spec.max_hold_hours_ceiling)
+    cfg["risk"] = risk
+    costs = dict(cfg["trading_costs"])
+    costs["expected_hold_hours"] = min(model.horizon_hours, 168.0)
+    cfg["trading_costs"] = costs
     return validate_config(cfg, allow_shadow_strategy=True)
 
 
@@ -544,7 +559,8 @@ def research_selection_catalog() -> dict[str, tuple[dict, ...]]:
 
     catalog: dict[str, list[dict]] = {}
     for variant in registered.values():
-        if (variant.status not in {"candidate", "testing"}
+        if (variant.variant_id == TUNED_LS_VARIANT_ID
+                or variant.status not in {"candidate", "testing"}
                 or variant.variant_id == baseline_variant_id(variant.strategy_id)):
             continue
         declared = declared_research_setting(variant)

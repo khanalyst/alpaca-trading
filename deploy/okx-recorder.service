@@ -8,12 +8,13 @@ Wants=network-online.target
 Type=simple
 User=okx
 WorkingDirectory=/opt/okx-agent-crypto
-ExecStart=/opt/okx-agent-crypto/.venv/bin/python research/record_flow.py \
+ExecStart=/opt/okx-agent-crypto/.venv/bin/python /opt/okx-agent-crypto/research/record_flow.py \
   --out /opt/okx-agent-crypto/runtime/research/recorded
 Restart=always
 RestartSec=60
 StandardOutput=journal
 StandardError=journal
+TimeoutStopSec=45s
 
 [Install]
 WantedBy=multi-user.target

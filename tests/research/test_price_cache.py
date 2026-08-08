@@ -105,7 +105,15 @@ class PriceCacheTests(unittest.TestCase):
     def test_days_covering_spans_the_range(self):
         cache = PriceCache(self.path)
         days = cache.days_covering(DAY_START, DAY_START + 2 * DAY_MS)
-        self.assertEqual(days, ["2025-10-09", "2025-10-10", "2025-10-11"])
+        self.assertEqual(days, ["2025-10-09", "2025-10-10"])
+
+    def test_days_covering_zero_width_range_is_empty(self):
+        cache = PriceCache(self.path)
+        self.assertEqual(
+            cache.days_covering(DAY_START, DAY_START), [])
+        self.assertEqual(
+            cache.days_covering(DAY_START + DAY_MS,
+                                DAY_START), [])
 
     def test_each_uncached_day_is_fetched_once(self):
         fetcher = CountingFetcher()
@@ -114,8 +122,8 @@ class PriceCacheTests(unittest.TestCase):
         fetched = cache.ensure("BTC/USDT:USDT", DAY_START,
                                DAY_START + 2 * DAY_MS)
 
-        self.assertEqual(fetched, 3)
-        self.assertEqual(len(fetcher.calls), 3)
+        self.assertEqual(fetched, 2)
+        self.assertEqual(len(fetcher.calls), 2)
 
     def test_symbols_do_not_share_a_cache_entry(self):
         fetcher = CountingFetcher()

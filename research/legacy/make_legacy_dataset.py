@@ -1,4 +1,4 @@
-"""Adapt an `edge_lab` dataset into the layout `phase1_v2_backtest.py` expects.
+"""Adapt an `edge_lab` dataset into the layout the legacy phase1 backtest expects.
 
 Running the repository's own backtest over the same bars as the independent
 harness turns "two studies agreed" into real corroboration: two separately

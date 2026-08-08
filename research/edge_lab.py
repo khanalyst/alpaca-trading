@@ -38,6 +38,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from .stats import clustered_sign_flip_mean
+except ImportError:
+    from stats import clustered_sign_flip_mean
+
 BAR_MS = 900_000
 HOUR_MS = 3_600_000
 FOUR_HOUR_MS = 4 * HOUR_MS
@@ -602,6 +607,7 @@ class FundingCarryContract:
     min_samples: int = 20
     stop_atr_multiple: float = 3.0
     reward_risk: float = 2.0
+    carry_exit_funding_percentile: float = 50.0
     max_hold_bars: int = 960               # 10 days
     min_stop_pct: float = 0.2
     max_stop_pct: float = 15.0
@@ -635,7 +641,10 @@ class FundingCarryContract:
     def levels(self, df: pd.DataFrame, direction: str,
                exit_policy: str) -> tuple[np.ndarray, np.ndarray]:
         stop = df["atr_1h_pct"].to_numpy(float) * self.stop_atr_multiple
-        return np.round(stop, 6), np.round(stop * self.reward_risk, 6)
+        take = (np.full(len(df), np.nan)
+                if exit_policy == "carry_until_normalised"
+                else stop * self.reward_risk)
+        return np.round(stop, 6), np.round(take, 6)
 
 
 def evidence_masks(df: pd.DataFrame, c: Contract) -> dict[str, np.ndarray]:
@@ -800,7 +809,8 @@ DEFAULT_COST_SCENARIO = "account_taker"
 
 def simulate(frame: SymbolFrame, idx: np.ndarray, direction: str,
              stop_pct: np.ndarray, take_pct: np.ndarray,
-             costs: Costs, max_hold_bars: int) -> pd.DataFrame:
+             costs: Costs, max_hold_bars: int,
+             funding_exit_percentile: float | None = None) -> pd.DataFrame:
     """Vectorized forward simulation of entries at bar `idx + 1` open.
 
     Ambiguity rule: when a bar's range spans both the stop and the target,
@@ -840,19 +850,32 @@ def simulate(frame: SymbolFrame, idx: np.ndarray, direction: str,
         stop_hit = (win_high >= stop_level[:, None]) & valid
         take_hit = (win_low <= take_level[:, None]) & valid
 
+    if funding_exit_percentile is not None:
+        funding_percentile = frame.df[
+            "funding_percentile_30"].to_numpy(float)[grid_clipped]
+        # Match ShadowEvaluator._carry_normalisation_exit exactly: the
+        # executable contract closes when the percentile is at or below the
+        # registered threshold.  Do not invent a direction-dependent rule in
+        # the tournament that the recorded forward evaluator does not run.
+        goal_hit = (funding_percentile <= funding_exit_percentile) & valid
+        goal_name = "funding_normalised"
+    else:
+        goal_hit = take_hit
+        goal_name = "take_profit"
+
     big = max_hold_bars + 10
     first_stop = np.where(stop_hit.any(1), stop_hit.argmax(1), big)
-    first_take = np.where(take_hit.any(1), take_hit.argmax(1), big)
+    first_goal = np.where(goal_hit.any(1), goal_hit.argmax(1), big)
     # Stop-first on a tie (same bar) is the conservative assumption.
-    stopped = first_stop <= first_take
-    took = (first_take < first_stop) & (first_take < big)
+    stopped = first_stop <= first_goal
+    reached_goal = (first_goal < first_stop) & (first_goal < big)
     last_valid = valid.sum(1) - 1
     offset = np.where(stopped & (first_stop < big), first_stop,
-                      np.where(took, first_take, last_valid))
+                      np.where(reached_goal, first_goal, last_valid))
     exit_idx = np.minimum(entry_idx + offset, n - 1)
 
     reason = np.where(stopped & (first_stop < big), "stop",
-                      np.where(took, "take_profit", "max_hold"))
+                      np.where(reached_goal, goal_name, "max_hold"))
     gap_open = win_open[np.arange(len(offset)), offset]
     if direction == "long":
         stop_fill = np.minimum(stop_level, gap_open)
@@ -956,6 +979,8 @@ def summarize(trades: pd.DataFrame, label: str = "",
         "total_r": float(r.sum()),
         "avg_hold_h": float(trades["bars_held"].mean() * 0.25),
         "tp_rate_pct": float((trades["exit_reason"] == "take_profit").mean() * 100),
+        "funding_normalisation_rate_pct": float(
+            (trades["exit_reason"] == "funding_normalised").mean() * 100),
         "stop_rate_pct": float((trades["exit_reason"] == "stop").mean() * 100),
         "timeout_rate_pct": float((trades["exit_reason"] == "max_hold").mean() * 100),
         "months": int(len(np.unique(months))),
@@ -965,6 +990,15 @@ def summarize(trades: pd.DataFrame, label: str = "",
         out["expectancy_r_ci95"] = ci
         out["significant"] = bool(
             ci[0] == ci[0] and (ci[0] > 0 or ci[1] < 0))
+        significance_test = clustered_sign_flip_mean(r.tolist(),
+                                                     months.tolist())
+        # Fewer than eight regimes can produce a small exact p-value but do
+        # not provide enough independent market conditions for qualification.
+        if significance_test["clusters"] < 8:
+            significance_test["method"] = "insufficient_clusters"
+            significance_test["p_value"] = 1.0
+        out["p_value"] = float(significance_test["p_value"])
+        out["significance_test"] = significance_test
     # Standard error using month blocks, for a t-like read on the mean.
     per_month = pd.Series(r).groupby(months).mean()
     if len(per_month) > 2:
@@ -1109,7 +1143,9 @@ def build_trades(frames: dict[str, SymbolFrame],
                 stop, take = contract.levels(df, direction, exit_policy)
                 mask &= ~np.isnan(stop) & (stop >= contract.min_stop_pct) \
                     & (stop <= contract.max_stop_pct)
-                mask &= ~np.isnan(take) & (take <= 50.0)
+                carry_exit = exit_policy == "carry_until_normalised"
+                if not carry_exit:
+                    mask &= ~np.isnan(take) & (take <= 50.0)
                 idx = np.where(mask)[0]
                 if len(idx) == 0:
                     continue
@@ -1128,8 +1164,9 @@ def build_trades(frames: dict[str, SymbolFrame],
                     # timing alone and not in data availability.
                     usable = (in_universe & ~np.isnan(stop)
                               & (stop >= contract.min_stop_pct)
-                              & (stop <= contract.max_stop_pct)
-                              & ~np.isnan(take) & (take <= 50.0))
+                              & (stop <= contract.max_stop_pct))
+                    if not carry_exit:
+                        usable &= ~np.isnan(take) & (take <= 50.0)
                     pool = np.where(usable)[0]
                     pool = pool[pool < high]
                     if len(pool) == 0:
@@ -1146,7 +1183,9 @@ def build_trades(frames: dict[str, SymbolFrame],
                 if flip is None:
                     chunk = simulate(
                         frame, idx, traded_direction, stop[idx], take[idx],
-                        costs, contract.max_hold_bars)
+                        costs, contract.max_hold_bars,
+                        (getattr(contract, "carry_exit_funding_percentile")
+                         if carry_exit else None))
                     if not chunk.empty:
                         chunk["setup_type"] = setup
                         chunk["signal_direction"] = direction
@@ -1157,7 +1196,11 @@ def build_trades(frames: dict[str, SymbolFrame],
                             continue
                         s2, t2 = contract.levels(df, want, exit_policy)
                         chunk = simulate(frame, sub, want, s2[sub], t2[sub],
-                                         costs, contract.max_hold_bars)
+                                         costs, contract.max_hold_bars,
+                                         (getattr(
+                                             contract,
+                                             "carry_exit_funding_percentile")
+                                          if carry_exit else None))
                         if not chunk.empty:
                             chunk["setup_type"] = setup
                             chunk["signal_direction"] = direction

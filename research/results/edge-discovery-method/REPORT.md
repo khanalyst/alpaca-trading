@@ -1,5 +1,9 @@
 # How to infer an edge, and where to look for one
 
+> **ARCHIVED / FROZEN EVIDENCE SNAPSHOT.** This report records the data and
+> methodology available when it ran. Its recommendations are not current
+> runtime configuration and do not authorize capital.
+
 > ## ⚠ Cost basis correction — 2026-08-04
 >
 > **Every number below was produced against the `base` cost scenario:
@@ -361,8 +365,8 @@ in a market where t=2.6 has already been shown to arise from nothing.
 ## Reproduce
 
 ```bash
-python research/fetch_flow_data.py --out runtime/research/flow --days 32
-python research/analyse_flow.py --data runtime/research/data \
+python research/legacy/fetch_flow_data.py --out runtime/research/flow --days 32
+python research/legacy/analyse_flow.py --data runtime/research/data \
                                 --flow runtime/research/flow
 python research/record_flow.py  --out runtime/research/recorded
 ```

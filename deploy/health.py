@@ -32,9 +32,13 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
     heartbeat = _read_json(path)
     status = str(heartbeat.get("status") or "missing")
     fresh = _fresh(heartbeat.get("updated_ts"), max_age, now)
+    strategy_shadow_errors = heartbeat.get("strategy_shadow_errors")
+    if not isinstance(strategy_shadow_errors, dict):
+        strategy_shadow_errors = {}
     research_ok = not (
         heartbeat.get("research_expected") is True
-        and heartbeat.get("research_available") is not True)
+        and (heartbeat.get("research_available") is not True
+             or bool(strategy_shadow_errors)))
     ok = fresh and status in {"starting", "running", "paused"} and research_ok
     return {
         "ok": ok,
@@ -42,6 +46,8 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "status": status,
         "fresh": fresh,
         "research_available": heartbeat.get("research_available"),
+        "research_status": heartbeat.get("research_status"),
+        "strategy_shadow_errors": strategy_shadow_errors,
     }
 
 
@@ -64,15 +70,26 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
     status = str(heartbeat.get("status") or "missing")
     fresh = _fresh(heartbeat.get("updated_ts"), max_age, now)
     last_exit = heartbeat.get("last_exit_code")
-    ok = fresh and status in {"waiting", "running", "completed"} and (
+    current = time.time() if now is None else float(now)
+    deadline = heartbeat.get("deadline_ts")
+    try:
+        hung = status == "running" and deadline is not None and current > float(deadline)
+    except (TypeError, ValueError):
+        hung = status == "running"
+    ok = fresh and not hung and status in {"waiting", "running", "completed"} and (
         last_exit in {None, 0})
     return {
         "ok": ok,
         "component": "research",
         "status": status,
         "fresh": fresh,
+        "hung": hung,
+        "job_id": heartbeat.get("job_id"),
+        "started_ts": heartbeat.get("started_ts"),
+        "completed_ts": heartbeat.get("completed_ts"),
         "last_exit_code": last_exit,
         "next_run_ts": heartbeat.get("next_run_ts"),
+        "structured_failures": heartbeat.get("structured_failures") or [],
     }
 
 

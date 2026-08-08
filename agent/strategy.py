@@ -16,8 +16,9 @@ import json
 import time
 
 from . import hypotheses
-from .contracts import EVIDENCE_BUILDERS, finite as _finite
-from .registry import spec_for
+from .contracts import finite as _finite
+from .registry import (contract_for_variant, spec_for,
+                       validate_contract_config)
 
 
 # Bounds untrusted labels before per-strategy validation.
@@ -54,6 +55,14 @@ def identity(cfg: dict) -> tuple[str, str]:
     return str(block["id"]), str(block["version"])
 
 
+def variant_identity(cfg: dict) -> str:
+    """Return the explicit semantic variant, or the registered baseline."""
+    block = cfg["strategy"]
+    strategy_id = str(block["id"])
+    return str(block.get("variant_id") or
+               strategy_id.replace("-", "_") + ".baseline")
+
+
 def signal_probe(decision: dict, symbol_snapshot: dict,
                  cfg: dict) -> dict | None:
     """Build an idempotency identity before the full setup contract runs."""
@@ -64,6 +73,7 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
             or not symbol or direction not in {"long", "short"}):
         return None
     strategy_id, strategy_version = identity(cfg)
+    semantic_variant_id = variant_identity(cfg)
     setup_type = str(decision.get("setup_type") or "invalid")[:80]
     if setup_type == "other":
         # Match the attribution build_setup_plan will assign, so the
@@ -79,6 +89,7 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
     setup_key = _hash({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
+        "variant_id": semantic_variant_id,
         "symbol": symbol,
         "direction": direction,
         "setup_type": setup_type,
@@ -86,6 +97,7 @@ def signal_probe(decision: dict, symbol_snapshot: dict,
     return {
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
+        "variant_id": semantic_variant_id,
         # Rejected evaluations use a per-symbol/per-bar ID. Valid setup IDs
         # remain more specific and include their semantic setup key.
         "setup_id": _hash({
@@ -114,13 +126,18 @@ def setup_evidence(snapshot: dict, cfg: dict) -> dict:
     """
     strategy_id = str(cfg["strategy"]["id"])
     try:
-        builder = EVIDENCE_BUILDERS[strategy_id]
-    except KeyError:
-        raise KeyError(
-            f"no evidence contract is registered for strategy.id "
-            f"{strategy_id!r}; registered: "
-            f"{', '.join(sorted(EVIDENCE_BUILDERS))}") from None
-    return builder(snapshot, cfg)
+        contract = contract_for_variant(
+            strategy_id, cfg["strategy"].get("variant_id"))
+    except (KeyError, ValueError) as exc:
+        raise KeyError(str(exc)) from None
+    # A declared variant is an executable identity, not a comment.  Refuse
+    # stale effective parameters before the builder sees market data.
+    if cfg["strategy"].get("variant_id"):
+        try:
+            validate_contract_config(cfg)
+        except ValueError as exc:
+            raise ValueError(f"strategy contract mismatch: {exc}") from None
+    return contract.builder(snapshot, cfg)
 
 
 def enrich_snapshot(snapshot: dict, cfg: dict) -> dict:
@@ -199,6 +216,16 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
                      ) -> tuple[dict | None, str | None]:
     """Validate one model-labelled setup and derive deterministic SL/TP."""
     direction = decision.get("direction")
+    try:
+        composite = contract_for_variant(
+            str(cfg["strategy"]["id"]), cfg["strategy"].get("variant_id"))
+    except (KeyError, ValueError) as exc:
+        return None, f"strategy contract mismatch: {exc}"
+    if cfg["strategy"].get("variant_id"):
+        try:
+            validate_contract_config(cfg)
+        except ValueError as exc:
+            return None, f"strategy contract mismatch: {exc}"
     if direction not in {"long", "short"}:
         return None, "setup direction is invalid"
     setup_type = str(decision.get("setup_type") or "")
@@ -303,6 +330,7 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     setup_key = _hash({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
+        "variant_id": variant_identity(cfg),
         "symbol": decision.get("symbol"),
         "direction": direction,
         "setup_type": setup_type,
@@ -315,6 +343,8 @@ def build_setup_plan(decision: dict, symbol_snapshot: dict,
     enriched.update({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
+        "variant_id": variant_identity(cfg),
+        "contract_hash": composite.semantic_hash,
         "setup_id": setup_id,
         "setup_key": setup_key,
         "setup_type": setup_type,
@@ -386,6 +416,7 @@ def _build_staged_setup_plan(decision: dict, symbol_snapshot: dict,
     plan.update({
         "strategy_id": strategy_id,
         "strategy_version": strategy_version,
+        "variant_id": variant_identity(cfg),
         "setup_id": setup_id,
         "setup_key": setup_key,
         "setup_type": "staged_mechanism",
@@ -409,6 +440,7 @@ def new_setup_record(plan: dict, cfg: dict,
     return {
         "strategy_id": str(plan["strategy_id"]),
         "strategy_version": str(plan["strategy_version"]),
+        "variant_id": str(plan.get("variant_id") or variant_identity(cfg)),
         "setup_key": str(plan["setup_key"]),
         "setup_type": str(plan["setup_type"]),
         "symbol": str(plan["symbol"]),

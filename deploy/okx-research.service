@@ -10,10 +10,16 @@ Environment=PYTHON=/opt/okx-agent-crypto/.venv/bin/python
 # Production operators should add BACKUP_TARGET and
 # REQUIRE_EXTERNAL_BACKUP=1 through `systemctl edit` after provisioning a
 # pre-existing different-device mount. A path alone is not external proof.
-ExecStart=/opt/okx-agent-crypto/research/nightly.sh
+ExecStart=/opt/okx-agent-crypto/.venv/bin/python \
+  /opt/okx-agent-crypto/deploy/scheduler.py --once \
+  --root /opt/okx-agent-crypto \
+  --config /opt/okx-agent-crypto/config.yaml \
+  --script /opt/okx-agent-crypto/research/nightly.sh \
+  --status-file /opt/okx-agent-crypto/runtime/health/research.json \
+  --hour 3 --minute 0 --timeout-seconds 14400
 # Reduce research CPU and I/O priority to protect the trading loop.
 Nice=10
 IOSchedulingClass=idle
-TimeoutStartSec=4h
+TimeoutStartSec=4h10m
 StandardOutput=journal
 StandardError=journal

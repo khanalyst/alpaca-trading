@@ -48,3 +48,16 @@ from . import (flush_fade, funding_carry,  # noqa: E402,F401
                funding_unwind, ls_ratio_fade,
                momentum_phase1v2, scalp_maker,
                trend_multiday)                            # (register on import)
+
+
+def __getattr__(name: str):
+    """Lazily expose the canonical composite contract from the registry.
+
+    Keeping this a lazy compatibility export avoids importing the registry
+    while its evidence-builder modules are still registering themselves.
+    """
+    if name in {"StrategyContract", "contract_for", "contract_for_variant",
+                "contract_catalog_manifest"}:
+        from .. import registry
+        return getattr(registry, name)
+    raise AttributeError(name)

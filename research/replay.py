@@ -54,6 +54,7 @@ from agent.forward_models import require_complete_contract
 from agent.risk import RiskEngine
 
 from . import corpus
+from .evidence_primitives import canonical_opportunity_key
 from .outcomes import CostModel, SetupPlan, resolve_from_cache
 
 
@@ -118,10 +119,7 @@ class ReplayDecision:
 
     def proposal_key(self) -> tuple:
         """Identity shared across arms, independent of replay execution."""
-        if self.proposal_id:
-            return ("proposal_id", self.proposal_id)
-        signal = self.signal_ts if self.signal_ts is not None else self.cycle_id
-        return (self.symbol, signal, self.direction, self.setup_type)
+        return canonical_opportunity_key(self)
 
 
 @dataclass

@@ -348,6 +348,9 @@ def cmd_check(args, cfg) -> int:
     ok = True
     live_catalog = None
     live_system = None
+    analyst_required = (
+        str((cfg.get("strategy") or {}).get("execution_mode") or "analyst")
+        == "analyst")
     print(f"Mode: {cfg['mode']}")
     print(f"LLM:  {cfg['llm']['provider']} / {cfg['llm']['model']}")
     print(f"Secrets: {secrets_file()}")
@@ -376,9 +379,12 @@ def cmd_check(args, cfg) -> int:
             ok = False
     provider = cfg["llm"]["provider"]
     need = "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY"
-    if not os.getenv(need):
-        print(f"  MISSING {need} in .env")
+    if analyst_required and not os.getenv(need):
+        print(f"  MISSING {need} in .env (analyst execution requires it)")
         ok = False
+    elif not analyst_required:
+        print("  LLM runtime check skipped: strategy.execution_mode is "
+              f"{cfg['strategy']['execution_mode']}")
     alert_cfg = cfg["alerts"]
     alert_env = alert_cfg["webhook_url_env"]
     if cfg["mode"] == "live" and not alert_cfg["enabled"]:
@@ -467,7 +473,7 @@ def cmd_check(args, cfg) -> int:
                 except Exception as e:
                     print(f"  LIVE ALERT CHECK FAILED: {e}")
                     ok = False
-            if ok:
+            if ok and analyst_required:
                 try:
                     from agent.brain import LLM
                     llm_kwargs = {}

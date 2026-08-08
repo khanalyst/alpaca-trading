@@ -26,9 +26,6 @@ def spec(**overrides):
 class SpecValidationTests(unittest.TestCase):
     """A spec that cannot state its own claim must not construct."""
 
-    def test_registry_module_imports(self):
-        self.assertIsNotNone(registry.REGISTRY)
-
     def test_mechanism_is_mandatory(self):
         with self.assertRaisesRegex(ValueError, "must state a mechanism"):
             spec(mechanism="   ")
@@ -52,9 +49,12 @@ class SpecValidationTests(unittest.TestCase):
 
 
 class TierLadderTests(unittest.TestCase):
-    def test_ladder_is_ordered_worst_to_best(self):
-        ranks = [TIERS.index(t) for t in TIERS]
-        self.assertEqual(ranks, sorted(ranks))
+    def test_ladder_preserves_the_capital_authorization_policy(self):
+        self.assertEqual(TIERS, (
+            "T0_REJECTED", "T1_HYPOTHESIS", "T2_CANDIDATE",
+            "T3_VALIDATED", "T4_CONFIRMED",
+        ))
+        self.assertEqual(LIVE_MIN_TIER, "T3_VALIDATED")
 
     def test_meets_compares_up_the_ladder(self):
         candidate = spec(tier="T2_CANDIDATE")

@@ -21,12 +21,19 @@ Compatibility safety anchors retained from the former walkthrough:
 - Check with `research.py readiness` before trusting a run.
 - The `okx` service user is `nologin`; do not use `sudo -iu okx`; run commands
   with `sudo -u okx` and explicit paths.
-- Preserve `runtime/research/recorded`, completed snapshots, research
-  manifests, forward evidence, `research/results`, the active `journal.db`,
-  and `research/cache/findings.db` in a verified backup before selecting
+- Preserve `runtime/research/recorded`, its content-addressed raw archive,
+  `runtime/research/market_events.db`, completed snapshots, discovery artifacts
+  and content-addressed discovery handoffs,
+  operational JSONL histories, research manifests, forward evidence,
+  `research/results`, the active `journal.db`, and
+  `research/cache/findings.db` in a verified backup before selecting
   **Delete with VM**. Without a separate retained copy, deleting the VM
   destroys the corpus.
-- On the legacy systemd lane, install and enable the recorder before the trader:
+- The shipped demo remains `shadow_only`; the configured tuned LS identity is a
+  pinned isolated paper arm, never an adaptive one-axis selector candidate.
+- On the legacy systemd lane, install all services. Starting the recorder first
+  preserves more short-retention data, but recorder health does not block the
+  trader or research scheduler:
 
   ```bash
   sudo cp deploy/okx-recorder.service /etc/systemd/system/

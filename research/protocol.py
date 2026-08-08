@@ -26,6 +26,12 @@ from dataclasses import dataclass, field
 
 from agent.forward_models import require_complete_contract
 
+from .evidence_primitives import (
+    chronological_split,
+    common_time_cutoff as _common_time_cutoff,
+    index_rows,
+    split_at_time as _split_at_time,
+)
 from .score import score_returns
 from .stats import (INSUFFICIENT_SAMPLE,
                     PAIRED_SIGN_FLIP_NULL_ASSUMPTION,
@@ -85,34 +91,21 @@ def split_by_time(items: list, fraction: float = OUT_OF_SAMPLE_FRACTION,
     exercise is that the confirm window contains market the fit window has
     never seen.
     """
-    ordered = sorted(items, key=key)
-    if len(ordered) < 2:
-        return ordered, []
-    cut = int(len(ordered) * fraction)
-    cut = min(max(cut, 1), len(ordered) - 1)
-    return ordered[:cut], ordered[cut:]
+    return chronological_split(items, fraction, key)
 
 
 def common_time_cutoff(
         populations: list[list], fraction: float = OUT_OF_SAMPLE_FRACTION,
         key=lambda item: getattr(item, "ts", 0.0)) -> float | None:
     """Return one calendar boundary shared by every experimental arm."""
-    timestamps = sorted({float(key(item))
-                         for population in populations for item in population})
-    if len(timestamps) < 2:
-        return None
-    cut = int(len(timestamps) * fraction)
-    cut = min(max(cut, 1), len(timestamps) - 1)
-    return timestamps[cut]
+    return _common_time_cutoff(populations, fraction, key)
 
 
 def split_at_time(
         items: list, cutoff_ts: float,
         key=lambda item: getattr(item, "ts", 0.0)) -> tuple[list, list]:
     """Split at a fixed timestamp without leaking one episode across windows."""
-    ordered = sorted(items, key=key)
-    return ([item for item in ordered if float(key(item)) < cutoff_ts],
-            [item for item in ordered if float(key(item)) >= cutoff_ts])
+    return _split_at_time(items, cutoff_ts, key)
 
 
 def regime_profile(decisions: list) -> dict:
@@ -203,11 +196,15 @@ def paper_trade_decisions(rows: list) -> list:
     A veto is an observed zero-return action, not missing data. This matters
     for confidence, exposure and discriminator axes: their edge is precisely
     whether accepting a proposal the baseline rejected adds value.
+    Explicitly inference-ineligible rows are quarantined before either a veto
+    zero or a trade outcome can be reconstructed.
     """
     from .replay import ReplayDecision
 
     decisions = []
     for row in rows:
+        if row.get("inference_eligible") is False:
+            continue
         is_ledger = "decision_outcome" in row
         decision_outcome = (str(row.get("decision_outcome") or "").upper()
                             if is_ledger else "PROPOSED")
@@ -244,30 +241,39 @@ def paper_trade_decisions(rows: list) -> list:
 def paired_arm_comparison(
         left: list, right: list, *, include_randomization: bool = True) -> dict:
     """Match two research arms on exact proposal identity before inference."""
-    def indexed(decisions: list) -> tuple[dict, set, list]:
-        resolved: dict = {}
-        proposed = set()
-        duplicates = []
-        for decision in decisions:
-            if (not getattr(decision, "contract_passed", False)
-                    and getattr(decision, "stage", None) != "executed"):
-                continue
-            key = decision.proposal_key()
-            proposed.add(key)
+    def indexed(decisions: list) -> tuple[dict, set, int, list, dict]:
+        eligible = [
+            decision for decision in decisions
+            if (getattr(decision, "contract_passed", False)
+                or getattr(decision, "stage", None) == "executed")
+        ]
+
+        def value_for(decision):
             outcome = getattr(decision, "outcome", None) or {}
             value = outcome.get("r_multiple")
             if value is None:
-                continue
-            if key in resolved:
-                duplicates.append(key)
-                resolved.pop(key, None)
-                continue
-            resolved[key] = (float(decision.ts), float(value),
-                             str(outcome.get("result") or ""))
-        return resolved, proposed, duplicates
+                return None
+            return (float(decision.ts), float(value),
+                    str(outcome.get("result") or ""))
 
-    left_resolved, left_proposed, left_duplicates = indexed(left)
-    right_resolved, right_proposed, right_duplicates = indexed(right)
+        indexed_rows = index_rows(eligible, value_fn=value_for)
+        # A duplicate identity is removed from the opportunity union as well
+        # as from the resolved map.  Otherwise a repeated unresolved row can
+        # inflate coverage and a later third row can silently resurrect it.
+        return (indexed_rows.resolved, indexed_rows.unique_keys,
+                indexed_rows.duplicate_rows,
+                list(indexed_rows.duplicate_keys),
+                indexed_rows.duplicate_reasons)
+
+    (left_resolved, left_proposed, left_duplicate_rows,
+     left_duplicate_keys, left_duplicate_reasons) = indexed(left)
+    (right_resolved, right_proposed, right_duplicate_rows,
+     right_duplicate_keys, right_duplicate_reasons) = indexed(right)
+
+    def reason_rows(reasons: dict) -> list[dict]:
+        return [{"key": list(key), "reason": reason}
+                for key, reason in reasons.items()]
+
     common = sorted(
         set(left_resolved) & set(right_resolved), key=repr)
 
@@ -325,15 +331,29 @@ def paired_arm_comparison(
         "right_only_proposals": len(right_proposed - left_proposed),
         "left_unresolved": len(left_proposed - set(left_resolved)),
         "right_unresolved": len(right_proposed - set(right_resolved)),
-        "left_duplicates": len(left_duplicates),
-        "right_duplicates": len(right_duplicates),
+        # Keep the historical names, but count duplicate rows (not merely
+        # distinct keys).  The key counts and reasons below make both views
+        # available to report consumers.
+        "left_duplicates": left_duplicate_rows,
+        "right_duplicates": right_duplicate_rows,
+        "left_duplicate_rows": left_duplicate_rows,
+        "right_duplicate_rows": right_duplicate_rows,
+        "left_duplicate_keys": len(left_duplicate_keys),
+        "right_duplicate_keys": len(right_duplicate_keys),
+        "duplicate_count": left_duplicate_rows + right_duplicate_rows,
+        "duplicate_key_count": (len(left_duplicate_keys)
+                                + len(right_duplicate_keys)),
+        "duplicate_reasons": {
+            "left": reason_rows(left_duplicate_reasons),
+            "right": reason_rows(right_duplicate_reasons),
+        },
         "mismatch_examples": {
             "left_only": [list(key) for key in sorted(
                 left_proposed - right_proposed, key=repr)[:10]],
             "right_only": [list(key) for key in sorted(
                 right_proposed - left_proposed, key=repr)[:10]],
-            "left_duplicates": [list(key) for key in left_duplicates[:10]],
-            "right_duplicates": [list(key) for key in right_duplicates[:10]],
+            "left_duplicates": [list(key) for key in left_duplicate_keys[:10]],
+            "right_duplicates": [list(key) for key in right_duplicate_keys[:10]],
         },
         "bootstrap": {
             "kind": PAIR_BOOTSTRAP_KIND,

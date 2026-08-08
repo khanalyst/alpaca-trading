@@ -325,6 +325,75 @@ class PerformanceReportTests(unittest.TestCase):
              for g in payload["groups"]}, {"account-a", "account-b"})
         self.assertEqual(payload["transfers"], {"count": 1, "net_usdt": 25})
 
+    def test_json_report_surfaces_canonical_strategy_contract_identity(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute(
+            "CREATE TABLE trades (ts REAL, action TEXT, trade_id TEXT, "
+            "risk_usd REAL, realized_pnl_usd REAL, pnl_semantics TEXT, "
+            "funding_status TEXT, strategy_id TEXT, strategy_version TEXT, "
+            "runtime_mode TEXT, account_fingerprint TEXT, variant_id TEXT, "
+            "strategy_config_version TEXT)")
+        db.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+            (1, "open", "canonical", 10, None, None, "available",
+             "momentum", "phase1-v3", "demo", "account-a", None, "cfg"),
+            (2, "close", "canonical", None, 1, "incremental_v1", "available",
+             None, None, None, None, None, None),
+            (3, "open", "legacy", 10, None, None, "available",
+             None, None, "demo", "account-b", None, None),
+            (4, "close", "legacy", None, 1, "incremental_v1", "available",
+             None, None, None, None, None, None),
+        ])
+        db.execute("CREATE TABLE events (ts REAL, kind TEXT, payload TEXT)")
+
+        payload = json_report(db)
+        by_account = {
+            group["provenance"]["account_fingerprint"]: group["provenance"]
+            for group in payload["groups"]}
+        canonical = by_account["account-a"]
+        from agent import registry
+        contract = registry.contract_for("momentum")
+        self.assertEqual(canonical["strategy_contract_status"], "VERIFIED")
+        self.assertEqual(canonical["strategy_contract_hash"],
+                         contract.semantic_hash)
+        self.assertEqual(canonical["strategy_contract_variant_id"],
+                         contract.variant_id)
+        self.assertEqual(canonical["strategy_contract_model_id"],
+                         contract.outcome_model.model_id)
+        self.assertGreaterEqual(
+            payload["diagnostics"]["strategy_contract_quarantined"], 1)
+
+    def test_json_report_quarantines_stale_strategy_version(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute(
+            "CREATE TABLE trades (ts REAL, action TEXT, trade_id TEXT, "
+            "risk_usd REAL, realized_pnl_usd REAL, pnl_semantics TEXT, "
+            "funding_status TEXT, strategy_id TEXT, strategy_version TEXT, "
+            "runtime_mode TEXT, account_fingerprint TEXT, variant_id TEXT, "
+            "strategy_config_version TEXT)")
+        db.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+            (1, "open", "stale", 10, None, None, "available",
+             "momentum", "phase1-v2", "demo", "account-stale", None, "cfg"),
+            (2, "close", "stale", None, 1, "incremental_v1", "available",
+             None, None, None, None, None, None),
+        ])
+        db.execute("CREATE TABLE events (ts REAL, kind TEXT, payload TEXT)")
+
+        payload = json_report(db)
+        provenance = payload["groups"][0]["provenance"]
+        from agent import registry
+        contract = registry.contract_for("momentum")
+        self.assertEqual(provenance["strategy_contract_status"], "QUARANTINED")
+        self.assertEqual(provenance["strategy_contract_hash"],
+                         contract.semantic_hash)
+        self.assertIn("phase1-v2", provenance[
+            "strategy_contract_exclusion_reason"])
+        self.assertIn(contract.version, provenance[
+            "strategy_contract_exclusion_reason"])
+        self.assertEqual(
+            payload["diagnostics"]["strategy_contract_verified"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

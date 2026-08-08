@@ -543,7 +543,7 @@ class ResearchSelectorMigrationTests(unittest.TestCase):
             self.assertEqual(migrated.schema_version(), findings.SCHEMA_VERSION)
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-                "paper_execution_evidence_and_validity")
+                "paper_inference_quarantine_reasons")
             self.assertEqual(migrated.research_selections(), [])
             self.assertEqual(
                 migrated.active_experiment_assignment(

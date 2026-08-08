@@ -45,6 +45,22 @@ class FillClient:
         raise ccxt.RequestTimeout("ambiguous")
 
 
+class FundingHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.exchange = Exchange.__new__(Exchange)
+        self.exchange.cfg = valid_config()
+
+    def test_empty_history_is_unknown_not_zero_funding(self):
+        self.exchange.x = Mock()
+        self.exchange.x.fetch_funding_history.return_value = []
+        self.assertIsNone(self.exchange.funding_since("BTC/USDT:USDT", 1))
+
+    def test_explicit_zero_funding_row_remains_a_verified_zero(self):
+        self.exchange.x = Mock()
+        self.exchange.x.fetch_funding_history.return_value = [{"amount": 0}]
+        self.assertEqual(self.exchange.funding_since("BTC/USDT:USDT", 1), 0)
+
+
 class FillVerificationTests(unittest.TestCase):
     def setUp(self):
         self.exchange = Exchange.__new__(Exchange)

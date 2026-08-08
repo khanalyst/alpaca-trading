@@ -72,6 +72,48 @@ class SignalAndHeartbeatTests(unittest.TestCase):
             self.assertNotIn("OKX_API_KEY", stored)
             self.assertEqual(list(root.glob("*.tmp")), [])
 
+    def test_heartbeat_history_is_append_only_redacted_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = "history-secret-value"
+            with patch.dict(os.environ, {"OPENAI_API_KEY": secret}), \
+                    patch.multiple(
+                        state, RUNTIME=root, RUNTIME_SCOPE="demo",
+                        HEARTBEAT_FILE=root / "heartbeat.json"):
+                state.write_heartbeat(
+                    "running", api_key=secret,
+                    error=(f"authorization=Bearer {secret}; "
+                           "OPENAI_API_KEY=foreign-secret-value"),
+                    diagnostic="x" * (state.HISTORY_RECORD_MAX_BYTES * 2))
+                state.write_heartbeat("paused", stop_reason="SIGTERM")
+
+            history = root / "heartbeat.history.jsonl"
+            lines = history.read_bytes().splitlines(keepends=True)
+            records = [json.loads(line) for line in lines]
+            self.assertEqual([row["status"] for row in records],
+                             ["running", "paused"])
+            self.assertNotIn(secret, history.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "foreign-secret-value", history.read_text(encoding="utf-8"))
+            self.assertNotIn("api_key", records[0])
+            self.assertTrue(all(
+                len(line) <= state.HISTORY_RECORD_MAX_BYTES for line in lines))
+            self.assertEqual(json.loads(
+                (root / "heartbeat.json").read_text())["status"], "paused")
+
+    def test_heartbeat_history_failure_does_not_break_latest_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.multiple(
+                    state, RUNTIME=root, RUNTIME_SCOPE="demo",
+                    HEARTBEAT_FILE=root / "heartbeat.json"), \
+                    patch.object(
+                        state, "append_operational_history",
+                        side_effect=OSError("history unavailable")):
+                result = state.write_heartbeat("running", run_id="run-1")
+            self.assertEqual(json.loads(
+                (root / "heartbeat.json").read_text()), result)
+
     def test_engine_shutdown_request_persists_an_operator_pause(self):
         # Imported locally so the pure deployment probes remain runnable on a
         # host that has not installed the exchange client yet.
@@ -122,6 +164,37 @@ class HealthProbeTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_status_history_is_append_only_redacted_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            secret = "scheduler-secret-value"
+            with patch.dict(os.environ, {"OPENAI_API_KEY": secret}):
+                scheduler.write_status(
+                    path, "running", access_token=secret,
+                    stderr_tail=f"api_key={secret}",
+                    stdout_tail="x" * (state.HISTORY_RECORD_MAX_BYTES * 2))
+                scheduler.write_status(path, "failed", last_exit_code=2)
+
+            history = path.with_name("research.history.jsonl")
+            lines = history.read_bytes().splitlines(keepends=True)
+            records = [json.loads(line) for line in lines]
+            self.assertEqual([row["status"] for row in records],
+                             ["running", "failed"])
+            self.assertNotIn(secret, history.read_text(encoding="utf-8"))
+            self.assertNotIn("access_token", records[0])
+            self.assertTrue(all(
+                len(line) <= state.HISTORY_RECORD_MAX_BYTES for line in lines))
+            self.assertEqual(json.loads(path.read_text())["status"], "failed")
+
+    def test_status_history_failure_does_not_break_latest_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            with patch.object(
+                    scheduler.agent_state, "append_operational_history",
+                    side_effect=OSError("history unavailable")):
+                result = scheduler.write_status(path, "waiting")
+            self.assertEqual(json.loads(path.read_text()), result)
+
     def test_missed_daily_run_is_due_immediately_once(self):
         now = datetime(2026, 7, 31, 4, 0, tzinfo=timezone.utc)
         self.assertEqual(scheduler.next_run(now, 3, 0, None), now)

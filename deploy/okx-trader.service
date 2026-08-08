@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 User=okx
 WorkingDirectory=/opt/okx-agent-crypto
-ExecStart=/opt/okx-agent-crypto/.venv/bin/python main.py run
+ExecStart=/opt/okx-agent-crypto/.venv/bin/python /opt/okx-agent-crypto/main.py run
 Restart=on-failure
 RestartSec=30
 # A crash loop must not silently burn LLM budget.
@@ -16,6 +16,7 @@ StartLimitBurst=5
 StartLimitIntervalSec=600
 StandardOutput=journal
 StandardError=journal
+TimeoutStopSec=2m
 
 [Install]
 WantedBy=multi-user.target

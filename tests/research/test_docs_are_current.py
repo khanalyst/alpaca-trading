@@ -4,11 +4,10 @@ Docs rot silently and in one direction: a command gets renamed, a config key
 gets added, and README keeps confidently describing the previous version.
 Someone following it then hits an error that looks like their mistake.
 
-These tests are cheap and they only assert things that are mechanically
-checkable - that every command and file path the docs name actually exists,
-and that every config key the agent accepts is documented somewhere. They
-cannot tell whether the prose is *true*, only whether it still refers to real
-things.
+These tests are cheap and assert things that are mechanically checkable: file
+and command surfaces, registry identities, config-backed defaults, protocol
+thresholds, and the authority boundaries that must remain explicit. They do
+not try to freeze incidental inventory counts or historical milestone names.
 """
 
 import re
@@ -24,12 +23,25 @@ REPO = Path(__file__).resolve().parents[2]
 README = (REPO / "README.md").read_text(encoding="utf-8")
 SETUP = (REPO / "SETUP.md").read_text(encoding="utf-8")
 AZURE = (REPO / "AZURE_DEPLOYMENT.md").read_text(encoding="utf-8")
+DEPLOY = (REPO / "deploy" / "README.md").read_text(encoding="utf-8")
 OPERATIONS = (REPO / "OPERATIONS.md").read_text(encoding="utf-8")
+RESEARCH_README = (REPO / "research" / "README.md").read_text(encoding="utf-8")
+CANONICAL = (REPO / "research" / "AUTONOMOUS_RESEARCH.md").read_text(
+    encoding="utf-8")
 HYPOTHESES = (REPO / "research" / "HYPOTHESES_AND_VARIANTS.md").read_text(
     encoding="utf-8")
 BOTH = README + SETUP
-ALL_DOCS = README + SETUP + AZURE + OPERATIONS + HYPOTHESES
 PROTOCOL = (REPO / "research" / "protocol.md").read_text(encoding="utf-8")
+CURRENT_DOCS = {
+    "README": README,
+    "SETUP": SETUP,
+    "OPERATIONS": OPERATIONS,
+    "research/README": RESEARCH_README,
+    "canonical lifecycle": CANONICAL,
+    "protocol": PROTOCOL,
+    "strategy catalog": HYPOTHESES,
+}
+ALL_DOCS = "\n".join((README, SETUP, AZURE, DEPLOY, *CURRENT_DOCS.values()))
 
 
 def flowed(text: str) -> str:
@@ -44,6 +56,7 @@ def flowed(text: str) -> str:
 
 README_FLOWED = flowed(README)
 PROTOCOL_FLOWED = flowed(PROTOCOL)
+CANONICAL_FLOWED = flowed(CANONICAL)
 
 
 class ReferencedPathsExistTests(unittest.TestCase):
@@ -72,12 +85,36 @@ class ReferencedPathsExistTests(unittest.TestCase):
             relative = path.relative_to(REPO)
             if any(part in ignored_dirs for part in relative.parts):
                 continue
+            if "ARCHIVED / FROZEN — internal path compatibility only" in (
+                    path.read_text(encoding="utf-8")[:400]):
+                continue
             documents.append(relative.as_posix())
         missing = sorted(
             path for path in documents if f"({path})" not in README)
         self.assertEqual(
             missing, [],
             f"README documentation index omits: {missing}")
+
+    def test_every_relative_markdown_link_resolves(self):
+        ignored_dirs = {
+            ".git", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            "vm-import",
+        }
+        missing = []
+        for source in REPO.rglob("*.md"):
+            relative = source.relative_to(REPO)
+            if any(part in ignored_dirs for part in relative.parts):
+                continue
+            for raw_target in re.findall(
+                    r"\[[^\]]*\]\(([^)]+)\)",
+                    source.read_text(encoding="utf-8")):
+                target = raw_target.strip("<>").split("#", 1)[0]
+                if (not target or "://" in target
+                        or target.startswith(("mailto:", "/"))):
+                    continue
+                if target.endswith(".md") and not (source.parent / target).exists():
+                    missing.append((relative.as_posix(), raw_target))
+        self.assertEqual(missing, [], f"broken Markdown links: {missing}")
 
     def test_retired_letter_taxonomy_is_not_used(self):
         pattern = re.compile(r"\bH-[G-M](?:\([iv]+\))?\b")
@@ -91,6 +128,25 @@ class ReferencedPathsExistTests(unittest.TestCase):
         self.assertEqual(
             offenders, [],
             f"retired letter taxonomy remains in: {offenders}")
+
+    def test_retired_milestone_labels_are_not_current_policy(self):
+        # Assemble the retired labels so this regression guard does not itself
+        # make a repository text search look like current documentation.
+        retired = ("G" + "2", "B" + "7.5", "H" + "-E", "B" + "9.2")
+        for name, document in CURRENT_DOCS.items():
+            # A compatibility filename may retain an old label. Link targets
+            # are not policy prose and are deliberately ignored here.
+            prose = re.sub(r"\]\([^)]+\)", "]", document)
+            for label in retired:
+                self.assertNotIn(
+                    label, prose, f"{name} uses retired label {label}")
+
+    def test_plans_are_frozen_records_not_open_checklists(self):
+        for path in (REPO / "research" / "plan").glob("*.md"):
+            with self.subTest(plan=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("ARCHIVED / FROZEN", text[:400])
+                self.assertNotRegex(text, r"(?m)^\s*- \[ \]")
 
 
 class DocumentedCommandsExistTests(unittest.TestCase):
@@ -130,6 +186,26 @@ class DocumentedCommandsExistTests(unittest.TestCase):
                 continue
             self.assertIn(f"research.py {command}", BOTH,
                           f"`research.py {command}` is undocumented")
+
+    def test_every_evidence_cli_command_is_documented(self):
+        from research.evidence_cli import parser
+
+        available = set()
+        for action in parser()._actions:
+            if hasattr(action, "choices") and action.choices:
+                available.update(str(choice) for choice in action.choices)
+        for command in available:
+            for document, name in ((CANONICAL, "canonical lifecycle"),
+                                   (OPERATIONS, "OPERATIONS")):
+                self.assertIn(
+                    f"research.evidence_cli {command}", document,
+                    f"{name} omits evidence command {command}")
+
+    def test_registration_handoff_is_visible_in_operator_docs(self):
+        for document, name in ((README, "README"), (SETUP, "SETUP"),
+                               (OPERATIONS, "OPERATIONS")):
+            self.assertIn("research.py prepare-handoff", document,
+                          f"{name} omits prepare-handoff")
 
 
 class ConfigKeysAreDocumentedTests(unittest.TestCase):
@@ -222,13 +298,13 @@ class ResearchProtocolDocumentationTests(unittest.TestCase):
 
 
 class VersionClaimsTests(unittest.TestCase):
-    def test_the_documented_strategy_version_matches_the_register(self):
+    def test_the_documented_momentum_version_matches_the_registry(self):
         from agent import registry
 
         version = registry.spec_for("momentum").version
 
         self.assertIn(version, README,
-                      f"README does not mention the live version {version}")
+                      f"README does not mention momentum version {version}")
 
     def test_the_documented_version_matches_the_shipped_config(self):
         # Whichever strategy is configured, its version must be that
@@ -256,56 +332,127 @@ class CurrentPipelineClaimsTests(unittest.TestCase):
         raw = yaml.safe_load((REPO / "config.yaml").read_text())
         claims = (
             raw["mode"], raw["strategy"]["id"],
-            raw["strategy"]["version"], str(raw["cycle"]["interval_seconds"]),
+            raw["strategy"]["version"], raw["strategy"]["execution_mode"],
+            str(raw["cycle"]["interval_seconds"]),
             raw["research"]["findings_store"],
         )
         for claim in claims:
             self.assertIn(claim, README)
 
+        canonical_claims = (
+            f"top {raw['universe']['top_n']}",
+            f"{raw['research']['collector']['top_n']} instruments",
+            f"forward_feed_version: {raw['research']['forward_feed_version']}",
+        )
+        for claim in canonical_claims:
+            self.assertIn(claim, CANONICAL)
+
     def test_strategy_and_variant_inventory_matches_code(self):
-        from agent import registry, variants
+        from agent import registry
 
-        raw = yaml.safe_load((REPO / "config.yaml").read_text())
-        named = variants.load_registry(REPO / "research" / "variants.yaml")
-        materialized = dict(named)
+        self.assertIn(
+            f"Registered strategies | {len(registry.REGISTRY)} ", HYPOTHESES)
         for strategy_id, spec in registry.REGISTRY.items():
-            for variant in variants.preregistered_variants(
-                    strategy_id, spec.version):
-                materialized.setdefault(variant.variant_id, variant)
-            if strategy_id == "momentum":
-                for variant in variants.hypothesis_variants(
-                        strategy_id, spec.version):
-                    materialized.setdefault(variant.variant_id, variant)
-            materialized.setdefault(
-                variants.baseline_variant_id(strategy_id),
-                variants.baseline(strategy_id, spec.version))
-        selector_count = sum(
-            len(items) for items in variants.research_selection_catalog().values())
-        tournament_settings = 0
-        for path in (REPO / "research" / "hypotheses").glob("*.yaml"):
-            tournament_settings += len(
-                (yaml.safe_load(path.read_text()) or {}).get("settings") or [])
-
-        for value in (len(registry.REGISTRY), len(named), len(materialized),
-                      selector_count, tournament_settings):
-            self.assertIn(str(value), HYPOTHESES)
-        for strategy_id in registry.REGISTRY:
-            self.assertIn(f"`{strategy_id}`", HYPOTHESES)
-        self.assertEqual(raw["research"]["experiment_min_duration_days"], 10)
-        self.assertEqual(raw["research"]["experiment_min_observations"], 100)
-        self.assertIn("14 maximum", HYPOTHESES)
+            row = f"| `{strategy_id}` | `{spec.version}` | `{spec.tier}` |"
+            self.assertIn(row, HYPOTHESES)
+        self.assertIn("There is no proven or live-qualified edge", HYPOTHESES)
+        self.assertIn("No current strategy is a proven edge", CANONICAL)
 
     def test_current_findings_schema_is_documented(self):
         from research.findings import SCHEMA_VERSION
 
-        self.assertEqual(SCHEMA_VERSION, 16)
-        for doc in (README, OPERATIONS, HYPOTHESES):
+        for doc in (README, OPERATIONS, HYPOTHESES, CANONICAL):
             self.assertIn(f"schema {SCHEMA_VERSION}", doc.lower())
 
+    def test_retired_schema_16_is_not_current_prose(self):
+        for name, document in CURRENT_DOCS.items():
+            self.assertNotIn(
+                "schema 16", document.lower(),
+                f"{name} still describes the retired findings schema")
+
+    def test_shipped_mode_and_tuned_contract_are_exact(self):
+        variant_id = "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3"
+        for document, name in (
+                (README, "README"), (SETUP, "SETUP"),
+                (OPERATIONS, "OPERATIONS"),
+                (RESEARCH_README, "research/README"),
+                (CANONICAL, "canonical lifecycle"),
+                (HYPOTHESES, "strategy catalog")):
+            self.assertIn("shadow_only", document, f"{name} omits shipped mode")
+            self.assertIn(variant_id, document, f"{name} omits tuned identity")
+        for phrase in ("70/30", "1.5 ATR", "1 ATR", "3R",
+                       "80/20", "3 ATR", "2 ATR", "2R"):
+            self.assertIn(phrase, README_FLOWED)
+        self.assertIn("no positive edge", README_FLOWED)
+
+    def test_contract_drift_and_funding_quarantine_are_documented(self):
+        for document, name in (
+                (README, "README"), (RESEARCH_README, "research/README"),
+                (CANONICAL, "canonical lifecycle"),
+                (PROTOCOL, "protocol")):
+            normalized = flowed(document)
+            self.assertIn("StrategyContract", normalized,
+                          f"{name} omits the canonical contract")
+            self.assertIn("semantic hash", normalized,
+                          f"{name} omits semantic identity")
+            self.assertIn("quarant", normalized,
+                          f"{name} omits drift quarantine")
+            self.assertIn("verified_realized", normalized)
+            self.assertIn("verified_no_settlement_due", normalized)
+
+    def test_event_plane_and_discovery_boundary_are_documented(self):
+        for document, name in (
+                (README, "README"), (SETUP, "SETUP"),
+                (OPERATIONS, "OPERATIONS"),
+                (RESEARCH_README, "research/README"),
+                (CANONICAL, "canonical lifecycle"),
+                (PROTOCOL, "protocol")):
+            self.assertIn("event-plane.v1", document,
+                          f"{name} omits event-plane schema")
+            self.assertIn("forward_feed_version", document,
+                          f"{name} must distinguish feed version 8")
+        for command in ("ingest-recorded", "discover"):
+            self.assertIn(f"research.py {command}", README)
+            self.assertIn(f"research.py {command}", OPERATIONS)
+        event_docs = flowed(README + OPERATIONS + RESEARCH_README + CANONICAL
+                            + PROTOCOL).lower()
+        for phrase in ("receipt", "availability", "revision", "raw csv",
+                       "as-of", "quarant"):
+            self.assertIn(phrase, event_docs)
+        nightly = (REPO / "research" / "nightly.sh").read_text(encoding="utf-8")
+        self.assertLess(nightly.index("research.py ingest-recorded"),
+                        nightly.index("research.py discover"))
+        for phrase in ("typed", "AST-verified", "counterfactual",
+                       "world model", "source-event digests",
+                       "non-authorizing"):
+            self.assertIn(phrase.lower(), CANONICAL_FLOWED.lower())
+
+    def test_operational_histories_and_backup_scope_are_documented(self):
+        for phrase in ("heartbeat.history.jsonl",
+                       "runtime/health/research.history.jsonl",
+                       "runtime/research/market_events.db",
+                       "recorded_archive", "discovery artifacts",
+                       "SQLite integrity", "JSON/JSONL", "secret exclusions"):
+            self.assertIn(phrase, README + SETUP + OPERATIONS + RESEARCH_README
+                          + CANONICAL)
+
     def test_nightly_order_and_failure_semantics_are_documented(self):
-        for phrase in ("research-loop", "G2", "exit 3", "exit 4", "exit 5",
-                       "tournament", "verified backup"):
+        for phrase in ("readiness", "proposal-fidelity", "forward qualification",
+                       "review-staged", "research-loop", "author",
+                       "prepare-handoff", "tournament", "verified backup",
+                       "exit 3", "exit 4", "exit 5"):
             self.assertIn(phrase, OPERATIONS)
+        ordered = (
+            "readiness", "proposal-fidelity replay", "forward qualification",
+            "ingest-recorded", "bounded research-only discovery",
+            "review-staged", "prepare-handoff", "tournament", "verified backup",
+        )
+        workflow = flowed(OPERATIONS.split(
+            "## 3. Nightly workflow and exit behavior", 1)[1].split(
+                "Exact exit behavior:", 1)[0])
+        positions = [workflow.index(phrase) for phrase in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("makes the nightly child nonzero", flowed(OPERATIONS))
 
     def test_external_classification_does_not_claim_path_is_proof(self):
         flowed_ops = flowed(OPERATIONS)
@@ -320,8 +467,8 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
         self.assertIn("authoritative", README.lower())
         self.assertIn("exploratory", README.lower())
 
-    def test_gate_g2_is_documented_as_a_stop(self):
-        self.assertIn("G2", README)
+    def test_proposal_fidelity_is_documented_as_a_stop(self):
+        self.assertIn("proposal-fidelity", README)
         self.assertIn("check-fidelity", BOTH)
 
     def test_insufficient_sample_is_explained(self):
@@ -331,16 +478,21 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
         """Data gates and dormant execution paths must remain visible."""
         for doc, name in ((README, "README"), (SETUP, "SETUP")):
             self.assertIn("readiness", doc, f"{name} omits the readiness cmd")
-            self.assertIn("G2", doc, f"{name} omits gate G2")
-            self.assertIn("B7.5", doc, f"{name} omits B7.5")
+            self.assertIn("proposal-fidelity", doc,
+                          f"{name} omits proposal fidelity")
+            self.assertIn("Maker-first entry boundary", doc,
+                          f"{name} omits maker-first boundary")
 
     def test_environment_boundary_says_how_it_completes(self):
         self.assertIn("How it completes", README)
         self.assertIn("Why it waits", README)
 
     def test_current_pipeline_and_schema_are_not_hidden(self):
-        for phrase in ("all seven", "baseline", "at most one candidate",
-                       "WORKED", "FAILED", "INCONCLUSIVE", "schema 16"):
+        from research.findings import SCHEMA_VERSION
+
+        for phrase in ("all seven", "shared baseline", "bounded batch",
+                       "WORKED", "FAILED", "INCONCLUSIVE",
+                       f"schema {SCHEMA_VERSION}"):
             self.assertIn(phrase.lower(), README_FLOWED.lower())
 
     def test_research_results_never_claim_live_authority(self):
@@ -363,6 +515,104 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
     def test_the_new_journal_events_are_documented(self):
         for kind in ("book_state", "snapshot_enrichment", "shadow_decision"):
             self.assertIn(kind, README, f"journal event {kind} undocumented")
+
+
+class AutonomousLifecycleDocumentationTests(unittest.TestCase):
+    def test_authority_chain_is_complete_and_ordered(self):
+        stages = (
+            "market snapshot", "deterministic shadow decision",
+            "isolated paper evidence", "paired qualification",
+            "bounded LLM authoring/refinement",
+            "human-reviewed registration handoff", "reviewed demo run",
+            "explicit human live approval",
+        )
+        positions = [CANONICAL_FLOWED.index(stage) for stage in stages]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_paired_gate_constants_match_the_protocol(self):
+        from research.protocol import (
+            MIN_AXIS_SETTINGS,
+            MIN_BOOTSTRAP_CLUSTERS,
+            MIN_PAIR_COVERAGE_PCT,
+            MIN_PAIRED_CONFIRM_OBSERVATIONS,
+            MIN_PAIRED_FIT_OBSERVATIONS,
+            MIN_ROUND_TRIPS,
+        )
+
+        for phrase in (
+                f"{MIN_ROUND_TRIPS} full candidate/baseline pairs",
+                f"{MIN_PAIRED_FIT_OBSERVATIONS} fit pairs",
+                f"{MIN_PAIRED_CONFIRM_OBSERVATIONS} held-out confirmation pairs",
+                f"{MIN_PAIR_COVERAGE_PCT:.0f}% candidate/baseline coverage",
+                f"{MIN_BOOTSTRAP_CLUSTERS} distinct six-hour market episodes",
+                f"{MIN_AXIS_SETTINGS} settings on the declared axis"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+        for phrase in ("clustered paired sign-flip", "Holm correction"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+
+    def test_price_gap_and_economics_rules_are_explicit(self):
+        for phrase in (
+                "entry and exit fees", "observed spread treatment",
+                "depth-derived fill economics", "realized funding settlements",
+                "strictly ordered and contiguous", "returns `no_data`",
+                "zero held duration, costs, funding, and risk",
+                "the stop wins"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+
+    def test_evidence_provenance_and_parent_boundary_are_explicit(self):
+        for phrase in (
+                "research-evidence-package.v1", "content-addresses the exact dataset",
+                "code tree", "config identity", "runtime, argv, outputs",
+                "parent_evidence_ids", "separate package",
+                "retained and verified", "Synthetic fixtures cannot be relabeled"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+
+    def test_authoring_budgets_match_code_and_config(self):
+        from agent.staging import DEFAULT_MAX_ACTIVE
+        from research.authoring import MAX_PER_GENERATION
+
+        raw = yaml.safe_load((REPO / "config.yaml").read_text())
+        research = raw["research"]
+        refinement = research["staging_refinement"]
+        for phrase in (
+                f"limit is {research['staging_max_active']} active configurations",
+                "requests four proposals by default",
+                f"executable cap is {MAX_PER_GENERATION}",
+                "at most two one-parameter neighbors",
+                f"allows {refinement['max_attempts']} later attempt",
+                f"at most {refinement['max_variants_per_attempt']} variants per attempt",
+                f"at most {refinement['max_configurations_per_mechanism']} configurations",
+        ):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+        self.assertEqual(research["staging_max_active"], DEFAULT_MAX_ACTIVE)
+        for phrase in ("append-only", "full request", "raw response",
+                       "parse/validation status", "rejection reasons"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+
+    def test_handoff_and_human_authority_are_unambiguous(self):
+        for phrase in (
+                "staged_registration_handoff.v1", "live_eligible: false",
+                "does not mutate findings, source, registry, or configuration",
+                "Demo success does not authorize live capital",
+                "explicit human approval"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+
+    def test_deterministic_startup_is_provider_free(self):
+        for phrase in (
+                "engine startup does not construct or preflight an LLM client",
+                "no :llm research lane exists",
+                "does not make an LLM a runtime dependency"):
+            self.assertIn(phrase, CANONICAL_FLOWED.replace("`", ""))
+
+    def test_scheduler_status_and_health_contract_are_documented(self):
+        for phrase in (
+                "03:00", "missed job once per UTC date", "every 30 seconds",
+                "four-hour", "32,000-character", "process group on timeout",
+                "structured failures", "nonzero last exit", "deadline"):
+            self.assertIn(phrase, CANONICAL_FLOWED)
+        for status in ("waiting", "running", "completed", "failed",
+                       "timed_out", "stopped"):
+            self.assertIn(f"`{status}`", CANONICAL)
 
 
 class VariantScorecardsAreCurrentTests(unittest.TestCase):
@@ -429,6 +679,13 @@ class VariantScorecardsAreCurrentTests(unittest.TestCase):
                 self.assertIn(
                     f"({variant.strategy_id}/{variant.variant_id}.md)", text)
 
+    def test_the_tuned_ls_scorecard_makes_no_edge_claim(self):
+        path = (self.findings / "ls-ratio-fade" /
+                "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3.md")
+        card = flowed(path.read_text(encoding="utf-8")).lower()
+        for phrase in ("unproven", "research-only", "no positive"):
+            self.assertIn(phrase, card)
+
     def test_the_index_links_every_document_beside_it(self):
         """The generator rewrites this file; it must not orphan an audit."""
         from research import findings as findings_mod
@@ -483,10 +740,14 @@ class DeploymentDocTests(unittest.TestCase):
                 (REPO / "deploy" / unit).exists(),
                 f"AZURE_DEPLOYMENT.md names {unit}, which is not in deploy/")
 
-    def test_the_recorder_is_started_before_the_trader(self):
-        """Every hour it is off is data OKX will never serve again."""
-        self.assertLess(AZURE.index("enable --now okx-recorder"),
-                        AZURE.index("enable --now okx-trader"))
+    def test_the_recorder_is_observable_but_not_a_startup_dependency(self):
+        """A collection gap is serious, but it cannot silently gate runtime."""
+        self.assertIn("does not block", flowed(AZURE))
+        self.assertIn("no recorder dependency", DEPLOY.lower())
+        compose = yaml.safe_load((REPO / "compose.yaml").read_text())
+        for service in ("trader", "research"):
+            dependencies = compose["services"][service].get("depends_on") or {}
+            self.assertNotIn("recorder", dependencies)
 
 
 if __name__ == "__main__":

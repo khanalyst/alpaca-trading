@@ -16,35 +16,39 @@ strategy:
   # momentum is T0_REJECTED: -8.97% over 2026-07-29..08-05, and the only
   # strategy the recorded corpus says something significant about (mean
   # -0.428R over 43 independent 48h episodes, t=-2.45). ls-ratio-fade
-  # replaces it on the order path. Its 48h model horizon matches
-  # risk.max_hold_hours, it is realtime-eligible, its contract is complete
-  # so it can trade deterministically, and its derivation is independent of
-  # this corpus. Measured at -0.235R over 34 episodes (t=-1.22) at the
-  # registered 80/20 thresholds - not significant, i.e. unproven rather
-  # than rejected, which is the honest status of every available option.
+  # remains off the order path. Its 48h model horizon matches
+  # risk.max_hold_hours, it is realtime-eligible, and its contract is complete
+  # for deterministic shadow/replay. This shipped config keeps it
+  # shadow-only pending valid evidence and clean contract/version identity;
+  # mismatched rows are quarantined. Measured at -0.235R over 34 episodes
+  # (t=-1.22) at the registered 80/20 thresholds - not significant, i.e.
+  # unproven rather than rejected, which is the honest status of every
+  # available option.
   # research/plan/order-path-succession.md holds the full comparison.
   id: ls-ratio-fade
   version: v1
+  # This is an explicit, immutable tuning identity.  It is not the registered
+  # 80/20, 3 ATR-extension, 2 ATR/2R base contract.
+  variant_id: ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3
   # analyst | deterministic | shadow_only.
   #
   # A strategy earns promotion on evidence its deterministic contract
   # produced in a shadow lane, so running it live under an analyst would
   # trade something other than the thing that earned the promotion.
-  # `deterministic` removes the analyst call entirely: the contract
-  # proposes, risk vets, execution places. It needs no analyst prompt, which
-  # is what lets a shadow-only strategy occupy the order path once its
-  # evidence justifies it.
+  # `deterministic` remains a future explicitly authorized mode. When
+  # authorized, it removes the analyst call entirely: the contract proposes,
+  # risk vets, and execution places. It needs no analyst prompt, but valid
+  # evidence and clean contract identity are required before that mode may
+  # occupy the order path.
   #
   # `shadow_only` is the third value: no order path at all, research lanes
   # untouched. It is what to set when nothing should be trading.
   #
-  # `deterministic` is set here because ls-ratio-fade has no analyst prompt -
-  # no strategy except momentum does - so the contract itself proposes, and
-  # risk and execution apply unchanged. This is also the honest way to run
-  # it: the evidence that will judge it comes from the same contract in the
-  # shadow lane, so an analyst layer on top would trade something other than
-  # the thing being measured.
-  execution_mode: deterministic
+  # The shipped mode is intentionally `shadow_only`: ls-ratio-fade is measured
+  # under its own deterministic contract without placing orders. An explicitly
+  # authorized future `deterministic` mode may use the same contract after
+  # valid evidence clears the promotion and identity gates.
+  execution_mode: shadow_only
   signal_timeframe: 1h           # ls-ratio-fade's signal bar; one evaluation/bar
   # The three registered hypotheses (volume-thrust, oi-divergence,
   # basis-stretch) reach the book only through experimental setups. While
@@ -203,6 +207,16 @@ research:
   # the hard safety cap remains eight in code.
   experiment_candidate_batch_size: 4
   findings_store: research/cache/findings.db
+  # Bounded research-only observable discovery. It never edits strategy
+  # registry/configuration and emits only content-addressed handoffs.
+  discovery:
+    enabled: true
+    max_rows: 50000
+    max_nodes: 32
+    max_depth: 8
+    max_window: 256
+    discovery_artifacts: research/results/discovery-artifacts
+    discovery_results: research/results/discovery
   # Standalone public-data collection is intentionally separate from the live
   # universe/risk settings above. It may scan more instruments or poll books
   # more often without changing what the active account can trade.
@@ -220,6 +234,24 @@ research:
   # `research.py author`; absent until something is staged, and the shadow
   # lane is simply absent while it does not exist.
   staging_store: research/cache/staging.db
+  # One budget is shared by authoring, CLI review and runtime shadow reloads.
+  # Each new mechanism starts as a root plus at most two one-dimensional
+  # neighbours, so the budget is configuration count rather than idea count.
+  staging_max_active: 32
+  staging_lifecycle:
+    never_fired_decisions: 2000
+    never_fired_max_age_hours: 168
+    no_observation_max_age_hours: 72
+    starved_max_age_hours: 72
+    starved_fraction: 0.5
+  staging_refinement:
+    max_attempts: 1
+    max_variants_per_attempt: 2
+    max_configurations_per_mechanism: 5
+    relative_step: 0.10
+  # Content-addressed proposals for explicit human implementation/review.
+  # Preparing one never edits the registry, source, or running configuration.
+  staging_handoff_dir: research/results/staged-handoffs
   # Optional pre-existing destination. It is external only when its mounted
   # filesystem/device differs from every repository/source device; an explicit
   # same-device path remains configured-local. The path is never auto-created.

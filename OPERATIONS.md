@@ -1,8 +1,11 @@
 # Operations — trader, research, and durable evidence
 
-This is the operational authority. The shipped system uses one demo order path,
-four isolated deterministic realtime research evaluators, and three registered
-models that are offline-only.
+This is the operational authority. The shipped system uses OKX `demo` with
+`strategy.execution_mode: shadow_only`: no order, LLM, or deterministic entry
+path is active. Four isolated deterministic realtime research evaluators run,
+and three registered models are offline-only. The semantic authority chain and human approval
+boundaries are in
+[research/AUTONOMOUS_RESEARCH.md](research/AUTONOMOUS_RESEARCH.md).
 
 ## 1. Runtime locations
 
@@ -95,38 +98,45 @@ for recovery from a bad query, but it does not make deletion of the VM safe.
 The mount and capacity checks must succeed before the nightly research result
 is treated as durably backed up.
 
+Recorder health is a collection signal, not a startup dependency. Compose and
+the legacy units may start the trader and research scheduler while the recorder
+is stale or absent; that gap is unrecoverable short-retention data, not trading
+authorization.
+
 ## 3. Nightly workflow and exit behavior
 
 `research/nightly.sh` runs in this order:
 
 1. readiness; failure is remembered while the run continues;
-2. `review-staged`, which gives each machine-authored mechanism a coded
-   verdict and retires the ones that are finished;
-3. `author`, which proposes new mechanisms and stages the ones that validate.
-   It runs after the verdicts so the next generation sees the latest coded
-   failures;
-4. `qualify-staged`, which starts isolated local PAPER only for staged
-   mechanisms whose fixed-harness evidence is supported;
-5. `research-loop`, which creates missing deterministic outcomes and reviews a
-   bounded queue (default eight) of pending results; one failed provider call
-   is persisted and does not stop later items;
-6. corpus statistics and G2 replay when the journal exists;
-7. funnel, cadence, sweeps, three-arm analysis, forward qualification,
-   fail-closed draft review-artifact preparation, the candidate shortlist,
+2. when the journal exists, corpus statistics and the proposal-fidelity replay;
+3. funnel, cadence, sweeps, three-arm analyst-effect analysis, and paired
+   forward qualification;
+4. only after proposal fidelity passes: `ingest-recorded`, then bounded
+   research-only discovery and `prepare-discovery-handoff`, then `review-staged`, bounded refinement,
+   `qualify-staged`, the bounded `research-loop`, `author`, and
+   `prepare-handoff`;
+5. fail-closed draft review-artifact preparation, the candidate shortlist,
    and scorecard regeneration;
-8. one fresh immutable market-history snapshot under
+6. one fresh immutable market-history snapshot under
    `runtime/research/snapshots/<UTC timestamp>` and journal forward-evidence
    export;
-9. the exploratory tournament, with immutable per-run artifacts;
-10. one new verified backup.
+7. the exploratory tournament, with immutable per-run artifacts; and
+8. one new verified backup.
 
 Exact exit behavior:
 
-- a real G2 failure stops immediately with exit 3 before later research;
-- G2 exit 4 means collecting; gated commands may refuse, but the workflow
+- a real proposal-fidelity mismatch stops immediately with exit 3 before later research;
+- proposal-fidelity exit 4 means collecting; dependent lifecycle commands are
+  skipped, while the workflow
   continues to tournament and backup;
-- an LLM review/provider/parse failure is persisted for retry and does not
-  discard the deterministic outcome or abort the workflow;
+- missing recorder files produce nonfatal `NO_DATA`; an ingest in which every
+  row is quarantined, or a real discovery parser/code-generation failure,
+  makes the nightly child nonzero;
+- no eligible discovery result (including no persisted `COMPLETE` result for a
+  handoff) is a nonfatal nightly state; integrity or parser failures remain
+  fail-closed;
+- an LLM author/review/provider/parse failure is persisted for retry and makes
+  the nightly child nonzero; it never discards the deterministic outcome;
 - backup failure makes the research service nonzero (exit 5 unless readiness
   was already nonzero);
 - a remembered readiness failure produces final exit 4 after the backup;
@@ -136,9 +146,18 @@ The research service is separate from `okx-trader.service`/the `trader`
 container. Its failure is visible in systemd or the Compose health/dashboard
 state and does not authorize trading or disappear into trader logs.
 While the nightly child is running, the scheduler atomically refreshes
-`runtime/health/research.json` every 30 seconds. The 180-second health window
+`runtime/health/research.json` every 30 seconds and appends a bounded,
+redacted `runtime/health/research.history.jsonl` record. The trader heartbeat
+similarly appends `heartbeat.history.jsonl`. The 180-second health window
 therefore remains green for a legitimate long run and turns stale only when
-the scheduler can no longer supervise and refresh the child.
+the scheduler can no longer supervise and refresh the child. The default job
+deadline is four hours. Timeout terminates the child process group and records
+`timed_out`; bounded stdout/stderr tails, truncation counts, job ID, deadline,
+exit code, and structured author/review failures remain in the status file.
+Even if a wrapper masks a structured provider/review failure with exit zero,
+the scheduler marks the effective job failed. Health is green only for fresh
+`waiting`, `running`, or `completed` state with no nonzero last exit and no
+deadline overrun.
 
 Run manually:
 
@@ -152,6 +171,9 @@ The four realtime strategies receive the same cycle snapshot and timestamp and
 use deterministic contract proposals. Each has an isolated paper account and
 durable assignment state. A bounded batch of pre-registered candidates shares
 one stable baseline in each lane (four by shipped config, hard cap eight).
+The configured tuned LS variant
+`ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3` is a pinned isolated paper
+arm with its own account; it is never an adaptive one-axis selector candidate.
 Four packet workers bound computation; they do not reduce the realtime lane
 set. The lanes are logically isolated, and packet computation may overlap while
 durable writes remain serialized. Four simultaneous SQLite writers are not
@@ -167,21 +189,30 @@ the prior decision. It is not aligned to wall-clock or signal-bar boundaries;
 safety, marks, exits, reconciliation, and shadow advancement continue on the
 shorter loop.
 
-G2 compares the full canonical pre-risk proposal identity (cycle, symbol,
+The proposal-fidelity replay compares the full canonical pre-risk proposal identity (cycle, symbol,
 direction, setup identity/type, signal timestamp, strategy version, and
 baseline variant) symmetrically with replay keys. It requires a non-vacuous
 exact match and fails closed on malformed, duplicate, missing, or extra
 identities. Outcome-resolution gaps remain diagnostics rather than proposal
-mismatches. A failed, stale, or vacuous G2 blocks downstream journal evidence
+mismatches. A failed, stale, or vacuous result blocks downstream journal evidence
 from being treated as authoritative.
 
+Every runtime/evidence path resolves one canonical `StrategyContract`: registry
+specification, forward economics/exit, evidence builder, immutable variant
+identity, and semantic hash. Startup rejects effective configuration drift.
+Legacy or mismatched contract evidence remains auditable but is quarantined
+from inference. A closed paper outcome is inferential only when funding status
+is `verified_realized` or `verified_no_settlement_due`.
+
 The active research scope is `forward_feed_version: 8`. Feed v8 keeps the
-deterministic four realtime lanes and adds the real liquidation flow and the
-pre-registered conditioning axes; the active analyst's own decisions remain in
-a separate `:llm` scope and are not pooled with lane evidence. Feeds v1-v7
+deterministic four realtime lanes and repairs depth-ladder delivery across the
+wider 25-instrument universe. The shipped `shadow_only` runtime creates no
+order path or `:llm` lane. Analyst mode may retain genuine analyst decisions in a separate
+non-comparable scope; they are not pooled with lane evidence. Feeds v1-v7
 remain immutable historical evidence. Feed v4 is the market-data plumbing
-repair feed, feed v5 is the immutable-provenance fork, and feed v6 is the
-deterministic four-lane fork; no older evidence is migrated or pooled with v8.
+repair feed, feed v5 is the immutable-provenance fork, feed v6 is the
+deterministic four-lane fork, and feed v7 added liquidation flow and
+conditioning axes; no older evidence is migrated or pooled with v8.
 
 Within each strategy:
 
@@ -193,7 +224,7 @@ Within each strategy:
    those floors);
 4. each individual assignment still tests only one candidate setting, and
    accepted LLM selections queue without preempting active assignments;
-5. restart reconstructs the same active batch from schema 16;
+5. restart reconstructs the same active batch from Findings schema 17;
 6. terminal assignments produce one immutable `WORKED`, `FAILED`, or
    `INCONCLUSIVE` outcome with reasons and limitations.
 
@@ -221,6 +252,42 @@ Run closure plus a bounded batch of research-only LLM reviews (default eight):
 ```bash
 ./.venv/bin/python research.py research-loop
 ```
+
+### Recorded event plane and discovery
+
+The recorder writes local receipt/availability timestamps plus source, feed,
+schema, payload revision, and quality metadata. Run:
+
+```bash
+./.venv/bin/python research.py ingest-recorded
+./.venv/bin/python research.py discover
+./.venv/bin/python research.py prepare-discovery-handoff
+```
+
+`ingest-recorded` builds `runtime/research/market_events.db` with schema
+`event-plane.v1`, keeps content-addressed raw CSV archives, applies strict
+event-time and availability-time as-of filtering, and quarantines malformed or
+legacy rows. This version is separate from `forward_feed_version: 8`.
+
+The confirmed `execution_bar_1m` recorder series is joined into episodes after
+the signal feature cutoff, using a later bounded outcome cutoff for closed bars
+and funding. Episode direction is evidence-derived, the observable
+normalization path is persisted, and bars must be contiguous. A direct timeout
+requires full horizon coverage; a missing or partial horizon is `no_data`, not
+a timeout. Funding is inferential only as `verified_realized` or
+`verified_no_settlement_due`.
+
+Discovery is bounded and research-only: a typed IR, generated AST-verified
+evaluator, fixed mechanism-aligned `ExitProfile`, deterministic
+counterfactuals, a small fit-only world model, and exact source-event digests.
+It appends analysis/candidate evidence but cannot edit registry, configuration,
+tier, or order state. `IDLE`, `NO_DATA`, and `NO_STATE_DATA` are non-authorizing
+collection states. `COMPLETE` remains research-only: scalar or mixed
+scalar/non-episode rows cannot complete a counterfactual, and no discovery
+status grants registry/configuration/demo/live authority. The handoff command
+verifies the persisted result and typed artifact, then writes a content-
+addressed packet under `research/results/discovery-handoffs/` with
+`HUMAN_DECISION_REQUIRED`; it performs no mutation.
 
 ## 5. Tournament
 
@@ -382,15 +449,22 @@ The supported verified backup includes:
 
 - `research/cache/findings.db` through SQLite's online backup API;
 - the active `runtime/demo/journal.db` through the same API;
-- files under `runtime/research/recorded`;
+- `runtime/research/market_events.db` through the same API;
+- files under `runtime/research/recorded` and the content-addressed
+  `runtime/research/recorded_archive`;
 - every regular file in each completed immutable tree under
   `runtime/research/snapshots` (manifest present and no in-progress marker);
-- research manifest JSON files and `forward_evidence.json`; and
+- research manifest JSON files and `forward_evidence.json`;
+- mode-scoped state/account identity, `heartbeat.history.jsonl`, failed-alert
+  history, `runtime/health/research.json`, and
+  `runtime/health/research.history.jsonl`;
+- discovery artifacts; and
 - all files under `research/results`.
 
 Snapshot CSVs and their manifests retain the same path beneath
 `files/runtime/research/snapshots/` in the backup. `verify-backup` size- and
-SHA-256-checks each one, so a missing or changed raw input invalidates the
+SHA-256-checks each one, validates JSON/JSONL records, checks SQLite integrity
+and foreign keys, and rejects secret-bearing sources, so a missing or changed raw input invalidates the
 backup. A directory still carrying `.download-in-progress`, or lacking a final
 manifest, is an incomplete download rather than immutable evidence and is not
 included.
@@ -406,11 +480,26 @@ included.
 ./.venv/bin/python research.py three-arm
 ./.venv/bin/python research.py sweep research/sweeps/regime_conditioning.yaml
 ./.venv/bin/python research.py forward-qualify --scope <scope>
+./.venv/bin/python research.py prepare-handoff \
+  --store research/cache/findings.db \
+  --staging research/cache/staging.db
+./.venv/bin/python research.py prepare-discovery-handoff \
+  --store research/cache/findings.db
 ./.venv/bin/python research.py prepare-review-artifacts
 ./.venv/bin/python research.py t3-packet \
   --variant <qualified-variant-id> --scope <scope> \
   --reviewed-by <reviewer> --registry-change-ref <change-reference>
 ./.venv/bin/python research.py report
+
+./.venv/bin/python -m research.evidence_cli verify-package \
+  <evidence-package> --code-root . --config config.yaml
+./.venv/bin/python -m research.evidence_cli verify-golden \
+  tests/fixtures/evidence/golden_replay_synthetic.json \
+  tests/fixtures/evidence/golden_replay_expected.json
+./.venv/bin/python -m research.evidence_cli run-replay \
+  tests/fixtures/evidence/golden_replay_synthetic.json
+./.venv/bin/python -m research.evidence_cli import-replay \
+  <source> <new-fixture> --classification synthetic
 ```
 
 `prepare-review-artifacts` considers only variants with current v8
@@ -479,6 +568,7 @@ hand-written contracts implement.
 ./.venv/bin/python research.py staged             # what is registered
 ./.venv/bin/python research.py review-staged --dry-run
 ./.venv/bin/python research.py qualify-staged
+./.venv/bin/python research.py prepare-handoff
 ./.venv/bin/python research.py shortlist
 ```
 
@@ -491,6 +581,12 @@ yet be calibrated stays visible without occupying a lane that would never
 fire. Unlike `author`, a rejected entry here exits nonzero: a broken
 pre-registration is a mistake in version control, not a transient provider
 failure.
+
+Initial staged family registration is atomic: the root and all bounded child
+configurations publish together, and a failed validation leaves no partial
+family. The protocol and shortlist share canonical opportunity and
+duplicate-safe primitives, while each lane keeps its own qualification or
+reporting policy.
 
 Staged mechanisms run in their own `:staged` scope, with one isolated
 candidate paper account and one paired neutral baseline account per
@@ -523,6 +619,13 @@ A registered claim is immutable at the database level. Rewording one after
 results exist is refused by a trigger, because a claim that can be edited
 afterwards cannot be told apart from one retro-fitted to the result.
 
+`prepare-handoff` considers only a staged mechanism whose configuration-level
+verdicts support it. It writes an idempotent content-addressed JSON proposal
+under `research/results/staged-handoffs/` for human implementation and registry
+review. The artifact explicitly says that no code or registry mutation occurred
+and that it is not live-eligible. It is not a reviewed strategy packet and does
+not authorize either demo or live orders.
+
 The authoring model receives bounded persisted evidence rather than only field
 names: opportunity and firing rates, conditional returns, missing-data and
 null/near-miss reasons, fit versus held-out results, segment summaries, feature
@@ -545,9 +648,9 @@ and holding-period optimization is not yet wired as a second stage.
 
 `strategy.execution_mode` selects what decides on the order path. `analyst`
 makes one LLM call per decision cycle. `deterministic` makes no LLM call at
-all: the strategy's own forward contract proposes, and risk and execution
-apply unchanged. `shadow_only` is shipped and has no order path: nothing
-proposes and nothing opens.
+all and constructs no LLM client, preflight, or `:llm` lane: the strategy's own
+forward contract proposes, and risk and execution apply unchanged.
+`shadow_only` has no order path: nothing proposes and nothing opens.
 
 Use `deterministic` when a strategy has earned promotion on shadow evidence. That evidence
 was produced by its deterministic contract, so trading it under an analyst
@@ -555,12 +658,15 @@ would put an unmeasured layer on top of the thing that justified the
 promotion. It is also the only way a strategy other than `momentum` can occupy
 the order path at all: every other registered strategy has no analyst prompt.
 
+The current shipped block remains non-ordering:
+
 ```yaml
 strategy:
   id: ls-ratio-fade
   version: v1
+  variant_id: ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3
   signal_timeframe: 1h
-  execution_mode: deterministic
+  execution_mode: shadow_only
 ```
 
 Configuration refuses to start when the named strategy has no complete
@@ -569,20 +675,14 @@ forward contract, and the value must be exactly `analyst`, `deterministic` or
 mode change nobody reviewed. Tier gating is unchanged: live still requires
 `T3_VALIDATED` and a reviewed packet.
 
-`deterministic` is the shipped state, running `ls-ratio-fade/v1`. It replaced
-`momentum`, which is `T0_REJECTED`, returned -8.97% over 2026-07-29..08-05,
-and at that rate reaches `risk.max_drawdown_pct` - which flattens the book and
-self-kills the process, ending the research collection every other lane
-depends on. The replacement is a choice among unproven mechanisms rather than
-a promotion: `ls-ratio-fade` measures -0.153R at its shipped thresholds over
-independent 48h episodes, which is not significantly different from random.
-`research/plan/order-path-succession.md` holds the comparison and states,
-pre-committed, what would earn the seat on evidence.
+`shadow_only` is the shipped state. The configured tuned variant records
+70/30 tails, a 1.5 ATR extension cap, a 1 ATR minimum stop, and a 3R target;
+the registered base remains 80/20, 3 ATR, 2 ATR, and 2R. The tuned identity is
+unproven, research-only, and has no positive-edge claim.
 
-`shadow_only` is the state to set when nothing should trade at all. Research
-lanes run unchanged in it, and open positions still exit through exchange
-stops and targets, `max_hold_hours` and every risk reduction path; only
-discretionary opens and closes have no source.
+Research lanes run unchanged in `shadow_only`, and open positions still exit
+through exchange stops and targets, `max_hold_hours` and every risk reduction
+path; only discretionary opens and closes have no source.
 
 ## 8. Interpreting results
 
@@ -600,7 +700,8 @@ from a point estimate, a tournament rank, or an LLM explanation.
 ## 9. Recovery and handoff
 
 Copy data; do not relocate the authoritative VM files. Preserve the active
-journal, findings DB, recorder data, immutable raw snapshots,
+journal, findings DB, event-plane DB, recorder data and raw archive, immutable
+snapshots, operational JSONL histories, discovery artifacts,
 manifests/forward evidence, all tournament run directories, and the backup
 manifest/checksum. The verified backup command captures these supported
 sources; committed `findings/` scorecards remain in Git.
@@ -619,7 +720,7 @@ Before deleting or rebuilding the VM:
 
 | Symptom | Meaning/action |
 | --- | --- |
-| G2 failed | Stop authoritative interpretation and investigate proposal-key replay mismatch |
+| Proposal-fidelity replay failed | Stop authoritative interpretation and investigate proposal-key replay mismatch |
 | `INSUFFICIENT_SAMPLE` | Keep collecting; no edge verdict exists yet |
 | External backup BLOCKED | Provision/mount a different-device destination and run a required external backup |
 | `configured_local` | Explicit path shares a source filesystem; not VM-loss protection |
@@ -629,7 +730,7 @@ Before deleting or rebuilding the VM:
 | Findings DB missing | Check `research.findings_store`; there is no temporary fallback |
 | All shadow variants are `VETOED` for missing book levels or basis | Treat this as market-data plumbing failure, not evidence that every strategy failed. Verify `book_bid_levels`, `book_ask_levels`, and `perp_index_basis_pct`; repaired observations belong to feed v4, feed v5 is the immutable-provenance fork, feed v6 is the deterministic four-lane realtime fork, feed v7 added the real liquidation flow and conditioning axes, feed v8 repairs the depth-ladder delivery that silently starved six of seven strategies, and all v1-v7 rows remain historical. |
 | Trader stopped after Compose update | Expected safe `SIGTERM` pause; run `main.py check`, then explicitly `main.py resume` |
-| Recorder unhealthy | Trader startup remains blocked until a fresh recorder CSV exists |
+| Recorder unhealthy | Collection has a gap; inspect recorder logs/storage. Trader and research startup are independent and remain observable separately. |
 | Dashboard unreachable remotely | Expected loopback binding; use an SSH tunnel or private VPN |
 | VM `curl /healthz` works but Mac dashboard does not | The dashboard container is healthy; repair/restart the Mac SSH `LocalForward` tunnel and check whether local port 8080 is occupied. |
 | Dashboard scheduler is `missing` | The legacy systemd timer does not maintain the Compose scheduler heartbeat. Under Compose inspect the `research` container and `runtime/health/research.json`. |
@@ -647,8 +748,11 @@ Before deleting or rebuilding the VM:
 | Compose warns that config/secret UID/GID/mode are ignored | Expected for file-backed local Compose. Enforce host permissions: secret `10001:10001` mode `0400`; tracked `config.yaml` mode `0644`. |
 | `docker compose ps` is empty after an update | The updater failed before `compose up`; fix the first journal/preflight error and rerun the same revision. |
 
-The B7.5 maker-first order primitive is enabled in the shipped demo
-configuration and rejected in live mode. `cycle.decision_interval_seconds`, `maker_first_enabled`,
+### Maker-first entry boundary
+
+The maker-first order primitive is enabled in the shipped demo
+configuration and rejected in live mode. This is demo-only measurement, not a
+live-order or promotion path. `cycle.decision_interval_seconds`, `maker_first_enabled`,
 `maker_first_wait_seconds`, `research.shadow_enabled`,
 `research.shadow_variants`, and `research.shadow_budget_ms` are documented
 configuration controls; the shipped values/defaults are summarized in

@@ -12,7 +12,7 @@ from copy import deepcopy
 
 from .forward_models import require_complete_contract
 from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
-                       runnable_ids, spec_for)
+                       runnable_ids, spec_for, validate_contract_config)
 from .provider import normalize_provider_endpoint
 
 
@@ -91,7 +91,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
 
     strategy = _mapping(cfg.get("strategy"), "strategy")
     _keys(strategy, {
-        "id", "version", "signal_timeframe", "execution_mode",
+        "id", "version", "variant_id", "signal_timeframe", "execution_mode",
         "breakout_discriminator", "breakout_compression_max_atr_ratio",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
         "setup_memory_hours", "loss_reentry_min_minutes",
@@ -112,6 +112,10 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         if (not isinstance(strategy.get(key), str)
                 or not strategy[key].strip()):
             raise ConfigError(f"strategy.{key} must be a non-empty string")
+    if "variant_id" in strategy and (
+            not isinstance(strategy["variant_id"], str)
+            or not strategy["variant_id"].strip()):
+        raise ConfigError("strategy.variant_id must be a non-empty string")
     # The registry is authoritative for runnable strategies.
     try:
         spec = spec_for(strategy["id"])
@@ -314,6 +318,16 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         raise ConfigError(
             "strategy.signal_timeframe must appear in cycle.timeframes")
 
+    # A named semantic variant is immutable.  Check it after normal field
+    # validation so a malformed number gets the precise config error above,
+    # while a stale 70/30 or payoff value is attributed to the exact variant
+    # rather than silently scored under the registered base contract.
+    if strategy.get("variant_id"):
+        try:
+            validate_contract_config(cfg)
+        except (KeyError, ValueError) as exc:
+            raise ConfigError(str(exc)) from None
+
     risk = _mapping(cfg.get("risk"), "risk")
     _keys(risk, {"max_leverage", "entry_leverage", "risk_per_trade_pct",
                  "experimental_risk_per_trade_pct",
@@ -446,7 +460,8 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             "execution.maker_first_enabled is true and mode is live. The "
             "maker-first entry path is the B7.5 experiment and is validated "
             "on demo; run `python research.py readiness` and see "
-            "research/plan/B7.5-record.md before enabling it against real "
+            "research/plan/maker-first-entry-boundary.md before enabling it "
+            "against real "
             "capital.")
     if execution.get("maker_first_wait_seconds") is not None:
         # Bounded well inside a 15m signal bar. A passive order must resolve
@@ -532,11 +547,14 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                          "shadow_workers",
                          "experiment_candidate_batch_size",
                          "collector",
+                         "discovery",
                          "findings_store", "backup_target",
                          # Optional. Machine-authored mechanisms live in a
                          # separate append-only store so a proposed claim can
                          # never be confused with a hand-registered one.
                          "staging_store",
+                         "staging_handoff_dir", "staging_max_active",
+                         "staging_lifecycle", "staging_refinement",
                          "paper_initial_balance_usdt",
                          "paper_max_failures", "paper_min_closed_trades",
                          "experiment_min_duration_days",
@@ -583,6 +601,32 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             if "workers" in collector:
                 _integer(collector, "workers", 1, 32,
                          "research.collector")
+        discovery = research.get("discovery")
+        if discovery is None:
+            discovery = {}
+        else:
+            discovery = _mapping(discovery, "research.discovery")
+        _keys(discovery, {
+            "enabled", "max_rows", "max_nodes", "max_depth", "max_window",
+            "discovery_artifacts", "discovery_results",
+        }, "research.discovery")
+        discovery.setdefault("enabled", True)
+        discovery.setdefault("max_rows", 50_000)
+        discovery.setdefault("max_nodes", 32)
+        discovery.setdefault("max_depth", 8)
+        discovery.setdefault("max_window", 256)
+        discovery.setdefault("discovery_artifacts",
+                             "research/results/discovery-artifacts")
+        discovery.setdefault("discovery_results", "research/results/discovery")
+        _boolean(discovery, "enabled", "research.discovery")
+        _integer(discovery, "max_rows", 1, 50_000, "research.discovery")
+        _integer(discovery, "max_nodes", 1, 32, "research.discovery")
+        _integer(discovery, "max_depth", 1, 8, "research.discovery")
+        _integer(discovery, "max_window", 1, 256, "research.discovery")
+        for key in ("discovery_artifacts", "discovery_results"):
+            if not isinstance(discovery[key], str) or not discovery[key].strip():
+                raise ConfigError(f"research.discovery.{key} must be a path string")
+        research["discovery"] = discovery
         if "paper_initial_balance_usdt" in research:
             _number(research, "paper_initial_balance_usdt", 100,
                     1_000_000_000, "research")
@@ -614,6 +658,74 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         if "forward_feed_version" in research:
             _integer(research, "forward_feed_version", 1, 1_000,
                      "research")
+        if "staging_max_active" in research:
+            _integer(research, "staging_max_active", 1, 256, "research")
+        else:
+            # Keep every staging-store caller on one explicit validated
+            # budget, including configs written before bounded staging.
+            research["staging_max_active"] = 32
+        lifecycle = research.get("staging_lifecycle")
+        if lifecycle is None:
+            lifecycle = {}
+        else:
+            lifecycle = _mapping(lifecycle, "research.staging_lifecycle")
+        _keys(lifecycle, {
+            "never_fired_decisions", "never_fired_max_age_hours",
+            "no_observation_max_age_hours", "starved_max_age_hours",
+            "starved_fraction",
+        }, "research.staging_lifecycle")
+        lifecycle.setdefault("never_fired_decisions", 2_000)
+        lifecycle.setdefault("never_fired_max_age_hours", 7 * 24)
+        lifecycle.setdefault("no_observation_max_age_hours", 3 * 24)
+        lifecycle.setdefault("starved_max_age_hours", 3 * 24)
+        lifecycle.setdefault("starved_fraction", 0.5)
+        _integer(lifecycle, "never_fired_decisions", 1, 10_000_000,
+                 "research.staging_lifecycle")
+        for key in ("never_fired_max_age_hours",
+                    "no_observation_max_age_hours",
+                    "starved_max_age_hours"):
+            _number(lifecycle, key, 1, 365 * 24,
+                    "research.staging_lifecycle")
+        _number(lifecycle, "starved_fraction", 0.01, 1,
+                "research.staging_lifecycle")
+        research["staging_lifecycle"] = lifecycle
+
+        refinement = research.get("staging_refinement")
+        if refinement is None:
+            refinement = {}
+        else:
+            refinement = _mapping(
+                refinement, "research.staging_refinement")
+        _keys(refinement, {
+            "max_attempts", "max_variants_per_attempt",
+            "max_configurations_per_mechanism", "relative_step",
+        }, "research.staging_refinement")
+        # One retry of at most two one-dimensional neighbours is the shipped
+        # ceiling. Operators may turn it off, but cannot configure a grid.
+        refinement.setdefault("max_attempts", 1)
+        refinement.setdefault("max_variants_per_attempt", 2)
+        refinement.setdefault("max_configurations_per_mechanism", 5)
+        refinement.setdefault("relative_step", 0.10)
+        _integer(refinement, "max_attempts", 0, 2,
+                 "research.staging_refinement")
+        _integer(refinement, "max_variants_per_attempt", 1, 2,
+                 "research.staging_refinement")
+        _integer(refinement, "max_configurations_per_mechanism", 1, 16,
+                 "research.staging_refinement")
+        _number(refinement, "relative_step", 0.001, 0.5,
+                "research.staging_refinement")
+        if (refinement["max_configurations_per_mechanism"]
+                < 1 + refinement["max_variants_per_attempt"]):
+            raise ConfigError(
+                "research.staging_refinement."
+                "max_configurations_per_mechanism must cover the root plus "
+                "max_variants_per_attempt")
+        if (research["staging_max_active"]
+                < 1 + refinement["max_variants_per_attempt"]):
+            raise ConfigError(
+                "research.staging_max_active must cover one initial "
+                "configuration neighborhood")
+        research["staging_refinement"] = refinement
         findings_store = research.get("findings_store")
         if findings_store is not None and (
                 not isinstance(findings_store, str)
@@ -624,6 +736,12 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                 not isinstance(backup_target, str)
                 or not backup_target.strip()):
             raise ConfigError("research.backup_target must be a path string")
+        handoff_dir = research.get("staging_handoff_dir")
+        if handoff_dir is not None and (
+                not isinstance(handoff_dir, str)
+                or not handoff_dir.strip()):
+            raise ConfigError(
+                "research.staging_handoff_dir must be a path string")
         for key in ("shadow_variants",):
             names = research.get(key)
             if names is None:

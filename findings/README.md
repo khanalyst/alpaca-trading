@@ -4,7 +4,6 @@ Every registered variant, including the rejected ones. A rejection is a row here
 
 ## Repository audits
 
-- [Current main-repository implementation plan](../MAIN_REPO_REVIEW_PLAN.md)
 - [Detailed main repository review — 2026-07-30](main-repo-review-2026-07-30.md)
 - [Orchestrated strategy audit — 2026-07-29](orchestrated-audit-2026-07-29.md)
 
@@ -12,6 +11,7 @@ Every registered variant, including the rejected ones. A rejection is a row here
 
 | variant | status | round trips | expectancy | last updated |
 | --- | --- | --- | --- | --- |
+| [ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3](ls-ratio-fade/ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3.md) | testing | 0 | unproven; no positive edge | 2026-08-07 |
 | [momentum.baseline](momentum/momentum.baseline.md) | testing | 0 | - | 2026-07-28 |
 | [momentum.cond.session](momentum/momentum.cond.session.md) | candidate | 0 | - | 2026-08-05 |
 | [momentum.cond.vol_regime](momentum/momentum.cond.vol_regime.md) | candidate | 0 | - | 2026-08-05 |

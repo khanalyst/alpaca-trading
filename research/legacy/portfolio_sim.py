@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from research.edge_lab import (  # noqa: E402
     BAR_MS, Contract, Costs, derive_levels, evidence_masks, research_gate,
@@ -32,7 +32,7 @@ INITIAL_EQUITY = 10_000.0
 
 def _load_cfg() -> dict:
     from agent.config import validate_config
-    repo = Path(__file__).resolve().parents[1]
+    repo = Path(__file__).resolve().parents[2]
     return validate_config(yaml.safe_load((repo / "config.yaml").read_text()))
 
 

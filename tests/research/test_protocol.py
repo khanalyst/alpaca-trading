@@ -159,6 +159,25 @@ class PersistedDecisionTests(unittest.TestCase):
         self.assertEqual(comparison["paired_n"], 1)
         self.assertEqual(comparison["interval"].point, 1.25)
 
+    def test_inference_ineligible_rows_never_become_outcomes(self):
+        common = {
+            "proposal_id": "excluded", "cycle_id": "cycle-1",
+            "decision_ts": 100.0, "symbol": "BTC/USDT:USDT",
+            "signal_ts": 99, "direction": "long",
+            "setup_type": "trend_continuation",
+            "inference_eligible": False,
+        }
+        decisions = protocol.paper_trade_decisions([{
+            **common, "decision_outcome": "VETOED",
+            "trade_status": None, "trade_r_multiple": None,
+        }, {
+            **common, "proposal_id": "excluded-closed",
+            "decision_outcome": "PROPOSED", "trade_status": "CLOSED",
+            "trade_valid_for_inference": 1, "trade_r_multiple": 99.0,
+        }])
+
+        self.assertEqual(decisions, [])
+
 
 class ClusterRandomizationTests(unittest.TestCase):
     def test_null_or_weak_clustered_deltas_are_not_significant(self):
@@ -427,6 +446,21 @@ class PromotionTests(unittest.TestCase):
         clean["bootstrap"]["cluster_seconds"] = 1
         self.assertFalse(protocol.paired_window_adequate(
             clean, protocol.MIN_PAIRED_FIT_OBSERVATIONS))
+
+    def test_unresolved_resolved_third_duplicate_never_resurrects(self):
+        unresolved = at_second(None, 7)
+        resolved = at_second(1.0, 7)
+        third = at_second(2.0, 7)
+        comparison = protocol.paired_arm_comparison(
+            [unresolved, resolved, third], [at_second(0.0, 7)],
+            include_randomization=False)
+
+        self.assertEqual(comparison["paired_n"], 0)
+        self.assertEqual(comparison["left_duplicates"], 2)
+        self.assertEqual(comparison["left_duplicate_keys"], 1)
+        self.assertEqual(comparison["proposal_union_n"], 1)
+        self.assertIn("duplicate identity", str(
+            comparison["duplicate_reasons"]["left"]))
 
     def test_one_market_episode_cannot_promote_however_many_trades(self):
         """A collapsed interval is an absence of evidence, not certainty.

@@ -13,9 +13,16 @@ The executable sources remain authoritative when prose and code disagree:
 - `agent/forward_models.py` defines entry, stop, target, holding, and cost
   assumptions used by paper simulation;
 - `research/hypotheses/*.yaml` defines pre-registered research settings;
-- `research/variants.yaml` defines hand-authored momentum variants;
+- `research/variants.yaml` defines hand-authored immutable variants;
 - `agent/hypotheses.py` defines bounded numeric hypotheses exposed to the
-  active momentum analyst.
+  optional momentum analyst mode.
+
+Runtime and evidence identity is the canonical `StrategyContract` composite:
+registry spec, forward-model economics/exit, evidence builder, immutable
+variant identity, and semantic hash. Startup and evidence ingest reject drift;
+legacy/mismatched rows remain audit records but are quarantined from inference.
+Only funding status `verified_realized` or `verified_no_settlement_due` is
+inferential.
 
 ## Current inventory
 
@@ -23,53 +30,52 @@ The executable sources remain authoritative when prose and code disagree:
 | --- | --- |
 | Registered strategies | 7 mechanism/falsification claims |
 | Pre-registered YAML setting rows | 38 across 7 strategy files |
-| Hand-authored momentum variants | 24 immutable identities including baseline |
-| Materialized static identities | 77 including all 7 baselines |
+| Hand-authored variants | 25 immutable identities: 24 momentum identities plus the explicit tuned `ls-ratio-fade` contract |
+| Materialized static identities | 78 including all 7 baselines |
 | Bounded LLM selector candidates | 33 eligible single-axis candidates |
 | Realtime comparison arms | Up to 20 deterministic arms at shipped config: one shared baseline plus 4 pre-registered candidates in each of 4 realtime lanes (hard cap 36) |
-| Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 16 |
+| Adaptive exact-value variants | Dynamic; every attempted value is permanently recorded in schema 17 |
 
-The superseded `14 maximum` wording described seven realtime strategies; it is
-not a current arm count.
+### Registered strategy status
 
-The active analyst's separate `:llm` scope can hold its own baseline and
-candidate, adding up to two non-comparable arms. At shipped configuration the
-combined maximum is therefore 22 arms (20 deterministic plus 2 `:llm` arms);
-at the hard cap it is 38 (36 deterministic plus 2 `:llm` arms).
+| Strategy | Version | Registry status | Realtime | Shipped order path |
+| --- | --- | --- | --- | --- |
+| `momentum` | `phase1-v3` | `T0_REJECTED` | yes, negative control | no |
+| `flush-fade` | `v1` | `T0_REJECTED` | yes, negative control | no |
+| `funding-carry` | `v1` | `T0_REJECTED` | no | no |
+| `funding-unwind` | `v1` | `T1_HYPOTHESIS` | no | no |
+| `trend-multiday` | `v1` | `T1_HYPOTHESIS` | no | no |
+| `ls-ratio-fade` | `v1` | `T1_HYPOTHESIS` | yes | no (`shadow_only`) |
+| `scalp-maker` | `v1` | `T1_HYPOTHESIS` | yes | no |
+
+There is no proven or live-qualified edge. The table describes registry state,
+not a recommendation. Its identity/version/status cells are checked against
+`agent/registry.py` so this document cannot silently omit a family.
 
 The active realtime simulator identity is `forward_feed_version: 8`. Feed v8
 uses deterministic contract proposals in four realtime lanes: `momentum`,
 `flush-fade`, `ls-ratio-fade`, and `scalp-maker`. Each lane receives the same
 market snapshot and timestamp and owns independent paper cash, positions, risk
 state, decisions, and trades. `funding-carry`, `funding-unwind`, and
-`trend-multiday` remain registered offline-only models. **`ls-ratio-fade/v1`
-occupies the configured demo order path** under `execution_mode:
-deterministic`, replacing `momentum/phase1-v3`, which is `T0_REJECTED` and is
-the only strategy the recorded corpus says something significant about
-(-0.428R over 43 independent 48h episodes, t=-2.45). The replacement is a
-choice among unproven mechanisms, not a promotion:
+`trend-multiday` remain registered offline-only models. The shipped
+`execution_mode: shadow_only` leaves every order path disabled. The configured
+`ls-ratio-fade/v1` identity is the explicit
+`ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3` research contract, while
+`momentum/phase1-v3` remains the `T0_REJECTED` benchmark. This is a choice among
+unproven research mechanisms, not a promotion:
 `research/plan/order-path-succession.md` holds the comparison and the
 pre-committed criterion for what would earn the seat on evidence.
 
 Feeds v1-v7 remain immutable historical rows and must not be pooled with v8
-outcomes. Feed v4 is the market-data plumbing repair feed; feed v5 is the
-immutable experiment-provenance fork. The analyst's actual decisions continue
-in the sibling `:llm` scope for planner history; that lane is not comparable
-with deterministic research lanes.
-
-**The analyst's own decisions are still recorded, in the sibling scope
-`...:llm`.** That lane sees the identical snapshot and timestamp and holds
-what the LLM actually chose. It is what `research_history_context()` is built
-from, so it is the record the planner learns an edge from; dropping it would
-have left the analyst with no evidence of its own past decisions. The two
-lanes are deliberately not comparable and live in separate scopes so no
-verdict can pool them.
+outcomes. The shipped `shadow_only` runtime creates no order path or `:llm`
+lane. If analyst
+mode is explicitly selected, only its genuine decisions are retained in that
+sibling scope for planner history; the scope is non-comparable and cannot
+qualify a deterministic strategy.
 
 `funding-carry` exits on `carry_until_normalised`, not on a price target. Its
 own mechanism says the return source is the carry rather than a directional
-forecast, but its contract closed on a 2R price move, so it was scored on the
-one thing it claims not to be forecasting - and a position could be closed at a
-profit while funding was still paying, or held after the carry had gone. It now
+forecast. The current executable contract therefore has no price target: it
 closes when the 30-day funding percentile falls back to its median (50). The
 stop is unchanged, because its falsification requires price risk over the
 holding window to be charged against the carry, and the ten-day timeout remains
@@ -86,8 +92,8 @@ a measurement constraint, not a claim that any model has already cleared it.
 ### Momentum (`momentum`, version `phase1-v3`)
 
 **Plain definition.** Follow a completed short-term impulse when trend,
-breakout, or funding-reversal evidence supports it. This is the configured demo
-strategy, but it is retained primarily as the benchmark null that new ideas
+breakout, or funding-reversal evidence supports it. It is retained primarily
+as the rejected benchmark null that new ideas
 must beat.
 
 **Exact current signal families.**
@@ -167,8 +173,9 @@ creates a short; the mirrored negative tail creates a long. The contract
 refuses to fight a fully aligned 1h/4h trend.
 
 **Paper outcome contract.** Enter after the 1h signal; use a structure stop
-with at least 3 ATR, a 2R price target, observed taker costs and actual funding
-settlements, and a maximum ten-day hold.
+with at least 3 ATR, hold while funding pays, and close when the 30-day funding
+percentile normalizes to 50 or the ten-day timeout arrives. Observed taker
+costs and actual funding settlements are charged. There is no price target.
 
 **Rationale.** The crowd pays continuously to maintain leveraged positioning,
 so the funding-receiving side should earn carry without requiring a directional
@@ -286,15 +293,18 @@ only.
 - `lower_short_tail`: short threshold falls to the 10th percentile;
 - `extreme_long_tail`: long threshold rises to the 95th percentile;
 - `extreme_short_tail`: short threshold falls to the 5th percentile;
-- `wider_tails`: 70th/30th, the shipped order-path setting;
+- `wider_tails`: 70th/30th, one component of the configured tuned identity;
 - `widest_tails`: 60th/40th, the end of the widening axis;
 - `no_chase_tight`: entry extension capped at 1.0 ATR;
 - `no_chase_loose`: the registered 3.0 ATR cap, kept as the comparison point.
 
-**Shipped order-path setting.** This strategy occupies the demo order path
-under `execution_mode: deterministic`, with `ls_high_percentile: 70`,
-`ls_low_percentile: 30` and `hard_max_entry_extension_atr: 1.5`. Those come
-from replaying the contract over the recorded corpus across a 7x4 grid, scored
+**Configured tuned research identity.** The explicit
+`ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3` contract uses
+`ls_high_percentile: 70`, `ls_low_percentile: 30`,
+`hard_max_entry_extension_atr: 1.5`, a 1 ATR minimum stop, and a 3R target.
+The registered base remains 80/20, a 3 ATR extension cap, 2 ATR minimum stop,
+and 2R target. The tail/extension choices came from replaying the contract over
+the recorded corpus across a 7x4 grid, scored
 as R-multiples on independent 48-hour episodes against a direction-matched
 random baseline. Two results are worth stating because they shape what the
 selector should search:
@@ -307,10 +317,9 @@ selector should search:
   over 13,637 observations, so "above the 80th percentile" describes most of
   the corpus rather than an elevated reading.
 
-The setting is the argmax of that grid at -0.153R, not a positive result. The
-contract is unproven on this evidence rather than supported, and the reason it
-holds the order path is that every alternative is unproven too while momentum
-is measurably worse.
+The tail/extension setting is the argmax of that grid at -0.153R, not a positive
+result. The full tuned identity is unproven and research-only; its configured
+presence in `shadow_only` grants no order or capital authority.
 
 ### Maker spread capture (`scalp-maker`, version `v1`)
 
@@ -361,9 +370,9 @@ is the claimed source of return:
 The outcome evaluator records funding and price attribution separately. A
 positive headline return cannot make both mechanisms true.
 
-## Bounded momentum analyst hypotheses
+## Bounded momentum analyst-mode hypotheses
 
-The active momentum analyst may propose one exact numeric value for one of
+When momentum analyst mode is selected, it may propose one exact numeric value for one of
 these registered hypotheses. Bounds, reasoning, exact identity, and every
 acceptance/rejection event are immutable.
 
@@ -381,7 +390,7 @@ variant ID; status is the only field that may advance.
 | Variant | Exact change | Question being tested |
 | --- | --- | --- |
 | `momentum.baseline` | None | Comparison floor and replay identity |
-| `momentum.rr.fixed_1_5` | `fixed_reward_risk=1.5` | Retired: the order path closed 35 live trades at 11.4% wins. |
+| `momentum.rr.fixed_1_5` | `fixed_reward_risk=1.5` | Retired: the demo order path closed 35 trades at 11.4% wins. |
 | `momentum.rr.fixed_2_0` | `fixed_reward_risk=2.0` | Retired: sizing an already-negative directional edge. |
 | `momentum.rr.fixed_2_5` | `fixed_reward_risk=2.5` | Retired: sizing an already-negative directional edge. |
 | `momentum.rr.fixed_3_0` | `fixed_reward_risk=3.0` | Superseded because it duplicates the current baseline |
@@ -396,7 +405,7 @@ variant ID; status is the only field that may advance.
 | `momentum.conf.floor_0_60` | confidence floor `0.60` | Superseded: proposals below the shipped 0.65 prompt floor are unobservable. |
 | `momentum.conf.floor_0_70` | confidence floor `0.70` | Retired: the 0.70-0.80 confidence bucket went 0 for 13 live. |
 | `momentum.conf.floor_0_75` | confidence floor `0.75` | Retired: confidence is anti-informative in the observable band. |
-| `momentum.conf.floor_0_80` | confidence floor `0.80` | Retired: one live trade ever exceeded 0.80 confidence. |
+| `momentum.conf.floor_0_80` | confidence floor `0.80` | Retired: only one demo order-path trade exceeded 0.80 confidence. |
 | `momentum.discriminator.trend_alignment` | breakout discriminator `trend_alignment` | Retired as unrunnable: 2 breakout trades in 24 live round trips. |
 | `momentum.discriminator.volatility_regime` | breakout discriminator `volatility_regime` | Retired as unrunnable: no breakout population to partition. |
 | `momentum.cond.vol_regime` | None; conditioning axis | Does expectancy change sign between volatility compression and expansion? |

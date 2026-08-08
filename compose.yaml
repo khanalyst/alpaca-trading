@@ -54,9 +54,6 @@ services:
     <<: *app
     container_name: okx-trader
     command: ["python", "main.py", "run"]
-    depends_on:
-      recorder:
-        condition: service_healthy
     environment:
       OKX_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
     secrets:
@@ -88,10 +85,15 @@ services:
   research:
     <<: *app
     container_name: okx-research
-    command: ["python", "deploy/scheduler.py", "--hour", "3", "--minute", "0"]
-    depends_on:
-      recorder:
-        condition: service_healthy
+    command:
+      - python
+      - deploy/scheduler.py
+      - --hour
+      - "3"
+      - --minute
+      - "0"
+      - --timeout-seconds
+      - ${OKX_RESEARCH_TIMEOUT_SECONDS:-14400}
     environment:
       OKX_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       PYTHON: /usr/local/bin/python
@@ -111,7 +113,7 @@ services:
       - research-results:/app/research/results
       - findings-reports:/app/findings
     healthcheck:
-      test: ["CMD", "python", "deploy/health.py", "research"]
+      test: ["CMD", "python", "deploy/health.py", "research", "--max-age", "180"]
       interval: 30s
       timeout: 5s
       retries: 5

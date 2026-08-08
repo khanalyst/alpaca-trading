@@ -25,6 +25,14 @@ class EvidenceStore:
             {"decision_id": "d3", "proposal_id": "p3", "paper_trade_id": None,
              "symbol": "BTC", "direction": "long", "setup_type": "reversal",
              "decision_outcome": "VETOED", "reason": "confidence below floor"},
+            {"decision_id": "d4", "proposal_id": "p4", "paper_trade_id": None,
+             "symbol": "BTC", "direction": "short", "setup_type": "reversal",
+             "decision_outcome": "VETOED", "reason": "data missing",
+             "inference_eligible": False},
+            {"decision_id": "d5", "proposal_id": "p5", "paper_trade_id": "t2",
+             "symbol": "BTC", "direction": "long", "setup_type": "reversal",
+             "decision_outcome": "PROPOSED", "reason": None,
+             "inference_eligible": False},
         ]
 
     def paper_trades_for(self, scope, variant):
@@ -34,6 +42,10 @@ class EvidenceStore:
             "trade_id": "t1", "proposal_id": "p1", "status": "CLOSED",
             "result": "target", "valid_for_inference": 1,
             "r_multiple": 0.5, "net_pnl_usd": 12.0,
+        }, {
+            "trade_id": "t2", "proposal_id": "p5", "status": "CLOSED",
+            "result": "target", "valid_for_inference": 1,
+            "r_multiple": 99.0, "net_pnl_usd": 999.0,
         }]
 
     def experiment_outcomes(self, scope=None):
@@ -55,6 +67,13 @@ class EvidenceStore:
                                    "trade_status": "CLOSED", "trade_valid_for_inference": 1,
                                    "trade_r_multiple": 0.5},
                                   {"decision_ts": 6, "decision_outcome": "VETOED"},
+                                  {"decision_ts": 2, "decision_outcome": "PROPOSED",
+                                   "trade_status": "CLOSED",
+                                   "trade_valid_for_inference": 1,
+                                   "trade_r_multiple": 99.0,
+                                   "inference_eligible": False},
+                                  {"decision_ts": 7, "decision_outcome": "VETOED",
+                                   "inference_eligible": False},
                               ]},
                 "baseline": {"variant_id": "baseline-1", "decision_count": 3,
                               "trade_r_metrics": {"expectancy_r": 0.1}},
@@ -121,6 +140,14 @@ class AuthoringEvidenceContextTests(unittest.TestCase):
         segments = [row for row in context["segment_context"]
                     if row["arm"] == "candidate"]
         self.assertEqual({row["segment"] for row in segments}, {"fit", "confirm"})
+        fit = [row for row in segments if row["segment"] == "fit"][0]
+        confirm = [row for row in segments if row["segment"] == "confirm"][0]
+        self.assertEqual(
+            (fit["opportunities"], fit["fired"], fit["closed"], fit["mean_r"]),
+            (1, 1, 1, 0.5))
+        self.assertEqual(
+            (confirm["opportunities"], confirm["declined"], confirm["closed"]),
+            (1, 1, 0))
         self.assertEqual(len(context["regime_context"]), 2)
         self.assertTrue(any(row["analysis_id"] == "a1"
                             for row in context["out_of_sample"]))
@@ -169,6 +196,14 @@ class AuthoringEvidenceContextTests(unittest.TestCase):
                             {"symbol": "ETH", "direction": "short",
                              "setup_type": "carry", "decision_outcome": "VETOED",
                              "reason": "data missing"},
+                            {"symbol": "ETH", "direction": "short",
+                             "setup_type": "carry", "decision_outcome": "PROPOSED",
+                             "trade_status": "CLOSED", "trade_valid_for_inference": 1,
+                             "trade_r_multiple": 99.0,
+                             "inference_eligible": False},
+                            {"symbol": "ETH", "direction": "short",
+                             "setup_type": "carry", "decision_outcome": "VETOED",
+                             "reason": "data missing", "inference_eligible": False},
                         ]}, "reasons": []},
                 }]
 

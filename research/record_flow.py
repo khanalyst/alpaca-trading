@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import signal
@@ -72,16 +73,34 @@ BOOK_FIELDS = [
     *[f"bid_depth_{b}bps" for b in DEPTH_BANDS_BPS],
     *[f"ask_depth_{b}bps" for b in DEPTH_BANDS_BPS],
     "imbalance_top", "imbalance_5bps",
+    "observed_at", "available_at", "source", "feed", "schema",
+    "revision_id",
+]
+# The discovery replay consumes only closed one-minute execution bars.  OKX's
+# market/candles response is [ts, open, high, low, close, volume, ...,
+# confirm]; ``confirm=1`` is persisted as ``closed=true`` so an in-progress
+# candle can never become an outcome bar through an as-of join.
+EXECUTION_BAR_FIELDS = [
+    "ts", "inst_id", "open", "high", "low", "close", "volume", "closed",
+    "observed_at", "available_at", "source", "feed", "schema", "revision_id",
 ]
 HOURLY_FIELDS = {
-    "long_short_ratio": ["ts", "ccy", "long_short_ratio"],
-    "taker_volume": ["ts", "ccy", "sell_vol", "buy_vol"],
-    "open_interest": ["ts", "inst_id", "oi_contracts", "oi_ccy", "oi_usd"],
+    "long_short_ratio": ["ts", "ccy", "long_short_ratio",
+                          "observed_at", "available_at", "source", "feed",
+                          "schema", "revision_id"],
+    "taker_volume": ["ts", "ccy", "sell_vol", "buy_vol",
+                      "observed_at", "available_at", "source", "feed",
+                      "schema", "revision_id"],
+    "open_interest": ["ts", "inst_id", "oi_contracts", "oi_ccy", "oi_usd",
+                       "observed_at", "available_at", "source", "feed",
+                       "schema", "revision_id"],
     # Actual filled liquidations: the DIRECT observation of the forced-flow
     # mechanism, rather than the open-interest proxy that flush-fade v1 used
     # and that was falsified. OKX serves only a short recent window, so this
     # exists only if it is recorded.
-    "liquidations": ["ts", "inst_id", "side", "pos_side", "bk_px", "sz"],
+    "liquidations": ["ts", "inst_id", "side", "pos_side", "bk_px", "sz",
+                     "observed_at", "available_at", "source", "feed",
+                     "schema", "revision_id"],
 }
 
 # Keep these four columns first and unchanged: existing exports and readers
@@ -92,8 +111,8 @@ LEGACY_FUNDING_FIELDS = [
 ]
 FUNDING_FIELDS = [
     *LEGACY_FUNDING_FIELDS,
-    "observed_at", "settlement_time", "source", "status",
-    "forecast_rate", "realized_rate",
+    "observed_at", "available_at", "settlement_time", "source", "feed",
+    "schema", "revision_id", "status", "forecast_rate", "realized_rate",
 ]
 FUNDING_FORECAST_SOURCE = "/api/v5/public/funding-rate"
 FUNDING_REALIZED_SOURCE = "/api/v5/public/funding-rate-history"
@@ -173,21 +192,41 @@ class Recorder:
         return None
 
     @staticmethod
+    def _payload_hash(row: dict) -> str:
+        """Hash the observed payload, excluding local provenance columns.
+
+        Upstream timestamps are often unchanged while values are revised. A
+        payload hash lets append() retain such revisions while still
+        suppressing an identical poll on restart.
+        """
+        excluded = {
+            "observed_at", "available_at", "revision_id", "quality",
+        }
+        payload = {str(k): row.get(k) for k in sorted(row) if k not in excluded}
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _row_key(series: str, row: dict) -> tuple[str, ...]:
         instrument = str(row.get("inst_id") or row.get("ccy"))
+        source = str(row.get("source") or "legacy")
+        feed = str(row.get("feed") or "legacy")
+        schema = str(row.get("schema") or "legacy_unknown")
+        payload_hash = Recorder._payload_hash(row)
         if series != "funding":
-            return str(row.get("ts")), instrument
+            return (source, feed, schema, str(row.get("ts")), instrument,
+                    payload_hash)
 
         # A forecast changes as settlement approaches. Using settlement time
         # as identity would retain only the first estimate.
         status = str(row.get("status") or "legacy")
-        source = str(row.get("source") or "legacy")
         settlement = str(row.get("settlement_time") or row.get("ts"))
         if status == "forecast":
-            return (source, status, str(row.get("observed_at")), settlement,
-                    instrument)
+            return (source, feed, schema, status, str(row.get("observed_at")),
+                    settlement, instrument, payload_hash)
         # A realized history row is one immutable result per settlement.
-        return source, status, settlement, instrument
+        return source, feed, schema, status, settlement, instrument, payload_hash
 
     @staticmethod
     def _upgrade_legacy_funding_header(path: Path, fields: list[str]) -> None:
@@ -251,6 +290,10 @@ class Recorder:
                         pass
             fresh = []
             for row in rows:
+                # Normalize programmatic rows to the declared CSV schema so
+                # a legacy row with newly added blank columns deduplicates
+                # exactly like a row read back through DictReader.
+                row = {field: row.get(field, "") for field in fields}
                 key = self._row_key(series, row)
                 if key in key_set:
                     continue
@@ -269,11 +312,35 @@ class Recorder:
 
     # Capture
 
+    @staticmethod
+    def _annotate(row: dict, *, observed_at: int, source: str,
+                  feed: str = "okx-public",
+                  schema: str = "record_flow.v1") -> dict:
+        """Attach local receipt/provenance without changing legacy values.
+
+        ``available_at`` is deliberately local receipt time.  We never use a
+        file mtime or an upstream event timestamp as a claim of availability.
+        """
+        result = dict(row)
+        result.update({
+            "observed_at": int(observed_at),
+            "available_at": int(observed_at),
+            "source": source,
+            "feed": feed,
+            "schema": schema,
+        })
+        result["revision_id"] = Recorder._payload_hash(result)
+        return result
+
     def order_book(self, inst_id: str) -> dict | None:
         data = self.get("/api/v5/market/books",
                         {"instId": inst_id, "sz": BOOK_LEVELS})
         if not data:
             return None
+        # Receipt time is taken after the response is available.  Taking it
+        # before the request would make a slow request appear available in
+        # the past and weaken strict as-of joins.
+        observed_at = int(time.time() * 1000)
         book = data[0]
         bids = [(float(p), float(s)) for p, s, *_ in book.get("bids", [])]
         asks = [(float(p), float(s)) for p, s, *_ in book.get("asks", [])]
@@ -321,7 +388,8 @@ class Recorder:
         row["imbalance_5bps"] = (
             (row["bid_depth_5bps"] - row["ask_depth_5bps"]) / deep
             if deep > 0 else 0.0)
-        return row
+        return self._annotate(
+            row, observed_at=observed_at, source="/api/v5/market/books")
 
     def capture_books(self, instruments: list[str]) -> int:
         if self.workers <= 1 or len(instruments) <= 1:
@@ -336,6 +404,42 @@ class Recorder:
         rows = [row for row in fetched if row]
         return self.append("order_book", BOOK_FIELDS, rows)
 
+    def execution_bars(self, inst_id: str) -> list[dict]:
+        """Read and retain only closed 1m candles for offline replay."""
+        data = self.get("/api/v5/market/candles",
+                        {"instId": inst_id, "bar": "1m", "limit": "100"}) or []
+        observed_at = int(time.time() * 1000)
+        rows: list[dict] = []
+        for item in data:
+            if not isinstance(item, (list, tuple)) or len(item) < 6:
+                continue
+            # The last field is OKX's confirmation marker.  Do not infer a
+            # closed candle when the exchange omits it.
+            if len(item) < 9 or str(item[8]).strip() not in {"1", "true", "True"}:
+                continue
+            try:
+                ts = int(item[0])
+                values = [float(item[index]) for index in range(1, 6)]
+            except (TypeError, ValueError):
+                continue
+            open_price, high, low, close, volume = values
+            if min(open_price, high, low, close) <= 0 or high < low:
+                continue
+            rows.append(self._annotate({
+                "ts": ts, "inst_id": inst_id, "open": open_price,
+                "high": high, "low": low, "close": close,
+                "volume": volume, "closed": True,
+            }, observed_at=observed_at,
+                source="/api/v5/market/candles"))
+        return rows
+
+    def capture_execution_bars(self, instruments: list[str]) -> int:
+        """Append closed execution bars without exposing network state to discovery."""
+        rows: list[dict] = []
+        for inst_id in instruments:
+            rows.extend(self.execution_bars(inst_id))
+        return self.append("execution_bar_1m", EXECUTION_BAR_FIELDS, rows)
+
     def capture_hourly(self, instruments: list[str],
                        currencies: list[str]) -> dict[str, int]:
         written: dict[str, int] = {}
@@ -345,8 +449,13 @@ class Recorder:
             data = self.get(
                 "/api/v5/rubik/stat/contracts/long-short-account-ratio",
                 {"ccy": ccy, "period": "1H", "limit": "6"}) or []
-            rows += [{"ts": int(r[0]), "ccy": ccy,
-                      "long_short_ratio": float(r[1])} for r in data]
+            observed_at = int(time.time() * 1000)
+            rows += [self._annotate(
+                {"ts": int(r[0]), "ccy": ccy,
+                 "long_short_ratio": float(r[1])},
+                observed_at=observed_at,
+                source="/api/v5/rubik/stat/contracts/long-short-account-ratio")
+                     for r in data]
         written["long_short_ratio"] = self.append(
             "long_short_ratio", HOURLY_FIELDS["long_short_ratio"], rows)
 
@@ -355,9 +464,12 @@ class Recorder:
             data = self.get("/api/v5/rubik/stat/taker-volume",
                             {"ccy": ccy, "instType": "CONTRACTS",
                              "period": "1H", "limit": "6"}) or []
-            rows += [{"ts": int(r[0]), "ccy": ccy,
-                      "sell_vol": float(r[1]), "buy_vol": float(r[2])}
-                     for r in data]
+            observed_at = int(time.time() * 1000)
+            rows += [self._annotate(
+                {"ts": int(r[0]), "ccy": ccy,
+                 "sell_vol": float(r[1]), "buy_vol": float(r[2])},
+                observed_at=observed_at,
+                source="/api/v5/rubik/stat/taker-volume") for r in data]
         written["taker_volume"] = self.append(
             "taker_volume", HOURLY_FIELDS["taker_volume"], rows)
 
@@ -366,13 +478,14 @@ class Recorder:
             data = self.get("/api/v5/public/open-interest",
                             {"instType": "SWAP", "instId": inst_id}) or []
             for item in data:
-                rows.append({
+                rows.append(self._annotate({
                     "ts": int(item.get("ts") or time.time() * 1000),
                     "inst_id": inst_id,
                     "oi_contracts": item.get("oi"),
                     "oi_ccy": item.get("oiCcy"),
                     "oi_usd": item.get("oiUsd"),
-                })
+                }, observed_at=int(time.time() * 1000),
+                    source="/api/v5/public/open-interest"))
         written["open_interest"] = self.append(
             "open_interest", HOURLY_FIELDS["open_interest"], rows)
 
@@ -391,19 +504,22 @@ class Recorder:
                 forecast_rate = item.get("fundingRate")
                 if forecast_rate in (None, ""):
                     continue
-                rows.append({
+                rows.append(self._annotate({
                     # `ts` and `funding_rate` remain compatibility aliases.
                     "ts": settlement_time,
                     "inst_id": inst_id,
                     "funding_rate": forecast_rate,
                     "next_funding_time": item.get("nextFundingTime"),
                     "observed_at": observed_at,
+                    "available_at": observed_at,
                     "settlement_time": settlement_time,
                     "source": FUNDING_FORECAST_SOURCE,
+                    "feed": "okx-public",
+                    "schema": "record_flow.v1",
                     "status": "forecast",
                     "forecast_rate": forecast_rate,
                     "realized_rate": "",
-                })
+                }, observed_at=observed_at, source=FUNDING_FORECAST_SOURCE))
 
             # The current-rate endpoint is a moving forecast.  Poll history
             # separately so settled rates are not inferred from that forecast.
@@ -420,20 +536,23 @@ class Recorder:
                 if realized_rate in (None, ""):
                     # Never infer a settled value from another response field.
                     continue
-                rows.append({
+                rows.append(self._annotate({
                     "ts": settlement_time,
                     "inst_id": item.get("instId") or inst_id,
                     "funding_rate": realized_rate,
                     "next_funding_time": "",
                     "observed_at": observed_at,
+                    "available_at": observed_at,
                     "settlement_time": settlement_time,
                     "source": FUNDING_REALIZED_SOURCE,
+                    "feed": "okx-public",
+                    "schema": "record_flow.v1",
                     "status": "realized",
                     # A history row is not the forecast snapshot observed
                     # before settlement. Keep that evidence in forecast rows.
                     "forecast_rate": "",
                     "realized_rate": realized_rate,
-                })
+                }, observed_at=observed_at, source=FUNDING_REALIZED_SOURCE))
         written["funding"] = self.append(
             "funding", HOURLY_FIELDS["funding"], rows)
 
@@ -449,7 +568,7 @@ class Recorder:
                              "uly": underlying}) or []
             for item in data:
                 for detail in item.get("details") or []:
-                    rows.append({
+                    rows.append(self._annotate({
                         "ts": int(detail.get("ts")
                                   or detail.get("time") or 0),
                         "inst_id": item.get("instId") or inst_id,
@@ -457,7 +576,8 @@ class Recorder:
                         "pos_side": detail.get("posSide"),
                         "bk_px": detail.get("bkPx"),
                         "sz": detail.get("sz"),
-                    })
+                    }, observed_at=int(time.time() * 1000),
+                        source="/api/v5/public/liquidation-orders"))
         written["liquidations"] = self.append(
             "liquidations", HOURLY_FIELDS["liquidations"], rows)
         return written
@@ -614,6 +734,7 @@ def main() -> int:
     (settings["out"] / "README.txt").write_text(
         "OKX market data recorded because the exchange deletes it.\n"
         "order_book/       depth snapshots; never served historically\n"
+        "execution_bar_1m/ closed 1m OHLC bars for outcome replay\n"
         "long_short_ratio/ retail positioning; ~30 day retention upstream\n"
         "taker_volume/     aggressor flow;    ~30 day retention upstream\n"
         "open_interest/    ~60 day retention upstream\n"
@@ -640,15 +761,17 @@ def main() -> int:
                 continue
 
             written = recorder.capture_books(instruments)
+            bars_written = recorder.capture_execution_bars(instruments)
             if (cycle_start - last_hourly
                     > settings["hourly_interval_seconds"]):
                 currencies = sorted({i.split("-")[0] for i in instruments})
                 hourly = recorder.capture_hourly(instruments, currencies)
                 last_hourly = cycle_start
-                log.info("books=%d hourly=%s", written,
+                log.info("books=%d execution_bars=%d hourly=%s", written,
+                         bars_written,
                          json.dumps(hourly, separators=(",", ":")))
             else:
-                log.info("books=%d", written)
+                log.info("books=%d execution_bars=%d", written, bars_written)
         except Exception as exc:
             # A recorder that dies on a bad response loses the data it exists
             # to protect. Log and keep going.

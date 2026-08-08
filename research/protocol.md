@@ -31,7 +31,7 @@ amendment, it is a result being negotiated.
 | Date | Amendment | Reason |
 | --- | --- | --- |
 | 2026-07-30 | **Criterion 10 added**: a Holm correction across every axis evaluated in one qualification run. **Criterion 5 reclassified** as a selection screen rather than an independent test. | The correction existed only for conditioning cells, so the path that actually qualifies an edge corrected nothing while this document claimed the corrected figure was the only quotable one. Five axes are registered and the count grows with the registry. No variant had forward evidence at the time, so nothing was pending on either criterion. |
-| 2026-07-31 | **Real-time rotation outcomes documented separately.** Every strategy now keeps one baseline and at most one candidate; inadequacy is checked before performance and terminal outcomes are immutable. | The previous text said every setting ran continuously, which no longer matched the durable per-strategy rotation or the closed learning loop. |
+| 2026-07-31 | **Real-time rotation outcomes documented separately.** The initial durable design paired a stable baseline with a serial candidate assignment; inadequacy was checked before performance and terminal outcomes became immutable. | The previous text said every setting ran continuously. The 2026-08-06 amendment below superseded serial assignment with bounded batches. |
 | 2026-07-31 | **Forward qualification now reconstructs every setting from all eligible completed assignment attempts and its own contemporaneous baseline. Axis correction uses a calibrated paired six-hour-cluster sign-flip p-value.** | A common latest-ledger watermark erased earlier serial settings, and interval geometry is not a p-value. Existing v2 analyses remain readable but cannot authorize a new qualification. |
 | 2026-08-06 | **Real-time rotation now runs one shared baseline with a bounded pre-registered candidate batch per strategy (four shipped, hard cap eight); each assignment still tests one setting.** | Priority 1 increases discovery throughput without mixing adaptive selections into a static family or changing the downstream family-correction and held-out gates. |
 
@@ -63,6 +63,11 @@ isolated from the static batch.
 The registered `funding-carry`, `funding-unwind`, and `trend-multiday` models
 are offline-only; their candidates do not occupy realtime lanes.
 
+The configured `ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3` contract is
+not part of that adaptive one-axis candidate set. It is a pinned isolated paper
+arm with its own account; the coupled 70/30, 1.5-ATR, 1-ATR, 3R identity is
+never decomposed into selector assignments.
+
 An assignment becomes terminal only after both configured collection floors
 are met (ten elapsed days and 100 comparable paired observations by default), or it
 is explicitly rejected. The deterministic evaluator then checks evidence
@@ -91,6 +96,13 @@ Every outcome stores reasons and limitations. `WORKED` creates only an
 `promotion_allowed: false`. A separate LLM reviewer may explain the immutable
 result and nominate one registered next setting; it cannot revise the verdict
 or authorize execution.
+
+Inference eligibility is fail-closed before any of those statistics run. Each
+row must match the canonical `StrategyContract` variant and semantic hash; old,
+missing, or mismatched contract provenance is retained but quarantined. A
+closed outcome must also have funding status `verified_realized` or
+`verified_no_settlement_due`. Legacy, partial, forecast-only, or otherwise
+unverified funding never becomes a zero-cost sample.
 
 ## Promotion — every criterion must hold
 
@@ -301,15 +313,44 @@ Two things make that pressure survivable, and both are already built:
 A null result is a row in the findings store with the same weight as a
 positive one. A programme that records only what worked records only noise.
 
+## Recorded-data discovery boundary
+
+The recorder event plane is `event-plane.v1` at
+`runtime/research/market_events.db`; it is separate from and does not increment
+`forward_feed_version: 8`. Ingestion preserves receipt/availability, source,
+feed, schema, revision, and quality metadata, uses strict event and availability
+as-of filtering, archives raw CSV inputs, and quarantines malformed or legacy
+rows. Confirmed `execution_bar_1m` bars are joined after the signal feature
+cutoff with a later bounded outcome cutoff for bars and funding; direction is
+evidence-derived, and normalization is evaluated on the persisted episode path.
+Bars must be contiguous. Direct timeout requires full horizon coverage, while
+partial bars remain `no_data`. Nightly ingestion runs before discovery.
+
+Discovery is a bounded research-only screen: typed IR, generated verified
+evaluator, fixed mechanism-aligned exit profile, deterministic
+counterfactuals, a small fit-only world model, and exact source-event digest.
+Its candidate/analysis records are append-only and cannot authorize registry,
+configuration, tier, or order changes. `IDLE`, `NO_DATA`, and `NO_STATE_DATA`
+remain non-authorizing outcomes. `COMPLETE` is still research-only: scalar or
+mixed scalar/non-episode rows cannot complete a counterfactual, and no
+discovery result grants registry/configuration/demo/live authority.
+
+The protocol and shortlist share `research/evidence_primitives.py` for
+canonical opportunity identity, duplicate-safe indexing, chronological split,
+and pair/union coverage. Their lane policies remain separate, but duplicate
+rows are never resurrected by either path. Price-cache ranges use an
+end-exclusive `end_ms`; a bar exactly at the endpoint is outside the window.
+
 ## From collection to reviewed evidence
 
 The current realtime path is one shared baseline plus a bounded candidate batch
 for each realtime strategy, not every setting at once. Four strategy evaluators
 advance on every available shared snapshot using deterministic contracts and no
 per-strategy LLM calls. The three long-horizon registered models are offline-
-only. The active momentum analyst's actual choices are retained in a separate
-`:llm` scope. Packet computation may run concurrently, while durable writes
-remain serialized.
+only. The shipped `shadow_only` runtime creates no order path or `:llm` scope.
+Analyst mode may retain its genuine choices in a separate, non-comparable scope; those rows
+are planner history rather than qualification evidence. Packet computation may
+run concurrently, while durable writes remain serialized.
 
 The model decision throttle is elapsed-time based: with
 `cycle.decision_interval_seconds: 300`, the engine waits for at least 95% of
@@ -319,7 +360,7 @@ continues independently.
 Selections and adaptive values are first-class immutable identities. An
 accepted selection waits behind the active assignment. Terminal assignment
 evidence, outcomes, findings, review attempts, explanations, and any
-research-only edge candidate remain append-only in schema 16.
+research-only edge candidate remain append-only in schema 17.
 
 The separate `research.py forward-qualify` path continues to apply the
 multi-setting criteria above to complete prequalification decision-ledger
@@ -329,13 +370,22 @@ setting uses all eligible completed assignment windows and the baseline from
 those same windows; an operational failure invalidates its assignment evidence
 rather than becoming missing data.
 
-Gate G2 is narrower than risk or execution validation: replay compares the
+Evidence-package verification recursively verifies every `parent_evidence_ids`
+package and rejects a missing, tampered, cyclic, or over-depth parent. A child
+cannot become authoritative merely because its parent digest is present.
+
+Staged family registration is atomic: the root and all bounded initial
+configurations publish together, and a validation failure leaves no partial
+family. The staged maker-first boundary remains demo-only measurement; it is
+not a live-order or promotion path.
+
+The proposal-fidelity replay is narrower than risk or execution validation: it compares the
 full canonical pre-risk proposal identity (cycle, symbol, direction, setup
 identity/type, signal timestamp, strategy version, and baseline variant)
 symmetrically with replay keys. It requires a non-vacuous exact match and
 fails closed on malformed, duplicate, missing, or extra identities. Outcome
 resolution gaps remain diagnostics rather than proposal mismatches. A failed,
-stale, or vacuous G2 blocks treating journal-derived evidence as authoritative.
+stale, or vacuous result blocks treating journal-derived evidence as authoritative.
 
 Forward qualification proves one strategy version and one declared axis,
 verifies identical non-axis executable inputs, persists family correction, and
@@ -343,7 +393,7 @@ recomputes claims from embedded source evidence. A qualifying result can begin
 a clean isolated local PAPER account only when flat.
 
 PAPER success still does not edit the strategy registry. `research.py
-t3-packet` builds an immutable SHA-256-addressed review bundle containing G2,
+`t3-packet` builds an immutable SHA-256-addressed review bundle containing proposal fidelity,
 configuration/code/corpus provenance, held-out forward evidence, and the paper
 result. Neither a packet nor any other research artifact automatically changes
 the configured strategy, registry tier, account mode, risk, or capital.

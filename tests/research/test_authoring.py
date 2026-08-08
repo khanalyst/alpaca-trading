@@ -74,11 +74,20 @@ class AuthoringLoopTests(unittest.TestCase):
         self.assertEqual(result["status"], "AUTHORED")
         self.assertEqual(result["generation"], 0)
         self.assertEqual(result["accepted_count"], 1)
-        self.assertEqual(len(self.store.active()), 1)
+        self.assertEqual(result["accepted"][0]["configuration_count"], 3)
+        self.assertEqual(len(self.store.active()), 3)
 
         again = authoring.author_generation(
             self.store, self.cfg,
-            author=FakeProposer(response(good_proposal("basis-crowding"))),
+            author=FakeProposer(response(good_proposal(
+                "basis-crowding",
+                mechanism=("Perpetual basis dislocations force inventory "
+                           "holders to cross the spread when convergence "
+                           "removes the temporary financing subsidy."),
+                payer=("The basis inventory holder pays to exit when the "
+                       "financing dislocation converges."),
+                falsifier=("Held-out basis-tail observations have no positive "
+                           "paired expectancy after costs at adequate n.")))),
             now=2000.0)
         self.assertEqual(again["generation"], 1)
         self.assertEqual(self.store.generation(), 1)
@@ -96,8 +105,11 @@ class AuthoringLoopTests(unittest.TestCase):
             self.store, self.cfg, author=proposer, now=1000.0)
         self.assertEqual(result["accepted_count"], 1)
         self.assertEqual(result["rejected_count"], 2)
-        self.assertEqual([c.contract_id for c in self.store.active()],
-                         ["keeper"])
+        roots = [
+            row["contract_id"] for row in self.store.records(active_only=True)
+            if row["parent_contract_id"] is None]
+        self.assertEqual(roots, ["keeper"])
+        self.assertEqual(len(self.store.active()), 3)
         reasons = " ".join(item["reason"] for item in result["rejected"])
         self.assertIn("moon_phase", reasons)
 

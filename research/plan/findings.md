@@ -1,10 +1,10 @@
-# Historical findings pointer
+# Archived findings-plan pointer
 
-This is an archive pointer, not a current plan. The original broad analysis is
-retained in Git history; current behaviour and operation are defined by
-[`../../README.md`](../../README.md), [`../../SETUP.md`](../../SETUP.md), and
+> **ARCHIVED / FROZEN — not a current checklist.** The original broad analysis
+> remains available in Git history.
+
+No finding automatically edits the strategy registry, changes configuration,
+or authorizes capital. Current behavior and evidence boundaries are in
+[`../AUTONOMOUS_RESEARCH.md`](../AUTONOMOUS_RESEARCH.md),
+[`../protocol.md`](../protocol.md), and
 [`../../OPERATIONS.md`](../../OPERATIONS.md).
-
-No finding automatically edits the strategy registry or authorizes capital.
-For evidence boundaries, see [`RECONCILIATION.md`](RECONCILIATION.md) and
-[`../protocol.md`](../protocol.md).

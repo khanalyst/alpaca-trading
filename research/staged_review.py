@@ -20,6 +20,8 @@ from __future__ import annotations
 import time
 
 from . import shortlist as shortlist_mod
+from .staged_lifecycle import (DEFAULT_POLICY, LifecyclePolicy,
+                               aggregate_mechanism_evidence)
 
 # Retirement codes. The wording of each is what a proposer reads, so it says
 # what to do differently rather than only what happened.
@@ -27,6 +29,8 @@ NEGATIVE_EXPECTANCY = "NEGATIVE_EXPECTANCY"
 DIED_OUT_OF_SAMPLE = "DIED_OUT_OF_SAMPLE"
 NEVER_FIRED = "NEVER_FIRED"
 STARVED_OF_DATA = "STARVED_OF_DATA"
+STARVED_EXPIRED = "STARVED_EXPIRED"
+INACTIVE_EXPIRED = "INACTIVE_EXPIRED"
 
 # Codes that keep a mechanism running. Collecting is not a verdict.
 COLLECTING = "COLLECTING"
@@ -66,14 +70,23 @@ def stage_of(candidate) -> str:
     return SCREEN
 
 
-def verdict_for(candidate) -> tuple[str, str]:
+def verdict_for(candidate, *, age_seconds: float | None = None,
+                policy: LifecyclePolicy | None = None) -> tuple[str, str]:
     """Return ``(code, explanation)`` for one measured staged mechanism."""
+    policy = policy or DEFAULT_POLICY
     evaluated = (getattr(candidate, "eligible_opportunities", 0)
                  or candidate.declined_decisions + candidate.trades)
     starved = candidate.starved_decisions
     total = evaluated + starved
 
-    if total and starved / total >= STARVED_FRACTION:
+    if total and starved / total >= policy.starved_fraction:
+        if (age_seconds is not None
+                and age_seconds >= policy.starved_max_age_seconds):
+            return STARVED_EXPIRED, (
+                f"{starved} of {total} decisions were starved for "
+                f"{age_seconds / 86400:.1f} days. The configuration is "
+                "retired to release its lane, but this pipeline result does "
+                "not falsify the mechanism.")
         return STARVED_OF_DATA, (
             f"{starved} of {total} decisions were never evaluated because the "
             "market data was absent. This is a pipeline result, not a market "
@@ -107,13 +120,29 @@ def verdict_for(candidate) -> tuple[str, str]:
             "A result that does not survive its own out-of-sample window is "
             "the shape of an edge fitted to where it was found.")
 
+    never_fired_floor = int(policy.never_fired_decisions)
     if (candidate.trades == 0
-            and evaluated >= NEVER_FIRED_DECISION_FLOOR):
+            and evaluated >= never_fired_floor):
         return NEVER_FIRED, (
             f"evaluated {evaluated} times and never fired. "
             "The thresholds do not describe a state this market reaches, so "
             "the claim is unreachable rather than wrong. Propose the same "
             "mechanism at a condition the market actually visits.")
+
+    if candidate.trades == 0 and age_seconds is not None:
+        if total == 0 and age_seconds >= policy.no_observation_max_age_seconds:
+            return INACTIVE_EXPIRED, (
+                f"the lane recorded no observations for "
+                f"{age_seconds / 86400:.1f} days. It is expired to release "
+                "bounded staging capacity; absence of execution evidence is "
+                "not a falsification of the mechanism.")
+        if (evaluated > 0
+                and age_seconds >= policy.never_fired_max_age_seconds):
+            return NEVER_FIRED, (
+                f"evaluated {evaluated} reachable decisions over "
+                f"{age_seconds / 86400:.1f} days and never fired. The age "
+                "limit releases the lane without waiting for an unrealistic "
+                f"{never_fired_floor}-decision threshold.")
 
     # ``Candidate.label`` is normally produced by shortlist._label, but this
     # guard is intentionally repeated at the immutable staged-verdict
@@ -166,11 +195,15 @@ def verdict_for(candidate) -> tuple[str, str]:
         "Not enough to conclude either way.")
 
 
-RETIRING = frozenset({NEGATIVE_EXPECTANCY, DIED_OUT_OF_SAMPLE, NEVER_FIRED})
+RETIRING = frozenset({
+    NEGATIVE_EXPECTANCY, DIED_OUT_OF_SAMPLE, NEVER_FIRED, STARVED_EXPIRED,
+    INACTIVE_EXPIRED,
+})
 
 
 def review(staging_store, findings_store, *, scope_key: str | None = None,
-           retire: bool = True, now: float | None = None) -> dict:
+           retire: bool = True, now: float | None = None,
+           policy: LifecyclePolicy | None = None) -> dict:
     """Adjudicate every staged mechanism and retire the ones that are done.
 
     ``retire=False`` reports the same verdicts without acting on them, so an
@@ -179,7 +212,15 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
     from agent.shadow import staged_variant_id
 
     timestamp = time.time() if now is None else float(now)
+    policy = policy or DEFAULT_POLICY
     active = staging_store.active()
+    try:
+        active_records = {
+            row["contract_id"]: row
+            for row in staging_store.records(active_only=True)
+        }
+    except AttributeError:  # pragma: no cover - compatibility with test doubles
+        active_records = {}
     variant_ids = {
         staged_variant_id(contract.contract_id) for contract in active}
     measured = shortlist_mod.from_store(
@@ -209,6 +250,9 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
     for scope in scopes:
         for contract in active:
             variant_id = staged_variant_id(contract.contract_id)
+            record = active_records.get(contract.contract_id, {})
+            age_seconds = max(
+                0.0, timestamp - float(record.get("registered_ts", timestamp)))
             candidate = (candidates.get((scope, variant_id))
                          if scope is not None else None)
             if candidate is None:
@@ -217,7 +261,16 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
                 code, explanation = COLLECTING, (
                     "no evaluations recorded yet; the lane has not run.")
             else:
-                code, explanation = verdict_for(candidate)
+                code, explanation = verdict_for(
+                    candidate, age_seconds=age_seconds, policy=policy)
+            if candidate is None and age_seconds >= policy.no_observation_max_age_seconds:
+                # There is no Candidate object to pass through verdict_for,
+                # but an entirely absent lane still consumes scarce capacity.
+                code, explanation = INACTIVE_EXPIRED, (
+                    f"the lane recorded no observations for "
+                    f"{age_seconds / 86400:.1f} days and expired. This "
+                    "releases staging capacity without claiming the mechanism "
+                    "was falsified.")
             entry = {
                 "contract_id": contract.contract_id,
                 "variant_id": variant_id,
@@ -228,6 +281,15 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
                 "explanation": explanation,
                 "mechanism": contract.mechanism,
                 "payer": contract.payer,
+                "mechanism_id": record.get(
+                    "mechanism_id", contract.contract_id),
+                "configuration_id": record.get(
+                    "configuration_id", contract.contract_id),
+                "parent_contract_id": record.get("parent_contract_id"),
+                "refinement_attempt": int(
+                    record.get("refinement_attempt", 0)),
+                "registered_ts": record.get("registered_ts"),
+                "age_seconds": age_seconds,
                 "trades": getattr(candidate, "trades", 0),
                 "mean_r": getattr(candidate, "mean_r", 0.0),
                 "eligible_opportunities": getattr(
@@ -261,10 +323,26 @@ def review(staging_store, findings_store, *, scope_key: str | None = None,
             except Exception as exc:  # noqa: BLE001 - one failure is not fatal
                 for item in entries:
                     item["retire_error"] = f"{type(exc).__name__}: {exc}"
+    mechanism_groups: dict[str, list[dict]] = {}
+    for entry in verdicts:
+        mechanism_groups.setdefault(
+            str(entry["mechanism_id"]), []).append(entry)
+    mechanisms = []
+    for mechanism_id, entries in sorted(mechanism_groups.items()):
+        aggregate = aggregate_mechanism_evidence(entries)
+        mechanisms.append({
+            "mechanism_id": mechanism_id,
+            "mechanism": entries[0]["mechanism"],
+            "payer": entries[0]["payer"],
+            **aggregate,
+        })
     return {
+        "schema": "staged_review.v2",
+        "reviewed_ts": timestamp,
         "reviewed": len(verdicts),
         "retired": retired,
         "verdicts": verdicts,
+        "mechanisms": mechanisms,
     }
 
 
@@ -282,12 +360,17 @@ def authoring_history(staging_store, findings_store,
         code = reason.split(":", 1)[0].strip() if ":" in reason else ""
         item = {
             "contract_id": row.get("contract_id"),
+            "mechanism_id": row.get("mechanism_id"),
+            "configuration_id": row.get("configuration_id"),
+            "parent_contract_id": row.get("parent_contract_id"),
+            "refinement_attempt": row.get("refinement_attempt", 0),
             "mechanism": row.get("mechanism"),
             "payer": row.get("payer"),
             "code": code,
             "reason": reason,
+            "retired_ts": row.get("retired_ts"),
         }
-        if code == STARVED_OF_DATA:
+        if code in {STARVED_OF_DATA, STARVED_EXPIRED, INACTIVE_EXPIRED}:
             inconclusive.append(item)
         else:
             falsified.append(item)
@@ -297,6 +380,9 @@ def authoring_history(staging_store, findings_store,
     outcome = review(staging_store, findings_store,
                      scope_key=scope_key, retire=False)
     for entry in outcome["verdicts"]:
-        if entry["code"] in (STARVED_OF_DATA,):
+        if entry["code"] in (
+                STARVED_OF_DATA, STARVED_EXPIRED, INACTIVE_EXPIRED):
             inconclusive.append(entry)
+        elif entry["code"] in (NEGATIVE_EXPECTANCY, DIED_OUT_OF_SAMPLE):
+            falsified.append(entry)
     return {"falsified": falsified, "inconclusive": inconclusive}

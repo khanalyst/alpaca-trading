@@ -146,7 +146,9 @@ class Engine:
             }
         journal_variant_id = (
             self.demo_authorization["variant_id"]
-            if self.demo_authorization else variants.LIVE_VARIANT_ID)
+            if self.demo_authorization else str(
+                (cfg.get("strategy") or {}).get("variant_id")
+                or variants.LIVE_VARIANT_ID))
         if self.demo_authorization:
             artifact_context.update({
                 "packet_id": self.demo_authorization.get("packet_id"),
@@ -205,6 +207,8 @@ class Engine:
                     "account_fingerprint"],
                 preflight=self.demo_preflight,
             )
+        execution_mode = str(
+            (cfg.get("strategy") or {}).get("execution_mode") or "analyst")
         if not light:
             llm_kwargs = {}
             if self.research_selection_catalog is not None:
@@ -212,14 +216,16 @@ class Engine:
                     "catalog": self.research_selection_catalog,
                     "system": self.system_prompt,
                 }
-            self.llm = brain.LLM(cfg, **llm_kwargs)
-            self.llm.preflight()
+            if execution_mode == "analyst":
+                self.llm = brain.LLM(cfg, **llm_kwargs)
+                self.llm.preflight()
             self.risk = RiskEngine(cfg)
         # Disabled shadow evaluation remains a complete no-op.
         self._research_failure_count = 0
         self._research_consecutive_failures = 0
         self._research_last_failure: dict | None = None
         self._research_last_success_ts: float | None = None
+        self._strategy_shadow_errors: dict[str, dict] = {}
         self.shadow = self._build_shadow(cfg)
         self.universe: list[str] = []
         self.universe_ts = 0.0
@@ -341,6 +347,8 @@ class Engine:
         expected = bool(research_cfg.get("shadow_enabled"))
         available = getattr(self, "shadow", None) is not None
         failures = int(getattr(self, "_research_consecutive_failures", 0))
+        strategy_errors = dict(getattr(
+            self, "_strategy_shadow_errors", {}) or {})
         try:
             state.write_heartbeat(
                 status,
@@ -352,7 +360,7 @@ class Engine:
                 research_status=(
                     "disabled" if not expected else
                     "unavailable" if not available else
-                    "degraded" if failures else "healthy"),
+                    "degraded" if failures or strategy_errors else "healthy"),
                 research_failure_count=int(getattr(
                     self, "_research_failure_count", 0)),
                 research_consecutive_failures=failures,
@@ -360,6 +368,7 @@ class Engine:
                     self, "_research_last_failure", None),
                 research_last_success_ts=getattr(
                     self, "_research_last_success_ts", None),
+                strategy_shadow_errors=strategy_errors,
                 **detail,
             )
         except Exception as exc:                           # noqa: BLE001
@@ -410,7 +419,8 @@ class Engine:
             "variant_id": (
                 self.demo_authorization["variant_id"]
                 if getattr(self, "demo_authorization", None)
-                else variants.LIVE_VARIANT_ID),
+                else str((self.cfg.get("strategy") or {}).get("variant_id")
+                         or variants.LIVE_VARIANT_ID)),
         }
         if getattr(self, "demo_authorization", None):
             run_context.update({
@@ -3358,8 +3368,23 @@ class Engine:
             return self.cfg
         block = dict(self.cfg["strategy"])
         block.update(spec.contract_params)
-        block["id"] = spec.id
-        block["version"] = spec.version
+        block.update({
+            "id": spec.id,
+            "version": spec.version,
+            "variant_id": registry.baseline_variant_id(spec.id),
+        })
+        try:
+            model = require_complete_contract(spec.id)
+        except (KeyError, ValueError):
+            # Lightweight test/tooling specs may intentionally omit a model;
+            # retain the historical parameter-only shadow behaviour for them.
+            model = None
+        if model is not None:
+            block.update({
+                "min_stop_atr_multiple": model.stop_atr_multiple,
+                "fixed_reward_risk": model.reward_risk,
+                "forward_horizon_hours": model.horizon_hours,
+            })
         return {**self.cfg, "strategy": block}
 
     def _execution_mode(self) -> str:
@@ -3462,6 +3487,24 @@ class Engine:
             try:
                 spec = registry.spec_for(strategy_id)
                 shadow_cfg = self._shadow_cfg(spec)
+                # Registered builders are resolved through the composite
+                # contract, so a registry entry cannot silently use a stale
+                # module-level function.  Unknown synthetic builders remain
+                # available to isolated tests/tooling and are not persisted as
+                # authoritative strategies.
+                if strategy_id in registry.REGISTRY:
+                    composite = registry.contract_for_variant(
+                        strategy_id,
+                        shadow_cfg["strategy"].get("variant_id"))
+                    if composite.builder is not builder:
+                        raise ValueError(
+                            f"strategy {strategy_id!r} evidence builder drift")
+                    builder = composite.builder
+                    contract_hash = composite.semantic_hash
+                    contract_variant_id = composite.variant_id
+                else:
+                    contract_hash = None
+                    contract_variant_id = None
                 fired = []
                 for symbol in symbols:
                     data = snapshot[symbol]
@@ -3487,6 +3530,9 @@ class Engine:
                                 "swing_high_pct": self._plain(
                                     data.get("swing_high_pct")),
                                 "extension_atr": self._plain(extension),
+                                "strategy_contract_hash": contract_hash,
+                                "strategy_contract_variant_id": (
+                                    contract_variant_id),
                             })
                 fired_symbols = {signal["symbol"] for signal in fired}
                 breadth = {
@@ -3506,6 +3552,8 @@ class Engine:
                         "instruments_fired": breadth[
                             "instruments_with_a_valid_setup"],
                         "signals": len(fired),
+                        "strategy_contract_hash": contract_hash,
+                        "strategy_contract_variant_id": contract_variant_id,
                         "is_active": spec.id == str(
                             self.cfg["strategy"]["id"]),
                     }),
@@ -3516,9 +3564,30 @@ class Engine:
                     state.log_event(
                         "strategy_shadow_decision", self._audit_json(signal),
                         strategy_id=spec.id, strategy_version=spec.version)
+                getattr(self, "_strategy_shadow_errors", {}).pop(
+                    strategy_id, None)
             except Exception as exc:                       # noqa: BLE001
                 log.warning("Shadow evaluation failed for %s: %s",
                             strategy_id, exc)
+                errors = getattr(self, "_strategy_shadow_errors", None)
+                if errors is None:
+                    errors = {}
+                    self._strategy_shadow_errors = errors
+                previous = errors.get(strategy_id) or {}
+                errors[strategy_id] = {
+                    "type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                    "ts": time.time(),
+                    "consecutive_failures": int(
+                        previous.get("consecutive_failures") or 0) + 1,
+                }
+                try:
+                    state.log_event(
+                        "strategy_shadow_failed",
+                        self._audit_json(errors[strategy_id]),
+                        strategy_id=strategy_id)
+                except Exception:                          # noqa: BLE001
+                    pass
         return breadth_by_strategy
 
     def _record_observations(self, snapshot: dict) -> None:

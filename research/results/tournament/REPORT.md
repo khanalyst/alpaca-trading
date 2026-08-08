@@ -1,7 +1,7 @@
 # Strategy tournament
 
-> **Historical top-level latest view.** This committed report predates the
-> current schema-14 per-run artifact ledger. New tournament invocations retain
+> **ARCHIVED / FROZEN TOP-LEVEL LATEST VIEW.** This committed report predates
+> the current per-run artifact ledger. New tournament invocations retain
 > immutable evidence under `research/results/tournament/runs/`; the top-level
 > report is only a latest-view copy and never live authority.
 

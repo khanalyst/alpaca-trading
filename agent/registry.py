@@ -14,7 +14,7 @@ Three ideas are encoded here, and they are the point of the module:
 state both is not ready to be registered, let alone traded.
 
 **Confidence is evidenced, not asserted.** ``tier`` records how far a strategy
-has actually got through the evidence gates, from T0_REJECTED to T4_CONFIRMED.
+has actually progressed through qualification, from T0_REJECTED to T4_CONFIRMED.
 It is backed by persisted research, changed through review, read by policy,
 and never moved by a hunch or by an exploratory command editing code.
 
@@ -31,28 +31,32 @@ editing one line of config.
 this module currently rests on a *recomputed* backtest over downloaded OHLCV
 - ``research/edge_lab.py`` and its dependents - which reconstructs indicators
 after the fact rather than reading the snapshot the agent actually decided
-from. findings.md section 9.2 is explicit that this is a different system
-than the one you run: some snapshot fields come from the live 24h ticker and
-cannot be reconstructed, so a recomputed backtest silently mixes revised data
-with the original.
+from. ``research/AUTONOMOUS_RESEARCH.md`` is explicit that this is a different
+system than the one you run: some snapshot fields come from the live 24h ticker
+and cannot be reconstructed, so a recomputed backtest silently mixes revised
+data with the original.
 
 That does not make the evidence worthless, and the direction of the bias is
 against the strategy rather than for it, so a T0_REJECTED verdict is the
 conservative reading. It does mean the verdict is **exploratory and not yet
 confirmed by the faithful path**: the replay harness in ``research/replay.py``
 re-derives decisions from the recorded snapshot using the production contract
-and risk engine, and gate G2 requires it to reproduce the live agent's own
-decisions before any number downstream is trusted.
+and risk engine, and proposal fidelity requires it to reproduce the live
+agent's own decisions before any number downstream is trusted.
 
 The tier gate stays as it is. Keeping momentum away from live capital on
 exploratory evidence is the right way to be wrong. But a tier may only be
 *raised* on journal-replay evidence, never on a recomputed backtest. See
-``research/plan/RECONCILIATION.md``.
+``research/AUTONOMOUS_RESEARCH.md``.
 """
 
 from __future__ import annotations
+import hashlib
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
 from .forward_models import ForwardOutcomeModel, model_for
 
@@ -192,6 +196,178 @@ class StrategySpec:
         return self.tier_rank() >= TIERS.index(minimum_tier)
 
 
+@dataclass(frozen=True)
+class StrategyContract:
+    """The one executable identity for a registered strategy.
+
+    ``StrategySpec`` describes the mechanism and policy while
+    ``ForwardOutcomeModel`` describes how a firing becomes an observation.
+    Keeping those two records is useful for their existing callers, but using
+    either one by itself is unsafe: a setup can be labelled with one strategy
+    and scored with another model.  This immutable composite is the boundary
+    all runtime and evidence code can use to prove that the pieces agree.
+
+    Builder functions are intentionally kept out of the serialized payload;
+    their stable module/qualname is included instead.  A callable is exposed
+    for the runtime through ``builder`` and is not part of equality or hash
+    semantics, which keeps manifests deterministic across Python processes.
+    """
+
+    spec: StrategySpec
+    outcome_model: ForwardOutcomeModel
+    builder_id: str
+    builder: Callable[..., dict] = field(repr=False, compare=False,
+                                         hash=False)
+    variant_id: str = ""
+    variant_parameters: tuple[tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.outcome_model.strategy_id != self.spec.id:
+            raise ValueError(
+                f"strategy {self.spec.id!r} and forward model "
+                f"{self.outcome_model.strategy_id!r} disagree")
+        if not self.builder_id or not callable(self.builder):
+            raise ValueError(f"strategy {self.spec.id!r} has no executable builder")
+        if not self.variant_id:
+            object.__setattr__(self, "variant_id", baseline_variant_id(self.spec.id))
+        if not self.variant_parameters:
+            params = dict(self.spec.contract_params)
+            params.update({
+                "min_stop_atr_multiple": self.outcome_model.stop_atr_multiple,
+                "fixed_reward_risk": self.outcome_model.reward_risk,
+                "forward_horizon_hours": self.outcome_model.horizon_hours,
+            })
+            object.__setattr__(self, "variant_parameters", tuple(
+                sorted(params.items(), key=lambda item: item[0])))
+
+    @property
+    def id(self) -> str:
+        return self.spec.id
+
+    @property
+    def version(self) -> str:
+        return self.spec.version
+
+    @property
+    def model(self) -> ForwardOutcomeModel:
+        """Compatibility spelling for callers that call it the model."""
+        return self.outcome_model
+
+    @property
+    def forward_model(self) -> ForwardOutcomeModel:
+        return self.outcome_model
+
+    @property
+    def builder_identity(self) -> str:
+        return self.builder_id
+
+    @property
+    def mechanism(self) -> str:
+        return self.spec.mechanism
+
+    @property
+    def tier(self) -> str:
+        return self.spec.tier
+
+    @property
+    def evidence(self) -> tuple[str, ...]:
+        return self.spec.evidence
+
+    @property
+    def thresholds(self) -> dict:
+        return self.parameters
+
+    @property
+    def setup_policy(self) -> dict:
+        return {
+            "setup_types": tuple(self.spec.setup_types),
+            "signal_timeframe": self.spec.signal_timeframe,
+            "required_timeframes": tuple(self.spec.required_timeframes),
+            "max_hold_hours_ceiling": self.spec.max_hold_hours_ceiling,
+        }
+
+    @property
+    def identity(self) -> dict:
+        return {"strategy_id": self.id, "strategy_version": self.version,
+                "variant_id": self.variant_id}
+
+    @property
+    def parameters(self) -> dict:
+        return dict(self.variant_parameters)
+
+    def manifest(self) -> dict:
+        """Return a JSON/YAML-safe canonical semantic manifest."""
+        return {
+            "strategy_id": self.id,
+            "strategy_version": self.version,
+            "variant_id": self.variant_id,
+            "identity": {"id": self.id, "version": self.version},
+            "mechanism": self.spec.mechanism,
+            "falsification": self.spec.falsification,
+            "tier": self.spec.tier,
+            "evidence": list(self.spec.evidence),
+            "implementation": {
+                "implemented": self.spec.implemented,
+                "analyst_ready": self.spec.analyst_ready,
+                "forward_model_ready": self.spec.forward_model_ready,
+                "realtime_eligible": self.spec.realtime_eligible,
+            },
+            "executable": {
+                "builder_id": self.builder_id,
+                "setup_types": list(self.spec.setup_types),
+                "signal_timeframe": self.spec.signal_timeframe,
+                "required_timeframes": list(self.spec.required_timeframes),
+                "max_hold_hours_ceiling": self.spec.max_hold_hours_ceiling,
+                "execution_style": self.spec.execution_style,
+            },
+            "parameters": self.parameters,
+            "outcome_model": self.outcome_model.as_dict(),
+        }
+
+    @property
+    def semantic_hash(self) -> str:
+        encoded = json.dumps(self.manifest(), sort_keys=True,
+                             separators=(",", ":"), allow_nan=False,
+                             default=_json_default).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def hash(self) -> str:
+        """Short compatibility alias; manifests always use full SHA-256."""
+        return self.semantic_hash
+
+    @property
+    def manifest_hash(self) -> str:
+        return self.semantic_hash
+
+    @property
+    def canonical_hash(self) -> str:
+        return self.semantic_hash
+
+    @property
+    def contract_hash(self) -> str:
+        return self.semantic_hash
+
+    def as_dict(self) -> dict:
+        payload = self.manifest()
+        payload["semantic_hash"] = self.semantic_hash
+        return payload
+
+    def canonical_manifest(self) -> dict:
+        return self.manifest()
+
+
+def _json_default(value: Any):
+    if isinstance(value, tuple):
+        return list(value)
+    raise TypeError(f"value {value!r} is not JSON serializable")
+
+
+def baseline_variant_id(strategy_id: str) -> str:
+    """Stable readable id for the registered (unmodified) semantics."""
+    return str(strategy_id).replace("-", "_") + ".baseline"
+
+
 # Strategy-local prompt text prevents cross-strategy label leakage.
 _MOMENTUM_PROMPT = """
 SETUP ARCHETYPES (long side described; mirror them for shorts)
@@ -251,8 +427,8 @@ REGISTRY: dict[str, StrategySpec] = {
                 "The T0 verdict rests on a recomputed OHLCV backtest, which "
                 "is exploratory evidence: it is enough to withhold capital "
                 "and not enough to raise a tier. Confirmation requires the "
-                "journal replay to pass gate G2 and the three-arm H-E test "
-                "to run - see research/plan/RECONCILIATION.md."),
+                "proposal-fidelity journal replay and three-arm analyst-effect "
+                "analysis - see research/AUTONOMOUS_RESEARCH.md."),
             evidence=("research/results/edge-audit-2024-2026/REPORT.md",),
             contract_params={
                 "breakout_range_threshold_pct": 85.0,
@@ -514,6 +690,164 @@ REGISTRY: dict[str, StrategySpec] = {
 }
 
 
+# This is deliberately not a normal one-axis research setting.  The tuning
+# run changed the two positioning thresholds, the no-chase cap, and both
+# payoff numbers together.  Giving it a first-class immutable identity keeps
+# those semantics from being mistaken for the registered 80/20, 3 ATR,
+# 2 ATR/2R contract or scheduled as a one-axis experiment.
+TUNED_LS_VARIANT_ID = "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3"
+_IMMUTABLE_VARIANT_OVERRIDES: dict[str, dict[str, Any]] = {
+    TUNED_LS_VARIANT_ID: {
+        "ls_high_percentile": 70.0,
+        "ls_low_percentile": 30.0,
+        "hard_max_entry_extension_atr": 1.5,
+        "min_stop_atr_multiple": 1.0,
+        "fixed_reward_risk": 3.0,
+    },
+}
+
+
+def _builder_for(strategy_id: str) -> tuple[str, Callable[..., dict]]:
+    # Import lazily: contracts import registry to obtain the registered
+    # strategy policies, so importing the package at module import time would
+    # create a cycle.
+    from .contracts import EVIDENCE_BUILDERS
+
+    try:
+        builder = EVIDENCE_BUILDERS[strategy_id]
+    except KeyError:
+        raise ValueError(
+            f"strategy {strategy_id!r} has no executable evidence builder") from None
+    return f"{builder.__module__}.{builder.__qualname__}", builder
+
+
+def _base_contract(strategy_id: str) -> StrategyContract:
+    spec = spec_for(strategy_id)
+    model = model_for(strategy_id)
+    builder_id, builder = _builder_for(strategy_id)
+    return StrategyContract(
+        spec=spec, outcome_model=model, builder_id=builder_id,
+        builder=builder, variant_id=baseline_variant_id(strategy_id))
+
+
+def contract_for(strategy_id: str) -> StrategyContract:
+    """Return the canonical registered contract for ``strategy_id``.
+
+    The returned object is immutable and contains both the mechanism policy
+    and the exact forward outcome model.  It is the preferred runtime/evidence
+    lookup; ``spec_for`` and ``model_for`` remain available as narrow legacy
+    helpers for callers that need only one half of the contract.
+    """
+    return _base_contract(str(strategy_id))
+
+
+def contract_for_variant(strategy_id: str, variant_id: str | None = None
+                         ) -> StrategyContract:
+    """Resolve a canonical contract plus an explicitly named immutable variant.
+
+    Only the tuned ls-ratio-fade semantics are encoded here.  Ordinary
+    research variants remain parameter overlays and are intentionally not
+    promoted to executable contracts until they have their own reviewed
+    identity.
+    """
+    base = contract_for(strategy_id)
+    if variant_id in (None, "", "live", base.variant_id):
+        return base
+    if variant_id != TUNED_LS_VARIANT_ID:
+        raise ValueError(
+            f"variant {variant_id!r} has no immutable strategy contract; "
+            "register a reviewed contract before using it for execution")
+    if strategy_id != "ls-ratio-fade":
+        raise ValueError(
+            f"variant {variant_id!r} belongs to ls-ratio-fade, not {strategy_id!r}")
+    overrides = _IMMUTABLE_VARIANT_OVERRIDES[variant_id]
+    model = replace(
+        base.outcome_model,
+        stop_atr_multiple=float(overrides["min_stop_atr_multiple"]),
+        reward_risk=float(overrides["fixed_reward_risk"]),
+        stop_assumption="structure distance with a 1 ATR minimum",
+        target_assumption="fixed 3R positioning-reversion target",
+        contract_evidence=base.outcome_model.contract_evidence,
+    )
+    params = dict(base.parameters)
+    params.update(overrides)
+    return StrategyContract(
+        spec=base.spec, outcome_model=model,
+        builder_id=base.builder_id, builder=base.builder,
+        variant_id=variant_id,
+        variant_parameters=tuple(sorted(params.items())))
+
+
+def contract_catalog() -> dict[str, StrategyContract]:
+    """Return every registered strategy's canonical composite contract."""
+    return {strategy_id: contract_for(strategy_id)
+            for strategy_id in sorted(REGISTRY)}
+
+
+def contract_catalog_manifest(*, include_variants: bool = True) -> dict:
+    """Return deterministic catalog data suitable for YAML/reports/checks."""
+    contracts = {
+        strategy_id: contract.as_dict()
+        for strategy_id, contract in contract_catalog().items()
+    }
+    if include_variants:
+        tuned = contract_for_variant("ls-ratio-fade", TUNED_LS_VARIANT_ID)
+        contracts["ls-ratio-fade"]["variants"] = {
+            TUNED_LS_VARIANT_ID: tuned.as_dict(),
+        }
+    payload = {"schema": "strategy-contract-catalog.v1", "contracts": contracts}
+    payload["catalog_hash"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                   allow_nan=False, default=_json_default).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def validate_contract_config(cfg: Mapping[str, Any], *, require_variant: bool = False
+                             ) -> StrategyContract:
+    """Validate effective strategy values against a named composite contract.
+
+    Legacy callers may omit ``strategy.variant_id`` while migrating.  Once a
+    variant is declared, every semantic value that variant owns is checked;
+    this is the startup/evidence boundary that prevents a tuned config from
+    being scored under the base outcome model.
+    """
+    strategy = cfg.get("strategy") if isinstance(cfg, Mapping) else None
+    if not isinstance(strategy, Mapping):
+        raise ValueError("config.strategy must be a mapping")
+    strategy_id = str(strategy.get("id") or "")
+    variant_id = str(strategy.get("variant_id") or "")
+    if require_variant and not variant_id:
+        raise ValueError(
+            f"strategy {strategy_id!r} must declare strategy.variant_id")
+    contract = contract_for_variant(strategy_id, variant_id or None)
+    if not variant_id:
+        return contract
+    expected = contract.parameters
+    paths = {
+        "ls_high_percentile": "ls_high_percentile",
+        "ls_low_percentile": "ls_low_percentile",
+        "hard_max_entry_extension_atr": "hard_max_entry_extension_atr",
+        "min_stop_atr_multiple": "min_stop_atr_multiple",
+        "fixed_reward_risk": "fixed_reward_risk",
+        "forward_horizon_hours": "forward_horizon_hours",
+    }
+    for key, field_name in paths.items():
+        if key not in expected or key not in strategy:
+            continue
+        try:
+            actual = float(strategy[key])
+            target = float(expected[key])
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"strategy.{key} is not numeric for contract {variant_id!r}") from None
+        if actual != target:
+            raise ValueError(
+                f"strategy.{key}={actual:g} does not match contract "
+                f"{variant_id!r} value {target:g}")
+    return contract
+
+
 def spec_for(strategy_id: str) -> StrategySpec:
     """Return the registered spec or raise ``UnknownStrategy``."""
     try:
@@ -538,3 +872,111 @@ def live_eligible_ids() -> tuple[str, ...]:
     return tuple(sorted(
         s.id for s in REGISTRY.values()
         if s.implemented and s.analyst_ready and s.meets(LIVE_MIN_TIER)))
+
+
+def validate_contract_catalog() -> dict[str, StrategyContract]:
+    """Build every composite contract, raising on registry/runtime drift."""
+    catalog = contract_catalog()
+    for strategy_id, contract in catalog.items():
+        if contract.id != strategy_id:
+            raise ValueError(
+                f"catalog key {strategy_id!r} does not match contract id "
+                f"{contract.id!r}")
+        if contract.outcome_model.model_id != contract.spec.forward_model_id:
+            raise ValueError(
+                f"strategy {strategy_id!r} forward model binding drift: "
+                f"{contract.outcome_model.model_id!r} != "
+                f"{contract.spec.forward_model_id!r}")
+    return catalog
+
+
+def validate_hypothesis_catalog(root: str | Path | None = None) -> tuple[str, ...]:
+    """Validate hypothesis YAML identities and declared base semantics.
+
+    Hypothesis files are pre-registration inputs, not executable code.  This
+    small check still prevents a renamed strategy, timeframe, or payoff from
+    silently describing a different runtime contract.  Settings under a
+    hypothesis's ``settings`` list remain experiment values and are not
+    compared with the registered base.
+    """
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - dependency is shipped in runtime
+        return ()
+    base = Path(root) if root is not None else (
+        Path(__file__).resolve().parents[1] / "research" / "hypotheses")
+    errors: list[str] = []
+    if not base.exists():
+        return ()
+    for path in sorted(base.glob("*.yaml")):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        strategy_id = str(raw.get("strategy_id") or "")
+        if not strategy_id:
+            continue
+        try:
+            contract = contract_for(strategy_id)
+        except (KeyError, ValueError) as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        if raw.get("version") not in (None, contract.version):
+            errors.append(
+                f"{path}: version {raw.get('version')!r} does not match "
+                f"{contract.version!r}")
+        if raw.get("signal_timeframe") not in (
+                None, contract.spec.signal_timeframe):
+            errors.append(
+                f"{path}: signal_timeframe {raw.get('signal_timeframe')!r} "
+                f"does not match {contract.spec.signal_timeframe!r}")
+        expected = contract.parameters
+        for key in ("ls_high_percentile", "ls_low_percentile",
+                    "hard_max_entry_extension_atr", "stop_atr_multiple",
+                    "reward_risk"):
+            if key not in raw:
+                continue
+            expected_key = {
+                "stop_atr_multiple": "min_stop_atr_multiple",
+                "reward_risk": "fixed_reward_risk",
+            }.get(key, key)
+            if expected_key not in expected:
+                continue
+            try:
+                if float(raw[key]) != float(expected[expected_key]):
+                    errors.append(
+                        f"{path}: {key}={raw[key]!r} does not match "
+                        f"contract value {expected[expected_key]!r}")
+            except (TypeError, ValueError):
+                errors.append(f"{path}: {key} is not numeric")
+        tuned_id = raw.get("tuned_variant_id")
+        tuned_semantics = raw.get("tuned_semantics")
+        if tuned_id or tuned_semantics:
+            if tuned_id != TUNED_LS_VARIANT_ID:
+                errors.append(f"{path}: unknown tuned_variant_id {tuned_id!r}")
+            elif not isinstance(tuned_semantics, Mapping):
+                errors.append(f"{path}: tuned_semantics must be a mapping")
+            else:
+                tuned = contract_for_variant(strategy_id, str(tuned_id))
+                for key, value in tuned_semantics.items():
+                    if key not in tuned.parameters or float(value) != float(
+                            tuned.parameters[key]):
+                        errors.append(
+                            f"{path}: tuned {key}={value!r} does not match "
+                            f"{tuned.parameters.get(key)!r}")
+    if errors:
+        raise ValueError("hypothesis contract catalog drift: " + "; ".join(errors))
+    return tuple(str(path) for path in sorted(base.glob("*.yaml")))
+
+
+if __name__ == "__main__":  # pragma: no cover - tiny catalog CLI
+    import argparse
+
+    parser = argparse.ArgumentParser(description="strategy contract catalog")
+    parser.add_argument("--check", action="store_true",
+                        help="validate all composite contract bindings")
+    parser.add_argument("--json", action="store_true",
+                        help="print the canonical manifest")
+    args = parser.parse_args()
+    validate_contract_catalog()
+    validate_hypothesis_catalog()
+    if args.json or not args.check:
+        print(json.dumps(contract_catalog_manifest(), sort_keys=True,
+                         indent=2, default=_json_default))

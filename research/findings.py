@@ -36,7 +36,7 @@ from research import artifact as artifact_mod
 
 
 DEFAULT_STORE = Path(__file__).resolve().parent / "cache" / "findings.db"
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 KINDS = ("observation", "recommendation", "decision")
 
@@ -220,7 +220,7 @@ FORWARD_TRADE_FIELDS = (
     "entry_ts", "entry_price", "notional", "risk_usd", "stop_price",
     "take_price", "exit_ts", "exit_price", "result", "net_pnl_usd",
     "r_multiple", "status", "failure", "valid_for_inference",
-    "execution_json",
+    "execution_json", "funding_status", "inference_exclusion_reason",
 )
 
 FORWARD_DECISION_FIELDS = (
@@ -230,7 +230,8 @@ FORWARD_DECISION_FIELDS = (
     "decision_ts", "trade_proposal_id", "trade_scope_key",
     "trade_variant_id", "trade_model_id", "trade_entry_ts",
     "trade_exit_ts", "trade_result", "trade_r_multiple", "trade_status",
-    "trade_valid_for_inference",
+    "trade_valid_for_inference", "trade_funding_status",
+    "trade_inference_exclusion_reason",
 )
 
 
@@ -251,6 +252,94 @@ def _forward_decision_evidence(row: dict | sqlite3.Row) -> dict:
     item["assumptions"] = assumptions
     item["proposal"] = proposal
     return json.loads(_canonical_json(item))
+
+
+def _row_value(row: dict | sqlite3.Row, key: str, default=None):
+    """Read a mapping or sqlite row without making old ledgers noisy."""
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _json_mapping(value) -> dict | None:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return dict(decoded) if isinstance(decoded, Mapping) else None
+    return None
+
+
+def _provenance_exclusion_reason(
+        provenance: object, variant_id: str, *,
+        expected_contract_hash: str | None = None,
+        expected_contract_variant_id: str | None = None) -> str | None:
+    """Return a durable quarantine reason for semantic contract drift.
+
+    Historical rows remain readable, but a missing or changed contract
+    identity must never silently join a current executable experiment.
+    """
+    if not isinstance(provenance, Mapping):
+        return "legacy evidence missing strategy contract provenance"
+    contract_hash = str(provenance.get("strategy_contract_hash") or "").strip()
+    contract_variant = str(
+        provenance.get("strategy_contract_variant_id") or "").strip()
+    if not contract_hash or not contract_variant:
+        return "legacy evidence missing strategy contract provenance"
+    if expected_contract_variant_id and contract_variant != str(
+            expected_contract_variant_id):
+        return ("strategy contract variant mismatch: "
+                f"{contract_variant} != {expected_contract_variant_id}")
+    if expected_contract_hash and contract_hash != str(expected_contract_hash):
+        return "strategy contract hash mismatch"
+    return None
+
+
+def _trade_inference_exclusion_reason(
+        row: dict | sqlite3.Row, *, expected_contract_hash: str | None = None,
+        expected_contract_variant_id: str | None = None) -> str | None:
+    """Classify persisted outcomes before any score or paired comparison.
+
+    This is intentionally conservative.  A row can still be returned by
+    audit/export APIs, but only a fully observed, contract-bound outcome is an
+    inference sample.
+    """
+    result = str(_row_value(row, "result", "") or "")
+    if result == "unfilled":
+        return (_row_value(row, "inference_exclusion_reason")
+                or "passive fill unresolved; not an outcome sample")
+    raw_validity = _row_value(row, "valid_for_inference", 1)
+    try:
+        validity = int(raw_validity)
+    except (TypeError, ValueError):
+        return "malformed valid_for_inference marker"
+    if validity not in {0, 1}:
+        return "malformed valid_for_inference marker"
+    if validity == 0:
+        return (_row_value(row, "inference_exclusion_reason")
+                or "execution evidence marked invalid for inference")
+    execution = _json_mapping(_row_value(row, "execution_json")) or {}
+    exit_evidence = _json_mapping(execution.get("exit")) or {}
+    funding_status = str(
+        _row_value(row, "funding_status")
+        or exit_evidence.get("funding_status") or "").strip()
+    if funding_status not in {"verified_realized", "verified_no_settlement_due"}:
+        return (_row_value(row, "inference_exclusion_reason")
+                or ("funding coverage is unavailable"
+                    if not funding_status else
+                    f"funding coverage status {funding_status} is not verified"))
+    assumptions = _json_mapping(_row_value(row, "assumptions_json")) or {}
+    reason = _provenance_exclusion_reason(
+        assumptions.get("experiment_provenance"),
+        str(_row_value(row, "variant_id", "")),
+        expected_contract_hash=expected_contract_hash,
+        expected_contract_variant_id=expected_contract_variant_id)
+    return reason
 
 
 def _finite_number(value, default: float = 0.0) -> float:
@@ -475,27 +564,94 @@ def _experiment_arm_evidence(
     window_params = [value for window in windows for value in window]
 
     has_execution_validity = _stored_version(conn) >= 16
+    has_quarantine_columns = _stored_version(conn) >= 17
     stored_validity = (
         "t.valid_for_inference" if has_execution_validity else "1")
     validity_alias = (
         "CASE WHEN t.result='unfilled' THEN 0 "
         f"ELSE {stored_validity} END")
+    trade_quality_sql = (
+        "t.funding_status AS trade_funding_status, "
+        "t.inference_exclusion_reason AS trade_inference_exclusion_reason "
+        if has_quarantine_columns else
+        "NULL AS trade_funding_status, "
+        "NULL AS trade_inference_exclusion_reason")
     rows = conn.execute(
         "SELECT d.*, t.proposal_id AS trade_proposal_id, "
         "t.scope_key AS trade_scope_key, t.variant_id AS trade_variant_id, "
         "t.model_id AS trade_model_id, t.entry_ts AS trade_entry_ts, "
         "t.exit_ts AS trade_exit_ts, t.result AS trade_result, "
         "t.r_multiple AS trade_r_multiple, t.status AS trade_status, "
-        f"{validity_alias} AS trade_valid_for_inference "
+        f"{validity_alias} AS trade_valid_for_inference, "
+        f"{trade_quality_sql} "
         "FROM paper_decisions AS d LEFT JOIN paper_trades AS t "
         "ON t.trade_id=d.paper_trade_id "
         "WHERE d.scope_key=? AND d.variant_id=? "
         f"AND ({window_clause}) "
         "ORDER BY d.decision_ts, d.decision_id",
         (scope_key, variant_id, *window_params)).fetchall()
+    # Resolve the registered contract identity once per arm.  A parameter
+    # variant may still use the base executable contract; the tuned identity
+    # is the sole immutable non-base contract currently registered.
+    expected_contract_hash = expected_contract_variant_id = None
+    try:
+        variant_row = conn.execute(
+            "SELECT strategy_id, variant_id FROM variants WHERE variant_id=?",
+            (variant_id,)).fetchone()
+        if variant_row is not None:
+            from agent import registry as strategy_registry
+            contract_variant_id = (
+                variant_id if variant_id == strategy_registry.TUNED_LS_VARIANT_ID
+                else strategy_registry.baseline_variant_id(
+                    str(variant_row["strategy_id"])))
+            contract = strategy_registry.contract_for_variant(
+                str(variant_row["strategy_id"]), contract_variant_id)
+            expected_contract_hash = contract.semantic_hash
+            expected_contract_variant_id = contract.variant_id
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # Unknown/staged historical rows are retained but quarantined below.
+        pass
+
+    trade_quality = {}
+    trade_rows = conn.execute(
+        "SELECT DISTINCT t.* FROM paper_trades AS t "
+        "JOIN paper_decisions AS d ON d.paper_trade_id=t.trade_id "
+        "WHERE d.scope_key=? AND d.variant_id=? "
+        f"AND ({window_clause}) "
+        "ORDER BY t.entry_ts, t.trade_id",
+        (scope_key, variant_id, *window_params)).fetchall()
+    quarantined = []
+    for trade in trade_rows:
+        reason = _trade_inference_exclusion_reason(
+            trade, expected_contract_hash=expected_contract_hash,
+            expected_contract_variant_id=expected_contract_variant_id)
+        trade_quality[str(trade["trade_id"])] = reason
+        if reason:
+            quarantined.append({
+                "trade_id": str(trade["trade_id"]),
+                "variant_id": str(trade["variant_id"]),
+                "entry_ts": trade["entry_ts"],
+                "result": trade["result"],
+                "reason": reason,
+            })
+
     decisions = []
     for row in rows:
         evidence = _forward_decision_evidence(row)
+        trade_id = evidence.get("paper_trade_id")
+        reason = trade_quality.get(str(trade_id)) if trade_id else None
+        if reason is None and not trade_id:
+            provenance = (evidence.get("assumptions") or {}).get(
+                "experiment_provenance")
+            reason = _provenance_exclusion_reason(
+                provenance, variant_id,
+                expected_contract_hash=expected_contract_hash,
+                expected_contract_variant_id=expected_contract_variant_id)
+        if reason:
+            evidence["inference_exclusion_reason"] = reason
+            evidence["inference_eligible"] = False
+        else:
+            evidence["inference_eligible"] = True
         exit_ts = evidence.get("trade_exit_ts")
         if exit_ts is not None and float(exit_ts) > ended_ts:
             evidence.update({
@@ -504,27 +660,22 @@ def _experiment_arm_evidence(
             })
         decisions.append(evidence)
 
-    trade_rows = conn.execute(
-        "SELECT DISTINCT t.* FROM paper_trades AS t "
-        "JOIN paper_decisions AS d ON d.paper_trade_id=t.trade_id "
-        "WHERE d.scope_key=? AND d.variant_id=? "
-        f"AND ({window_clause}) "
-        "ORDER BY t.entry_ts, t.trade_id",
-        (scope_key, variant_id, *window_params)).fetchall()
     unfilled = [row for row in trade_rows
                 if str(row["status"]) == "CLOSED"
                 and str(row["result"]) == "unfilled"
                 and row["exit_ts"] is not None
                 and float(row["exit_ts"]) <= ended_ts]
-    closed = [row for row in trade_rows
-              if row["exit_ts"] is not None
-              and float(row["exit_ts"]) <= ended_ts
-              and str(row["result"]) != "unfilled"
-              and row["r_multiple"] is not None
-              and (not has_execution_validity
-                   or int(row["valid_for_inference"] or 0) == 1)]
+    closed_observed = [row for row in trade_rows
+                       if row["exit_ts"] is not None
+                       and float(row["exit_ts"]) <= ended_ts
+                       and str(row["result"]) != "unfilled"
+                       and row["r_multiple"] is not None]
+    closed = [row for row in closed_observed
+              if trade_quality.get(str(row["trade_id"])) is None]
     unresolved = [row for row in trade_rows
-                  if row not in closed and row not in unfilled]
+                  if row not in closed and row not in unfilled
+                  and not (str(row["status"]) == "CLOSED"
+                           and trade_quality.get(str(row["trade_id"]))) ]
     costs = {
         "gross_pnl_usdt": 0.0, "fees_usdt": 0.0,
         "execution_cost_usdt": 0.0, "funding_cost_usdt": 0.0,
@@ -538,7 +689,9 @@ def _experiment_arm_evidence(
         cost_limitations.extend(limitations)
     trade_returns = [_finite_number(row["r_multiple"]) for row in closed]
     trade_score = score_returns(trade_returns, label=variant_id)
-    policy = protocol.paper_trade_decisions(decisions)
+    eligible_decisions = [
+        item for item in decisions if item.get("inference_eligible", True)]
+    policy = protocol.paper_trade_decisions(eligible_decisions)
     policy_returns = [
         _finite_number(item.outcome.get("r_multiple"))
         for item in policy if getattr(item, "outcome", None)
@@ -597,9 +750,16 @@ def _experiment_arm_evidence(
             str(row["decision_outcome"]) == "PROPOSED" for row in rows),
         "vetoed_decisions": sum(
             str(row["decision_outcome"]) == "VETOED" for row in rows),
-        "opens": len(trade_rows), "closes": len(closed),
+        # ``closes`` is the retained audit count.  ``scored_closes`` is the
+        # authoritative inference denominator after funding/contract
+        # quarantine; keeping both prevents a legacy row from disappearing
+        # while ensuring it cannot affect a score or paired qualification.
+        "opens": len(trade_rows), "closes": len(closed_observed),
+        "scored_closes": len(closed),
         "fill_opportunities": len(trade_rows), "unfilled": len(unfilled),
         "unresolved_opens": len(unresolved),
+        "inference_exclusions": quarantined,
+        "inference_exclusion_count": len(quarantined),
         "wins": wins, "losses": losses, "breakeven": breakeven,
         "win_rate_pct": (wins / len(closed) * 100.0 if closed else None),
         "net_pnl_usdt": net_pnl,
@@ -2556,6 +2716,14 @@ def _migration_16(conn: sqlite3.Connection) -> None:
         "NOT NULL DEFAULT 1 CHECK (valid_for_inference IN (0,1))")
 
 
+def _migration_17(conn: sqlite3.Connection) -> None:
+    """Retain explicit quarantine and funding-completeness diagnostics."""
+    conn.execute(
+        "ALTER TABLE paper_trades ADD COLUMN funding_status TEXT")
+    conn.execute(
+        "ALTER TABLE paper_trades ADD COLUMN inference_exclusion_reason TEXT")
+
+
 MIGRATIONS = {
     1: ("create_initial_store", _migration_1),
     2: ("rebuild_legacy_constraints", _migration_2),
@@ -2573,6 +2741,7 @@ MIGRATIONS = {
     14: ("verified_external_mount_classification", _migration_14),
     15: ("experiment_draining_and_retry_lineage", _migration_15),
     16: ("paper_execution_evidence_and_validity", _migration_16),
+    17: ("paper_inference_quarantine_reasons", _migration_17),
 }
 
 
@@ -3395,7 +3564,22 @@ class FindingsStore:
     def _close_paper_trade(conn: sqlite3.Connection, close: dict) -> None:
         columns = {str(row[1]) for row in conn.execute(
             "PRAGMA table_info(paper_trades)").fetchall()}
-        if "execution_json" in columns:
+        funding_status = close.get("funding_status")
+        exclusion_reason = close.get("inference_exclusion_reason")
+        if "execution_json" in columns and "funding_status" in columns:
+            cursor = conn.execute(
+                "UPDATE paper_trades SET exit_ts=?, exit_price=?, result=?, "
+                "net_pnl_usd=?, r_multiple=?, execution_json=?, "
+                "valid_for_inference=?, funding_status=?, "
+                "inference_exclusion_reason=?, status='CLOSED' "
+                "WHERE trade_id=? AND status='OPEN'",
+                (close["exit_ts"], close["exit_price"], close["result"],
+                 close["net_pnl_usd"], close["r_multiple"],
+                 _canonical_json(close.get("execution") or {}),
+                 1 if close.get("valid_for_inference", True) else 0,
+                 funding_status, exclusion_reason,
+                 close["trade_id"]))
+        elif "execution_json" in columns:
             cursor = conn.execute(
                 "UPDATE paper_trades SET exit_ts=?, exit_price=?, result=?, "
                 "net_pnl_usd=?, r_multiple=?, execution_json=?, "
@@ -3559,14 +3743,28 @@ class FindingsStore:
             decisions = [
                 row for row in decisions if paper_started is not None
                 and float(row["decision_ts"]) >= float(paper_started)]
+        # ``paper_summary`` remains an operational ledger view: historical
+        # rows stay visible here.  Authoritative qualification uses
+        # ``_experiment_arm_evidence`` below, which applies the stricter
+        # contract/funding quarantine and reports these reasons explicitly.
+        exclusion_reasons = {}
+        for row in trades:
+            reason = _trade_inference_exclusion_reason(row)
+            if reason:
+                exclusion_reasons[str(row.get("trade_id"))] = reason
+        def ledger_valid(row: dict) -> bool:
+            try:
+                return int(row.get("valid_for_inference", 1)) == 1
+            except (TypeError, ValueError):
+                return False
         unfilled = [row for row in trades if row["status"] == "CLOSED"
                     and row.get("result") == "unfilled"]
         closed = [row for row in trades if row["status"] == "CLOSED"
                   and row.get("result") != "unfilled"
-                  and int(row.get("valid_for_inference", 1)) == 1]
+                  and ledger_valid(row)]
         invalid = [row for row in trades if row["status"] == "CLOSED"
                    and row.get("result") != "unfilled"
-                   and int(row.get("valid_for_inference", 1)) == 0]
+                   and not ledger_valid(row)]
         accepted = [row for row in decisions
                     if row["decision_outcome"] == "PROPOSED"]
         vetoed = [row for row in decisions
@@ -3589,6 +3787,12 @@ class FindingsStore:
             "fill_opportunities": len(trades),
             "unfilled_trades": len(unfilled),
             "invalid_closed_trades": len(invalid),
+            "authoritative_closed_trades": len([
+                row for row in closed
+                if not exclusion_reasons.get(str(row.get("trade_id")))]),
+            "inference_exclusions": [
+                {"trade_id": trade_id, "reason": reason}
+                for trade_id, reason in sorted(exclusion_reasons.items())],
             "net_pnl_usdt": sum(float(row["net_pnl_usd"] or 0) for row in closed),
             "expectancy_r": (sum(float(row["r_multiple"] or 0) for row in closed)
                              / len(closed) if closed else None),
@@ -4151,6 +4355,20 @@ class FindingsStore:
     def _forward_assignment_decisions(
             conn: sqlite3.Connection, scope_key: str, variant_id: str,
             started_ts: float, ended_ts: float) -> list[dict]:
+        expected_contract_hash = expected_contract_variant_id = None
+        try:
+            variant = FindingsStore._require_variant(conn, variant_id)
+            from agent import registry as strategy_registry
+            contract_variant = (
+                variant_id if variant_id == strategy_registry.TUNED_LS_VARIANT_ID
+                else strategy_registry.baseline_variant_id(
+                    str(variant["strategy_id"])))
+            contract = strategy_registry.contract_for_variant(
+                str(variant["strategy_id"]), contract_variant)
+            expected_contract_hash = contract.semantic_hash
+            expected_contract_variant_id = contract.variant_id
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
         rows = conn.execute(
             "SELECT d.*, t.proposal_id AS trade_proposal_id, "
             "t.scope_key AS trade_scope_key, "
@@ -4159,7 +4377,10 @@ class FindingsStore:
             "t.entry_ts AS trade_entry_ts, t.exit_ts AS trade_exit_ts, "
             "t.result AS trade_result, t.r_multiple AS trade_r_multiple, "
             "t.status AS trade_status, "
-            "t.valid_for_inference AS trade_valid_for_inference "
+            "t.valid_for_inference AS trade_valid_for_inference, "
+            "t.funding_status AS trade_funding_status, "
+            "t.inference_exclusion_reason AS "
+            "trade_inference_exclusion_reason "
             "FROM paper_decisions AS d LEFT JOIN paper_trades AS t "
             "ON t.trade_id=d.paper_trade_id "
             "WHERE d.scope_key=? AND d.variant_id=? "
@@ -4169,6 +4390,33 @@ class FindingsStore:
         decisions = []
         for row in rows:
             evidence = _forward_decision_evidence(row)
+            reason = evidence.get("trade_inference_exclusion_reason")
+            if reason is None and evidence.get("paper_trade_id"):
+                valid = evidence.get("trade_valid_for_inference")
+                try:
+                    if int(valid or 0) == 0:
+                        reason = (evidence.get(
+                            "trade_inference_exclusion_reason")
+                            or "execution evidence marked invalid for inference")
+                except (TypeError, ValueError):
+                    reason = "malformed valid_for_inference marker"
+                funding_status = str(
+                    evidence.get("trade_funding_status") or "").strip()
+                if reason is None and funding_status not in {
+                        "verified_realized", "verified_no_settlement_due"}:
+                    reason = "funding coverage is unavailable or unverified"
+            if reason is None:
+                reason = _provenance_exclusion_reason(
+                    (evidence.get("assumptions") or {}).get(
+                        "experiment_provenance"),
+                    variant_id,
+                    expected_contract_hash=expected_contract_hash,
+                    expected_contract_variant_id=expected_contract_variant_id)
+            if reason:
+                evidence["inference_exclusion_reason"] = reason
+                evidence["inference_eligible"] = False
+            else:
+                evidence["inference_eligible"] = True
             exit_ts = evidence.get("trade_exit_ts")
             if exit_ts is not None and float(exit_ts) > ended_ts:
                 evidence.update({
@@ -6667,9 +6915,11 @@ class FindingsStore:
                 break
             chosen.append(candidate)
             selected_id = str(candidate.get("variant_id") or "")
+            selected_key = str(candidate.get("candidate_key") or "")
             remaining = [
                 item for item in remaining
-                if str(item.get("variant_id") or "") != selected_id]
+                if (str(item.get("variant_id") or "") != selected_id
+                    and str(item.get("candidate_key") or "") != selected_key)]
         if not chosen:
             return []
 
@@ -6765,6 +7015,20 @@ class FindingsStore:
                     "attempt": attempt,
                     "retry_of_assignment_id": retry_of,
                 })[:32]
+                # Batch assignment must enforce the same accepted-selection
+                # binding as the single-candidate path.  Checking only the
+                # event status would allow an accepted selection for another
+                # scope, strategy, or variant to be consumed here.
+                if selection_id:
+                    selection = conn.execute(
+                        "SELECT * FROM research_selections WHERE selection_id=?",
+                        (selection_id,)).fetchone()
+                    if (selection is None
+                            or selection["scope_key"] != scope_key
+                            or selection["requested_strategy_id"] != strategy_id
+                            or selection["resolved_variant_id"] != variant_id):
+                        raise ValueError(
+                            "research selection does not match this assignment")
                 setting_json = _canonical_json(candidate.get("setting") or {})
                 code_identity_json = _canonical_json(candidate.get("code_identity") or {})
                 config_identity_json = _canonical_json(candidate.get("config_identity") or {})

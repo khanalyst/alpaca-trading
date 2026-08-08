@@ -1,0 +1,178 @@
+{
+  "schema": "research-replay-fixture.v1",
+  "provenance": {
+    "classification": "synthetic",
+    "generator": "hand-authored deterministic contract test vector",
+    "disclaimer": "Synthetic prices and account state for regression testing only; this is not observed market data."
+  },
+  "coverage": {
+    "expected_records": 1,
+    "observed_records": 1,
+    "gaps": []
+  },
+  "config": {
+    "mode": "demo",
+    "llm": {
+      "provider": "anthropic",
+      "model": "test-model",
+      "temperature": 0.2,
+      "max_tokens": 2000
+    },
+    "strategy": {
+      "id": "momentum",
+      "version": "phase1-v3",
+      "signal_timeframe": "15m",
+      "allow_experimental_setups_in_demo": true,
+      "setup_cooldown_minutes": 45,
+      "setup_memory_hours": 72,
+      "loss_reentry_min_minutes": 60,
+      "min_stop_atr_multiple": 1.0,
+      "min_hold_minutes": 90,
+      "structure_buffer_atr_multiple": 0.15,
+      "hard_max_entry_extension_atr": 2.5,
+      "breakout_discriminator": "none",
+      "breakout_compression_max_atr_ratio": 1.0,
+      "breakout_range_threshold_pct": 85,
+      "breakout_min_relative_volume": 1.0,
+      "funding_extreme_pct_per_8h": 0.01,
+      "fixed_reward_risk": 2.0,
+      "extended_reward_risk": 3.0
+    },
+    "universe": {
+      "top_n": 10,
+      "min_24h_quote_volume_usd": 50000000,
+      "min_history_candles": 60,
+      "denylist": [],
+      "refresh_minutes": 60
+    },
+    "cycle": {
+      "interval_seconds": 300,
+      "timeframes": ["15m", "1h", "4h"],
+      "candles": 120
+    },
+    "risk": {
+      "max_leverage": 3,
+      "entry_leverage": 2,
+      "risk_per_trade_pct": 1.5,
+      "experimental_risk_per_trade_pct": 0.5,
+      "max_total_open_risk_pct": 3.0,
+      "max_position_notional_pct": 30,
+      "max_gross_exposure_pct": 150,
+      "max_net_direction_pct": 100,
+      "max_btc_beta_exposure_pct": 100,
+      "min_btc_beta_samples": 24,
+      "max_concurrent_positions": 3,
+      "max_same_direction_positions": 2,
+      "max_setups_firing_for_entry": 4,
+      "min_confidence": 0.65,
+      "max_hold_hours": 48,
+      "daily_loss_limit_pct": 5,
+      "flatten_on_daily_stop": false,
+      "max_drawdown_pct": 15,
+      "max_margin_usage_pct": 60,
+      "min_maintenance_margin_ratio": 3.0,
+      "min_stop_liquidation_buffer_pct": 1.0,
+      "cooldown_minutes_after_loss": 45
+    },
+    "execution": {
+      "slippage_guard_pct": 0.5,
+      "max_spread_pct": 0.15,
+      "max_order_book_slippage_pct": 0.35,
+      "max_market_data_age_seconds": 10,
+      "paper_maker_fill_penetration_bps": 1,
+      "paper_maker_order_ttl_seconds": 120,
+      "fill_timeout_seconds": 1,
+      "liquidity_feedback_ttl_minutes": 30,
+      "liquidity_retries_before_backoff": 1,
+      "liquidity_backoff_minutes": 15,
+      "liquidity_depth_buffer_pct": 70,
+      "entry_failure_backoff_minutes": 15,
+      "entry_failure_backoff_max_minutes": 60,
+      "entry_failure_ttl_minutes": 240
+    },
+    "trading_costs": {
+      "taker_fee_pct_per_side": 0.05,
+      "expected_stop_slippage_pct": 0.15,
+      "expected_funding_intervals_held": 1,
+      "expected_hold_hours": 8
+    },
+    "alerts": {
+      "enabled": false,
+      "webhook_url_env": "ALERT_WEBHOOK_URL",
+      "format": "generic",
+      "minimum_level": "error",
+      "timeout_seconds": 5
+    }
+  },
+  "replay": {
+    "variant_id": "momentum.synthetic-golden",
+    "mode": "recorded_llm"
+  },
+  "cycles": [
+    {
+      "ts": 1760000000.0,
+      "run_id": "synthetic-run",
+      "cycle_id": "synthetic-cycle-1",
+      "snapshot": {
+        "BTC/USDT:USDT": {
+          "price": 100.0,
+          "signal_ts": 1759999500000,
+          "trend_15m": "up",
+          "trend_1h": "up",
+          "trend_4h": "up",
+          "mom_1h_pct": 0.6,
+          "mom_15m_pct": 0.3,
+          "atr_1h_pct": 0.8,
+          "atr_1h_ratio": 1.0,
+          "ema20_1h_dist_pct": 0.2,
+          "range_pos_pct": 60.0,
+          "relative_volume_1h": 1.4,
+          "funding_rate_pct": 0.005,
+          "funding_interval_hours": 8,
+          "funding_percentile_30": 50,
+          "funding_samples_30": 30,
+          "funding_mean_30_pct": 0.004,
+          "next_funding_minutes": 240,
+          "perp_index_basis_pct": 0.01,
+          "open_interest_musd": 500.0,
+          "swing_high_pct": 2.0,
+          "swing_low_pct": 2.0,
+          "spread_pct": 0.02,
+          "taker_fee_pct_per_side": 0.05
+        },
+        "_market_context": {
+          "benchmark": "BTC/USDT:USDT"
+        }
+      },
+      "portfolio": {
+        "equity_usdt": 10000.0
+      },
+      "max_new": 3,
+      "provider": "anthropic",
+      "variant_id": null,
+      "strategy_config_version": null,
+      "journal_rowid": null,
+      "enrichment": {}
+    }
+  ],
+  "model_outputs": [
+    {
+      "ts": 1760000000.0,
+      "cycle_id": "synthetic-cycle-1",
+      "response_id": "synthetic-response-1",
+      "raw_text_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "parsed_decisions": [
+        {
+          "symbol": "BTC/USDT:USDT",
+          "action": "open",
+          "direction": "long",
+          "setup_type": "trend_continuation",
+          "confidence": 0.8,
+          "invalidation_anchor": "structure",
+          "exit_policy": "fixed_rr"
+        }
+      ],
+      "request_attempts": 1
+    }
+  ]
+}

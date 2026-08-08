@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -32,6 +33,18 @@ STATE_LOCK_FILE = RUNTIME / "state.lock"
 HEARTBEAT_FILE = RUNTIME / "heartbeat.json"
 
 log = logging.getLogger("state")
+
+HISTORY_RECORD_MAX_BYTES = 16_384
+_HISTORY_MAX_STRING_CHARS = 1_024
+_HISTORY_MAX_COLLECTION_ITEMS = 64
+_HISTORY_MAX_DEPTH = 6
+_HISTORY_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:[a-z0-9]+[_-])*(?:api[_ -]?(?:key|secret)|"
+    r"access[_ -]?token|secret[_ -]?key|private[_ -]?key|password|"
+    r"passphrase|credential|authorization|cookie)\b[\"']?\s*[:=]\s*[\"']?"
+    r"(?:bearer\s+)?[^\"'\s,;}]+[\"']?")
+_HISTORY_BEARER = re.compile(
+    r"(?i)\bbearer\s+[a-z0-9._~+/=-]{4,}")
 
 RUNNING = "RUNNING"          # normal operation: manage positions, open new ones
 PAUSED = "PAUSED"            # housekeeping only: no LLM calls, no new entries
@@ -579,6 +592,128 @@ def set_state(name: str, reason: str | None = None, **extra) -> dict:
         return st
 
 
+def operational_history_path(latest_path: str | Path) -> Path:
+    """Return the append-only JSONL sibling for one latest-value JSON file."""
+    path = Path(latest_path)
+    stem = path.name[:-5] if path.name.lower().endswith(".json") else path.name
+    return path.with_name(f"{stem}.history.jsonl")
+
+
+def _history_secret_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+    parts = set(normalized.split("_"))
+    return bool(parts & {
+        "secret", "token", "password", "passphrase", "credential",
+        "authorization", "cookie",
+    }) or any(marker in normalized for marker in (
+        "apikey", "api_key", "private_key"))
+
+
+def _history_secret_values() -> tuple[str, ...]:
+    return tuple(sorted({
+        value for key, value in os.environ.items()
+        if _history_secret_key(key) and isinstance(value, str)
+        and len(value) >= 4
+    }, key=len, reverse=True))
+
+
+def _history_text(value: object, secrets: tuple[str, ...]) -> str:
+    text = str(value)
+    for secret in secrets:
+        text = text.replace(secret, "<redacted>")
+    text = _HISTORY_SECRET_ASSIGNMENT.sub("<redacted>", text)
+    text = _HISTORY_BEARER.sub("<redacted>", text)
+    if len(text) > _HISTORY_MAX_STRING_CHARS:
+        text = text[:_HISTORY_MAX_STRING_CHARS - 1] + "…"
+    return text
+
+
+def _history_value(
+        value: object, secrets: tuple[str, ...], depth: int = 0) -> object:
+    if depth >= _HISTORY_MAX_DEPTH:
+        return "<truncated>"
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        omitted = 0
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _HISTORY_MAX_COLLECTION_ITEMS:
+                omitted += 1
+                continue
+            if _history_secret_key(key):
+                omitted += 1
+                continue
+            safe_key = _history_text(key, secrets)[:128]
+            result[safe_key] = _history_value(item, secrets, depth + 1)
+        if omitted:
+            result["_history_items_omitted"] = omitted
+        return result
+    if isinstance(value, (list, tuple)):
+        items = [
+            _history_value(item, secrets, depth + 1)
+            for item in value[:_HISTORY_MAX_COLLECTION_ITEMS]
+        ]
+        if len(value) > _HISTORY_MAX_COLLECTION_ITEMS:
+            items.append(
+                f"<{len(value) - _HISTORY_MAX_COLLECTION_ITEMS} items omitted>")
+        return items
+    if isinstance(value, str):
+        return _history_text(value, secrets)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _history_text(value, secrets)
+
+
+def _history_line(payload: dict) -> bytes:
+    safe = _history_value(payload, _history_secret_values())
+    if not isinstance(safe, dict):
+        safe = {"history_truncated": True}
+
+    def encode(value: dict) -> bytes:
+        return (json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ) + "\n").encode("utf-8")
+
+    line = encode(safe)
+    if len(line) <= HISTORY_RECORD_MAX_BYTES:
+        return line
+    core_keys = (
+        "schema", "status", "updated_ts", "pid", "runtime_mode", "run_id",
+        "strategy_id", "strategy_version", "job_id", "run_date",
+        "last_run_date", "last_exit_code", "started_ts", "completed_ts",
+        "deadline_ts", "next_run_ts",
+    )
+    reduced = {key: safe[key] for key in core_keys if key in safe}
+    reduced["history_truncated"] = True
+    line = encode(reduced)
+    if len(line) <= HISTORY_RECORD_MAX_BYTES:
+        return line
+    minimal = {
+        key: safe[key] for key in ("schema", "status", "updated_ts", "pid")
+        if key in safe
+    }
+    minimal["history_truncated"] = True
+    line = encode(minimal)
+    if len(line) > HISTORY_RECORD_MAX_BYTES:
+        raise ValueError("operational history record exceeds size limit")
+    return line
+
+
+def append_operational_history(path: str | Path, payload: dict) -> None:
+    """Append one redacted, bounded record using a single O_APPEND write."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = _history_line(payload)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        written = os.write(fd, line)
+        if written != len(line):
+            raise OSError("short operational history write")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(target, 0o600)
+
+
 def write_heartbeat(status: str, **detail) -> dict:
     """Atomically publish a small, non-secret process-health record.
 
@@ -615,6 +750,14 @@ def write_heartbeat(status: str, **detail) -> dict:
         try:
             tmp.unlink()
         except FileNotFoundError:
+            pass
+    try:
+        append_operational_history(
+            operational_history_path(HEARTBEAT_FILE), payload)
+    except Exception as exc:                              # noqa: BLE001
+        try:
+            log.warning("could not append heartbeat history: %s", exc)
+        except Exception:                                 # noqa: BLE001
             pass
     return payload
 
@@ -852,7 +995,10 @@ def code_fingerprint() -> str:
     """Hash trading-runtime sources without depending on git metadata."""
     root = Path(__file__).resolve().parent.parent
     digest = hashlib.sha256()
-    files = sorted((root / "agent").glob("*.py"))
+    # Contracts are executable paper-trading inputs too.  Recursive discovery
+    # keeps their package modules (and any future nested forward-model helpers)
+    # inside the same provenance boundary as the top-level runtime modules.
+    files = sorted((root / "agent").rglob("*.py"))
     if (root / "main.py").exists():
         files.append(root / "main.py")
     for path in files:

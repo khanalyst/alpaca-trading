@@ -4,14 +4,14 @@
 # Two evidence paths run here and they are not equals. The AUTHORITATIVE
 # path replays the recorded snapshot through the production contract and risk
 # engine; the EXPLORATORY path recomputes indicators from downloaded OHLCV.
-# See research/plan/RECONCILIATION.md - a tier may be lowered on the second
-# and raised only on the first.
+# See research/AUTONOMOUS_RESEARCH.md - a tier may be lowered on the second and
+# raised only on the first.
 #
-# The authoritative path runs FIRST and its gate is hard. If G2 fidelity
-# fails, the replay does not reproduce the live agent's own decisions, every
-# number downstream of it is worthless, and this script stops rather than
-# producing a report that looks fine. That is the plan's instruction: treat a
-# G2 failure as a full stop, not a debugging task to work around.
+# The authoritative path runs FIRST and proposal fidelity is a hard boundary.
+# If replay does not reproduce the live agent's own decisions, every number
+# downstream of it is worthless, and this script stops rather than producing a
+# report that looks fine. Treat a proposal-fidelity mismatch as a full stop,
+# not a debugging task to work around.
 #
 # Historical downloads, durable findings, tournament runs and backup histories
 # are append-only; only documented top-level latest views are refreshed. A
@@ -84,13 +84,13 @@ STAGING="$CONFIG_STAGING"
 STRATEGY_ID="$CONFIG_STRATEGY"
 BASELINE_VARIANT="$CONFIG_BASELINE"
 
-# Qualification must name the deterministic feed lane. A wildcard shadow
-# build also creates a sibling ``:llm`` scope, and guessing between the two
-# would allow non-comparable analyst decisions into forward evidence. An
-# operator may provide FORWARD_SCOPE explicitly; otherwise derive it only
-# when the journal proves one account identity and the configured feed
-# version supplies one unambiguous deterministic scope. If identity is
-# unavailable, leave it empty and the CLI remains fail-closed.
+# Qualification must name the deterministic feed lane. Wildcard selection in
+# deterministic mode creates only deterministic scopes; it does not create an
+# ``:llm`` sibling. Analyst mode may create that separate, non-comparable scope,
+# so an operator may provide FORWARD_SCOPE explicitly. Otherwise derive it only
+# when the journal proves one account identity and the configured feed version
+# supplies one unambiguous deterministic scope. If identity is unavailable,
+# leave it empty and the CLI remains fail-closed.
 FORWARD_SCOPE="${FORWARD_SCOPE:-}"
 if [ -z "$FORWARD_SCOPE" ] && [ -f "$JOURNAL" ]; then
   FORWARD_SCOPE="$($PY - "$JOURNAL" "$MODE" "$ROOT/config.yaml" <<'PY'
@@ -133,58 +133,34 @@ echo "=== $(date -u +%FT%TZ) readiness ==="
 "$PY" research.py readiness --db "$JOURNAL" --store "$STORE" \
   || readiness_failed=1
 
-# Staged verdicts run before generation, deliberately: a proposer that has
-# not yet been told why the last batch died will restate a dead claim at a
-# slightly different threshold, which is the same claim wearing a different
-# number. Generation is still not gated on a terminal outcome; when nothing
-# has finished, it is exactly what the loop needs.
-echo "=== $(date -u +%FT%TZ) adjudicating staged mechanisms ==="
-"$PY" research.py review-staged --store "$STORE" --staging "$STAGING" \
-  || echo "  (staged review unavailable this cycle)"
-
-echo "=== $(date -u +%FT%TZ) starting supported staged PAPER lanes ==="
-"$PY" research.py qualify-staged --store "$STORE" --staging "$STAGING" \
-  || echo "  (staged PAPER qualification unavailable this cycle)"
-
-echo "=== $(date -u +%FT%TZ) authoring new candidate mechanisms ==="
-"$PY" research.py author --store "$STORE" --staging "$STAGING" \
-  || echo "  (authoring unavailable this cycle; retried next run)"
-
-echo "=== $(date -u +%FT%TZ) research learning loop ==="
-# One invocation reviews a bounded queue of completed outcomes. Provider or
-# parse failures are persisted per item and must not abort later reviews or
-# the wider nightly run.
-"$PY" research.py research-loop --store "$STORE" \
-  --max-reviews "$RESEARCH_REVIEW_CAP" \
-  || echo "WARNING: research review deferred; deterministic outcomes remain stored" >&2
-
 if [ -f "$JOURNAL" ]; then
   echo "=== $(date -u +%FT%TZ) corpus ==="
   "$PY" research.py corpus stats --db "$JOURNAL"
 
-  echo "=== $(date -u +%FT%TZ) gate G2: replay fidelity ==="
+  echo "=== $(date -u +%FT%TZ) proposal-fidelity replay ==="
   # Hard gate. Nothing below this line means anything if the replay cannot
   # reproduce what the agent actually decided.
   set +e
   "$PY" research.py replay --db "$JOURNAL" --variant "$BASELINE_VARIANT" \
     --replay-mode recorded_llm --check-fidelity
-  g2=$?
+  proposal_fidelity_status=$?
   set -e
-  case "$g2" in
-    0) ;;
-    4) echo "G2 collecting - fewer than 100 proposals are recorded." >&2
-       echo "Gated commands below will refuse; collection continues." >&2 ;;
-    *) echo "G2 FAILED - stopping. Every downstream number would be " >&2
+  case "$proposal_fidelity_status" in
+    0) proposal_fidelity_ready=1 ;;
+    4) echo "Proposal fidelity collecting - fewer than 100 proposals are recorded." >&2
+       echo "Dependent lifecycle commands are skipped; collection continues." >&2
+       proposal_fidelity_ready=0 ;;
+    *) echo "Proposal fidelity FAILED - stopping. Every downstream number would be " >&2
        echo "precise, plausible, internally consistent and wrong." >&2
        exit 3 ;;
   esac
 
-  echo "=== $(date -u +%FT%TZ) funnel (gate G4) ==="
+  echo "=== $(date -u +%FT%TZ) veto-distribution funnel ==="
   # Published before any sweep: if the binding veto sits downstream of the
   # strategy contract, no contract parameter can change the trade count.
   "$PY" research.py funnel --db "$JOURNAL" --prices "$PRICES" || true
 
-  echo "=== $(date -u +%FT%TZ) decision cadence (B9.2 evidence) ==="
+  echo "=== $(date -u +%FT%TZ) decision-cadence evidence ==="
   "$PY" research.py cadence --db "$JOURNAL" || true
 
   echo "=== $(date -u +%FT%TZ) pre-registered conditioning axes ==="
@@ -199,7 +175,7 @@ if [ -f "$JOURNAL" ]; then
       || echo "  (refused or incomplete; see above)"
   done
 
-  echo "=== $(date -u +%FT%TZ) three-arm H-E ==="
+  echo "=== $(date -u +%FT%TZ) three-arm analyst-effect analysis ==="
   "$PY" research.py three-arm --db "$JOURNAL" --prices "$PRICES" \
     --store "$STORE" || true
 
@@ -210,6 +186,55 @@ if [ -f "$JOURNAL" ]; then
   fi
   "$PY" research.py "${forward_args[@]}" \
     || echo "  (collecting, unscoped, or no promotable edge; see above)"
+
+  if [ "$proposal_fidelity_ready" = "1" ]; then
+    DISCOVERY_EVENT_PLANE="${DISCOVERY_EVENT_PLANE:-$ROOT/runtime/research/market_events.db}"
+    echo "=== ingesting recorded market events ==="
+    # Recorder absence is an explicit NO_DATA state; malformed CSV/codegen
+    # failures remain nonzero and visible to the scheduler.
+    "$PY" research.py ingest-recorded --db "$DISCOVERY_EVENT_PLANE"
+
+    echo "=== bounded research-only discovery ==="
+    # Discovery is downstream of proposal fidelity/G2.  It never authorizes
+    # a strategy; no-data is a successful collection state and true parser or
+    # code-generation failures remain nonzero for the scheduler.
+    if [ -f "$DISCOVERY_EVENT_PLANE" ]; then
+      "$PY" research.py discover --event-plane "$DISCOVERY_EVENT_PLANE" \
+        --store "$STORE"
+    else
+      "$PY" research.py discover --store "$STORE"
+    fi
+
+    echo "=== preparing discovery human-review handoffs ==="
+    # A complete discovery result is verified against its persisted typed
+    # artifact and event-plane evidence before this non-authorizing export.
+    # The packet never mutates the registry, config, code, demo, or live
+    # authority; falsified/tampered evidence fails closed before staged review.
+    "$PY" research.py prepare-discovery-handoff --store "$STORE"
+
+    # Only now may the lifecycle consume evidence. Corpus loading and proposal
+    # fidelity are prerequisites: a provider or validation failure below is a
+    # real failed job, and set -e prevents dependent generation/handoff work.
+    echo "=== $(date -u +%FT%TZ) adjudicating and refining staged mechanisms ==="
+    "$PY" research.py review-staged --store "$STORE" --staging "$STAGING"
+
+    echo "=== $(date -u +%FT%TZ) starting supported staged PAPER lanes ==="
+    "$PY" research.py qualify-staged --store "$STORE" --staging "$STAGING"
+
+    echo "=== $(date -u +%FT%TZ) research learning loop ==="
+    # Every attempted outcome remains isolated and persisted, but any provider
+    # or parse failure makes this invocation nonzero after the bounded batch.
+    "$PY" research.py research-loop --store "$STORE" \
+      --max-reviews "$RESEARCH_REVIEW_CAP"
+
+    echo "=== $(date -u +%FT%TZ) authoring bounded candidate neighborhoods ==="
+    "$PY" research.py author --store "$STORE" --staging "$STAGING"
+
+    echo "=== $(date -u +%FT%TZ) preparing staged human-review handoffs ==="
+    "$PY" research.py prepare-handoff --store "$STORE" --staging "$STAGING"
+  else
+    echo "=== staged lifecycle skipped until proposal fidelity passes ==="
+  fi
 
   echo "=== $(date -u +%FT%TZ) preparing operator review artifacts ==="
   # Only a draft, content-addressed T3 packet is created automatically, and
@@ -270,7 +295,7 @@ if [ "$backup_status" -ne 0 ]; then
 fi
 
 if [ "${readiness_failed:-0}" = "1" ]; then
-  echo "=== readiness reported a FAILED gate; see the top of this log ===" >&2
+  echo "=== readiness reported a failure; see the top of this log ===" >&2
   status=4
 fi
 

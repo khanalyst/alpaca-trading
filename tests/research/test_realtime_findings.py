@@ -111,6 +111,23 @@ class StoreFixture(unittest.TestCase):
         self.store = findings.FindingsStore(self.path)
 
 
+class InferenceQuarantineTests(unittest.TestCase):
+    def test_malformed_validity_marker_is_fail_closed(self):
+        reason = findings._trade_inference_exclusion_reason({
+            "result": "target", "valid_for_inference": "not-a-boolean",
+        })
+        self.assertEqual(reason, "malformed valid_for_inference marker")
+
+    def test_missing_contract_provenance_is_audit_only(self):
+        reason = findings._trade_inference_exclusion_reason({
+            "result": "target", "valid_for_inference": 1,
+            "funding_status": "verified_no_settlement_due",
+            "assumptions_json": json.dumps({}),
+            "variant_id": "momentum.baseline",
+        })
+        self.assertIn("legacy evidence", reason)
+
+
 class MigrationTests(StoreFixture):
     def test_legacy_v1_rows_migrate_in_place(self):
         legacy = Path(self.tmp.name) / "legacy.db"
@@ -693,6 +710,14 @@ class QualificationAndPacketFixture(StoreFixture):
                         "result": "target" if outcome >= 0 else "stop",
                         "net_pnl_usd": outcome * 100.0,
                         "r_multiple": outcome,
+                        "execution_json": json.dumps({
+                            "funding_events": [],
+                            "exit": {
+                                "funding_status":
+                                    "verified_no_settlement_due",
+                            },
+                        }, sort_keys=True),
+                        "funding_status": "verified_no_settlement_due",
                     })
         with sqlite3.connect(self.path) as conn:
             conn.executemany("""
@@ -701,13 +726,16 @@ class QualificationAndPacketFixture(StoreFixture):
                     symbol, direction, setup_type, signal_ts, model_id,
                     assumptions_json, entry_ts, entry_price, notional,
                     risk_usd, stop_price, take_price, exit_ts, exit_price,
-                    result, net_pnl_usd, r_multiple, status)
+                    result, net_pnl_usd, r_multiple, status, execution_json,
+                    valid_for_inference, funding_status,
+                    inference_exclusion_reason)
                 VALUES (
                     :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
                     :symbol, :direction, :setup_type, :signal_ts, :model_id,
                     :assumptions_json, :entry_ts, :entry_price, :notional,
                     :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
-                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
+                    :result, :net_pnl_usd, :r_multiple, 'CLOSED',
+                    :execution_json, 1, :funding_status, NULL)
             """, trades)
             conn.executemany("""
                 INSERT INTO paper_decisions (
@@ -812,6 +840,19 @@ class QualificationAndPacketFixture(StoreFixture):
         state["paper_started_ts"] = 10
         self.store.save_paper_portfolio(
             scope, self.v.variant_id, state, version, now=10)
+        paper_provenance = state["experiment_provenance"]
+        paper_assumptions = json.dumps({
+            "experiment_provenance": paper_provenance,
+            "cost_components": {
+                "entry_fee_pct": 0.01, "exit_fee_pct": 0.01,
+                "spread_pct": 0.01, "entry_slippage_pct": 0.0,
+                "stop_slippage_pct": 0.0,
+            },
+        }, sort_keys=True)
+        paper_execution = json.dumps({
+            "funding_events": [],
+            "exit": {"funding_status": "verified_no_settlement_due"},
+        }, sort_keys=True)
         rows = []
         for index in range(protocol.MIN_ROUND_TRIPS):
             rows.append({
@@ -825,7 +866,7 @@ class QualificationAndPacketFixture(StoreFixture):
                 "setup_type": "trend_continuation",
                 "signal_ts": index,
                 "model_id": "momentum.fixed_rr.15m.v2",
-                "assumptions_json": "{}",
+                "assumptions_json": paper_assumptions,
                 "entry_ts": 11 + index,
                 "entry_price": 100.0,
                 "notional": 1000.0,
@@ -837,6 +878,8 @@ class QualificationAndPacketFixture(StoreFixture):
                 "result": "target",
                 "net_pnl_usd": 100.0,
                 "r_multiple": 1.0,
+                "execution_json": paper_execution,
+                "funding_status": "verified_no_settlement_due",
             })
         with sqlite3.connect(self.path) as conn:
             conn.executemany("""
@@ -845,13 +888,16 @@ class QualificationAndPacketFixture(StoreFixture):
                     symbol, direction, setup_type, signal_ts, model_id,
                     assumptions_json, entry_ts, entry_price, notional,
                     risk_usd, stop_price, take_price, exit_ts, exit_price,
-                    result, net_pnl_usd, r_multiple, status)
+                    result, net_pnl_usd, r_multiple, status, execution_json,
+                    valid_for_inference, funding_status,
+                    inference_exclusion_reason)
                 VALUES (
                     :trade_id, :proposal_id, :scope_key, :variant_id, :cycle_id,
                     :symbol, :direction, :setup_type, :signal_ts, :model_id,
                     :assumptions_json, :entry_ts, :entry_price, :notional,
                     :risk_usd, :stop_price, :take_price, :exit_ts, :exit_price,
-                    :result, :net_pnl_usd, :r_multiple, 'CLOSED')
+                    :result, :net_pnl_usd, :r_multiple, 'CLOSED',
+                    :execution_json, 1, :funding_status, NULL)
             """, rows)
         analysis = self.store.analysis(analysis_id)
         candidate_provenance = (

@@ -319,6 +319,11 @@ def contract_agreement(frames: dict, samples: int, seed: int) -> dict:
     raw["strategy"]["version"] = spec_for("momentum").version
     raw["strategy"]["signal_timeframe"] = "15m"
     raw["strategy"]["execution_mode"] = "analyst"
+    # The shipped config names the coupled ls-ratio-fade tuning.  This
+    # validation lane is intentionally pinned to momentum, so carrying that
+    # explicit variant identity would make config validation reject the
+    # otherwise useful cross-contract feature comparison.
+    raw["strategy"].pop("variant_id", None)
     cfg = validate_config(raw)
     contract = Contract.from_config(cfg)
     rng = np.random.default_rng(seed)

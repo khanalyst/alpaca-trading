@@ -1408,7 +1408,20 @@ class Exchange:
         except Exception as exc:
             log.warning("funding history unavailable for %s: %s", symbol, exc)
             return None
-        return sum(float(row.get("amount") or 0) for row in rows)
+        # An empty history is not proof of zero funding.  Returning 0.0 here
+        # caused the close path to label an unobserved settlement as
+        # ``available`` and let a forecast enter realized PnL.  Preserve a
+        # real zero amount when the exchange returned an explicit row, but
+        # fail closed when no usable funding ledger entry exists.
+        amounts = []
+        for row in rows:
+            try:
+                amount = float(row.get("amount"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(amount):
+                amounts.append(amount)
+        return sum(amounts) if amounts else None
 
     @staticmethod
     def _seconds_timestamp(value: object) -> float | None:

@@ -1,14 +1,15 @@
 # Main repository review — 2026-07-30
 
-> **Historical snapshot.** This document preserves the code and evidence state
-> observed on July 30, 2026. Statements about the then-current schema, missing variants, or
-> partially implemented items are not current operating claims. The reconciled
-> implementation is schema 16 and is documented in `README.md`,
-> `OPERATIONS.md`, and `MAIN_REPO_REVIEW_PLAN.md`.
+> **ARCHIVED / FROZEN REVIEW SNAPSHOT.** This document preserves the code and
+> evidence state observed on July 30, 2026. Review labels, gate names,
+> schema/feed claims, and follow-up items below are not a current checklist.
+> Use `README.md`, `OPERATIONS.md`, and
+> `research/AUTONOMOUS_RESEARCH.md` for current behavior.
 
-> Preserved detailed review record. The current implementation status is
-> maintained in [`../MAIN_REPO_REVIEW_PLAN.md`](../MAIN_REPO_REVIEW_PLAN.md);
-> this document retains the full findings and reasoning behind that plan.
+> Preserved detailed review record. Current implementation status and authority
+> boundaries are maintained in
+> [`../research/AUTONOMOUS_RESEARCH.md`](../research/AUTONOMOUS_RESEARCH.md);
+> this document retains the historical findings and reasoning.
 
 Reviewed at `4791dda` against four requirements. The status notes below also
 include subsequent changes now present on `main`.
@@ -304,16 +305,19 @@ Three excesses are real.
 ### R3-01 — permanent infrastructure and one-shot studies are indistinguishable · **Recommended**
 
 `research/` holds 30 modules. Roughly half are single-use lab notebooks whose
-reports are already committed and whose conclusions are settled: `find_edge`,
-`deep_edge`, `unbiased_recheck`, `maker_study`, `selection_study`,
-`analyse_flow`, `make_legacy_dataset`, `phase1_v2_backtest`, `signal_lab`,
-`portfolio_sim`. They all import `edge_lab`, so each is a surface that has to
+reports are already committed and whose conclusions are settled. The retained
+cluster is now explicitly named under `research/legacy/`: `find_edge`,
+`deep_edge`, `edge_report`, `fetch_flow_data`,
+`make_legacy_dataset`, `phase1_v2_backtest`, `portfolio_sim`,
+`selection_study`, `unbiased_recheck`, and `validate_candidate`; the
+load-bearing `maker_study` and shared `signal_lab` remain at their original
+paths. The legacy programs import `edge_lab`, so each is a surface that has to
 keep importing correctly forever, and nothing distinguishes them from
 `replay.py` or `protocol.py`, which must keep working.
 
 `RECONCILIATION.md` already weighed deleting them and kept them for good
 reasons — a deleted rejection is how a bad idea comes back. The cheaper third
-option: move them under `research/studies/`, or give each a header line naming
+option: move them under `research/legacy/`, or give each a header line naming
 the report it produced and the date it was last meaningful. A reader can then
 tell what must keep working from what already ran.
 
