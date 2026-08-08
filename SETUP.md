@@ -2,8 +2,10 @@
 
 This is the installation authority for the Alpaca intraday paper-trading
 runtime. The default account is Alpaca paper, the data universe is US stocks
-and ETFs, and options are available only through defined-risk intraday
-profiles. Live trading is unsupported and explicitly guarded in the provider.
+and ETFs, and options are available only as single-leg long intraday calls or
+puts. A trader process runs one execution profile (`shares` or `options`) at a
+time; multi-leg, naked, and short option structures are unsupported. Live
+trading is unsupported and explicitly guarded in the provider.
 
 ## Local setup
 
@@ -31,35 +33,51 @@ ALPACA_OPTIONS_FEED=indicative
 ```
 
 Use paper credentials only. Keep withdrawal permissions disabled and do not
-put the file in Git. `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` are optional and are
-needed only by an explicitly enabled research or analyst feature.
+put the file in Git. `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` are optional. LLM use
+is disabled by default and those keys are needed only when `llm.enabled: true`
+is explicitly set for an analyst feature. Deterministic IBR execution remains
+the default.
 
 Run the local checks before starting a loop:
 
 ```bash
+./.venv/bin/python main.py check --offline
 ./.venv/bin/python main.py check
 ./.venv/bin/python main.py status
 ./.venv/bin/python main.py run
 ```
 
-`check` must confirm the Alpaca paper endpoint, credentials, market clock, and
-feed settings. It must fail closed if a live endpoint is requested. Run the
-trader once in the foreground first; only then use Compose or systemd.
+`check` is the authenticated preflight by default and must confirm the Alpaca
+paper endpoint, credentials, market clock, and feed settings; it fails closed
+if a live endpoint is requested. `check --offline` validates local
+configuration only and is not a trading preflight. On a fresh edge ledger the
+trader will remain safely idle until research has passed an initial backtest
+and a strictly later unseen shadow tail. Confirm that expected hold in
+`main.py status`, then run the trader once in the foreground before switching
+to Compose or systemd.
 
 ## Behavioural defaults
 
 - Strategy: initial balance range (IBR), normally 09:30–09:45 America/New_York.
-- Instruments: liquid US equities/ETFs; options are selected from a validated
-  chain and traded only as defined-risk structures.
+- Instruments: liquid US equities/ETFs, or single-leg long options selected
+  from a validated chain, according to the configured execution profile.
 - Entries: regular NYSE session only, with a close-time cutoff.
 - Exits: stop/target and risk controls, followed by a mandatory pre-close
-  flatten. No position may cross the session close.
+  flatten. No position or option contract may cross the session close.
 - Account: paper endpoint and paper credentials; there is no live-ready mode.
 - Data: `iex` stock feed by default; set an entitled feed explicitly if the
   paper account supports one. Record the feed in run metadata.
 
-The IBR hypothesis is unproven. Research output is evidence for review, never
-an automatic promotion or configuration mutation.
+The IBR hypothesis is unproven. The research cycle records an autonomous,
+forward-only edge lifecycle: an initial corpus backtest must pass before a
+later unseen shadow tail can validate and select a champion; paper outcomes
+are appended for forward monitoring and may demote a champion. Runtime entries
+remain blocked without a validated/champion SQLite record.
+
+For an operator-initiated close, run
+`./.venv/bin/python main.py flatten --reason operator` (or the equivalent
+Compose command) and treat a non-zero exit as an incomplete flatten requiring
+broker reconciliation.
 
 ## Docker Compose on a VM
 
@@ -79,6 +97,11 @@ docker compose ps
 docker compose logs --tail=100 trader
 ```
 
+The trader may start before research, but it cannot open an entry on a fresh
+ledger. Start the research profile after the recorder has an initial corpus;
+keep recording so a later unseen tail can qualify a champion. Do not weaken
+the entry gate to make a new deployment trade immediately.
+
 The Compose services are `recorder`, `trader`, optional `research`, and
 `dashboard`;
 their container names are `alpaca-recorder`, `alpaca-trader`,
@@ -90,18 +113,31 @@ Named volumes survive an ordinary `docker compose down`. Do not use
 `down -v` or prune volumes unless the journal and research artifacts have been
 backed up and the reset is intentional.
 
-Research is an offline profile and does not run on a default startup. Supply a
-normalized JSONL dataset explicitly when needed:
+Research is an offline profile and does not run on a default startup. When the
+recorder has written the mixed bars/quotes/options dataset at
+`runtime/research/recorded/market.csv`, the research cycle discovers and routes
+it automatically. An explicit normalized JSONL dataset can override it when
+needed:
 
 ```bash
-export ALPACA_RESEARCH_DATASET=/app/runtime/research/input/bars.jsonl
+export ALPACA_RESEARCH_DATASET=/app/runtime/research/input/market.jsonl
 docker compose --profile research up -d research
 ```
+
+The edge-lab ledger defaults to `runtime/research/edge_lab.sqlite3` (override
+with `ALPACA_EDGE_DB`). Inspect its append-only lifecycle with
+`python research.py edge status`. The scheduled cycle performs normal
+backtest-to-unseen-shadow validation and champion selection automatically;
+manual `edge promote`/rollback commands are available only as audited controls
+subject to lifecycle/evidence rules; demote, retire, and rollback are operator
+safety actions.
 
 ## Legacy systemd lane
 
 For hosts that do not use Compose, install the trader/recorder units and the
-optional research units in `deploy/` as the `alpaca` service user:
+research units in `deploy/` as the `alpaca` service user. The research process
+has no broker credentials, but it must produce a champion before entries are
+enabled on a fresh deployment:
 
 ```bash
 sudo useradd --system --home /opt/alpaca-agent-trading --shell /usr/sbin/nologin alpaca
@@ -112,9 +148,12 @@ sudo systemctl enable --now alpaca-recorder.service
 sudo systemctl enable --now alpaca-trader.service
 ```
 
-Enable `alpaca-research.timer` only after setting `ALPACA_RESEARCH_DATASET` to
-a normalized JSONL input in the service EnvironmentFile. Research is offline
-and never a prerequisite for paper trading.
+Enable `alpaca-research.timer` after the recorder has produced its default
+dataset, or set `ALPACA_RESEARCH_DATASET` to a normalized JSONL input in the
+credential-free `/etc/alpaca-agent-trading/research.env` file. Research runs
+offline and is optional as a service,
+but the trader still requires a validated/champion edge record in SQLite
+before opening entries.
 
 Compose and the systemd application lane are alternatives. Do not enable both
 on one host. The trader remains one replica/process. Put credentials in an

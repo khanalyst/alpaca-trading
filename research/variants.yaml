@@ -1,0 +1,11 @@
+{
+  "variants": [
+    {"variant_id": "ibr.baseline", "strategy_id": "ibr", "base_version": "v1", "overrides": {}, "vehicles": ["equity", "option"], "hypothesis": "The registered IBR configuration is the paired baseline for every vehicle."},
+    {"variant_id": "ibr.range.30", "strategy_id": "ibr", "base_version": "v1", "overrides": {"strategy.range_minutes": 30}, "vehicles": ["equity", "option"], "hypothesis": "A thirty-minute range removes opening noise while retaining the first directional repricing."},
+    {"variant_id": "ibr.range.45", "strategy_id": "ibr", "base_version": "v1", "overrides": {"strategy.range_minutes": 45}, "vehicles": ["equity", "option"], "hypothesis": "A wider range requires a more persistent imbalance and reduces false breakouts."},
+    {"variant_id": "ibr.target.1_5r", "strategy_id": "ibr", "base_version": "v1", "overrides": {"strategy.target_r": 1.5}, "vehicles": ["equity", "option"], "hypothesis": "A 1.5R target improves hit rate enough to offset its smaller winners after costs."},
+    {"variant_id": "ibr.target.3r", "strategy_id": "ibr", "base_version": "v1", "overrides": {"strategy.target_r": 3.0}, "vehicles": ["equity", "option"], "hypothesis": "A 3R target tests whether the opening imbalance has a persistent tail."},
+    {"variant_id": "ibr.buffer.0bps", "strategy_id": "ibr", "base_version": "v1", "overrides": {"strategy.breakout_buffer_bps": 0.0}, "vehicles": ["equity", "option"], "hypothesis": "Immediate close confirmation captures more genuine breakouts than a fixed buffer."},
+    {"variant_id": "ibr.buffer.10bps", "strategy_id": "ibr", "base_version": "v1", "overrides": {"strategy.breakout_buffer_bps": 10.0}, "vehicles": ["equity", "option"], "hypothesis": "A larger close buffer selects only breakouts with meaningful follow-through."}
+  ]
+}

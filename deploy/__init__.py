@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -13,16 +14,23 @@ def load_config(path: str | Path) -> dict:
     parses only scalar top-level and one-level section values used by probes.
     """
     source = Path(path)
+    text = source.read_text(encoding="utf-8")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        return value
     try:
         import yaml
     except ImportError:
         yaml = None
     if yaml is not None:
-        value = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+        value = yaml.safe_load(text) or {}
         return value if isinstance(value, dict) else {}
     result: dict = {}
     section: dict | None = None
-    for raw in source.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip() or ":" not in line:
             continue

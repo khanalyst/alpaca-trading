@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import mimetypes
+import os
 import sqlite3
 import sys
 import threading
@@ -91,10 +93,49 @@ def _performance(path: Path) -> dict:
         return {"available": False, "reason": "journal not created"}
     try:
         import report
-        with _ro_connect(path) as connection:
+        with closing(_ro_connect(path)) as connection:
             return {"available": True, **report.json_report(connection)}
     except Exception as exc:                               # noqa: BLE001
         return {"available": False, "reason": type(exc).__name__}
+
+
+def _edge_status(path: Path) -> dict:
+    """Expose the append-only edge-lab lifecycle without promoting anything.
+
+    The dashboard is intentionally read-only and does not import the edge
+    runner.  Reading the small SQLite ledger directly also keeps the view
+    usable in a recovery image where optional research dependencies are not
+    installed.
+    """
+    if not path.is_file():
+        return {"available": False, "status": "not_initialized",
+                "candidates": 0, "by_status": {}, "by_vehicle": {}}
+    try:
+        with closing(_ro_connect(path)) as connection:
+            tables = _tables(connection)
+            if not {"candidates", "candidate_state"}.issubset(tables):
+                return {"available": False, "status": "invalid_ledger",
+                        "candidates": 0, "by_status": {}, "by_vehicle": {}}
+            rows = connection.execute(
+                """SELECT c.vehicle, s.status, COUNT(*) AS count
+                   FROM candidates c JOIN candidate_state s
+                     ON s.candidate_id=c.candidate_id
+                   GROUP BY c.vehicle, s.status
+                   ORDER BY c.vehicle, s.status""").fetchall()
+        by_status: dict[str, int] = {}
+        by_vehicle: dict[str, int] = {}
+        for row in rows:
+            status = str(row["status"])
+            vehicle = str(row["vehicle"])
+            count = int(row["count"])
+            by_status[status] = by_status.get(status, 0) + count
+            by_vehicle[vehicle] = by_vehicle.get(vehicle, 0) + count
+        return {"available": True, "status": "ready",
+                "candidates": sum(by_status.values()),
+                "by_status": by_status, "by_vehicle": by_vehicle}
+    except (OSError, sqlite3.Error, ValueError):
+        return {"available": False, "status": "unreadable",
+                "candidates": 0, "by_status": {}, "by_vehicle": {}}
 
 
 def _reports(root: Path) -> list[dict]:
@@ -139,6 +180,8 @@ def snapshot(root: Path) -> dict:
     recorder_path = runtime / "research" / "recorded"
     trader_heartbeat = runtime / mode / "heartbeat.json"
     research_heartbeat = runtime / "health" / "research.json"
+    edge_configured = Path(os.getenv("ALPACA_EDGE_DB", "runtime/research/edge_lab.sqlite3"))
+    edge_path = edge_configured if edge_configured.is_absolute() else root / edge_configured
     cycle_seconds = float(config.get("cycle", {}).get("interval_seconds") or 60)
     trader_max_age = max(90.0, cycle_seconds * 4)
     return {
@@ -147,13 +190,12 @@ def snapshot(root: Path) -> dict:
         "mode": mode,
         "strategy": {
             key: config.get("strategy", {}).get(key)
-            for key in ("id", "version", "signal_timeframe")
+            for key in ("id", "version", "execution_mode", "variant_id")
         },
         "cycle": {
             key: config.get("cycle", {}).get(key)
-            for key in ("interval_seconds", "decision_interval_seconds")
+            for key in ("interval_seconds",)
         },
-        "research_feed_version": None,
         "trader": {
             "health": health.trader(trader_heartbeat, trader_max_age),
             "heartbeat": _safe_heartbeat(trader_heartbeat),
@@ -172,10 +214,15 @@ def snapshot(root: Path) -> dict:
         },
         "performance": _cached(
             f"performance:{journal}", 30, lambda: _performance(journal)),
+        "edge": _cached(
+            f"edge:{edge_path}", 30, lambda: _edge_status(edge_path)),
         "research": {
-            "available": False,
-            "optional": True,
-            "note": "offline research is dataset-gated; no promotion metrics are computed",
+            "available": edge_path.is_file(),
+            "service_optional": True,
+            "entry_gate_required": bool(
+                config.get("research", {}).get("enabled", True) and
+                config.get("research", {}).get("require_validated_variant", True)),
+            "note": "the service is optional to run continuously; entries require a validated edge record",
         },
         "reports": _cached(
             f"reports:{root}", 30, lambda: _reports(root)),
@@ -219,10 +266,10 @@ const good=x=>x?'ok':'bad'; const when=x=>x?new Date(x*1000).toISOString():'—'
 function table(parent,rows,cols){const t=el('table'),h=el('tr');cols.forEach(c=>h.append(el('th',c)));t.append(h);rows.forEach(r=>{const tr=el('tr');cols.forEach(c=>tr.append(el('td',String(r[c]??'—'))));t.append(tr)});parent.append(t)}
 async function showReport(path){const r=await fetch('/api/report?path='+encodeURIComponent(path));const j=await r.json();const p=card(path,true);p.append(el('pre',j.text||j.error||'unavailable'));p.scrollIntoView({behavior:'smooth'})}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
- let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'research feed','v'+d.research_feed_version);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'research attached',d.trader.heartbeat.research_available,good(d.trader.heartbeat.research_available));row(c,'research state',d.trader.heartbeat.research_status,good(d.trader.heartbeat.research_status==='healthy'||d.trader.heartbeat.research_status==='disabled'));
+ let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
  c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
  c=card('Paper journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
- c=card('Research');row(c,'status',d.research.optional?'optional / dataset-gated':'disabled');c.append(el('p',d.research.note||'No research status.','muted'));
+ c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}

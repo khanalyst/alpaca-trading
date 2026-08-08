@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Small, offline research CLI for Alpaca US equity/ETF/options data.
-
-Only normalized market-data validation and deterministic IBR replay are
-supported here.  Provider downloads, order placement, unsupported hypotheses,
-and portfolio aggregation are intentionally outside this command.
-"""
+"""Offline validation, IBR replay, and bounded autonomous edge discovery."""
 
 from __future__ import annotations
 
@@ -19,6 +14,8 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from research.ibr import IBRConfig, replay_ibr, replay_ibr_vehicles
+from research.edge_lab import (EdgeLedger, DEFAULT_DB_PATH, discover,
+                               init_ledger)
 from research.market_data import (
     NormalizationError,
     normalize_option_snapshot,
@@ -133,6 +130,104 @@ def cmd_backtest_ibr(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_json(path: str | Path | None, default):
+    if path is None:
+        return default
+    source = Path(path)
+    try:
+        text = source.read_text(encoding="utf-8")
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        # Research trade/evidence feeds are commonly JSONL; accept that
+        # append-friendly representation as well as one JSON document.
+        try:
+            value = [json.loads(line) for line in text.splitlines() if line.strip()]
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{source}: invalid JSON: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"{source}: invalid JSON: {exc}") from exc
+    return value
+
+
+def _db(args):
+    return Path(getattr(args, "db", None) or DEFAULT_DB_PATH)
+
+
+def cmd_edge_init(args: argparse.Namespace) -> int:
+    print(json.dumps(init_ledger(_db(args)), sort_keys=True))
+    return 0
+
+
+def cmd_edge_status(args: argparse.Namespace) -> int:
+    print(json.dumps(EdgeLedger(_db(args)).status(vehicle=args.vehicle), sort_keys=True))
+    return 0
+
+
+def cmd_edge_promote(args: argparse.Namespace) -> int:
+    ledger = EdgeLedger(_db(args))
+    record = ledger.transition(args.candidate, args.status, reason=args.reason,
+                               actor=args.actor, rollback=args.rollback)
+    print(json.dumps(record, sort_keys=True))
+    return 0
+
+
+def cmd_edge_ingest(args: argparse.Namespace) -> int:
+    ledger = EdgeLedger(_db(args))
+    outcome = _read_json(args.outcome, {})
+    if not isinstance(outcome, dict):
+        raise ValueError("outcome JSON must be an object")
+    print(json.dumps(ledger.ingest_paper_outcome(args.candidate, outcome), sort_keys=True))
+    return 0
+
+
+def cmd_edge_discover(args: argparse.Namespace) -> int:
+    config = _read_json(args.config, {})
+    if not isinstance(config, dict):
+        raise ValueError("--config JSON must be an object")
+    result = discover(
+        args.data, db_path=_db(args), vehicle=args.vehicle, lane=args.lane,
+        config=config, variants_path=args.variants,
+        min_trades=args.min_trades, min_sessions=args.min_sessions,
+        alpha=args.alpha)
+    print(json.dumps(result, sort_keys=True, default=str))
+    promoted = any(item.get("status") in {"validated", "champion"}
+                   for item in result.get("variants", []))
+    return 0 if promoted else 2
+
+
+def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
+    parser = sub.add_parser(name, help=f"edge ledger {command}")
+    parser.add_argument("--db", default=None)
+    if command == "init":
+        parser.set_defaults(func=cmd_edge_init)
+    elif command == "status":
+        parser.add_argument("--vehicle", choices=("equity", "option"), default=None)
+        parser.set_defaults(func=cmd_edge_status)
+    elif command == "promote":
+        parser.add_argument("candidate")
+        parser.add_argument("status", choices=("backtest_passed", "shadow", "validated", "champion", "demoted", "retired"))
+        parser.add_argument("--reason", required=True)
+        parser.add_argument("--actor", default="cli")
+        parser.add_argument("--rollback", action="store_true")
+        parser.set_defaults(func=cmd_edge_promote)
+    elif command == "ingest":
+        parser.add_argument("candidate")
+        parser.add_argument("outcome")
+        parser.set_defaults(func=cmd_edge_ingest)
+    elif command == "discover":
+        parser.add_argument("--data", required=True,
+                            help="normalized market JSONL corpus")
+        parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")
+        parser.add_argument("--lane", choices=("auto", "backtest", "shadow"), default="auto")
+        parser.add_argument("--config", help="optional base runtime config JSON")
+        parser.add_argument("--variants", help="optional preregistration JSON/YAML path")
+        parser.add_argument("--min-trades", type=int, default=100)
+        parser.add_argument("--min-sessions", type=int, default=10)
+        parser.add_argument("--alpha", type=float, default=.05)
+        parser.set_defaults(func=cmd_edge_discover)
+    return parser
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="research.py", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -149,12 +244,28 @@ def build_parser() -> argparse.ArgumentParser:
     ibr.add_argument("--vehicle", choices=("equity", "option", "both"), default="equity")
     _add_cost_flags(ibr)
     ibr.set_defaults(func=cmd_backtest_ibr)
+    # Both ``edge init`` and flat ``edge-init`` forms are accepted so cron
+    # jobs can stay terse while operators retain a discoverable command tree.
+    edge = sub.add_parser("edge", help="auditable edge discovery ledger")
+    edge_sub = edge.add_subparsers(dest="edge_command", required=True)
+    for name in ("init", "status", "promote", "ingest", "discover"):
+        _edge_parser(edge_sub, name, name)
+    for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest", "edge-discover"):
+        _edge_parser(sub, name, name.split("-", 1)[1])
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Operational callers consume JSON; a non-zero return is the signal
+        # to stop a scheduler cycle rather than continue with partial evidence.
+        print(json.dumps({"error": str(exc), "type": type(exc).__name__}, sort_keys=True))
+        return 3
 
 
 if __name__ == "__main__":

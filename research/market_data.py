@@ -9,10 +9,11 @@ object through the research code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Mapping
+import math
+from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 
@@ -159,6 +160,7 @@ class UnderlyingBar:
     volume: float
     identity: EventIdentity
     interval_seconds: int = 60
+    atr: float | None = None
 
     @property
     def end(self) -> datetime:
@@ -191,6 +193,61 @@ class UnderlyingBar:
     @property
     def timezone(self) -> str:
         return self.identity.timezone
+
+
+def atr_series(bars: Iterable[Any], period: int = 14) -> list[float | None]:
+    """Compute a no-lookahead Wilder ATR series for normalized OHLCV bars.
+
+    Each result uses true ranges through that bar's completed close and the
+    immediately preceding close.  Values before a complete period are None;
+    this avoids partial-window volatility estimates at session start.
+    """
+    period = int(period)
+    if period <= 0:
+        raise ValueError("ATR period must be positive")
+    rows = list(bars or ())
+    output: list[float | None] = [None] * len(rows)
+    ranges: list[float] = []
+    previous_close: float | None = None
+    current_atr: float | None = None
+    for index, row in enumerate(rows):
+        def value(name):
+            return getattr(row, name, None) if not isinstance(row, Mapping) else row.get(name)
+        try:
+            high = float(value("high")); low = float(value("low")); close = float(value("close"))
+        except (TypeError, ValueError):
+            ranges.append(float("nan")); previous_close = None; continue
+        if not all(math.isfinite(item) for item in (high, low, close)) or high < low:
+            ranges.append(float("nan")); previous_close = close; continue
+        tr = high - low if previous_close is None else max(
+            high - low, abs(high - previous_close), abs(low - previous_close))
+        ranges.append(tr)
+        window = ranges[index + 1 - period:index + 1]
+        if index + 1 >= period and all(math.isfinite(item) for item in window):
+            current_atr = (sum(window) / period if current_atr is None else
+                           ((current_atr * (period - 1)) + tr) / period)
+            output[index] = current_atr
+        previous_close = close
+    return output
+
+
+def attach_atr(bars: Iterable[Any], period: int = 14) -> list[Any]:
+    """Attach ATR values while retaining immutable normalized records."""
+    from dataclasses import replace
+    rows = list(bars or ())
+    values = atr_series(rows, period=period)
+    output = []
+    for row, atr in zip(rows, values):
+        if isinstance(row, UnderlyingBar):
+            output.append(replace(row, atr=atr))
+        elif isinstance(row, Mapping):
+            item = dict(row)
+            if atr is not None:
+                item["atr"] = atr; item["atr_period"] = int(period)
+            output.append(item)
+        else:
+            output.append(row)
+    return output
 
 
 @dataclass(frozen=True)
@@ -305,10 +362,6 @@ def normalize_underlying_bar(payload: Mapping[str, Any], *, provider: str | None
     )
 
 
-# Concise aliases used by data adapters and notebooks.
-normalize_bar = normalize_underlying_bar
-
-
 def normalize_quote(payload: Mapping[str, Any], *, provider: str | None = None,
                     feed: str | None = None) -> QuoteSnapshot:
     ts = parse_timestamp(_field(payload, "timestamp", "ts", "t", "time"))
@@ -361,7 +414,7 @@ def normalize_option_snapshot(payload: Mapping[str, Any], contract: OptionContra
 __all__ = [
     "EventIdentity", "NormalizationError", "OptionContract", "OptionSnapshot",
     "QuoteSnapshot", "UnderlyingBar", "normalize_option_contract",
-    "normalize_bar", "normalize_option_snapshot", "normalize_quote",
+    "normalize_option_snapshot", "normalize_quote",
     "normalize_underlying_bar",
-    "parse_timestamp", "NEW_YORK", "UTC",
+    "parse_timestamp", "atr_series", "attach_atr", "NEW_YORK", "UTC",
 ]

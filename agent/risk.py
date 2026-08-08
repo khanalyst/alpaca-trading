@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from datetime import date, datetime, timezone
 from typing import Mapping
 
 
@@ -15,8 +16,36 @@ def _num(value, default=None):
     return number if math.isfinite(number) else default
 
 
+def _timestamp(value):
+    """Normalize quote timestamps expressed as epoch or ISO text."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        if abs(number) > 100_000_000_000:
+            number /= 1000.0
+        return number
+    else:
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _option_kind(value) -> str:
+    return str(getattr(value, "value", value or "")).lower().split(".")[-1].strip()
+
+
 class RiskEngine:
-    """Risk boundary with shares and defined-risk options profiles.
+    """Risk boundary with shares and single-leg long-option profiles.
 
     The constructor accepts the whole config mapping or just a ``risk``
     mapping. No exchange/client imports are needed, which keeps replay and
@@ -109,7 +138,7 @@ class RiskEngine:
                 rejected.append("not a mapping"); continue
             option = dict(raw)
             raw_kind = option.get("type", option.get("right", option.get("option_type", "")))
-            kind = str(getattr(raw_kind, "value", raw_kind)).lower().split(".")[-1]
+            kind = _option_kind(raw_kind)
             strategy = str(option.get("strategy", option.get("structure", "single"))).lower()
             side = str(option.get("side", "buy")).lower()
             intent = str(option.get("position_intent", "buy_to_open")).lower()
@@ -128,63 +157,107 @@ class RiskEngine:
                 expiry = option.get("expiration", option.get("expiry"))
                 if expiry is not None:
                     try:
-                        from datetime import datetime, timezone
-                        exp = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
-                        if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
-                        dte = (exp.timestamp() - now_value) / 86400.0
-                    except (TypeError, ValueError):
+                        if isinstance(expiry, date) and not isinstance(expiry, datetime):
+                            dte = (expiry - datetime.fromtimestamp(now_value, timezone.utc).date()).days
+                        else:
+                            exp = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+                            if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+                            dte = (exp.timestamp() - now_value) / 86400.0
+                    except (TypeError, ValueError, OverflowError):
                         dte = None
             if dte is None or dte < minimum or dte > maximum:
                 rejected.append("dte out of bounds"); continue
             if dte <= 0:
                 rejected.append("0DTE"); continue
             stale = option.get("stale") is True or option.get("quote_stale") is True
+            max_age = _num(self.execution.get("max_market_data_age_seconds"), 30) or 30
             quote_age = _num(option.get("quote_age_seconds"))
-            if quote_age is not None and quote_age > _num(self.execution.get("max_market_data_age_seconds"), 30):
-                stale = True
-            quote_ts = _num(option.get("quote_ts", option.get("timestamp")))
-            if quote_ts is not None and abs(quote_ts) > 100_000_000_000:
-                quote_ts /= 1000.0
-            if quote_ts is not None and now_value - quote_ts > _num(self.execution.get("max_market_data_age_seconds"), 30):
+            quote_ts = _timestamp(option.get("quote_ts", option.get("quote_timestamp", option.get("timestamp"))))
+            if quote_age is None and quote_ts is not None:
+                quote_age = now_value - quote_ts
+            # A caller that supplies an evaluation clock opts into strict
+            # point-in-time validation.  The no-clock form remains compatible
+            # with offline fixtures, while provider candidates always include
+            # quote_age_seconds and therefore still fail closed.
+            require_fresh = now is not None or any(key in option for key in (
+                "quote_ts", "quote_timestamp", "quote_age_seconds", "timestamp"))
+            if require_fresh and quote_age is None:
+                rejected.append("quote freshness unavailable"); continue
+            if quote_age is not None and (quote_age < 0 or quote_age > max_age):
                 stale = True
             if stale:
                 rejected.append("stale quote"); continue
-            bid = _num(option.get("bid"), 0.0) or 0.0
-            ask = _num(option.get("ask", option.get("debit")), None)
+            # A long option must be executable at a real two-sided market;
+            # accepting ask-only/debit-only rows hides untradeable chains.
+            bid = _num(option.get("bid"))
+            ask = _num(option.get("ask"))
+            if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+                rejected.append("invalid bid/ask"); continue
+            bid_size = _num(option.get("bid_size"))
+            ask_size = _num(option.get("ask_size"))
+            if (bid_size is not None and bid_size <= 0) or (
+                    ask_size is not None and ask_size <= 0):
+                rejected.append("empty displayed option market"); continue
             debit = _num(option.get("debit", option.get("net_debit")), ask)
-            if ask is None and debit is None:
-                rejected.append("missing debit"); continue
             if debit is None or debit <= 0:
                 rejected.append("invalid debit"); continue
-            if ask is not None and bid > 0:
-                spread_pct = (ask - bid) / ((ask + bid) / 2) * 100.0
-                if spread_pct > max_spread:
-                    rejected.append("wide option spread"); continue
-            elif _num(option.get("spread_pct")) is not None and float(option["spread_pct"]) > max_spread:
+            spread_pct = (ask - bid) / ((ask + bid) / 2) * 100.0
+            if spread_pct > max_spread:
                 rejected.append("wide option spread"); continue
             volume = _num(option.get("volume"), 0.0) or 0.0
             open_interest = _num(option.get("open_interest", option.get("oi")), 0.0) or 0.0
-            if volume <= 0 and open_interest <= 0:
+            displayed_size = min(
+                value for value in (bid_size, ask_size)
+                if value is not None
+            ) if bid_size is not None and ask_size is not None else 0.0
+            if volume <= 0 and open_interest <= 0 and displayed_size <= 0:
                 rejected.append("illiquid option"); continue
             multiplier = _num(option.get("multiplier", option.get("contract_multiplier", option.get("size"))))
             if multiplier is None or multiplier <= 0:
                 rejected.append("invalid contract multiplier"); continue
             if multiplier != math.floor(multiplier):
                 rejected.append("invalid contract multiplier"); continue
+            # Derive a stable moneyness distance when the provider did not
+            # precompute one.  ATM proximity is the primary tie-breaker; a
+            # narrow, liquid quote then beats a merely cheap deep-OTM row.
+            strike = _num(option.get("strike", option.get("strike_price")))
+            spot = _num(option.get("underlying_price", option.get("underlying_last", option.get("spot"))))
+            moneyness_distance = _num(option.get("moneyness_distance"))
+            if moneyness_distance is None and strike is not None and spot is not None and spot > 0:
+                moneyness_distance = abs(strike - spot) / spot
+            option["moneyness_distance"] = moneyness_distance if moneyness_distance is not None else float("inf")
+            option["spread_pct"] = spread_pct
+            option["displayed_size"] = displayed_size
             option["debit"] = debit; option["multiplier"] = multiplier; option["dte"] = dte
             option["max_loss_per_contract"] = debit * multiplier
             option["max_loss"] = option["max_loss_per_contract"]
             accepted.append(option)
         if not accepted:
             detail = rejected[0] if rejected else "no candidates"
-            raise ValueError(f"no eligible defined-risk option: {detail}")
-        # Prefer the smallest debit then greatest open interest, yielding
-        # deterministic selection independent of source chain ordering.
-        return min(accepted, key=lambda row: (float(row["debit"]), -(_num(row.get("open_interest"), 0.0) or 0.0), str(row.get("symbol", ""))))
+            raise ValueError(f"no eligible single-leg long option: {detail}")
+        # Deterministic and execution-aware: choose near-ATM first, then a
+        # tighter spread and deeper displayed liquidity.  Debit is only a
+        # late tie-breaker, preventing the cheapest illiquid far-OTM contract
+        # from winning by construction.
+        return min(accepted, key=lambda row: (
+            float(row.get("moneyness_distance", float("inf"))),
+            float(row.get("spread_pct", float("inf"))),
+            -(_num(row.get("volume"), 0.0) or 0.0),
+            -(_num(row.get("open_interest", row.get("oi")), 0.0) or 0.0),
+            -(_num(row.get("displayed_size"), 0.0) or 0.0),
+            float(row["debit"]), str(row.get("symbol", ""))))
 
     def size_options(self, equity: float, risk_usd: float,
                      candidates, direction: str, now: float | None = None) -> dict:
-        contract = self.select_option_contract(candidates, direction=direction, now=now)
+        rows = list(candidates or ())
+        # Provider-generated candidates carry quote_age_seconds/quote_ts.  A
+        # bare offline fixture predating those fields remains usable without
+        # an artificial clock, while any timestamped candidate is checked
+        # strictly against ``now``.
+        has_freshness = any(isinstance(row, Mapping) and any(key in row for key in (
+            "quote_ts", "quote_timestamp", "quote_age_seconds", "timestamp")) for row in rows)
+        contract = self.select_option_contract(rows, direction=direction,
+                                               now=now if has_freshness else None)
         max_loss = float(contract["max_loss_per_contract"])
         contracts = math.floor(float(risk_usd) / max_loss)
         liquidity_cap = _num(contract.get("liquidity_cap_contracts", contract.get("max_contracts")))

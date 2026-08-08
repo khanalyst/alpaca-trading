@@ -3,13 +3,15 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import os
+from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
 
-from agent.alpaca_domain import Account, CalendarDay, MarketClock, Order, Position
-from agent.alpaca_provider import AlpacaProvider, AlpacaSession, PaperModeError
+from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position
+from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, PaperModeError
 from agent.config import ConfigError, validate_config
 from agent.engine import Engine
 from agent.market import MarketData
@@ -92,6 +94,21 @@ class BrainFake:
 
 
 class RuntimeSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_tmp = tempfile.TemporaryDirectory(prefix="alpaca-runtime-safety-")
+        from agent import state
+        self.original_runtime_base = state.RUNTIME_BASE
+        state.RUNTIME_BASE = Path(self.runtime_tmp.name)
+        state.configure_runtime("paper")
+        state.ensure_ready()
+        self.addCleanup(self._cleanup_runtime)
+
+    def _cleanup_runtime(self):
+        from agent import state
+        state.RUNTIME_BASE = self.original_runtime_base
+        state.configure_runtime("paper")
+        self.runtime_tmp.cleanup()
+
     def test_provider_uses_configured_equity_and_option_feeds(self):
         seen = []
 
@@ -283,6 +300,33 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(result["orders"], [])
         self.assertEqual(provider.orders_sent, [])
 
+    def test_required_edge_blocks_the_real_order_path_until_champion_exists(self):
+        provider = FakeProvider()
+        cfg = _cfg()
+        cfg["research"] = {
+            "enabled": True,
+            "require_validated_variant": True,
+            "champion_min_confidence": .95,
+            "db_path": str(Path(self.runtime_tmp.name) / "empty-edge.sqlite3"),
+        }
+        engine = Engine(cfg, provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        result = engine.run_once({})
+        self.assertEqual(result["action"], "hold")
+        self.assertIn("no validated edge champion", result["reason"])
+        self.assertEqual(provider.orders_sent, [])
+        self.assertFalse(engine.check()["edge_ready"])
+
+    def test_authenticated_preflight_rejects_inactive_or_untradable_symbols(self):
+        class InvalidAssetProvider(FakeProvider):
+            def assets(self):
+                return [Asset("SPY", status="inactive", tradable=False)]
+
+        engine = Engine(_cfg(), light=True, provider=InvalidAssetProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(Exception, "inactive or not tradable"):
+            engine.preflight()
+
     def test_engine_uses_early_calendar_close_for_force_flat_metadata(self):
         provider = FakeProvider()
         # Opening range bars remain 09:30--09:45 New York while the broker
@@ -318,6 +362,20 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(engine.flatten_all("test"))
         self.assertEqual(len(provider.orders_sent), 1)
         self.assertIn("flatten", provider.orders_sent[0].client_order_id)
+
+    def test_bounded_run_flattens_existing_positions_before_exit(self):
+        provider = FakeProvider()
+        provider.positions_live = [Position("SPY", Decimal("2"), "long")]
+        engine = Engine(_cfg(), provider=provider)
+        engine.run(max_cycles=0)
+        self.assertEqual(provider.positions_live, [])
+        self.assertEqual(len(provider.orders_sent), 1)
+
+    def test_bounded_run_reports_incomplete_shutdown_flatten(self):
+        engine = Engine(_cfg(), provider=FakeProvider())
+        with patch.object(engine, "_flatten_all_impl", return_value=False):
+            with self.assertRaisesRegex(AlpacaError, "shutdown flatten incomplete"):
+                engine.run(max_cycles=0)
 
 
 if __name__ == "__main__":

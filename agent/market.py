@@ -2,15 +2,83 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal
-from typing import Any, Iterable
+import math
+from typing import Any, Iterable, Mapping
 
 from .alpaca_domain import (Asset, Bar, CalendarDay, MarketClock, OptionContract,
                             Quote)
-from .alpaca_session import NEW_YORK, SessionPolicy, as_new_york, local_clock, session_for
+from .alpaca_session import NEW_YORK, SessionPolicy, as_new_york, session_for
 from .alpaca_provider import AlpacaError
+
+
+def _bar_number(value: Any, key: str) -> float | None:
+    if isinstance(value, Mapping):
+        value = value.get(key)
+    else:
+        value = getattr(value, key, None)
+    try:
+        number = float(value)
+        return number if number == number and abs(number) != float("inf") else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def atr_series(bars: Iterable[Any], period: int = 14) -> list[Decimal | None]:
+    """Compute a close-confirmed Wilder ATR for each OHLCV bar.
+
+    The value at index *i* uses true ranges through index *i* only (and the
+    prior close at *i - 1*).  No future bar is consulted, so attaching the
+    result to a production bar cannot introduce look-ahead.  Values before a
+    complete ``period`` are ``None`` rather than a partial-window estimate.
+    """
+    period = int(period)
+    if period <= 0:
+        raise ValueError("ATR period must be positive")
+    rows = list(bars or ())
+    output: list[Decimal | None] = [None] * len(rows)
+    true_ranges: list[float] = []
+    previous_close: float | None = None
+    atr: float | None = None
+    for index, row in enumerate(rows):
+        high = _bar_number(row, "high"); low = _bar_number(row, "low")
+        close = _bar_number(row, "close")
+        if high is None or low is None or close is None or high < low:
+            previous_close = close
+            true_ranges.append(float("nan"))
+            continue
+        tr = high - low if previous_close is None else max(
+            high - low, abs(high - previous_close), abs(low - previous_close))
+        true_ranges.append(tr)
+        if index + 1 >= period and all(math.isfinite(value) for value in true_ranges[index + 1 - period:index + 1]):
+            if atr is None:
+                atr = sum(true_ranges[index + 1 - period:index + 1]) / period
+            else:
+                atr = ((atr * (period - 1)) + tr) / period
+            output[index] = Decimal(str(atr))
+        previous_close = close
+    return output
+
+
+def attach_atr(bars: Iterable[Any], period: int = 14) -> list[Any]:
+    """Return bars with a no-lookahead ``atr`` field attached."""
+    rows = list(bars or ())
+    values = atr_series(rows, period=period)
+    output = []
+    for row, atr in zip(rows, values):
+        if isinstance(row, Bar):
+            output.append(replace(row, atr=atr))
+        elif isinstance(row, Mapping):
+            item = dict(row)
+            if atr is not None:
+                item["atr"] = float(atr)
+                item["atr_period"] = int(period)
+            output.append(item)
+        else:
+            output.append(row)
+    return output
 
 
 @dataclass(frozen=True)
@@ -30,6 +98,7 @@ class MarketSnapshot:
 class MarketData:
     provider: Any
     policy: SessionPolicy = field(default_factory=SessionPolicy)
+    atr_period: int = 14
     _calendar: list[CalendarDay] = field(default_factory=list)
     _calendar_loaded: bool = False
     _calendar_error: str | None = None
@@ -90,7 +159,13 @@ class MarketData:
         return [a for a in rows if a.tradable and a.status.lower() == "active"]
 
     def stock_bars(self, symbols: Iterable[str], timeframe="1Day", start=None, end=None):
-        return self.provider.bars(list(symbols), timeframe=timeframe, start=start, end=end)
+        rows = self.provider.bars(list(symbols), timeframe=timeframe, start=start, end=end)
+        if not isinstance(rows, Mapping):
+            return rows
+        # ATR is attached at the market boundary so both live and replay
+        # callers receive identical close-confirmed evidence.
+        return {str(symbol).upper(): attach_atr(values, period=self.atr_period)
+                for symbol, values in rows.items()}
 
     def stock_quotes(self, symbols: Iterable[str], start=None, end=None):
         return self.provider.quotes(list(symbols), start=start, end=end)

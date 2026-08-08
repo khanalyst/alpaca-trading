@@ -67,6 +67,49 @@ def _bar_value(bar: Mapping, *keys: str) -> float | None:
     return None
 
 
+def atr_series(bars: Iterable[Mapping], period: int = 14) -> list[float | None]:
+    """Return Wilder ATR values using each bar and its prior close only.
+
+    ATR is intentionally computed here as a strategy input rather than read
+    from a model response.  The first value appears only after ``period``
+    complete bars; a signal bar therefore cannot borrow a future close.
+    """
+    period = int(period)
+    if period <= 0:
+        raise ValueError("ATR period must be positive")
+    rows = [row for row in (bars or ()) if isinstance(row, Mapping)]
+    values: list[float | None] = [None] * len(rows)
+    ranges: list[float] = []
+    previous_close: float | None = None
+    current_atr: float | None = None
+    for index, row in enumerate(rows):
+        high = _bar_value(row, "high", "h")
+        low = _bar_value(row, "low", "l")
+        close = _bar_value(row, "close", "c")
+        if high is None or low is None or close is None or high < low:
+            ranges.append(float("nan")); previous_close = close; continue
+        tr = high - low if previous_close is None else max(
+            high - low, abs(high - previous_close), abs(low - previous_close))
+        ranges.append(tr)
+        window = ranges[index + 1 - period:index + 1]
+        if index + 1 >= period and all(math.isfinite(item) for item in window):
+            current_atr = (sum(window) / period if current_atr is None else
+                           ((current_atr * (period - 1)) + tr) / period)
+            values[index] = current_atr
+        previous_close = close
+    return values
+
+
+def _bars_with_atr(rows: Iterable[Mapping], period: int = 14) -> list[dict]:
+    source = [dict(row) for row in (rows or ()) if isinstance(row, Mapping)]
+    values = atr_series(source, period=period)
+    for row, atr in zip(source, values):
+        if atr is not None:
+            row["atr"] = atr
+            row["atr_period"] = int(period)
+    return source
+
+
 def _parse_clock(value: str, fallback: time) -> time:
     try:
         hour, minute = str(value).split(":", 1)
@@ -87,6 +130,7 @@ class IBRConfig:
     min_relative_volume: float = 1.0
     min_ibr_width_atr: float = 0.0
     max_ibr_width_atr: float = float("inf")
+    atr_period: int = 14
     max_ibr_width_pct: float = float("inf")
     latest_entry_time: str = "11:00"
     force_flat_minutes_before_close: int = 5
@@ -301,6 +345,15 @@ def evaluate_ibr_breakout(
     if width_pct is not None and width_pct > cfg.max_ibr_width_pct:
         return None
     atr = finite(bar.get("atr", bar.get("atr_1m", bar.get("atr_pct", rng.get("atr")))))
+    if atr is None:
+        # Standalone evaluators may provide the completed history alongside
+        # the candidate bar.  Compute only through that bar; never inspect a
+        # future row from the caller's source sequence.
+        history = bar.get("history") or bar.get("bars") or bar.get("_bars")
+        if isinstance(history, Iterable) and not isinstance(history, (str, bytes, Mapping)):
+            values = atr_series(history, period=int(getattr(cfg, "atr_period", 14)))
+            if values:
+                atr = values[-1]
     if atr is not None and "atr_pct" in bar:
         atr = close * atr / 100.0
     if atr and atr > 0:
@@ -383,13 +436,6 @@ def evaluate_exit(direction: str, bar: Mapping, *, stop_price: float,
     return None
 
 
-# Explicit aliases make the contract discoverable to replay clients without
-# forcing them to know an internal naming choice.
-construct_ibr_range = build_ibr_range
-build_initial_breakout_range = build_ibr_range
-check_ibr_breakout = evaluate_ibr_breakout
-
-
 def _force_flat_at(signal_ts: datetime, cfg: IBRConfig) -> str:
     # US regular session ends at 16:00 local. Keep this metadata explicit so
     # options and shares share exactly the same underlying exit clock.
@@ -408,6 +454,10 @@ def generate_ibr_signal(
     """Build the opening range and scan completed bars for the first signal."""
     cfg = config if isinstance(config, IBRConfig) else IBRConfig.from_mapping(config)
     rows = [bar for bar in (bars or ()) if isinstance(bar, Mapping)]
+    rows.sort(key=lambda row: _bar_time(row) or datetime.min.replace(tzinfo=timezone.utc))
+    # Production OHLCV adapters may return plain dictionaries.  Attach ATR
+    # before scanning so configured width bounds have a point-in-time value.
+    rows = _bars_with_atr(rows, period=int(getattr(cfg, "atr_period", 14)))
     rng = build_ibr_range(rows, config=cfg)
     if rng is None:
         return None
@@ -451,5 +501,3 @@ def setup_evidence(snapshot: Mapping, cfg: Mapping | None = None) -> dict:
 
 
 register("ibr", setup_evidence)
-
-ibr_signal = generate_ibr_signal

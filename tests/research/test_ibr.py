@@ -3,7 +3,7 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from research.ibr import IBRConfig, ReplayError, replay_ibr, replay_ibr_vehicles
-from research.market_data import normalize_underlying_bar
+from research.market_data import normalize_option_snapshot, normalize_underlying_bar
 
 
 def bars_for_day(*, breakout=True, gap=False):
@@ -89,14 +89,37 @@ class IBRReplayTests(unittest.TestCase):
         self.assertEqual(result.trades[0].exit_price, 95)
 
     def test_equity_and_option_results_are_not_pooled(self):
-        results = replay_ibr_vehicles(bars_for_day(), config=IBRConfig(
-            stop_pct=.01, target_pct=.02, spread_bps=0, slippage_bps=0, fee_bps=0),
-            vehicles=("equity", "option"))
+        bars = bars_for_day()
+        contract = {
+            "symbol": "SPY240216C00101000", "underlying": "SPY",
+            "expiration": "2024-02-16", "strike": 101,
+            "right": "call", "multiplier": 100,
+        }
+        entry_time = bars[31].timestamp
+        exit_time = bars[31].end
+        entry = normalize_option_snapshot({
+            **contract, "timestamp": entry_time.isoformat(),
+            "bid": 1.9, "ask": 2.0, "last": 1.95,
+            "underlying_price": 101, "provider": "alpaca", "feed": "opra",
+        })
+        exit_quote = normalize_option_snapshot({
+            **contract, "timestamp": exit_time.isoformat(),
+            "bid": 3.0, "ask": 3.1, "last": 3.05,
+            "underlying_price": 103, "provider": "alpaca", "feed": "opra",
+        })
+        results = replay_ibr_vehicles(
+            bars, config=IBRConfig(stop_pct=.01, target_pct=.02,
+                                   spread_bps=0, slippage_bps=0, fee_bps=0),
+            vehicles=("equity", "option"),
+            option_snapshots={entry_time: entry, exit_time: exit_quote})
         self.assertEqual(set(results), {"equity", "option"})
         self.assertEqual(results["equity"].vehicle, "equity")
         self.assertEqual(results["option"].vehicle, "option")
-        self.assertIsInstance(results["equity"].net_pnl, float)
-        self.assertIsInstance(results["option"].net_pnl, float)
+        self.assertEqual(len(results["option"].trades), 1)
+        self.assertEqual(results["option"].trades[0].contract_multiplier, 100)
+        self.assertAlmostEqual(results["option"].net_pnl, 100.0)
+        self.assertNotEqual(results["equity"].net_pnl,
+                            results["option"].net_pnl)
 
     def test_missing_immediate_next_bar_has_no_trade(self):
         bars = bars_for_day()

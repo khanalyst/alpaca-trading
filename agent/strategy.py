@@ -11,15 +11,9 @@ from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
-from .contracts.ibr import (IBRConfig, build_ibr_range,
-                            evaluate_exit, evaluate_ibr_breakout,
-                            setup_evidence as _ibr_evidence)
+from .contracts.ibr import build_ibr_range, setup_evidence as _ibr_evidence
 
-# Public strategy-level aliases for replay/test clients.
-construct_ibr_range = build_ibr_range
-build_initial_breakout_range = build_ibr_range
-check_ibr_breakout = evaluate_ibr_breakout
-from .registry import (baseline_variant_id, contract_for_variant, spec_for,
+from .registry import (baseline_variant_id, contract_for_variant,
                        validate_contract_config)
 
 SETUP_TYPES = {"ibr_breakout", "range_breakout"}
@@ -273,10 +267,6 @@ def semantic_block(records: Mapping, setup_key: str, now: float | None = None) -
 def evaluated_signal(records: Mapping, plan: Mapping) -> dict | None:
     ts = _finite(plan.get("signal_ts"), -1)
     return next((record for record in records.values() if isinstance(record, Mapping) and record.get("symbol") == plan.get("symbol") and _finite(record.get("signal_ts"), -2) == ts), None)
-
-
-def failed_thesis_reentry_reason(records: Mapping, plan: Mapping, cfg: Mapping, now: float | None = None) -> str | None:
-    return None
 
 
 def prune_records(records: Mapping, now: float | None = None) -> dict:

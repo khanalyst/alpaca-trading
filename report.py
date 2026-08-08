@@ -9,6 +9,7 @@ attempt to promote strategies, score experiments, or contact a broker.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import csv
 import json
 import math
@@ -20,12 +21,6 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "runtime" / "paper" / "journal.db"
-
-
-def configured_default_db() -> Path:
-    """Return the paper scope regardless of stale legacy configuration."""
-    return DEFAULT_DB
-
 
 def _columns(db: sqlite3.Connection, table: str) -> set[str]:
     try:
@@ -146,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"journal not found: {args.journal}", file=sys.stderr)
         return 1
     try:
-        with sqlite3.connect(args.journal) as db:
+        with closing(sqlite3.connect(args.journal)) as db:
             if args.csv:
                 print(csv_report(db), end="")
             else:

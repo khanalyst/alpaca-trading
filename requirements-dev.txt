@@ -1,2 +1,0 @@
-# Optional local test runner; production uses requirements.lock.txt without it.
-pytest==9.0.2

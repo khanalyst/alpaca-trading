@@ -58,8 +58,11 @@ class AlpacaRuntimeTests(unittest.TestCase):
         config = validate_config({})
         self.assertEqual(config["mode"], "paper")
         self.assertTrue(config["broker"]["paper"])
+        self.assertFalse(config["llm"]["enabled"])
         with self.assertRaises(ConfigError):
             validate_config({"mode": "live", "broker": {"paper": False}})
+        with self.assertRaisesRegex(ConfigError, "model is required"):
+            validate_config({"llm": {"enabled": True}})
 
 
 if __name__ == "__main__":

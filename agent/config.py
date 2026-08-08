@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 from typing import Any, Mapping
 import os
@@ -59,17 +60,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "broker": {"paper": True, "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
     "universe": {"symbols": ["SPY", "QQQ"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
-    "strategy": {"id": "ibr", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
-    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0},
-    "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "ibr", "max_slippage_bps": 50},
-    "llm": {"provider": "openai", "model": "gpt-5.6-sol-coding", "temperature": 0.2, "max_tokens": 2000},
+    "strategy": {"id": "ibr", "version": "v1", "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10, "setup_memory_hours": 24.0, "setup_cooldown_minutes": 0.0},
+    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0},
+    "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "ibr", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100},
+    # Deterministic IBR execution is the safe default.  The model boundary is
+    # available only when explicitly enabled by configuration.
+    "llm": {"enabled": False, "provider": "openai", "model": "", "temperature": 0.2, "max_tokens": 2000},
+    "research": {"enabled": True, "require_validated_variant": True,
+                 "champion_min_confidence": 0.95},
+    "cycle": {"interval_seconds": 60},
 }
 
 
-def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = False) -> dict:
-    del allow_shadow_strategy
+def validate_config(raw: Mapping[str, Any]) -> dict:
     cfg = deepcopy(_map(raw, "config"))
-    allowed = {"mode", "broker", "data", "session", "universe", "strategy", "risk", "execution", "llm", "alerts", "research", "cycle"}
+    allowed = {"mode", "broker", "data", "session", "universe", "strategy", "risk", "execution", "llm", "research", "cycle"}
     _unknown(cfg, allowed, "config")
     mode = cfg.get("mode", "paper")
     if mode != "paper":
@@ -85,10 +90,12 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     out["mode"] = mode
 
     broker = _map(out.get("broker"), "broker")
-    _unknown(broker, {"paper", "data_feed", "options_feed", "api_key", "secret_key", "endpoint"}, "broker")
+    _unknown(broker, {"paper", "allow_live", "data_feed", "options_feed", "api_key", "secret_key", "endpoint"}, "broker")
     paper = _bool(broker, "paper", "broker", True)
     if not paper:
         raise ConfigError("paper mode requires broker.paper=true")
+    if broker.get("allow_live", False) is not False:
+        raise ConfigError("broker.allow_live must remain false; live trading is disabled")
     paper_env = os.getenv("ALPACA_PAPER")
     if paper_env is not None and paper_env.strip().lower() not in {"1", "true", "yes", "on"}:
         raise ConfigError("ALPACA_PAPER must be true; live trading is disabled")
@@ -102,7 +109,7 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     data = out.get("data")
     if data is not None:
         data = _map(data, "data")
-        _unknown(data, {"feed", "options_feed", "adjustment", "delayed"}, "data")
+        _unknown(data, {"feed", "options_feed"}, "data")
         if "feed" in data:
             data["feed"] = _feed(data["feed"])
         if "options_feed" in data:
@@ -119,7 +126,7 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     out["session"] = session
 
     universe = _map(out.get("universe"), "universe")
-    _unknown(universe, {"symbols", "asset_classes", "min_price", "max_symbols", "denylist", "top_n", "refresh_minutes"}, "universe")
+    _unknown(universe, {"symbols", "asset_classes", "min_price", "max_symbols", "denylist"}, "universe")
     symbols = universe.get("symbols", [])
     if not isinstance(symbols, list) or any(not isinstance(x, str) or not x.strip() for x in symbols):
         raise ConfigError("universe.symbols must be a list of non-empty symbols")
@@ -135,9 +142,11 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     out["universe"] = universe
 
     strategy = _map(out.get("strategy"), "strategy")
-    _unknown(strategy, {"id", "version", "variant_id", "execution_mode", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "latest_entry_time", "force_flat_minutes_before_close", "signal_timeframe"}, "strategy")
+    _unknown(strategy, {"id", "version", "variant_id", "execution_mode", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "atr_period", "max_ibr_width_pct", "max_spread_bps", "stale_minutes", "latest_entry_time", "force_flat_minutes_before_close", "setup_memory_hours", "setup_cooldown_minutes"}, "strategy")
     if not isinstance(strategy.get("id"), str) or not strategy["id"].strip():
         raise ConfigError("strategy.id must be a non-empty string")
+    if strategy.get("execution_mode", "shares") not in {"shares", "options"}:
+        raise ConfigError("strategy.execution_mode must be shares or options")
     strategy["range_minutes"] = _int(strategy, "range_minutes", "strategy", 1, 240, 15)
     strategy["breakout_buffer_bps"] = _num(strategy, "breakout_buffer_bps", "strategy", 0, 500, 5)
     strategy["min_relative_volume"] = _num(strategy, "min_relative_volume", "strategy", 0, 100, 1)
@@ -145,6 +154,11 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     strategy["max_entry_extension_r"] = _num(strategy, "max_entry_extension_r", "strategy", 0, 100, 1)
     strategy["min_ibr_width_atr"] = _num(strategy, "min_ibr_width_atr", "strategy", 0, 100, .25)
     strategy["max_ibr_width_atr"] = _num(strategy, "max_ibr_width_atr", "strategy", 0, 100, 3)
+    strategy["atr_period"] = _int(strategy, "atr_period", "strategy", 1, 500, 14)
+    strategy["max_spread_bps"] = _num(strategy, "max_spread_bps", "strategy", 0, 10_000, 25)
+    strategy["stale_minutes"] = _int(strategy, "stale_minutes", "strategy", 1, 1440, 60)
+    strategy["setup_memory_hours"] = _num(strategy, "setup_memory_hours", "strategy", 0, 720, 24)
+    strategy["setup_cooldown_minutes"] = _num(strategy, "setup_cooldown_minutes", "strategy", 0, 10_080, 0)
     if strategy["min_ibr_width_atr"] > strategy["max_ibr_width_atr"]:
         raise ConfigError("strategy.min_ibr_width_atr cannot exceed max_ibr_width_atr")
     if not isinstance(strategy.get("latest_entry_time"), str):
@@ -152,7 +166,7 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     out["strategy"] = strategy
 
     risk = _map(out.get("risk"), "risk")
-    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_drawdown_pct", "max_gross_exposure_pct", "max_hold_hours"}, "risk")
+    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_gross_exposure_pct", "min_confidence"}, "risk")
     risk["risk_per_trade_pct"] = _num(risk, "risk_per_trade_pct", "risk", .001, 100, .5)
     risk["daily_loss_limit_pct"] = _num(risk, "daily_loss_limit_pct", "risk", .01, 100, 2)
     risk["max_open_risk_pct"] = _num(risk, "max_open_risk_pct", "risk", .01, 100, 2)
@@ -163,10 +177,11 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     if risk["options_min_dte"] > risk["options_max_dte"]:
         raise ConfigError("risk.options_min_dte cannot exceed options_max_dte")
     risk["options_max_spread_pct"] = _num(risk, "options_max_spread_pct", "risk", 0, 100, 10)
+    risk["min_confidence"] = _num(risk, "min_confidence", "risk", 0, 1, 0)
     out["risk"] = risk
 
     execution = _map(out.get("execution"), "execution")
-    _unknown(execution, {"order_type", "time_in_force", "client_order_id_prefix", "max_slippage_bps", "maker_first_enabled"}, "execution")
+    _unknown(execution, {"order_type", "time_in_force", "client_order_id_prefix", "max_slippage_bps", "max_market_data_age_seconds", "max_spread_bps"}, "execution")
     if execution.get("order_type", "market") not in {"market", "limit"}:
         raise ConfigError("execution.order_type must be market or limit")
     if execution.get("time_in_force", "day") not in {"day", "gtc", "ioc", "fok"}:
@@ -174,24 +189,54 @@ def validate_config(raw: Mapping[str, Any], *, allow_shadow_strategy: bool = Fal
     if not isinstance(execution.get("client_order_id_prefix", "ibr"), str) or not execution["client_order_id_prefix"]:
         raise ConfigError("execution.client_order_id_prefix must be non-empty")
     execution["max_slippage_bps"] = _num(execution, "max_slippage_bps", "execution", 0, 10_000, 50)
+    execution["max_market_data_age_seconds"] = _num(execution, "max_market_data_age_seconds", "execution", 1, 3600, 30)
+    execution["max_spread_bps"] = _num(execution, "max_spread_bps", "execution", 0, 10_000, 100)
     out["execution"] = execution
 
     llm = _map(out.get("llm"), "llm")
-    _unknown(llm, {"provider", "model", "temperature", "max_tokens", "base_url"}, "llm")
+    _unknown(llm, {"enabled", "provider", "model", "temperature", "max_tokens", "base_url"}, "llm")
+    llm["enabled"] = _bool(llm, "enabled", "llm", False)
     if llm.get("provider") not in {"openai", "anthropic"}:
         raise ConfigError("llm.provider must be openai or anthropic")
-    if not isinstance(llm.get("model"), str) or not llm["model"].strip():
-        raise ConfigError("llm.model must be a non-empty string")
+    if not isinstance(llm.get("model"), str):
+        raise ConfigError("llm.model must be a string")
+    if llm["enabled"] and not llm["model"].strip():
+        raise ConfigError("llm.model is required when llm.enabled=true")
     llm["temperature"] = _num(llm, "temperature", "llm", 0, 2, .2)
     llm["max_tokens"] = _int(llm, "max_tokens", "llm", 128, 32_000, 2_000)
     out["llm"] = llm
+    research = _map(out.get("research"), "research")
+    _unknown(research, {"enabled", "require_validated_variant", "champion_min_confidence", "db_path"}, "research")
+    research["enabled"] = _bool(research, "enabled", "research", True)
+    research["require_validated_variant"] = _bool(
+        research, "require_validated_variant", "research", True)
+    research["champion_min_confidence"] = _num(
+        research, "champion_min_confidence", "research", 0, 1, .95)
+    if research.get("db_path") is not None and not isinstance(research["db_path"], str):
+        raise ConfigError("research.db_path must be a path string")
+    out["research"] = research
+    cycle = _map(out.get("cycle"), "cycle")
+    _unknown(cycle, {"interval_seconds"}, "cycle")
+    cycle["interval_seconds"] = _num(cycle, "interval_seconds", "cycle", .1, 86_400, 60)
+    out["cycle"] = cycle
+    from .registry import validate_contract_config
+    validate_contract_config(out)
     return out
 
 
 def load_config(path: str | Path) -> dict:
+    source = Path(path).read_text(encoding="utf-8")
     try:
-        import yaml
-    except ImportError as exc:
-        raise ConfigError("PyYAML is required to load YAML configuration files") from exc
-    with open(path, encoding="utf-8") as handle:
-        return validate_config(yaml.safe_load(handle) or {})
+        raw = json.loads(source)
+    except json.JSONDecodeError as json_error:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ConfigError(
+                f"{path}: PyYAML is unavailable and the configuration is not JSON"
+            ) from exc
+        try:
+            raw = yaml.safe_load(source) or {}
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"invalid YAML: {exc}") from exc
+    return validate_config(raw or {})

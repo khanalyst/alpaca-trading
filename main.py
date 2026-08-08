@@ -5,29 +5,22 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, is_dataclass
+import json
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from agent.config import ConfigError, validate_config
+from agent.config import ConfigError, load_config
 from agent.engine import Engine
 
 
 def load_cfg(path: str | Path = ROOT / "config.yaml") -> dict:
-    try:
-        import yaml
-    except ImportError as exc:
-        raise ConfigError("PyYAML is required to load YAML configuration") from exc
-    with open(path, encoding="utf-8") as handle:
-        try:
-            raw = yaml.safe_load(handle) or {}
-        except yaml.YAMLError as exc:
-            raise ConfigError(f"invalid YAML: {exc}") from exc
-    return validate_config(raw)
+    return load_config(path)
 
 
 def _plain(value):
@@ -44,11 +37,13 @@ def _plain(value):
 
 
 def _dump_yaml(value) -> str:
+    plain = _plain(value)
     try:
         import yaml
-    except ImportError as exc:
-        raise ConfigError("PyYAML is required for CLI output") from exc
-    return yaml.safe_dump(_plain(value), sort_keys=False,
+    except ImportError:
+        # JSON is an adequate presentation fallback in a recovery shell.
+        return json.dumps(plain, indent=2, sort_keys=False, default=str)
+    return yaml.safe_dump(plain, sort_keys=False,
                          default_flow_style=False).rstrip()
 
 
@@ -63,31 +58,53 @@ def cmd_check(args, cfg) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"Authenticated check failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        engine.close()
     print(_dump_yaml(result))
-    return 0
+    return 1 if result.get("edge_required") and not result.get("edge_ready") else 0
 
 
 def cmd_status(args, cfg) -> int:
-    result = _engine(cfg, light=True).status()
+    engine = _engine(cfg, light=True)
+    try:
+        result = engine.status()
+    finally:
+        engine.close()
     print(_dump_yaml(result))
-    return 0
+    return 1 if (result.get("auth_error") or
+                 (result.get("edge_required") and not result.get("edge_ready"))) else 0
 
 
 def cmd_run(args, cfg) -> int:
     engine = _engine(cfg)
+    previous = {}
+    def _stop(signum, _frame):
+        engine.request_shutdown(signal.Signals(signum).name)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.signal(signum, _stop)
     try:
         engine.run(max_cycles=args.cycles)
     except Exception as exc:  # noqa: BLE001
         print(f"run failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        engine.close()
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
     return 0
 
 
 def cmd_flatten(args, cfg) -> int:
+    engine = _engine(cfg, light=True)
     try:
-        _engine(cfg, light=True).flatten_all(args.reason)
+        complete = engine.flatten_all(args.reason)
     except Exception as exc:  # noqa: BLE001
         print(f"flatten failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.close()
+    if not complete:
+        print("flatten incomplete: residual paper positions remain", file=sys.stderr)
         return 1
     print("Flatten requested")
     return 0
@@ -98,8 +115,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=str(ROOT / "config.yaml"))
     p.add_argument("--env-file", default=None)
     sub = p.add_subparsers(dest="command", required=True)
-    check = sub.add_parser("check", help="validate config; no network by default")
-    check.add_argument("--authenticated", action="store_true", help="query account and broker clock")
+    check = sub.add_parser("check", help="validate config and authenticated paper connectivity")
+    auth = check.add_mutually_exclusive_group()
+    auth.add_argument("--authenticated", dest="authenticated", action="store_true",
+                      help="query account, broker clock, calendar and configured feeds (default)")
+    auth.add_argument("--offline", dest="authenticated", action="store_false",
+                      help="validate local configuration only; never use as a trading preflight")
+    check.set_defaults(authenticated=True)
     check.set_defaults(fn=cmd_check)
     status = sub.add_parser("status")
     status.set_defaults(fn=cmd_status)

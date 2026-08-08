@@ -11,14 +11,14 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from dataclasses import replace
 from typing import Any
 
 from .alpaca_domain import (Account, Asset, Bar, CalendarDay, MarketClock, Order,
                             OrderRequest, OptionContract, OptionSnapshot, Position,
-                            Quote)
+                            Quote, parse_occ_symbol)
 from .alpaca_session import normalize_calendar_day, paper_env_guard
 
 EQUITY_FEEDS = {"iex", "sip", "delayed_sip"}
@@ -94,6 +94,41 @@ def _dt(value: Any) -> datetime | None:
         return None
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        return dict(vars(value))
+    except (TypeError, ValueError):
+        return {name: getattr(value, name) for name in (
+            "symbol", "contract", "underlying_symbol", "underlying",
+            "expiration", "expiration_date", "expiry", "strike",
+            "strike_price", "type", "right", "option_type", "multiplier",
+            "contract_size", "volume", "open_interest", "latest_quote",
+            "quote", "latest_trade", "last_trade", "daily_bar",
+            "prev_daily_bar", "minute_bar", "timestamp", "bid_price",
+            "ask_price", "bid_size", "ask_size", "last_price", "greeks")
+            if hasattr(value, name)}
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+
+
+def _first(obj: Any, *names: str) -> Any:
+    """Return the first non-null field across SDK/mapping aliases."""
+    for name in names:
+        value = _value(obj, name)
+        if value is not None:
+            return value
+    return None
+
+
 def normalize_quote(value: Any, symbol: str | None = None, feed: str | None = None) -> Quote:
     return Quote(
         symbol=str(_value(value, "symbol", symbol) or symbol or "").upper(),
@@ -119,6 +154,7 @@ def normalize_bar(value: Any, symbol: str | None = None, feed: str | None = None
         trade_count=_value(value, "trade_count"),
         vwap=Decimal(str(_value(value, "vwap"))) if _value(value, "vwap") is not None else None,
         feed=_canonical_feed(feed or _value(value, "feed"), options=False),
+        atr=_decimal_or_none(_value(value, "atr")),
     )
 
 
@@ -140,9 +176,6 @@ class AlpacaSession:
         if not paper or allow_live:
             raise PaperModeError("live Alpaca trading is disabled; paper=true and allow_live=false are required")
         self.paper = True
-        # Kept as a compatibility attribute for callers that inspect it; it
-        # can never enable a live endpoint.
-        self.allow_live = False
         self._trading = trading_client
         self._stock_data = stock_data_client
         self._option_data = option_data_client
@@ -447,7 +480,8 @@ class AlpacaProvider:
             tif = getattr(TimeInForce, request.time_in_force.upper())
             cls = MarketOrderRequest if request.type == "market" else LimitOrderRequest
             qty = int(request.qty) if request.qty == request.qty.to_integral_value() else float(request.qty)
-            kwargs = {"symbol": request.symbol, "qty": qty, "side": side, "time_in_force": tif, "client_order_id": cid}
+            kwargs = {"symbol": request.symbol, "qty": qty, "side": side, "time_in_force": tif, "client_order_id": cid,
+                      "extended_hours": bool(request.extended_hours)}
             if request.limit_price is not None:
                 kwargs["limit_price"] = float(request.limit_price)
             if request.position_intent is not None:
@@ -589,30 +623,216 @@ class AlpacaProvider:
         if isinstance(raw, Mapping):
             rows = []
             for key, value in raw.items():
-                if isinstance(value, Mapping):
-                    row = dict(value); row.setdefault("symbol", key); rows.append(row)
-                else:
-                    rows.append(value)
+                row = _mapping(value)
+                row.setdefault("symbol", key)
+                rows.append(row)
         else:
             rows = raw
         result = []
         for row in rows or []:
-            symbol = str(_value(row, "symbol", "")).upper()
+            row = _mapping(row)
+            contract_value = _value(row, "contract")
+            symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
+            symbol = str(symbol_value or "").upper()
             quote = _value(row, "latest_quote", _value(row, "quote", row))
+            quote = _mapping(quote)
             contract = None
             contract_source = _value(row, "contract") or row
             try:
-                if _value(contract_source, "underlying_symbol") or _value(contract_source, "underlying"):
-                    contract_data = dict(contract_source) if isinstance(contract_source, Mapping) else vars(contract_source)
-                    contract_data.setdefault("symbol", symbol)
-                    contract = OptionContract.from_sdk(contract_data)
+                contract_data = _mapping(contract_source)
+                contract_data.setdefault("symbol", symbol)
+                # A chain response may return only the OCC key and quote;
+                # OptionContract.from_sdk handles this compact identity.
+                contract = OptionContract.from_sdk(contract_data)
             except (TypeError, ValueError):
                 contract = None
             def dec(name):
                 value = _value(quote, name)
                 return Decimal(str(value)) if value is not None else None
-            result.append(OptionSnapshot(symbol=symbol, contract=contract, bid=dec("bid_price"), ask=dec("ask_price"), bid_size=dec("bid_size"), ask_size=dec("ask_size"), last=dec("last_price"), timestamp=_dt(_value(quote, "timestamp", _value(row, "timestamp"))), volume=dec("volume"), open_interest=dec("open_interest"), feed=requested_feed, greeks=_value(row, "greeks", {}) or {}))
+            result.append(OptionSnapshot(
+                symbol=symbol, contract=contract, bid=dec("bid_price") if dec("bid_price") is not None else dec("bid"),
+                ask=dec("ask_price") if dec("ask_price") is not None else dec("ask"),
+                bid_size=dec("bid_size"), ask_size=dec("ask_size"),
+                last=dec("last_price") if dec("last_price") is not None else dec("last"),
+                timestamp=_dt(_value(quote, "timestamp", _value(row, "timestamp"))),
+                volume=dec("volume") if dec("volume") is not None else dec("day_volume"),
+                open_interest=dec("open_interest") if dec("open_interest") is not None else dec("oi"),
+                feed=requested_feed, greeks=_value(row, "greeks", {}) or {},
+                underlying_price=dec("underlying_price") if dec("underlying_price") is not None else dec("underlying_last")))
         return result
+
+    def option_candidates(self, underlying_symbol: str, *, now: datetime | float | None = None,
+                          underlying_price: Decimal | float | None = None,
+                          feed: str | None = None, min_dte: int | None = None,
+                          max_dte: int | None = None, **kwargs) -> list[dict[str, Any]]:
+        """Return auditable, risk-ready single-leg option candidates.
+
+        The trading API's option-contract endpoint is the source of truth for
+        identity (expiry, strike, right, multiplier).  The option-chain
+        endpoint contributes the latest quote, volume/open-interest and quote
+        timestamp.  Responses that contain only OCC symbols are parsed by
+        :func:`parse_occ_symbol`; this keeps malformed or incomplete rows
+        from being silently treated as eligible contracts.
+
+        ``quote_age_seconds`` is measured against ``now`` (UTC) and is kept in
+        the returned mapping so risk can fail closed on stale/future quotes.
+        No order is submitted by this method.
+        """
+        underlying = str(underlying_symbol or "").strip().upper()
+        if not underlying:
+            raise ValueError("underlying_symbol is required")
+        requested_feed = _canonical_feed(feed or self.options_feed, options=True)
+        if now is None:
+            now_dt = datetime.now(timezone.utc)
+        elif isinstance(now, datetime):
+            now_dt = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+            now_dt = now_dt.astimezone(timezone.utc)
+        else:
+            value = float(now)
+            if abs(value) > 100_000_000_000:
+                value /= 1000.0
+            now_dt = datetime.fromtimestamp(value, timezone.utc)
+
+        metadata: dict[str, OptionContract] = {}
+        try:
+            contracts = self.option_contracts(underlying, **kwargs)
+        except Exception:
+            # Some paper fakes and older SDK builds expose only the chain.
+            contracts = []
+        for contract in contracts:
+            if isinstance(contract, OptionContract):
+                metadata[contract.symbol.upper()] = contract
+
+        # Fetch once; option_snapshots remains a convenient public normalized
+        # view, but doing the flattening here avoids a second network request.
+        raw = self.option_chain(underlying, feed=requested_feed, **kwargs)
+        if isinstance(raw, Mapping):
+            rows = []
+            for key, value in raw.items():
+                row = _mapping(value); row.setdefault("symbol", key); rows.append(row)
+        else:
+            rows = [_mapping(value) for value in (raw or [])]
+
+        if underlying_price is None:
+            for row in rows:
+                value = (_value(_value(row, "latest_quote", _value(row, "quote", row)), "underlying_price") or
+                         _value(row, "underlying_price") or _value(row, "underlying_last"))
+                underlying_price = _decimal_or_none(value)
+                if underlying_price is not None:
+                    break
+        spot = _decimal_or_none(underlying_price)
+        candidates: list[dict[str, Any]] = []
+        for raw_row in rows:
+            row = _mapping(raw_row)
+            contract_value = _value(row, "contract")
+            symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
+            symbol = str(symbol_value or "").strip().upper()
+            if not symbol:
+                continue
+            contract_raw = _mapping(_value(row, "contract") or row)
+            contract = metadata.get(symbol)
+            if contract is None:
+                try:
+                    contract_data = dict(contract_raw)
+                    contract_data.setdefault("symbol", symbol)
+                    contract = OptionContract.from_sdk(contract_data)
+                except (TypeError, ValueError):
+                    occ = parse_occ_symbol(symbol)
+                    if occ is None:
+                        continue
+                    try:
+                        contract = OptionContract.from_sdk(occ)
+                    except (TypeError, ValueError):
+                        continue
+            if contract.underlying_symbol and contract.underlying_symbol != underlying:
+                continue
+            quote = _mapping(_value(row, "latest_quote", _value(row, "quote", row)))
+            daily_bar = _mapping(_value(row, "daily_bar", {}))
+            timestamp = _dt(_first(quote, "timestamp") if _first(quote, "timestamp") is not None else _first(row, "timestamp"))
+            age = None if timestamp is None else (now_dt - timestamp).total_seconds()
+            bid_raw = _first(quote, "bid_price", "bid")
+            ask_raw = _first(quote, "ask_price", "ask")
+            last_raw = _first(quote, "last_price", "last")
+            volume_raw = _first(quote, "volume", "day_volume")
+            oi_raw = _first(quote, "open_interest", "oi")
+            if bid_raw is None: bid_raw = _first(row, "bid_price", "bid")
+            if ask_raw is None: ask_raw = _first(row, "ask_price", "ask")
+            if last_raw is None: last_raw = _first(row, "last_price", "last")
+            if volume_raw is None: volume_raw = _first(row, "volume", "day_volume")
+            if volume_raw is None: volume_raw = _first(daily_bar, "volume", "v")
+            if oi_raw is None: oi_raw = _first(row, "open_interest", "oi")
+            if oi_raw is None: oi_raw = contract.open_interest
+            bid = _decimal_or_none(bid_raw)
+            ask = _decimal_or_none(ask_raw)
+            last = _decimal_or_none(last_raw)
+            volume = _decimal_or_none(volume_raw)
+            open_interest = _decimal_or_none(oi_raw)
+            expiry = contract.expiration_date
+            dte = None if expiry is None else (expiry - now_dt.date()).days
+            row_out: dict[str, Any] = {
+                "symbol": contract.symbol, "underlying_symbol": contract.underlying_symbol or underlying,
+                "underlying": contract.underlying_symbol or underlying,
+                "expiration": expiry.isoformat() if expiry else None,
+                "expiration_date": expiry, "dte": dte,
+                "strike": contract.strike_price, "strike_price": contract.strike_price,
+                "type": contract.option_type, "right": contract.option_type,
+                "option_type": contract.option_type, "multiplier": contract.multiplier,
+                "contract_size": contract.contract_size,
+                "bid": bid, "ask": ask, "last": last,
+                "bid_size": _decimal_or_none(_first(quote, "bid_size") if _first(quote, "bid_size") is not None else _first(row, "bid_size")),
+                "ask_size": _decimal_or_none(_first(quote, "ask_size") if _first(quote, "ask_size") is not None else _first(row, "ask_size")),
+                "quote_ts": timestamp, "timestamp": timestamp,
+                "quote_age_seconds": age, "quote_stale": age is None or age < 0,
+                "volume": volume, "open_interest": open_interest,
+                "feed": requested_feed, "side": "buy", "strategy": "single",
+                "position_intent": "buy_to_open",
+            }
+            if spot is not None and contract.strike_price is not None and spot > 0:
+                distance = abs(float(contract.strike_price) - float(spot)) / float(spot)
+                row_out["underlying_price"] = spot
+                row_out["moneyness"] = float(contract.strike_price) / float(spot)
+                row_out["moneyness_distance"] = distance
+            candidates.append(row_out)
+        if min_dte is not None:
+            candidates = [row for row in candidates if row.get("dte") is not None and row["dte"] >= int(min_dte)]
+        if max_dte is not None:
+            candidates = [row for row in candidates if row.get("dte") is not None and row["dte"] <= int(max_dte)]
+        return candidates
+
+    def close_position(self, symbol: str, qty: Decimal | float | None = None, *,
+                       client_order_id: str | None = None,
+                       order_type: str = "market", time_in_force: str = "day") -> Order | None:
+        """Submit one normalized closing order for an existing long position.
+
+        The hook intentionally refuses short options and never uses the SDK's
+        untyped ``close_position`` shortcut: an OCC symbol receives the
+        explicit ``sell_to_close`` intent while stock positions receive a
+        normal sell.  The caller can reconcile the returned order exactly as
+        any other :class:`Order`.
+        """
+        wanted = str(symbol or "").strip().upper()
+        if not wanted:
+            raise ValueError("position symbol is required")
+        held = next((position for position in self.positions()
+                     if str(position.symbol).upper() == wanted), None)
+        if held is None:
+            return None
+        position_qty = abs(Decimal(str(qty if qty is not None else held.qty)))
+        if position_qty <= 0:
+            return None
+        side = str(held.side).lower()
+        if side not in {"long", "buy"}:
+            if parse_occ_symbol(wanted) is not None:
+                raise AlpacaError("short option positions cannot be closed by the long-only hook")
+            close_side = "buy"
+        else:
+            close_side = "sell"
+        intent = "sell_to_close" if parse_occ_symbol(wanted) is not None else None
+        request = OrderRequest(wanted, position_qty, close_side, type=order_type,
+                               time_in_force=time_in_force,
+                               client_order_id=client_order_id,
+                               position_intent=intent)
+        return self.submit_order(request)
 
     def trade_updates(self, callback):
         """Connect an injected stream callback; reconciliation remains REST-backed."""
@@ -628,7 +848,10 @@ class AlpacaProvider:
 
     def reconcile_orders(self, client_order_ids=None) -> list[Order]:
         """REST reconciliation hook after a stream disconnect or timeout."""
-        rows = self.orders()
+        # Alpaca's default order query is open orders only.  Reconciliation
+        # needs recent terminal fills as well so a disappearing position can
+        # be attributed to its actual exit fill and paper P&L is not lost.
+        rows = self.orders(status="all")
         if client_order_ids is None:
             return rows
         wanted = set(client_order_ids)
@@ -636,7 +859,7 @@ class AlpacaProvider:
 
     def reconcile(self) -> dict[str, list[Any]]:
         """REST-backed startup/retry reconciliation snapshot."""
-        return {"positions": self.positions(), "orders": self.orders()}
+        return {"positions": self.positions(), "orders": self.orders(status="all")}
 
 
 # Clearer public name for new callers; ``AlpacaProvider`` remains canonical.

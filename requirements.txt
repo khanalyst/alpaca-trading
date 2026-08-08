@@ -1,8 +1,5 @@
 alpaca-py==0.43.5
 anthropic==0.117.1
 openai==2.46.0
-pandas==3.0.3
-numpy==2.5.1
 PyYAML==6.0.3
 python-dotenv==1.2.2
-requests==2.34.2

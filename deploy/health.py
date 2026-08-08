@@ -9,6 +9,15 @@ import time
 import urllib.request
 from pathlib import Path
 
+# ``python deploy/health.py ...`` sets ``sys.path[0]`` to ``deploy/`` rather
+# than the repository root.  Add the root explicitly so recovery shells and
+# Compose health checks do not depend on PYTHONPATH being preconfigured.
+import sys
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
 from deploy import load_config
 
 

@@ -15,10 +15,8 @@ httpx==0.28.1
 idna==3.18
 jiter==0.16.0
 msgpack==1.1.1
-numpy==2.5.1
 openai==2.46.0
 orjson==3.11.9
-pandas==3.0.3
 pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4

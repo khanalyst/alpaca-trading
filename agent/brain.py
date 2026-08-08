@@ -23,8 +23,7 @@ def prompt_version(system: str | None = None) -> str:
     return hashlib.sha256((system or SYSTEM).encode()).hexdigest()[:16]
 
 
-def build_system(cfg: Mapping[str, Any] | None = None, catalog=None) -> str:
-    del catalog
+def build_system(cfg: Mapping[str, Any] | None = None) -> str:
     cfg = cfg or {}
     strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
     risk = cfg.get("risk") if isinstance(cfg.get("risk"), Mapping) else {}
@@ -53,6 +52,7 @@ class DecisionBrain:
 
     def __init__(self, cfg: Mapping[str, Any], *, client=None, system: str | None = None):
         self.cfg = dict(cfg)
+        self.enabled = bool(self.cfg.get("enabled", False))
         self.system = system or build_system(cfg)
         self.prompt_version = prompt_version(self.system)
         self.client = client
@@ -64,33 +64,40 @@ class DecisionBrain:
         api_key = os.getenv("OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError("LLM credentials are unavailable; authenticated decisions cannot run")
+        base_url = self.cfg.get("base_url") or (
+            os.getenv("OPENAI_BASE_URL") if provider == "openai" else None)
         if provider == "openai":
             from openai import OpenAI
-            self.client = OpenAI(api_key=api_key)
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            self.client = OpenAI(**kwargs)
         elif provider == "anthropic":
             from anthropic import Anthropic
-            self.client = Anthropic(api_key=api_key)
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            self.client = Anthropic(**kwargs)
         else:
             raise ValueError(f"unsupported LLM provider {provider!r}")
         return self.client
 
     def decide(self, snapshot: Mapping[str, Any], portfolio: Mapping[str, Any]) -> dict:
+        if not self.enabled:
+            raise RuntimeError("LLM decisions are disabled; deterministic strategy is active")
         prompt = json.dumps({"snapshot": snapshot, "portfolio": portfolio}, default=str, sort_keys=True)
         provider = str(self.cfg.get("provider", "openai")).lower()
         client = self._client()
         if hasattr(client, "complete"):
             result = client.complete(system=self.system, prompt=prompt)
         elif provider == "openai":
-            response = client.chat.completions.create(model=self.cfg.get("model", "gpt-4o-mini"), temperature=self.cfg.get("temperature", .2), max_tokens=self.cfg.get("max_tokens", 2000), messages=[{"role": "system", "content": self.system}, {"role": "user", "content": prompt}])
+            response = client.chat.completions.create(model=self.cfg["model"], temperature=self.cfg.get("temperature", .2), max_tokens=self.cfg.get("max_tokens", 2000), messages=[{"role": "system", "content": self.system}, {"role": "user", "content": prompt}])
             result = response.choices[0].message.content
         else:
-            response = client.messages.create(model=self.cfg.get("model", "claude-3-5-sonnet"), max_tokens=self.cfg.get("max_tokens", 2000), temperature=self.cfg.get("temperature", .2), system=self.system, messages=[{"role": "user", "content": prompt}])
+            response = client.messages.create(model=self.cfg["model"], max_tokens=self.cfg.get("max_tokens", 2000), temperature=self.cfg.get("temperature", .2), system=self.system, messages=[{"role": "user", "content": prompt}])
             result = response.content[0].text
         parsed = _extract_json(result)
         decisions = parsed.get("decisions", [])
         if not isinstance(decisions, list):
             raise ValueError("model decisions must be a list")
         return {"decisions": decisions}
-
-
-Brain = DecisionBrain

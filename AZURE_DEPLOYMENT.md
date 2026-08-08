@@ -15,8 +15,8 @@ Before selecting **Delete with VM**, verify a tested, off-host copy of
 `runtime/`, `research/cache/`, `research/results/`, `findings/`, the reviewed
 configuration, and the deployed Git revision. A second directory on the same
 managed disk is not an off-host backup. Restore into a new VM, run compile and
-unit checks, run `main.py check`, and reconcile the Alpaca paper account before
-starting `alpaca-trader`.
+unit checks, run `main.py check` (authenticated by default), and reconcile the
+Alpaca paper account before starting `alpaca-trader`.
 
 For a non-Compose host, the legacy units are named `alpaca-recorder.service`,
 `alpaca-trader.service`, `alpaca-research.service`, and

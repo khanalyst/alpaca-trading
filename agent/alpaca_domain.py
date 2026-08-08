@@ -14,6 +14,50 @@ from typing import Any, Mapping
 import re
 
 
+_OCC_SYMBOL_RE = re.compile(r"^(?P<root>[A-Z0-9.]{1,8})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$")
+
+
+def parse_occ_symbol(symbol: Any) -> dict[str, Any] | None:
+    """Parse an OCC option symbol into provider-neutral contract metadata.
+
+    Alpaca normally supplies ``underlying_symbol``, expiry, strike and right
+    as separate fields.  Historical chain responses and test fixtures often
+    contain only the compact OCC symbol (for example
+    ``SPY260821C00600000``), so parsing it at the boundary prevents risk code
+    from guessing contract identity.  OCC strike values are expressed in
+    thousandths of a dollar.
+    """
+    raw = str(symbol or "").strip().upper().replace(" ", "")
+    match = _OCC_SYMBOL_RE.fullmatch(raw)
+    if match is None:
+        return None
+    parts = match.groupdict()
+    try:
+        expiry = date(2000 + int(parts["expiry"][:2]), int(parts["expiry"][2:4]), int(parts["expiry"][4:]))
+        strike = Decimal(parts["strike"]) / Decimal("1000")
+    except (TypeError, ValueError):
+        return None
+    return {"symbol": raw, "underlying_symbol": parts["root"],
+            "expiration_date": expiry, "strike_price": strike,
+            "option_type": "call" if parts["right"] == "C" else "put",
+            "contract_size": Decimal("100")}
+
+
+def _object_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    try:
+        return vars(value)
+    except TypeError:
+        # SDK model objects occasionally expose slots/properties only.
+        return {name: getattr(value, name) for name in (
+            "symbol", "asset_class", "class", "exchange", "status",
+            "tradable", "underlying_symbol", "underlying",
+            "expiration_date", "expiration", "strike_price", "strike",
+            "option_type", "right", "type", "contract_size", "multiplier",
+            "volume", "open_interest") if hasattr(value, name)}
+
+
 def _decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
     if value is None or value == "":
         return default
@@ -52,7 +96,7 @@ class Asset:
     def from_sdk(cls, value: Any) -> "Asset":
         if isinstance(value, cls):
             return value
-        data = value if isinstance(value, Mapping) else vars(value)
+        data = _object_mapping(value)
         symbol = str(data.get("symbol") or "").strip().upper()
         if not symbol:
             raise ValueError("asset is missing symbol")
@@ -83,7 +127,14 @@ class OptionContract(Asset):
 
     @classmethod
     def from_sdk(cls, value: Any) -> "OptionContract":
-        data = value if isinstance(value, Mapping) else vars(value)
+        data = dict(_object_mapping(value))
+        symbol = str(data.get("symbol") or "").strip().upper()
+        # OCC parsing is a fallback only; explicit provider metadata always
+        # wins so adjusted/non-standard contracts remain auditable.
+        occ = parse_occ_symbol(symbol)
+        if occ:
+            for key, fallback in occ.items():
+                data.setdefault(key, fallback)
         base = Asset.from_sdk(value)
         raw_expiry = data.get("expiration_date") or data.get("expiration")
         expiry = raw_expiry if isinstance(raw_expiry, date) else (
@@ -99,7 +150,7 @@ class OptionContract(Asset):
                 "symbol", "exchange", "status", "tradable",
                 "fractionable", "shortable", "easy_to_borrow", "marginable", "raw")},
             asset_class="us_option",
-            underlying_symbol=str(data.get("underlying_symbol") or data.get("underlying") or "").upper(),
+            underlying_symbol=str(data.get("underlying_symbol") or data.get("underlying") or (occ or {}).get("underlying_symbol") or "").upper(),
             expiration_date=expiry,
             strike_price=_decimal(data.get("strike_price") or data.get("strike")),
             option_type=option_type,
@@ -154,6 +205,7 @@ class OptionSnapshot:
     open_interest: Decimal | None = None
     feed: str = "indicative"
     greeks: Mapping[str, Any] = field(default_factory=dict)
+    underlying_price: Decimal | None = None
 
     @property
     def mid(self) -> Decimal | None:
@@ -174,6 +226,11 @@ class Bar:
     trade_count: int | None = None
     vwap: Decimal | None = None
     feed: str = "iex"
+    # Wilder ATR computed by the market adapter from bars through this bar's
+    # close.  It is deliberately optional at the provider boundary because
+    # the provider returns raw OHLCV; :mod:`agent.market` attaches it without
+    # ever consulting a future bar.
+    atr: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -217,11 +274,11 @@ class OrderRequest:
         if not symbol:
             raise ValueError("order symbol is required")
         object.__setattr__(self, "symbol", symbol)
-        side = str(self.side).lower()
+        side = _text(self.side).lower()
         if side not in {"buy", "sell"}:
             raise ValueError("order side must be buy or sell")
         object.__setattr__(self, "side", side)
-        order_type = str(self.type).lower()
+        order_type = _text(self.type).lower()
         if order_type not in {"market", "limit"}:
             raise ValueError(f"unsupported order type {self.type!r}")
         object.__setattr__(self, "type", order_type)
@@ -237,7 +294,9 @@ class OrderRequest:
         # side of integer quantities whenever an OCC right is recognizable.
         if re.fullmatch(r"[A-Z0-9.]{1,8}\d{6}[CP]\d{8}", symbol) and qty != qty.to_integral_value():
             raise ValueError("option order qty must be an integer number of contracts")
-        if self.time_in_force not in {"day", "gtc", "opg", "cls", "ioc", "fok"}:
+        tif = _text(self.time_in_force).lower()
+        object.__setattr__(self, "time_in_force", tif)
+        if tif not in {"day", "gtc", "opg", "cls", "ioc", "fok"}:
             raise ValueError(f"unsupported time_in_force {self.time_in_force!r}")
         if order_type == "limit" and (self.limit_price is None or Decimal(str(self.limit_price)) <= 0):
             raise ValueError("limit orders require a positive limit_price")

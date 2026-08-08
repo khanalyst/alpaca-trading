@@ -401,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--script", default="research/nightly.sh")
+    parser.add_argument("--script", default="deploy/research-cycle.sh")
     parser.add_argument("--status-file", default="runtime/health/research.json")
     parser.add_argument("--hour", type=int, default=3)
     parser.add_argument("--minute", type=int, default=0)

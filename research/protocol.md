@@ -18,7 +18,8 @@ Every replay must establish the following invariants:
 - a gap through a level fills at the gap open;
 - spread, slippage, and both-side fees are charged;
 - positions are force-flat before the session close;
-- equity and option books have separate samples, costs, and P&L.
+- equity and single-leg long-option books have separate samples, costs, and
+  P&L; multi-leg and short option structures are outside the protocol.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
 missing or partial opening range is `no trade`, not an imputed range. A missing
@@ -34,3 +35,28 @@ without this provenance are descriptive only and cannot pass a qualification
 gate. Walk-forward and held-out checks must be chronological. Paired baseline,
 placebo, and acceptance-floor checks are evaluated independently for each
 vehicle and may not pool option and underlying returns.
+
+## Autonomous edge lane
+
+The bounded registry in `research/variants.yaml` is the complete proposal
+surface for IBR. Each setting is evaluated as two independent vehicle arms.
+No arbitrary variant string is executable: `agent.edge` resolves only a
+pre-registered id whose SQLite candidate is `validated` or `champion`.
+
+Backtests and forward-shadow runs are persisted with immutable hashes and
+trade/evidence rows. The autonomous lane first evaluates the initial corpus as
+a backtest, then accepts only a later, unseen session tail for shadow
+evidence. Passing gates advance `candidate` -> `backtest_passed` -> `shadow` ->
+`validated`, after which champion selection is automatic; runtime entries stay
+blocked until a validated/champion record exists for the selected vehicle.
+A candidate cannot skip the lifecycle or silently move backwards. Paper
+outcomes are append-only and may demote a champion. Normal operation needs no
+manual promotion; explicit `edge promote`/rollback commands are supported only
+as audited controls subject to lifecycle/evidence rules. Demote, retire, and
+rollback are operator safety actions.
+
+Each transition requires a chronological fit/held-out boundary, minimum trades
+and sessions in each window, matched baseline deltas, cluster-level sign
+randomisation, family-level false-discovery correction, and a
+placebo/falsification comparison. Drawdown is persisted and used to rank
+otherwise qualified champions conservatively.

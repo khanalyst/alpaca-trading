@@ -3,7 +3,7 @@
 The package accepts normalized market records only and never places orders.
 """
 
-from .ibr import IBRConfig, IBRReplay, IBRResult, IBRTrade, replay_ibr
+from .ibr import IBRConfig, IBRResult, IBRTrade, replay_ibr
 from .market_data import (
     EventIdentity,
     NormalizationError,
@@ -17,7 +17,7 @@ from .market_data import (
 )
 
 __all__ = [
-    "EventIdentity", "IBRConfig", "IBRReplay", "IBRResult", "IBRTrade",
+    "EventIdentity", "IBRConfig", "IBRResult", "IBRTrade",
     "NormalizationError", "OptionContract", "OptionSnapshot", "QuoteSnapshot",
     "UnderlyingBar", "normalize_option_snapshot", "normalize_quote",
     "normalize_underlying_bar", "replay_ibr",
