@@ -23,7 +23,10 @@ REFINABLE_FAILURES = frozenset({
 
 @dataclass(frozen=True)
 class RefinementPolicy:
-    max_attempts: int = 2
+    # Shipped configuration permits one later attempt.  Keep the Python
+    # default aligned so callers that construct a policy implicitly cannot
+    # bypass that production budget.
+    max_attempts: int = 1
     max_variants_per_attempt: int = 2
     max_configurations_per_mechanism: int = 5
     relative_step: float = 0.10
@@ -139,17 +142,12 @@ def stage_initial_neighborhood(
         contract, max_variants=variant_budget,
         relative_step=policy.relative_step)
         if variant_budget else [])
-    store.ensure_capacity(1 + len(variants))
-    root = store.register_bounded(
-        proposal_mapping(contract), generation=generation, now=now)
+    registered_contracts = store.register_batch(
+        proposal_mapping(contract), variants,
+        generation=generation, now=now)
+    root = registered_contracts[0]
     mechanism_id_value = mechanism_identity(root)
-    registered = [root.contract_id]
-    for variant in variants:
-        child = store.register_variant(
-            variant, mechanism_id=mechanism_id_value,
-            parent_contract_id=root.contract_id, generation=generation,
-            refinement_attempt=0, now=now)
-        registered.append(child.contract_id)
+    registered = [item.contract_id for item in registered_contracts]
     return {
         "schema": "staged_neighborhood.v1",
         "mechanism_id": mechanism_id_value,

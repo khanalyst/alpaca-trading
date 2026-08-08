@@ -12,7 +12,7 @@ from copy import deepcopy
 
 from .forward_models import require_complete_contract
 from .registry import (LIVE_MIN_TIER, UnknownStrategy, live_eligible_ids,
-                       runnable_ids, spec_for)
+                       runnable_ids, spec_for, validate_contract_config)
 from .provider import normalize_provider_endpoint
 
 
@@ -91,7 +91,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
 
     strategy = _mapping(cfg.get("strategy"), "strategy")
     _keys(strategy, {
-        "id", "version", "signal_timeframe", "execution_mode",
+        "id", "version", "variant_id", "signal_timeframe", "execution_mode",
         "breakout_discriminator", "breakout_compression_max_atr_ratio",
         "allow_experimental_setups_in_demo", "setup_cooldown_minutes",
         "setup_memory_hours", "loss_reentry_min_minutes",
@@ -112,6 +112,10 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         if (not isinstance(strategy.get(key), str)
                 or not strategy[key].strip()):
             raise ConfigError(f"strategy.{key} must be a non-empty string")
+    if "variant_id" in strategy and (
+            not isinstance(strategy["variant_id"], str)
+            or not strategy["variant_id"].strip()):
+        raise ConfigError("strategy.variant_id must be a non-empty string")
     # The registry is authoritative for runnable strategies.
     try:
         spec = spec_for(strategy["id"])
@@ -314,6 +318,16 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
         raise ConfigError(
             "strategy.signal_timeframe must appear in cycle.timeframes")
 
+    # A named semantic variant is immutable.  Check it after normal field
+    # validation so a malformed number gets the precise config error above,
+    # while a stale 70/30 or payoff value is attributed to the exact variant
+    # rather than silently scored under the registered base contract.
+    if strategy.get("variant_id"):
+        try:
+            validate_contract_config(cfg)
+        except (KeyError, ValueError) as exc:
+            raise ConfigError(str(exc)) from None
+
     risk = _mapping(cfg.get("risk"), "risk")
     _keys(risk, {"max_leverage", "entry_leverage", "risk_per_trade_pct",
                  "experimental_risk_per_trade_pct",
@@ -446,7 +460,8 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             "execution.maker_first_enabled is true and mode is live. The "
             "maker-first entry path is the B7.5 experiment and is validated "
             "on demo; run `python research.py readiness` and see "
-            "research/plan/B7.5-record.md before enabling it against real "
+            "research/plan/maker-first-entry-boundary.md before enabling it "
+            "against real "
             "capital.")
     if execution.get("maker_first_wait_seconds") is not None:
         # Bounded well inside a 15m signal bar. A passive order must resolve
@@ -532,6 +547,7 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
                          "shadow_workers",
                          "experiment_candidate_batch_size",
                          "collector",
+                         "discovery",
                          "findings_store", "backup_target",
                          # Optional. Machine-authored mechanisms live in a
                          # separate append-only store so a proposed claim can
@@ -585,6 +601,32 @@ def validate_config(raw: dict, *, allow_shadow_strategy: bool = False) -> dict:
             if "workers" in collector:
                 _integer(collector, "workers", 1, 32,
                          "research.collector")
+        discovery = research.get("discovery")
+        if discovery is None:
+            discovery = {}
+        else:
+            discovery = _mapping(discovery, "research.discovery")
+        _keys(discovery, {
+            "enabled", "max_rows", "max_nodes", "max_depth", "max_window",
+            "discovery_artifacts", "discovery_results",
+        }, "research.discovery")
+        discovery.setdefault("enabled", True)
+        discovery.setdefault("max_rows", 50_000)
+        discovery.setdefault("max_nodes", 32)
+        discovery.setdefault("max_depth", 8)
+        discovery.setdefault("max_window", 256)
+        discovery.setdefault("discovery_artifacts",
+                             "research/results/discovery-artifacts")
+        discovery.setdefault("discovery_results", "research/results/discovery")
+        _boolean(discovery, "enabled", "research.discovery")
+        _integer(discovery, "max_rows", 1, 50_000, "research.discovery")
+        _integer(discovery, "max_nodes", 1, 32, "research.discovery")
+        _integer(discovery, "max_depth", 1, 8, "research.discovery")
+        _integer(discovery, "max_window", 1, 256, "research.discovery")
+        for key in ("discovery_artifacts", "discovery_results"):
+            if not isinstance(discovery[key], str) or not discovery[key].strip():
+                raise ConfigError(f"research.discovery.{key} must be a path string")
+        research["discovery"] = discovery
         if "paper_initial_balance_usdt" in research:
             _number(research, "paper_initial_balance_usdt", 100,
                     1_000_000_000, "research")

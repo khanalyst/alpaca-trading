@@ -25,6 +25,34 @@ from .stats import (INSUFFICIENT_SAMPLE, bootstrap_mean,
                     minimum_detectable_effect)
 
 
+def verified_round_trips(trades: list[dict]) -> list[dict]:
+    """Return only round trips whose funding was actually reconciled.
+
+    The caller may still retain and display the full matched ledger.  This
+    helper is the explicit boundary for inference: a funding forecast or a
+    legacy row with no settlement proof is never silently scored as zero.
+    """
+    return [trade for trade in trades or []
+            if trade.get("funding_complete") is True
+            and trade.get("r_multiple") is not None
+            and _finite_number(trade.get("r_multiple")) is not None]
+
+
+def _finite_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def score_matched_trades(trades: list[dict], label: str = "") -> dict:
+    """Score a matched ledger after fail-closed funding filtering."""
+    return score_returns(
+        [trade["r_multiple"] for trade in verified_round_trips(trades)],
+        label=label)
+
+
 def _number(value, default: float = 0.0) -> float:
     try:
         return float(value) if value is not None else default
@@ -146,7 +174,9 @@ def match_round_trips(events: list[dict]) -> tuple[list[dict], dict]:
             "funding_status": (
                 close.get("funding_status") or "legacy_unknown"),
             "funding_complete": (
-                close.get("funding_status") == "available"),
+                close.get("funding_status") in {
+                    "available", "verified_realized",
+                    "verified_no_settlement_due", "not_applicable"}),
             "open_fill_status": opened.get("fill_status"),
             "close_fill_status": close.get("fill_status"),
         })

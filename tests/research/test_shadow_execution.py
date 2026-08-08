@@ -132,7 +132,6 @@ class CoverageAndFreshnessTests(unittest.TestCase):
             open_position(deadline_ts=NOW + 60.0), row, now, self.cfg)
 
         self.assertIsNone(resolved)
-
     def test_stale_ticker_and_book_are_rechecked_at_open(self):
         for stale_field, expected in (
                 ("ticker_ts", "ticker is 11.0s old"),
@@ -151,6 +150,40 @@ class CoverageAndFreshnessTests(unittest.TestCase):
                 self.assertIn(expected, records[0].reason)
                 self.assertEqual(evaluator.store.paper_trades_for(
                     evaluator.scope_key, variant().variant_id), [])
+
+
+class FundingCoverageTests(unittest.TestCase):
+    def test_no_settlement_due_is_verified_without_a_forecast(self):
+        position = open_position(
+            funding_treatment="observed_realized_settlements",
+            cost_components={
+                "funding_interval_hours": 8.0,
+                "next_funding_minutes": 480.0,
+            },
+        )
+        status, reason = shadow.ShadowEvaluator._funding_coverage(
+            position, NOW + 60.0)
+        self.assertEqual(status, "verified_no_settlement_due")
+        self.assertIsNone(reason)
+
+    def test_due_settlement_without_realized_event_is_invalid(self):
+        position = open_position(
+            funding_treatment="observed_realized_settlements",
+            cost_components={
+                "funding_interval_hours": 8.0,
+                "next_funding_minutes": 0.0,
+            },
+        )
+        status, reason = shadow.ShadowEvaluator._funding_coverage(
+            position, NOW + 8 * 3600.0)
+        self.assertEqual(status, "missing")
+        self.assertIn("0/2", reason)
+
+    def test_non_funding_contract_is_explicitly_not_applicable(self):
+        status, reason = shadow.ShadowEvaluator._funding_coverage(
+            open_position(funding_treatment="none"), NOW + 8 * 3600.0)
+        self.assertEqual(status, "verified_no_settlement_due")
+        self.assertIsNone(reason)
 
 
 class MakerChronologyTests(unittest.TestCase):

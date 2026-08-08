@@ -365,8 +365,8 @@ in a market where t=2.6 has already been shown to arise from nothing.
 ## Reproduce
 
 ```bash
-python research/fetch_flow_data.py --out runtime/research/flow --days 32
-python research/analyse_flow.py --data runtime/research/data \
+python research/legacy/fetch_flow_data.py --out runtime/research/flow --days 32
+python research/legacy/analyse_flow.py --data runtime/research/data \
                                 --flow runtime/research/flow
 python research/record_flow.py  --out runtime/research/recorded
 ```

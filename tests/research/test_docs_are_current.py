@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[2]
 README = (REPO / "README.md").read_text(encoding="utf-8")
 SETUP = (REPO / "SETUP.md").read_text(encoding="utf-8")
 AZURE = (REPO / "AZURE_DEPLOYMENT.md").read_text(encoding="utf-8")
+DEPLOY = (REPO / "deploy" / "README.md").read_text(encoding="utf-8")
 OPERATIONS = (REPO / "OPERATIONS.md").read_text(encoding="utf-8")
 RESEARCH_README = (REPO / "research" / "README.md").read_text(encoding="utf-8")
 CANONICAL = (REPO / "research" / "AUTONOMOUS_RESEARCH.md").read_text(
@@ -40,7 +41,7 @@ CURRENT_DOCS = {
     "protocol": PROTOCOL,
     "strategy catalog": HYPOTHESES,
 }
-ALL_DOCS = "\n".join((README, SETUP, AZURE, *CURRENT_DOCS.values()))
+ALL_DOCS = "\n".join((README, SETUP, AZURE, DEPLOY, *CURRENT_DOCS.values()))
 
 
 def flowed(text: str) -> str:
@@ -297,13 +298,13 @@ class ResearchProtocolDocumentationTests(unittest.TestCase):
 
 
 class VersionClaimsTests(unittest.TestCase):
-    def test_the_documented_strategy_version_matches_the_register(self):
+    def test_the_documented_momentum_version_matches_the_registry(self):
         from agent import registry
 
         version = registry.spec_for("momentum").version
 
         self.assertIn(version, README,
-                      f"README does not mention the live version {version}")
+                      f"README does not mention momentum version {version}")
 
     def test_the_documented_version_matches_the_shipped_config(self):
         # Whichever strategy is configured, its version must be that
@@ -363,6 +364,78 @@ class CurrentPipelineClaimsTests(unittest.TestCase):
         for doc in (README, OPERATIONS, HYPOTHESES, CANONICAL):
             self.assertIn(f"schema {SCHEMA_VERSION}", doc.lower())
 
+    def test_retired_schema_16_is_not_current_prose(self):
+        for name, document in CURRENT_DOCS.items():
+            self.assertNotIn(
+                "schema 16", document.lower(),
+                f"{name} still describes the retired findings schema")
+
+    def test_shipped_mode_and_tuned_contract_are_exact(self):
+        variant_id = "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3"
+        for document, name in (
+                (README, "README"), (SETUP, "SETUP"),
+                (OPERATIONS, "OPERATIONS"),
+                (RESEARCH_README, "research/README"),
+                (CANONICAL, "canonical lifecycle"),
+                (HYPOTHESES, "strategy catalog")):
+            self.assertIn("shadow_only", document, f"{name} omits shipped mode")
+            self.assertIn(variant_id, document, f"{name} omits tuned identity")
+        for phrase in ("70/30", "1.5 ATR", "1 ATR", "3R",
+                       "80/20", "3 ATR", "2 ATR", "2R"):
+            self.assertIn(phrase, README_FLOWED)
+        self.assertIn("no positive edge", README_FLOWED)
+
+    def test_contract_drift_and_funding_quarantine_are_documented(self):
+        for document, name in (
+                (README, "README"), (RESEARCH_README, "research/README"),
+                (CANONICAL, "canonical lifecycle"),
+                (PROTOCOL, "protocol")):
+            normalized = flowed(document)
+            self.assertIn("StrategyContract", normalized,
+                          f"{name} omits the canonical contract")
+            self.assertIn("semantic hash", normalized,
+                          f"{name} omits semantic identity")
+            self.assertIn("quarant", normalized,
+                          f"{name} omits drift quarantine")
+            self.assertIn("verified_realized", normalized)
+            self.assertIn("verified_no_settlement_due", normalized)
+
+    def test_event_plane_and_discovery_boundary_are_documented(self):
+        for document, name in (
+                (README, "README"), (SETUP, "SETUP"),
+                (OPERATIONS, "OPERATIONS"),
+                (RESEARCH_README, "research/README"),
+                (CANONICAL, "canonical lifecycle"),
+                (PROTOCOL, "protocol")):
+            self.assertIn("event-plane.v1", document,
+                          f"{name} omits event-plane schema")
+            self.assertIn("forward_feed_version", document,
+                          f"{name} must distinguish feed version 8")
+        for command in ("ingest-recorded", "discover"):
+            self.assertIn(f"research.py {command}", README)
+            self.assertIn(f"research.py {command}", OPERATIONS)
+        event_docs = flowed(README + OPERATIONS + RESEARCH_README + CANONICAL
+                            + PROTOCOL).lower()
+        for phrase in ("receipt", "availability", "revision", "raw csv",
+                       "as-of", "quarant"):
+            self.assertIn(phrase, event_docs)
+        nightly = (REPO / "research" / "nightly.sh").read_text(encoding="utf-8")
+        self.assertLess(nightly.index("research.py ingest-recorded"),
+                        nightly.index("research.py discover"))
+        for phrase in ("typed", "AST-verified", "counterfactual",
+                       "world model", "source-event digests",
+                       "non-authorizing"):
+            self.assertIn(phrase.lower(), CANONICAL_FLOWED.lower())
+
+    def test_operational_histories_and_backup_scope_are_documented(self):
+        for phrase in ("heartbeat.history.jsonl",
+                       "runtime/health/research.history.jsonl",
+                       "runtime/research/market_events.db",
+                       "recorded_archive", "discovery artifacts",
+                       "SQLite integrity", "JSON/JSONL", "secret exclusions"):
+            self.assertIn(phrase, README + SETUP + OPERATIONS + RESEARCH_README
+                          + CANONICAL)
+
     def test_nightly_order_and_failure_semantics_are_documented(self):
         for phrase in ("readiness", "proposal-fidelity", "forward qualification",
                        "review-staged", "research-loop", "author",
@@ -371,11 +444,12 @@ class CurrentPipelineClaimsTests(unittest.TestCase):
             self.assertIn(phrase, OPERATIONS)
         ordered = (
             "readiness", "proposal-fidelity replay", "forward qualification",
+            "ingest-recorded", "bounded research-only discovery",
             "review-staged", "prepare-handoff", "tournament", "verified backup",
         )
-        workflow = OPERATIONS.split(
+        workflow = flowed(OPERATIONS.split(
             "## 3. Nightly workflow and exit behavior", 1)[1].split(
-                "Exact exit behavior:", 1)[0]
+                "Exact exit behavior:", 1)[0])
         positions = [workflow.index(phrase) for phrase in ordered]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("makes the nightly child nonzero", flowed(OPERATIONS))
@@ -446,7 +520,7 @@ class ResearchLayerIsDocumentedTests(unittest.TestCase):
 class AutonomousLifecycleDocumentationTests(unittest.TestCase):
     def test_authority_chain_is_complete_and_ordered(self):
         stages = (
-            "market snapshot", "deterministic decision",
+            "market snapshot", "deterministic shadow decision",
             "isolated paper evidence", "paired qualification",
             "bounded LLM authoring/refinement",
             "human-reviewed registration handoff", "reviewed demo run",
@@ -605,6 +679,13 @@ class VariantScorecardsAreCurrentTests(unittest.TestCase):
                 self.assertIn(
                     f"({variant.strategy_id}/{variant.variant_id}.md)", text)
 
+    def test_the_tuned_ls_scorecard_makes_no_edge_claim(self):
+        path = (self.findings / "ls-ratio-fade" /
+                "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3.md")
+        card = flowed(path.read_text(encoding="utf-8")).lower()
+        for phrase in ("unproven", "research-only", "no positive"):
+            self.assertIn(phrase, card)
+
     def test_the_index_links_every_document_beside_it(self):
         """The generator rewrites this file; it must not orphan an audit."""
         from research import findings as findings_mod
@@ -659,10 +740,14 @@ class DeploymentDocTests(unittest.TestCase):
                 (REPO / "deploy" / unit).exists(),
                 f"AZURE_DEPLOYMENT.md names {unit}, which is not in deploy/")
 
-    def test_the_recorder_is_started_before_the_trader(self):
-        """Every hour it is off is data OKX will never serve again."""
-        self.assertLess(AZURE.index("enable --now okx-recorder"),
-                        AZURE.index("enable --now okx-trader"))
+    def test_the_recorder_is_observable_but_not_a_startup_dependency(self):
+        """A collection gap is serious, but it cannot silently gate runtime."""
+        self.assertIn("does not block", flowed(AZURE))
+        self.assertIn("no recorder dependency", DEPLOY.lower())
+        compose = yaml.safe_load((REPO / "compose.yaml").read_text())
+        for service in ("trader", "research"):
+            dependencies = compose["services"][service].get("depends_on") or {}
+            self.assertNotIn("recorder", dependencies)
 
 
 if __name__ == "__main__":

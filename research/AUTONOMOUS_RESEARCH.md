@@ -8,29 +8,35 @@ belongs in [`../SETUP.md`](../SETUP.md), operations in
 rules in [`protocol.md`](protocol.md).
 
 No current strategy is a proven edge or qualified for live capital. The
-shipped `demo` account runs `ls-ratio-fade/v1` in `deterministic` mode as an
-operations rehearsal and evidence-collection path. It is registered as a
-hypothesis, not as a profitable result.
+shipped account mode remains `demo`, but `strategy.execution_mode` is
+`shadow_only`: no order, LLM, or deterministic entry path is active. The
+configured `ls-ratio-fade/v1` tuned identity is research-only and remains an
+unproven hypothesis.
 
 ## The authority chain
 
 The lifecycle is deliberately one-way:
 
-`market snapshot → deterministic decision → isolated paper evidence → paired
-qualification → bounded LLM authoring/refinement → human-reviewed registration
-handoff → reviewed demo run → explicit human live approval`
+`market snapshot → deterministic shadow decision → isolated paper evidence →
+paired qualification → bounded LLM authoring/refinement → human-reviewed
+registration handoff → optional reviewed demo run → explicit human live
+approval`
 
 Those arrows are authority boundaries, not just processing stages:
 
-1. The engine records one timestamped market snapshot. The configured strategy
-   may reach the demo exchange; research evaluators have no exchange object.
-2. Deterministic contracts emit long and short proposals before risk policy is
-   applied. The shipped long/short-ratio contract goes long when an
-   instrument's own 30-day ratio percentile is at least 70 and its one-hour
-   trend is not down; it goes short at or below 30 when that trend is not up.
-   Entry is refused beyond 1.5 ATR from the one-hour EMA. The registered paper
-   outcome contract uses a two-ATR minimum structure stop, a fixed 2R target,
-   observed costs/funding, and a 48-hour outer hold.
+1. The engine records one timestamped market snapshot. In shipped
+   `shadow_only` mode no strategy reaches the demo exchange; research
+   evaluators have no exchange object.
+2. Deterministic shadow contracts emit long and short paper proposals before
+   risk policy is applied. The registered long/short-ratio base contract uses
+   80/20 within-instrument percentile tails, a 3 ATR extension cap, a two-ATR
+   minimum structure stop, fixed 2R target, observed costs/funding, and a
+   48-hour outer hold. The explicit
+   `ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3` research variant uses
+   70/30 tails, a 1.5 ATR extension cap, a 1 ATR stop, and a 3R target; it is
+   unproven, research-only, and not a promotion. It is a pinned isolated paper
+   arm with its own account and is never an adaptive one-axis selector
+   candidate.
 3. Every research arm owns isolated cash, positions, decisions, trades, risk,
    cooldowns, and circuit breakers. Eligible vetoes are explicit zero-return
    decisions; missing or unresolved observations are not silently converted
@@ -60,9 +66,9 @@ Those arrows are authority boundaries, not just processing stages:
 
 `strategy.execution_mode` has three meanings:
 
-- `deterministic` (shipped): the registered forward contract proposes orders;
-  engine startup does not construct or preflight an LLM client and no `:llm`
-  research lane exists;
+- `deterministic`: the registered forward contract proposes orders; engine
+  startup does not construct or preflight an LLM client and no `:llm` research
+  lane exists;
 - `analyst`: the momentum analyst proposes on the order path and the exact
   analyst decisions may be recorded in a separate `:llm` scope;
 - `shadow_only`: there is no order path, while research lanes may continue.
@@ -74,7 +80,8 @@ never be relabeled as analyst evidence.
 
 The shipped config still names an LLM provider/model because the independent
 nightly author and reviewer may use it. That does not make an LLM a runtime
-dependency for deterministic or shadow-only trader startup.
+dependency for the shipped `shadow_only` startup. No order or deterministic
+entry path is enabled until an operator explicitly changes the mode.
 
 ## Current strategy inventory
 
@@ -88,8 +95,8 @@ against `agent/registry.py`.
 - `funding-unwind`, `trend-multiday`, `ls-ratio-fade`, and `scalp-maker` remain
   hypotheses. `funding-unwind` and `trend-multiday` have long horizons, and
   `funding-carry` is also offline-only despite having an executable forward
-  model. `ls-ratio-fade` is the active deterministic demo strategy by
-  elimination, not promotion.
+  model. The tuned `ls-ratio-fade` identity is configured for shadow research
+  by elimination, not promoted to an order path.
 - `funding-carry` holds while funding pays and exits when the 30-day funding
   percentile normalizes to 50, or on its stop/ten-day timeout. It has no price
   target. `funding-unwind` is a different directional claim and retains a fixed
@@ -99,7 +106,7 @@ The runtime trading universe is the top 25 qualifying instruments. The
 standalone recorder may scan up to 50 instruments, and the nightly historical
 download currently caps a fresh snapshot at 26 symbols. These are separate
 purposes and must not be described as one universe. Current FindingsStore data
-uses schema 16 and current realtime evidence uses `forward_feed_version: 8`;
+uses schema 17 and current realtime evidence uses `forward_feed_version: 8`;
 older feed identities remain historical and are never pooled into the current
 population.
 
@@ -138,6 +145,14 @@ can retire early; passing an early screen can never promote.
 
 ## Contract and economic fidelity
 
+`StrategyContract` is the canonical composite of registry strategy spec,
+forward-model economics/exit, evidence builder, immutable variant identity,
+and semantic hash. Startup rejects a named variant whose effective
+configuration has drifted. Evidence ingest retains missing or mismatched legacy
+rows for audit but quarantines them from inference. Funding is also
+fail-closed: only `verified_realized` and `verified_no_settlement_due` outcomes
+may enter inference, qualification, or authoring metrics.
+
 Paper evidence is attributable only when the strategy contract, forward
 outcome model, executable configuration, code identity, dataset, runtime,
 command, and outputs are bound before the outcome is known. Forward models fix
@@ -149,10 +164,15 @@ mark-price fiction. It records entry and exit fees, observed spread treatment,
 depth-derived fill economics, stop slippage, and realized funding settlements.
 The R denominator uses the same all-in planned-loss components as runtime risk
 sizing. An absent book or required field is a data refusal, not a cheap fill.
-For one-minute outcome replay, bars must be strictly ordered and contiguous
-after the signal/entry boundary. A missing minute returns `no_data` with zero
-held duration, costs, funding, and risk; it cannot manufacture a timeout. If a
-single minute touches stop and target, the stop wins.
+For one-minute outcome replay, confirmed `execution_bar_1m` bars must be
+strictly ordered and contiguous after the signal/entry boundary. A missing
+minute returns `no_data` with zero held duration, costs, funding, and risk; a
+direct timeout requires full horizon coverage and cannot be manufactured from
+the last partial bar. If a single minute touches stop and target, the stop wins.
+The observable normalization path is evaluated from those persisted bars;
+long/short direction comes from the evidence-derived episode identity.
+Price-cache ranges use an end-exclusive `end_ms`; a bar exactly at the end
+boundary belongs to the next request, not this window.
 
 Evidence packages use `research-evidence-package.v1`. The manifest
 content-addresses the exact dataset and coverage, provenance class, code tree,
@@ -160,9 +180,10 @@ strategy and forward contracts, config identity, fees/slippage/funding,
 prompt applicability and provider/model when relevant, runtime, argv, outputs,
 timestamps, and parent evidence IDs. Blob, code, config, coverage, or manifest
 drift fails verification. `parent_evidence_ids` make derivations recursively
-traceable by content ID; every referenced parent remains a separate package
-that must also be retained and verified rather than trusting a label. Synthetic
-fixtures cannot be relabeled as real-market evidence.
+traceable by content ID; verification recursively verifies every referenced
+parent package, which must remain a separate package that is retained and
+verified rather than trusting a label. Synthetic fixtures cannot be relabeled as
+real-market evidence.
 
 Useful verification commands:
 
@@ -180,6 +201,40 @@ Useful verification commands:
 
 The checked-in golden replay is explicitly synthetic. It proves deterministic
 replay behavior, not market profitability.
+
+## Recorded event plane and bounded discovery
+
+The recorder adds local receipt (`observed_at`/`available_at`), source, feed,
+schema, payload revision, and quality metadata without inferring missing legacy
+timestamps. Confirmed `execution_bar_1m` rows are joined into episodes only
+after the signal feature cutoff, using a later bounded outcome cutoff for bars
+and funding. Direction is derived from the persisted episode evidence rather
+than a scalar outcome. `research.py ingest-recorded` builds
+`runtime/research/market_events.db` as the separate `event-plane.v1` view,
+archives content-addressed raw CSV snapshots, applies strict event-time and
+availability-time as-of filtering, and quarantines malformed, contradictory,
+or legacy rows. The nightly path ingests before discovery. Missing recorder
+input is the nonfatal `NO_DATA` state, and recorder health does not gate trader
+or research startup. `forward_feed_version` remains 8; it is not the event
+plane schema version.
+
+`research.py discover` evaluates a bounded typed IR and generated,
+AST-verified evaluator. The initial family uses persisted open-interest,
+taker-volume, and book fields for a forced-flow-pressure observable, binds a
+causal claim/falsifier and fixed mechanism-aligned `ExitProfile`, runs verified
+funding/cost/episode counterfactuals, fits only a small empirical world model,
+and records exact source-event digests in content-addressed artifacts. Candidate
+progression and Findings analysis are append-only and non-authorizing.
+`IDLE`, `NO_DATA`, and `NO_STATE_DATA` cannot change registry, configuration,
+tier, or order state. A `COMPLETE` result remains research-only: scalar or
+mixed scalar/non-episode rows cannot complete a counterfactual, and no
+discovery result grants registry/config/demo/live authority.
+
+The protocol and shortlist share the policy-neutral primitives in
+`research/evidence_primitives.py` for canonical opportunity identity,
+duplicate-safe indexing, chronological splitting, and pair/union coverage.
+Their lane policies remain distinct, but neither may silently change the
+opportunity identity or resurrect a duplicate.
 
 ## Bounded authoring and refinement
 
@@ -202,6 +257,8 @@ negative expectancy, held-out failure, or never firing. It changes one scalar
 threshold toward a bounded neighbor, records parent configuration and attempt,
 and is idempotent across scheduler retries. Inactive/starved lanes expire to
 release capacity without claiming that the market mechanism was falsified.
+Initial staged family registration publishes the root and all bounded
+configurations atomically; a failed child validation leaves no partial family.
 
 Prepare a supported staged handoff with:
 
@@ -215,6 +272,14 @@ Artifacts default to `research/results/staged-handoffs/sha256-<digest>.json`.
 Rerunning unchanged evidence returns the existing artifact. Preparation reads
 a consistent findings snapshot and does not mutate findings, source, registry,
 or configuration.
+
+For recorded discovery, `research.py prepare-discovery-handoff` is a separate
+human checkpoint. It verifies the persisted `COMPLETE` result, typed artifact,
+contract identity, event evidence, and content hashes, then writes an
+idempotent packet under `research/results/discovery-handoffs/`. The packet is
+content-addressed and carries `HUMAN_DECISION_REQUIRED`; registry, config,
+code, demo, and live authority/mutation fields are all false. Missing or
+ineligible discovery evidence is a nonfatal nightly state.
 
 ## Scheduler and health truth
 
@@ -230,13 +295,27 @@ provider failure, retry-pending review, or partial review makes the effective
 job status nonzero even if a wrapper returned zero. Status becomes `waiting`,
 `running`, `completed`, `failed`, `timed_out`, or `stopped`; job identity,
 deadline, exit code and structured failures persist in
-`runtime/health/research.json`.
+`runtime/health/research.json`, with bounded redacted append-only history in
+`runtime/health/research.history.jsonl`. Trader heartbeat writes the same
+latest-value/history pair through `heartbeat.json` and
+`heartbeat.history.jsonl`.
 
 The research health probe is green only for a fresh `waiting`, `running`, or
 `completed` heartbeat with no nonzero last exit and no run past its deadline.
 Trader health also fails when research is expected but unavailable or when any
 per-strategy shadow evaluator reports an error. Research failure is visible but
 does not restart or stop the separate trader service.
+
+An automatic nightly run with no eligible discovery result (including no
+persisted COMPLETE result to hand off) is nonfatal and remains an explicit
+research status. Parser, artifact-integrity, or content-address failures are
+different: they fail closed and make the child nonzero.
+
+Verified backups include findings/journal/event-plane SQLite snapshots, raw
+recorder data and archives, completed immutable market snapshots, runtime
+identity, heartbeat/status/failed-alert histories, discovery artifacts, and
+research results. Verification checks payload hashes, JSON/JSONL parsing,
+SQLite integrity/foreign keys, and secret exclusions.
 
 ## Human checkpoints
 
@@ -253,3 +332,8 @@ variant, scope, reviewed packet reference, and expected demo account
 fingerprint. Moving from that rehearsal to live remains an explicit human
 approval and configuration deployment. Nothing in the scheduler, authoring
 loop, handoff generator, evidence package, or demo run performs that move.
+
+The maker-first passive-entry primitive is a demo-only measurement boundary,
+distinct from the `scalp-maker` shadow strategy. Its fill/cancel/timeout
+evidence must be collected and reviewed before any live-mode consideration;
+configuration rejects maker-first in live mode.

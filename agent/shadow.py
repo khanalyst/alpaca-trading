@@ -130,8 +130,47 @@ def _model_for(strategy_id: str):
 
 
 def _variant_runtime(variant: Variant, base_cfg: dict) -> tuple[dict, object, dict]:
-    cfg = apply(variant, base_cfg, allow_shadow_strategy=True)
-    model = _model_for(variant.strategy_id)
+    variant_base = base_cfg
+    # The shipped config carries the coupled tuned identity.  Ordinary
+    # selector arms must start from the registered base, otherwise applying a
+    # one-axis override would either inherit tuned semantics or fail only
+    # after scoring began.  Keep the tuned arm itself on its exact identity.
+    if (variant.strategy_id != STAGED_STRATEGY_ID
+            and variant.variant_id != strategy_registry.TUNED_LS_VARIANT_ID
+            and str((base_cfg.get("strategy") or {}).get("variant_id") or "")
+            == strategy_registry.TUNED_LS_VARIANT_ID):
+        variant_base = deepcopy(base_cfg)
+        spec = strategy_registry.spec_for(variant.strategy_id)
+        model_base = require_complete_contract(variant.strategy_id)
+        block = dict(variant_base["strategy"])
+        block.update(spec.contract_params)
+        block.update({
+            "id": spec.id,
+            "version": spec.version,
+            "signal_timeframe": spec.signal_timeframe,
+            "variant_id": strategy_registry.baseline_variant_id(spec.id),
+            "min_stop_atr_multiple": model_base.stop_atr_multiple,
+            "fixed_reward_risk": model_base.reward_risk,
+            "forward_horizon_hours": model_base.horizon_hours,
+        })
+        variant_base["strategy"] = block
+    cfg = apply(variant, variant_base, allow_shadow_strategy=True)
+    if variant.strategy_id == STAGED_STRATEGY_ID:
+        model = STAGED_HARNESS
+        contract_hash = _content_hash(model.as_dict())
+    else:
+        # Resolve the composite contract when this is an immutable semantic
+        # variant; ordinary one-axis arms retain the registered model but are
+        # still fingerprinted against the canonical base contract.
+        try:
+            composite = strategy_registry.contract_for_variant(
+                variant.strategy_id, cfg["strategy"].get("variant_id"))
+            model = composite.outcome_model
+            contract_hash = composite.semantic_hash
+        except ValueError:
+            composite = strategy_registry.contract_for(variant.strategy_id)
+            model = _model_for(variant.strategy_id)
+            contract_hash = composite.semantic_hash
     provenance = {
         "variant_definition_hash": variant_identity_hash(variant),
         "strategy_config_version": runtime_state.experiment_fingerprint(cfg),
@@ -139,13 +178,19 @@ def _variant_runtime(variant: Variant, base_cfg: dict) -> tuple[dict, object, di
         "code_version": runtime_state.code_fingerprint(),
         "forward_model_id": model.model_id,
         "forward_model_assumptions_hash": _content_hash(model.as_dict()),
+        "strategy_contract_hash": contract_hash,
+        "strategy_contract_variant_id": str(
+            cfg["strategy"].get("variant_id")
+            or composite.variant_id if variant.strategy_id != STAGED_STRATEGY_ID
+            else variant.variant_id),
     }
     return cfg, model, provenance
 
 
 def _identity_bundle(baseline: dict, candidate: dict) -> tuple[dict, dict]:
     code_keys = {
-        "code_version", "forward_model_id", "forward_model_assumptions_hash"}
+        "code_version", "forward_model_id", "forward_model_assumptions_hash",
+        "strategy_contract_hash", "strategy_contract_variant_id"}
     config_keys = {
         "variant_definition_hash", "strategy_config_version",
         "experiment_config"}
@@ -177,7 +222,8 @@ class ShadowEvaluator:
             rotation_min_duration_seconds: float = 10 * 86_400,
             rotation_min_observations: int = 100,
             rotation_batch_size: int = DEFAULT_ROTATION_BATCH_SIZE,
-            rotation_hard_cap: int = MAX_ROTATION_CANDIDATES) -> None:
+            rotation_hard_cap: int = MAX_ROTATION_CANDIDATES,
+            pinned_variants: list[Variant] | None = None) -> None:
         self.budget_ms = float(budget_ms)
         self.base_cfg = base_cfg
         self.scope_key = str(scope_key)
@@ -204,6 +250,11 @@ class ShadowEvaluator:
         self._models = {}
         self._provenance: dict[str, dict] = {}
         self._variants: dict[str, Variant] = {}
+        # Pinned arms are durable paper portfolios that are intentionally not
+        # members of adaptive one-axis rotation. The shipped tuned
+        # ls-ratio-fade identity is the first such arm: its coupled settings
+        # are an immutable contract, not a selector axis.
+        self._pinned_variant_ids: set[str] = set()
         self.registration_errors: dict[str, str] = {}
         self.last_coverage: dict = {}
         self._rotation_enabled = rotation_baseline is not None
@@ -220,8 +271,11 @@ class ShadowEvaluator:
         self._rotation_batch_size = min(
             self._rotation_batch_size, self._rotation_hard_cap)
         # One shared baseline plus at most eight candidate accounts is the
-        # resource envelope for a strategy rotation.
-        self._rotation_resource_cap = 1 + self._rotation_hard_cap
+        # resource envelope for a strategy rotation. Pinned arms are fixed
+        # research accounts outside that candidate cap, but still consume a
+        # durable account slot and are reflected in the telemetry envelope.
+        self._rotation_resource_cap = (
+            1 + self._rotation_hard_cap + len(pinned_variants or []))
         self._rotation_batch_id: str | None = None
         self._rotation_min_duration_seconds = float(
             rotation_min_duration_seconds)
@@ -245,6 +299,16 @@ class ShadowEvaluator:
             except Exception as exc:                       # noqa: BLE001
                 self.registration_errors[rotation_baseline.variant_id] = str(exc)
                 raise
+            for variant in pinned_variants or []:
+                if not isinstance(variant, Variant):
+                    raise TypeError(
+                        "pinned shadow variants must be Variant instances; got "
+                        f"{type(variant).__name__}")
+                try:
+                    self._enroll_variant(variant)
+                    self._pinned_variant_ids.add(variant.variant_id)
+                except Exception as exc:                   # noqa: BLE001
+                    self.registration_errors[variant.variant_id] = str(exc)
             for candidate in rotation_candidates or []:
                 try:
                     self._add_rotation_candidate(candidate)
@@ -281,6 +345,10 @@ class ShadowEvaluator:
             raise TypeError("rotation candidate requires a Variant")
         if variant.strategy_id != self._rotation_baseline.strategy_id:
             raise ValueError("rotation candidate strategy does not match baseline")
+        if variant.variant_id == strategy_registry.TUNED_LS_VARIANT_ID:
+            raise ValueError(
+                "the immutable tuned ls-ratio-fade arm is pinned outside "
+                "one-axis rotation")
         proposal = candidate.get("proposal")
         declared = self._declared_setting(variant, proposal)
         if declared is None:
@@ -317,6 +385,12 @@ class ShadowEvaluator:
             return descriptor
         stored = self.store.variant(assignment["candidate_variant_id"])
         if stored is None:
+            return None
+        if (str(stored.get("variant_id") or "")
+                == strategy_registry.TUNED_LS_VARIANT_ID):
+            # A stale store may contain an assignment from before the tuned
+            # identity was promoted to a pinned arm. Never rehydrate that
+            # coupled bundle as an adaptive candidate.
             return None
         proposal = (self.store.hypothesis_proposal(assignment["proposal_id"])
                     if assignment.get("proposal_id") else None)
@@ -527,7 +601,8 @@ class ShadowEvaluator:
         self._rotation_batch_id = (
             str(ordered[0].get("batch_id"))
             if ordered and ordered[0].get("batch_id") else None)
-        self._active_rotation_ids = {baseline_id} | current_ids
+        self._active_rotation_ids = ({baseline_id} | current_ids
+                                     | self._pinned_variant_ids)
 
     def _proposal_lifecycle(
             self, proposal: dict, status: str, detail: dict,
@@ -577,7 +652,8 @@ class ShadowEvaluator:
     def _advance_variant_ids(self) -> list[str]:
         if not self._rotation_enabled:
             return self.variant_ids
-        return sorted(self._active_rotation_ids | self._retired_variant_ids)
+        return sorted(self._active_rotation_ids | self._retired_variant_ids
+                      | self._pinned_variant_ids)
 
     def held_symbols(self) -> list[str]:
         """Symbols required to mark or close local positions after reranking."""
@@ -679,6 +755,10 @@ class ShadowEvaluator:
                 proposals_by_variant[candidate_id] = (
                     recorded_opens
                     if assignment.get("status") != "DRAINING" else [])
+            # Pinned paper arms observe the same proposal stream but never
+            # receive an experiment assignment or selector lifecycle.
+            for pinned_id in self._pinned_variant_ids:
+                proposals_by_variant[pinned_id] = recorded_opens
         else:
             proposals_by_variant = {
                 variant_id: recorded_opens for variant_id in self.variant_ids}
@@ -816,8 +896,9 @@ class ShadowEvaluator:
                 for assignment in self._rotation_assignments.values()
                 if assignment["status"] not in {"COMPLETED", "REJECTED"}
             }
-            self._active_rotation_ids = {
-                self._rotation_baseline.variant_id} | set(active)
+            self._active_rotation_ids = (
+                {self._rotation_baseline.variant_id} | set(active)
+                | self._pinned_variant_ids)
             ordered = sorted(
                 active.values(),
                 key=lambda item: (
@@ -1156,6 +1237,37 @@ class ShadowEvaluator:
         position["funding_events"] = [
             existing[key] for key in sorted(existing)]
 
+    @staticmethod
+    def _funding_coverage(position: dict, exit_ts: float) -> tuple[str, str | None]:
+        """Classify realized-funding coverage without crediting forecasts."""
+        treatment = str(position.get("funding_treatment") or
+                        "observed_realized_settlements")
+        if treatment in {"none", "not_applicable"}:
+            return "verified_no_settlement_due", None
+        components = position.get("cost_components") or {}
+        try:
+            interval = float(components.get("funding_interval_hours"))
+            next_minutes = float(components.get("next_funding_minutes"))
+            entry_ts = float(position.get("fill_ts") or position["entry_ts"])
+            elapsed_minutes = max(0.0, float(exit_ts) - entry_ts) / 60.0
+        except (KeyError, TypeError, ValueError):
+            return "unavailable", "funding schedule is unavailable"
+        if (not math.isfinite(interval) or interval <= 0
+                or not math.isfinite(next_minutes) or next_minutes < 0):
+            return "unavailable", "funding schedule is unavailable"
+        if elapsed_minutes < next_minutes:
+            return "verified_no_settlement_due", None
+        expected = 1 + int((elapsed_minutes - next_minutes)
+                           // (interval * 60.0))
+        realized = sum(
+            1 for event in position.get("funding_events") or []
+            if isinstance(event, dict) and event.get("status") == "realized")
+        if realized >= expected:
+            return "verified_realized", None
+        if realized:
+            return "partial", f"funding coverage {realized}/{expected} settlements"
+        return "missing", f"funding coverage 0/{expected} settlements"
+
     @classmethod
     def _maker_fill_bar(
             cls, position: dict, row: dict) -> dict | None:
@@ -1416,6 +1528,19 @@ class ShadowEvaluator:
                 (result, exit_price, exit_evidence,
                  valid_for_inference, exit_ts) = resolved
                 self._capture_funding_events(position, row, exit_ts)
+                funding_status, funding_reason = self._funding_coverage(
+                    position, exit_ts)
+                # A funding forecast is never a realized observation.  If
+                # the position crossed one or more settlement boundaries but
+                # the journal cannot prove every settlement, retain the
+                # outcome for audit/debugging while excluding it from all
+                # strategy inference.
+                if funding_status not in {
+                        "verified_realized", "verified_no_settlement_due"}:
+                    valid_for_inference = False
+                exit_evidence["funding_status"] = funding_status
+                if funding_reason:
+                    exit_evidence["funding_exclusion_reason"] = funding_reason
                 net_pnl, r_multiple = self._paper_pnl(
                     position, exit_price, result, exit_ts,
                     spread_in_exit_price=bool(
@@ -1427,6 +1552,15 @@ class ShadowEvaluator:
             elif not valid_for_inference:
                 state["invalid_outcome_count"] = int(
                     state.get("invalid_outcome_count") or 0) + 1
+                # Invalid evidence must not train the strategy, but a
+                # realized loss still represents operational risk.  Preserve
+                # the cooldown safety boundary without counting the row as a
+                # scored loss or updating qualification statistics.
+                if net_pnl < 0:
+                    cooldown = float(
+                        cfg["risk"]["cooldown_minutes_after_loss"])
+                    state.setdefault("cooldowns", {})[position["symbol"]] = (
+                        exit_ts + cooldown * 60)
             elif net_pnl < 0:
                 state["loss_count"] = int(state.get("loss_count") or 0) + 1
                 state["consecutive_losses"] = int(
@@ -1449,6 +1583,15 @@ class ShadowEvaluator:
                 "exit_price": exit_price, "result": result,
                 "net_pnl_usd": net_pnl, "r_multiple": r_multiple,
                 "valid_for_inference": valid_for_inference,
+                "funding_status": (
+                    exit_evidence.get("funding_status")
+                    or ("not_applicable" if result == "unfilled" else None)),
+                "inference_exclusion_reason": (
+                    exit_evidence.get("funding_exclusion_reason")
+                    if not valid_for_inference
+                    else None) or (
+                        exit_evidence.get("reason")
+                        if not valid_for_inference else None),
                 "execution": execution_record,
             })
             state["cash_usdt"] = float(state["cash_usdt"]) + net_pnl
@@ -1740,6 +1883,7 @@ class ShadowEvaluator:
             # Both fixed at entry, from the contract, so the exit rule cannot
             # be revised once the outcome starts to be observable.
             "exit_policy": model.exit_policy,
+            "funding_treatment": model.funding_treatment,
             "carry_exit_funding_percentile": (
                 model.carry_exit_funding_percentile),
             "horizon_hours": horizon_hours,
@@ -2510,6 +2654,7 @@ def _build_strategy_evaluator(
                 and variant.status in {"candidate", "testing"})
         ]
     names.extend(findings_store.qualified_variant_ids(scope_key))
+    pinned_variants = []
     pending_adaptive = findings_store.pending_hypothesis_proposals(strategy_id)
     active = findings_store.active_experiment_assignment(
         scope_key, strategy_id)
@@ -2528,6 +2673,13 @@ def _build_strategy_evaluator(
                 or candidate.variant_id == baseline_id
                 or candidate.variant_id in seen):
             continue
+        # The shipped ls-ratio-fade tuning is an immutable coupled contract.
+        # Enrol it as a standalone paper arm, but never expose it to the
+        # one-axis rotation/selector catalog.
+        if candidate.variant_id == strategy_registry.TUNED_LS_VARIANT_ID:
+            seen.add(candidate.variant_id)
+            pinned_variants.append(candidate)
+            continue
         # Schema-10 rotates exactly one declared axis. Multi-parameter YAML
         # bundles remain pre-registered but are not silently treated as one.
         if ShadowEvaluator._declared_setting(candidate) is None:
@@ -2545,6 +2697,13 @@ def _build_strategy_evaluator(
             continue
         candidate = from_record(stored)
         if candidate.strategy_id != strategy_id:
+            continue
+        if candidate.variant_id == strategy_registry.TUNED_LS_VARIANT_ID:
+            # A malformed/legacy adaptive proposal must not turn the
+            # immutable coupled arm into a selector candidate. Keep the
+            # account pinned and leave the proposal outside rotation.
+            seen.add(candidate.variant_id)
+            pinned_variants.append(candidate)
             continue
         seen.add(candidate.variant_id)
         rotation_candidates.append({
@@ -2576,6 +2735,7 @@ def _build_strategy_evaluator(
             block.get("experiment_candidate_batch_size")
             or DEFAULT_ROTATION_BATCH_SIZE),
         rotation_hard_cap=MAX_ROTATION_CANDIDATES,
+        pinned_variants=pinned_variants,
     )
 
 

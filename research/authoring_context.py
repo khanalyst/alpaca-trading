@@ -69,6 +69,11 @@ def _missing_reason(reason: object) -> bool:
     return any(text.startswith(prefix) for prefix in _MISSING_REASON_PREFIXES)
 
 
+def _inference_eligible(row: object) -> bool:
+    return (isinstance(row, Mapping)
+            and row.get("inference_eligible") is not False)
+
+
 def _reason_codes(outcome: Mapping) -> list[str]:
     codes = {
         _text(item.get("code"))
@@ -168,7 +173,7 @@ def _outcome_context(outcomes: list[dict]) -> tuple[list, list, list, list, list
                     continue
                 buckets = {"fit": [], "confirm": []}
                 for row in rows:
-                    if not isinstance(row, Mapping):
+                    if not _inference_eligible(row):
                         continue
                     ts = _finite(row.get("decision_ts"))
                     if ts is None:
@@ -200,6 +205,7 @@ def _outcome_context(outcomes: list[dict]) -> tuple[list, list, list, list, list
 
 
 def _segment_metrics(rows: list[Mapping]) -> dict:
+    rows = [row for row in rows if _inference_eligible(row)]
     fired = sum(_text(row.get("decision_outcome")).upper() == "PROPOSED"
                 for row in rows)
     declined = sum(_text(row.get("decision_outcome")).upper() == "VETOED"
@@ -361,6 +367,9 @@ def _paper_context(findings_store, scopes: list[str], variant_ids: list[str]):
                 trades = findings_store.paper_trades_for(scope, variant_id)
             except Exception:  # noqa: BLE001 - evidence is advisory input
                 continue
+            decisions = [
+                row for row in decisions if _inference_eligible(row)]
+            trades = [row for row in trades if _inference_eligible(row)]
             if not decisions and not trades:
                 continue
             trade_by_id = {
@@ -465,6 +474,7 @@ def _outcome_paper_context(outcomes: list[dict]):
             rows = arm.get("decisions")
             if not variant_id or not isinstance(rows, list):
                 continue
+            rows = [row for row in rows if _inference_eligible(row)]
             groups = defaultdict(lambda: {
                 "opportunities": 0, "fired": 0, "declined": 0,
                 "closed": 0, "wins": 0, "returns": [], "net_pnl": None,
@@ -499,7 +509,7 @@ def _outcome_paper_context(outcomes: list[dict]):
                         if net_pnl is not None:
                             group["net_pnl"] = (
                                 (group["net_pnl"] or 0.0) + net_pnl)
-            total = sum(isinstance(row, Mapping) for row in rows)
+            total = len(rows)
             rates.append({
                 "scope_key": scope,
                 "variant_id": variant_id,

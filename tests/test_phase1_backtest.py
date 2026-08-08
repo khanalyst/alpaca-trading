@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from research.phase1_v2_backtest import (
+from research.legacy.phase1_v2_backtest import (
     BAR_MS,
     SCENARIOS,
     execution_fill,

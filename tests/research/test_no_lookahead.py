@@ -53,9 +53,12 @@ class NoLookaheadTests(unittest.TestCase):
             resolve(plan(), [inside])
 
     def test_the_first_bar_after_the_signal_bar_is_allowed(self):
-        first = Bar(FIRST_VISIBLE, 100.0, 100.5, 99.5, 100.0, 1000.0)
+        # A one-bar fixture cannot prove a 24-hour no-event timeout.  Make
+        # the first visible bar terminal so this test isolates the visibility
+        # boundary rather than the timeout-coverage rule.
+        first = Bar(FIRST_VISIBLE, 100.0, 104.5, 99.5, 100.0, 1000.0)
         outcome = resolve(plan(), [first])
-        self.assertNotEqual(outcome.result, "no_data")
+        self.assertEqual(outcome.result, "target")
 
     def test_one_early_bar_among_valid_ones_still_raises(self):
         """Filtering it out silently would hide the bug that produced it."""
@@ -80,10 +83,10 @@ class NoLookaheadTests(unittest.TestCase):
             resolve(plan(entry_ts=entry_ts), [before_entry])
 
         first_post_entry = Bar(FIRST_VISIBLE + 6 * 60_000,
-                               100.0, 101.0, 99.0, 100.0, 1000.0)
-        self.assertNotEqual(
+                               100.0, 101.0, 97.5, 100.0, 1000.0)
+        self.assertEqual(
             resolve(plan(entry_ts=entry_ts), [first_post_entry]).result,
-            "no_data")
+            "stop")
 
     def test_reversed_bars_are_rejected_instead_of_silently_sorted(self):
         bars = [bar(1, 101.0, 99.0), bar(0, 101.0, 99.0)]
@@ -142,6 +145,12 @@ class GoldenPathTests(unittest.TestCase):
 
     def test_no_bars_is_no_data_not_a_guess(self):
         self.assertEqual(resolve(plan(), []).result, "no_data")
+
+    def test_partial_no_event_path_is_no_data_not_a_timeout(self):
+        # The resolver must not manufacture a shorter, cheaper timeout from
+        # a bar slice that ends before the requested holding deadline.
+        bars = [bar(0, 100.5, 99.5, close=100.0)]
+        self.assertEqual(resolve(plan(), bars).result, "no_data")
 
 
 class TimeoutTests(unittest.TestCase):

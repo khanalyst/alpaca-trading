@@ -305,16 +305,19 @@ Three excesses are real.
 ### R3-01 — permanent infrastructure and one-shot studies are indistinguishable · **Recommended**
 
 `research/` holds 30 modules. Roughly half are single-use lab notebooks whose
-reports are already committed and whose conclusions are settled: `find_edge`,
-`deep_edge`, `unbiased_recheck`, `maker_study`, `selection_study`,
-`analyse_flow`, `make_legacy_dataset`, `phase1_v2_backtest`, `signal_lab`,
-`portfolio_sim`. They all import `edge_lab`, so each is a surface that has to
+reports are already committed and whose conclusions are settled. The retained
+cluster is now explicitly named under `research/legacy/`: `find_edge`,
+`deep_edge`, `edge_report`, `fetch_flow_data`,
+`make_legacy_dataset`, `phase1_v2_backtest`, `portfolio_sim`,
+`selection_study`, `unbiased_recheck`, and `validate_candidate`; the
+load-bearing `maker_study` and shared `signal_lab` remain at their original
+paths. The legacy programs import `edge_lab`, so each is a surface that has to
 keep importing correctly forever, and nothing distinguishes them from
 `replay.py` or `protocol.py`, which must keep working.
 
 `RECONCILIATION.md` already weighed deleting them and kept them for good
 reasons — a deleted rejection is how a bad idea comes back. The cheaper third
-option: move them under `research/studies/`, or give each a header line naming
+option: move them under `research/legacy/`, or give each a header line naming
 the report it produced and the date it was last meaningful. A reader can then
 tell what must keep working from what already ran.
 

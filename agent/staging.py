@@ -230,6 +230,128 @@ class StagingStore:
             refinement_attempt=refinement_attempt,
             mechanism_id_override=str(mechanism_id))
 
+    def register_batch(
+            self, root_proposal: object, variants: list[object] | tuple[object, ...], *,
+            generation: int, now: float | None = None,
+            novelty_threshold: float = 0.84) -> list[ProposedContract]:
+        """Register a root and its initial configuration family atomically.
+
+        Initial neighborhoods are one logical registration: publishing the
+        root without all of its children leaves a family that cannot be
+        interpreted as pre-registered.  Validate and compile every proposal
+        before opening the transaction, then perform the capacity, novelty,
+        identity, and inserts on one connection so any failure rolls back the
+        complete family.
+        """
+        if not isinstance(variants, (list, tuple)):
+            raise StagingError("variants must be a list or tuple")
+        root = (root_proposal if isinstance(root_proposal, ProposedContract)
+                else validate(root_proposal))
+        contracts = [
+            (item if isinstance(item, ProposedContract) else validate(item))
+            for item in variants
+        ]
+        all_contracts = [root, *contracts]
+        if not isinstance(generation, int) or generation < 0:
+            raise StagingError("generation must be a non-negative integer")
+        mechanism_id_value = mechanism_identity(root)
+        for contract in all_contracts:
+            if not _ID.match(contract.contract_id):
+                raise ContractProposalError(
+                    f"contract_id {contract.contract_id!r} must be 3-64 lowercase "
+                    "alphanumerics, '.', '-' or '_'")
+            compile_contract(contract)
+            if contract is not root and mechanism_identity(contract) != mechanism_id_value:
+                raise StagingError(
+                    "batch child changes mechanism semantics; register it as "
+                    "a separate root")
+        ids = [contract.contract_id for contract in all_contracts]
+        if len(ids) != len(set(ids)):
+            raise StagingError("batch contains duplicate contract_id values")
+        timestamp = time.time() if now is None else float(now)
+        rows = []
+        for index, contract in enumerate(all_contracts):
+            rows.append({
+                "contract_id": contract.contract_id,
+                "generation": generation,
+                "author": contract.author,
+                "tier": STAGING_TIER,
+                "mechanism": contract.mechanism,
+                "payer": contract.payer,
+                "falsifier": contract.falsifier,
+                "direction": contract.direction,
+                "conditions_json": json.dumps(
+                    [asdict(condition) for condition in contract.conditions],
+                    sort_keys=True, separators=(",", ":")),
+                "notes": contract.notes,
+                "registered_ts": timestamp,
+                "mechanism_id": mechanism_id_value,
+                "configuration_id": configuration_identity(contract),
+                "parent_contract_id": None if index == 0 else root.contract_id,
+                "refinement_attempt": 0,
+            })
+
+        try:
+            with closing(_connect(self.path)) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                active = int(conn.execute(
+                    "SELECT COUNT(*) FROM staged_contracts "
+                    "WHERE retired_ts IS NULL").fetchone()[0])
+                if active + len(rows) > self.max_active:
+                    raise StagingCapacityError(
+                        f"active staged-contract cap {self.max_active} reached; "
+                        "review, retire, or raise the configured budget")
+
+                root_configuration = rows[0]["configuration_id"]
+                duplicate = conn.execute(
+                    "SELECT contract_id FROM staged_contracts "
+                    "WHERE configuration_id=? ORDER BY registered_ts LIMIT 1",
+                    (root_configuration,)).fetchone()
+                if duplicate is not None:
+                    raise StagingNoveltyError(
+                        f"configuration repeats {duplicate['contract_id']!r}; "
+                        "changing contract_id is not a new test")
+                conflicts = self._novelty_conflicts(
+                    conn, root, novelty_threshold=novelty_threshold)
+                if conflicts:
+                    first = conflicts[0]
+                    raise StagingNoveltyError(
+                        f"mechanism is not novel relative to "
+                        f"{first['contract_id']!r} "
+                        f"(similarity {first['similarity']:.3f}); use an "
+                        "explicit bounded variant/refinement instead")
+
+                seen_configurations = set()
+                for row in rows:
+                    configuration_id = row["configuration_id"]
+                    if configuration_id in seen_configurations:
+                        raise StagingNoveltyError(
+                            "batch contains duplicate executable configurations")
+                    seen_configurations.add(configuration_id)
+                    duplicate = conn.execute(
+                        "SELECT contract_id FROM staged_contracts "
+                        "WHERE configuration_id=? ORDER BY registered_ts LIMIT 1",
+                        (configuration_id,)).fetchone()
+                    if duplicate is not None:
+                        raise StagingNoveltyError(
+                            f"configuration repeats {duplicate['contract_id']!r}; "
+                            "changing contract_id is not a new test")
+                    conn.execute(
+                        "INSERT INTO staged_contracts (contract_id, generation, "
+                        "author, tier, mechanism, payer, falsifier, direction, "
+                        "conditions_json, notes, registered_ts, mechanism_id, "
+                        "configuration_id, parent_contract_id, refinement_attempt) "
+                        "VALUES (:contract_id,:generation,:author,:tier,:mechanism,"
+                        ":payer,:falsifier,:direction,:conditions_json,:notes,"
+                        ":registered_ts,:mechanism_id,:configuration_id,"
+                        ":parent_contract_id,:refinement_attempt)", row)
+                conn.commit()
+        except (StagingCapacityError, StagingNoveltyError):
+            raise
+        except sqlite3.IntegrityError as exc:
+            raise StagingError("staged registration batch was rejected") from exc
+        return all_contracts
+
     def _register(
             self, proposal: object, *, generation: int,
             now: float | None, strict_novelty: bool,

@@ -188,6 +188,30 @@ if [ -f "$JOURNAL" ]; then
     || echo "  (collecting, unscoped, or no promotable edge; see above)"
 
   if [ "$proposal_fidelity_ready" = "1" ]; then
+    DISCOVERY_EVENT_PLANE="${DISCOVERY_EVENT_PLANE:-$ROOT/runtime/research/market_events.db}"
+    echo "=== ingesting recorded market events ==="
+    # Recorder absence is an explicit NO_DATA state; malformed CSV/codegen
+    # failures remain nonzero and visible to the scheduler.
+    "$PY" research.py ingest-recorded --db "$DISCOVERY_EVENT_PLANE"
+
+    echo "=== bounded research-only discovery ==="
+    # Discovery is downstream of proposal fidelity/G2.  It never authorizes
+    # a strategy; no-data is a successful collection state and true parser or
+    # code-generation failures remain nonzero for the scheduler.
+    if [ -f "$DISCOVERY_EVENT_PLANE" ]; then
+      "$PY" research.py discover --event-plane "$DISCOVERY_EVENT_PLANE" \
+        --store "$STORE"
+    else
+      "$PY" research.py discover --store "$STORE"
+    fi
+
+    echo "=== preparing discovery human-review handoffs ==="
+    # A complete discovery result is verified against its persisted typed
+    # artifact and event-plane evidence before this non-authorizing export.
+    # The packet never mutates the registry, config, code, demo, or live
+    # authority; falsified/tampered evidence fails closed before staged review.
+    "$PY" research.py prepare-discovery-handoff --store "$STORE"
+
     # Only now may the lifecycle consume evidence. Corpus loading and proposal
     # fidelity are prerequisites: a provider or validation failure below is a
     # real failed job, and set -e prevents dependent generation/handoff work.

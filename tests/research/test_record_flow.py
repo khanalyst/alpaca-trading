@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from research.record_flow import (
     MAX_COLLECTOR_WORKERS,
+    EXECUTION_BAR_FIELDS,
     FUNDING_FIELDS,
     FUNDING_FORECAST_SOURCE,
     FUNDING_REALIZED_SOURCE,
@@ -198,6 +199,38 @@ class FundingCaptureTests(unittest.TestCase):
             recorder.append("funding", FUNDING_FIELDS, [realized]), 0)
         self.assertEqual(len(list((self.root / "funding").glob("*.csv"))), 1)
 
+    def test_execution_bars_retain_closed_candles_only(self):
+        recorder = Recorder(self.root)
+
+        def get(path: str, params: dict):  # noqa: ARG001
+            self.assertEqual(path, "/api/v5/market/candles")
+            self.assertEqual(params, {"instId": INSTRUMENT,
+                                      "bar": "1m", "limit": "100"})
+            return [
+                ["1000", "100", "101", "99", "100.5", "2", "0", "0", "1"],
+                ["1060", "100.5", "102", "100", "101", "2", "0", "0", "0"],
+                ["1120", "101", "102", "100", "101.5", "2", "0", "0", "bad"],
+            ]
+
+        recorder.get = get
+        rows = recorder.execution_bars(INSTRUMENT)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["closed"], True)
+        self.assertEqual(rows[0]["close"], 100.5)
+        self.assertEqual(rows[0]["source"], "/api/v5/market/candles")
+
+    def test_execution_bar_capture_is_idempotent(self):
+        recorder = Recorder(self.root)
+        candle = ["1000", "100", "101", "99", "100.5", "2", "0", "0", "1"]
+        recorder.get = lambda path, params: [candle]
+        self.assertEqual(recorder.capture_execution_bars([INSTRUMENT]), 1)
+        self.assertEqual(recorder.capture_execution_bars([INSTRUMENT]), 0)
+        path = next((self.root / "execution_bar_1m").glob("*.csv"))
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            self.assertEqual(reader.fieldnames, EXECUTION_BAR_FIELDS)
+            self.assertEqual(len(list(reader)), 1)
+
 
 class CollectorIsolationTests(unittest.TestCase):
     def setUp(self):
@@ -254,6 +287,32 @@ class CollectorIsolationTests(unittest.TestCase):
     def test_unknown_collector_setting_is_rejected(self):
         with self.assertRaises(ValueError):
             load_collector_config_from_mapping({"place_orders": True})
+
+    def test_order_book_receipt_timestamp_is_after_response(self):
+        recorder = Recorder(self.root)
+        recorder.contract_size[INSTRUMENT] = 1.0
+        sequence = []
+
+        def get(path: str, params: dict):  # noqa: ARG001
+            sequence.append("response")
+            return [{
+                "ts": "100", "bids": [["100", "1"]],
+                "asks": [["101", "1"]],
+            }]
+
+        recorder.get = get
+
+        def clock():
+            sequence.append("clock")
+            return 2_000_000.0
+
+        with patch("research.record_flow.time.time", side_effect=clock):
+            row = recorder.order_book(INSTRUMENT)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(sequence, ["response", "clock"])
+        self.assertEqual(row["observed_at"], 2_000_000_000)
+        self.assertEqual(row["available_at"], 2_000_000_000)
 
 
 if __name__ == "__main__":

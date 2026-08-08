@@ -245,6 +245,18 @@ class BackupTests(unittest.TestCase):
         self.data_manifest = data / "manifest.json"
         self.data_manifest.write_text('{"window":"test"}\n', encoding="utf-8")
 
+        self.heartbeat_history = self.root / "demo" / "heartbeat.history.jsonl"
+        self.heartbeat_history.parent.mkdir()
+        self.heartbeat_history.write_text(
+            '{"schema":1,"status":"running","updated_ts":1}\n'
+            '{"schema":1,"status":"paused","updated_ts":2}\n',
+            encoding="utf-8")
+        self.research_history = self.root / "health" / "research.history.jsonl"
+        self.research_history.parent.mkdir()
+        self.research_history.write_text(
+            '{"schema":2,"status":"waiting","updated_ts":1}\n',
+            encoding="utf-8")
+
         self.snapshot = (
             self.runtime_research / "snapshots" / "20260731T030000Z")
         self.snapshot_csv = self.snapshot / "swap" / "BTC-USDT-SWAP.csv"
@@ -306,7 +318,8 @@ class BackupTests(unittest.TestCase):
         source_hashes = {
             path: sha256(path) for path in (
                 self.recorder, self.data_manifest, self.snapshot_csv,
-                self.snapshot_manifest, self.result_report)
+                self.snapshot_manifest, self.result_report,
+                self.heartbeat_history, self.research_history)
         }
         first = self.create()
         second = self.create()
@@ -315,7 +328,12 @@ class BackupTests(unittest.TestCase):
         self.assertNotEqual(first["backup_path"], second["backup_path"])
         self.assertTrue(Path(first["backup_path"]).is_dir())
         self.assertTrue(Path(second["backup_path"]).is_dir())
-        self.assertTrue(backup.verify_backup(first["backup_path"])["ok"])
+        verification = backup.verify_backup(first["backup_path"])
+        self.assertTrue(verification["ok"])
+        self.assertEqual(verification["json_checks"][
+            "files/runtime/demo/heartbeat.history.jsonl"]["records"], 2)
+        self.assertEqual(verification["json_checks"][
+            "files/runtime/health/research.history.jsonl"]["records"], 1)
         journal_snapshot = (
             Path(first["backup_path"]) / "sqlite" / "journal.db")
         restored_journal = self.root / "restored-journal.db"
@@ -342,12 +360,61 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(sha256(path), before)
         self.assertEqual(self.writer.execute(
             "SELECT COUNT(*) FROM events").fetchone()[0], 1)
-
         with contextlib.closing(sqlite3.connect(self.store_path)) as conn, conn:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
                     "UPDATE backup_runs SET target_kind='local_default' "
                     "WHERE backup_id=?", (first["backup_id"],))
+
+    def test_secret_bearing_text_and_unknown_runtime_blobs_are_excluded(self):
+        secret_csv = self.runtime_research / "recorded" / "order_book" / "extra.csv"
+        secret_csv.write_text("ts,api_key\n2,do-not-archive\n", encoding="utf-8")
+        arbitrary = self.runtime_research / "recorded" / "order_book" / "notes.bin"
+        arbitrary.write_bytes(b"arbitrary blob")
+        mode_state = self.runtime_research / "demo" / "state.json"
+        mode_state.parent.mkdir()
+        mode_state.write_text('{"api_key":"do-not-archive"}\n', encoding="utf-8")
+
+        result = self.create()
+        root = Path(result["backup_path"])
+        manifest = json.loads((root / backup.MANIFEST_NAME).read_text())
+        archived = {item["archive_path"] for item in manifest["files"]}
+        self.assertIn(
+            "files/runtime/research/recorded/order_book/2026-07-31.csv",
+            archived)
+        self.assertNotIn(
+            "files/runtime/research/recorded/order_book/extra.csv", archived)
+        self.assertNotIn(
+            "files/runtime/research/recorded/order_book/notes.bin", archived)
+        self.assertFalse(any(path.endswith("/demo/state.json")
+                             for path in archived))
+        reasons = {item["reason"] for item in manifest["source_exclusions"]}
+        self.assertTrue(any("secret" in reason for reason in reasons))
+        self.assertTrue(any("extension" in reason for reason in reasons))
+
+    def test_malformed_manifest_shape_is_a_verification_failure(self):
+        result = self.create()
+        root = Path(result["backup_path"])
+        manifest = root / backup.MANIFEST_NAME
+        value = json.loads(manifest.read_text())
+        value["files"] = {"not": "a list"}
+        manifest.write_text(json.dumps(value), encoding="utf-8")
+        failure = backup.verify_backup(root)
+        self.assertFalse(failure["ok"])
+        self.assertIn("manifest files must be a list", failure["errors"])
+
+    def test_malformed_operational_history_fails_backup_verification(self):
+        with self.research_history.open("a", encoding="utf-8") as handle:
+            handle.write("not-json\n")
+
+        with self.assertRaises(backup.BackupError) as caught:
+            self.create()
+
+        self.assertFalse(caught.exception.result["ok"])
+        self.assertTrue(any(
+            "JSON verification failed: "
+            "files/runtime/health/research.history.jsonl" in error
+            for error in caught.exception.result["errors"]))
 
     def test_completed_raw_snapshot_is_preserved_and_restorable(self):
         partial = self.runtime_research / "snapshots" / "incomplete"

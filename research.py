@@ -4,10 +4,10 @@
 Nothing here touches the trading path. Commands read ``journal.db`` and, from
 batch 2 onward, a local price cache. A G2 check appends its pass/fail audit
 record to that journal unless ``--no-persist`` is supplied; research evidence
-is persisted in schema 16. The
-dedicated ``research-loop`` command may call the LLM with a research-only
-prompt, and ``backup`` creates a new verified versioned snapshot. No command
-places an order or mutates trading state.
+is persisted in schema 17. The dedicated ``research-loop`` command may call
+the LLM with a research-only prompt; ``ingest-recorded`` and ``discover`` are
+also bounded research-only commands. ``backup`` creates a new verified
+versioned snapshot. No command places an order or mutates trading state.
 
     python research.py corpus stats
     python research.py corpus stats --db runtime/demo/journal.db
@@ -30,6 +30,7 @@ if str(REPO) not in sys.path:
 
 from research import (backup as backup_mod, corpus,             # noqa: E402
                       artifact as artifact_mod, findings as findings_mod,
+                      discovery as discovery_mod,
                       prices as prices_mod, protocol,
                       readiness as readiness_mod,
                       replay as replay_mod, review as review_mod,
@@ -128,6 +129,9 @@ def _price_cache(args: argparse.Namespace):
 
 DEFAULT_STAGING_PATH = "research/cache/staging.db"
 DEFAULT_STAGING_HANDOFF_DIR = "research/results/staged-handoffs"
+DEFAULT_DISCOVERY_HANDOFF_DIR = "research/results/discovery-handoffs"
+DEFAULT_DISCOVERY_RESULT_DIR = "research/results/discovery"
+DEFAULT_DISCOVERY_ARTIFACT_DIR = "research/results/discovery-artifacts"
 DEFAULT_RESEARCH_REVIEW_CAP = 8
 
 
@@ -1491,6 +1495,194 @@ def cmd_research_loop(args: argparse.Namespace) -> int:
     return 2 if (result.get("retry_pending") or result.get("failed")) else 0
 
 
+def cmd_discover(args: argparse.Namespace) -> int:
+    """Run one bounded, research-only discovery candidate."""
+    cfg = _load_config()
+    from agent.registry import contract_for_variant
+    from research.recorded_data import DEFAULT_DB
+    discovery_cfg = (cfg.get("research") or {}).get("discovery") or {}
+    strategy_cfg = cfg.get("strategy") or {}
+    contract = contract_for_variant(
+        str(strategy_cfg.get("id") or ""),
+        str(strategy_cfg.get("variant_id") or "") or None)
+    contract_identity = contract.as_dict()
+    store = findings_mod.FindingsStore(_configured_store(cfg, args.store))
+    artifacts_root = args.artifacts or discovery_cfg.get(
+        "discovery_artifacts", "research/results/discovery-artifacts")
+    results_root = args.results or discovery_cfg.get(
+        "discovery_results", "research/results/discovery")
+    artifacts_root = Path(artifacts_root) if Path(artifacts_root).is_absolute() \
+        else REPO / artifacts_root
+    results_root = Path(results_root) if Path(results_root).is_absolute() \
+        else REPO / results_root
+    previous_hashes = discovery_mod.prior_program_hashes(
+        store, results_root)
+    rows = []
+    as_of = {}
+    if args.rows:
+        path = Path(args.rows)
+        if not path.exists():
+            print(json.dumps({"status": "FAILED", "error":
+                              f"rows path does not exist: {path}"}))
+            return 2
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                rows, as_of = raw, {}
+            elif isinstance(raw, dict):
+                rows, as_of = raw.get("rows", []), raw.get("as_of", {})
+            else:
+                raise ValueError("rows JSON must be an object or list")
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                raise ValueError("rows JSON must contain a list of row objects")
+            if not isinstance(as_of, dict):
+                raise ValueError("rows JSON as_of must be an object")
+        except (OSError, ValueError, TypeError) as exc:
+            print(json.dumps({"status": "FAILED", "error": str(exc)}))
+            return 2
+    if not rows and not args.rows:
+        from research.recorded_data import EventPlane
+        plane = EventPlane(args.event_plane or DEFAULT_DB)
+        # Features are selected at the signal decision/cutoff.  Episode bars
+        # and realized funding are selected at a later bounded as-of time so
+        # the outcome horizon can be observed without moving the signal
+        # feature boundary forward.
+        signal_decision = int(args.decision_time_ms or time.time() * 1000)
+        episode_decision = int(
+            getattr(args, "episode_decision_time_ms", None)
+            or discovery_cfg.get("episode_decision_time_ms")
+            or time.time() * 1000)
+        episode_cutoff = getattr(args, "episode_cutoff_event_ts_ms", None)
+        if episode_cutoff is None:
+            episode_cutoff = discovery_cfg.get("episode_cutoff_event_ts_ms")
+        if episode_cutoff is None:
+            # The signal cutoff remains the feature boundary; absent an
+            # explicit outcome cutoff, the later episode as-of is its causal
+            # bar/funding cutoff.
+            episode_cutoff = episode_decision
+        rows = discovery_mod.load_discovery_episodes(
+            plane, instrument=args.instrument,
+            decision_time_ms=signal_decision,
+            cutoff_event_ts_ms=args.cutoff_event_ts_ms,
+            episode_decision_time_ms=episode_decision,
+            episode_cutoff_event_ts_ms=episode_cutoff,
+            max_horizon_bars=getattr(args, "episode_horizon_bars", None)
+            or discovery_cfg.get("episode_horizon_bars"),
+            bar_series=getattr(args, "episode_bar_series", None)
+            or discovery_cfg.get("episode_bar_series", "execution_bar_1m"),
+            funding_series=getattr(args, "funding_series", None)
+            or discovery_cfg.get("funding_series", "funding"))
+        as_of = {"decision_time_ms": signal_decision,
+                 "cutoff_event_ts_ms": args.cutoff_event_ts_ms,
+                 "episode_decision_time_ms": episode_decision,
+                 "episode_cutoff_event_ts_ms": episode_cutoff,
+                 "event_plane": str(args.event_plane or DEFAULT_DB)}
+    result = discovery_mod.run_discovery(
+        rows, result_root=artifacts_root, analysis_root=results_root,
+        as_of=as_of, findings_store=store, previous_hashes=previous_hashes,
+        enabled=bool(discovery_cfg.get("enabled", True)),
+        max_rows=int(discovery_cfg.get("max_rows", discovery_mod.MAX_ROWS)),
+        max_nodes=int(discovery_cfg.get("max_nodes", discovery_mod.MAX_NODES)),
+        max_depth=int(discovery_cfg.get("max_depth", discovery_mod.MAX_DEPTH)),
+        max_window=int(discovery_cfg.get("max_window", discovery_mod.MAX_WINDOW)),
+        contract_identity=contract_identity)
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0 if result.get("status") in {
+        "COMPLETE", "NO_DATA", "INSUFFICIENT_COVERAGE", "NO_OUTCOME_DATA",
+        "NO_STATE_DATA", "NO_EPISODE_DATA", "NO_COUNTERFACTUAL_DATA", "IDLE", "DISABLED",
+    } else 2
+
+
+def cmd_prepare_discovery_handoff(args: argparse.Namespace) -> int:
+    """Export one complete discovery result for human registration review."""
+    from agent.registry import contract_for_variant
+    from research.discovery_handoff import (
+        HandoffError, build_discovery_handoff, load_persisted_discovery,
+        write_discovery_handoff)
+
+    cfg = _load_config()
+    store_path = _configured_store(cfg, args.store)
+    if not store_path.is_file():
+        print(json.dumps({
+            "status": "NO_DISCOVERY_STORE", "prepared": [],
+        }, sort_keys=True))
+        return 0
+    result_root = _configured_path(
+        cfg, "", args.results, DEFAULT_DISCOVERY_RESULT_DIR)
+    artifact_root = _configured_path(
+        cfg, "", args.artifacts, DEFAULT_DISCOVERY_ARTIFACT_DIR)
+    output_dir = _configured_path(
+        cfg, "", args.out, DEFAULT_DISCOVERY_HANDOFF_DIR)
+    strategy_cfg = cfg.get("strategy") or {}
+    try:
+        expected_contract = contract_for_variant(
+            str(strategy_cfg.get("id") or ""),
+            str(strategy_cfg.get("variant_id") or "") or None).as_dict()
+        evidence = load_persisted_discovery(
+            store_path, analysis_id=args.analysis_id,
+            result_root=result_root, artifact_root=artifact_root,
+            expected_contract_identity=expected_contract)
+        handoff = build_discovery_handoff(
+            evidence, analysis_id=evidence["analysis_id"],
+            analysis_payload_hash=evidence["analysis_payload_hash"])
+        written = write_discovery_handoff(handoff, output_dir)
+    except HandoffError as exc:
+        reason = str(exc)
+        if args.analysis_id is None and (
+                "no persisted discovery analysis" in reason
+                or "requires a persisted COMPLETE result" in reason
+                or "FALSIFIED discovery results" in reason):
+            status = ("NO_COMPLETE_DISCOVERY"
+                      if "no persisted discovery analysis" in reason
+                      else "NOT_HANDOFF_ELIGIBLE")
+            print(json.dumps({
+                "status": status, "prepared": [], "reason": reason,
+            }, sort_keys=True))
+            return 0
+        print(json.dumps({
+            "status": "VALIDATION_FAILED", "prepared": [],
+            "error": reason,
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "status": "PREPARED", "prepared": [{
+            **written,
+            "strategy_id": evidence["contract_identity"]["strategy_id"],
+            "variant_id": evidence["contract_identity"]["variant_id"],
+            "live_eligible": False,
+        }],
+        "registry_mutation_performed": False,
+        "config_mutation_performed": False,
+        "code_mutation_performed": False,
+        "demo_mutation_performed": False,
+        "live_mutation_performed": False,
+    }, sort_keys=True))
+    return 0
+
+
+def cmd_ingest_recorded(args: argparse.Namespace) -> int:
+    """Ingest recorder CSVs into the canonical market event plane."""
+    from research.recorded_data import (DEFAULT_ARCHIVE, DEFAULT_DB,
+                                        DEFAULT_RECORDED, EventPlane)
+    cfg = _load_config()
+    collector = ((cfg.get("research") or {}).get("collector") or {})
+    configured_recorded = collector.get("out")
+    recorded = Path(args.recorded or configured_recorded or DEFAULT_RECORDED)
+    if not recorded.is_absolute():
+        recorded = REPO / recorded
+    db = Path(args.db or DEFAULT_DB)
+    archive = Path(args.archive or DEFAULT_ARCHIVE)
+    report = EventPlane(db).ingest(recorded, archive_root=archive)
+    if not report.get("files"):
+        result = {"status": "NO_DATA", **report}
+    elif int(report.get("rows_valid", 0) or 0) == 0:
+        result = {"status": "FAILED", "reason": "all recorder rows quarantined", **report}
+    else:
+        result = {"status": "INGESTED", **report}
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 2 if result["status"] == "FAILED" else 0
+
+
 def cmd_author(args: argparse.Namespace) -> int:
     """Ask for new candidate mechanisms and stage the ones that validate.
 
@@ -2210,6 +2402,61 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-review", action="store_true",
         help="only create missing deterministic outcomes; do not call an LLM")
     learning.set_defaults(func=cmd_research_loop)
+
+    ingest = sub.add_parser(
+        "ingest-recorded",
+        help="ingest recorder CSVs into runtime/research/market_events.db")
+    ingest.add_argument("--recorded", default=None,
+                        help="recorder CSV root (default runtime/research/recorded)")
+    ingest.add_argument("--db", default=None,
+                        help="event-plane SQLite path")
+    ingest.add_argument("--archive", default=None,
+                        help="immutable recorder archive root")
+    ingest.set_defaults(func=cmd_ingest_recorded)
+
+    discover = sub.add_parser(
+        "discover",
+        help="run one bounded research-only observable discovery candidate")
+    discover.add_argument("--rows", default=None,
+                          help="JSON list of exact-as-of rows (offline tests)")
+    discover.add_argument("--event-plane", default=None,
+                          help="event-plane SQLite path for strict as-of rows")
+    discover.add_argument("--store", default=None,
+                          help="findings.db path used for discovery history")
+    discover.add_argument("--instrument", default=None)
+    discover.add_argument("--decision-time-ms", type=int, default=None)
+    discover.add_argument("--cutoff-event-ts-ms", type=int, default=None)
+    discover.add_argument("--episode-decision-time-ms", type=int, default=None,
+                          help="later as-of time allowed to observe completed episode bars")
+    discover.add_argument("--episode-cutoff-event-ts-ms", type=int, default=None,
+                          help="causal event cutoff for episode bars/funding")
+    discover.add_argument("--episode-horizon-bars", type=int, default=None,
+                          help="bounded contiguous 1m outcome horizon")
+    discover.add_argument("--episode-bar-series", default=None,
+                          help="recorded closed-bar series (default execution_bar_1m)")
+    discover.add_argument("--funding-series", default=None,
+                          help="recorded funding series (default funding)")
+    discover.add_argument("--artifacts", default=None)
+    discover.add_argument("--results", default=None)
+    discover.set_defaults(func=cmd_discover)
+
+    discovery_handoff = sub.add_parser(
+        "prepare-discovery-handoff",
+        help="write a non-authorizing complete discovery result for human review")
+    discovery_handoff.add_argument("--store", default=None,
+                                   help="findings.db path")
+    discovery_handoff.add_argument("--analysis-id", default=None,
+                                   help="one persisted discovery analysis id")
+    discovery_handoff.add_argument(
+        "--results", default=None,
+        help="persisted discovery result directory")
+    discovery_handoff.add_argument(
+        "--artifacts", default=None,
+        help="typed discovery artifact directory")
+    discovery_handoff.add_argument(
+        "--out", default=None,
+        help="handoff directory; defaults to research/results/discovery-handoffs")
+    discovery_handoff.set_defaults(func=cmd_prepare_discovery_handoff)
 
     return parser
 

@@ -15,6 +15,16 @@ version: v1
 # unproven rather than supported. Nothing here changes tier gating - it is
 # T1_HYPOTHESIS and live still requires T3_VALIDATED and a signed packet.
 status: registered_demo_order_path
+# The active tuning is a coupled contract, not any one of the selector arms
+# below.  Keep the registered base values (80/20 and 3 ATR) above immutable;
+# this identity names the exact 70/30, 1.5 ATR, 1 ATR-stop/3R semantics.
+tuned_variant_id: ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3
+tuned_semantics:
+  ls_high_percentile: 70.0
+  ls_low_percentile: 30.0
+  hard_max_entry_extension_atr: 1.5
+  min_stop_atr_multiple: 1.0
+  fixed_reward_risk: 3.0
 
 mechanism: |
   Within an instrument, when the retail long/short account ratio rises
@@ -100,17 +110,17 @@ settings:
       The mirrored widening test, isolating the short threshold.
   - id: registered_long_tail
     params:
-      ls_high_percentile: 80.0
+      ls_high_percentile: 85.0
     claim: >-
-      The originally registered 80th-percentile long threshold, kept as the
-      comparison point the shipped 70 has to beat. It lost to 70 at every
-      extension cap on the recorded corpus.
+      An 85th-percentile long threshold, kept as a strict comparison point
+      above the registered 80th-percentile base; it tests whether the tuned
+      70 tail's advantage survives a modest tightening.
   - id: registered_short_tail
     params:
-      ls_low_percentile: 20.0
+      ls_low_percentile: 15.0
     claim: >-
-      The originally registered 20th-percentile short threshold, as the
-      mirrored comparison point.
+      A 15th-percentile short threshold, a strict comparison point below the
+      registered 20th-percentile base.
   - id: no_chase_tight
     params:
       hard_max_entry_extension_atr: 1.0
@@ -120,9 +130,10 @@ settings:
       the preference is a plateau or an optimum.
   - id: no_chase_loose
     params:
-      hard_max_entry_extension_atr: 3.0
+      hard_max_entry_extension_atr: 4.0
     claim: >-
-      The registered no-chase limit. It was worst at every percentile pair
+      A deliberately looser 4 ATR no-chase limit. The registered 3 ATR base
+      was worst at every percentile pair
       on the corpus, so it is kept as the comparison point the tighter caps
       have to beat rather than as a candidate.
 

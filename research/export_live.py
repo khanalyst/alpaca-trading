@@ -40,9 +40,32 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "research"))
 
 from edge_lab import COST_SCENARIOS, load_dataset, simulate  # noqa: E402
+from agent import registry as strategy_registry  # noqa: E402
 from agent.registry import spec_for  # noqa: E402
 
 BAR_MS = 900_000
+
+
+def _contract_exclusion_reason(payload: dict) -> str | None:
+    """Classify legacy or semantically mismatched shadow rows.
+
+    Rows remain in the returned decision frame for auditability; ``resolve``
+    excludes rows carrying a reason from authoritative forward scoring.
+    """
+    strategy_id = str(payload.get("strategy_id") or "").strip()
+    contract_hash = str(payload.get("strategy_contract_hash") or "").strip()
+    contract_variant = str(
+        payload.get("strategy_contract_variant_id") or "").strip()
+    if not strategy_id or not contract_hash or not contract_variant:
+        return "legacy evidence missing strategy contract provenance"
+    try:
+        expected = strategy_registry.contract_for_variant(
+            strategy_id, contract_variant)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return "strategy contract is not registered"
+    if contract_hash != expected.semantic_hash:
+        return "strategy contract hash mismatch"
+    return None
 
 
 def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
@@ -99,6 +122,9 @@ def read_journal(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame,
             payload["ts"] = row.ts
             payload["strategy_id"] = row.strategy_id
             payload["strategy_version"] = row.strategy_version
+            reason = _contract_exclusion_reason(payload)
+            if reason:
+                payload["inference_exclusion_reason"] = reason
             rows.append(payload)
         return pd.DataFrame(rows)
 
@@ -186,6 +212,10 @@ def resolve(decisions: pd.DataFrame, frames: dict, costs,
             continue
         idx, stops, takes = [], [], []
         for row in group.to_dict("records"):
+            if row.get("inference_exclusion_reason"):
+                unresolved[
+                    f"{strategy_id}: {row['inference_exclusion_reason']}"] += 1
+                continue
             # Signal timestamp is the completed bar the contract fired on.
             signal_ts = row.get("signal_ts")
             try:

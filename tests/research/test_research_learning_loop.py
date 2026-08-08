@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+from agent import registry as strategy_registry
 from agent import variants
 from research import findings, review
 from tests.helpers import valid_config
@@ -121,13 +122,23 @@ class ResearchLearningFixture(unittest.TestCase):
                     entry_price = 100.0
                     exit_price = entry_price * (
                         1.0 + (net_pnl + modeled_cost) / notional)
+                    variant_object = (
+                        self.baseline if variant_id == baseline_id
+                        else self.registry[variant_id])
                     provenance = {
-                        "variant_definition_hash": variant_id,
+                        "variant_definition_hash": findings.variant_identity_hash(
+                            variant_object),
                         "strategy_config_version": f"{lane}-config",
                         "experiment_config": {"lane": lane},
                         "code_version": "test-code",
                         "forward_model_id": MODEL_ID,
                         "forward_model_assumptions_hash": "test-model-hash",
+                        "strategy_contract_hash": (
+                            strategy_registry.contract_for("momentum")
+                            .semantic_hash),
+                        "strategy_contract_variant_id": (
+                            strategy_registry.contract_for("momentum")
+                            .variant_id),
                     }
                     assumptions = json.dumps({
                         "forward_model": {"model_id": MODEL_ID},
@@ -150,14 +161,16 @@ class ResearchLearningFixture(unittest.TestCase):
                             model_id, assumptions_json, entry_ts, entry_price,
                             notional, risk_usd, stop_price, take_price, exit_ts,
                             exit_price, result, net_pnl_usd, r_multiple, status,
-                            failure)
+                            failure, execution_json, valid_for_inference,
+                            funding_status, inference_exclusion_reason)
                         VALUES (
                             :trade_id, :proposal_id, :scope_key, :variant_id,
                             :cycle_id, :symbol, :direction, :setup_type,
                             :signal_ts, :model_id, :assumptions_json, :entry_ts,
                             :entry_price, :notional, :risk_usd, :stop_price,
                             :take_price, :exit_ts, :exit_price, :result,
-                            :net_pnl_usd, :r_multiple, 'CLOSED', NULL)
+                            :net_pnl_usd, :r_multiple, 'CLOSED', NULL,
+                            :execution_json, 1, :funding_status, NULL)
                     """, {
                         "trade_id": trade_id, "proposal_id": proposal_id,
                         "scope_key": scope, "variant_id": variant_id,
@@ -173,6 +186,14 @@ class ResearchLearningFixture(unittest.TestCase):
                         "result": "target" if net_pnl >= 0 else "stop",
                         "net_pnl_usd": net_pnl,
                         "r_multiple": r_multiple,
+                        "execution_json": json.dumps({
+                            "funding_events": [],
+                            "exit": {
+                                "funding_status":
+                                    "verified_no_settlement_due",
+                            },
+                        }, sort_keys=True),
+                        "funding_status": "verified_no_settlement_due",
                     })
                     conn.execute("""
                         INSERT INTO paper_decisions (
@@ -247,7 +268,7 @@ class DeterministicOutcomeTests(ResearchLearningFixture):
             self.assertEqual(migrated.schema_version(), findings.SCHEMA_VERSION)
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-                "paper_execution_evidence_and_validity")
+                "paper_inference_quarantine_reasons")
             # Backfilled history uses the same rule as a live rejection: an
             # operational abort is INCONCLUSIVE, never FAILED.
             self.assertEqual(outcome["verdict"], "INCONCLUSIVE")

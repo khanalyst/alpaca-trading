@@ -54,9 +54,6 @@ services:
     <<: *app
     container_name: okx-trader
     command: ["python", "main.py", "run"]
-    depends_on:
-      recorder:
-        condition: service_healthy
     environment:
       OKX_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
     secrets:
@@ -97,9 +94,6 @@ services:
       - "0"
       - --timeout-seconds
       - ${OKX_RESEARCH_TIMEOUT_SECONDS:-14400}
-    depends_on:
-      recorder:
-        condition: service_healthy
     environment:
       OKX_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       PYTHON: /usr/local/bin/python

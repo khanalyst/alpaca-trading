@@ -25,7 +25,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 SCHEMA = "research-evidence-package.v1"
@@ -33,6 +33,7 @@ REPLAY_FIXTURE_SCHEMA = "research-replay-fixture.v1"
 GOLDEN_OUTPUT_SCHEMA = "research-golden-replay-output.v1"
 PROVENANCE_CLASSES = frozenset({"synthetic", "real_market"})
 _DIGEST_LENGTH = 64
+_DEFAULT_MAX_PARENT_DEPTH = 32
 GOLDEN_REPLAY_NORMALIZATION = "python-ast-no-docstrings.v1"
 _GOLDEN_REPLAY_CORE_SCOPE = (
     "agent/contracts/__init__.py",
@@ -260,9 +261,11 @@ def _artifact(path: Path, *, name: str | None = None) -> dict:
 
 def _copy_blob(path: Path, blobs: Path, descriptor: Mapping[str, object]) -> None:
     digest = str(descriptor["sha256"])
+    size = int(descriptor["size"])
     destination = blobs / digest
     if destination.exists():
-        if sha256_file(destination) != digest:
+        if (destination.stat().st_size != size
+                or sha256_file(destination) != digest):
             raise EvidenceValidationError(
                 f"temporary blob collision for {digest}")
         return
@@ -270,6 +273,12 @@ def _copy_blob(path: Path, blobs: Path, descriptor: Mapping[str, object]) -> Non
         shutil.copyfileobj(source, target, length=1024 * 1024)
         target.flush()
         os.fsync(target.fileno())
+    # Re-hash the destination, rather than trusting the source descriptor or
+    # copy operation.  A partially written/corrupt blob must never become part
+    # of a package that is subsequently published under its manifest ID.
+    if destination.stat().st_size != size or sha256_file(destination) != digest:
+        raise EvidenceValidationError(
+            f"freshly copied evidence blob failed hash verification: {digest}")
 
 
 def _relative_code_files(
@@ -488,7 +497,11 @@ def _fsync_directory(path: Path) -> None:
 
 
 def create_evidence_package(
-        store: str | Path, spec: EvidenceSpec) -> Path:
+        store: str | Path, spec: EvidenceSpec, *,
+        parent_package_root: str | Path | None = None,
+        parent_lookup: Mapping[str, str | Path]
+        | Callable[[str], str | Path | None] | None = None,
+        max_parent_depth: int = _DEFAULT_MAX_PARENT_DEPTH) -> Path:
     """Create one package atomically and return its content-addressed path.
 
     Existing packages are never overwritten.  A concurrent writer producing
@@ -498,6 +511,17 @@ def create_evidence_package(
     root.mkdir(parents=True, exist_ok=True)
     if not root.is_dir():
         raise EvidenceValidationError(f"evidence store is not a directory: {root}")
+    if (isinstance(max_parent_depth, bool)
+            or not isinstance(max_parent_depth, int)
+            or max_parent_depth < 0):
+        raise EvidenceValidationError("max_parent_depth must be non-negative")
+    if parent_package_root is not None and parent_lookup is not None:
+        raise EvidenceValidationError(
+            "provide parent_package_root or parent_lookup, not both")
+    # Packages conventionally share one content-addressed store.  A caller
+    # with a separately managed ancestry can pass an explicit root or lookup.
+    ancestry_root = (Path(parent_package_root)
+                     if parent_package_root is not None else root)
     temporary = Path(tempfile.mkdtemp(prefix=".evidence-", dir=root))
     try:
         blobs = temporary / "blobs"
@@ -505,6 +529,17 @@ def create_evidence_package(
         manifest = _manifest_for(spec, blobs)
         evidence_id = str(manifest["evidence_id"])
         _write_manifest(temporary / "manifest.json", manifest)
+        # Verify the bytes while still in the private directory.  Publishing a
+        # directory and discovering a copy/hash defect afterwards would leave
+        # an addressable but invalid package in the store.
+        _verify_evidence_package(
+            temporary, require_package_name=False)
+        if manifest["parent_evidence_ids"]:
+            _verify_parent_tree(
+                manifest, package_root=ancestry_root,
+                parent_lookup=parent_lookup,
+                max_parent_depth=max_parent_depth,
+                allow_unresolved_parents=False)
         _fsync_directory(blobs)
         _fsync_directory(temporary)
         destination = root / evidence_id
@@ -517,7 +552,10 @@ def create_evidence_package(
             # independently verifies; every other error remains fatal.
             if not destination.is_dir():
                 raise
-            verify_evidence_package(destination)
+            verify_evidence_package(
+                destination, package_root=ancestry_root,
+                parent_lookup=parent_lookup,
+                max_parent_depth=max_parent_depth)
             shutil.rmtree(temporary)
         _fsync_directory(root)
         return destination
@@ -543,6 +581,133 @@ def _load_manifest(package: Path) -> dict:
         raise EvidenceValidationError(
             "package manifest fields do not match its schema")
     return manifest
+
+
+def verify_evidence_package(
+        package: str | Path, *, code_root: str | Path | None = None,
+        config_path: str | Path | None = None,
+        package_root: str | Path | None = None,
+        parent_lookup: Mapping[str, str | Path]
+        | Callable[[str], str | Path | None] | None = None,
+        max_parent_depth: int = _DEFAULT_MAX_PARENT_DEPTH,
+        allow_unresolved_parents: bool = False) -> dict:
+    """Verify package identity, all blobs, coverage, and optional inputs.
+
+    A package that declares parents must be verified with an explicit package
+    root or lookup.  This prevents a valid child from silently referring to a
+    missing, tampered, cyclic, or over-deep ancestry.  The unresolved escape
+    hatch is reserved for fixtures that intentionally model an external store.
+    """
+    manifest = _verify_evidence_package(
+        package, code_root=code_root, config_path=config_path)
+    if manifest["parent_evidence_ids"] or package_root is not None \
+            or parent_lookup is not None:
+        return verify_evidence_ancestry(
+            package, package_root=package_root,
+            parent_lookup=parent_lookup, code_root=code_root,
+            config_path=config_path, max_parent_depth=max_parent_depth,
+            allow_unresolved_parents=allow_unresolved_parents)
+    return manifest
+
+
+def _parent_path(
+        parent_id: str, *, package_root: str | Path | None,
+        parent_lookup: Mapping[str, str | Path] | Callable[[str], str | Path | None]
+        | None) -> Path | None:
+    if parent_lookup is not None:
+        value = (parent_lookup(parent_id) if callable(parent_lookup)
+                 else parent_lookup.get(parent_id))
+        return None if value is None else Path(value)
+    if package_root is None:
+        return None
+    return Path(package_root) / parent_id
+
+
+def _verify_parent_tree(
+        manifest: Mapping[str, object], *, package_root: str | Path | None,
+        parent_lookup: Mapping[str, str | Path]
+        | Callable[[str], str | Path | None] | None,
+        max_parent_depth: int,
+        allow_unresolved_parents: bool) -> None:
+    """Verify declared parents recursively from an explicit source."""
+    def visit(parent_id: str, depth: int,
+              ancestors: frozenset[str]) -> None:
+        if depth > max_parent_depth:
+            raise EvidenceValidationError(
+                "parent evidence ancestry exceeds maximum depth")
+        candidate = _parent_path(
+            parent_id, package_root=package_root, parent_lookup=parent_lookup)
+        if candidate is None:
+            if allow_unresolved_parents:
+                return
+            raise EvidenceValidationError(
+                f"parent evidence package is not resolvable: {parent_id}")
+        candidate_path = Path(candidate)
+        if not candidate_path.exists():
+            if allow_unresolved_parents:
+                return
+            raise EvidenceValidationError(
+                f"parent evidence package is missing: {parent_id}")
+        try:
+            parent = _verify_evidence_package(candidate_path)
+        except EvidenceValidationError:
+            # A present parent is never tolerated as an unresolved fixture.
+            raise
+        evidence_id = str(parent["evidence_id"])
+        if evidence_id != parent_id:
+            raise EvidenceValidationError(
+                "parent evidence package identity does not match declared ID: "
+                f"{parent_id} != {evidence_id}")
+        if evidence_id in ancestors:
+            raise EvidenceValidationError(
+                "parent evidence ancestry contains a cycle")
+        current = ancestors | {evidence_id}
+        for nested in parent["parent_evidence_ids"]:
+            visit(str(nested), depth + 1, current)
+
+    root_id = str(manifest["evidence_id"])
+    ancestors = frozenset({root_id})
+    for parent in manifest["parent_evidence_ids"]:
+        visit(str(parent), 1, ancestors)
+
+
+def verify_evidence_ancestry(
+        package: str | Path, *,
+        package_root: str | Path | None = None,
+        parent_lookup: Mapping[str, str | Path]
+        | Callable[[str], str | Path | None] | None = None,
+        code_root: str | Path | None = None,
+        config_path: str | Path | None = None,
+        max_parent_depth: int = _DEFAULT_MAX_PARENT_DEPTH,
+        allow_unresolved_parents: bool = False) -> dict:
+    """Verify a package and every declared parent from an explicit source.
+
+    A root is interpreted as ``root/<evidence_id>``; a lookup may instead
+    return each package path directly.  Missing parents, cycles, and excessive
+    depth fail closed.  ``allow_unresolved_parents`` is an explicit fixture
+    escape hatch only: it permits missing parents but still verifies every
+    parent that can be resolved and never suppresses cycle/depth failures.
+    """
+    if (isinstance(max_parent_depth, bool)
+            or not isinstance(max_parent_depth, int)
+            or max_parent_depth < 0):
+        raise EvidenceValidationError("max_parent_depth must be non-negative")
+    if package_root is None and parent_lookup is None:
+        if not allow_unresolved_parents:
+            raise EvidenceValidationError(
+                "parent package root or lookup is required for ancestry verification")
+        return _verify_evidence_package(
+            package, code_root=code_root, config_path=config_path)
+
+    manifest = _verify_evidence_package(package)
+    _verify_parent_tree(
+        manifest, package_root=package_root, parent_lookup=parent_lookup,
+        max_parent_depth=max_parent_depth,
+        allow_unresolved_parents=allow_unresolved_parents)
+    # Verify the requested package against optional current inputs after the
+    # ancestry walk; parent packages intentionally use their own snapshots.
+    return _verify_evidence_package(
+        package, code_root=code_root, config_path=config_path)
 
 
 def _artifact_descriptors(manifest: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -598,9 +763,10 @@ def _verify_current_code(
         raise EvidenceValidationError("current code tree does not match evidence")
 
 
-def verify_evidence_package(
+def _verify_evidence_package(
         package: str | Path, *, code_root: str | Path | None = None,
-        config_path: str | Path | None = None) -> dict:
+        config_path: str | Path | None = None,
+        require_package_name: bool = True) -> dict:
     """Verify package identity, all blobs, coverage, and optional current inputs."""
     package_path = Path(package)
     if package_path.is_symlink() or not package_path.is_dir():
@@ -609,7 +775,8 @@ def verify_evidence_package(
     evidence_id = _require_digest(manifest.get("evidence_id"), "evidence_id")
     unsigned = dict(manifest)
     unsigned.pop("evidence_id", None)
-    if sha256_json(unsigned) != evidence_id or package_path.name != evidence_id:
+    if (sha256_json(unsigned) != evidence_id
+            or (require_package_name and package_path.name != evidence_id)):
         raise EvidenceValidationError("evidence manifest identity mismatch")
     if (manifest.get("purpose") != "research_evidence_only"
             or manifest.get("capabilities") != {
@@ -705,7 +872,8 @@ def verify_evidence_package(
     return manifest
 
 
-# Short aliases make the integration surface pleasant without hiding intent.
+# Backwards-compatible names retained for integrations that used the original
+# concise package API.  They inherit the explicit ancestry checks above.
 create_package = create_evidence_package
 verify_package = verify_evidence_package
 

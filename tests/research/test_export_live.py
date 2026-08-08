@@ -55,6 +55,8 @@ class JournalSchemaTests(unittest.TestCase):
         self.assertEqual(len(decisions), 3)
         self.assertEqual(
             set(decisions["strategy_id"]), {"momentum", "funding-unwind"})
+        self.assertTrue(
+            decisions["inference_exclusion_reason"].notna().all())
         self.assertTrue(summaries.empty)
         self.assertTrue(trades.empty)
 
@@ -132,6 +134,21 @@ class OutcomeModelTests(unittest.TestCase):
         self.assertEqual(
             resolved.attrs["unresolved"],
             {"momentum/BTC: incomplete 192-bar outcome window": 1})
+
+    def test_legacy_contract_rows_are_quarantined_before_resolution(self):
+        decisions = pd.DataFrame([{
+            **self.decision("momentum"),
+            "inference_exclusion_reason": (
+                "legacy evidence missing strategy contract provenance"),
+        }])
+        resolved = resolve(
+            decisions, {"BTC": self.frame(240)}, self.costs(),
+            max_hold_bars=1, min_stop_atr=1.0,
+            buffer_atr=0.1, reward_risk=2.0)
+        self.assertTrue(resolved.empty)
+        self.assertEqual(
+            resolved.attrs["unresolved"],
+            {"momentum: legacy evidence missing strategy contract provenance": 1})
 
     def test_stale_strategy_id_does_not_break_export_metadata(self):
         self.assertEqual(

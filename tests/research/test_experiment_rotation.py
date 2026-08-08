@@ -172,6 +172,50 @@ class RotationStoreTests(unittest.TestCase):
             [self.first.variant_id, self.second.variant_id,
              self.third.variant_id])
 
+    def test_batch_selection_preserves_exact_identity_across_restart(self):
+        first = self.store.ensure_experiment_batch(
+            "demo:batch", "momentum", self.baseline.variant_id,
+            self.candidates(), minimum_duration_seconds=THREE_DAYS,
+            minimum_observations=2, target_candidates=2, hard_cap=2, now=1.0)
+        self.assertEqual(
+            [item["candidate_variant_id"] for item in first],
+            [self.first.variant_id, self.second.variant_id])
+        self.assertEqual([item["batch_ordinal"] for item in first], [0, 1])
+        batch_id = first[0]["batch_id"]
+        assignment_ids = [item["assignment_id"] for item in first]
+
+        resumed = self.store.ensure_experiment_batch(
+            "demo:batch", "momentum", self.baseline.variant_id,
+            list(reversed(self.candidates())),
+            minimum_duration_seconds=1.0, minimum_observations=1,
+            target_candidates=2, hard_cap=2, now=2.0)
+        self.assertEqual(
+            [item["assignment_id"] for item in resumed], assignment_ids)
+        self.assertEqual({item["batch_id"] for item in resumed}, {batch_id})
+        self.assertEqual(
+            [item["minimum_duration_seconds"] for item in resumed],
+            [THREE_DAYS, THREE_DAYS])
+
+    def test_batch_selection_deduplicates_executable_candidate_identity(self):
+        alias = static_variant(
+            "momentum.rr.alias_1_5", "strategy.fixed_reward_risk", 1.5)
+        self.store.register(alias)
+        duplicate = store_candidate(alias, 0)
+        duplicate["candidate_key"] = store_candidate(self.first, 1)[
+            "candidate_key"]
+        assignments = self.store.ensure_experiment_batch(
+            "demo:identity", "momentum", self.baseline.variant_id,
+            [duplicate, store_candidate(self.first, 1),
+             store_candidate(self.second, 2)],
+            minimum_duration_seconds=THREE_DAYS, minimum_observations=2,
+            target_candidates=3, hard_cap=3, now=1.0)
+
+        # The alias has the same candidate_key as the first executable
+        # configuration and must not consume a second batch slot.
+        self.assertEqual(
+            [item["candidate_variant_id"] for item in assignments],
+            ["momentum.rr.alias_1_5", self.second.variant_id])
+
     def test_strategies_have_independent_active_assignments(self):
         other_baseline = variants.baseline("other", "v1")
         other_candidate = static_variant(
@@ -241,6 +285,119 @@ class RotationRuntimeTests(unittest.TestCase):
         self.registry = {
             item.variant_id: item
             for item in (self.baseline, self.first, self.second)}
+
+    @staticmethod
+    def tuned_ls_config() -> dict:
+        cfg = valid_config()
+        cfg["strategy"].update({
+            "id": "ls-ratio-fade",
+            "version": "v1",
+            "signal_timeframe": "1h",
+            "variant_id": "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3",
+            "ls_high_percentile": 70.0,
+            "ls_low_percentile": 30.0,
+            "hard_max_entry_extension_atr": 1.5,
+            "min_stop_atr_multiple": 1.0,
+            "fixed_reward_risk": 3.0,
+        })
+        cfg["research"] = {
+            "shadow_enabled": True,
+            "shadow_variants": [
+                "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3",
+                "ls_ratio_fade.axis.high_75",
+            ],
+            "shadow_budget_ms": 0,
+            "experiment_min_duration_days": 10,
+            "experiment_min_observations": 1,
+        }
+        return cfg
+
+    def test_shipped_tuned_ls_arm_is_pinned_with_exact_contract_config(self):
+        tuned = variants.Variant(
+            variant_id=(
+                "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3"),
+            strategy_id="ls-ratio-fade", base_version="v1",
+            overrides={
+                "strategy.ls_high_percentile": 70.0,
+                "strategy.ls_low_percentile": 30.0,
+                "strategy.hard_max_entry_extension_atr": 1.5,
+                "strategy.min_stop_atr_multiple": 1.0,
+                "strategy.fixed_reward_risk": 3.0,
+            },
+            hypothesis=(
+                "The coupled tuned settings are one immutable ls-ratio-fade "
+                "contract, not a one-axis selector setting."),
+            status="testing")
+        axis = static_variant(
+            "ls_ratio_fade.axis.high_75", "strategy.ls_high_percentile", 75.0,
+            strategy_id="ls-ratio-fade")
+        cfg = self.tuned_ls_config()
+        scope = "demo:tuned-ls"
+        evaluator = shadow.build(
+            cfg, {tuned.variant_id: tuned, axis.variant_id: axis},
+            scope_key=scope, store=self.store)
+
+        self.assertIsInstance(evaluator, shadow.ShadowEvaluator)
+        self.assertIn(tuned.variant_id, evaluator.variant_ids)
+        self.assertIn("ls_ratio_fade.baseline", evaluator.variant_ids)
+        self.assertIsNotNone(
+            self.store.paper_portfolio_state(scope, tuned.variant_id))
+        self.assertIsNotNone(
+            self.store.paper_portfolio_state(scope, "ls_ratio_fade.baseline"))
+        self.assertEqual(
+            evaluator._configs[tuned.variant_id]["strategy"][
+                "ls_high_percentile"], 70.0)
+        self.assertEqual(
+            evaluator._configs[tuned.variant_id]["strategy"][
+                "ls_low_percentile"], 30.0)
+        self.assertEqual(
+            evaluator._configs[tuned.variant_id]["strategy"][
+                "hard_max_entry_extension_atr"], 1.5)
+        self.assertEqual(
+            evaluator._configs[tuned.variant_id]["strategy"][
+                "min_stop_atr_multiple"], 1.0)
+        self.assertEqual(
+            evaluator._configs[tuned.variant_id]["strategy"][
+                "fixed_reward_risk"], 3.0)
+        self.assertEqual(
+            evaluator._provenance[tuned.variant_id][
+                "strategy_contract_variant_id"], tuned.variant_id)
+        self.assertEqual(evaluator._models[tuned.variant_id].stop_atr_multiple, 1.0)
+        self.assertEqual(evaluator._models[tuned.variant_id].reward_risk, 3.0)
+
+        # The coupled arm has its own account and is never an adaptive
+        # one-axis assignment. The ordinary axis remains eligible separately.
+        self.assertIn(tuned.variant_id, evaluator._pinned_variant_ids)
+        self.assertNotIn(tuned.variant_id, evaluator._rotation_candidates)
+        assignment = self.store.active_experiment_assignment(
+            scope, "ls-ratio-fade")
+        self.assertIsNotNone(assignment)
+        self.assertNotEqual(assignment["candidate_variant_id"], tuned.variant_id)
+        self.assertEqual(self.store.paper_scopes(), [scope])
+
+    def test_tuned_ls_bundle_is_not_offered_to_selector(self):
+        tuned = variants.Variant(
+            variant_id=(
+                "ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3"),
+            strategy_id="ls-ratio-fade", base_version="v1",
+            overrides={
+                "strategy.ls_high_percentile": 70.0,
+                "strategy.ls_low_percentile": 30.0,
+                "strategy.hard_max_entry_extension_atr": 1.5,
+                "strategy.min_stop_atr_multiple": 1.0,
+                "strategy.fixed_reward_risk": 3.0,
+            },
+            hypothesis=(
+                "The coupled tuned settings are one immutable ls-ratio-fade "
+                "contract, not a one-axis selector setting."),
+            status="testing")
+        self.assertIsNone(variants.declared_research_setting(tuned))
+        offered = {
+            item["variant_id"]
+            for items in variants.research_selection_catalog().values()
+            for item in items
+        }
+        self.assertNotIn(tuned.variant_id, offered)
 
     def test_build_runs_only_baseline_and_one_selected_setting(self):
         evaluator = shadow.build(
@@ -376,7 +533,7 @@ class RotationMigrationTests(unittest.TestCase):
                 [row["name"] for row in migrated.migration_history()])
             self.assertEqual(
                 migrated.migration_history()[-1]["name"],
-                "paper_execution_evidence_and_validity")
+                "paper_inference_quarantine_reasons")
             self.assertEqual(
                 migrated.pending_hypothesis_proposals("momentum")[0][
                     "proposal_id"], proposal["proposal_id"])

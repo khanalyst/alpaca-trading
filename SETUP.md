@@ -6,7 +6,8 @@ configuration. Day-to-day research, backup, and recovery procedures are in
 human authority boundaries are in
 [research/AUTONOMOUS_RESEARCH.md](research/AUTONOMOUS_RESEARCH.md).
 
-Current defaults are OKX `demo`, strategy `ls-ratio-fade/v1` in deterministic
+Current defaults are OKX `demo`, strategy `ls-ratio-fade/v1` with the explicit
+`ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3` contract in `shadow_only`
 mode, LLM provider `openai`, and model/deployment identifier
 `gpt-5.6-sol-coding`. `momentum/phase1-v3` remains the rejected benchmark. No
 credential is stored in the repository. Use an OKX demo API key with Read and
@@ -17,7 +18,7 @@ Trade only; never enable Withdraw.
 Requirements: Python 3.12+, Git, an OKX demo account, and disk space for SQLite
 journals, recorder data, findings, tournament runs, and backups. A supported
 model key is needed for analyst execution and the independent research
-author/reviewer, but not to start the shipped deterministic trader.
+author/reviewer, but not to start the shipped `shadow_only` runtime.
 
 ```bash
 git clone <repository> okx-agent-crypto
@@ -55,8 +56,11 @@ In another terminal:
 ./.venv/bin/python research.py replay --check-fidelity
 ```
 
-The configured `ls-ratio-fade/v1` strategy is unproven; demo use is an
-operations rehearsal and data-collection path, not a profitable-edge claim.
+The configured `ls-ratio-fade/v1` tuned identity is unproven and research-only.
+It is a pinned, isolated paper arm with its own account and is never an
+adaptive one-axis selector candidate.
+In the shipped `shadow_only` mode no order, LLM, or deterministic entry path is
+active; `demo` names the account environment, not an authorization to trade.
 `momentum/phase1-v3` is retained as the `T0_REJECTED` benchmark. The
 proposal-fidelity replay must pass before authoritative downstream research is
 trusted. It compares the full
@@ -97,7 +101,8 @@ authorize live mode. The complete operating and rollback procedure is in
 | Key | Shipped value/behavior |
 | --- | --- |
 | `mode` | `demo` |
-| `strategy.id` / `strategy.version` | `ls-ratio-fade` / `v1` (deterministic demo path) |
+| `strategy.id` / `strategy.version` | `ls-ratio-fade` / `v1` |
+| `strategy.variant_id` | `ls_ratio_fade.tuned_70_30_ext_1_5_stop_1_target_3`: 70/30 tails, 1.5 ATR extension cap, 1 ATR stop, 3R target; distinct from the registered 80/20, 3 ATR extension, 2 ATR stop, 2R base |
 | `llm.provider` / `llm.model` | `openai` / `gpt-5.6-sol-coding` |
 | `cycle.interval_seconds` | `60` seconds for marks, paper exits, housekeeping, and reconciliation |
 | `cycle.decision_interval_seconds` | `300` elapsed seconds (95% jitter tolerance); model decisions remain slower than safety/mark cycles |
@@ -108,11 +113,12 @@ authorize live mode. The complete operating and rollback procedure is in
 | `research.shadow_budget_ms` | `0` |
 | `research.shadow_workers` | `4` bounded packet-computation workers per evaluator |
 | `research.experiment_candidate_batch_size` | `4` pre-registered candidates per lane; hard cap `8` |
-| `research.findings_store` | `research/cache/findings.db` |
-| `research.collector` | Separate public-data recorder; up to 50 instruments and 4 workers |
-| `strategy.execution_mode` | `deterministic` (shipped): trades the named strategy's own forward contract with no LLM client, preflight, decision call, or `:llm` lane. `analyst` makes one LLM call per decision cycle; `shadow_only` runs no order path at all, leaving the research lanes unchanged |
+| `research.findings_store` | `research/cache/findings.db`, Findings schema 17 |
+| `research.collector` | Separate public-data recorder; up to 50 instruments and 4 workers; health is observable but does not gate trader or research startup |
+| `strategy.execution_mode` | `shadow_only` (shipped): no order, LLM, or deterministic entry path. `deterministic` uses the named strategy contract without an LLM; `analyst` makes one LLM call per decision cycle |
 | `research.staging_store` | `research/cache/staging.db`; machine-authored mechanisms, created by `research.py author` and absent until one is staged |
 | `research.forward_feed_version` | `8`; v8 repairs the depth-ladder delivery that silently starved six of seven strategies and widens the universe to 25; three long-horizon models are offline-only; v1-v7 remain historical, with v4 the market-data plumbing repair feed, v5 the immutable-provenance fork, v6 the deterministic four-lane fork, and v7 the liquidation-flow and conditioning-axis fork |
+| Recorded event plane | `runtime/research/market_events.db`, schema `event-plane.v1`; independent of `forward_feed_version: 8` |
 | `research.experiment_min_duration_days` | `10` |
 | `research.experiment_min_observations` | `100` |
 | `research.backup_target` | Unset; local-default backups until a mount is explicitly configured |
@@ -126,7 +132,23 @@ assignments. Both ten elapsed days and 100 comparable paired observations must
 be met before an assignment can close. The separate collector may scan a wider
 public universe without changing the active account's universe or risk limits.
 The three long-horizon registered models are offline-only. Only the configured
-main strategy can reach the demo exchange.
+main strategy could reach the demo exchange after an explicit execution-mode
+change; in the shipped `shadow_only` mode no strategy does.
+
+The recorder's confirmed `execution_bar_1m` series is joined into episodes only
+after the signal feature cutoff, using a later outcome cutoff for closed bars
+and funding. Direction is evidence-derived (`long`/`short`), bars must be
+contiguous, and the observable normalization path is preserved. A direct
+timeout requires full horizon coverage; missing or partial bars remain
+`no_data`. Funding is inferential only as `verified_realized` or
+`verified_no_settlement_due`.
+
+`StrategyContract` binds registry identity, forward economics/exit, evidence
+builder, immutable variant identity, and a semantic hash. Startup fails on
+configuration drift. Evidence with a missing or mismatched contract identity
+is retained for audit but quarantined from inference. Funding is likewise
+fail-closed: only `verified_realized` and `verified_no_settlement_due` rows are
+inferential.
 
 The available exit policies are `fixed_rr`, `extended_rr`, and
 `carry_until_normalised` (for `funding-carry`).
@@ -140,6 +162,9 @@ The available exit policies are `fixed_rr`, `extended_rr`, and
 ./.venv/bin/python research.py research-loop --no-review
 ./.venv/bin/python research.py prepare-handoff
 ./.venv/bin/python research.py prepare-review-artifacts
+./.venv/bin/python research.py ingest-recorded
+./.venv/bin/python research.py discover
+./.venv/bin/python research.py prepare-discovery-handoff
 ./.venv/bin/python research.py report
 ./.venv/bin/python research.py backup
 ./.venv/bin/python -m pytest -q
@@ -269,8 +294,9 @@ sudo systemctl disable okx-research.timer \
   okx-trader.service okx-recorder.service
 ```
 
-The recorder must become healthy before Compose starts the single trader. The
-research scheduler runs at 03:00 UTC and performs one missed run after a
+Compose starts the recorder, trader, and research scheduler independently; a
+stale recorder is visible in health but does not block trader or research
+startup. The research scheduler runs at 03:00 UTC and performs one missed run after a
 restart. Each run downloads a fresh immutable market snapshot under
 `runtime/research/snapshots/<UTC timestamp>`; it never appends to yesterday's
 universe. During a long run the scheduler refreshes its durable health status
@@ -499,8 +525,10 @@ sudo systemctl enable --now okx-trader
 sudo systemctl enable --now okx-research.timer
 ```
 
-Start the recorder before the trader. The timer is scheduled for 03:00 UTC,
-has up to 10 minutes randomized delay, and is persistent across missed runs.
+Starting the recorder first preserves more short-retention data, but neither
+the trader nor research service has a recorder startup dependency. The timer
+is scheduled for 03:00 UTC, has up to 10 minutes randomized delay, and is
+persistent across missed runs.
 
 ```bash
 sudo systemctl status okx-recorder okx-trader okx-research.timer
@@ -649,10 +677,13 @@ Azure deletion policy; verify **Detach**/disabled **Delete with VM** in Azure.
 
 The managed disk is a backup destination, not the application's active data
 directory. The supported backup captures the findings database, active
-journal, `runtime/research/recorded`, research manifests and forward evidence,
-complete manifest-bearing immutable trees under
-`runtime/research/snapshots/`, and `research/results`. `verify-backup` checks
-the size and SHA-256 of every captured raw snapshot file. See
+journal, account/state identity, heartbeat and failed-alert histories,
+`runtime/health/research.history.jsonl`, `runtime/research/market_events.db`,
+raw recorder data and content-addressed archives, research manifests and
+forward evidence, complete manifest-bearing immutable trees under
+`runtime/research/snapshots/`, discovery artifacts, and `research/results`.
+`verify-backup` checks checksums, JSON/JSONL syntax, SQLite integrity/foreign
+keys, and secret exclusions. See
 [OPERATIONS.md](OPERATIONS.md) before a zero-data-loss VM deletion or rebuild.
 
 ## 7. Deployment updates
@@ -692,7 +723,8 @@ The maker-first order primitive is not the `scalp-maker` shadow strategy.
 The shipped demo configuration enables it for measurement: validate its
 fill/cancel/timeout evidence before any live-mode consideration. Configuration
 validation rejects maker-first in live mode; exchange-only passive-order races
-are not proven by historical data.
+are not proven by historical data. This boundary is demo-only and does not
+authorize live capital.
 
 ## 10. Staged registration handoff
 
@@ -710,3 +742,11 @@ The default output is a content-addressed JSON file under
 configuration mutation occurred and that the mechanism is not live-eligible.
 An operator reviews and implements/registers the contract separately; this
 command does not authorize demo or live trading.
+
+For recorded discovery, `research.py discover` may return `IDLE`, `NO_DATA`,
+`NO_STATE_DATA`, or another inconclusive state without authorizing anything.
+Only a verified `COMPLETE` result can be exported by
+`research.py prepare-discovery-handoff`; the export is content-addressed under
+`research/results/discovery-handoffs/`, carries
+`HUMAN_DECISION_REQUIRED`, and has no registry/config/code/demo/live
+authority. Scalar/non-episode counterfactuals can never be `COMPLETE`.

@@ -15,12 +15,12 @@
       "research/corpus.py",
       "research/replay.py"
     ],
-    "sha256": "7cc439dbaf89d02b6a00f028463aef2db968ac0554e99bc5b6c3d505113fb6ef"
+    "sha256": "74e317ba4a2be093e6ed3fe70853d8d68a046e4901a9e7120f1cffd113275d5d"
   },
   "variant_id": "momentum.synthetic-golden",
   "mode": "recorded_llm",
   "cycles": 1,
-  "digest": "3fd089e883fda17c",
+  "digest": "7cdc35ec0f93ee4b",
   "funnel": {
     "fired": 1,
     "proposed": 1,

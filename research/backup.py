@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -32,6 +33,21 @@ DEFAULT_RUNTIME_RESEARCH = REPO / "runtime" / "research"
 DEFAULT_RESULTS = REPO / "research" / "results"
 MANIFEST_NAME = "MANIFEST.json"
 MANIFEST_CHECKSUM_NAME = "MANIFEST.sha256"
+_SOURCE_EXCLUSIONS: list[dict[str, str]] = []
+_SECRET_FRAGMENT = re.compile(
+    r"(?im)[\"']?\s*(?:api[_-]?key|api[_-]?secret|access[_-]?token|"
+    r"secret[_-]?key|private[_-]?key|password)\s*[\"']?\s*(?:[:=,]|$)")
+_TEXT_EXTENSIONS = frozenset({
+    ".csv", ".json", ".jsonl", ".txt", ".md", ".yaml", ".yml",
+})
+_ROLE_EXTENSIONS = {
+    "recorded": frozenset({".csv"}),
+    "archive": frozenset({".csv", ".json"}),
+    "snapshot": frozenset({".csv", ".json"}),
+    "runtime": frozenset({".json", ".jsonl"}),
+    "discovery": _TEXT_EXTENSIONS,
+    "results": _TEXT_EXTENSIONS,
+}
 
 
 class BackupError(RuntimeError):
@@ -69,7 +85,7 @@ def _manifest_content_id(manifest: dict) -> str:
         "size_bytes": item.get("size_bytes"),
         "sha256": item.get("sha256"),
         "verification": item.get("verification") or {},
-    } for item in manifest.get("files") or []]
+        } for item in manifest.get("files") or [] if isinstance(item, dict)]
     return hashlib.sha256(_canonical({
         "schema": manifest.get("schema"),
         "files": files,
@@ -142,6 +158,38 @@ def _regular_files(root: Path) -> list[Path]:
         and not path.name.endswith(("-wal", "-shm", "-journal")))
 
 
+def _safe_runtime_file(path: Path, *, role: str | None = None) -> bool:
+    """Allow known evidence roles and reject text containing secret fragments."""
+    lowered = path.name.lower()
+    if any(token in lowered for token in (
+            "secret", "credential", "password", "token", "apikey",
+            "api_key", "private", ".env", ".key")):
+        _SOURCE_EXCLUSIONS.append({
+            "source_path": str(path), "reason": "secret-like filename",
+        })
+        return False
+    if role is not None and path.suffix.lower() not in _ROLE_EXTENSIONS.get(
+            role, frozenset()):
+        _SOURCE_EXCLUSIONS.append({
+            "source_path": str(path), "reason": f"unsupported {role} evidence extension",
+        })
+        return False
+    if path.suffix.lower() in _TEXT_EXTENSIONS:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _SOURCE_EXCLUSIONS.append({
+                "source_path": str(path), "reason": f"text scan failed: {exc}",
+            })
+            return False
+        if _SECRET_FRAGMENT.search(content):
+            _SOURCE_EXCLUSIONS.append({
+                "source_path": str(path), "reason": "secret fragment in text content",
+            })
+            return False
+    return True
+
+
 def _immutable_snapshot_files(root: Path) -> list[Path]:
     """Return files from completed downloader snapshots only.
 
@@ -167,23 +215,40 @@ def _immutable_snapshot_files(root: Path) -> list[Path]:
 def _source_entries(
         store_path: Path, journal_path: Path | None,
         runtime_research_root: Path, results_root: Path) -> list[tuple[Path, Path]]:
+    _SOURCE_EXCLUSIONS.clear()
     entries: list[tuple[Path, Path]] = [
         (store_path, Path("sqlite") / "findings.db"),
     ]
     if journal_path is not None and journal_path.is_file():
         entries.append((journal_path, Path("sqlite") / "journal.db"))
 
+    # The event plane is SQLite/WAL-backed and is captured through the online
+    # backup API by _capture_file, so a live recorder can keep writing safely.
+    event_plane = runtime_research_root / "market_events.db"
+    if event_plane.is_file():
+        entries.append((event_plane, Path("sqlite") / "market_events.db"))
+
     recorded = runtime_research_root / "recorded"
     for path in _regular_files(recorded):
-        entries.append((
-            path, Path("files/runtime/research/recorded")
-            / path.relative_to(recorded)))
+        if _safe_runtime_file(path, role="recorded"):
+            entries.append((
+                path, Path("files/runtime/research/recorded")
+                / path.relative_to(recorded)))
+
+    # Content-addressed recorder blobs and completed snapshot manifests.
+    archive = runtime_research_root / "recorded_archive"
+    for path in _regular_files(archive):
+        if _safe_runtime_file(path, role="archive"):
+            entries.append((
+                path, Path("files/runtime/research/recorded_archive")
+                / path.relative_to(archive)))
 
     snapshots = runtime_research_root / "snapshots"
     for path in _immutable_snapshot_files(snapshots):
-        entries.append((
-            path, Path("files/runtime/research/snapshots")
-            / path.relative_to(snapshots)))
+        if _safe_runtime_file(path, role="snapshot"):
+            entries.append((
+                path, Path("files/runtime/research/snapshots")
+                / path.relative_to(snapshots)))
 
     if runtime_research_root.is_dir():
         for path in _regular_files(runtime_research_root):
@@ -193,18 +258,84 @@ def _source_entries(
             name = path.name.lower()
             if ("manifest" in name and path.suffix.lower() == ".json") \
                     or relative == Path("forward_evidence.json"):
+                if _safe_runtime_file(path, role="runtime"):
+                    entries.append((
+                        path, Path("files/runtime/research") / relative))
+
+    # Preserve mode-scoped state, corrupt copies, heartbeat and alert evidence
+    # without recursively copying runtime credentials or caches.
+    runtime_root = runtime_research_root.parent
+    for mode in sorted(runtime_root.iterdir()) if runtime_root.is_dir() else []:
+        if not mode.is_dir() or mode.name in {"backups", "cache"}:
+            continue
+        for path in _regular_files(mode):
+            if not _safe_runtime_file(path, role="runtime"):
+                continue
+            name = path.name.lower()
+            if (name == "state.json" or name.startswith("state.corrupt.")
+                    or name in {
+                        "heartbeat.json", "heartbeat.history.jsonl",
+                        "failed_alerts.jsonl",
+                    }):
                 entries.append((
-                    path, Path("files/runtime/research") / relative))
+                    path, Path("files/runtime") / mode.name
+                    / path.relative_to(mode)))
+    for name in ("research.json", "research.history.jsonl"):
+        health = runtime_root / "health" / name
+        if health.is_file() and _safe_runtime_file(health):
+            entries.append((health, Path("files/runtime/health") / name))
+
+    # Discovery artifacts are optional and may be named either singular or
+    # plural by older deployments. Include only an existing directory.
+    for discovery in (
+            runtime_research_root / "discovery-artifact",
+            runtime_research_root / "discovery-artifacts",
+            runtime_root / "discovery-artifact",
+            runtime_root / "discovery-artifacts"):
+        if not discovery.is_dir():
+            continue
+        for path in _regular_files(discovery):
+            if _safe_runtime_file(path, role="discovery"):
+                entries.append((
+                    path, Path("files/runtime")
+                    / path.relative_to(runtime_root)))
 
     for path in _regular_files(results_root):
-        entries.append((
-            path, Path("files/research/results")
-            / path.relative_to(results_root)))
+        if _safe_runtime_file(path, role="results"):
+            entries.append((
+                path, Path("files/research/results")
+                / path.relative_to(results_root)))
 
     by_archive: dict[str, tuple[Path, Path]] = {}
     for source, archive in entries:
         by_archive[archive.as_posix()] = (source, archive)
     return [by_archive[key] for key in sorted(by_archive)]
+
+
+def _optional_runtime_metadata(runtime_research_root: Path) -> dict:
+    """Read explicitly named identity/data-plane metadata when present."""
+    runtime_root = runtime_research_root.parent
+    candidates = {
+        "runtime_identity": (
+            runtime_root / "runtime_identity.json",
+            runtime_research_root / "runtime_identity.json"),
+        "data_plane": (
+            runtime_root / "data_plane.json",
+            runtime_research_root / "data_plane.json"),
+    }
+    result: dict = {}
+    for key, paths in candidates.items():
+        for path in paths:
+            if not path.is_file() or not _safe_runtime_file(path):
+                continue
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                result[key] = value
+                break
+    return result
 
 
 def _assert_target_outside_sources(target: Path, source_roots: list[Path]) -> None:
@@ -311,15 +442,16 @@ def verify_backup(path: str | Path) -> dict:
     except (OSError, ValueError, IndexError) as exc:
         errors.append(f"manifest unreadable: {exc}")
 
-    content_id = manifest.get("content_id") if isinstance(manifest, dict) else None
-    if manifest:
+    manifest_obj = manifest if isinstance(manifest, dict) else {}
+    content_id = manifest_obj.get("content_id")
+    if manifest_obj:
         calculated = _manifest_content_id(manifest)
         if content_id != calculated:
             errors.append("manifest content identity mismatch")
         if content_id and content_id[:16] not in root.name:
             errors.append("backup directory does not contain its content identity")
-        kind = manifest.get("target_kind")
-        evidence = manifest.get("target_evidence")
+        kind = manifest_obj.get("target_kind")
+        evidence = manifest_obj.get("target_evidence")
         if (kind == "external_mounted"
                 and not _positive_external_target_evidence(evidence)):
             errors.append("external target classification evidence is invalid")
@@ -329,7 +461,15 @@ def verify_backup(path: str | Path) -> dict:
 
     checked = 0
     sqlite_checks: dict[str, dict] = {}
-    for item in manifest.get("files", []) if manifest else []:
+    json_checks: dict[str, dict] = {}
+    files = manifest_obj.get("files")
+    if not isinstance(files, list):
+        errors.append("manifest files must be a list")
+        files = []
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            errors.append(f"manifest file entry {index} must be an object")
+            continue
         archive_path = str(item.get("archive_path") or "")
         relative = Path(archive_path)
         if (not archive_path or relative.is_absolute()
@@ -343,7 +483,12 @@ def verify_backup(path: str | Path) -> dict:
         except OSError as exc:
             errors.append(f"missing backup file {archive_path}: {exc}")
             continue
-        if size != int(item.get("size_bytes", -1)):
+        try:
+            expected_size = int(item.get("size_bytes", -1))
+        except (TypeError, ValueError):
+            expected_size = -1
+            errors.append(f"invalid size: {archive_path}")
+        if size != expected_size:
             errors.append(f"size mismatch: {archive_path}")
         if digest != item.get("sha256"):
             errors.append(f"checksum mismatch: {archive_path}")
@@ -355,18 +500,40 @@ def verify_backup(path: str | Path) -> dict:
             sqlite_checks[archive_path] = check
             if not check.get("ok"):
                 errors.append(f"SQLite verification failed: {archive_path}")
+        elif relative.suffix.lower() in {".json", ".jsonl"}:
+            try:
+                if relative.suffix.lower() == ".json":
+                    json.loads(file_path.read_text(encoding="utf-8"))
+                    check = {"ok": True, "records": 1}
+                else:
+                    records = 0
+                    with file_path.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            if line.strip():
+                                record = json.loads(line)
+                                if not isinstance(record, dict):
+                                    raise ValueError(
+                                        "JSONL history record is not an object")
+                                records += 1
+                    check = {"ok": True, "records": records}
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                check = {"ok": False, "error": str(exc)}
+            json_checks[archive_path] = check
+            if not check.get("ok"):
+                errors.append(f"JSON verification failed: {archive_path}")
         checked += 1
 
     return {
         "ok": not errors,
-        "backup_id": manifest.get("backup_id") if manifest else None,
+        "backup_id": manifest_obj.get("backup_id"),
         "content_id": content_id,
-        "target_kind": manifest.get("target_kind") if manifest else None,
+        "target_kind": manifest_obj.get("target_kind"),
         "target_evidence": (
-            manifest.get("target_evidence") if manifest else None),
+            manifest_obj.get("target_evidence")),
         "manifest_sha256": manifest_sha256,
         "files_verified": checked,
         "sqlite_checks": sqlite_checks,
+        "json_checks": json_checks,
         "errors": errors,
     }
 
@@ -388,7 +555,7 @@ def create_backup(
     target_root = Path(target) if target is not None else DEFAULT_TARGET
     configured_target = bool(target_configured or target is not None)
     classification_sources = [
-        REPO, store_path, runtime_root, results,
+        REPO, store_path, runtime_root, runtime_root.parent, results,
         *([journal] if journal is not None else []),
     ]
     target_kind, target_evidence = _classify_target(
@@ -414,7 +581,8 @@ def create_backup(
         "nonce": uuid.uuid4().hex,
     })
     source_paths = [
-        str(store_path), str(runtime_root), str(results),
+        str(store_path), str(runtime_root), str(runtime_root.parent),
+        str(results),
         str(journal) if journal is not None else None,
     ]
     source_paths = [path for path in source_paths if path is not None]
@@ -488,6 +656,8 @@ def create_backup(
             "target_kind": target_kind,
             "target_evidence": target_evidence,
             "source_paths": source_paths,
+            **_optional_runtime_metadata(runtime_root),
+            "source_exclusions": list(_SOURCE_EXCLUSIONS),
             "files": files,
         }
         content_id = _manifest_content_id(manifest_without_identity)

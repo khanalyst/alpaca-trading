@@ -46,7 +46,7 @@ the historical record says is not there.
 
 ## 1. Method, and why it should be believed
 
-This audit does not reuse the existing `phase1_v2_backtest.py`. It is a
+This audit does not reuse the existing `research/legacy/phase1_v2_backtest.py`. It is a
 second, independently written feature engine (`research/edge_lab.py`),
 cross-validated against the production code in two directions:
 
@@ -338,7 +338,7 @@ great deal in practice, which is what Section 5 bounds.
 ## 6b. Cross-check: the repository's own backtest, same data
 
 To make sure this is not an artifact of a new codebase, the repository's
-existing `research/phase1_v2_backtest.py` was run unmodified on the same
+existing `research/legacy/phase1_v2_backtest.py` was run unmodified on the same
 freshly downloaded bars, restricted to the same six instruments its committed
 result used (AAVE, BTC, DOGE, ETH, SOL, XRP) — but over a *different* window
 (2024-07 → 2026-07 rather than 2025-01 → 2026-07).
@@ -546,7 +546,7 @@ been run — 79 ways — and it is empty.
 python research/download_okx_history.py --out runtime/research/data \
   --days 730 --min-volume-usd 30000000 --max-symbols 26
 python research/validate_features.py --data runtime/research/data --samples 30
-python research/edge_report.py --data runtime/research/data --stage all
+python research/legacy/edge_report.py --data runtime/research/data --stage all
 ```
 
 Full machine-readable output: `summary.json` in this directory.

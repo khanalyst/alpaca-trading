@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -22,9 +23,12 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from agent import state as agent_state  # noqa: E402
+
 
 _running = True
 _child: subprocess.Popen | None = None
+log = logging.getLogger("research.scheduler")
 RUNNING_HEARTBEAT_SECONDS = 30.0
 DEFAULT_JOB_TIMEOUT_SECONDS = 4 * 60 * 60
 DEFAULT_OUTPUT_LIMIT_CHARS = 32_000
@@ -158,6 +162,14 @@ def write_status(path: Path, status: str, **detail) -> dict:
         try:
             temp.unlink()
         except FileNotFoundError:
+            pass
+    try:
+        agent_state.append_operational_history(
+            agent_state.operational_history_path(path), payload)
+    except Exception as exc:                              # noqa: BLE001
+        try:
+            log.warning("could not append research status history: %s", exc)
+        except Exception:                                 # noqa: BLE001
             pass
     return payload
 

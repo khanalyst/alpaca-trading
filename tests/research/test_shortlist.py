@@ -11,6 +11,7 @@ the distinction that made six strategies look falsified for a week.
 import unittest
 
 from research import shortlist
+from research.replay import ReplayDecision
 
 
 def trades(returns, start_ts=1_000.0, risk=100.0):
@@ -297,3 +298,41 @@ class OpportunityEvidenceTests(unittest.TestCase):
         self.assertEqual(candidate.starved_decisions, 100)
         self.assertEqual(candidate.eligible_opportunities, 110)
         self.assertAlmostEqual(candidate.mean_r, 100 / 110, places=3)
+
+    def test_replay_and_shortlist_use_the_same_canonical_identity(self):
+        replay = ReplayDecision(
+            cycle_id="different-cycle", ts=10.0, symbol="BTC/USDT:USDT",
+            signal_ts=123, stage="executed", direction="long",
+            setup_type="range_breakout", proposal_id="proposal-1")
+        row = {"proposal_id": "proposal-1", "symbol": "other-symbol",
+               "signal_ts": 999, "direction": "short",
+               "setup_type": "other"}
+        self.assertEqual(replay.proposal_key(), shortlist._proposal_key(row))
+
+    def test_duplicate_rows_are_excluded_and_block_supported(self):
+        trade_rows = [self._trade(i, 1.0, f"p{i}") for i in range(100)]
+        trade_rows.extend([
+            self._trade(100, 1.0, "duplicate"),
+            self._trade(101, 2.0, "duplicate"),
+            self._trade(102, 3.0, "duplicate"),
+        ])
+        decisions = [self._decision(f"p{i}") for i in range(100)]
+        decisions.extend([
+            self._decision("duplicate"),
+            self._decision("duplicate"),
+            self._decision("duplicate"),
+        ])
+        baseline_trades = [self._trade(i, 0.0, f"p{i}") for i in range(100)]
+        baseline_decisions = [self._decision(f"p{i}") for i in range(100)]
+        candidate = shortlist.measure(
+            "staged.x", "demo:s", trade_rows, decisions=decisions,
+            baseline_trades=baseline_trades,
+            baseline_decisions=baseline_decisions,
+            baseline_variant_id="momentum.baseline")
+
+        self.assertEqual(candidate.trades, 100)
+        self.assertEqual(candidate.eligible_opportunities, 100)
+        self.assertEqual(candidate.duplicate_count, 4)
+        self.assertEqual(candidate.pair_coverage_pct, 100.0)
+        self.assertNotEqual(candidate.label, shortlist.SUPPORTED)
+        self.assertIn("duplicate", " ".join(candidate.reasons).lower())

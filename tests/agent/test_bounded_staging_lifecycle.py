@@ -50,6 +50,48 @@ class BoundedStagingLifecycleTests(unittest.TestCase):
         with self.assertRaises(StagingNoveltyError):
             store.register_bounded(proposal("renamed", 75), generation=1)
 
+    def test_register_batch_publishes_a_root_and_family_atomically(self):
+        store = StagingStore(self.path, max_active=4)
+        registered = store.register_batch(
+            proposal("batch-root", 80),
+            [proposal("batch-low", 70), proposal("batch-high", 60)],
+            generation=3, now=10.0)
+
+        self.assertEqual(
+            [contract.contract_id for contract in registered],
+            ["batch-root", "batch-low", "batch-high"])
+        records = store.records()
+        self.assertEqual(len(records), 3)
+        root = next(record for record in records
+                    if record["contract_id"] == "batch-root")
+        self.assertIsNone(root["parent_contract_id"])
+        self.assertEqual(
+            {record["parent_contract_id"] for record in records
+             if record["contract_id"] != "batch-root"},
+            {"batch-root"})
+        self.assertEqual(
+            {record["mechanism_id"] for record in records},
+            {root["mechanism_id"]})
+        self.assertEqual(
+            len({record["configuration_id"] for record in records}), 3)
+
+    def test_register_batch_failure_leaves_no_partial_family(self):
+        store = StagingStore(self.path, max_active=2)
+        with self.assertRaises(StagingCapacityError):
+            store.register_batch(
+                proposal("batch-root", 80),
+                [proposal("batch-child", 70), proposal("batch-child-two", 60)],
+                generation=0)
+        self.assertEqual(store.records(), [])
+
+        store = StagingStore(self.path)
+        with self.assertRaises(StagingNoveltyError):
+            store.register_batch(
+                proposal("batch-root", 80),
+                [proposal("batch-a", 70), proposal("batch-b", 70)],
+                generation=0)
+        self.assertEqual(store.records(), [])
+
     def test_age_releases_an_unobserved_lane_without_claiming_falsification(self):
         store = StagingStore(self.path)
         store.register(proposal(), generation=0, now=0)

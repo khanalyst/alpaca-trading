@@ -114,8 +114,14 @@ class PriceCache:
         return [int(row[0]) for row in rows] == expected
 
     def days_covering(self, start_ms: int, end_ms: int) -> list[str]:
-        out, cursor = [], int(start_ms) - (int(start_ms) % DAY_MS)
-        while cursor <= int(end_ms):
+        start = int(start_ms)
+        end = int(end_ms)
+        if start >= end:
+            return []
+        out, cursor = [], start - (start % DAY_MS)
+        # ``end_ms`` is exclusive, including the day at exactly-midnight
+        # would fetch one unrelated day past the requested range.
+        while cursor < end:
             out.append(day_of(cursor))
             cursor += DAY_MS
         return out
@@ -152,6 +158,8 @@ class PriceCache:
         Idempotent: a second call over the same range performs zero network
         calls, which the test suite asserts with a counting fetcher.
         """
+        if int(start_ms) >= int(end_ms):
+            return 0
         fetched = 0
         for day in self.days_covering(start_ms, end_ms):
             if self.has_day(symbol, day):

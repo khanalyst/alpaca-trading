@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from research.edge_lab import (  # noqa: E402
     COST_SCENARIOS, DEFAULT_COST_SCENARIO, Contract, Costs, HOUR_MS,
@@ -600,7 +600,7 @@ def stage_portfolio(frames, membership, out: dict) -> None:
     print("\n" + "=" * 78)
     print("STAGE 7 - ACCOUNT SIMULATION THROUGH THE REPOSITORY RISK ENGINE")
     print("=" * 78)
-    from research.portfolio_sim import run_portfolio
+    from research.legacy.portfolio_sim import run_portfolio
     results = {}
     for cost_name in ("frictionless", "base", "account_taker"):
         metrics = run_portfolio(frames, membership, Contract(),

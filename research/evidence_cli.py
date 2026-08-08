@@ -59,6 +59,9 @@ def parser() -> argparse.ArgumentParser:
     verified.add_argument("package")
     verified.add_argument("--code-root")
     verified.add_argument("--config")
+    verified.add_argument(
+        "--package-root",
+        help="explicit root containing parent evidence packages")
 
     run = commands.add_parser(
         "run-replay", help="run a sanitized fixture through production replay")
@@ -87,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify-package":
             manifest = verify_evidence_package(
                 args.package, code_root=args.code_root,
-                config_path=args.config)
+                config_path=args.config, package_root=args.package_root)
             print(manifest["evidence_id"])
         elif args.command == "run-replay":
             print(canonical_json(replay_fixture(args.fixture)))

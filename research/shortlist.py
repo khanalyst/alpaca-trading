@@ -23,6 +23,8 @@ from .stats import (benjamini_hochberg, bootstrap_difference,
                     bootstrap_mean, bootstrap_p_value,
                     cluster_block_bootstrap_difference,
                     paired_cluster_sign_flip)
+from .evidence_primitives import (canonical_opportunity_key, index_rows,
+                                  pair_sets)
 
 # Sample floors. These are not significance thresholds; they gate what a
 # label is allowed to say, so a promising number on nine trades cannot read
@@ -96,6 +98,13 @@ class Candidate:
     confirmation_delta_ci_low: float | None = None
     confirmation_delta_ci_high: float | None = None
     confirmation_p_value: float | None = None
+    # Duplicate identities are data-integrity failures, not extra evidence.
+    # They are retained in the report so a ledger repair is actionable, but
+    # any duplicate blocks the strongest label.
+    duplicate_decisions: int = 0
+    duplicate_trades: int = 0
+    baseline_duplicate_decisions: int = 0
+    baseline_duplicate_trades: int = 0
     starved_decisions: int = 0
     declined_decisions: int = 0
     # Opportunity-level evidence.  ``trades`` remains the count of closed,
@@ -151,6 +160,17 @@ class Candidate:
         return (self.mean_r if self.opportunity_mean_r is None
                 else self.opportunity_mean_r)
 
+    @property
+    def duplicate_count(self) -> int:
+        return (self.duplicate_decisions + self.duplicate_trades
+                + self.baseline_duplicate_decisions
+                + self.baseline_duplicate_trades)
+
+    @property
+    def duplicates(self) -> int:
+        """Compact compatibility alias used by report consumers."""
+        return self.duplicate_count
+
     def rank_key(self) -> tuple:
         # Within a label, the lower confidence bound orders candidates: it is
         # the value the evidence supports rather than the one it produced.
@@ -186,15 +206,8 @@ def _value(row, key: str, default=None):
 
 
 def _proposal_key(row):
-    """Return the immutable proposal identity used by the decision ledger."""
-    proposal_id = _value(row, "proposal_id")
-    if proposal_id is not None:
-        return ("proposal", str(proposal_id))
-    # Older rows may not carry the generated id.  The replay identity is the
-    # stable fallback and intentionally excludes variant/wall-clock fields.
-    return ("identity", _value(row, "cycle_id"), _value(row, "symbol"),
-            _value(row, "signal_ts"), _value(row, "direction"),
-            _value(row, "setup_type"))
+    """Return the immutable identity shared with replay and protocol."""
+    return canonical_opportunity_key(row)
 
 
 def _starved_reason(reason: object) -> bool:
@@ -212,10 +225,23 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
     denominator but are not silently converted to a zero.  That distinction
     prevents missing close data from becoming performance evidence.
     """
-    closed = _closed(trades)
-    by_key = {_proposal_key(row): row for row in closed}
-    by_trade_id = {str(_value(row, "trade_id")): row for row in closed
-                   if _value(row, "trade_id") is not None}
+    raw_closed = _closed(trades)
+    # Index before joining.  A dict comprehension would let a second row
+    # replace the first, and a later third row could then become evidence;
+    # ``index_rows`` permanently excludes every repeated identity.
+    closed_index = index_rows(
+        raw_closed,
+        value_fn=lambda row: float(row["r_multiple"]),
+        timestamp_fn=lambda row: float(_value(row, "entry_ts", 0.0) or 0.0))
+    closed = sorted(
+        closed_index.resolved_rows.values(),
+        key=lambda row: float(_value(row, "entry_ts", 0.0) or 0.0))
+    by_key = dict(closed_index.resolved)
+    by_trade_id: dict[str, dict] = {}
+    for row in closed:
+        trade_id = _value(row, "trade_id")
+        if trade_id is not None:
+            by_trade_id.setdefault(str(trade_id), row)
 
     # Direct callers and old fixtures have no ledger.  Preserve the original
     # trade-only behaviour while still allowing a supplied declined count to
@@ -227,19 +253,21 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
             "closed": closed, "returns": returns, "keys": keys,
             "eligible": len(closed), "resolved": len(closed),
             "fired": len(closed), "declined": 0, "starved": 0,
-            "resolved_by_key": dict(zip(keys, returns)),
+            "resolved_by_key": dict(closed_index.resolved),
             "resolved_ts_by_key": {
-                key: float(row.get("entry_ts") or 0.0)
-                for key, row in zip(keys, closed)},
-            "eligible_keys": set(keys), "coverage_known": False,
+                key: closed_index.resolved_ts.get(key, 0.0)
+                for key in keys},
+            "eligible_keys": set(closed_index.unique_keys),
+            "coverage_known": False,
+            "duplicate_rows": closed_index.duplicate_rows,
+            "duplicate_keys": set(closed_index.duplicate_keys),
+            "duplicate_reasons": closed_index.duplicate_reasons,
+            "duplicate_decisions": 0,
+            "duplicate_trades": closed_index.duplicate_rows,
         }
 
-    returns: list[float] = []
-    keys: list[object] = []
-    resolved_by_key: dict[object, float] = {}
-    resolved_ts_by_key: dict[object, float] = {}
-    eligible_keys: set = set()
-    eligible = resolved = fired = declined = starved = 0
+    eligible_rows: list = []
+    starved = 0
     def _decision_ts(row):
         value = _value(row, "decision_ts",
                        _value(row, "entry_ts", _value(row, "signal_ts", 0.0)))
@@ -251,40 +279,30 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
     ordered_decisions = sorted(decisions or [], key=_decision_ts)
     for row in ordered_decisions:
         outcome = str(_value(row, "decision_outcome", "") or "").upper()
-        key = _proposal_key(row)
         if outcome == "VETOED":
             if _starved_reason(_value(row, "reason")):
                 starved += 1
                 continue
-            eligible += 1
-            declined += 1
-            eligible_keys.add(key)
-            resolved += 1
-            returns.append(0.0)
-            keys.append(key)
-            resolved_by_key[key] = 0.0
-            resolved_ts_by_key[key] = _decision_ts(row)
-            continue
-        if outcome != "PROPOSED":
-            continue
-        eligible += 1
-        # The signal fired when the decision was accepted, even if its paper
-        # trade is still open or later becomes invalid for inference. Those
-        # rows remain unresolved for return/coverage purposes, but they still
-        # belong in the firing-rate denominator and numerator.
-        fired += 1
-        eligible_keys.add(key)
+            eligible_rows.append(row)
+        elif outcome == "PROPOSED":
+            # The signal fired when accepted, even if its paper trade is
+            # still open or invalid.  Such a row remains eligible but
+            # unresolved until a valid close is present.
+            eligible_rows.append(row)
+
+    def value_for(row):
+        outcome = str(_value(row, "decision_outcome", "") or "").upper()
+        if outcome == "VETOED":
+            return 0.0
+        key = _proposal_key(row)
         trade = by_key.get(key)
         if trade is None and _value(row, "paper_trade_id") is not None:
             trade = by_trade_id.get(str(_value(row, "paper_trade_id")))
         if trade is None:
-            # Protocol/replay callers may pass the decision ledger after its
-            # trade join rather than separate paper-trade rows.
             joined_status = str(_value(row, "trade_status") or "").upper()
             joined_value = _value(row, "trade_r_multiple")
             if (joined_status == "CLOSED"
-                    and str(_value(row, "trade_result") or "")
-                    != "unfilled"
+                    and str(_value(row, "trade_result") or "") != "unfilled"
                     and int(_value(row, "trade_valid_for_inference", 1)
                             or 0) == 1
                     and joined_value is not None):
@@ -293,17 +311,35 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
                 except (TypeError, ValueError):
                     joined_value = None
                 if joined_value is not None and math.isfinite(joined_value):
-                    trade = {"r_multiple": joined_value}
-        if trade is None:
-            # The row is still an opportunity, but no valid close is evidence
-            # yet.  Leave it unresolved rather than inventing a return.
-            continue
-        value = float(trade["r_multiple"])
-        resolved += 1
-        returns.append(value)
-        keys.append(key)
-        resolved_by_key[key] = value
-        resolved_ts_by_key[key] = _decision_ts(row)
+                    return joined_value
+            return None
+        # Closed rows are indexed as key -> scalar return.  Keep this join
+        # scalar so an index can never be mistaken for a raw row mapping.
+        if isinstance(trade, dict):
+            return float(trade["r_multiple"])
+        return float(trade)
+
+    decision_index = index_rows(
+        eligible_rows, value_fn=value_for, timestamp_fn=_decision_ts)
+    eligible_keys = set(decision_index.unique_keys)
+    first_rows = decision_index.first_rows
+    unique_rows = [first_rows[key] for key in eligible_keys]
+    unique_rows.sort(key=_decision_ts)
+    resolved_by_key = dict(decision_index.resolved)
+    keys = [key for row in unique_rows
+            if (key := _proposal_key(row)) in resolved_by_key]
+    returns = [resolved_by_key[key] for key in keys]
+    resolved_ts_by_key = {
+        key: decision_index.resolved_ts.get(key, 0.0)
+        for key in keys}
+    eligible = len(unique_rows)
+    resolved = len(keys)
+    fired = sum(1 for row in unique_rows
+                if str(_value(row, "decision_outcome", "") or "").upper()
+                == "PROPOSED")
+    declined = sum(1 for row in unique_rows
+                   if str(_value(row, "decision_outcome", "") or "").upper()
+                   == "VETOED")
 
     return {
         "closed": closed, "returns": returns, "keys": keys,
@@ -312,14 +348,26 @@ def _opportunity_evidence(trades: list, decisions: list | None = None) -> dict:
         "resolved_by_key": resolved_by_key,
         "resolved_ts_by_key": resolved_ts_by_key,
         "eligible_keys": eligible_keys, "coverage_known": True,
+        "duplicate_rows": (closed_index.duplicate_rows
+                            + decision_index.duplicate_rows),
+        "duplicate_keys": (set(closed_index.duplicate_keys)
+                            | set(decision_index.duplicate_keys)),
+        "duplicate_reasons": {
+            "trades": closed_index.duplicate_reasons,
+            "decisions": decision_index.duplicate_reasons,
+        },
+        "duplicate_decisions": decision_index.duplicate_rows,
+        "duplicate_trades": closed_index.duplicate_rows,
     }
 
 
 def _paired_opportunity_evidence(left: dict, right: dict) -> dict:
     """Match resolved candidate/baseline opportunities by immutable identity."""
-    union = left["eligible_keys"] | right["eligible_keys"]
-    common = list(set(left["resolved_by_key"]) &
-                  set(right["resolved_by_key"]))
+    paired_sets = pair_sets(
+        left["eligible_keys"], right["eligible_keys"],
+        left["resolved_by_key"], right["resolved_by_key"])
+    union = paired_sets["union"]
+    common = list(paired_sets["matched"])
     common.sort(key=lambda key: (
         left["resolved_ts_by_key"].get(
             key, right["resolved_ts_by_key"].get(key, 0.0)), repr(key)))
@@ -335,6 +383,14 @@ def _paired_opportunity_evidence(left: dict, right: dict) -> dict:
         "union": len(union),
         "coverage_pct": (len(common) / len(union) * 100.0
                           if union else 0.0),
+        "duplicate_rows": (left.get("duplicate_rows", 0)
+                            + right.get("duplicate_rows", 0)),
+        "left_duplicate_rows": left.get("duplicate_rows", 0),
+        "right_duplicate_rows": right.get("duplicate_rows", 0),
+        "duplicate_reasons": {
+            "left": left.get("duplicate_reasons", {}),
+            "right": right.get("duplicate_reasons", {}),
+        },
     }
 
 
@@ -342,6 +398,13 @@ def _label(candidate: Candidate) -> tuple[str, list]:
     """Decide what the evidence is allowed to claim."""
     reasons: list = []
     n = candidate.trades
+    duplicate_reason = None
+    if candidate.duplicate_count:
+        duplicate_reason = (
+            f"{candidate.duplicate_count} duplicate opportunity rows were "
+            "excluded permanently; duplicate identities require ledger "
+            "repair")
+        reasons.append(duplicate_reason)
     if n == 0:
         if candidate.starved_decisions:
             reasons.append(
@@ -372,6 +435,11 @@ def _label(candidate: Candidate) -> tuple[str, list]:
             f"{n} closed trades supports a preliminary reading only; "
             f"{MIN_FOR_SUPPORTED} is the floor for a supported one")
         return PRELIMINARY, reasons
+
+    if candidate.duplicate_count:
+        reasons.append("duplicate identities block SUPPORTED until the "
+                       "evidence ledger is repaired")
+        return INCONCLUSIVE, reasons
 
     if (candidate.source == "staged" and not candidate.is_baseline
             and candidate.pair_coverage_pct is None):
@@ -543,6 +611,8 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
         trades=len(closed), wins=sum(1 for r in returns if r > 0),
         net_pnl_usd=round(sum(
             float(row.get("net_pnl_usd") or 0.0) for row in closed), 2),
+        duplicate_decisions=int(evidence.get("duplicate_decisions", 0)),
+        duplicate_trades=int(evidence.get("duplicate_trades", 0)),
         starved_decisions=starved_count, declined_decisions=declined_count,
         eligible_opportunities=int(evidence["eligible"]),
         resolved_opportunities=int(evidence["resolved"]),
@@ -590,12 +660,20 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
                 baseline_evidence["resolved"] /
                 baseline_evidence["eligible"] * 100.0
                 if baseline_evidence["eligible"] else 0.0)
-    if returns and baseline_evidence and baseline_evidence["returns"]:
-        if decisions is not None and baseline_decisions is not None:
-            paired = _paired_opportunity_evidence(evidence,
-                                                   baseline_evidence)
-            candidate.matched_opportunities = paired["matched"]
-            candidate.pair_coverage_pct = paired["coverage_pct"]
+        candidate.baseline_duplicate_decisions = int(
+            baseline_evidence.get("duplicate_decisions", 0))
+        candidate.baseline_duplicate_trades = int(
+            baseline_evidence.get("duplicate_trades", 0))
+    delta = None
+    if (baseline_evidence is not None
+            and decisions is not None and baseline_decisions is not None):
+        # Pair coverage is reported even when one side has no resolved rows;
+        # an empty or duplicate-only union is deliberately fail-closed.
+        paired = _paired_opportunity_evidence(evidence,
+                                               baseline_evidence)
+        candidate.matched_opportunities = paired["matched"]
+        candidate.pair_coverage_pct = paired["coverage_pct"]
+        if returns and baseline_evidence["returns"]:
             delta = (cluster_block_bootstrap_difference(
                 paired["pairs"], cluster_seconds=PAIR_CLUSTER_SECONDS)
                      if paired["pairs"] else None)
@@ -625,16 +703,19 @@ def measure(variant_id: str, scope_key: str, trades: list, *,
                 # Multiplicity correction must consume the confirmatory
                 # paired test, not a candidate-vs-zero exploratory test.
                 candidate.p_value = candidate.confirmation_p_value
-        else:
-            # Legacy trade-only evidence has no proposal identity to match;
-            # retain the historical independent comparison and leave pair
-            # coverage unknown rather than manufacturing a match.
-            delta = bootstrap_difference(
-                returns, baseline_evidence["returns"])
         if delta is not None:
             candidate.delta_vs_baseline = round(delta.point, 4)
             candidate.delta_ci_low = round(delta.low, 4)
             candidate.delta_ci_high = round(delta.high, 4)
+    elif (baseline_evidence is not None and returns
+          and baseline_evidence["returns"]):
+        # Legacy trade-only evidence has no proposal identity to match;
+        # retain the historical independent comparison and leave pair
+        # coverage unknown rather than manufacturing a match.
+        delta = bootstrap_difference(returns, baseline_evidence["returns"])
+        candidate.delta_vs_baseline = round(delta.point, 4)
+        candidate.delta_ci_low = round(delta.low, 4)
+        candidate.delta_ci_high = round(delta.high, 4)
     elif baseline_decisions is not None:
         # Explicitly supplied empty baseline evidence is inadequate, not an
         # absent legacy argument. This makes SUPPORTED fail closed when a

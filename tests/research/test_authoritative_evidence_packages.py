@@ -5,9 +5,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from research import evidence_package as evidence
 from research import evidence_cli
@@ -36,6 +38,12 @@ class AuthoritativePackageFixture(unittest.TestCase):
         self.output = self.root / "result.json"
         self.output.write_text('{"expectancy_r":-0.1}\n', encoding="utf-8")
         self.store = self.root / "evidence"
+        # Parent references are real content-addressed packages.  Keeping a
+        # concrete parent in the fixture exercises ancestry resolution instead
+        # of allowing a placeholder digest to bypass it.
+        self.parent = evidence.create_evidence_package(
+            self.store, self.spec(parent_evidence_ids=()))
+        self.parent_id = self.parent.name
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -84,19 +92,33 @@ class AuthoritativePackageFixture(unittest.TestCase):
                 "started_at": "2026-08-07T00:00:00+00:00",
                 "completed_at": "2026-08-07T00:00:01+00:00",
             },
-            "parent_evidence_ids": ("a" * 64,),
+            "parent_evidence_ids": (
+                getattr(self, "parent_id", None),
+            ) if getattr(self, "parent_id", None) else (),
         }
         values.update(overrides)
         return evidence.EvidenceSpec(**values)
 
+    def parent_lookup(self, evidence_id):
+        return self.store / str(evidence_id)
+
+    def create(self, store=None, spec=None):
+        return evidence.create_evidence_package(
+            store or self.store, spec or self.spec(),
+            parent_lookup=self.parent_lookup)
+
+    def verify(self, package, **kwargs):
+        return evidence.verify_evidence_package(
+            package, parent_lookup=self.parent_lookup, **kwargs)
+
 
 class ContentAddressedEvidenceTests(AuthoritativePackageFixture):
     def test_manifest_and_package_path_are_deterministic_and_research_only(self):
-        first = evidence.create_evidence_package(self.store, self.spec())
-        second = evidence.create_evidence_package(self.store, self.spec())
+        first = self.create()
+        second = self.create()
 
         self.assertEqual(first, second)
-        manifest = evidence.verify_evidence_package(
+        manifest = self.verify(
             first, code_root=self.root, config_path=self.config)
         self.assertEqual(first.name, manifest["evidence_id"])
         self.assertEqual(len(first.name), 64)
@@ -107,13 +129,14 @@ class ContentAddressedEvidenceTests(AuthoritativePackageFixture):
             manifest["dataset"]["provenance"]["classification"],
             "synthetic")
         self.assertEqual(
-            manifest["parent_evidence_ids"], ["a" * 64])
+            manifest["parent_evidence_ids"], [self.parent_id])
 
     def test_tampered_or_missing_material_is_rejected(self):
         for defect in ("tamper", "missing"):
             with self.subTest(defect=defect):
                 package = evidence.create_evidence_package(
-                    self.store / defect, self.spec())
+                    self.store / defect, self.spec(),
+                    parent_lookup=self.parent_lookup)
                 manifest = json.loads(
                     (package / "manifest.json").read_text(encoding="utf-8"))
                 digest = manifest["dataset"]["artifact"]["sha256"]
@@ -126,17 +149,17 @@ class ContentAddressedEvidenceTests(AuthoritativePackageFixture):
                     evidence.verify_evidence_package(package)
 
     def test_current_code_and_config_drift_are_rejected(self):
-        package = evidence.create_evidence_package(self.store, self.spec())
+        package = self.create()
         self.strategy.write_text("STRATEGY = 'drift'\n", encoding="utf-8")
         with self.assertRaisesRegex(
                 evidence.EvidenceValidationError, "code tree"):
-            evidence.verify_evidence_package(package, code_root=self.root)
+            self.verify(package, code_root=self.root)
 
         self.strategy.write_text("STRATEGY = 'exact-v1'\n", encoding="utf-8")
         self.config.write_text('{"changed":true}\n', encoding="utf-8")
         with self.assertRaisesRegex(
                 evidence.EvidenceValidationError, "config"):
-            evidence.verify_evidence_package(
+            self.verify(
                 package, code_root=self.root, config_path=self.config)
 
     def test_gappy_incomplete_and_unlabelled_datasets_fail_closed(self):
@@ -164,22 +187,101 @@ class ContentAddressedEvidenceTests(AuthoritativePackageFixture):
             with self.subTest(index=index), self.assertRaises(
                     evidence.EvidenceValidationError):
                 evidence.create_evidence_package(
-                    self.store / str(index), self.spec(dataset=dataset))
+                    self.store / str(index), self.spec(dataset=dataset),
+                    parent_lookup=self.parent_lookup)
 
     def test_prompt_identity_is_exact_when_a_model_was_applicable(self):
         prompt = self.root / "prompt.txt"
         inputs = self.root / "prompt-inputs.json"
         prompt.write_text("select no trades", encoding="utf-8")
         inputs.write_text('{"snapshot":"synthetic"}\n', encoding="utf-8")
-        package = evidence.create_evidence_package(
-            self.store,
-            self.spec(prompt=evidence.PromptEvidence(
+        package = self.create(spec=self.spec(
+            prompt=evidence.PromptEvidence(
                 applicable=True, provider="openai", model="test-model",
                 prompt_path=prompt, inputs_path=inputs)))
-        manifest = evidence.verify_evidence_package(package)
+        manifest = self.verify(package)
         self.assertTrue(manifest["prompt"]["applicable"])
         self.assertEqual(manifest["prompt"]["provider"], "openai")
         self.assertEqual(len(manifest["prompt"]["prompt"]["sha256"]), 64)
+
+    def test_missing_or_tampered_parent_is_rejected(self):
+        child = self.create()
+        for defect in ("missing", "tampered"):
+            with self.subTest(defect=defect):
+                parent = self.parent
+                if defect == "missing":
+                    shutil.rmtree(parent)
+                else:
+                    manifest = json.loads(
+                        (parent / "manifest.json").read_text(encoding="utf-8"))
+                    digest = manifest["dataset"]["artifact"]["sha256"]
+                    (parent / "blobs" / digest).write_text(
+                        "tampered parent\n", encoding="utf-8")
+                with self.assertRaises(evidence.EvidenceValidationError):
+                    self.verify(child)
+
+                # Restore the parent for the next subtest when necessary.
+                if defect == "missing":
+                    self.parent = evidence.create_evidence_package(
+                        self.store, self.spec(parent_evidence_ids=()))
+
+    def test_parent_cycle_is_rejected_by_lookup(self):
+        child = self.create()
+        real_verify = evidence._verify_evidence_package
+        calls = 0
+
+        def cyclic_verify(package, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return real_verify(package, **kwargs)
+            if calls == 3:
+                return {
+                    "evidence_id": self.parent_id,
+                    "parent_evidence_ids": [child.name],
+                }
+            return {"evidence_id": child.name, "parent_evidence_ids": []}
+
+        with patch.object(evidence, "_verify_evidence_package",
+                          side_effect=cyclic_verify):
+            with self.assertRaisesRegex(
+                evidence.EvidenceValidationError, "cycle"):
+                evidence.verify_evidence_package(
+                    child, parent_lookup={
+                        self.parent_id: child, child.name: child})
+
+    def test_parent_lookup_must_return_the_declared_identity(self):
+        other_output = self.root / "other-result.json"
+        other_output.write_text('{"expectancy_r":0.2}\n', encoding="utf-8")
+        other = self.create(spec=self.spec(
+            parent_evidence_ids=(), outputs=(other_output,)))
+        child = self.create()
+        with self.assertRaisesRegex(
+                evidence.EvidenceValidationError, "does not match declared ID"):
+            evidence.verify_evidence_package(
+                child, parent_lookup={self.parent_id: other})
+
+    def test_parent_depth_limit_is_enforced(self):
+        middle = self.create(
+            spec=self.spec(parent_evidence_ids=(self.parent_id,)))
+        child = self.create(spec=self.spec(
+            parent_evidence_ids=(middle.name,)))
+        with self.assertRaisesRegex(
+                evidence.EvidenceValidationError, "maximum depth"):
+            self.verify(child, max_parent_depth=1)
+
+    def test_fresh_copy_corruption_is_rejected_before_publish(self):
+        def corrupt_copy(source, target, length=0):
+            del source, length
+            target.write(b"corrupt copy")
+
+        with patch.object(evidence.shutil, "copyfileobj", corrupt_copy):
+            with self.assertRaisesRegex(
+                    evidence.EvidenceValidationError, "freshly copied"):
+                evidence.create_evidence_package(
+                    self.store / "corrupt", self.spec(),
+                    parent_lookup=self.parent_lookup)
+        self.assertFalse(any(self.store.glob(".evidence-*")))
 
 
 class TruthfulGoldenReplayTests(unittest.TestCase):

@@ -12,18 +12,20 @@ REPO = Path(__file__).resolve().parents[2]
 # These executable modules previously had no direct test import.  The options
 # below are their operational input contract, not a count-driven list of every
 # helper in research/: each script either acquires durable input or transforms
-# a named dataset into an auditable analysis artifact.
+# a named dataset into an auditable analysis artifact.  The one-shot programs
+# live under research.legacy; maker_study remains at its load-bearing path.
 ENTRYPOINTS = {
-    "research.analyse_flow": ("--data", "--flow"),
-    "research.deep_edge": ("--data", "--out"),
-    "research.edge_report": ("--data", "--stage", "--out"),
-    "research.fetch_flow_data": ("--out", "--days", "--period"),
-    "research.find_edge": ("--data", "--out"),
-    "research.make_legacy_dataset": ("--source", "--dest", "--min-bars"),
+    "research.legacy.analyse_flow": ("--data", "--flow"),
+    "research.legacy.deep_edge": ("--data", "--out"),
+    "research.legacy.edge_report": ("--data", "--stage", "--out"),
+    "research.legacy.fetch_flow_data": ("--out", "--days", "--period"),
+    "research.legacy.find_edge": ("--data", "--out"),
+    "research.legacy.make_legacy_dataset": (
+        "--source", "--dest", "--min-bars"),
     "research.maker_study": ("--data", "--out"),
-    "research.selection_study": ("--data", "--out"),
-    "research.unbiased_recheck": ("--data", "--out"),
-    "research.validate_candidate": ("--data", "--out"),
+    "research.legacy.selection_study": ("--data", "--out"),
+    "research.legacy.unbiased_recheck": ("--data", "--out"),
+    "research.legacy.validate_candidate": ("--data", "--out"),
 }
 
 

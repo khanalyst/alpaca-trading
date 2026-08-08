@@ -228,8 +228,20 @@ def resolve(plan: SetupPlan, bars: list, max_hold_hours: float = 24.0,
     if held == 0:
         return Outcome(result="no_data")
 
-    # Timeout exits at the bar close, matching the live max-hold force close.
+    # A timeout is a claim that the entire holding window elapsed without an
+    # event.  If the supplied slice ends before that deadline, resolving the
+    # last available bar as a timeout manufactures a shorter, cheaper trade.
+    # Early stop/target returns above remain attributable as soon as their bar
+    # is observed; only the no-event path requires complete coverage.
+    # ``floor_ts`` may be inside a minute (for a delayed decision).  The
+    # expected-open cursor then remains strictly before the deadline even
+    # though the final observed bar closes after it.  Measure coverage by the
+    # bar's close, which is the first instant at which that minute is known.
     last = bars[held - 1]
+    if int(last.ts) + minute_ms < deadline:
+        return Outcome(result="no_data")
+
+    # Timeout exits at the bar close, matching the live max-hold force close.
     return _finish(plan, costs, "timeout", last.close_ts, last.close,
                    held, mae, mfe)
 

@@ -231,6 +231,15 @@ class ExperimentCorrectnessTests(unittest.TestCase):
         self.assertEqual(outcome["payload"]["baseline"]["closes"], 1)
         self.assertEqual(outcome["payload"]["candidate"]["closes"], 1)
         self.assertEqual(outcome["payload"]["candidate"]["unresolved_opens"], 0)
+        # This fixture intentionally omits canonical contract/funding
+        # provenance.  The rows remain auditable, but strict inference must
+        # quarantine them and refuse qualification.
+        for arm_name in ("baseline", "candidate"):
+            arm = outcome["payload"][arm_name]
+            self.assertEqual(arm["scored_closes"], 0)
+            self.assertEqual(arm["inference_exclusion_count"], 1)
+            self.assertTrue(arm["inference_exclusions"][0]["reason"])
+        self.assertEqual(outcome["verdict"], "INCONCLUSIVE")
         self.assertEqual(
             [event["status"] for event in
              self.store.experiment_assignment_history(

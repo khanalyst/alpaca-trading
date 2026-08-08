@@ -92,6 +92,90 @@ def _json_safe(value: object) -> object:
     return value
 
 
+def _strategy_contract_identity(trade: dict) -> dict:
+    """Resolve the canonical executable contract for one report row.
+
+    The live journal predates contract columns, so identity is derived from
+    the registered strategy and explicit immutable variant when possible.
+    Legacy/parameter-only rows remain visible but are marked quarantined
+    rather than being presented as a canonical contract.
+    """
+    strategy_id = str(trade.get("strategy_id") or "").strip()
+    requested_variant = str(trade.get("variant_id") or "").strip()
+    unknown = {
+        "strategy_contract_hash": None,
+        "strategy_contract_variant_id": None,
+        "strategy_contract_model_id": None,
+        "strategy_contract_status": "UNKNOWN",
+        "strategy_contract_exclusion_reason": (
+            "legacy row has no strategy identity"),
+    }
+    if not strategy_id:
+        return unknown
+    if requested_variant in {"", "live", "legacy", "legacy_baseline"}:
+        contract_variant = None
+    else:
+        contract_variant = requested_variant
+    try:
+        from agent import registry as strategy_registry
+        contract = (strategy_registry.contract_for(strategy_id)
+                    if contract_variant is None else
+                    strategy_registry.contract_for_variant(
+                        strategy_id, contract_variant))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        return {
+            **unknown,
+            "strategy_contract_status": "QUARANTINED",
+            "strategy_contract_exclusion_reason": (
+                f"no canonical StrategyContract for {strategy_id}"
+                + (f" variant {requested_variant}" if requested_variant
+                   else "")
+                + f": {exc}"),
+        }
+    persisted_version = str(trade.get("strategy_version") or "").strip()
+    # ``match_round_trips`` uses ``legacy`` when an old journal row has no
+    # version at all.  That sentinel is absence, not a claimed executable
+    # version; any other persisted value must agree with the canonical
+    # contract or the row is not safe to label as current.
+    if (persisted_version and persisted_version != "legacy"
+            and persisted_version != contract.version):
+        return {
+            "strategy_contract_hash": contract.semantic_hash,
+            "strategy_contract_variant_id": contract.variant_id,
+            "strategy_contract_model_id": contract.outcome_model.model_id,
+            "strategy_contract_status": "QUARANTINED",
+            "strategy_contract_exclusion_reason": (
+                f"strategy version {persisted_version!r} does not match "
+                f"canonical StrategyContract version {contract.version!r}"),
+        }
+    return {
+        "strategy_contract_hash": contract.semantic_hash,
+        "strategy_contract_variant_id": contract.variant_id,
+        "strategy_contract_model_id": contract.outcome_model.model_id,
+        "strategy_contract_status": "VERIFIED",
+        "strategy_contract_exclusion_reason": None,
+    }
+
+
+def _annotate_strategy_contracts(trades: list[dict]) -> dict:
+    """Attach contract identity and return compact report diagnostics."""
+    reasons = defaultdict(int)
+    verified = quarantined = 0
+    for trade in trades:
+        identity = _strategy_contract_identity(trade)
+        trade.update(identity)
+        if identity["strategy_contract_status"] == "VERIFIED":
+            verified += 1
+        else:
+            quarantined += 1
+            reasons[identity["strategy_contract_exclusion_reason"]] += 1
+    return {
+        "strategy_contract_verified": verified,
+        "strategy_contract_quarantined": quarantined,
+        "strategy_contract_quarantine_reasons": dict(sorted(reasons.items())),
+    }
+
+
 def _columns(db: sqlite3.Connection, table: str) -> set[str]:
     try:
         return {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
@@ -215,6 +299,8 @@ def print_equity(db: sqlite3.Connection, transfers: list[tuple[float, float]]) -
 
 
 def print_trades(trades: list[dict], diagnostics: dict) -> None:
+    from research.score import verified_round_trips
+
     section("MATCHED ROUND TRIPS")
     print(f"  opens {diagnostics['opens']}   closes {diagnostics['closes']}   "
           f"partial closes {diagnostics['partial_closes']}   "
@@ -235,22 +321,40 @@ def print_trades(trades: list[dict], diagnostics: dict) -> None:
     if diagnostics.get("funding_incomplete"):
         print(f"  warning: funding was unavailable or unverified for "
               f"{diagnostics['funding_incomplete']} matched trade(s)")
-    if not trades:
+    contract_rows = {
+        (
+            row.get("strategy_contract_status"),
+            row.get("strategy_contract_variant_id"),
+            row.get("strategy_contract_model_id"),
+            row.get("strategy_contract_hash"),
+            row.get("strategy_contract_exclusion_reason"),
+        )
+        for row in trades if row.get("strategy_contract_status")
+    }
+    for status, variant, model, contract_hash, reason in sorted(
+            contract_rows, key=lambda item: tuple(
+                "" if value is None else str(value) for value in item)):
+        print(f"  StrategyContract {status}: variant={variant or 'UNKNOWN'} "
+              f"model={model or 'UNKNOWN'} hash={contract_hash or 'UNKNOWN'}")
+        if reason:
+            print(f"    quarantine reason: {reason}")
+    verified = verified_round_trips(trades)
+    if not verified:
         print("  no verified trade-ID-matched round trips yet")
         return
 
-    wins = [trade for trade in trades if trade["net_pnl_usd"] > 0]
-    losses = [trade for trade in trades if trade["net_pnl_usd"] <= 0]
-    pnl = sum(trade["net_pnl_usd"] for trade in trades)
-    notionals = sum(trade["notional_usd"] for trade in trades)
-    risk_trades = [trade for trade in trades if trade["risk_usd"] > 0]
+    wins = [trade for trade in verified if trade["net_pnl_usd"] > 0]
+    losses = [trade for trade in verified if trade["net_pnl_usd"] <= 0]
+    pnl = sum(trade["net_pnl_usd"] for trade in verified)
+    notionals = sum(trade["notional_usd"] for trade in verified)
+    risk_trades = [trade for trade in verified if trade["risk_usd"] > 0]
     risk = sum(trade["risk_usd"] for trade in risk_trades)
     gross_profit = sum(trade["net_pnl_usd"] for trade in wins)
     gross_loss = abs(sum(trade["net_pnl_usd"] for trade in losses))
     profit_factor = gross_profit / gross_loss if gross_loss else None
     print(f"  net realized PnL {pnl:+,.2f} USDT   "
-          f"win rate {len(wins) / len(trades) * 100:.1f}%   "
-          f"expectancy {pnl / len(trades):+,.2f} USDT/trade")
+          f"win rate {len(wins) / len(verified) * 100:.1f}%   "
+          f"expectancy {pnl / len(verified):+,.2f} USDT/trade")
     factor_text = (f"{profit_factor:.2f}" if profit_factor is not None
                    else "n/a (no losing trades)")
     print(f"  notional-weighted return "
@@ -261,12 +365,12 @@ def print_trades(trades: list[dict], diagnostics: dict) -> None:
         print(f"  aggregate risk return {risk_pnl / risk:+.2f}R across "
               f"{len(risk_trades)} risk-tagged trades   "
               f"average {sum(t['r_multiple'] for t in risk_trades) / len(risk_trades):+.2f}R/trade")
-    print(f"  recorded costs: fees {sum(t['fees_usd'] for t in trades):,.2f}   "
-          f"funding {sum(t['funding_usd'] for t in trades):+,.2f}   "
+    print(f"  recorded costs: fees {sum(t['fees_usd'] for t in verified):,.2f}   "
+          f"funding {sum(t['funding_usd'] for t in verified):+,.2f}   "
           f"implementation shortfall "
-          f"{sum(t['slippage_usd'] for t in trades):+,.2f}   "
+          f"{sum(t['slippage_usd'] for t in verified):+,.2f}   "
           f"adverse slippage "
-          f"{sum(t['adverse_slippage_usd'] for t in trades):,.2f} USDT")
+          f"{sum(t['adverse_slippage_usd'] for t in verified):,.2f} USDT")
 
 
 def print_per_symbol(trades: list[dict]) -> None:
@@ -319,6 +423,7 @@ def print_per_strategy(trades: list[dict]) -> None:
     if not trades:
         print("  no verified strategy-attributed round trips yet")
         return
+    _annotate_strategy_contracts(trades)
     grouped = defaultdict(list)
     for trade in trades:
         grouped[(
@@ -331,12 +436,17 @@ def print_per_strategy(trades: list[dict]) -> None:
             trade["code_version"],
             trade["variant_id"],
             trade["strategy_config_version"],
+            trade["strategy_contract_hash"],
+            trade["strategy_contract_variant_id"],
         )].append(trade)
     for (
             runtime_mode, account_fingerprint, strategy_id, version,
             prompt_version, config_version, code_version, variant_id,
-            strategy_config_version
-    ), rows in sorted(grouped.items()):
+            strategy_config_version, contract_hash, contract_variant_id
+    ), rows in sorted(
+            grouped.items(),
+            key=lambda item: tuple("" if value is None else str(value)
+                                   for value in item[0])):
         pnl = sum(row["net_pnl_usd"] for row in rows)
         wins = [row for row in rows if row["net_pnl_usd"] > 0]
         losses = [row for row in rows if row["net_pnl_usd"] <= 0]
@@ -357,6 +467,14 @@ def print_per_strategy(trades: list[dict]) -> None:
         print(f"    variant prompt={prompt_version} config={config_version} "
               f"code={code_version} parameter={variant_id} "
               f"strategy-config={strategy_config_version}")
+        contract_status = rows[0]["strategy_contract_status"]
+        print(f"    StrategyContract status={contract_status} "
+              f"variant={contract_variant_id or 'UNKNOWN'} "
+              f"model={rows[0]['strategy_contract_model_id'] or 'UNKNOWN'} "
+              f"hash={contract_hash or 'UNKNOWN'}")
+        if contract_status != "VERIFIED":
+            print("    warning: row is quarantined from canonical "
+                  f"contract identity ({rows[0]['strategy_contract_exclusion_reason']})")
         print(f"    trades {len(rows)}   win rate "
               f"{len(wins) / len(rows) * 100:.1f}%   "
               f"net realized {pnl:+,.2f} USDT")
@@ -498,13 +616,12 @@ def json_report(db: sqlite3.Connection) -> dict:
     last week's table. Everything here is derived from the same
     match_round_trips call the printed report uses, so the two cannot drift.
     """
-    from research.score import score_returns
+    from research.score import score_matched_trades
 
     transfers = load_transfers(db)
     events = load_trade_events(db)
     trades, diagnostics = match_round_trips(events)
-    r_values = [t["r_multiple"] for t in trades
-                if t.get("r_multiple") is not None]
+    diagnostics.update(_annotate_strategy_contracts(trades))
     grouped: dict = {}
     for trade in trades:
         provenance = (
@@ -513,6 +630,11 @@ def json_report(db: sqlite3.Connection) -> dict:
             trade["prompt_version"], trade["config_version"],
             trade["code_version"], trade["variant_id"],
             trade["strategy_config_version"],
+            trade["strategy_contract_hash"],
+            trade["strategy_contract_variant_id"],
+            trade["strategy_contract_model_id"],
+            trade["strategy_contract_status"],
+            trade["strategy_contract_exclusion_reason"],
         )
         grouped.setdefault(provenance, []).append(trade)
 
@@ -521,22 +643,26 @@ def json_report(db: sqlite3.Connection) -> dict:
         "runtime_mode", "account_fingerprint", "strategy_id",
         "strategy_version", "prompt_version", "config_version",
         "code_version", "variant_id", "strategy_config_version",
+        "strategy_contract_hash", "strategy_contract_variant_id",
+        "strategy_contract_model_id", "strategy_contract_status",
+        "strategy_contract_exclusion_reason",
     )
-    for provenance, rows in sorted(grouped.items()):
+    for provenance, rows in sorted(
+            grouped.items(),
+            key=lambda item: tuple("" if value is None else str(value)
+                                   for value in item[0])):
         identity = dict(zip(fields, provenance))
         label = "/".join(str(identity[name]) for name in fields)
         groups.append({
             "provenance": identity,
-            "score": score_returns(
-                [t["r_multiple"] for t in rows
-                 if t.get("r_multiple") is not None], label=label),
+            "score": score_matched_trades(rows, label=label),
         })
 
     return {
         "schema": 2,
         "round_trips": len(trades),
         "diagnostics": diagnostics,
-        "overall": score_returns(r_values, label="all"),
+        "overall": score_matched_trades(trades, label="all"),
         "groups": groups,
         "transfers": {
             "count": len(transfers),
@@ -564,11 +690,14 @@ def main(path: Path | None = None, as_json: bool = False) -> int:
         transfers = load_transfers(db)
         events = load_trade_events(db)
         trades, diagnostics = match_round_trips(events)
+        diagnostics.update(_annotate_strategy_contracts(trades))
+        from research.score import verified_round_trips
+        scored_trades = verified_round_trips(trades)
         print_equity(db, transfers)
         print_trades(trades, diagnostics)
-        print_per_strategy(trades)
-        print_per_symbol(trades)
-        print_calibration(trades)
+        print_per_strategy(scored_trades)
+        print_per_symbol(scored_trades)
+        print_calibration(scored_trades)
         print_rejections(db)
         print_transfers(transfers)
     finally:
