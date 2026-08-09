@@ -16,10 +16,12 @@ from unittest.mock import patch
 from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position
 from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, PaperModeError
 from agent.config import ConfigError, validate_config
+from agent import engine as engine_module
 from agent.engine import Engine
 from agent.edge import resolve_validated_variants
 from agent.market import MarketData
 from agent.risk import RiskEngine
+from agent.runtime_control import RuntimeControlMixin
 from research.edge_lab import EdgeLedger
 
 
@@ -98,6 +100,17 @@ def _cfg():
 class BrainFake:
     def decide(self, snapshot, portfolio):
         return {"decisions": []}
+
+
+class RuntimeControlFacadeTests(unittest.TestCase):
+    def test_engine_reexports_runtime_control_facade_by_identity(self):
+        self.assertIs(engine_module.RuntimeControlMixin, RuntimeControlMixin)
+        self.assertTrue(issubclass(Engine, RuntimeControlMixin))
+        self.assertLess(Engine.__mro__.index(engine_module.ExecutionLifecycleMixin),
+                        Engine.__mro__.index(RuntimeControlMixin))
+        for name in ("flatten_all", "_flatten_all_impl", "request_shutdown",
+                     "close", "run"):
+            self.assertIs(getattr(Engine, name), getattr(RuntimeControlMixin, name))
 
 
 class RuntimeSafetyTests(unittest.TestCase):
