@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+from inspect import getattr_static
 from unittest.mock import patch
 
 from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position, Quote
@@ -23,6 +24,7 @@ from agent.market import MarketData
 from agent.risk import RiskEngine
 from agent.runtime_control import RuntimeControlMixin
 from agent.startup_edge_policy import StartupEdgePolicyMixin
+from agent.market_entry_risk import MarketEntryRiskMixin
 from research.edge_lab import EdgeLedger
 from research.edge_ledger_store import hash_config
 
@@ -129,6 +131,27 @@ class StartupEdgePolicyFacadeTests(unittest.TestCase):
                      "_inside_regular_session", "_enforce_intraday_cleanup",
                      "_latest_entry_allowed", "_refresh_edge"):
             self.assertIs(getattr(Engine, name), getattr(StartupEdgePolicyMixin, name))
+
+
+class MarketEntryRiskFacadeTests(unittest.TestCase):
+    def test_engine_reexports_market_entry_risk_facade_by_identity(self):
+        self.assertIs(engine_module.MarketEntryRiskMixin, MarketEntryRiskMixin)
+        self.assertTrue(issubclass(Engine, MarketEntryRiskMixin))
+        self.assertEqual(Engine.__mro__[1:5], (
+            engine_module.ExecutionLifecycleMixin,
+            RuntimeControlMixin,
+            StartupEdgePolicyMixin,
+            MarketEntryRiskMixin,
+        ))
+        for name in (
+            "_event", "_bar_mapping", "_quote_mapping", "_universe", "_collect",
+            "_number", "_required_number", "_timestamp", "_wall_clock",
+            "_validated_clock_timestamp", "_completed", "_llm_allows",
+            "_entry_execution", "_update_daily_risk", "_fail_closed",
+            "_risk_order", "_client_id",
+        ):
+            self.assertIs(getattr_static(Engine, name),
+                          getattr_static(MarketEntryRiskMixin, name))
 
 
 class RuntimeSafetyTests(unittest.TestCase):
