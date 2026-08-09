@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from agent.alpaca_domain import Asset, OptionContract, OrderRequest
-from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, PaperModeError
+from agent.alpaca_provider import (AlpacaError, AlpacaProvider, AlpacaSession,
+                                   IdempotencyConflict, PaperModeError)
 from agent.alpaca_session import NEW_YORK, SessionPolicy, normalize_calendar_day
 from agent.config import ConfigError, validate_config
 from agent.instruments import (validate_equity_symbol,
@@ -101,6 +102,92 @@ class AlpacaRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match OCC"):
             OptionContract.from_sdk({
                 "symbol": "SPY260821C00600000", "option_type": "put"})
+
+    def test_order_request_rejects_non_boolean_or_enabled_extended_hours(self):
+        for value in ("false", 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "extended_hours"):
+                OrderRequest("SPY", Decimal("1"), "buy", extended_hours=value)
+        with self.assertRaisesRegex(ValueError, "extended_hours"):
+            OrderRequest("SPY", Decimal("1"), "buy", extended_hours=True)
+
+    def test_order_request_rejects_unsupported_stop_price(self):
+        with self.assertRaisesRegex(ValueError, "stop orders are not supported"):
+            OrderRequest("SPY", Decimal("1"), "buy", stop_price=Decimal("99"))
+
+    def test_positions_require_finite_positive_qty_and_exact_side(self):
+        class BadPositions(TradingFake):
+            def get_all_positions(self):
+                return [{"symbol": "SPY", "asset_class": "us_equity",
+                         "qty": "NaN", "side": "long"}]
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=BadPositions()))
+        with self.assertRaises(AlpacaError):
+            provider.positions()
+
+    def test_orders_apply_local_status_filters_and_all_is_unfiltered(self):
+        class MisfilteredOrders(TradingFake):
+            def get_orders(self, **kwargs):
+                return [
+                    {"id": "open", "symbol": "SPY", "asset_class": "us_equity",
+                     "qty": "1", "side": "buy", "status": "accepted",
+                     "type": "market", "time_in_force": "day"},
+                    {"id": "filled", "symbol": "SPY", "asset_class": "us_equity",
+                     "qty": "1", "side": "buy", "status": "filled",
+                     "type": "market", "time_in_force": "day"},
+                    {"id": "stopped", "symbol": "SPY", "asset_class": "us_equity",
+                     "qty": "1", "side": "buy", "status": "stopped",
+                     "type": "market", "time_in_force": "day"},
+                ]
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=MisfilteredOrders()))
+        self.assertEqual([order.id for order in provider.orders(status="open")], ["open"])
+        self.assertEqual({order.id for order in provider.orders(status="all")},
+                         {"open", "filled", "stopped"})
+
+    def test_idempotency_exact_lookup_rejects_unrelated_order(self):
+        class UnrelatedLookup(TradingFake):
+            def get_order_by_client_id(self, client_order_id):
+                return {"id": "other", "symbol": "SPY", "asset_class": "us_equity",
+                        "qty": "1", "side": "buy", "status": "accepted",
+                        "type": "market", "time_in_force": "day",
+                        "client_order_id": "different"}
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=UnrelatedLookup()))
+        request = OrderRequest("SPY", Decimal("1"), "buy", client_order_id="wanted")
+        with self.assertRaises(IdempotencyConflict):
+            provider.submit_order(request)
+
+    def test_idempotency_full_bounded_history_does_not_prove_absence(self):
+        class FullHistory(TradingFake):
+            def get_orders(self, **kwargs):
+                return [{"id": str(index), "client_order_id": f"other-{index}"}
+                        for index in range(500)]
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=FullHistory()))
+        request = OrderRequest("SPY", Decimal("1"), "buy", client_order_id="wanted")
+        with self.assertRaises(AlpacaError):
+            provider.submit_order(request)
+
+    def test_close_position_uses_held_qty_and_rejects_reversal(self):
+        class HeldPosition(TradingFake):
+            def get_all_positions(self):
+                return [{"symbol": "SPY", "asset_class": "us_equity",
+                         "qty": "2", "side": "long"}]
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=HeldPosition()))
+        self.assertEqual(provider.close_position("SPY").qty, Decimal("2"))
+        with self.assertRaises(AlpacaError):
+            provider.close_position("SPY", qty=Decimal("3"))
 
     def test_provider_rejects_non_boolean_clock_open_flag(self):
         class StringClockTrading(TradingFake):

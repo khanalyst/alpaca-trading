@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -32,6 +33,78 @@ from .instruments import (reject_crypto, validate_asset_class,
 
 class IdempotencyConflict(AlpacaError):
     """A client order id already belongs to a different order request."""
+
+
+def _finite_decimal(value: Any, field: str, *, positive: bool = False) -> Decimal:
+    """Parse provider numerics without allowing NaN/Infinity to cross boundary."""
+    try:
+        result = Decimal(str(value))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{field} must be numeric") from exc
+    if not result.is_finite():
+        raise ValueError(f"{field} must be finite")
+    if positive and result <= 0:
+        raise ValueError(f"{field} must be positive")
+    return result
+
+
+def _optional_decimal(value: Any, field: str) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    return _finite_decimal(value, field)
+
+
+def _validate_finite_values(value: Any, field: str) -> Any:
+    """Validate nested quote/greek payloads without changing their shape."""
+    if isinstance(value, Mapping):
+        return {key: _validate_finite_values(item, f"{field}.{key}")
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        normalized = [_validate_finite_values(item, f"{field}[{index}]")
+                      for index, item in enumerate(value)]
+        return type(value)(normalized)
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise AlpacaError(f"{field} must be finite")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise AlpacaError(f"{field} must be finite")
+    return value
+
+
+def _option_row_contract(row: Any, symbol: str) -> OptionContract:
+    """Build a contract while retaining and checking all explicit metadata."""
+    outer = _mapping(row)
+    source = _mapping(_value(row, "contract")) if _value(row, "contract") is not None else {}
+    source_symbol = source.get("symbol")
+    if source_symbol not in (None, "") and str(source_symbol).strip().upper() != symbol:
+        raise ValueError("contract symbol does not match option row symbol")
+    merged = dict(outer)
+    for key, value in source.items():
+        if key in merged and merged[key] not in (None, "") and value not in (None, ""):
+            left = _text(merged[key]) if key in {"option_type", "right", "type", "underlying_symbol", "underlying"} else str(merged[key])
+            right = _text(value) if key in {"option_type", "right", "type", "underlying_symbol", "underlying"} else str(value)
+            if left.lower() != right.lower():
+                raise ValueError(f"contradictory option metadata {key}")
+        merged.setdefault(key, value)
+    merged["symbol"] = symbol
+    return OptionContract.from_sdk(merged)
+
+
+_TERMINAL_ORDER_STATUSES = {
+    "filled", "canceled", "cancelled", "expired", "rejected", "done", "closed",
+    "done_for_day", "replaced", "stopped", "suspended", "failed", "not_found",
+}
+
+
+def _order_status_matches(value: Any, requested: str | None) -> bool:
+    """Apply order status filters locally when a provider ignores them."""
+    if requested in (None, "", "all"):
+        return True
+    status = _text(value).strip()
+    if requested == "open":
+        return status not in _TERMINAL_ORDER_STATUSES
+    if requested == "closed":
+        return status in _TERMINAL_ORDER_STATUSES
+    return status == requested
 
 
 class AlpacaProvider:
@@ -229,13 +302,16 @@ class AlpacaProvider:
                 symbol = validate_instrument(
                     _value(row, "symbol", ""),
                     validate_asset_class(asset_class))
+                qty = _finite_decimal(_value(row, "qty", None), "position qty", positive=True)
+                side = _text(_value(row, "side", None))
+                if side not in {"long", "short"}:
+                    raise ValueError("position side must be long or short")
                 result.append(Position(
-                    symbol=symbol, qty=Decimal(str(_value(row, "qty", 0))),
-                    side=_text(_value(row, "side"), "long"),
-                    market_value=Decimal(str(_value(row, "market_value"))) if _value(row, "market_value") is not None else None,
-                    avg_entry_price=Decimal(str(_value(row, "avg_entry_price"))) if _value(row, "avg_entry_price") is not None else None,
-                    current_price=Decimal(str(_value(row, "current_price"))) if _value(row, "current_price") is not None else None,
-                    unrealized_pl=Decimal(str(_value(row, "unrealized_pl"))) if _value(row, "unrealized_pl") is not None else None,
+                    symbol=symbol, qty=qty, side=side,
+                    market_value=_optional_decimal(_value(row, "market_value"), "position market_value"),
+                    avg_entry_price=_optional_decimal(_value(row, "avg_entry_price"), "position avg_entry_price"),
+                    current_price=_optional_decimal(_value(row, "current_price"), "position current_price"),
+                    unrealized_pl=_optional_decimal(_value(row, "unrealized_pl"), "position unrealized_pl"),
                     raw=dict(row) if isinstance(row, Mapping) else {}))
             return result
         except AlpacaError:
@@ -244,6 +320,7 @@ class AlpacaProvider:
             raise AlpacaError(f"positions request failed: {exc}") from exc
 
     def orders(self, *, status: str | None = None, client_order_id: str | None = None) -> list[Order]:
+        requested_status = _text(status).strip() if status is not None else None
         try:
             # get_order_by_client_id is exact and avoids pulling an unbounded
             # order history when reconciling one id after a timeout.
@@ -252,7 +329,16 @@ class AlpacaProvider:
                     row = self.session.trading.get_order_by_client_id(client_order_id=client_order_id)
                 except TypeError:
                     row = self.session.trading.get_order_by_client_id(client_order_id)
-                return [self._order(row)] if row is not None else []
+                # Fakes and old SDKs occasionally ignore the lookup argument;
+                # never return an unrelated order as an idempotency match.
+                if row is None:
+                    return []
+                if _value(row, "client_order_id") != client_order_id:
+                    raise IdempotencyConflict(
+                        f"broker returned an unrelated order for client_order_id {client_order_id!r}")
+                if not _order_status_matches(_value(row, "status", ""), requested_status):
+                    return []
+                return [self._order(row)]
             from alpaca.trading.requests import GetOrdersRequest
             try:
                 from alpaca.trading.enums import QueryOrderStatus
@@ -276,22 +362,50 @@ class AlpacaProvider:
             try:
                 rows = self.session.trading.get_orders(**({"status": status} if status else {}))
             except TypeError:
-                rows = self.session.trading.get_orders()
-            if status:
-                rows = [row for row in rows if _text(_value(row, "status", "")) == str(status).lower()]
-            if client_order_id:
-                rows = [row for row in rows if _value(row, "client_order_id") == client_order_id]
+                try:
+                    rows = self.session.trading.get_orders()
+                except Exception as exc:  # noqa: BLE001
+                    raise AlpacaError(f"orders request failed: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise AlpacaError(f"orders request failed: {exc}") from exc
         except TypeError:
             # Injected fakes often implement the older kwargs shape even when
             # alpaca-py is present in the test environment.
-            rows = self.session.trading.get_orders(status=status)
-            if client_order_id:
-                rows = [row for row in rows if _value(row, "client_order_id") == client_order_id]
+            try:
+                rows = self.session.trading.get_orders(**({"status": status} if status else {}))
+            except TypeError:
+                try:
+                    rows = self.session.trading.get_orders()
+                except Exception as exc:  # noqa: BLE001
+                    raise AlpacaError(f"orders request failed: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise AlpacaError(f"orders request failed: {exc}") from exc
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise AlpacaError(f"orders request failed: {exc}") from exc
-        return [self._order(row) for row in rows]
+        rows = list(rows or [])
+        if (client_order_id and len(rows) >= 500 and
+                not any(_value(row, "client_order_id") == client_order_id for row in rows)):
+            raise AlpacaError(
+                "bounded order history is full; requested client_order_id absence is unprovable")
+        # Provider-side filters are hints only. Apply exact local filtering on
+        # every SDK/fallback path before normalizing untrusted rows.
+        rows = [row for row in rows if _order_status_matches(
+            _value(row, "status", ""), requested_status)]
+        if client_order_id:
+            rows = [row for row in rows if _value(row, "client_order_id") == client_order_id]
+        try:
+            return [self._order(row) for row in rows]
+        except AlpacaError:
+            raise
+        except ValueError as exc:
+            # Keep the historical missing-asset-class diagnostic as a
+            # ValueError, while all other malformed provider rows are
+            # normalized to the provider boundary error type.
+            if "asset_class is required" in str(exc):
+                raise
+            raise AlpacaError(f"malformed broker order: {exc}") from exc
 
     def _order(self, row: Any) -> Order:
         reject_crypto(row, "order")
@@ -301,12 +415,60 @@ class AlpacaProvider:
         symbol = validate_instrument(
             _value(row, "symbol", ""),
             validate_asset_class(asset_class))
-        tif = _text(_value(row, "time_in_force", None))
+        order_id = str(_value(row, "id", "") or "").strip()
+        if not order_id:
+            raise AlpacaError("broker order id is required")
+        status = _text(_value(row, "status", None)).strip()
+        if not status:
+            raise AlpacaError("broker order status is required")
+        qty = _finite_decimal(_value(row, "qty", None), "broker order qty", positive=True)
+        filled_qty = _finite_decimal(_value(row, "filled_qty", 0), "broker order filled_qty")
+        if filled_qty < 0 or filled_qty > qty:
+            raise AlpacaError("broker order filled_qty must be between zero and qty")
+        side = _text(_value(row, "side", None)).strip()
+        if side not in {"buy", "sell"}:
+            raise AlpacaError("broker order side must be buy or sell")
+        order_type = _text(_value(row, "type", None)).strip()
+        if order_type not in {"market", "limit"}:
+            raise AlpacaError("broker order type must be market or limit")
+        tif = _text(_value(row, "time_in_force", None)).strip()
         if not tif:
             raise AlpacaError("broker order time_in_force is required")
         if tif != "day":
             raise AlpacaError("broker order time_in_force must be day")
-        return Order(id=str(_value(row, "id", "")), symbol=symbol, qty=Decimal(str(_value(row, "qty", 0))), side=_text(_value(row, "side")), status=_text(_value(row, "status")), type=_text(_value(row, "type"), "market"), time_in_force=tif, client_order_id=_value(row, "client_order_id"), filled_qty=Decimal(str(_value(row, "filled_qty", 0))), filled_avg_price=Decimal(str(_value(row, "filled_avg_price"))) if _value(row, "filled_avg_price") is not None else None, submitted_at=_dt(_value(row, "submitted_at")), updated_at=_dt(_value(row, "updated_at")), raw=dict(row) if isinstance(row, Mapping) else {})
+        filled_avg_price = _optional_decimal(_value(row, "filled_avg_price"), "broker order filled_avg_price")
+        return Order(id=order_id, symbol=symbol, qty=qty, side=side,
+                     status=status, type=order_type, time_in_force=tif,
+                     client_order_id=_value(row, "client_order_id"),
+                     filled_qty=filled_qty, filled_avg_price=filled_avg_price,
+                     submitted_at=_dt(_value(row, "submitted_at")),
+                     updated_at=_dt(_value(row, "updated_at")),
+                     raw=_mapping(row))
+
+    def _verify_existing_order(self, request: OrderRequest, existing: Order) -> None:
+        """Ensure an idempotency hit is the same economic order request."""
+        if existing.symbol != request.symbol or existing.qty != request.qty:
+            raise IdempotencyConflict("client_order_id belongs to a different symbol or quantity")
+        if existing.side != request.side or existing.type != request.type:
+            raise IdempotencyConflict("client_order_id belongs to a different side or order type")
+        if existing.time_in_force != request.time_in_force:
+            raise IdempotencyConflict("client_order_id belongs to a different time_in_force")
+        raw = existing.raw or {}
+        existing_limit = _value(raw, "limit_price")
+        if request.limit_price is None:
+            if existing.type == "limit" and existing_limit is not None:
+                # A limit request can never be equivalent to an absent limit.
+                raise IdempotencyConflict("client_order_id belongs to a different limit price")
+        else:
+            try:
+                if existing_limit is None or _finite_decimal(existing_limit, "broker order limit_price") != request.limit_price:
+                    raise IdempotencyConflict("client_order_id belongs to a different limit price")
+            except ValueError as exc:
+                raise IdempotencyConflict("client_order_id belongs to a malformed limit price") from exc
+        requested_intent = request.position_intent
+        existing_intent = _text(_value(raw, "position_intent", None)) or None
+        if requested_intent != existing_intent:
+            raise IdempotencyConflict("client_order_id belongs to a different position intent")
 
     def submit_order(self, request: OrderRequest) -> Order:
         validate_instrument(request.symbol)
@@ -325,6 +487,7 @@ class AlpacaProvider:
         # A provider-side lookup makes retries safe across process restarts.
         existing = self.orders(client_order_id=cid)
         if existing:
+            self._verify_existing_order(request, existing[0])
             self._submitted_orders[cid] = existing[0]
             return existing[0]
         try:
@@ -335,7 +498,7 @@ class AlpacaProvider:
             cls = MarketOrderRequest if request.type == "market" else LimitOrderRequest
             qty = int(request.qty) if request.qty == request.qty.to_integral_value() else float(request.qty)
             kwargs = {"symbol": request.symbol, "qty": qty, "side": side, "time_in_force": tif, "client_order_id": cid,
-                      "extended_hours": bool(request.extended_hours)}
+                      "extended_hours": request.extended_hours}
             if request.limit_price is not None:
                 kwargs["limit_price"] = float(request.limit_price)
             if request.position_intent is not None:
@@ -384,6 +547,7 @@ class AlpacaProvider:
 
     def bars(self, symbols, timeframe="1Day", start=None, end=None, feed: str | None = None) -> dict[str, list[Bar]]:
         symbols = [validate_equity_symbol(symbol) for symbol in symbols]
+        requested_symbols = set(symbols)
         requested_feed = _canonical_feed(feed or self.data_feed)
         try:
             from alpaca.data.requests import StockBarsRequest
@@ -410,10 +574,26 @@ class AlpacaProvider:
             request = StockBarsRequest(**request_kwargs)
         except ImportError:
             request = {"symbols": symbols, "timeframe": timeframe, "start": start, "end": end, "feed": requested_feed}
+        except AlpacaError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(f"stock bars request construction failed: {exc}") from exc
         try:
             response = self.session.stock_data.get_stock_bars(request)
             data = getattr(response, "data", response)
-            return {str(symbol).upper(): [normalize_bar(row, str(symbol), requested_feed) for row in rows] for symbol, rows in (data or {}).items()}
+            result: dict[str, list[Bar]] = {}
+            for key, rows in (data or {}).items():
+                key_symbol = str(key).upper()
+                if key_symbol not in requested_symbols:
+                    continue
+                normalized_rows = []
+                for row in rows or []:
+                    row_symbol = str(_value(row, "symbol", key_symbol) or key_symbol).upper()
+                    if row_symbol not in requested_symbols:
+                        continue
+                    normalized_rows.append(normalize_bar(row, row_symbol, requested_feed))
+                result[key_symbol] = normalized_rows
+            return result
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -421,6 +601,7 @@ class AlpacaProvider:
 
     def quotes(self, symbols, start=None, end=None, feed: str | None = None) -> dict[str, list[Quote]]:
         symbols = [validate_equity_symbol(symbol) for symbol in symbols]
+        requested_symbols = set(symbols)
         requested_feed = _canonical_feed(feed or self.data_feed)
         try:
             from alpaca.data.requests import StockQuotesRequest
@@ -431,10 +612,26 @@ class AlpacaProvider:
             request = StockQuotesRequest(**request_kwargs)
         except ImportError:
             request = {"symbols": symbols, "start": start, "end": end, "feed": requested_feed}
+        except AlpacaError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(f"stock quotes request construction failed: {exc}") from exc
         try:
             response = self.session.stock_data.get_stock_quotes(request)
             data = getattr(response, "data", response)
-            return {str(symbol).upper(): [normalize_quote(row, str(symbol), requested_feed) for row in rows] for symbol, rows in (data or {}).items()}
+            result: dict[str, list[Quote]] = {}
+            for key, rows in (data or {}).items():
+                key_symbol = str(key).upper()
+                if key_symbol not in requested_symbols:
+                    continue
+                normalized_rows = []
+                for row in rows or []:
+                    row_symbol = str(_value(row, "symbol", key_symbol) or key_symbol).upper()
+                    if row_symbol not in requested_symbols:
+                        continue
+                    normalized_rows.append(normalize_quote(row, row_symbol, requested_feed))
+                result[key_symbol] = normalized_rows
+            return result
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -454,13 +651,25 @@ class AlpacaProvider:
             request_kwargs.update(kwargs)
             if start is not None: request_kwargs["start"] = start
             if end is not None: request_kwargs["end"] = end
-            try:
-                request = OptionChainRequest(**request_kwargs)
-            except TypeError:
-                # Older alpaca-py builds did not expose an options feed field;
-                # retain the canonical metadata while using their request shape.
-                request_kwargs.pop("feed", None)
-                request = OptionChainRequest(**request_kwargs)
+            request = None
+            # alpaca-py has shipped several OptionChainRequest signatures.
+            # Retry only compatible shape reductions; never leak constructor
+            # TypeError to callers.
+            attempts = [dict(request_kwargs)]
+            for drop in (("feed",), ("feed", "start"), ("feed", "end"),
+                         ("feed", "start", "end"), ("start", "end")):
+                candidate = {k: v for k, v in request_kwargs.items() if k not in drop}
+                if candidate not in attempts:
+                    attempts.append(candidate)
+            last_error = None
+            for candidate in attempts:
+                try:
+                    request = OptionChainRequest(**candidate)
+                    break
+                except TypeError as exc:
+                    last_error = exc
+            if request is None:
+                raise AlpacaError(f"option chain request construction failed: {last_error}")
         except ImportError:
             request = {"underlying_symbol": underlying_symbol, "start": start,
                        "end": end, "feed": requested_feed, **kwargs}
@@ -491,31 +700,48 @@ class AlpacaProvider:
             row = _mapping(row)
             contract_value = _value(row, "contract")
             symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
-            symbol = str(symbol_value or "").upper()
-            quote = _value(row, "latest_quote", _value(row, "quote", row))
-            quote = _mapping(quote)
+            symbol = str(symbol_value or "").strip().upper()
+            if not symbol or symbol == "BAD":
+                continue
+            occ = parse_occ_symbol(symbol)
+            if occ is not None and occ["underlying_symbol"] != underlying_symbol:
+                continue
+            explicit_underlying = _value(row, "underlying_symbol", _value(row, "underlying"))
+            if explicit_underlying is not None and str(explicit_underlying).strip().upper() != underlying_symbol:
+                continue
             contract = None
-            contract_source = _value(row, "contract") or row
             try:
-                contract_data = _mapping(contract_source)
-                contract_data.setdefault("symbol", symbol)
-                # A chain response may return only the OCC key and quote;
-                # OptionContract.from_sdk handles this compact identity.
-                contract = OptionContract.from_sdk(contract_data)
-            except (TypeError, ValueError):
-                contract = None
+                contract = _option_row_contract(row, symbol)
+            except (TypeError, ValueError) as exc:
+                # Snapshot rows must carry a listed OCC contract identity;
+                # malformed/quote-only keys are not eligible evidence.
+                if occ is not None and ("decimal" in str(exc).lower() or
+                                        "expiration" in str(exc).lower()):
+                    raise AlpacaError(f"option snapshot contract is invalid: {exc}") from exc
+                continue
+            quote = _mapping(_value(row, "latest_quote", _value(row, "quote", row)))
             def dec(name):
-                value = _value(quote, name)
-                return Decimal(str(value)) if value is not None else None
+                try:
+                    return _optional_decimal(_value(quote, name), f"option {name}")
+                except ValueError as exc:
+                    raise AlpacaError(f"option snapshot {name} is invalid: {exc}") from exc
+            timestamp_value = _value(quote, "timestamp", _value(row, "timestamp"))
+            timestamp = _dt(timestamp_value)
+            if timestamp_value is not None:
+                if timestamp is None:
+                    raise AlpacaError("option snapshot timestamp is invalid")
+                if timestamp.tzinfo is None:
+                    raise AlpacaError("option snapshot timestamp must be timezone-aware")
             result.append(OptionSnapshot(
                 symbol=symbol, contract=contract, bid=dec("bid_price") if dec("bid_price") is not None else dec("bid"),
                 ask=dec("ask_price") if dec("ask_price") is not None else dec("ask"),
                 bid_size=dec("bid_size"), ask_size=dec("ask_size"),
                 last=dec("last_price") if dec("last_price") is not None else dec("last"),
-                timestamp=_dt(_value(quote, "timestamp", _value(row, "timestamp"))),
+                timestamp=timestamp,
                 volume=dec("volume") if dec("volume") is not None else dec("day_volume"),
                 open_interest=dec("open_interest") if dec("open_interest") is not None else dec("oi"),
-                feed=requested_feed, greeks=_value(row, "greeks", {}) or {},
+                feed=requested_feed,
+                greeks=_validate_finite_values(_value(row, "greeks", {}) or {}, "option greeks"),
                 underlying_price=dec("underlying_price") if dec("underlying_price") is not None else dec("underlying_last")))
         return result
 
@@ -541,22 +767,34 @@ class AlpacaProvider:
         if now is None:
             now_dt = datetime.now(timezone.utc)
         elif isinstance(now, datetime):
-            now_dt = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+            if now.tzinfo is None:
+                raise AlpacaError("option candidate now must be timezone-aware")
+            now_dt = now
             now_dt = now_dt.astimezone(timezone.utc)
         else:
-            value = float(now)
-            if abs(value) > 100_000_000_000:
-                value /= 1000.0
-            now_dt = datetime.fromtimestamp(value, timezone.utc)
+            try:
+                value = float(now)
+                if not math.isfinite(value):
+                    raise ValueError("timestamp must be finite")
+                if abs(value) > 100_000_000_000:
+                    value /= 1000.0
+                now_dt = datetime.fromtimestamp(value, timezone.utc)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise AlpacaError(f"option candidate now is invalid: {exc}") from exc
 
         metadata: dict[str, OptionContract] = {}
         try:
             contracts = self.option_contracts(underlying, **kwargs)
-        except Exception:
-            # Some paper fakes and older SDK builds expose only the chain.
+        except AlpacaError as exc:
+            # Some paper fakes and older SDK builds expose only the chain. An
+            # explicit capability error is the sole compatible fallback;
+            # real provider/request failures remain fatal.
+            if "request support is unavailable" not in str(exc).lower():
+                raise
             contracts = []
         for contract in contracts:
-            if isinstance(contract, OptionContract):
+            if (isinstance(contract, OptionContract) and
+                    (not contract.underlying_symbol or contract.underlying_symbol == underlying)):
                 metadata[contract.symbol.upper()] = contract
 
         # Fetch once; option_snapshots remains a convenient public normalized
@@ -573,42 +811,59 @@ class AlpacaProvider:
             for row in rows:
                 value = (_value(_value(row, "latest_quote", _value(row, "quote", row)), "underlying_price") or
                          _value(row, "underlying_price") or _value(row, "underlying_last"))
-                underlying_price = _decimal_or_none(value)
+                try:
+                    underlying_price = _decimal_or_none(value)
+                except ValueError as exc:
+                    raise AlpacaError(f"option underlying price is invalid: {exc}") from exc
                 if underlying_price is not None:
                     break
-        spot = _decimal_or_none(underlying_price)
+        try:
+            spot = _decimal_or_none(underlying_price)
+        except ValueError as exc:
+            raise AlpacaError(f"option underlying price is invalid: {exc}") from exc
         candidates: list[dict[str, Any]] = []
         for raw_row in rows:
             row = _mapping(raw_row)
             contract_value = _value(row, "contract")
             symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
             symbol = str(symbol_value or "").strip().upper()
-            if not symbol:
+            if not symbol or symbol == "BAD":
                 continue
             try:
                 symbol = validate_option_symbol(symbol, underlying)
             except ValueError:
                 continue
-            contract_raw = _mapping(_value(row, "contract") or row)
-            contract = metadata.get(symbol)
-            if contract is None:
-                try:
-                    contract_data = dict(contract_raw)
-                    contract_data.setdefault("symbol", symbol)
-                    contract = OptionContract.from_sdk(contract_data)
-                except (TypeError, ValueError):
-                    occ = parse_occ_symbol(symbol)
-                    if occ is None:
-                        continue
-                    try:
-                        contract = OptionContract.from_sdk(occ)
-                    except (TypeError, ValueError):
-                        continue
+            metadata_contract = metadata.get(symbol)
+            try:
+                row_contract = _option_row_contract(row, symbol)
+            except (TypeError, ValueError) as exc:
+                # Contradictory explicit metadata is never repaired from OCC;
+                # drop this row rather than selecting the wrong leg.
+                if "decimal" in str(exc).lower() or "expiration" in str(exc).lower():
+                    raise AlpacaError(f"option candidate contract is invalid: {exc}") from exc
+                continue
+            contract = metadata_contract or row_contract
+            if metadata_contract is not None:
+                if any((metadata_contract.underlying_symbol != row_contract.underlying_symbol,
+                        metadata_contract.expiration_date != row_contract.expiration_date,
+                        metadata_contract.strike_price != row_contract.strike_price,
+                        metadata_contract.option_type != row_contract.option_type,
+                        metadata_contract.contract_size != row_contract.contract_size)):
+                    continue
             if contract.underlying_symbol and contract.underlying_symbol != underlying:
                 continue
             quote = _mapping(_value(row, "latest_quote", _value(row, "quote", row)))
             daily_bar = _mapping(_value(row, "daily_bar", {}))
-            timestamp = _dt(_first(quote, "timestamp") if _first(quote, "timestamp") is not None else _first(row, "timestamp"))
+            timestamp_value = (_first(quote, "timestamp") if _first(quote, "timestamp") is not None
+                               else _first(row, "timestamp"))
+            timestamp = _dt(timestamp_value)
+            if timestamp_value is None:
+                continue
+            if timestamp_value is not None:
+                if timestamp is None:
+                    raise AlpacaError("option candidate timestamp is invalid")
+                if timestamp.tzinfo is None:
+                    raise AlpacaError("option candidate timestamp must be timezone-aware")
             age = None if timestamp is None else (now_dt - timestamp).total_seconds()
             bid_raw = _first(quote, "bid_price", "bid")
             ask_raw = _first(quote, "ask_price", "ask")
@@ -622,11 +877,16 @@ class AlpacaProvider:
             if volume_raw is None: volume_raw = _first(daily_bar, "volume", "v")
             if oi_raw is None: oi_raw = _first(row, "open_interest", "oi")
             if oi_raw is None: oi_raw = contract.open_interest
-            bid = _decimal_or_none(bid_raw)
-            ask = _decimal_or_none(ask_raw)
-            last = _decimal_or_none(last_raw)
-            volume = _decimal_or_none(volume_raw)
-            open_interest = _decimal_or_none(oi_raw)
+            try:
+                bid = _decimal_or_none(bid_raw)
+                ask = _decimal_or_none(ask_raw)
+                last = _decimal_or_none(last_raw)
+                volume = _decimal_or_none(volume_raw)
+                open_interest = _decimal_or_none(oi_raw)
+                bid_size = _decimal_or_none(_first(quote, "bid_size") if _first(quote, "bid_size") is not None else _first(row, "bid_size"))
+                ask_size = _decimal_or_none(_first(quote, "ask_size") if _first(quote, "ask_size") is not None else _first(row, "ask_size"))
+            except ValueError as exc:
+                raise AlpacaError(f"option candidate decimal is invalid: {exc}") from exc
             expiry = contract.expiration_date
             dte = None if expiry is None else (expiry - now_dt.date()).days
             row_out: dict[str, Any] = {
@@ -639,8 +899,8 @@ class AlpacaProvider:
                 "option_type": contract.option_type, "multiplier": contract.multiplier,
                 "contract_size": contract.contract_size,
                 "bid": bid, "ask": ask, "last": last,
-                "bid_size": _decimal_or_none(_first(quote, "bid_size") if _first(quote, "bid_size") is not None else _first(row, "bid_size")),
-                "ask_size": _decimal_or_none(_first(quote, "ask_size") if _first(quote, "ask_size") is not None else _first(row, "ask_size")),
+                "bid_size": bid_size,
+                "ask_size": ask_size,
                 "quote_ts": timestamp, "timestamp": timestamp,
                 "quote_age_seconds": age, "quote_stale": age is None or age < 0,
                 "volume": volume, "open_interest": open_interest,
@@ -677,17 +937,28 @@ class AlpacaProvider:
                      if str(position.symbol).upper() == wanted), None)
         if held is None:
             return None
-        position_qty = abs(Decimal(str(qty if qty is not None else held.qty)))
-        if position_qty <= 0:
-            return None
+        if qty is None:
+            position_qty = held.qty
+        else:
+            try:
+                position_qty = _finite_decimal(qty, "close position qty", positive=True)
+            except ValueError as exc:
+                raise AlpacaError(str(exc)) from exc
+        if position_qty > held.qty:
+            raise AlpacaError("close position qty exceeds held quantity")
         side = str(held.side).lower()
-        if side not in {"long", "buy"}:
+        if side == "long":
+            close_side = "sell"
+        elif side == "short":
             if parse_occ_symbol(wanted) is not None:
                 raise AlpacaError("short option positions cannot be closed by the long-only hook")
             close_side = "buy"
         else:
-            close_side = "sell"
-        intent = "sell_to_close" if parse_occ_symbol(wanted) is not None else None
+            raise AlpacaError("held position side must be long or short")
+        if parse_occ_symbol(wanted) is not None:
+            intent = "sell_to_close"
+        else:
+            intent = None
         request = OrderRequest(wanted, position_qty, close_side, type=order_type,
                                time_in_force=time_in_force,
                                client_order_id=client_order_id,

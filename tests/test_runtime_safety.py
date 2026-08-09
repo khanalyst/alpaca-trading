@@ -554,8 +554,8 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         class OptionData:
             def get_option_chain(self, request):
-                return types.SimpleNamespace(data={"OPT": {
-                    "symbol": "OPT", "latest_quote": {"bid_price": 1,
+                return types.SimpleNamespace(data={"SPY260821C00600000": {
+                    "symbol": "SPY260821C00600000", "latest_quote": {"bid_price": 1,
                     "ask_price": 2, "timestamp": "2026-08-07T14:00:00+00:00"}}})
 
         session = AlpacaSession(paper=True, trading_client=object(),

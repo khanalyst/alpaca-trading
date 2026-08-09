@@ -65,9 +65,12 @@ def _decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
     if value is None or value == "":
         return default
     try:
-        return Decimal(str(value))
+        result = Decimal(str(value))
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"invalid decimal value {value!r}") from exc
+    if not result.is_finite():
+        raise ValueError(f"decimal value {value!r} must be finite")
+    return result
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -153,6 +156,15 @@ class OptionContract(Asset):
         if self.underlying_symbol:
             object.__setattr__(self, "underlying_symbol",
                                validate_equity_symbol(self.underlying_symbol))
+        contract_size = _decimal(self.contract_size)
+        object.__setattr__(self, "contract_size", contract_size)
+        if contract_size is None or contract_size <= 0:
+            raise ValueError("contract_size must be finite and positive")
+        for name in ("strike_price", "volume", "open_interest"):
+            value = getattr(self, name)
+            if value is not None:
+                value = _decimal(value)
+                object.__setattr__(self, name, value)
 
     @classmethod
     def from_sdk(cls, value: Any) -> "OptionContract":
@@ -161,7 +173,67 @@ class OptionContract(Asset):
         # OCC parsing is a fallback only; explicit provider metadata always
         # wins so adjusted/non-standard contracts remain auditable.
         occ = parse_occ_symbol(symbol)
+        underlying_values = [data.get(name) for name in ("underlying_symbol", "underlying")
+                             if data.get(name) not in (None, "")]
+        if len({str(item).strip().upper() for item in underlying_values}) > 1:
+            raise ValueError("underlying metadata is contradictory")
+        expiry_values = [data.get(name) for name in ("expiration_date", "expiration")
+                         if data.get(name) not in (None, "")]
+        parsed_expiries = []
+        for item in expiry_values:
+            try:
+                parsed_expiries.append(item.date() if isinstance(item, datetime) else item
+                                       if isinstance(item, date)
+                                       else date.fromisoformat(str(item)[:10]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid expiration metadata") from exc
+        if len(set(parsed_expiries)) > 1:
+            raise ValueError("expiration metadata is contradictory")
+        strike_values = [data.get(name) for name in ("strike_price", "strike")
+                         if data.get(name) not in (None, "")]
+        parsed_strikes = [_decimal(item) for item in strike_values]
+        if len(set(parsed_strikes)) > 1:
+            raise ValueError("strike metadata is contradictory")
+        right_values = [data.get(name) for name in ("option_type", "right", "type")
+                        if data.get(name) not in (None, "")]
+        if len({_text(item) for item in right_values}) > 1:
+            raise ValueError("option type metadata is contradictory")
+        multiplier_values = [data.get(name) for name in ("contract_size", "size", "multiplier")
+                             if data.get(name) not in (None, "")]
+        parsed_multipliers = [_decimal(item) for item in multiplier_values]
+        if len(set(parsed_multipliers)) > 1:
+            raise ValueError("multiplier metadata is contradictory")
         if occ:
+            # OCC is a compact identity, not permission to overwrite explicit
+            # provider metadata. Contradictions fail closed.
+            explicit_underlying = data.get("underlying_symbol") or data.get("underlying")
+            if explicit_underlying is not None and str(explicit_underlying).strip().upper() != occ["underlying_symbol"]:
+                raise ValueError("underlying_symbol does not match OCC symbol")
+            explicit_expiry = data.get("expiration_date") or data.get("expiration")
+            if explicit_expiry is not None:
+                try:
+                    parsed_expiry = (explicit_expiry.date() if isinstance(explicit_expiry, datetime)
+                                     else explicit_expiry if isinstance(explicit_expiry, date)
+                                     else date.fromisoformat(str(explicit_expiry)[:10]))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid expiration metadata") from exc
+                if parsed_expiry != occ["expiration_date"]:
+                    raise ValueError("expiration_date does not match OCC symbol")
+            explicit_strike = data.get("strike_price")
+            if explicit_strike is None:
+                explicit_strike = data.get("strike")
+            if explicit_strike is not None and _decimal(explicit_strike) != occ["strike_price"]:
+                raise ValueError("strike_price does not match OCC symbol")
+            explicit_right = data.get("option_type") or data.get("right") or data.get("type")
+            if explicit_right is not None and _text(explicit_right) != occ["option_type"]:
+                raise ValueError("option_type does not match OCC symbol")
+            explicit_multiplier = data.get("contract_size")
+            if explicit_multiplier is None:
+                explicit_multiplier = data.get("size")
+            if explicit_multiplier is None:
+                explicit_multiplier = data.get("multiplier")
+            if explicit_multiplier is not None and _decimal(explicit_multiplier) != occ["contract_size"]:
+                raise ValueError("contract_size does not match OCC symbol")
             for key, fallback in occ.items():
                 data.setdefault(key, fallback)
         data.setdefault("asset_class", "us_option")
@@ -172,8 +244,11 @@ class OptionContract(Asset):
         data.setdefault("tradable", True)
         base = Asset.from_sdk(data)
         raw_expiry = data.get("expiration_date") or data.get("expiration")
-        expiry = raw_expiry if isinstance(raw_expiry, date) else (
-            date.fromisoformat(str(raw_expiry)[:10]) if raw_expiry else None)
+        try:
+            expiry = raw_expiry if isinstance(raw_expiry, date) else (
+                date.fromisoformat(str(raw_expiry)[:10]) if raw_expiry else None)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid expiration metadata") from exc
         # alpaca-py exposes ``type`` as OptionType.CALL/PUT while a number of
         # fixtures and API payloads use ``right``.  Normalize all forms at the
         # provider boundary so risk never compares enum reprs.
@@ -294,6 +369,28 @@ class Position:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", validate_instrument(self.symbol))
+        try:
+            qty = Decimal(str(self.qty))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("position qty must be numeric") from exc
+        if not qty.is_finite() or qty < 0:
+            raise ValueError("position qty must be finite and nonnegative")
+        object.__setattr__(self, "qty", qty)
+        side = _text(self.side)
+        if side not in {"long", "short"}:
+            raise ValueError("position side must be long or short")
+        object.__setattr__(self, "side", side)
+        for name in ("market_value", "avg_entry_price", "current_price", "unrealized_pl"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            try:
+                decimal = Decimal(str(value))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"position {name} must be numeric") from exc
+            if not decimal.is_finite():
+                raise ValueError(f"position {name} must be finite")
+            object.__setattr__(self, name, decimal)
 
 
 @dataclass(frozen=True)
@@ -324,8 +421,8 @@ class OrderRequest:
             qty = Decimal(str(self.qty))
         except Exception as exc:  # noqa: BLE001
             raise ValueError("order qty must be numeric") from exc
-        if qty <= 0:
-            raise ValueError("order qty must be positive")
+        if not qty.is_finite() or qty <= 0:
+            raise ValueError("order qty must be finite and positive")
         object.__setattr__(self, "qty", qty)
         # OCC option symbols are 21 characters (root + YYMMDD + C/P + strike)
         # but roots can be shorter/longer.  This deliberately errs on the
@@ -336,8 +433,22 @@ class OrderRequest:
         object.__setattr__(self, "time_in_force", tif)
         if tif != "day":
             raise ValueError("time_in_force must be day")
-        if order_type == "limit" and (self.limit_price is None or Decimal(str(self.limit_price)) <= 0):
-            raise ValueError("limit orders require a positive limit_price")
+        if self.limit_price is not None:
+            try:
+                limit_price = Decimal(str(self.limit_price))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError("limit_price must be numeric") from exc
+            if not limit_price.is_finite() or limit_price <= 0:
+                raise ValueError("limit_price must be finite and positive")
+            object.__setattr__(self, "limit_price", limit_price)
+        if order_type == "limit" and self.limit_price is None:
+            raise ValueError("limit orders require a finite positive limit_price")
+        if self.stop_price is not None:
+            raise ValueError("stop orders are not supported")
+        if not isinstance(self.extended_hours, bool):
+            raise ValueError("extended_hours must be a boolean")
+        if self.extended_hours:
+            raise ValueError("extended_hours must be false")
         if self.position_intent is not None:
             intent = str(self.position_intent).lower()
             if intent not in {"buy_to_open", "buy_to_close", "sell_to_close"}:

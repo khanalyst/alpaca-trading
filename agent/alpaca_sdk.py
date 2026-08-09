@@ -86,7 +86,10 @@ def _mapping(value: Any) -> dict[str, Any]:
             "contract_size", "volume", "open_interest", "latest_quote",
             "quote", "latest_trade", "last_trade", "daily_bar",
             "prev_daily_bar", "minute_bar", "timestamp", "bid_price",
-            "ask_price", "bid_size", "ask_size", "last_price", "greeks")
+            "ask_price", "bid_size", "ask_size", "last_price", "greeks",
+            "id", "qty", "side", "status", "time_in_force", "client_order_id",
+            "filled_qty", "filled_avg_price", "submitted_at", "updated_at",
+            "limit_price", "stop_price", "position_intent")
             if hasattr(value, name)}
 
 
@@ -94,9 +97,12 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value))
-    except (TypeError, ValueError, ArithmeticError):
-        return None
+        result = Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise ValueError(f"invalid decimal value {value!r}") from exc
+    if not result.is_finite():
+        raise ValueError(f"decimal value {value!r} must be finite")
+    return result
 
 
 def _first(obj: Any, *names: str) -> Any:
@@ -109,29 +115,38 @@ def _first(obj: Any, *names: str) -> Any:
 
 
 def normalize_quote(value: Any, symbol: str | None = None, feed: str | None = None) -> Quote:
+    bid_raw = _value(value, "bid_price", _value(value, "bid"))
+    ask_raw = _value(value, "ask_price", _value(value, "ask"))
+    last_raw = _value(value, "last_price", _value(value, "last"))
     return Quote(
         symbol=str(_value(value, "symbol", symbol) or symbol or "").upper(),
         timestamp=_dt(_value(value, "timestamp")),
-        bid=Decimal(str(_value(value, "bid_price", _value(value, "bid")))) if _value(value, "bid_price", _value(value, "bid")) is not None else None,
-        ask=Decimal(str(_value(value, "ask_price", _value(value, "ask")))) if _value(value, "ask_price", _value(value, "ask")) is not None else None,
-        bid_size=Decimal(str(_value(value, "bid_size"))) if _value(value, "bid_size") is not None else None,
-        ask_size=Decimal(str(_value(value, "ask_size"))) if _value(value, "ask_size") is not None else None,
-        last=Decimal(str(_value(value, "last_price", _value(value, "last")))) if _value(value, "last_price", _value(value, "last")) is not None else None,
+        bid=_decimal_or_none(bid_raw),
+        ask=_decimal_or_none(ask_raw),
+        bid_size=_decimal_or_none(_value(value, "bid_size")),
+        ask_size=_decimal_or_none(_value(value, "ask_size")),
+        last=_decimal_or_none(last_raw),
         feed=_canonical_feed(feed or _value(value, "feed"), options=False),
     )
 
 
 def normalize_bar(value: Any, symbol: str | None = None, feed: str | None = None) -> Bar:
+    open_price = _decimal_or_none(_value(value, "open"))
+    high_price = _decimal_or_none(_value(value, "high"))
+    low_price = _decimal_or_none(_value(value, "low"))
+    close_price = _decimal_or_none(_value(value, "close"))
+    if any(price is None for price in (open_price, high_price, low_price, close_price)):
+        raise ValueError("bar OHLC values are required")
     return Bar(
         symbol=str(_value(value, "symbol", symbol) or symbol or "").upper(),
         timestamp=_dt(_value(value, "timestamp")) or datetime.min,
-        open=Decimal(str(_value(value, "open"))),
-        high=Decimal(str(_value(value, "high"))),
-        low=Decimal(str(_value(value, "low"))),
-        close=Decimal(str(_value(value, "close"))),
-        volume=Decimal(str(_value(value, "volume", 0))),
+        open=open_price,
+        high=high_price,
+        low=low_price,
+        close=close_price,
+        volume=_decimal_or_none(_value(value, "volume", 0)),
         trade_count=_value(value, "trade_count"),
-        vwap=Decimal(str(_value(value, "vwap"))) if _value(value, "vwap") is not None else None,
+        vwap=_decimal_or_none(_value(value, "vwap")),
         feed=_canonical_feed(feed or _value(value, "feed"), options=False),
         atr=_decimal_or_none(_value(value, "atr")),
     )
