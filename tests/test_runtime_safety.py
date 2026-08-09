@@ -3,6 +3,7 @@
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -374,6 +375,184 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(len(provider.orders_sent), 1)
         self.assertIn("flatten", provider.orders_sent[0].client_order_id)
 
+    def test_flatten_close_position_retries_rejected_with_distinct_attempt_ids(self):
+        class CloseProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.close_requests = []
+                self.close_orders = []
+
+            def close_position(self, symbol, qty=None, *, client_order_id=None,
+                               order_type="market", time_in_force="day"):
+                quantity = qty or abs(self.positions_live[0].qty)
+                attempt = len(self.close_requests)
+                status = "rejected" if attempt == 0 else "filled"
+                order = Order(
+                    f"close-{attempt}", symbol, quantity, "sell", status,
+                    order_type, time_in_force, client_order_id=client_order_id)
+                self.close_requests.append(order)
+                self.close_orders.append(order)
+                if status == "filled":
+                    self.positions_live = []
+                return order
+
+            def orders(self, **_):
+                return list(self.close_orders)
+
+        provider = CloseProvider()
+        provider.positions_live = [Position("SPY", Decimal("2"), "long")]
+        engine = Engine(_cfg(), light=True, provider=provider)
+        with patch("agent.engine.time.sleep"):
+            self.assertTrue(engine.flatten_all("retry"))
+        self.assertEqual(len(provider.close_requests), 2)
+        first, second = provider.close_requests
+        self.assertNotEqual(first.client_order_id, second.client_order_id)
+        runtime = __import__("agent.state", fromlist=["load_state"]).load_state()
+        rows = [row for row in runtime["orders"].values()
+                if row.get("action") == "flatten"]
+        self.assertEqual([row["attempt"] for row in rows], [0, 1])
+        self.assertEqual({row["status"] for row in rows}, {"rejected", "filled"})
+
+    def test_flatten_dedupes_live_close_position_order(self):
+        class LiveCloseProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.close_requests = []
+                self.close_orders = []
+
+            def close_position(self, symbol, qty=None, *, client_order_id=None,
+                               order_type="market", time_in_force="day"):
+                quantity = qty or abs(self.positions_live[0].qty)
+                order = Order(
+                    "live-close", symbol, quantity, "sell", "accepted",
+                    order_type, time_in_force, client_order_id=client_order_id)
+                self.close_requests.append(order)
+                self.close_orders.append(order)
+                return order
+
+            def orders(self, **_):
+                return list(self.close_orders)
+
+        provider = LiveCloseProvider()
+        provider.positions_live = [Position("SPY", Decimal("2"), "long")]
+        engine = Engine(_cfg(), light=True, provider=provider)
+        with patch("agent.engine.time.sleep"):
+            self.assertFalse(engine.flatten_all("live"))
+        self.assertEqual(len(provider.close_requests), 1)
+        runtime = __import__("agent.state", fromlist=["load_state"]).load_state()
+        rows = [row for row in runtime["orders"].values()
+                if row.get("action") == "flatten"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attempt"], 0)
+        self.assertEqual(rows[0]["status"], "accepted")
+
+    def test_external_lock_blocks_flatten_and_cycle_without_mutation(self):
+        holder = Engine(_cfg(), light=True, provider=FakeProvider())
+        contender_provider = FakeProvider()
+        contender = Engine(_cfg(), light=True, provider=contender_provider)
+        self.assertTrue(holder._acquire_lock(persistent=True))
+        try:
+            self.assertFalse(contender.flatten_all("held"))
+            result = contender.run_once({})
+            self.assertEqual(result, {"action": "hold", "reason": "runtime_lock_held"})
+            self.assertEqual(contender_provider.cancel_calls, 0)
+            self.assertEqual(contender_provider.orders_sent, [])
+        finally:
+            holder.close()
+
+    def test_close_pauses_state_before_stopped_heartbeat_and_releases_lock(self):
+        from agent import state
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        state.update_state(lambda current: {**current, "state": state.RUNNING})
+        self.assertTrue(engine._acquire_lock(persistent=True))
+        engine.close()
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+        self.assertIsNone(engine._lock_handle)
+        handle = state.acquire_run_lock()
+        self.assertIsNotNone(handle)
+        state.release_run_lock(handle)
+
+    def test_close_preserves_killed_and_day_stopped_states(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        for terminal in (state.KILLED, state.DAY_STOPPED):
+            state.update_state(lambda current, terminal=terminal: {
+                **current, "state": terminal})
+            self.assertTrue(engine._acquire_lock(persistent=True))
+            engine.close()
+            self.assertEqual(state.load_state()["state"], terminal)
+
+    def test_close_releases_lock_when_heartbeat_write_fails(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        state.update_state(lambda current: {**current, "state": state.RUNNING})
+        self.assertTrue(engine._acquire_lock(persistent=True))
+        with patch.object(state, "write_heartbeat", side_effect=OSError("disk full")):
+            engine.close()
+        self.assertIsNone(engine._lock_handle)
+
+    def test_request_shutdown_preserves_operator_pause_through_close(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        state.update_state(lambda current: {**current, "state": state.RUNNING,
+                                            "operator_pause": False})
+        self.assertTrue(engine._acquire_lock(persistent=True))
+        engine.running = True
+        engine.request_shutdown("operator request")
+        runtime = state.load_state()
+        self.assertFalse(engine.running)
+        self.assertEqual(engine.shutdown_reason, "operator request")
+        self.assertEqual(runtime["state"], state.PAUSED)
+        self.assertTrue(runtime["operator_pause"])
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "pausing")
+        engine.close()
+        runtime = state.load_state()
+        self.assertEqual(runtime["state"], state.PAUSED)
+        self.assertTrue(runtime["operator_pause"])
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+        self.assertEqual(heartbeat["reason"], "operator request")
+
+    def test_readiness_false_rolls_back_running_state_and_releases_lock(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        with patch.object(engine, "_ensure_order_ready", return_value=False):
+            with self.assertRaisesRegex(AlpacaError, "runtime readiness"):
+                engine.run()
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertFalse(state.load_state()["operator_pause"])
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+
+    def test_readiness_exception_rolls_back_and_propagates_original(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        with patch.object(engine, "_ensure_order_ready",
+                          side_effect=RuntimeError("readiness exploded")):
+            with self.assertRaisesRegex(RuntimeError, "readiness exploded"):
+                engine.run()
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+
+    def test_direct_cycle_alpaca_error_stops_and_releases_temporary_lock(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        with patch.object(engine, "_run_once_impl",
+                          side_effect=AlpacaError("cycle failed")):
+            with self.assertRaisesRegex(AlpacaError, "cycle failed"):
+                engine.run_once({})
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+
     def test_bounded_run_flattens_existing_positions_before_exit(self):
         provider = FakeProvider()
         provider.positions_live = [Position("SPY", Decimal("2"), "long")]
@@ -381,12 +560,54 @@ class RuntimeSafetyTests(unittest.TestCase):
         engine.run(max_cycles=0)
         self.assertEqual(provider.positions_live, [])
         self.assertEqual(len(provider.orders_sent), 1)
+        from agent import state
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
 
     def test_bounded_run_reports_incomplete_shutdown_flatten(self):
         engine = Engine(_cfg(), provider=FakeProvider())
         with patch.object(engine, "_flatten_all_impl", return_value=False):
             with self.assertRaisesRegex(AlpacaError, "shutdown flatten incomplete"):
                 engine.run(max_cycles=0)
+        from agent import state
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "degraded")
+        self.assertEqual(heartbeat["reason"], "shutdown_flatten_incomplete")
+        self.assertFalse(engine._ensure_order_ready())
+
+    def test_bounded_run_reports_shutdown_flatten_exception_as_degraded(self):
+        engine = Engine(_cfg(), provider=FakeProvider())
+        with patch.object(engine, "_flatten_all_impl",
+                          side_effect=RuntimeError("flatten exploded")):
+            with self.assertRaisesRegex(AlpacaError, "shutdown flatten failed"):
+                engine.run(max_cycles=0)
+        from agent import state
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "degraded")
+        self.assertEqual(heartbeat["reason"], "shutdown_flatten_failed")
+        self.assertFalse(engine._ensure_order_ready())
+
+    def test_run_cycle_alpaca_error_preserves_propagation_and_safe_terminal_state(self):
+        from agent import state
+        engine = Engine(_cfg(), provider=FakeProvider())
+        with patch.object(engine, "_ensure_order_ready", return_value=True), \
+             patch.object(engine, "run_once",
+                          side_effect=AlpacaError("cycle exploded")), \
+             patch.object(engine, "_flatten_all_impl", return_value=True):
+            with self.assertRaisesRegex(AlpacaError, "cycle exploded"):
+                engine.run()
+        self.assertEqual(state.load_state()["state"], state.PAUSED)
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
 
     def test_preopen_startup_cancels_orders_and_flattens_residual_position(self):
         class PreopenProvider(FakeProvider):

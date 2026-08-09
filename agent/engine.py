@@ -831,9 +831,20 @@ class Engine(ExecutionLifecycleMixin):
             temporary = True
         try:
             return self._run_once_impl(snapshot, portfolio)
+        except AlpacaError:
+            # A bounded/direct cycle does not have ``run``'s outer finally to
+            # publish a truthful terminal state.  Close this runtime here
+            # while preserving the exception for callers.  A persistent run
+            # is finalized by ``run`` so it can flatten first.
+            if not self._persistent_lock:
+                self.close()
+            raise
         finally:
             if temporary:
-                self._release_lock()
+                # ``close`` already releases this handle on the error path;
+                # avoid attempting to unlock a closed file object.
+                if self._lock_handle is not None:
+                    self._release_lock()
 
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         if not self._ensure_order_ready():
@@ -1192,11 +1203,23 @@ class Engine(ExecutionLifecycleMixin):
         """Release the process lock and leave a truthful terminal heartbeat."""
         self.running = False
         try:
-            state.write_heartbeat("stopped", run_id=self.run_id,
-                                  reason=self.shutdown_reason or "closed")
-        except Exception:
-            pass
-        self._release_lock()
+            # Persist the lifecycle transition before announcing a stopped
+            # heartbeat.  Terminal states are intentionally absorbing: close
+            # must not overwrite an operator kill or daily risk stop, and it
+            # must preserve request_shutdown's operator_pause flag.
+            try:
+                state.commit({}, transition=(state.RUNNING, state.PAUSED))
+            except Exception:
+                pass
+            try:
+                state.write_heartbeat("stopped", run_id=self.run_id,
+                                      reason=self.shutdown_reason or "closed")
+            except Exception:
+                pass
+        finally:
+            # State/heartbeat persistence is best effort, but a held process
+            # lock is never allowed to survive close().
+            self._release_lock()
 
     def run(self, *, max_cycles: int | None = None) -> None:
         if not self._acquire_lock(persistent=True):
@@ -1213,10 +1236,32 @@ class Engine(ExecutionLifecycleMixin):
         except Exception:
             self._release_lock()
             raise
-        if not self._ensure_order_ready():
-            self._release_lock()
-            raise AlpacaError(self._preflight_error or
-                              "runtime readiness and startup reconciliation are required")
+        try:
+            ready = self._ensure_order_ready()
+        except BaseException:
+            # Readiness may fail after start_runtime has durably marked the
+            # process RUNNING.  Roll that state back before propagating the
+            # original exception; close() also emits the terminal heartbeat
+            # and releases the persistent lock.
+            self.running = False
+            try:
+                state.write_heartbeat("degraded", run_id=self.run_id,
+                                      reason=self._preflight_error or
+                                      "runtime_readiness_failed")
+            except Exception:
+                pass
+            self.close()
+            raise
+        if not ready:
+            reason = self._preflight_error or \
+                "runtime readiness and startup reconciliation are required"
+            self.running = False
+            try:
+                state.write_heartbeat("degraded", run_id=self.run_id, reason=reason)
+            except Exception:
+                pass
+            self.close()
+            raise AlpacaError(reason)
         self.running = True
         cycles = 0
         run_failure: BaseException | None = None
@@ -1240,6 +1285,7 @@ class Engine(ExecutionLifecycleMixin):
         finally:
             exit_reason = self.shutdown_reason or "run_exit"
             flatten_failure: AlpacaError | None = None
+            flatten_failure_reason: str | None = None
             try:
                 complete = self._flatten_all_impl(exit_reason)
                 if not complete:
@@ -1248,11 +1294,32 @@ class Engine(ExecutionLifecycleMixin):
                         reason="shutdown_flatten_incomplete")
                     flatten_failure = AlpacaError(
                         f"shutdown flatten incomplete; {self.mode} positions may remain")
+                    flatten_failure_reason = "shutdown_flatten_incomplete"
             except Exception as exc:  # noqa: BLE001
                 self._event("shutdown_flatten_failed", {
                     "reason": exit_reason, "error": str(exc)})
                 flatten_failure = AlpacaError(
                     f"shutdown flatten failed; {self.mode} positions may remain: {exc}")
+                flatten_failure_reason = "shutdown_flatten_failed"
+            if flatten_failure_reason is not None:
+                # Residual exposure is an operator-pause condition.  The
+                # transition only changes RUNNING, so KILLED/DAY_STOPPED are
+                # preserved while a restart is prevented from trading.
+                try:
+                    state.commit({"operator_pause": True},
+                                 transition=(state.RUNNING, state.PAUSED))
+                except Exception:
+                    pass
             self.close()
+            if flatten_failure_reason is not None:
+                # close() deliberately emits stopped for normal shutdown, but
+                # residual exposure is not a normal terminal condition.  Keep
+                # the final heartbeat degraded after the lock is released so
+                # operators and watchdogs see the outstanding risk.
+                try:
+                    state.write_heartbeat("degraded", run_id=self.run_id,
+                                          reason=flatten_failure_reason)
+                except Exception:
+                    pass
             if flatten_failure is not None and run_failure is None:
                 raise flatten_failure
