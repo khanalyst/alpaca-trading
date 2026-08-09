@@ -41,6 +41,173 @@ class RiskProfileTests(unittest.TestCase):
         self.assertEqual(option["contracts"], 5)
         self.assertEqual(option["max_loss"], 100)
 
+    def test_boolean_numeric_inputs_fail_closed(self):
+        base = {"type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+                "volume": 10, "open_interest": 100, "multiplier": 100}
+        with self.assertRaisesRegex(ValueError, "no eligible"):
+            self.risk.select_option_contract(
+                [{**base, "multiplier": True}], direction="long")
+        with self.assertRaisesRegex(ValueError, "risk_usd measurement"):
+            self.risk.size_shares(10_000, 100, 2, risk_usd=True)
+        with self.assertRaisesRegex(ValueError, "risk_usd measurement"):
+            self.risk.size_options(10_000, True, [base], direction="long")
+        plan, why = self.risk.vet_open(
+            {"symbol": "SPY", "direction": "long", "entry_price": 101,
+             "stop_price": 99, "target_price": 105, "risk_usd": True},
+            10_000, [], {"SPY": {"price": 101}}, {}, 0, now=0)
+        self.assertIsNone(plan)
+        self.assertIn("risk_usd measurement is invalid", why)
+        plan, why = self.risk.vet_open(
+            {"symbol": "SPY", "direction": "long", "entry_price": 101,
+             "stop_price": True, "stop_distance": 2, "target_price": 105},
+            10_000, [], {"SPY": {"price": 101}}, {}, 0, now=0)
+        self.assertIsNone(plan)
+
+    def test_evaluation_clock_is_strict_but_legacy_candidates_remain_supported(self):
+        evaluation = datetime(2026, 8, 9, 14, 30, tzinfo=timezone.utc)
+        timestamped = {
+            "type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+            "volume": 10, "open_interest": 100, "multiplier": 100,
+            "quote_ts": evaluation, "quote_age_seconds": 0,
+        }
+        for clock in (evaluation, evaluation.timestamp()):
+            with self.subTest(clock=clock):
+                selected = self.risk.select_option_contract(
+                    [timestamped], direction="long", now=clock)
+                self.assertEqual(selected["type"], "call")
+
+        # Historical offline fixtures have no quote timestamp and remain
+        # usable through the timestamp-free/no-clock compatibility path.
+        legacy = {key: value for key, value in timestamped.items()
+                  if key not in {"quote_ts", "quote_age_seconds"}}
+        self.assertEqual(
+            self.risk.select_option_contract([legacy], "long")["type"], "call")
+
+        invalid_clocks = (True, False, float("nan"), float("inf"),
+                          float("-inf"), "2026-08-09T14:30:00+00:00",
+                          datetime(2026, 8, 9, 14, 30))
+        for clock in invalid_clocks:
+            with self.subTest(clock=clock):
+                with self.assertRaisesRegex(ValueError, "evaluation timestamp"):
+                    self.risk.select_option_contract(
+                        [timestamped], "long", now=clock)
+
+        decision = {"symbol": "SPY", "direction": "long", "entry_price": 101,
+                    "stop_price": 99, "target_price": 105}
+        for clock in invalid_clocks:
+            with self.subTest(vet_clock=clock):
+                plan, why = self.risk.vet_open(
+                    decision, 10_000, [], {"SPY": {"price": 101}}, {}, 0,
+                    now=clock)
+                self.assertIsNone(plan)
+                self.assertIn("evaluation timestamp", why)
+
+    def test_explicit_share_risk_budget_never_falls_back_to_default_when_malformed(self):
+        invalid_budgets = (True, False, None, float("nan"), float("inf"),
+                           float("-inf"), "not-a-number")
+        for budget in invalid_budgets:
+            with self.subTest(budget=budget):
+                if budget is None:
+                    # None is the sole explicit value that requests the
+                    # configured default budget.
+                    result = self.risk.size_shares(10_000, 100, 2,
+                                                   risk_usd=budget)
+                    self.assertEqual(result["shares"], 50)
+                else:
+                    with self.assertRaisesRegex(ValueError, "risk_usd measurement"):
+                        self.risk.size_shares(10_000, 100, 2,
+                                              risk_usd=budget)
+
+    def test_option_sizing_requires_finite_positive_equity_and_risk(self):
+        candidate = {"type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+                     "volume": 10, "open_interest": 100, "multiplier": 100}
+        for field, values in {
+            "equity": (True, False, 0, -1, float("nan"), float("inf"),
+                       float("-inf"), "not-a-number"),
+            "risk_usd": (True, False, 0, -1, float("nan"), float("inf"),
+                         float("-inf"), "not-a-number"),
+        }.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    kwargs = {"equity": 10_000, "risk_usd": 100,
+                              "candidates": [candidate], "direction": "long"}
+                    kwargs[field] = value
+                    with self.assertRaisesRegex(ValueError,
+                                                f"{field} measurement"):
+                        self.risk.size_options(**kwargs)
+
+    def test_identity_aliases_conflict_within_each_map_and_across_maps(self):
+        base = {"type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+                "volume": 10, "open_interest": 100, "multiplier": 100,
+                "expiration": "2026-08-21", "expiration_date": "2026-08-21",
+                "strike": 600, "strike_price": 600,
+                "right": "call", "option_type": "call",
+                "contract_multiplier": 100, "contract_size": 100,
+                "size": 100}
+        cases = (
+            ("outer expiry", {"expiration_date": "2026-08-22"}, None),
+            ("outer strike", {"strike_price": 601}, None),
+            ("outer right", {"option_type": "put"}, None),
+            ("outer multiplier", {"size": 50}, None),
+            ("nested expiry", {}, {"expiration": "2026-08-22"}),
+            ("nested strike", {}, {"strike": 601}),
+            ("nested right", {}, {"right": "put"}),
+            ("nested multiplier", {}, {"multiplier": 50}),
+            ("cross-map expiry", {"expiration": "2026-08-21"},
+             {"expiration_date": "2026-08-22"}),
+        )
+        for label, outer_change, nested_change in cases:
+            with self.subTest(label=label):
+                candidate = {**base, **outer_change}
+                if nested_change is not None:
+                    candidate["contract"] = {
+                        "expiration_date": "2026-08-21", "strike_price": 600,
+                        "option_type": "call", "contract_size": 100,
+                        **nested_change,
+                    }
+                with self.assertRaisesRegex(ValueError,
+                                             "option identity metadata mismatch"):
+                    self.risk.select_option_contract([candidate], "long")
+
+    def test_explicit_debit_aliases_do_not_fall_back_to_ask(self):
+        base = {"type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+                "volume": 10, "open_interest": 100, "multiplier": 100}
+        for key in ("debit", "net_debit"):
+            for value in (None, True, False, float("nan"), float("inf"),
+                          float("-inf"), "not-a-number"):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaisesRegex(ValueError, "invalid debit"):
+                        self.risk.select_option_contract(
+                            [{**base, key: value}], "long")
+
+    def test_nested_contract_identity_alias_mismatches_fail_closed(self):
+        base = {
+            "symbol": "SPY260821C00600000", "underlying_symbol": "SPY",
+            "expiration": "2026-08-21", "strike": 600, "type": "call",
+            "multiplier": 100, "dte": 12, "bid": 1.9, "ask": 2.0,
+            "volume": 10, "open_interest": 100,
+            "contract": {
+                "symbol": "SPY260821C00600000", "underlying_symbol": "SPY",
+                "expiration_date": "2026-08-21", "strike_price": 600,
+                "option_type": "call", "contract_size": 100,
+            },
+        }
+        mismatches = (
+            ("expiration", {"expiration": "2026-08-22"}),
+            ("strike", {"strike": 601}),
+            ("right", {"type": "put"}),
+            ("multiplier", {"multiplier": 50}),
+            ("malformed expiry", {"expiration": "not-a-date"}),
+            ("malformed strike", {"strike": True}),
+            ("malformed right", {"type": "unknown"}),
+            ("malformed multiplier", {"multiplier": False}),
+        )
+        for label, change in mismatches:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "option identity metadata mismatch"):
+                    self.risk.select_option_contract(
+                        [{**base, **change}], direction="long", underlying="SPY")
+
     def test_short_uses_put_and_debit_spread_is_rejected(self):
         put = select_option_contract(
             [{"type": "put", "dte": 21, "bid": 2.0, "ask": 2.1,

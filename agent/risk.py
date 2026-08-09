@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Number
 import re
 import time
 from dataclasses import fields, is_dataclass
@@ -89,6 +90,15 @@ def _normalize_option_candidate(value):
                     str(getattr(outer_value, "value", outer_value)).strip().upper() !=
                     str(getattr(nested_value, "value", nested_value)).strip().upper()):
                 option["_nested_identity_conflict"] = True
+    identity_aliases = (
+        (("expiration", "expiration_date", "expiry"), _expiration_date),
+        (("strike", "strike_price"), _num),
+        (("type", "right", "option_type"), _normalized_option_kind),
+        (("multiplier", "contract_multiplier", "contract_size", "size"), _num),
+    )
+    for aliases, normalizer in identity_aliases:
+        if _identity_alias_conflict(option, nested_contract, aliases, normalizer):
+            option["_nested_identity_conflict"] = True
     for nested_name in ("contract", "latest_quote", "quote"):
         nested = _object_mapping(option.get(nested_name))
         for key, nested_value in nested.items():
@@ -119,6 +129,8 @@ def _candidate_sequence(candidates):
 
 
 def _num(value, default=None):
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -132,7 +144,7 @@ def _timestamp(value):
         return None
     if isinstance(value, datetime):
         parsed = value
-    elif isinstance(value, (int, float)):
+    elif isinstance(value, Number):
         number = float(value)
         if not math.isfinite(number):
             return None
@@ -151,6 +163,43 @@ def _timestamp(value):
         # with a fabricated fresh quote age and bypass the freshness gate.
         return None
     return parsed.timestamp()
+
+
+def _evaluation_timestamp(value):
+    """Normalize an evaluation clock to a finite epoch timestamp.
+
+    Risk checks accept an aware ``datetime`` or a numeric epoch.  A missing
+    clock means "evaluate now" for the public selectors, while booleans,
+    strings, naive datetimes, and non-finite values are malformed clocks.
+    """
+    if value is None:
+        value = time.time()
+    if isinstance(value, bool):
+        raise ValueError("evaluation timestamp is invalid")
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("evaluation timestamp must be timezone-aware")
+        try:
+            timestamp = value.timestamp()
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError("evaluation timestamp is invalid") from exc
+    elif isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("evaluation timestamp is invalid") from exc
+    else:
+        raise ValueError("evaluation timestamp is invalid")
+    if not math.isfinite(timestamp):
+        raise ValueError("evaluation timestamp is invalid")
+    # datetime.fromtimestamp is used for expiry/DTE checks.  Reject finite
+    # epochs outside the platform's representable datetime range here rather
+    # than allowing a provider row to trigger an uncaught OverflowError.
+    try:
+        datetime.fromtimestamp(timestamp, timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("evaluation timestamp is invalid") from exc
+    return timestamp
 
 
 def _expiration_date(value):
@@ -183,6 +232,32 @@ def _option_kind(value) -> str:
     return str(getattr(value, "value", value or "")).lower().split(".")[-1].strip()
 
 
+def _identity_alias_conflict(outer: Mapping, nested: Mapping,
+                             aliases: tuple[str, ...], normalizer) -> bool:
+    """Return true when explicit outer/nested identity aliases disagree."""
+    outer_values = [outer[name] for name in aliases if name in outer]
+    nested_values = [nested[name] for name in aliases if name in nested]
+    def normalize(value):
+        try:
+            return normalizer(value)
+        except Exception:  # noqa: BLE001 - malformed identity fails closed
+            return None
+
+    outer_normalized = [normalize(value) for value in outer_values]
+    nested_normalized = [normalize(value) for value in nested_values]
+    if any(value is None for value in outer_normalized + nested_normalized):
+        return bool(outer_values or nested_values)
+    all_values = outer_normalized + nested_normalized
+    for first in all_values:
+        for second in all_values:
+            if isinstance(first, (int, float)) and isinstance(second, (int, float)):
+                if abs(first - second) > 1e-9:
+                    return True
+            elif first != second:
+                return True
+    return False
+
+
 class RiskEngine:
     """Risk boundary with shares and single-leg long-option profiles.
 
@@ -201,19 +276,19 @@ class RiskEngine:
         self.strategy_id = str(strategy.get("id") or "ibr")
 
     def _risk_usd(self, equity: float, decision: Mapping) -> float:
-        if "risk_usd" in decision:
+        if "risk_usd" in decision and decision.get("risk_usd") is not None:
             explicit = _num(decision.get("risk_usd"))
             if explicit is None:
                 raise ValueError("risk_usd measurement is invalid")
-        else:
-            explicit = None
-        if explicit is not None and explicit > 0:
             return explicit
         pct = _num(self.r.get("risk_per_trade_pct"), 1.0) or 1.0
         return equity * pct / 100.0
 
     @staticmethod
     def _entry_stop(decision: Mapping, market: Mapping) -> tuple[float | None, float | None, float | None]:
+        if any(isinstance(decision.get(name), bool)
+               for name in ("entry_price", "stop_price", "stop_distance", "stop_loss_pct")):
+            return None, None, None
         entry = _num(decision.get("entry_price"), _num(market.get("price")))
         stop = _num(decision.get("stop_price"))
         distance = _num(decision.get("stop_distance"))
@@ -235,7 +310,14 @@ class RiskEngine:
         equity = _num(equity); entry = _num(entry_price); distance = _num(stop_distance)
         if equity is None or equity <= 0 or entry is None or entry <= 0 or distance is None or distance <= 0:
             raise ValueError("equity, entry price, and stop distance must be positive")
-        budget = _num(risk_usd, self._risk_usd(equity, {})) or 0.0
+        if isinstance(risk_usd, bool):
+            raise ValueError("risk_usd measurement is invalid")
+        if risk_usd is None:
+            budget = self._risk_usd(equity, {})
+        else:
+            budget = _num(risk_usd)
+            if budget is None:
+                raise ValueError("risk_usd measurement is invalid")
         raw = math.floor(budget / distance)
         cap_pct = _num(self.r.get("max_position_notional_pct"), 100.0) or 100.0
         notional_cap = equity * cap_pct / 100.0
@@ -280,7 +362,7 @@ class RiskEngine:
             except ValueError as exc:
                 raise ValueError("option underlying is invalid") from exc
         minimum, maximum, max_spread = self._option_limits()
-        now_value = time.time() if now is None else float(now)
+        now_value = _evaluation_timestamp(now)
         wanted = "call" if direction == "long" else "put"
         accepted = []
         rejected = []
@@ -469,7 +551,25 @@ class RiskEngine:
             if (bid_size is not None and bid_size <= 0) or (
                     ask_size is not None and ask_size <= 0):
                 rejected.append("empty displayed option market"); continue
-            debit = _num(option.get("debit", option.get("net_debit")), ask)
+            explicit_debits = []
+            debit_invalid = False
+            for debit_key in ("debit", "net_debit"):
+                if debit_key not in option:
+                    continue
+                explicit_debit = _num(option[debit_key])
+                if explicit_debit is None or explicit_debit <= 0:
+                    rejected.append("invalid debit")
+                    debit_invalid = True
+                    break
+                explicit_debits.append(explicit_debit)
+            if debit_invalid:
+                continue
+            if explicit_debits and any(
+                    abs(value - explicit_debits[0]) > 1e-9
+                    for value in explicit_debits[1:]):
+                rejected.append("debit metadata mismatch")
+                continue
+            debit = explicit_debits[0] if explicit_debits else ask
             if debit is None or debit <= 0:
                 rejected.append("invalid debit"); continue
             spread_pct = (ask - bid) / ((ask + bid) / 2) * 100.0
@@ -522,6 +622,16 @@ class RiskEngine:
     def size_options(self, equity: float, risk_usd: float,
                      candidates, direction: str, now: float | None = None,
                      underlying: str | None = None) -> dict:
+        equity_value = _num(equity)
+        if equity_value is None or equity_value <= 0:
+            raise ValueError("equity measurement is invalid")
+        risk_value = _num(risk_usd)
+        if risk_value is None or risk_value <= 0:
+            raise ValueError("risk_usd measurement is invalid")
+        if isinstance(equity, bool):
+            raise ValueError("equity measurement is invalid")
+        if isinstance(risk_usd, bool):
+            raise ValueError("risk_usd measurement is invalid")
         rows = list(_candidate_sequence(candidates))
         # Provider-generated candidates carry quote_age_seconds/quote_ts.  A
         # bare offline fixture predating those fields remains usable without
@@ -534,11 +644,12 @@ class RiskEngine:
                     "quote_ts", "quote_timestamp", "quote_age_seconds", "timestamp")):
                 has_freshness = True
                 break
+        evaluation_now = None if now is None else _evaluation_timestamp(now)
         contract = self.select_option_contract(rows, direction=direction,
-                                               now=now if has_freshness else None,
+                                               now=evaluation_now if has_freshness else None,
                                                underlying=underlying)
         max_loss = float(contract["max_loss_per_contract"])
-        contracts = math.floor(float(risk_usd) / max_loss)
+        contracts = math.floor(risk_value / max_loss)
         liquidity_cap = _num(contract.get("liquidity_cap_contracts", contract.get("max_contracts")))
         if liquidity_cap is not None:
             contracts = min(contracts, math.floor(liquidity_cap))
@@ -558,7 +669,10 @@ class RiskEngine:
                  entry_failures: Mapping | None = None,
                  active_trades: Mapping | None = None,
                  now: float | None = None):
-        now_value = time.time() if now is None else float(now)
+        try:
+            now_value = _evaluation_timestamp(now)
+        except ValueError as exc:
+            return None, str(exc)
         equity = _num(equity); gross = _num(gross_notional)
         if equity is None or equity <= 0: return None, "account equity measurement is invalid"
         if gross is None or gross < 0: return None, "gross exposure measurement is invalid"
