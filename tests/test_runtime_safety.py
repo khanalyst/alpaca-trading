@@ -22,6 +22,7 @@ from agent.edge import resolve_validated_variants
 from agent.market import MarketData
 from agent.risk import RiskEngine
 from agent.runtime_control import RuntimeControlMixin
+from agent.startup_edge_policy import StartupEdgePolicyMixin
 from research.edge_lab import EdgeLedger
 
 
@@ -111,6 +112,21 @@ class RuntimeControlFacadeTests(unittest.TestCase):
         for name in ("flatten_all", "_flatten_all_impl", "request_shutdown",
                      "close", "run"):
             self.assertIs(getattr(Engine, name), getattr(RuntimeControlMixin, name))
+
+
+class StartupEdgePolicyFacadeTests(unittest.TestCase):
+    def test_engine_reexports_startup_edge_policy_facade_by_identity(self):
+        self.assertIs(engine_module.StartupEdgePolicyMixin, StartupEdgePolicyMixin)
+        self.assertTrue(issubclass(Engine, StartupEdgePolicyMixin))
+        self.assertEqual(Engine.__mro__[1:4], (
+            engine_module.ExecutionLifecycleMixin,
+            RuntimeControlMixin,
+            StartupEdgePolicyMixin,
+        ))
+        for name in ("preflight", "_ensure_order_ready",
+                     "_inside_regular_session", "_enforce_intraday_cleanup",
+                     "_latest_entry_allowed", "_refresh_edge"):
+            self.assertIs(getattr(Engine, name), getattr(StartupEdgePolicyMixin, name))
 
 
 class RuntimeSafetyTests(unittest.TestCase):
