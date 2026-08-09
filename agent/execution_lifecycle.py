@@ -1,0 +1,593 @@
+"""Durable order/trade execution lifecycle operations."""
+
+from __future__ import annotations
+
+import time
+from copy import deepcopy
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Mapping
+
+from . import state
+from .alpaca_domain import OrderRequest
+from .alpaca_provider import AlpacaError
+from .instruments import validate_instrument
+
+_FILLED_ORDER_STATUSES = {"filled", "partially_filled"}
+_TERMINAL_ORDER_STATUSES = {
+    "filled", "canceled", "cancelled", "expired", "rejected", "replaced", "stopped",
+    "suspended", "failed", "not_found",
+}
+
+
+def _plain(value):
+    if is_dataclass(value):
+        return {key: _plain(item) for key, item in asdict(value).items()}
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, set)):
+        return [_plain(item) for item in value]
+    if hasattr(value, "value"):
+        return _plain(value.value)
+    return value
+
+
+def _value(obj: Any, name: str, default=None):
+    if isinstance(obj, Mapping):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+class ExecutionLifecycleMixin:
+    def _client_order_pending(self, client_order_id: str | None) -> bool:
+        if not client_order_id:
+            return False
+        orders = state.load_state().get("orders", {})
+        if not isinstance(orders, Mapping):
+            return False
+        return any(isinstance(item, Mapping) and
+                   item.get("client_order_id") == client_order_id and
+                   str(item.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES
+                   for item in orders.values())
+
+    def _record_open_order(self, request: OrderRequest, order: Any, risk_plan: Mapping) -> None:
+        """Persist submission metadata; only a reported fill becomes a trade."""
+        symbol = request.symbol.upper()
+        order_id = str(getattr(order, "id", None) or request.client_order_id)
+        status = str(getattr(order, "status", "submitted") or "submitted").lower()
+        filled_qty = self._number(getattr(order, "filled_qty", None)) or 0.0
+        if status == "filled" and filled_qty <= 0:
+            filled_qty = float(request.qty)
+        fill_price = self._number(getattr(order, "filled_avg_price", None))
+        order_state = {
+            "order_id": order_id, "symbol": symbol, "status": status,
+            "client_order_id": request.client_order_id, "qty": str(request.qty),
+            "filled_qty": filled_qty, "filled_avg_price": fill_price,
+            "side": request.side, "type": request.type,
+            "time_in_force": request.time_in_force,
+            "position_intent": request.position_intent,
+            "risk_plan": _plain(risk_plan), "fill_logged": False,
+            "logged_filled_qty": 0.0,
+            "updated_ts": time.time(),
+        }
+        def update(current: dict) -> dict:
+            current.setdefault("orders", {})[order_id] = order_state
+            if filled_qty > 0 and status in _FILLED_ORDER_STATUSES:
+                self._activate_filled_trade(
+                    current, order_state, filled_qty, fill_price)
+            return current
+        current = state.update_state(update)
+        state.log_order(order, request, action="submit", run_id=self.run_id,
+                        runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
+                        setup_id=risk_plan.get("setup_id"))
+        self._event("order_submitted", {"symbol": request.symbol, "qty": str(request.qty),
+                                         "status": status, "filled_qty": filled_qty,
+                                         "client_order_id": request.client_order_id,
+                                         "risk": risk_plan})
+
+    def _activate_filled_trade(self, current: dict, order_state: dict,
+                               filled_qty: float, fill_price: float | None) -> dict:
+        """Create durable protection and one open-trade row for an actual fill."""
+        plan = order_state.get("risk_plan", {})
+        plan = plan if isinstance(plan, Mapping) else {}
+        symbol = str(order_state.get("symbol", "")).upper()
+        profile = str(plan.get("execution_profile", "shares"))
+        underlying = str(plan.get("underlying_symbol") or
+                         (symbol if profile == "shares" else "")).upper()
+        direction = str(plan.get("direction") or
+                        ("long" if order_state.get("side") == "buy" else "short"))
+        instrument_entry = fill_price
+        if instrument_entry is None:
+            instrument_entry = self._number(
+                plan.get("option", {}).get("debit") if profile == "options" and
+                isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
+        existing = current.get("active_trades", {}).get(symbol, {})
+        existing = existing if isinstance(existing, Mapping) else {}
+        trade = {
+            "symbol": symbol, "underlying_symbol": underlying,
+            "execution_profile": profile, "direction": direction,
+            "position_side": "long" if order_state.get("side") == "buy" else "short",
+            "qty": str(filled_qty), "entry_price": instrument_entry,
+            "underlying_entry_price": plan.get("entry_price"),
+            "opened_at": existing.get("opened_at", time.time()),
+            "setup_type": plan.get("setup_type", "ibr"),
+            "setup_id": plan.get("setup_id"), "order_id": order_state.get("order_id"),
+            "status": "open", "stop_price": plan.get("underlying_stop_price", plan.get("stop_price")),
+            "target_price": plan.get("underlying_target_price", plan.get("target_price")),
+            "force_flat_at": plan.get("force_flat_at"), "risk_usd": plan.get("risk_usd"),
+            "notional": plan.get("notional"), "variant_id": plan.get("variant_id"),
+            "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
+            "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
+            "contract_multiplier": plan.get("contract_multiplier", 1),
+        }
+        # A newly observed fill may precede the broker position endpoint.  An
+        # explicit false marker lets reconciliation retain that exposure over
+        # repeated empty-position snapshots; legacy trades without this field
+        # keep their historical disappearance behavior.
+        if existing:
+            if "position_confirmed" in existing:
+                trade["position_confirmed"] = existing.get("position_confirmed")
+        else:
+            trade["position_confirmed"] = False
+        current.setdefault("active_trades", {})[symbol] = trade
+        current.setdefault("protection", {})[symbol] = {
+            key: trade.get(key) for key in (
+                "underlying_symbol", "stop_price", "target_price", "force_flat_at")
+        }
+        logged_qty = self._number(order_state.get("logged_filled_qty")) or 0.0
+        if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
+            # Older state files used a boolean only; avoid duplicating their
+            # already-journaled fill during a rolling upgrade.
+            logged_qty = filled_qty
+        incremental_qty = max(0.0, filled_qty - logged_qty)
+        if incremental_qty > 0:
+            state.log_trade(
+                symbol, order_state.get("side"), "open", incremental_qty,
+                price=instrument_entry, notional=plan.get("notional"),
+                risk_usd=plan.get("risk_usd"), order_id=order_state.get("order_id"),
+                setup_id=plan.get("setup_id"), setup_type=plan.get("setup_type"),
+                strategy_id=trade.get("strategy_id"),
+                strategy_version=trade.get("strategy_version"),
+                variant_id=trade.get("variant_id"), fill_status="filled",
+                runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
+                run_id=self.run_id)
+            order_state["fill_logged"] = True
+            order_state["logged_filled_qty"] = filled_qty
+        return trade
+
+    def _close_position(self, position: Any, reason: str, *, attempt: int = 0) -> Any:
+        symbol = str(_value(position, "symbol", "")).upper()
+        qty = abs(Decimal(str(_value(position, "qty", 0))))
+        if not symbol or qty <= 0:
+            return None
+        client_order_id = self._client_id(
+            "close", {"symbol": symbol, "setup_id": reason}, attempt)
+        close = getattr(self.provider, "close_position", None)
+        if callable(close):
+            try:
+                result = close(symbol, qty=qty, client_order_id=client_order_id,
+                               order_type="market", time_in_force="day")
+            except TypeError:
+                try:
+                    result = close(symbol, qty=qty)
+                except TypeError:
+                    result = close(symbol)
+            try:
+                state.log_order(result, None, action="close", reason=reason,
+                                symbol=symbol, qty=float(qty), runtime_mode=self.mode,
+                                run_id=self.run_id,
+                                client_order_id=client_order_id)
+            except Exception as exc:  # noqa: BLE001
+                self._reconciled = False
+                self._preflight_error = (
+                    "post-submit close durability failure; reconciliation required")
+                try:
+                    state.commit({"operator_pause": True},
+                                 transition=(state.RUNNING, state.PAUSED))
+                except Exception:  # noqa: BLE001
+                    pass
+                raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
+            return result
+        side = "sell" if str(_value(position, "side", "long")).lower() in {"long", "buy"} else "buy"
+        request = OrderRequest(symbol, qty, side, type="market", time_in_force="day",
+                               client_order_id=client_order_id)
+        result = self.provider.submit_order(request)
+        try:
+            state.log_order(result, request, action="close", reason=reason,
+                            runtime_mode=self.mode, run_id=self.run_id)
+        except Exception as exc:  # noqa: BLE001
+            self._reconciled = False
+            self._preflight_error = (
+                "post-submit close durability failure; reconciliation required")
+            try:
+                state.commit({"operator_pause": True},
+                             transition=(state.RUNNING, state.PAUSED))
+            except Exception:  # noqa: BLE001
+                pass
+            raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
+        return result
+
+    def _protection_price(self, trade: Mapping, position: Any,
+                          now: datetime) -> float | None:
+        """Return the underlying price used by both stock and option exits."""
+        profile = str(trade.get("execution_profile", "shares")).lower()
+        if profile != "options":
+            direct = self._number(_value(position, "current_price",
+                                         _value(position, "price", None)))
+            if direct is not None and direct > 0:
+                return direct
+        underlying = str(trade.get("underlying_symbol") or
+                         _value(position, "symbol", "")).upper()
+        if not underlying:
+            return None
+        try:
+            rows = self.market.stock_quotes(
+                [underlying], start=now - timedelta(minutes=2), end=now)
+            values = rows.get(underlying, []) if isinstance(rows, Mapping) else []
+            quote = self._quote_mapping(values[-1], underlying) if values else {}
+        except Exception:  # noqa: BLE001
+            return None
+        timestamp = self._timestamp(quote.get("timestamp"))
+        maximum = float(self.cfg.get("execution", {}).get(
+            "max_market_data_age_seconds", 30) or 30)
+        if timestamp is None or timestamp > now or (now - timestamp).total_seconds() > maximum:
+            return None
+        bid = self._number(quote.get("bid", quote.get("bid_price")))
+        ask = self._number(quote.get("ask", quote.get("ask_price")))
+        if bid is None or ask is None or bid <= 0 or ask < bid:
+            return None
+        return (bid + ask) / 2.0
+
+    def _monitor_positions(self, now: datetime, positions: list[Any]) -> dict[str, Any]:
+        """Evaluate persisted protection on every cycle and close safely."""
+        runtime = state.load_state()
+        active = runtime.get("active_trades", {}) if isinstance(runtime, Mapping) else {}
+        force_flat = self.market.should_force_flat(now)
+        closed = []
+        failed = []
+        changed = False
+        for position in positions:
+            symbol = str(_value(position, "symbol", "")).upper()
+            trade = active.get(symbol, {}) if isinstance(active, Mapping) else {}
+            if isinstance(trade, Mapping) and trade.get("closing_order_id"):
+                saved_order = runtime.get("orders", {}).get(
+                    str(trade.get("closing_order_id")), {})
+                saved_status = str(saved_order.get("status", "")).lower() \
+                    if isinstance(saved_order, Mapping) else ""
+                # Do not send another close while the prior one is live.  A
+                # rejected/cancelled/not-found/filled terminal order may be
+                # retried if the broker still reports residual quantity.
+                if saved_status and saved_status not in _TERMINAL_ORDER_STATUSES:
+                    continue
+            price = self._protection_price(trade, position, now) if isinstance(trade, Mapping) else None
+            direction = str(trade.get("direction", _value(position, "side", "long"))).lower()
+            stop = self._number(trade.get("stop_price"))
+            target = self._number(trade.get("target_price"))
+            reason = None
+            if force_flat:
+                reason = "before_close"
+            elif not trade or stop is None or target is None:
+                reason = "protection_missing"
+            elif price is None:
+                reason = "protection_data_unavailable"
+            elif price is not None and direction in {"long", "buy"}:
+                if stop is not None and price <= stop:
+                    reason = "stop"
+                elif target is not None and price >= target:
+                    reason = "target"
+            elif price is not None:
+                if stop is not None and price >= stop:
+                    reason = "stop"
+                elif target is not None and price <= target:
+                    reason = "target"
+            if reason:
+                try:
+                    prior_attempt = self._number(trade.get("closing_attempt")) \
+                        if isinstance(trade, Mapping) else None
+                    attempt = int(prior_attempt) + 1 if prior_attempt is not None else 0
+                    order = self._close_position(position, reason, attempt=attempt)
+                    closed.append({"symbol": symbol, "reason": reason})
+                    if isinstance(trade, dict):
+                        close_fill = self._number(getattr(order, "filled_avg_price", None))
+                        close_order_id = str(getattr(order, "id", None) or
+                                             self._client_id("close", {
+                                                 "symbol": symbol, "reason": reason}))
+                        trade.update({"status": "closing", "closing_reason": reason,
+                                      "closing_price": close_fill,
+                                      "closing_trigger_price": price,
+                                      "closing_order_id": close_order_id,
+                                      "closing_attempt": attempt,
+                                      "updated_ts": time.time()})
+                        active[symbol] = trade
+                        runtime.setdefault("orders", {})[close_order_id] = {
+                            "order_id": close_order_id, "symbol": symbol,
+                            "status": str(getattr(order, "status", "submitted") or
+                                          "submitted").lower(),
+                            "client_order_id": getattr(order, "client_order_id", None),
+                            "qty": str(_value(position, "qty", 0)),
+                            "side": "sell" if str(_value(position, "side", "long")).lower()
+                            in {"long", "buy"} else "buy",
+                            "action": "close", "reason": reason,
+                            "attempt": attempt, "closing_attempt": attempt,
+                            "updated_ts": time.time(),
+                        }
+                        changed = True
+                except Exception as exc:  # noqa: BLE001
+                    failed.append({"symbol": symbol, "reason": reason,
+                                   "error": str(exc)})
+                    self._event("close_failed", {"symbol": symbol, "reason": reason,
+                                                  "error": str(exc)})
+        if changed:
+            try:
+                runtime = state.update_state(lambda current: {
+                    **current,
+                    "active_trades": dict(active),
+                    "orders": {**current.get("orders", {}),
+                               **runtime.get("orders", {})},
+                })
+            except Exception as exc:  # noqa: BLE001
+                self._reconciled = False
+                self._preflight_error = (
+                    "post-submit close state failure; reconciliation required")
+                try:
+                    state.commit({"operator_pause": True},
+                                 transition=(state.RUNNING, state.PAUSED))
+                except Exception:  # noqa: BLE001
+                    pass
+                raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
+        return {"closed": closed, "failed": failed, "force_flat": force_flat}
+
+    def reconcile(self):
+        if hasattr(self.provider, "reconcile"):
+            result = self.provider.reconcile()
+        else:
+            result = {"positions": self.provider.positions(), "orders": self.provider.orders()}
+        positions = result.get("positions", []) if isinstance(result, Mapping) else []
+        broker_orders = result.get("orders", []) if isinstance(result, Mapping) else []
+        for position in positions:
+            validate_instrument(
+                _value(position, "symbol", ""),
+                _value(position, "asset_class", _value(position, "class", None)))
+        for broker_order in broker_orders:
+            validate_instrument(
+                _value(broker_order, "symbol", ""),
+                _value(broker_order, "asset_class", _value(broker_order, "class", None)))
+            tif = str(_value(broker_order, "time_in_force", "") or "").lower()
+            if not tif:
+                raise AlpacaError("broker reconciliation found an order without time_in_force")
+            if tif != "day":
+                raise AlpacaError("broker reconciliation found a non-day order")
+        current = state.load_state()
+        # Keep an immutable view of the active trades from the start of this
+        # snapshot.  Order fills can activate or update a trade below; using
+        # the live mapping here would make those new fills look like trades
+        # that disappeared from the broker in this same reconciliation.
+        previous = current.get("active_trades", {})
+        previous = deepcopy(previous) if isinstance(previous, Mapping) else {}
+        order_state = current.get("orders", {})
+        order_state = order_state if isinstance(order_state, dict) else {}
+        by_id = {str(getattr(order, "id", "")): order for order in broker_orders
+                 if getattr(order, "id", None)}
+        by_client = {str(getattr(order, "client_order_id", "")): order
+                     for order in broker_orders if getattr(order, "client_order_id", None)}
+        for key, saved in list(order_state.items()):
+            if not isinstance(saved, dict):
+                continue
+            broker_order = by_id.get(str(saved.get("order_id") or key)) or \
+                by_client.get(str(saved.get("client_order_id") or ""))
+            if broker_order is None:
+                if str(saved.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES:
+                    misses = int(saved.get("not_found_count", 0) or 0) + 1
+                    saved.update({"not_found_count": misses,
+                                  "updated_ts": time.time()})
+                    # The order endpoint can lag a successful submission.
+                    # Require repeated complete reconciliation misses before
+                    # treating the id as terminal and eligible for retry.
+                    if misses >= 3:
+                        saved["status"] = "not_found"
+                continue
+            old_status = str(saved.get("status", "")).lower()
+            broker_status = str(getattr(broker_order, "status", old_status) or old_status).lower()
+            broker_filled_qty = self._number(getattr(broker_order, "filled_qty", None)) or 0.0
+            saved_filled_qty = self._number(saved.get("filled_qty")) or 0.0
+            # Filled quantity is durable evidence.  A lagging broker snapshot
+            # may report a smaller quantity than one already observed, but it
+            # must never erase that evidence or duplicate a later increment.
+            filled_qty = max(saved_filled_qty, broker_filled_qty)
+            fill_price = self._number(getattr(broker_order, "filled_avg_price", None))
+            saved_fill_price = self._number(saved.get("filled_avg_price"))
+            # Broker order snapshots and position snapshots can settle in a
+            # different order.  Never regress durable fill evidence to an
+            # older accepted/new view returned by a lagging order endpoint.
+            status = broker_status
+            if old_status in _TERMINAL_ORDER_STATUSES:
+                # Terminal evidence is absorbing across terminal subtypes:
+                # rejected/canceled/expired must not be rewritten as filled
+                # by a later contradictory order snapshot.
+                status = old_status
+            elif (old_status == "partially_filled" and
+                  broker_status not in _FILLED_ORDER_STATUSES and
+                  broker_status not in _TERMINAL_ORDER_STATUSES):
+                status = old_status
+            if fill_price is None or broker_filled_qty < saved_filled_qty:
+                fill_price = saved_fill_price or fill_price
+            saved.update({"status": status, "filled_qty": filled_qty,
+                          "filled_avg_price": fill_price, "not_found_count": 0,
+                          "updated_ts": time.time()})
+            logged_qty = self._number(saved.get("logged_filled_qty")) or 0.0
+            if (filled_qty > 0 and saved.get("risk_plan") and
+                    (not saved.get("fill_logged") or filled_qty > logged_qty)):
+                # Some broker snapshots expose filled_qty before updating the
+                # order status.  Durable quantity growth is enough evidence
+                # to protect and journal the incremental fill.
+                self._activate_filled_trade(current, saved, filled_qty, fill_price)
+            if status != old_status:
+                state.log_order(
+                    broker_order, None, action="reconcile", run_id=self.run_id,
+                    runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
+                    setup_id=(saved.get("risk_plan") or {}).get("setup_id")
+                    if isinstance(saved.get("risk_plan"), Mapping) else None)
+
+        pending_by_symbol: dict[str, list[dict]] = {}
+        for saved in order_state.values():
+            if not (isinstance(saved, dict) and saved.get("risk_plan") and
+                    not saved.get("position_closed")):
+                continue
+            status = str(saved.get("status", "")).lower()
+            filled_qty = self._number(saved.get("filled_qty")) or 0.0
+            # A terminal order with no durable fill cannot explain a later
+            # broker position.  Keep accepted/working orders eligible because
+            # the position endpoint may settle before order status, and keep
+            # terminal orders with positive fill evidence eligible for partial
+            # exposure attribution.
+            if status in _TERMINAL_ORDER_STATUSES and filled_qty <= 0:
+                continue
+            pending_by_symbol.setdefault(str(saved.get("symbol", "")).upper(), []).append(saved)
+        for rows in pending_by_symbol.values():
+            rows.sort(key=lambda item: float(item.get("updated_ts", 0) or 0), reverse=True)
+
+        active = {}
+        for position in positions:
+            symbol = str(_value(position, "symbol", "")).upper()
+            if not symbol:
+                continue
+            item = dict(previous.get(symbol, {}))
+            pending = next((row for row in pending_by_symbol.get(symbol, [])
+                            if not row.get("position_closed")), None)
+            if not item and isinstance(pending, dict):
+                pending["filled_qty"] = max(
+                    self._number(pending.get("filled_qty")) or 0.0,
+                    self._number(_value(position, "qty", 0)) or 0.0)
+                pending["filled_avg_price"] = self._number(
+                    _value(position, "avg_entry_price", None))
+                item = self._activate_filled_trade(
+                    current, pending, pending["filled_qty"], pending["filled_avg_price"])
+            if not item:
+                # A broker position without local protection is reconciled as
+                # unprotected; the same cycle's monitor closes it fail-closed.
+                item = {"symbol": symbol, "underlying_symbol": symbol,
+                        "execution_profile": "unknown", "opened_at": time.time(),
+                        "status": "unprotected", "risk_usd": 0.0}
+                prior_attempts = [
+                    self._number(saved.get("attempt", saved.get("closing_attempt")))
+                    for saved in order_state.values()
+                    if isinstance(saved, Mapping) and
+                    str(saved.get("symbol", "")).upper() == symbol and
+                    (str(saved.get("action", "")).lower() == "close" or
+                     saved.get("position_closed"))
+                ]
+                prior_attempts = [attempt for attempt in prior_attempts
+                                  if attempt is not None]
+                if prior_attempts:
+                    item["closing_attempt"] = int(max(prior_attempts))
+                self._event("unprotected_position", {"symbol": symbol})
+            unprotected = (str(item.get("status", "")).lower() == "unprotected" or
+                           str(item.get("execution_profile", "")).lower() == "unknown")
+            item.update({"symbol": symbol, "qty": str(_value(position, "qty", 0)),
+                         "direction": str(_value(position, "side", "long")).lower(),
+                         "current_price": str(_value(position, "current_price", "")),
+                         "status": ("closing" if item.get("closing_reason") else
+                                    "unprotected" if unprotected else "open"),
+                         "position_confirmed": True,
+                         "updated_ts": time.time()})
+            active[symbol] = item
+        # Include fill-first trades created earlier in this same reconcile.
+        # Their explicit false marker is the only safe basis for retaining an
+        # exposure that the position endpoint has not confirmed yet.
+        current_active = current.get("active_trades", {})
+        if isinstance(current_active, Mapping):
+            for symbol, fresh in current_active.items():
+                if symbol in active or not isinstance(fresh, Mapping):
+                    continue
+                if fresh.get("position_confirmed") is False:
+                    active[symbol] = dict(fresh)
+        for symbol, trade in previous.items():
+            if symbol in active or not isinstance(trade, Mapping):
+                continue
+            if trade.get("position_confirmed") is False:
+                # The order endpoint has durable fill evidence, but this
+                # trade has never been confirmed by a position snapshot.
+                # Do not infer a close from an empty position list yet.
+                fresh = current.get("active_trades", {}).get(symbol)
+                if isinstance(fresh, Mapping):
+                    active[symbol] = dict(fresh)
+                continue
+            qty = self._number(trade.get("qty")) or 0.0
+            entry = self._number(trade.get("entry_price"))
+            exit_price = self._number(trade.get("closing_price"))
+            closing_order = by_id.get(str(trade.get("closing_order_id") or ""))
+            if exit_price is None and closing_order is not None:
+                exit_price = self._number(getattr(closing_order, "filled_avg_price", None))
+            multiplier = self._number(trade.get("contract_multiplier")) or 1.0
+            realized = None
+            sign = -1.0 if str(trade.get("position_side", "long")) == "short" else 1.0
+            if entry is not None and exit_price is not None:
+                realized = (exit_price - entry) * qty * multiplier * sign
+            pnl_pct = ((exit_price - entry) / entry * 100.0 * sign
+                       if entry and exit_price is not None else None)
+            state.log_trade(
+                symbol, "sell" if str(trade.get("position_side", "long")) == "long" else "buy",
+                "close", qty, price=exit_price, reason=trade.get("closing_reason", "broker_reconcile"),
+                realized_pnl_usd=realized, pnl_pct=pnl_pct,
+                close_trigger=trade.get("closing_reason", "broker_reconcile"),
+                setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
+                strategy_id=trade.get("strategy_id"),
+                strategy_version=trade.get("strategy_version"),
+                variant_id=trade.get("variant_id"), runtime_mode=self.mode,
+                account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
+            self._record_edge_outcome(trade, realized, pnl_pct, exit_price)
+            entry_order_id = str(trade.get("order_id") or "")
+            entry_order = order_state.get(entry_order_id)
+            if isinstance(entry_order, dict):
+                closing_attempt = self._number(trade.get("closing_attempt"))
+                prior_attempt = self._number(
+                    entry_order.get("closing_attempt", entry_order.get("attempt")))
+                attempts = [attempt for attempt in (closing_attempt, prior_attempt)
+                            if attempt is not None]
+                entry_order["position_closed"] = True
+                if attempts:
+                    entry_order["closing_attempt"] = int(max(attempts))
+            current.setdefault("protection", {}).pop(symbol, None)
+        reconciled_at = time.time()
+        protection = current.get("protection", {})
+        current = state.update_state(lambda latest: {
+            **latest,
+            "active_trades": active,
+            "orders": {**latest.get("orders", {}), **order_state},
+            "protection": protection,
+            "last_reconciliation_ts": reconciled_at,
+        })
+        self._runtime_state = current
+        self._reconciled = True
+        self._event("rest_reconcile", {"positions": len(result.get("positions", [])) if isinstance(result, Mapping) else 0})
+        return result
+
+    def _record_edge_outcome(self, trade: Mapping, realized: float | None,
+                             pnl_pct: float | None, exit_price: float | None) -> None:
+        if self.mode != "paper":
+            return
+        variant_id = trade.get("variant_id")
+        if not variant_id or realized is None:
+            return
+        vehicle = "option" if str(trade.get("execution_profile")) == "options" else "equity"
+        risk_usd = self._number(trade.get("risk_usd"))
+        opened = self._number(trade.get("opened_at")) or time.time()
+        outcome = {
+            "variant_id": variant_id, "vehicle": vehicle,
+            "opportunity_id": trade.get("setup_id") or
+                              f"{trade.get('symbol')}:{opened:.6f}",
+            "session_date": datetime.fromtimestamp(opened, timezone.utc).date().isoformat(),
+            "net_pnl": realized, "pnl_pct": pnl_pct,
+            "risk_usd": risk_usd,
+            "r_multiple": (realized / risk_usd if risk_usd and risk_usd > 0 else None),
+            "entry_price": trade.get("entry_price"), "exit_price": exit_price,
+            "reason": trade.get("closing_reason", "broker_reconcile"),
+            "paper": True,
+        }
+        try:
+            from .edge import record_paper_outcome
+            record_paper_outcome(outcome, db_path=self._edge_db_path or None)
+        except Exception as exc:  # noqa: BLE001
+            self._event("edge_outcome_failed", {"error": str(exc),
+                                                 "variant_id": variant_id})

@@ -15,10 +15,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from agent import engine as engine_module
 from agent import state
 from agent.alpaca_domain import (Account, Order, OrderRequest, Position, Quote,
                                  parse_occ_symbol)
 from agent.engine import Engine
+from agent.execution_lifecycle import (ExecutionLifecycleMixin,
+                                       _FILLED_ORDER_STATUSES,
+                                       _TERMINAL_ORDER_STATUSES, _plain, _value)
 from agent.market import MarketData
 
 
@@ -114,6 +118,21 @@ def _config(edge_db: Path, profile="shares"):
                       "champion_min_confidence": .95,
                       "db_path": str(edge_db)},
     }
+
+
+class ExecutionLifecycleFacadeTests(unittest.TestCase):
+    def test_engine_reexports_lifecycle_facade_by_identity(self):
+        self.assertIs(engine_module.ExecutionLifecycleMixin, ExecutionLifecycleMixin)
+        self.assertIs(engine_module._FILLED_ORDER_STATUSES, _FILLED_ORDER_STATUSES)
+        self.assertIs(engine_module._TERMINAL_ORDER_STATUSES, _TERMINAL_ORDER_STATUSES)
+        self.assertIs(engine_module._plain, _plain)
+        self.assertIs(engine_module._value, _value)
+        self.assertTrue(issubclass(Engine, ExecutionLifecycleMixin))
+        for name in (
+                "_client_order_pending", "_record_open_order",
+                "_activate_filled_trade", "_close_position", "_protection_price",
+                "_monitor_positions", "reconcile", "_record_edge_outcome"):
+            self.assertIs(getattr(Engine, name), getattr(ExecutionLifecycleMixin, name))
 
 
 class ExecutionLifecycleTests(unittest.TestCase):
