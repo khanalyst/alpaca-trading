@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -117,14 +118,14 @@ class EdgeLedgerStoreExtractionTests(unittest.TestCase):
             path = Path(directory) / "edge.sqlite3"
             self.assertEqual(init_ledger(path), {"db_path": str(path), "schema": SCHEMA_VERSION})
             self.assertEqual(init_db(path), {"db_path": str(path), "schema": SCHEMA_VERSION})
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 self.assertEqual(
                     db.execute("SELECT value FROM ledger_meta WHERE key='schema'").fetchone()[0],
                     str(SCHEMA_VERSION),
                 )
             candidate = EdgeLedger(path).register_candidate(
                 "ibr.target.1_5r", hypothesis="immutable", config={})
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
                     db.execute(
                         "UPDATE candidates SET hypothesis='changed' WHERE candidate_id=?",
