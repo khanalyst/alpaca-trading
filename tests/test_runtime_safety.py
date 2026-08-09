@@ -25,6 +25,8 @@ from agent.risk import RiskEngine
 from agent.runtime_control import RuntimeControlMixin
 from agent.startup_edge_policy import StartupEdgePolicyMixin
 from agent.market_entry_risk import MarketEntryRiskMixin
+from agent import engine_cycle as engine_cycle_module
+from agent.engine_cycle import EngineCycleMixin
 from research.edge_lab import EdgeLedger
 from research.edge_ledger_store import hash_config
 
@@ -152,6 +154,37 @@ class MarketEntryRiskFacadeTests(unittest.TestCase):
         ):
             self.assertIs(getattr_static(Engine, name),
                           getattr_static(MarketEntryRiskMixin, name))
+
+
+class EngineCycleFacadeTests(unittest.TestCase):
+    def test_engine_reexports_cycle_facade_by_identity(self):
+        self.assertIs(engine_module.EngineCycleMixin, EngineCycleMixin)
+        self.assertTrue(issubclass(Engine, EngineCycleMixin))
+        self.assertEqual(Engine.__mro__[1:6], (
+            engine_module.ExecutionLifecycleMixin,
+            RuntimeControlMixin,
+            StartupEdgePolicyMixin,
+            MarketEntryRiskMixin,
+            EngineCycleMixin,
+        ))
+        for name in ("run_once", "_run_once_impl"):
+            self.assertIs(getattr_static(Engine, name),
+                          getattr_static(EngineCycleMixin, name))
+
+    def test_cycle_forwarders_resolve_engine_facade_aliases_at_call_time(self):
+        marker = object()
+        with patch.object(engine_module, "generate_ibr_signal",
+                          return_value=marker) as ibr, \
+             patch.object(engine_module, "generate_rule_signal",
+                          return_value=marker) as rule, \
+             patch.object(engine_module, "build_setup_plan",
+                          return_value=marker) as plan:
+            self.assertIs(engine_cycle_module.generate_ibr_signal("SPY", []), marker)
+            self.assertIs(engine_cycle_module.generate_rule_signal("SPY", []), marker)
+            self.assertIs(engine_cycle_module.build_setup_plan({}, {}, {}), marker)
+        ibr.assert_called_once_with("SPY", [])
+        rule.assert_called_once_with("SPY", [])
+        plan.assert_called_once_with({}, {}, {})
 
 
 class RuntimeSafetyTests(unittest.TestCase):
