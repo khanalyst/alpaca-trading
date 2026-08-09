@@ -1,0 +1,320 @@
+# Platform architecture and decomposition record
+
+This document describes the current Alpaca intraday research and trading
+platform as implemented. It is an engineering map, not a performance claim.
+The supported trading scope is US-listed equities/ETFs and listed OCC options.
+Options are single-leg long calls or puts only. Crypto, overnight positions,
+multi-leg options, naked options, and short-option exposure are rejected.
+
+## System boundaries
+
+The repository contains four cooperating processes:
+
+| Process | Authority | Durable output |
+| --- | --- | --- |
+| Recorder | Read-only Alpaca market-data collection | Mixed bars, quotes, and option snapshots under `runtime/research/recorded` |
+| Research | Offline simulation, evidence gates, and candidate lifecycle | Edge/factory SQLite ledgers and content-addressed proof artifacts |
+| Trader | Authenticated account reads and order/position mutation | Mode-scoped runtime state, operational journal, events, and heartbeat |
+| Dashboard | Read-only observation | No authoritative writes |
+
+Research cannot submit orders or mutate broker state. The trader cannot create
+an edge: it may only select an already verified `validated` or `champion`
+record from the research ledger. The dashboard is not an execution console.
+
+Paper and live runtimes use separate directories and account fingerprints.
+Paper is the documented default. Live mode requires an explicit live
+configuration, environment guard, authenticated preflight, pattern-day-trader
+status, and one specifically pinned proved variant.
+
+## Deployment and data flow
+
+```text
+Alpaca market-data APIs
+        |
+        v
+deploy/recorder.py + deploy/recorder_market.py
+        |
+        v
+append-only normalized market corpus
+        |
+        +------------------------------+
+        |                              |
+        v                              v
+research.edge_lab              research.strategy_factory
+explicit IBR variants          bounded rule-family variants
+        |                              |
+        +--------------+---------------+
+                       v
+             statistical/evidence gates
+                       |
+                       v
+        edge ledger + verified proof artifacts
+                       |
+                       v
+              agent.edge edge resolver
+                       |
+Alpaca account/order APIs <-> trader Engine <-> runtime state/journal
+```
+
+The Compose deployment uses a read-only application filesystem, an
+unprivileged user, dropped Linux capabilities, bounded CPU/memory/PIDs, Docker
+secrets, and named volumes for runtime and research data. There is one trader
+replica because the mode-scoped run lock is an additional safety boundary, not
+a substitute for single-owner deployment.
+
+## Trading runtime
+
+### Engine composition
+
+`agent.engine.Engine` remains the stable public class. Its responsibilities
+are composed in this order:
+
+1. `ExecutionLifecycleMixin` — broker order/fill/position reconciliation and
+   protection/close lifecycle.
+2. `RuntimeControlMixin` — run loop ownership, pause/shutdown, flattening, and
+   authenticated flat-only operator resume.
+3. `StartupEdgePolicyMixin` — preflight, session policy, startup cleanup, and
+   proved-edge readiness.
+4. `MarketEntryRiskMixin` — market collection, freshness validation, daily
+   risk state, fail-closed behavior, and order-plan construction.
+5. `EngineCycleMixin` — one complete decision cycle.
+
+The facade keeps `Engine` at `agent.engine.Engine`, preserves the established
+MRO, and retains legacy patch/import seams. The extracted modules do not import
+the facade eagerly, so reverse import order remains safe.
+
+### One decision cycle
+
+A normal cycle follows these gates:
+
+1. Acquire the mode-scoped process lock and confirm state/journal readiness.
+2. Authenticate the configured account and verify mode, endpoint, account
+   fingerprint, account status, clock, and market calendar.
+3. Reconcile durable orders/trades/protection with Alpaca positions and orders.
+   Broker truth wins; malformed or unavailable broker state fails closed.
+4. Apply regular-session and latest-entry cutoffs. Outside-session cleanup
+   cancels working orders and flattens residual exposure.
+5. Load the permitted universe and collect the latest valid bars, quotes, and
+   (for the option profile) option-chain snapshots.
+6. Resolve a vehicle-compatible proved edge from the research ledger and
+   generate its deterministic rule/IBR signal.
+7. Build a setup plan, then let `RiskEngine` validate prices, stops, daily P&L,
+   gross/open risk, option identity, liquidity, freshness, debit, multiplier,
+   and contract count.
+8. Reject duplicates by underlying and durable pending exposure; create a
+   deterministic client order ID with reserved retry suffix space.
+9. Submit through `AlpacaProvider`, persist the order/risk plan, and reconcile
+   acknowledgement/fills. A post-submit durability failure pauses the runtime
+   because broker state may already have changed.
+10. Monitor positions and protective exits, journal fills/trades/equity, and
+    force-flat before the close.
+
+The runtime never silently substitutes stale data, malformed numeric values,
+an unrelated idempotency lookup, an incompatible OCC contract, or an unknown
+broker status.
+
+### Provider boundary
+
+`agent.alpaca_provider.AlpacaProvider` owns authenticated account and trading
+operations. `AlpacaMarketDataMixin` owns the read-only discovery methods for
+bars, quotes, option chains, snapshots, contracts, and risk-ready candidates.
+
+`agent.alpaca_domain` contains broker-neutral account/order/position/contract
+models and strict request validation. `agent.alpaca_sdk` contains SDK-shape
+normalizers and lazy SDK compatibility helpers. Provider results are scoped to
+the requested symbols, finite, timezone-aware, and normalized before entering
+the engine. Order lookup is locally filtered even when a broker filter is
+ignored; an exact client-ID mismatch or a full bounded history makes absence
+unprovable and therefore blocks submission.
+
+### Risk boundary
+
+`agent.risk.RiskEngine` is the public risk decision engine. Pure input
+normalization lives in `agent.risk_inputs` and is re-exported by the facade.
+The risk engine:
+
+- sizes shares from an explicit stop distance and risk budget;
+- permits only one long option leg with OCC-consistent underlying, right,
+  expiry, strike, and multiplier metadata;
+- rejects stale/future/naive timestamps and malformed freshness flags;
+- enforces DTE, spread, volume/open-interest, displayed-size, moneyness,
+  per-contract loss, contract-count, notional, gross-risk, and daily-loss caps;
+- treats explicit malformed values as errors rather than falling back to a
+  default; and
+- emits a durable plan whose entry/stop/target/risk/notional fields are the
+  same fields consumed by execution and reconciliation.
+
+## Runtime state and recovery
+
+`agent.state` is the compatibility facade for dynamic, mode-scoped paths.
+`agent.state_store` owns validated atomic JSON reads/writes. `agent.journal`
+owns path-parameterized SQLite schema, migration, readiness, and inserts.
+
+The authoritative JSON state contains the runtime state machine, account
+fingerprint, active trades, protective orders, opened timestamps, durable
+orders, daily-risk baseline, reconciliation timestamp, preflight record, kill
+reason, and operator pause. Writes are lock-protected and atomically replaced.
+A present but malformed state file is corruption; it is never treated as a
+fresh default.
+
+The SQLite journal uses WAL plus `synchronous=FULL`, validates required base
+columns before migration, and records events, orders, trades, equity, runs,
+and schema metadata. Order/trade/event mirroring is SQLite-first; optional JSONL
+history failures do not invalidate a successful durable journal write.
+
+`main.py resume` is deliberately flat-only. It acquires the run lock, requires
+an exact paused/operator-paused state, re-runs authenticated preflight and
+reconciliation, rejects terminal states or any durable/broker position,
+working order, active trade, or protection row, performs a final read-only
+broker confirmation, and only then clears `operator_pause`. It never cancels,
+flattens, submits, or changes the state to `RUNNING`; the operator starts the
+trader separately.
+
+## Research and evidence pipeline
+
+### Normalized observations
+
+`research.market_data` defines point-in-time `UnderlyingBar`, `QuoteSnapshot`,
+`OptionContract`, and `OptionSnapshot` records. Normalization rejects naive or
+future timestamps, malformed OHLC/quotes, invalid provider/feed identity, and
+out-of-scope instruments. Session grouping uses `America/New_York` after
+timezone conversion.
+
+### Explicit IBR path
+
+`research.ibr` implements the initial-balance-range reference strategy. It
+requires contiguous completed opening-range bars, detects a breakout only
+after bar close, enters at the next bar open, applies gap-aware fills,
+resolves same-bar stop/target ties against the strategy, charges spread,
+slippage and fees, and closes before the session boundary. Equity and option
+vehicles have separate books.
+
+`research.edge_discovery_core` owns deterministic corpus loading, effective
+IBR configuration, opportunity materialization, gate construction, and gate
+finalization. `research.edge_lab` owns orchestration: variant registry lookup,
+replay, forward-only tail selection, ledger writes, lifecycle transitions, and
+champion selection.
+
+### Autonomous bounded strategy factory
+
+`research.strategy_factory` orchestrates multiple independent strategy
+families and isolated simulated accounts. `research.factory_core` owns pure
+hypothesis construction, simulation, diagnosis, and bounded mutation.
+`research.factory_ledger` owns factory lineage and events.
+
+Generated strategies are data in the finite grammar defined by
+`agent.contracts.rule`; research never generates or executes Python source.
+Diagnosis uses chronological fit data. Variants are judged on untouched
+held-out data, and a backtest winner still needs a strictly later forward
+shadow sample before runtime eligibility. Optional LLM replacement can only
+propose another schema-validated bounded rule; invalid output cannot retire a
+family or authorize trading.
+
+### Statistical gates and lifecycle
+
+`research.gates` provides chronological splits, structural floors, paired and
+cluster-aware controls, placebo/falsification tests, held-out separation,
+drawdown, sample counts, family false-discovery correction inputs, and the
+verified-gate envelope.
+
+`research.edge_ledger_store` owns the SQLite schema and hashing primitives.
+`research.edge_ledger_proof` owns verified-gate persistence and re-verification.
+`research.edge_ledger` owns candidate/run/trade/evidence/event lifecycle,
+champion selection, and paper-outcome monitoring.
+
+The lifecycle is forward-only:
+
+```text
+candidate -> backtest_passed -> shadow -> validated -> champion
+                                      \-> retired/demoted when rules permit
+```
+
+Every accepted proof retains content hashes for data, configuration, code, and
+provenance. Gate envelopes are re-verified before use. Malformed legacy proof
+rows are skipped rather than crashing champion selection. Paper outcomes are
+append-only and can demote an edge; they cannot manufacture a proof.
+
+## Safety invariants
+
+- Paper/live mode, endpoint, credentials, runtime directory, and account
+  fingerprint must agree.
+- The Alpaca clock/calendar controls session eligibility; no local weekday
+  approximation can authorize an entry.
+- Only day orders are supported. Extended-hours and stop orders are rejected.
+- Startup and shutdown are reconciled; exposure or ambiguous broker state
+  blocks entries and pauses safely.
+- A durable operator pause survives restart until authenticated flat-only
+  resume succeeds.
+- No position is intentionally held overnight.
+- Research has no broker mutation path, and runtime has no proof-generation
+  path.
+- Runtime decisions require a vehicle-compatible re-verified proved edge.
+- All risk, price, quantity, time, multiplier, P&L, and exposure inputs must be
+  finite and type-correct; booleans are not accepted as numbers.
+- SQLite/state failures at order-bearing boundaries are fatal to new entries.
+- Client order IDs and reconciliation make retries idempotent and observable.
+
+## Decomposition record
+
+The decomposition used stable facades, composition/mixins, path-parameterized
+adapters, and call-time dependency forwarding. This kept public class/module
+identities, signatures, import order, monkeypatch seams, and serialized class
+identity stable while moving cohesive responsibilities.
+
+| Original authority | Extracted responsibility |
+| --- | --- |
+| `agent.engine` | `execution_lifecycle`, `runtime_control`, `startup_edge_policy`, `market_entry_risk`, `engine_cycle` |
+| `agent.state` | Atomic JSON primitives in `state_store`; SQLite adapter in `journal` |
+| `agent.alpaca_provider` | Read-only market/options discovery in `alpaca_market_data` |
+| `agent.risk` | Pure normalization and identity helpers in `risk_inputs` |
+| `research.edge_ledger` | SQLite/hash primitives in `edge_ledger_store`; proof operations in `edge_ledger_proof` |
+| `research.edge_lab` | Deterministic discovery helpers in `edge_discovery_core` |
+| `research.strategy_factory` | Pure simulation/diagnosis/mutation in `factory_core`; lineage storage in `factory_ledger` |
+
+Compatibility tests assert facade identities, MRO, method ownership, reverse
+import order, lazy imports, pickle identity, path rebinding, and legacy helper
+patch interception. During extraction, moved method/helper ASTs and differential
+runtime scenarios were compared with their pre-extraction versions. The final
+canonical warning-as-error suite contains 299 tests.
+
+## Why the remaining larger modules are stop points
+
+Line count alone is not treated as monolithic design. A further split is made
+only when it separates an independently testable responsibility without
+fragmenting one atomic side-effect boundary. After the extractions above, the
+remaining larger modules are cohesive:
+
+| Module | Cohesive authority retained |
+| --- | --- |
+| `agent.execution_lifecycle` | One broker order/fill/position/protection lifecycle and its durable transitions |
+| `research.strategy_factory` | Process/thread orchestration and cross-ledger lifecycle; pure simulation and storage are already extracted |
+| `agent.risk` | One public risk-plan decision engine; normalization is already extracted |
+| `agent.runtime_control` | One runtime state machine, lock owner, recovery, shutdown, and heartbeat lifecycle |
+| `agent.alpaca_provider` | Authenticated account/trading boundary; read-only market discovery is already extracted |
+| `research.edge_ledger` | Candidate/run/trade/event lifecycle authority; storage primitives and proof logic are already extracted |
+| `agent.market_entry_risk` | One entry-data/risk/fail-closed orchestration boundary |
+| `agent.alpaca_domain` | Broker-neutral models and validation |
+| `research.market_data` | Provider-neutral market models and normalization |
+
+Splitting these merely to reduce file length would distribute atomic
+invariants across modules, add import/patch seams, and increase semantic-drift
+risk without creating a new responsibility boundary.
+
+## Verification authority
+
+The release gate is:
+
+```bash
+PYTHONPATH=. ./.venv/bin/python -W error -m unittest \
+  discover -s tests -t . -p 'test_*.py' -q
+./.venv/bin/python -m compileall -q agent deploy research tests
+git diff --check
+```
+
+The `-t .` argument is intentional: running discovery with `tests/` as the
+top-level import directory lets `tests/research` shadow the production
+`research` package. That runner-path problem is not a product test failure.
+
+The test suite is the behavioral authority. Setup and runtime operations are
+documented in `SETUP.md` and `OPERATIONS.md`; research evidence requirements
+are documented in `research/README.md` and `research/protocol.md`.

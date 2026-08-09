@@ -46,6 +46,9 @@ read as a performance claim.
 
 ## Architecture
 
+For the detailed process, module, state, research, execution, safety, and
+decomposition map, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 `agent/alpaca_provider.py` is the small boundary around `alpaca-py`. It
 normalizes account, asset, quote/bar, calendar, option-chain, order, and trade
 update data for the rest of the application. `agent/alpaca_session.py` owns
