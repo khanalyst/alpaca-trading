@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
 import json
+import inspect
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -9,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from research import edge_lab, edge_ledger, edge_ledger_store
+from research import edge_lab, edge_ledger, edge_ledger_proof, edge_ledger_store
 from research.edge_lab import DiscoveryError, EdgeLedger, discover
 from research.edge_ledger import (
     SCHEMA_VERSION, canonical_json, content_hash, hash_config, hash_dataset,
@@ -98,6 +99,54 @@ class EdgeLedgerStoreExtractionTests(unittest.TestCase):
             self.assertIs(getattr(edge_ledger, name), getattr(edge_ledger_store, name))
             self.assertIs(getattr(edge_lab, name), getattr(edge_ledger_store, name))
         self.assertIs(edge_ledger.EdgeLedger, edge_lab.EdgeLedger)
+
+    def test_proof_mixin_preserves_edge_ledger_facade_and_mro_identity(self):
+        names = (
+            "record_verified_gate", "_gate_envelope_error", "_latest_verified_gate",
+            "latest_verified_run", "eligibility",
+        )
+        self.assertTrue(issubclass(edge_ledger.EdgeLedger,
+                                   edge_ledger_proof.EdgeLedgerProofMixin))
+        for name in names:
+            self.assertNotIn(name, edge_ledger.EdgeLedger.__dict__)
+            self.assertIs(getattr(edge_ledger.EdgeLedger, name),
+                          getattr(edge_ledger_proof.EdgeLedgerProofMixin, name))
+            self.assertIs(inspect.getattr_static(edge_ledger.EdgeLedger, name),
+                          inspect.getattr_static(edge_ledger_proof.EdgeLedgerProofMixin, name))
+
+    def test_proof_import_is_lazy_and_does_not_capture_ledger_defaults(self):
+        root = Path(__file__).resolve().parents[2]
+        script = (
+            "import sys; import research.edge_ledger_proof as proof; "
+            "assert 'research.edge_ledger' not in sys.modules; "
+            "assert 'DEFAULT_DB_PATH' not in vars(proof)"
+        )
+        result = subprocess.run([sys.executable, "-c", script], cwd=root,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_legacy_edge_ledger_helpers_are_intercepted_by_proof_facade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", hypothesis="facade helper patches", config={})
+            run, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+            names = (
+                "_connect", "_json", "_row", "_utc", "content_hash",
+                "sample_counts", "verify_gate_envelope", "_finite_number",
+                "_nonnegative_integer",
+            )
+            patches = [mock.patch.object(edge_ledger, name,
+                                         wraps=getattr(edge_ledger, name))
+                       for name in names]
+            with patches[0] as connect, patches[1] as json_, patches[2] as row, \
+                    patches[3] as utc, patches[4] as content, patches[5] as counts, \
+                    patches[6] as verify, patches[7] as finite, patches[8] as integer:
+                ledger.record_verified_gate(run["run_id"], envelope)
+            for helper in (connect, json_, row, utc, content, counts, verify,
+                           finite, integer):
+                self.assertTrue(helper.called, helper)
 
     def test_hash_aliases_are_deterministic_and_reject_nonfinite_json(self):
         value = {"z": "café", "a": [1, True, None]}
