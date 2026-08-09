@@ -196,14 +196,52 @@ _JOURNAL_TABLES = {
     )""",
 }
 
+# These are the durable columns that make each writer's row meaningful.  The
+# migration below may add nullable, deployment-era columns, but it must not
+# silently treat a partial base table as ready and drop the fields below.
+_JOURNAL_REQUIRED_COLUMNS = {
+    "events": {"ts", "kind", "payload"},
+    "orders": {"ts", "action"},
+    "trades": {"ts", "symbol", "action", "qty"},
+    "equity": {"ts", "equity", "state"},
+    "schema_meta": {"key", "value"},
+}
+
+
+def _journal_columns(db, table: str) -> set[str]:
+    cursor = db.execute(f"PRAGMA table_info({table})")
+    try:
+        return {row[1] for row in cursor.fetchall()}
+    finally:
+        cursor.close()
+
+
+def _validate_existing_journal_schema(db) -> None:
+    """Reject malformed existing base tables before any migration writes."""
+    cursor = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    try:
+        existing = {row[0] for row in cursor.fetchall()}
+    finally:
+        cursor.close()
+    for table, required in _JOURNAL_REQUIRED_COLUMNS.items():
+        if table not in existing:
+            continue
+        present = _journal_columns(db, table)
+        missing = required - present
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise JournalNotReady(
+                f"{RUNTIME_SCOPE} journal table {table!r} is missing columns: {names}")
+
 
 def initialize_journal() -> Path:
     """Create/migrate the append-only operational journal and state directory."""
-    RUNTIME.mkdir(parents=True, exist_ok=True)
     try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(JOURNAL_FILE, timeout=5,
                              factory=_ClosingConnection) as db:
             db.execute("PRAGMA busy_timeout=5000")
+            _validate_existing_journal_schema(db)
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
             for ddl in _JOURNAL_TABLES.values():
@@ -218,16 +256,14 @@ def initialize_journal() -> Path:
                 "equity": {"run_id": "TEXT", "cycle_id": "TEXT", "runtime_mode": "TEXT", "account_fingerprint": "TEXT"},
             }
             for table, columns in required.items():
-                cursor = db.execute(f"PRAGMA table_info({table})")
-                present = {row[1] for row in cursor.fetchall()}
-                cursor.close()
+                present = _journal_columns(db, table)
                 for name, typ in columns.items():
                     if name not in present:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
             db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
                        ("runtime_schema", "2"))
             db.commit()
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
         raise JournalNotReady(f"{RUNTIME_SCOPE} journal unavailable: {exc}") from exc
     return JOURNAL_FILE
 
@@ -238,10 +274,17 @@ def journal_ready() -> bool:
         with sqlite3.connect(JOURNAL_FILE, timeout=1,
                              factory=_ClosingConnection) as db:
             cursor = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {row[0] for row in cursor.fetchall()}
-            cursor.close()
-        return {"events", "orders", "trades", "equity"}.issubset(tables)
-    except (OSError, sqlite3.Error, JournalNotReady):
+            try:
+                tables = {row[0] for row in cursor.fetchall()}
+            finally:
+                cursor.close()
+            required_tables = tuple(_JOURNAL_REQUIRED_COLUMNS)
+            if not set(required_tables).issubset(tables):
+                return False
+            return all(_JOURNAL_REQUIRED_COLUMNS[table].issubset(
+                _journal_columns(db, table))
+                       for table in required_tables)
+    except (OSError, sqlite3.Error, RuntimeError):
         return False
 
 
@@ -282,7 +325,7 @@ def _journal_insert(table: str, payload: Mapping[str, Any]) -> None:
             db.execute(f"INSERT INTO {table} ({','.join(names)}) VALUES ({placeholders})",
                        [row[name] for name in names])
             db.commit()
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
         raise JournalNotReady(f"journal write failed: {exc}") from exc
 
 
@@ -326,11 +369,11 @@ def write_heartbeat(status: str, **detail) -> dict:
     if status not in {"starting", "running", "degraded", "pausing", "paused", "killed", "stopped"}:
         raise ValueError(f"unsupported heartbeat status {status!r}")
     payload = {"schema": 1, "status": status, "updated_ts": time.time(),
-               "pid": os.getpid(), "runtime_mode": RUNTIME_SCOPE if RUNTIME_SCOPE in {"paper", "live"} else None,
+               "pid": os.getpid(), "runtime_mode": RUNTIME_SCOPE if RUNTIME_SCOPE in {"paper", "live", "test"} else None,
                **detail}
     _atomic_write(HEARTBEAT_FILE, payload)
     try: append_operational_history(operational_history_path(HEARTBEAT_FILE), payload)
-    except OSError: pass
+    except Exception: pass
     return payload
 
 
@@ -342,7 +385,7 @@ def log_event(kind: str, payload: str, **detail) -> None:
     _journal_insert("events", row)
     try:
         _append(EVENTS_FILE, row)
-    except OSError:
+    except Exception:
         pass
 
 
@@ -386,7 +429,7 @@ def log_trade(symbol, side, action, qty, price=None, notional=None,
     try:
         _append(EVENTS_FILE, {"ts": row["ts"], "kind": "trade",
                               "payload": json.dumps(row, default=str)})
-    except OSError:
+    except Exception:
         pass
 
 

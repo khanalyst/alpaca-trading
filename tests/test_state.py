@@ -1,9 +1,13 @@
 """Durable paper-runtime identity and single-process ownership checks."""
 
 import json
+import sqlite3
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from agent import state
 from agent import state_store
@@ -45,7 +49,14 @@ class StateSafetyTests(unittest.TestCase):
             state.load_state()
         with self.assertRaises(state.StateCorruptionError):
             state.bind_account_identity(
-                state.account_fingerprint("paper", "paper-account"))
+            state.account_fingerprint("paper", "paper-account"))
+        self.assertEqual(state.STATE_FILE.read_text(encoding="utf-8"), corrupt)
+
+    def test_journal_insert_preserves_state_corruption_failure(self):
+        corrupt = "{not-json"
+        state.STATE_FILE.write_text(corrupt, encoding="utf-8")
+        with self.assertRaises(state.StateCorruptionError):
+            state.log_event("event", "payload")
         self.assertEqual(state.STATE_FILE.read_text(encoding="utf-8"), corrupt)
 
     def test_persisted_state_missing_operator_pause_fails_closed(self):
@@ -108,6 +119,303 @@ class StateSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             state_store._atomic_write(path, {"value": float("nan")})
         self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_runtime_path_facade_globals_follow_each_configuration(self):
+        first_root = Path(self.tmp.name) / "first"
+        second_root = Path(self.tmp.name) / "second"
+
+        state.configure_runtime("paper", first_root)
+        self.assertEqual(state.RUNTIME_SCOPE, "paper")
+        self.assertEqual(state.RUNTIME, first_root / "paper")
+        self.assertEqual(state.STATE_FILE, first_root / "paper" / "state.json")
+        self.assertEqual(state.PID_FILE, first_root / "paper" / "agent.pid")
+        self.assertEqual(state.HEARTBEAT_FILE,
+                         first_root / "paper" / "heartbeat.json")
+        self.assertEqual(state.STATE_LOCK_FILE,
+                         first_root / "paper" / "state.lock")
+        self.assertEqual(state.EVENTS_FILE,
+                         first_root / "paper" / "events.jsonl")
+        self.assertEqual(state.JOURNAL_FILE,
+                         first_root / "paper" / "journal.db")
+
+        state.configure_runtime("live", second_root)
+        self.assertEqual(state.RUNTIME_SCOPE, "live")
+        self.assertEqual(state.RUNTIME, second_root / "live")
+        self.assertEqual(state.STATE_FILE, second_root / "live" / "state.json")
+        self.assertEqual(state.PID_FILE, second_root / "live" / "agent.pid")
+        self.assertEqual(state.HEARTBEAT_FILE,
+                         second_root / "live" / "heartbeat.json")
+        self.assertEqual(state.STATE_LOCK_FILE,
+                         second_root / "live" / "state.lock")
+        self.assertEqual(state.EVENTS_FILE,
+                         second_root / "live" / "events.jsonl")
+        self.assertEqual(state.JOURNAL_FILE,
+                         second_root / "live" / "journal.db")
+
+    def test_initialize_journal_is_idempotent_and_migrates_legacy_schema(self):
+        root = Path(self.tmp.name) / "legacy"
+        state.configure_runtime("paper", root)
+        state.RUNTIME.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            db.executescript(
+                """
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    action TEXT
+                );
+                CREATE TABLE trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    symbol TEXT,
+                    action TEXT,
+                    qty REAL
+                );
+                """
+            )
+            db.execute("INSERT INTO events(ts, kind, payload) VALUES (?, ?, ?)",
+                       (1.0, "legacy", "preserve me"))
+            db.execute("INSERT INTO orders(ts, action) VALUES (?, ?)",
+                       (2.0, "submit"))
+            db.execute("INSERT INTO trades(ts, symbol, action, qty) VALUES (?, ?, ?, ?)",
+                       (3.0, "SPY", "open", 2.0))
+            db.commit()
+
+        self.assertEqual(state.initialize_journal(), state.JOURNAL_FILE)
+        # A second migration must not duplicate or rewrite existing rows.
+        self.assertEqual(state.initialize_journal(), state.JOURNAL_FILE)
+
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            event = db.execute(
+                "SELECT ts, kind, payload FROM events ORDER BY id"
+            ).fetchall()
+            order = db.execute(
+                "SELECT ts, action FROM orders ORDER BY id"
+            ).fetchall()
+            trade = db.execute(
+                "SELECT ts, symbol, action, qty FROM trades ORDER BY id"
+            ).fetchall()
+            schema = db.execute(
+                "SELECT value FROM schema_meta WHERE key = 'runtime_schema'"
+            ).fetchone()
+            columns = {
+                table: {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+                for table in ("events", "orders", "trades", "equity")
+            }
+
+        self.assertEqual(event, [(1.0, "legacy", "preserve me")])
+        self.assertEqual(order, [(2.0, "submit")])
+        self.assertEqual(trade, [(3.0, "SPY", "open", 2.0)])
+        self.assertEqual(schema, ("2",))
+        self.assertTrue({"run_id", "cycle_id", "runtime_mode",
+                         "account_fingerprint"}.issubset(columns["events"]))
+        self.assertTrue({"reason", "run_id", "cycle_id", "runtime_mode",
+                         "account_fingerprint", "setup_id"}.issubset(columns["orders"]))
+        self.assertTrue({"run_id", "cycle_id", "runtime_mode",
+                         "account_fingerprint"}.issubset(columns["trades"]))
+        self.assertTrue({"run_id", "cycle_id", "runtime_mode",
+                         "account_fingerprint"}.issubset(columns["equity"]))
+
+    def test_journal_ready_and_ensure_ready_form_explicit_readiness_contract(self):
+        root = Path(self.tmp.name) / "readiness"
+        state.configure_runtime("paper", root)
+        self.assertTrue(state.journal_ready())
+        self.assertFalse(state.STATE_FILE.exists())
+
+        state.ensure_ready()
+        self.assertTrue(state.STATE_FILE.exists())
+        self.assertTrue(state.journal_ready())
+        # Repeated startup checks are safe and preserve the validated state.
+        before = state.STATE_FILE.read_text(encoding="utf-8")
+        state.ensure_ready()
+        self.assertEqual(state.STATE_FILE.read_text(encoding="utf-8"), before)
+
+    def test_journal_readiness_failure_is_reported_as_not_ready(self):
+        root = Path(self.tmp.name) / "unavailable"
+        runtime = root / "paper"
+        (runtime / "journal.db").mkdir(parents=True)
+        state.configure_runtime("paper", root)
+
+        self.assertFalse(state.journal_ready())
+        with self.assertRaises(state.JournalNotReady):
+            state.ensure_ready()
+
+    def test_regular_file_runtime_path_is_not_ready(self):
+        root = Path(self.tmp.name) / "regular-runtime"
+        root.mkdir()
+        (root / "paper").write_text("not a directory", encoding="utf-8")
+        state.configure_runtime("paper", root)
+
+        with self.assertRaises(state.JournalNotReady):
+            state.initialize_journal()
+        self.assertFalse(state.journal_ready())
+
+    def test_runtime_error_from_sqlite_connect_is_normalized(self):
+        with patch.object(state.sqlite3, "connect",
+                          side_effect=RuntimeError("connect unavailable")):
+            with self.assertRaises(state.JournalNotReady):
+                state.initialize_journal()
+            self.assertFalse(state.journal_ready())
+
+    def test_runtime_error_from_insert_connection_is_normalized(self):
+        with patch.object(state, "ensure_ready"), \
+                patch.object(state.sqlite3, "connect",
+                             side_effect=RuntimeError("connect unavailable")):
+            with self.assertRaises(state.JournalNotReady):
+                state._journal_insert("events", {
+                    "ts": 1.0, "kind": "event", "payload": "payload",
+                })
+
+    def test_malformed_existing_schema_fails_closed_without_repair(self):
+        root = Path(self.tmp.name) / "malformed"
+        state.configure_runtime("paper", root)
+        state.RUNTIME.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            db.execute(
+                "CREATE TABLE events ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "ts REAL NOT NULL, kind TEXT NOT NULL)"
+            )
+            db.commit()
+        before = state.JOURNAL_FILE.read_bytes()
+
+        self.assertFalse(state.journal_ready())
+        self.assertEqual(state.JOURNAL_FILE.read_bytes(), before)
+        with self.assertRaises(state.JournalNotReady):
+            state.ensure_ready()
+        self.assertEqual(state.JOURNAL_FILE.read_bytes(), before)
+
+    def test_log_apis_all_intercept_through_journal_insert(self):
+        order = SimpleNamespace(
+            id="order-1", client_order_id="client-1", symbol="SPY",
+            side="buy", qty=2, type="market", time_in_force="day",
+            status="filled", filled_qty=2, filled_avg_price=101.5,
+        )
+        with patch.object(state, "_journal_insert") as insert, \
+                patch.object(state, "_append") as append:
+            state.log_event("heartbeat", "ok", run_id="run-1")
+            state.log_order(order, action="submit", setup_id="setup-1")
+            state.log_equity("123.45", "running", run_id="run-1")
+            state.log_trade("SPY", "buy", "open", 2, price="101.5",
+                            trade_id="trade-1")
+
+        self.assertEqual([item.args[0] for item in insert.call_args_list],
+                         ["events", "orders", "equity", "trades"])
+        payloads = {item.args[0]: item.args[1] for item in insert.call_args_list}
+        self.assertEqual(payloads["events"]["run_id"], "run-1")
+        self.assertEqual(payloads["orders"]["setup_id"], "setup-1")
+        self.assertEqual(payloads["equity"]["equity"], 123.45)
+        self.assertEqual(payloads["trades"]["trade_id"], "trade-1")
+        # Event/trade mirrors are attempted only after the journal call.
+        self.assertEqual(append.call_count, 2)
+
+    def test_sqlite_failure_prevents_event_and_trade_jsonl_mirrors(self):
+        failure = state.JournalNotReady("journal unavailable")
+        with patch.object(state, "_journal_insert", side_effect=failure), \
+                patch.object(state, "_append") as append:
+            with self.assertRaises(state.JournalNotReady):
+                state.log_event("event", "payload")
+            with self.assertRaises(state.JournalNotReady):
+                state.log_trade("SPY", "buy", "open", 1)
+        append.assert_not_called()
+        self.assertFalse(state.EVENTS_FILE.exists())
+
+    def test_jsonl_mirror_failure_does_not_mask_successful_sqlite_insert(self):
+        with patch.object(state, "_append", side_effect=OSError("disk full")):
+            state.log_event("event", "payload")
+            state.log_trade("SPY", "buy", "open", 1)
+
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            events = db.execute(
+                "SELECT kind, payload FROM events ORDER BY id"
+            ).fetchall()
+            trades = db.execute(
+                "SELECT symbol, action, qty FROM trades ORDER BY id"
+            ).fetchall()
+        self.assertEqual(events, [("event", "payload")])
+        self.assertEqual(trades, [("SPY", "open", 1.0)])
+
+    def test_latest_heartbeat_write_survives_history_append_failure(self):
+        state.write_heartbeat("starting", sequence=1)
+        with patch.object(state, "append_operational_history",
+                          side_effect=OSError("history disk full")):
+            latest = state.write_heartbeat("running", sequence=2)
+
+        self.assertEqual(json.loads(state.HEARTBEAT_FILE.read_text(encoding="utf-8")),
+                         latest)
+        self.assertEqual(latest["status"], "running")
+        self.assertEqual(latest["sequence"], 2)
+
+    def test_best_effort_mirrors_ignore_non_os_errors(self):
+        with patch.object(state, "append_operational_history",
+                          side_effect=ValueError("history payload rejected")):
+            latest = state.write_heartbeat("running", sequence=3)
+        self.assertEqual(
+            json.loads(state.HEARTBEAT_FILE.read_text(encoding="utf-8")),
+            latest,
+        )
+
+        with patch.object(state, "_append",
+                          side_effect=RuntimeError("event mirror unavailable")):
+            state.log_event("event", "payload")
+        with patch.object(state, "_append",
+                          side_effect=ValueError("trade mirror rejected")):
+            state.log_trade("SPY", "buy", "open", 1)
+
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT kind, payload FROM events ORDER BY id DESC LIMIT 1"
+                ).fetchone(),
+                ("event", "payload"),
+            )
+            self.assertEqual(
+                db.execute(
+                    "SELECT symbol, action, qty FROM trades ORDER BY id DESC LIMIT 1"
+                ).fetchone(),
+                ("SPY", "open", 1.0),
+            )
+
+    def test_test_runtime_heartbeat_reports_scoped_mode(self):
+        state.configure_runtime("test", Path(self.tmp.name) / "heartbeat-test")
+        payload = state.write_heartbeat("starting")
+        self.assertEqual(payload["runtime_mode"], "test")
+
+    def test_journal_contract_symbols_and_connection_closure_are_available(self):
+        self.assertTrue(issubclass(state.JournalNotReady, RuntimeError))
+        self.assertTrue(issubclass(state._ClosingConnection, sqlite3.Connection))
+        self.assertTrue({"events", "orders", "trades", "equity", "runs",
+                         "schema_meta"}.issubset(state._JOURNAL_TABLES))
+
+        path = Path(self.tmp.name) / "closed.sqlite3"
+        db = sqlite3.connect(path, factory=state._ClosingConnection)
+        with db:
+            db.execute("CREATE TABLE sample (value INTEGER)")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+
+    def test_journal_insert_filters_payload_to_existing_columns(self):
+        state.initialize_journal()
+        state._journal_insert("events", {
+            "ts": 4.0,
+            "kind": "filtered",
+            "payload": "kept",
+            "runtime_mode": "paper",
+            "unknown_column": "discarded",
+            123: "discarded",
+        })
+
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            row = db.execute(
+                "SELECT ts, kind, payload, runtime_mode FROM events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row, (4.0, "filtered", "kept", "paper"))
 
 
 if __name__ == "__main__":
