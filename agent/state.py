@@ -12,6 +12,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from . import journal
+from .journal import (JournalNotReady, _ClosingConnection, _JOURNAL_REQUIRED_COLUMNS,
+                      _JOURNAL_TABLES, _journal_columns,
+                      _validate_existing_journal_schema)
 from .state_store import (DEFAULT, DAY_STOPPED, KILLED, PAUSED, RUNNING,
                           StateCorruptionError, _atomic_write, _read,
                           _validated)
@@ -30,20 +34,6 @@ JOURNAL_FILE = RUNTIME / "journal.db"
 
 class RuntimeIdentityError(RuntimeError):
     """Runtime files are not scoped to the requested mode/account."""
-
-
-class JournalNotReady(RuntimeError):
-    """The durable state/journal is unavailable for an order-bearing action."""
-
-
-class _ClosingConnection(sqlite3.Connection):
-    """Close SQLite handles when used as context managers on Python 3.14+."""
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        try:
-            return super().__exit__(exc_type, exc_value, traceback)
-        finally:
-            self.close()
 
 
 def _set_paths(runtime: Path, scope: str) -> Path:
@@ -147,143 +137,41 @@ def update_state(update: Mapping[str, Any] | Callable[[dict], Mapping[str, Any] 
             lock.close()
 
 
-_JOURNAL_TABLES = {
-    "events": """CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-        kind TEXT NOT NULL, payload TEXT NOT NULL,
-        run_id TEXT, cycle_id TEXT, strategy_id TEXT, strategy_version TEXT,
-        setup_id TEXT, prompt_version TEXT, config_version TEXT,
-        code_version TEXT, equity_basis_id TEXT, runtime_mode TEXT,
-        account_fingerprint TEXT, variant_id TEXT,
-        strategy_config_version TEXT
-    )""",
-    "orders": """CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-        order_id TEXT, client_order_id TEXT, symbol TEXT, side TEXT,
-        action TEXT, qty REAL, type TEXT, time_in_force TEXT, status TEXT,
-        filled_qty REAL, filled_avg_price REAL, reason TEXT,
-        run_id TEXT, cycle_id TEXT, runtime_mode TEXT,
-        account_fingerprint TEXT, setup_id TEXT
-    )""",
-    "trades": """CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-        symbol TEXT, side TEXT, action TEXT, qty REAL, price REAL,
-        notional REAL, leverage REAL, reason TEXT, confidence REAL,
-        pnl_pct REAL, trade_id TEXT, order_id TEXT, fee_usd REAL,
-        funding_usd REAL, realized_pnl_usd REAL, risk_usd REAL,
-        fill_status TEXT, slippage_usd REAL, adverse_slippage_usd REAL,
-        funding_status TEXT, pnl_semantics TEXT, strategy_id TEXT,
-        strategy_version TEXT, setup_id TEXT, setup_key TEXT, setup_type TEXT,
-        signal_ts REAL, exit_policy TEXT, invalidation_anchor TEXT,
-        run_id TEXT, cycle_id TEXT, runtime_mode TEXT,
-        account_fingerprint TEXT, variant_id TEXT,
-        strategy_config_version TEXT, close_trigger TEXT, close_evidence TEXT,
-        entry_equity_usd REAL
-    )""",
-    "equity": """CREATE TABLE IF NOT EXISTS equity (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-        equity REAL, state TEXT, basis_id TEXT, run_id TEXT, cycle_id TEXT,
-        runtime_mode TEXT, account_fingerprint TEXT
-    )""",
-    "runs": """CREATE TABLE IF NOT EXISTS runs (
-        run_id TEXT PRIMARY KEY, started_ts REAL NOT NULL, mode TEXT,
-        strategy_id TEXT, strategy_version TEXT, model TEXT,
-        prompt_version TEXT, config_version TEXT, code_version TEXT,
-        account_fingerprint TEXT
-    )""",
-    "schema_meta": """CREATE TABLE IF NOT EXISTS schema_meta (
-        key TEXT PRIMARY KEY, value TEXT NOT NULL
-    )""",
-}
-
-# These are the durable columns that make each writer's row meaningful.  The
-# migration below may add nullable, deployment-era columns, but it must not
-# silently treat a partial base table as ready and drop the fields below.
-_JOURNAL_REQUIRED_COLUMNS = {
-    "events": {"ts", "kind", "payload"},
-    "orders": {"ts", "action"},
-    "trades": {"ts", "symbol", "action", "qty"},
-    "equity": {"ts", "equity", "state"},
-    "schema_meta": {"key", "value"},
-}
-
-
-def _journal_columns(db, table: str) -> set[str]:
-    cursor = db.execute(f"PRAGMA table_info({table})")
-    try:
-        return {row[1] for row in cursor.fetchall()}
-    finally:
-        cursor.close()
-
-
-def _validate_existing_journal_schema(db) -> None:
-    """Reject malformed existing base tables before any migration writes."""
-    cursor = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    try:
-        existing = {row[0] for row in cursor.fetchall()}
-    finally:
-        cursor.close()
-    for table, required in _JOURNAL_REQUIRED_COLUMNS.items():
-        if table not in existing:
-            continue
-        present = _journal_columns(db, table)
-        missing = required - present
-        if missing:
-            names = ", ".join(sorted(missing))
-            raise JournalNotReady(
-                f"{RUNTIME_SCOPE} journal table {table!r} is missing columns: {names}")
-
-
 def initialize_journal() -> Path:
-    """Create/migrate the append-only operational journal and state directory."""
+    """Create/migrate the current mode-scoped operational journal."""
     try:
-        RUNTIME.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(JOURNAL_FILE, timeout=5,
-                             factory=_ClosingConnection) as db:
-            db.execute("PRAGMA busy_timeout=5000")
-            _validate_existing_journal_schema(db)
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=FULL")
-            for ddl in _JOURNAL_TABLES.values():
-                db.execute(ddl)
-            # Older deployed databases predate the orders table and may omit
-            # a few optional columns.  Add only columns required by the
-            # runtime writer; existing report/dashboard readers remain valid.
-            required = {
-                "events": {"run_id": "TEXT", "cycle_id": "TEXT", "runtime_mode": "TEXT", "account_fingerprint": "TEXT"},
-                "orders": {"reason": "TEXT", "run_id": "TEXT", "cycle_id": "TEXT", "runtime_mode": "TEXT", "account_fingerprint": "TEXT", "setup_id": "TEXT"},
-                "trades": {"run_id": "TEXT", "cycle_id": "TEXT", "runtime_mode": "TEXT", "account_fingerprint": "TEXT"},
-                "equity": {"run_id": "TEXT", "cycle_id": "TEXT", "runtime_mode": "TEXT", "account_fingerprint": "TEXT"},
-            }
-            for table, columns in required.items():
-                present = _journal_columns(db, table)
-                for name, typ in columns.items():
-                    if name not in present:
-                        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
-            db.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
-                       ("runtime_schema", "2"))
-            db.commit()
+        return journal.initialize_journal(
+            JOURNAL_FILE,
+            RUNTIME,
+            RUNTIME_SCOPE,
+            tables=_JOURNAL_TABLES,
+            required_columns=_JOURNAL_REQUIRED_COLUMNS,
+            connect=sqlite3.connect,
+            connection_factory=_ClosingConnection,
+        )
+    except JournalNotReady:
+        raise
     except (OSError, sqlite3.Error, RuntimeError) as exc:
-        raise JournalNotReady(f"{RUNTIME_SCOPE} journal unavailable: {exc}") from exc
-    return JOURNAL_FILE
+        raise JournalNotReady(
+            f"{RUNTIME_SCOPE} journal unavailable: {exc}"
+        ) from exc
 
 
 def journal_ready() -> bool:
+    """Initialize, then check readiness of the current journal only."""
     try:
+        # Keep this facade call explicit: callers may patch/rebind
+        # state.initialize_journal and still expect it to run first.
         initialize_journal()
-        with sqlite3.connect(JOURNAL_FILE, timeout=1,
-                             factory=_ClosingConnection) as db:
-            cursor = db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            try:
-                tables = {row[0] for row in cursor.fetchall()}
-            finally:
-                cursor.close()
-            required_tables = tuple(_JOURNAL_REQUIRED_COLUMNS)
-            if not set(required_tables).issubset(tables):
-                return False
-            return all(_JOURNAL_REQUIRED_COLUMNS[table].issubset(
-                _journal_columns(db, table))
-                       for table in required_tables)
+        return journal.journal_ready(
+            JOURNAL_FILE,
+            RUNTIME_SCOPE,
+            runtime=RUNTIME,
+            tables=_JOURNAL_TABLES,
+            required_columns=_JOURNAL_REQUIRED_COLUMNS,
+            connect=sqlite3.connect,
+            connection_factory=_ClosingConnection,
+        )
     except (OSError, sqlite3.Error, RuntimeError):
         return False
 
@@ -308,23 +196,25 @@ def check_journal() -> None:
 
 
 def _journal_insert(table: str, payload: Mapping[str, Any]) -> None:
+    # Keep state validation outside the SQLite adapter's error normalization so
+    # StateCorruptionError remains visible to order-bearing callers.
     ensure_ready()
     try:
-        with sqlite3.connect(JOURNAL_FILE, timeout=5,
-                             factory=_ClosingConnection) as db:
-            db.execute("PRAGMA busy_timeout=5000")
-            cursor = db.execute(f"PRAGMA table_info({table})")
-            columns = {row[1] for row in cursor.fetchall()}
-            cursor.close()
-            row = {str(key): value for key, value in payload.items()
-                   if str(key) in columns}
-            if not row:
-                raise JournalNotReady(f"journal table {table!r} has no writable columns")
-            names = list(row)
-            placeholders = ",".join("?" for _ in names)
-            db.execute(f"INSERT INTO {table} ({','.join(names)}) VALUES ({placeholders})",
-                       [row[name] for name in names])
-            db.commit()
+        journal.insert(
+            JOURNAL_FILE,
+            table,
+            payload,
+            RUNTIME_SCOPE,
+            runtime=RUNTIME,
+            tables=_JOURNAL_TABLES,
+            required_columns=_JOURNAL_REQUIRED_COLUMNS,
+            connect=sqlite3.connect,
+            connection_factory=_ClosingConnection,
+        )
+    except JournalNotReady:
+        raise
+    except StateCorruptionError:
+        raise
     except (OSError, sqlite3.Error, RuntimeError) as exc:
         raise JournalNotReady(f"journal write failed: {exc}") from exc
 

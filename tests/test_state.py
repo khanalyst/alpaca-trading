@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from agent import journal
 from agent import state
 from agent import state_store
 
@@ -399,6 +400,64 @@ class StateSafetyTests(unittest.TestCase):
             db.execute("CREATE TABLE sample (value INTEGER)")
         with self.assertRaises(sqlite3.ProgrammingError):
             db.execute("SELECT 1")
+
+    def test_journal_facade_exports_preserve_module_identity(self):
+        self.assertIs(state.JournalNotReady, journal.JournalNotReady)
+        self.assertIs(state._ClosingConnection, journal._ClosingConnection)
+        self.assertIs(state._JOURNAL_TABLES, journal._JOURNAL_TABLES)
+        self.assertIs(state._JOURNAL_REQUIRED_COLUMNS,
+                      journal._JOURNAL_REQUIRED_COLUMNS)
+        self.assertIs(state._journal_columns, journal._journal_columns)
+        self.assertIs(state._validate_existing_journal_schema,
+                      journal._validate_existing_journal_schema)
+        self.assertNotIn("state", journal.__dict__)
+
+    def test_journal_wrappers_use_rebound_paths_and_sqlite_seams(self):
+        root = Path(self.tmp.name) / "rebound"
+        state.configure_runtime("paper", root)
+        seen = []
+        real_connect = sqlite3.connect
+
+        def fake_connect(path, **kwargs):
+            seen.append((Path(path), kwargs))
+            return real_connect(path, **kwargs)
+
+        with patch.object(state.sqlite3, "connect", side_effect=fake_connect):
+            state.initialize_journal()
+        self.assertEqual(seen[0][0], state.JOURNAL_FILE)
+        self.assertIs(seen[0][1]["factory"], state._ClosingConnection)
+
+    def test_journal_ready_calls_state_initializer_before_adapter_probe(self):
+        order = []
+
+        def initialize():
+            order.append("initialize")
+            return state.JOURNAL_FILE
+
+        def ready(*args, **kwargs):
+            order.append("ready")
+            return True
+
+        with patch.object(state, "initialize_journal", side_effect=initialize), \
+                patch.object(journal, "journal_ready", side_effect=ready):
+            self.assertTrue(state.journal_ready())
+        self.assertEqual(order, ["initialize", "ready"])
+
+    def test_journal_insert_calls_state_readiness_before_adapter_insert(self):
+        order = []
+
+        def ensure():
+            order.append("ensure")
+
+        def insert(*args, **kwargs):
+            order.append("insert")
+
+        with patch.object(state, "ensure_ready", side_effect=ensure), \
+                patch.object(journal, "insert", side_effect=insert):
+            state._journal_insert("events", {
+                "ts": 1.0, "kind": "event", "payload": "payload",
+            })
+        self.assertEqual(order, ["ensure", "insert"])
 
     def test_journal_insert_filters_payload_to_existing_columns(self):
         state.initialize_journal()
