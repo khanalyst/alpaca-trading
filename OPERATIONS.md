@@ -91,6 +91,32 @@ means residual positions remain and requires manual reconciliation. If the
 trader is unhealthy, stop it, cancel open orders, flatten manually in the
 scoped Alpaca account, and leave it stopped until reconciliation passes.
 
+To recover an operator-paused runtime, use this sequence:
+
+1. Stop the trader and confirm the process has released its run lock.
+2. Run the authenticated `check` and `status` commands for the same mode and
+   account.
+3. If `status` shows positions, or broker inspection shows working orders, run
+   `flatten` and wait for a later status/reconciliation that proves flat.
+4. Run `resume`. It performs one authenticated reconciliation plus a final
+   read-only broker confirmation, and clears only the operator pause when
+   broker and durable state are flat and terminal.
+5. Start the trader again.
+
+```bash
+docker compose stop trader
+docker compose run --rm trader python main.py check
+docker compose run --rm trader python main.py status
+# only when positions or working orders remain:
+docker compose run --rm trader python main.py flatten --reason operator
+docker compose run --rm trader python main.py resume
+docker compose start trader
+```
+
+`resume` is authenticated and flat-only. It never cancels, submits, or
+flattens orders, and it rejects killed or daily-risk-stopped runtimes. Do not
+manually edit `state.json` or the SQLite journal to force a resume.
+
 ## Reconciliation and incident response
 
 Capture these artifacts before changing state:

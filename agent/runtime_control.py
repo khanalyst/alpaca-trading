@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from decimal import Decimal
@@ -17,6 +18,24 @@ from .execution_lifecycle import (
 )
 
 log = logging.getLogger("engine")
+
+
+class _ResumeBlocked(AlpacaError):
+    """Authorization failed after the resume command acquired its lock."""
+
+    def __init__(self, reason: str, detail: str | None = None):
+        self.reason = reason
+        self.detail = detail
+        message = f"operator resume blocked: {reason}"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
+
+
+def _normalized_status(value: Any) -> str:
+    raw = _value(value, "status", "")
+    raw = getattr(raw, "value", raw)
+    return str(raw or "").split(".")[-1].strip().lower()
 
 
 class RuntimeControlMixin:
@@ -187,6 +206,218 @@ class RuntimeControlMixin:
         return (not residual_positions and not residual_working_orders and
                 positions_error is None and orders_error is None)
 
+    def _resume_pause_invariants(self, runtime: Mapping[str, Any], *,
+                                 check_orders: bool = True) -> None:
+        """Validate the durable pause gate without changing any state."""
+        if not isinstance(runtime, Mapping):
+            raise _ResumeBlocked("runtime_state_malformed")
+        if runtime.get("state") != state.PAUSED:
+            current = runtime.get("state")
+            raise _ResumeBlocked(f"runtime_state_{str(current or 'unknown').lower()}")
+        if runtime.get("operator_pause") is not True:
+            raise _ResumeBlocked("operator_pause_required")
+        kill_reason = runtime.get("kill_reason")
+        if (kill_reason is not None and kill_reason is not False and
+                kill_reason != ""):
+            raise _ResumeBlocked("kill_reason_present")
+        if runtime.get("runtime_mode") != self.mode:
+            raise _ResumeBlocked("runtime_mode_mismatch")
+        risk_day = runtime.get("risk_day", {})
+        if not isinstance(risk_day, Mapping):
+            raise _ResumeBlocked("risk_day_malformed")
+        if "limit_hit" in risk_day:
+            limit_hit = risk_day.get("limit_hit")
+            if limit_hit is True:
+                raise _ResumeBlocked("daily_risk_limit_hit")
+            if limit_hit is not False:
+                raise _ResumeBlocked("risk_day_malformed")
+        for name in ("active_trades", "protection"):
+            rows = runtime.get(name, {})
+            if not isinstance(rows, Mapping):
+                raise _ResumeBlocked(f"{name}_malformed")
+            if any(not isinstance(row, Mapping) for row in rows.values()):
+                raise _ResumeBlocked(f"{name}_malformed")
+            if rows:
+                raise _ResumeBlocked(f"{name}_present")
+        orders = runtime.get("orders", {})
+        if not isinstance(orders, Mapping):
+            raise _ResumeBlocked("orders_malformed")
+        for key, row in orders.items():
+            if not isinstance(row, Mapping):
+                raise _ResumeBlocked("orders_malformed")
+            if check_orders and _normalized_status(row) not in _TERMINAL_ORDER_STATUSES:
+                raise _ResumeBlocked("nonterminal_local_orders")
+
+    def _record_resume_block(self, reason: str, detail: str | None = None) -> None:
+        payload = {
+            "phase": "authorization",
+            "reason": reason,
+            "mode": self.mode,
+            "run_id": self.run_id,
+        }
+        if detail:
+            payload["error"] = detail
+        try:
+            state.log_event(
+                "operator_resume_blocked",
+                json.dumps(payload, sort_keys=True, default=str),
+                runtime_mode=self.mode,
+                run_id=self.run_id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            state.write_heartbeat("degraded", run_id=self.run_id, reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def resume(self) -> dict[str, Any]:
+        """Authorize a paused runtime to be started again, without trading."""
+        # A control handle must never steal or overwrite the heartbeat of a
+        # trader that is already running, even when that trader owns the OS
+        # lock.  Only the successful acquisition path may emit recovery state.
+        if self.running:
+            raise AlpacaError("operator resume blocked: runtime_already_running")
+        if self._lock_handle is not None or self._persistent_lock:
+            raise AlpacaError("operator resume blocked: runtime_lock_held")
+        if not self._acquire_lock():
+            raise AlpacaError("operator resume blocked: runtime_lock_held")
+
+        phase = "journal"
+        try:
+            try:
+                state.check_journal()
+                runtime = state.load_state()
+                self._resume_pause_invariants(runtime, check_orders=False)
+
+                # A control object is intentionally light, so force a fresh
+                # authenticated preflight instead of trusting constructor data.
+                phase = "preflight"
+                self._preflight = None
+                self.preflight()
+                runtime = state.load_state()
+                self._resume_pause_invariants(runtime, check_orders=False)
+
+                phase = "reconcile"
+                snapshot = self.reconcile()
+                if not isinstance(snapshot, Mapping):
+                    raise _ResumeBlocked("reconcile_snapshot_malformed")
+                positions = snapshot.get("positions")
+                broker_orders = snapshot.get("orders")
+                if not isinstance(positions, (list, tuple)):
+                    raise _ResumeBlocked("reconcile_positions_malformed")
+                if not isinstance(broker_orders, (list, tuple)):
+                    raise _ResumeBlocked("reconcile_orders_malformed")
+                if positions:
+                    raise _ResumeBlocked("residual_positions")
+                for order in broker_orders:
+                    status = _normalized_status(order)
+                    if not status:
+                        raise _ResumeBlocked("broker_order_status_missing")
+                    if status not in _TERMINAL_ORDER_STATUSES:
+                        raise _ResumeBlocked("nonterminal_broker_orders")
+
+                runtime = state.load_state()
+                self._resume_pause_invariants(runtime, check_orders=True)
+                fingerprint = str(runtime.get("account_fingerprint") or "").strip()
+                if not fingerprint:
+                    raise _ResumeBlocked("account_identity_missing")
+
+                # Reconcile owns durable lifecycle updates; this final broker
+                # poll is deliberately read-only and catches an external fill
+                # or newly working order that settled after reconciliation.
+                try:
+                    confirm_positions = self.provider.positions()
+                    confirm_orders = self.provider.orders()
+                except Exception as exc:  # noqa: BLE001
+                    raise _ResumeBlocked(
+                        "flat_confirmation_failed", str(exc)) from exc
+                if not isinstance(confirm_positions, (list, tuple)):
+                    raise _ResumeBlocked("flat_confirmation_positions_malformed")
+                if not isinstance(confirm_orders, (list, tuple)):
+                    raise _ResumeBlocked("flat_confirmation_orders_malformed")
+                if confirm_positions:
+                    raise _ResumeBlocked("residual_positions")
+                for order in confirm_orders:
+                    status = _normalized_status(order)
+                    if not status:
+                        raise _ResumeBlocked("broker_order_status_missing")
+                    if status not in _TERMINAL_ORDER_STATUSES:
+                        raise _ResumeBlocked("nonterminal_broker_orders")
+                counts = {
+                    "positions": len(confirm_positions),
+                    "broker_orders": len(confirm_orders),
+                    "local_orders": len(runtime.get("orders", {})),
+                    "active_trades": len(runtime.get("active_trades", {})),
+                    "protection": len(runtime.get("protection", {})),
+                }
+                audit = {
+                    "phase": "authorization",
+                    "mode": self.mode,
+                    "run_id": self.run_id,
+                    "account_fingerprint": fingerprint,
+                    "counts": counts,
+                    **counts,
+                }
+                try:
+                    state.log_event(
+                        "operator_resume_authorized",
+                        json.dumps(audit, sort_keys=True, default=str),
+                        runtime_mode=self.mode,
+                        run_id=self.run_id,
+                        account_fingerprint=fingerprint,
+                        phase="authorization",
+                        **counts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise _ResumeBlocked(
+                        "authorization_audit_failed", str(exc)) from exc
+                try:
+                    state.write_heartbeat(
+                        "paused", run_id=self.run_id,
+                        reason="operator_resume_ready",
+                        runtime_mode=self.mode,
+                        account_fingerprint=fingerprint,
+                        **counts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise _ResumeBlocked(
+                        "authorization_heartbeat_failed", str(exc)) from exc
+
+                def clear_pause(current: dict) -> dict:
+                    self._resume_pause_invariants(current, check_orders=True)
+                    if current.get("account_fingerprint") != fingerprint:
+                        raise _ResumeBlocked("account_identity_changed")
+                    current["operator_pause"] = False
+                    return current
+
+                try:
+                    updated = state.update_state(clear_pause)
+                except _ResumeBlocked:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    raise _ResumeBlocked(
+                        "authorization_state_write_failed", str(exc)) from exc
+                self._runtime_state = updated
+                self._heartbeat_owner = False
+                return {"action": "resume", "resumed": True,
+                        "state": state.PAUSED, "operator_pause": False,
+                        "mode": self.mode, "run_id": self.run_id,
+                        "account_fingerprint": fingerprint, **counts}
+            except _ResumeBlocked as exc:
+                self._record_resume_block(exc.reason, exc.detail)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                reason = {
+                    "journal": "journal_unavailable",
+                    "preflight": "preflight_failed",
+                    "reconcile": "reconcile_failed",
+                }.get(phase, "resume_failed")
+                self._record_resume_block(reason, str(exc))
+                raise
+        finally:
+            self._release_lock()
+
     def request_shutdown(self, reason: str = "shutdown") -> None:
         self.shutdown_reason = reason
         self.running = False
@@ -198,24 +429,29 @@ class RuntimeControlMixin:
 
     def close(self) -> None:
         """Release the process lock and leave a truthful terminal heartbeat."""
+        owns_runtime = bool(self.running or self._persistent_lock or
+                            getattr(self, "_heartbeat_owner", False))
         self.running = False
         try:
-            # Persist the lifecycle transition before announcing a stopped
-            # heartbeat.  Terminal states are intentionally absorbing: close
-            # must not overwrite an operator kill or daily risk stop, and it
-            # must preserve request_shutdown's operator_pause flag.
-            try:
-                state.commit({}, transition=(state.RUNNING, state.PAUSED))
-            except Exception:
-                pass
-            try:
-                state.write_heartbeat("stopped", run_id=self.run_id,
-                                      reason=self.shutdown_reason or "closed")
-            except Exception:
-                pass
+            if owns_runtime:
+                # Persist the lifecycle transition before announcing a
+                # stopped heartbeat. Terminal states are intentionally
+                # absorbing: close must not overwrite an operator kill or
+                # daily risk stop, and it must preserve request_shutdown's
+                # operator_pause flag.
+                try:
+                    state.commit({}, transition=(state.RUNNING, state.PAUSED))
+                except Exception:
+                    pass
+                try:
+                    state.write_heartbeat("stopped", run_id=self.run_id,
+                                          reason=self.shutdown_reason or "closed")
+                except Exception:
+                    pass
         finally:
             # State/heartbeat persistence is best effort, but a held process
             # lock is never allowed to survive close().
+            self._heartbeat_owner = False
             self._release_lock()
 
     def run(self, *, max_cycles: int | None = None) -> None:
@@ -230,7 +466,8 @@ class RuntimeControlMixin:
         try:
             state.update_state(start_runtime)
         except Exception:
-            self._release_lock()
+            self.running = False
+            self.close()
             raise
         try:
             ready = self._ensure_order_ready()

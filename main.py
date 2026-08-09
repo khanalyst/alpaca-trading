@@ -120,6 +120,18 @@ def cmd_flatten(args, cfg) -> int:
     return 0
 
 
+def cmd_resume(args, cfg) -> int:
+    """Authenticate and authorize a paused, broker-confirmed flat runtime."""
+    try:
+        engine = _engine(cfg, light=True)
+        result = engine.resume()
+    except Exception as exc:  # noqa: BLE001
+        print(f"resume failed: {exc}", file=sys.stderr)
+        return 1
+    print(_dump_yaml(result))
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Alpaca trading agent")
     p.add_argument("--config", default=str(ROOT / "config.yaml"))
@@ -141,6 +153,14 @@ def parser() -> argparse.ArgumentParser:
     flatten = sub.add_parser("flatten")
     flatten.add_argument("--reason", default="operator")
     flatten.set_defaults(fn=cmd_flatten)
+    resume = sub.add_parser(
+        "resume",
+        help="authenticated flat-only authorization for a paused runtime",
+        description=("Authenticate, reconcile once, and clear operator pause "
+                     "only when the broker and durable journal prove flat; "
+                     "this command never submits, cancels, or flattens orders."),
+    )
+    resume.set_defaults(fn=cmd_resume)
     return p
 
 

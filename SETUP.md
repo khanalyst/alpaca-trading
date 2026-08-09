@@ -334,6 +334,23 @@ docker compose run --rm trader \
 
 A non-zero flatten result requires immediate broker reconciliation.
 
+For a later operator recovery, stop the trader, run the authenticated checks,
+flatten only if needed, then authorize the paused runtime and start it again:
+
+```bash
+docker compose stop trader
+docker compose run --rm trader python main.py check
+docker compose run --rm trader python main.py status
+# only when positions or working orders remain:
+docker compose run --rm trader python main.py flatten --reason operator
+docker compose run --rm trader python main.py resume
+docker compose start trader
+```
+
+`resume` is a strict authenticated, flat-only control command. It performs one
+reconciliation plus a final read-only broker confirmation and does not cancel,
+submit, or flatten anything. Never edit the runtime state or journal by hand.
+
 ## 15. Back up before updates
 
 Back up the Docker volumes containing:

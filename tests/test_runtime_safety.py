@@ -116,7 +116,7 @@ class RuntimeControlFacadeTests(unittest.TestCase):
         self.assertLess(Engine.__mro__.index(engine_module.ExecutionLifecycleMixin),
                         Engine.__mro__.index(RuntimeControlMixin))
         for name in ("flatten_all", "_flatten_all_impl", "request_shutdown",
-                     "close", "run"):
+                     "close", "run", "resume"):
             self.assertIs(getattr(Engine, name), getattr(RuntimeControlMixin, name))
 
 
@@ -202,6 +202,307 @@ class RuntimeSafetyTests(unittest.TestCase):
         state.RUNTIME_BASE = self.original_runtime_base
         state.configure_runtime("paper")
         self.runtime_tmp.cleanup()
+
+    def _set_operator_pause(self, **updates):
+        from agent import state
+        state.update_state(lambda current: {
+            **current, "operator_pause": True, **updates})
+
+    def test_light_control_construction_and_close_preserve_existing_heartbeat(self):
+        from agent import state
+        state.write_heartbeat("running", run_id="active-trader")
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "running")
+        self.assertEqual(heartbeat["run_id"], "active-trader")
+        engine.close()
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "running")
+
+    def test_non_light_startup_owns_and_closes_its_starting_heartbeat(self):
+        from agent import state
+        engine = Engine(_cfg(), provider=FakeProvider())
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "starting")
+        self.assertTrue(engine._heartbeat_owner)
+        engine.close()
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+        self.assertFalse(engine._heartbeat_owner)
+
+    def test_killed_run_startup_failure_closes_starting_heartbeat(self):
+        from agent import state
+        engine = Engine(_cfg(), provider=FakeProvider())
+        state.update_state(lambda current: {
+            **current, "state": state.KILLED, "kill_reason": "operator",
+            "operator_pause": True})
+        with self.assertRaisesRegex(AlpacaError, "operator"):
+            engine.run(max_cycles=0)
+        self.assertEqual(state.load_state()["state"], state.KILLED)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "stopped")
+        self.assertIsNone(engine._lock_handle)
+
+    def test_resume_success_clears_exact_pause_without_starting_runtime(self):
+        from agent import state
+        self._set_operator_pause()
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        result = engine.resume()
+        runtime = state.load_state()
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertTrue(result["resumed"])
+        self.assertEqual(runtime["state"], state.PAUSED)
+        self.assertFalse(runtime["operator_pause"])
+        self.assertEqual(heartbeat["status"], "paused")
+        self.assertEqual(heartbeat["reason"], "operator_resume_ready")
+        self.assertIsNone(engine._lock_handle)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            row = db.execute(
+                "SELECT kind, payload FROM events "
+                "WHERE kind = 'operator_resume_authorized' "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "operator_resume_authorized")
+        payload = json.loads(row[1])
+        self.assertEqual(payload["phase"], "authorization")
+        self.assertEqual(payload["mode"], "paper")
+        self.assertEqual(payload["counts"]["positions"], 0)
+
+    def test_resume_lock_rejection_preserves_active_heartbeat_and_does_not_call_broker(self):
+        from agent import state
+        self._set_operator_pause()
+        state.write_heartbeat("running", run_id="active-trader")
+        holder = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.assertTrue(holder._acquire_lock(persistent=True))
+        provider = FakeProvider()
+        contender = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(contender.close)
+        with self.assertRaisesRegex(AlpacaError, "runtime_lock_held"):
+            contender.resume()
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "running")
+        self.assertEqual(heartbeat["run_id"], "active-trader")
+        self.assertEqual(provider.orders_sent, [])
+        self.assertEqual(provider.cancel_calls, 0)
+        holder.close()
+
+    def test_resume_rejects_residual_positions_without_broker_mutation(self):
+        from agent import state
+        self._set_operator_pause()
+        provider = FakeProvider()
+        provider.positions_live = [Position("SPY", Decimal("0"), "long")]
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "residual_positions"):
+            engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertEqual(provider.orders_sent, [])
+        self.assertEqual(provider.cancel_calls, 0)
+
+    def test_resume_rejects_durable_nonterminal_order_omitted_by_broker(self):
+        from agent import state
+        self._set_operator_pause(orders={
+            "entry-1": {"order_id": "entry-1", "symbol": "SPY",
+                        "status": "accepted"},
+        })
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "nonterminal_local_orders"):
+            engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+
+    def test_resume_rejects_terminal_state_mode_and_daily_stop_gates(self):
+        from agent import state
+        for updates, reason in (
+                ({"state": state.KILLED, "kill_reason": "operator"},
+                 "runtime_state_killed"),
+                ({"state": state.DAY_STOPPED}, "runtime_state_day_stopped"),
+                ({"state": state.RUNNING}, "runtime_state_running"),
+                ({"runtime_mode": "live"}, "runtime_mode_mismatch"),
+                ({"risk_day": {"limit_hit": True}}, "daily_risk_limit_hit"),
+                ({"risk_day": {"limit_hit": "false"}}, "risk_day_malformed"),
+                ({"operator_pause": "true"}, "operator_pause_required"),
+        ):
+            with self.subTest(reason=reason):
+                baseline = {"state": state.PAUSED, "runtime_mode": "paper",
+                            "kill_reason": None, "risk_day": {}}
+                baseline.update(updates)
+                self._set_operator_pause(**baseline)
+                engine = Engine(_cfg(), light=True, provider=FakeProvider())
+                self.addCleanup(engine.close)
+                with self.assertRaisesRegex(AlpacaError, reason):
+                    engine.resume()
+                self.assertTrue(state.load_state()["operator_pause"] != False)
+
+    def test_resume_rejects_active_and_protection_rows_before_any_order(self):
+        from agent import state
+        for field in ("active_trades", "protection"):
+            with self.subTest(field=field):
+                updates = {"active_trades": {}, "protection": {}}
+                updates[field] = {"SPY": {"symbol": "SPY"}}
+                self._set_operator_pause(**updates)
+                engine = Engine(_cfg(), light=True, provider=FakeProvider())
+                self.addCleanup(engine.close)
+                with self.assertRaisesRegex(AlpacaError, f"{field}_present"):
+                    engine.resume()
+                self.assertTrue(state.load_state()["operator_pause"])
+
+    def test_resume_rejects_nonterminal_or_missing_broker_order_status(self):
+        class OrdersProvider(FakeProvider):
+            def __init__(self, status):
+                super().__init__()
+                self._status = status
+
+            def orders(self, **_):
+                return [Order("broker-1", "SPY", Decimal("1"), "buy",
+                               self._status, "market", "day")]
+
+        from agent import state
+        for status, reason in (("accepted", "nonterminal_broker_orders"),
+                               ("", "broker_order_status_missing")):
+            with self.subTest(status=status or "missing"):
+                self._set_operator_pause()
+                engine = Engine(_cfg(), light=True,
+                                provider=OrdersProvider(status))
+                self.addCleanup(engine.close)
+                with self.assertRaisesRegex(AlpacaError, reason):
+                    engine.resume()
+                self.assertTrue(state.load_state()["operator_pause"])
+
+    def test_resume_accepts_representative_terminal_broker_order_statuses(self):
+        class OrdersProvider(FakeProvider):
+            def __init__(self, status):
+                super().__init__()
+                self._status = status
+
+            def orders(self, **_):
+                return [Order("broker-1", "SPY", Decimal("1"), "buy",
+                               self._status, "market", "day")]
+
+        from agent import state
+        for status in ("filled", "canceled", "cancelled", "expired",
+                       "rejected", "replaced", "stopped", "suspended",
+                       "failed", "not_found"):
+            with self.subTest(status=status):
+                self._set_operator_pause()
+                engine = Engine(_cfg(), light=True,
+                                provider=OrdersProvider(status))
+                self.addCleanup(engine.close)
+                result = engine.resume()
+                self.assertTrue(result["resumed"])
+                self.assertEqual(state.load_state()["state"], state.PAUSED)
+                self.assertFalse(state.load_state()["operator_pause"])
+
+    def test_resume_final_read_only_confirmation_catches_late_position(self):
+        class SettlingProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.position_reads = 0
+
+            def positions(self):
+                self.position_reads += 1
+                if self.position_reads > 1:
+                    return [Position("SPY", Decimal("1"), "long")]
+                return []
+
+        from agent import state
+        self._set_operator_pause()
+        provider = SettlingProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "residual_positions"):
+            engine.resume()
+        self.assertEqual(provider.position_reads, 2)
+        self.assertTrue(state.load_state()["operator_pause"])
+
+    def test_resume_preflight_and_reconcile_failures_keep_pause_and_release_lock(self):
+        from agent import state
+
+        class BrokenPreflight(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.session = types.SimpleNamespace(api_key="",
+                                                     secret_key="secret")
+
+        class BrokenReconcile(FakeProvider):
+            def reconcile(self):
+                raise RuntimeError("reconcile unavailable")
+
+        self._set_operator_pause()
+        preflight_provider = BrokenPreflight()
+        preflight_engine = Engine(_cfg(), light=True,
+                                  provider=preflight_provider)
+        self.addCleanup(preflight_engine.close)
+        with self.assertRaisesRegex(AlpacaError, "authenticated paper credentials"):
+            preflight_engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertEqual(preflight_provider.orders_sent, [])
+        self.assertEqual(preflight_provider.cancel_calls, 0)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "degraded")
+        self.assertEqual(heartbeat["reason"], "preflight_failed")
+
+        self._set_operator_pause()
+        engine = Engine(_cfg(), light=True, provider=BrokenReconcile())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(RuntimeError, "reconcile unavailable"):
+            engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertIsNone(engine._lock_handle)
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "degraded")
+        self.assertEqual(heartbeat["reason"], "reconcile_failed")
+
+    def test_resume_journal_audit_heartbeat_and_state_write_failures_keep_pause(self):
+        from agent import state
+
+        self._set_operator_pause()
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        with patch.object(state, "check_journal",
+                          side_effect=RuntimeError("journal down")):
+            with self.assertRaisesRegex(RuntimeError, "journal down"):
+                engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+        self.assertEqual(json.loads(state.HEARTBEAT_FILE.read_text())["reason"],
+                         "journal_unavailable")
+
+        self._set_operator_pause()
+        real_log_event = state.log_event
+
+        def fail_audit(kind, payload, **detail):
+            if kind == "operator_resume_authorized":
+                raise OSError("audit unavailable")
+            return real_log_event(kind, payload, **detail)
+
+        with patch.object(state, "log_event", side_effect=fail_audit):
+            with self.assertRaisesRegex(AlpacaError, "authorization_audit_failed"):
+                engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+
+        self._set_operator_pause()
+        with patch.object(state, "write_heartbeat",
+                          side_effect=OSError("heartbeat unavailable")):
+            with self.assertRaisesRegex(AlpacaError,
+                                        "authorization_heartbeat_failed"):
+                engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
+
+        self._set_operator_pause()
+        real_update_state = state.update_state
+
+        def fail_clear(update):
+            if getattr(update, "__name__", "") == "clear_pause":
+                raise OSError("state unavailable")
+            return real_update_state(update)
+
+        with patch.object(state, "update_state", side_effect=fail_clear):
+            with self.assertRaisesRegex(AlpacaError,
+                                        "authorization_state_write_failed"):
+                engine.resume()
+        self.assertTrue(state.load_state()["operator_pause"])
 
     def test_provider_uses_configured_equity_and_option_feeds(self):
         seen = []
@@ -927,8 +1228,9 @@ class RuntimeSafetyTests(unittest.TestCase):
                 engine.run_once({})
         self.assertEqual(state.load_state()["state"], state.PAUSED)
         self.assertIsNone(engine._lock_handle)
-        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
-        self.assertEqual(heartbeat["status"], "stopped")
+        # A light/direct control object does not own the trader lifecycle and
+        # must not publish a terminal heartbeat while releasing its lock.
+        self.assertFalse(state.HEARTBEAT_FILE.exists())
 
     def test_bounded_run_flattens_existing_positions_before_exit(self):
         provider = FakeProvider()

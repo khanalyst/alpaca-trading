@@ -137,6 +137,7 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         self._runtime_state: dict = {}
         self._lock_handle = None
         self._persistent_lock = False
+        self._heartbeat_owner = False
         self._state_ready = False
         self._preflight: dict[str, Any] | None = None
         self._preflight_error: str | None = None
@@ -147,7 +148,6 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             state.configure_runtime(self.mode)
             state.ensure_ready()
             self._runtime_state = state.load_state()
-            state.write_heartbeat("starting", run_id=self.run_id)
             self._state_ready = True
         except Exception as exc:  # noqa: BLE001
             log.warning("state startup unavailable: %s", exc)
@@ -157,6 +157,8 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                 log.warning(self._preflight_error)
             else:
                 try:
+                    state.write_heartbeat("starting", run_id=self.run_id)
+                    self._heartbeat_owner = True
                     self.preflight()
                     self.reconcile()
                     self._enforce_intraday_cleanup(

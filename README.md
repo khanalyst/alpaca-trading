@@ -108,8 +108,9 @@ selection. This delay is an intentional evidence gate, not a startup error.
 
 For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow
-[OPERATIONS.md](OPERATIONS.md). `AZURE_DEPLOYMENT.md` is a compatibility
-pointer to those two authorities.
+[OPERATIONS.md](OPERATIONS.md). A paused-runtime recovery uses the
+authenticated, flat-only `main.py resume` command described there;
+`AZURE_DEPLOYMENT.md` is a compatibility pointer to those two authorities.
 
 ## Verification
 
