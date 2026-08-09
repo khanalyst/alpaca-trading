@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from agent import state
+from agent import state_store
 
 
 class StateSafetyTests(unittest.TestCase):
@@ -70,6 +71,31 @@ class StateSafetyTests(unittest.TestCase):
             lambda current: {**current, "state": state.RUNNING})
         self.assertTrue(updated["operator_pause"])
         self.assertEqual(updated["state"], state.RUNNING)
+
+    def test_store_primitives_are_facade_exports(self):
+        for name in ("RUNNING", "PAUSED", "DAY_STOPPED", "KILLED", "DEFAULT",
+                     "StateCorruptionError", "_validated", "_atomic_write", "_read"):
+            self.assertIs(getattr(state, name), getattr(state_store, name))
+
+    def test_validation_drops_unknown_fields_and_is_deepcopy_isolated(self):
+        source = {"unknown": "ignored"}
+        result = state_store._validated(source)
+        self.assertNotIn("unknown", result)
+        result["active_trades"]["AAPL"] = {"qty": 2}
+        self.assertNotIn("AAPL", state_store.DEFAULT["active_trades"])
+        fallback = {"active_trades": {}}
+        loaded = state_store._read(Path(self.tmp.name) / "missing.json", fallback)
+        loaded["active_trades"]["AAPL"] = {"qty": 1}
+        self.assertNotIn("AAPL", fallback["active_trades"])
+
+    def test_atomic_write_is_private_and_rejects_non_finite_json_without_replace(self):
+        path = Path(self.tmp.name) / "atomic.json"
+        state_store._atomic_write(path, {"state": state.PAUSED})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        original = path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            state_store._atomic_write(path, {"value": float("nan")})
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
 
 
 if __name__ == "__main__":
