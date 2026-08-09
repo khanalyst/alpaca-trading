@@ -1,8 +1,13 @@
+import ast
 import time
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from agent.alpaca_domain import OptionContract, OptionSnapshot
+from agent import engine as engine_module
+from agent import risk as risk_module
+from agent import risk_inputs
 from agent.risk import RiskEngine, select_option_contract, size_shares
 
 
@@ -16,6 +21,90 @@ class RiskProfileTests(unittest.TestCase):
                               "options_max_spread_pct": 10},
                     "execution": {}}
         self.risk = RiskEngine(self.cfg)
+
+    def test_risk_input_facade_preserves_identity_and_keeps_engine_methods_local(self):
+        moved = (
+            "_OCC_OPTION_RE", "_object_mapping", "_normalize_option_candidate",
+            "_candidate_sequence", "_num", "_timestamp",
+            "_evaluation_timestamp", "_expiration_date",
+            "_normalized_option_kind", "_option_kind",
+            "_identity_alias_conflict",
+        )
+        for name in moved:
+            with self.subTest(name=name):
+                self.assertIs(getattr(risk_module, name),
+                              getattr(risk_inputs, name))
+        for name in ("Number", "re", "time", "fields", "is_dataclass"):
+            with self.subTest(facade_import=name):
+                self.assertIs(getattr(risk_module, name),
+                              getattr(risk_inputs, name))
+        with patch.object(risk_module.time, "time", return_value=123.0):
+            self.assertEqual(risk_inputs._evaluation_timestamp(None), 123.0)
+
+        with open(risk_module.__file__, encoding="utf-8") as source:
+            risk_tree = ast.parse(source.read())
+        top_level_defs = {
+            node.name for node in risk_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertFalse(top_level_defs.intersection(moved))
+        engine_node = next(
+            node for node in risk_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "RiskEngine"
+        )
+        method_names = {
+            node.name for node in engine_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertTrue({
+            "__init__", "_risk_usd", "_entry_stop", "size_shares",
+            "_option_limits", "select_option_contract", "size_options",
+            "vet_open",
+        }.issubset(method_names))
+        self.assertIs(engine_module.RiskEngine, risk_module.RiskEngine)
+
+    def test_legacy_risk_helper_patches_intercept_selector(self):
+        evaluation = datetime(2026, 8, 9, 14, 30, tzinfo=timezone.utc)
+        candidate = {
+            "type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+            "volume": 10, "open_interest": 100, "multiplier": 100,
+            "quote_ts": evaluation, "quote_age_seconds": 0,
+        }
+        with patch.object(risk_module, "_candidate_sequence",
+                          wraps=risk_inputs._candidate_sequence) as sequence, \
+             patch.object(risk_module, "_normalize_option_candidate",
+                          wraps=risk_inputs._normalize_option_candidate) as normalize, \
+             patch.object(risk_module, "_timestamp",
+                          wraps=risk_inputs._timestamp) as timestamp:
+            selected = self.risk.select_option_contract(
+                [candidate], direction="long", now=evaluation.timestamp())
+        self.assertEqual(selected["type"], "call")
+        self.assertGreaterEqual(sequence.call_count, 1)
+        self.assertGreaterEqual(normalize.call_count, 1)
+        self.assertGreaterEqual(timestamp.call_count, 1)
+
+    def test_legacy_nested_helper_patches_reach_normalizer(self):
+        evaluation = datetime(2026, 8, 9, 14, 30, tzinfo=timezone.utc)
+        base = {
+            "type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
+            "volume": 10, "open_interest": 100, "multiplier": 100,
+            "quote_ts": evaluation, "quote_age_seconds": 0,
+        }
+        patches = (
+            ("_object_mapping", {}, base),
+            ("_identity_alias_conflict", True, base),
+            ("_option_kind", "put", base),
+            ("_num", None, {**base, "strike": 600}),
+            ("_expiration_date", None,
+             {**base, "expiration": "2026-08-21"}),
+        )
+        for name, replacement, candidate in patches:
+            with self.subTest(name=name):
+                with patch.object(risk_module, name, return_value=replacement):
+                    with self.assertRaisesRegex(ValueError, "no eligible"):
+                        self.risk.select_option_contract(
+                            [candidate], direction="long",
+                            now=evaluation.timestamp())
 
     def test_share_sizing_is_floor_risk_over_stop_and_notional_capped(self):
         result = self.risk.size_shares(equity=10_000, entry_price=100,
