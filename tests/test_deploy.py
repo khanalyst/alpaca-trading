@@ -170,6 +170,32 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(scheduler.build_parser().parse_args([]).script,
                          "deploy/research-cycle.sh")
 
+    def test_recorder_facade_reexports_market_symbols(self):
+        from deploy import recorder_market
+        names = (
+            "FIELDS", "_value", "_timeframe", "_feed", "_options_feed",
+            "_call_market_data", "_call_quotes", "_call_options", "_event_key",
+            "_number", "_iso", "_point_in_time", "_timestamp",
+            "_underlying_price", "_option_right", "_option_rank", "_option_rows",
+            "_rows",
+        )
+        for name in names:
+            self.assertIs(getattr(recorder, name), getattr(recorder_market, name))
+
+    def test_recorder_migrates_legacy_header_before_deduplicating(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            path.write_text(
+                "event_type,symbol,timestamp\n"
+                "bar_1m,SPY,2026-08-08T13:30:00+00:00\n",
+                encoding="utf-8")
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 1)
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(list(rows[0]), list(recorder.FIELDS))
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 0)
+
     def test_research_cycle_uses_recorded_csv_and_initializes_edge_ledger(self):
         csv_text = (
             "event_key,observed_at,provider,feed,event_type,symbol,timestamp,"
