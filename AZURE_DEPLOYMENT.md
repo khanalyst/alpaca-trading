@@ -12,7 +12,7 @@ the VM only the network access it needs. The dashboard must remain private or
 localhost-bound.
 
 Before selecting **Delete with VM**, verify a tested, off-host copy of
-`runtime/`, `research/cache/`, `research/results/`, `findings/`, the reviewed
+`runtime/`, `research/cache/`, `research/results/`, the reviewed
 configuration, and the deployed Git revision. A second directory on the same
 managed disk is not an off-host backup. Restore into a new VM, run compile and
 unit checks, run `main.py check` (authenticated by default), and reconcile the

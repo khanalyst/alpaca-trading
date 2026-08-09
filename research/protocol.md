@@ -83,6 +83,7 @@ The checked research config enables the bounded strategy LLM with model
 `gpt-5`. It reads only the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing
 or invalid credentials/output leave a pending replacement and cannot trigger
 premature retirement. Good edges produce deterministic content-addressed
-findings, with an optional HTTPS webhook notification. Scheduled cycles report
+edge proof reports under `research/results/edges/`, with an optional HTTPS
+webhook notification. Scheduled cycles report
 `completed`, `completed_no_edge`, `no_data`, or `failed`; no status bypasses the
 runtime edge gate.

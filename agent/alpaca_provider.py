@@ -881,33 +881,6 @@ class AlpacaProvider:
                                position_intent=intent)
         return self.submit_order(request)
 
-    def trade_updates(self, callback):
-        """Connect an injected stream callback; reconciliation remains REST-backed."""
-        stream = getattr(self.session.trading, "trade_updates", None) or getattr(self.session.trading, "stream", None)
-        if stream is None:
-            raise AlpacaError("trade-update stream is unavailable")
-        if callable(stream):
-            return stream(callback)
-        subscribe = getattr(stream, "subscribe_trade_updates", None)
-        if callable(subscribe):
-            return subscribe(callback)
-        raise AlpacaError("trade-update stream is unavailable")
-
-    def reconcile_orders(self, client_order_ids=None) -> list[Order]:
-        """REST reconciliation hook after a stream disconnect or timeout."""
-        # Alpaca's default order query is open orders only.  Reconciliation
-        # needs recent terminal fills as well so a disappearing position can
-        # be attributed to its actual exit fill and paper P&L is not lost.
-        rows = self.orders(status="all")
-        if client_order_ids is None:
-            return rows
-        wanted = set(client_order_ids)
-        return [row for row in rows if row.client_order_id in wanted]
-
     def reconcile(self) -> dict[str, list[Any]]:
         """REST-backed startup/retry reconciliation snapshot."""
         return {"positions": self.positions(), "orders": self.orders(status="all")}
-
-
-# Clearer public name for new callers; ``AlpacaProvider`` remains canonical.
-AlpacaBroker = AlpacaProvider

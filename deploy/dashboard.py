@@ -209,8 +209,7 @@ def _edge_status(path: Path) -> dict:
 
 
 def _reports(root: Path) -> list[dict]:
-    candidates = set((root / "findings").glob("**/*.md"))
-    candidates.update((root / "research" / "results").glob("**/REPORT.md"))
+    candidates = set((root / "research" / "results").glob("**/*.md"))
     rows = []
     for path in candidates:
         try:
@@ -302,7 +301,6 @@ def snapshot(root: Path) -> dict:
 
 def report_file(root: Path, relative: str) -> tuple[str, str]:
     allowed_roots = [
-        (root / "findings").resolve(),
         (root / "research" / "results").resolve(),
     ]
     candidate = (root / relative).resolve()

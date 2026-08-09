@@ -77,7 +77,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strategy_llm": {"enabled": True, "provider": "openai", "model": "gpt-5",
                          "max_attempts": 1, "timeout_seconds": 30,
                          "max_response_bytes": 16_384},
-        "proof": {"directory": "findings", "webhook_url": "",
+        "proof": {"directory": "research/results/edges", "webhook_url": "",
                   "webhook_timeout_seconds": 10},
     },
     "cycle": {"interval_seconds": 60},

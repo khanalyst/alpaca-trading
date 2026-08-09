@@ -1,75 +1,361 @@
-# Setup and deployment
+# Complete setup: Alpaca paper trading on an Ubuntu VM
 
-This is the installation authority for the Alpaca intraday runtime. Paper is
-the default account mode. The supported universe is US-listed equities/ETFs
-and listed OCC options; options are single-leg long intraday calls or puts.
-Crypto, multi-leg, naked, and short option structures are unsupported. A
-trader process runs one execution profile (`shares` or `options`) at a time.
+This is the primary installation and startup guide. Follow it in order for a
+new machine. The supported default is:
 
-## Local setup
+- one Ubuntu VM;
+- Docker Engine with the Compose plugin;
+- one Alpaca **paper** account;
+- US-listed equities/ETFs and listed OCC options only;
+- regular-session day trading with no overnight positions or working orders;
+- autonomous research that must prove an edge before the trader can enter.
 
-Requirements: Python 3.12+, Git, Docker Compose v2 (for the container path),
-and an Alpaca paper account. The repository does not contain credentials.
+Do not start with live credentials. Live mode is an optional, separately
+guarded step at the end of this guide.
+
+## 1. Prepare the Alpaca paper account
+
+1. Create or sign in to an Alpaca account.
+2. Open the paper-trading dashboard, not the live-trading dashboard.
+3. Generate a paper API key and secret. Paper credentials are different from
+   live credentials.
+4. Save both values immediately in a password manager; the secret may not be
+   shown again.
+5. Confirm the account can access the stock feed you plan to use. This project
+   defaults to `iex` for stocks and `indicative` for options. Use `sip` or
+   `opra` only when the account is entitled to those feeds.
+6. Do not enable or configure crypto symbols. This repository accepts only US
+   equity/ETF underlyings and listed OCC option contracts.
+
+Official references:
+
+- [Alpaca paper trading](https://docs.alpaca.markets/us/docs/paper-trading)
+- [Alpaca authentication and API domains](https://docs.alpaca.markets/us/docs/authentication)
+- [Alpaca option-chain feeds](https://docs.alpaca.markets/us/reference/optionchain)
+
+## 2. Create the VM
+
+Use a current Ubuntu LTS x86-64 VM. A practical starting size for all four
+services is 4 vCPUs, 8 GB RAM, and at least 40 GB of durable storage. Research
+and recorded market data can require more disk over time.
+
+VM checklist:
+
+1. Put the OS and Docker data on durable storage.
+2. Restrict inbound SSH (`22/tcp`) to your own IP or VPN.
+3. Do **not** expose port 8080 publicly. The dashboard is bound to localhost
+   and should be reached through an SSH tunnel.
+4. Enable provider snapshots/backups for the durable disk.
+5. Set the VM timezone however you prefer; containers run in UTC and market
+   policy uses `America/New_York` explicitly.
+6. Create a non-root administrative user with sudo access and connect over
+   SSH.
+
+Example connection:
 
 ```bash
-git clone <repository> alpaca-agent-trading
-cd alpaca-agent-trading
-python3.12 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.lock.txt
-cp .env.example .env
-chmod 600 .env
+ssh <vm-user>@<vm-address>
 ```
 
-Edit `.env`:
+## 3. Install Git, Docker Engine, and Compose
+
+Run these commands on the VM. They follow Docker's official Ubuntu repository
+installation path.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git
+
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+. /etc/os-release
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+Log out and reconnect so group membership is refreshed, then verify:
+
+```bash
+docker version
+docker compose version
+docker run --rm hello-world
+```
+
+If the Docker repository instructions change, use the current
+[Docker Engine for Ubuntu guide](https://docs.docker.com/engine/install/ubuntu/)
+and [Compose plugin guide](https://docs.docker.com/compose/install/linux/).
+
+## 4. Clone the repository
+
+```bash
+sudo install -d -o "$USER" -g "$USER" /opt/alpaca-agent-trading
+git clone <repository-url> /opt/alpaca-agent-trading
+cd /opt/alpaca-agent-trading
+git switch codex/alpaca-paper-edge-hardening
+```
+
+Replace the branch name after it is merged into the repository's default
+branch.
+
+## 5. Create the paper credential file
+
+Create a root-owned file outside the checkout:
+
+```bash
+sudo install -d -m 0750 /etc/alpaca-agent-trading
+sudo install -m 0600 /dev/null /etc/alpaca-agent-trading/agent.env
+sudoedit /etc/alpaca-agent-trading/agent.env
+```
+
+Enter only the paper credentials and selected feeds:
 
 ```dotenv
-ALPACA_API_KEY=your-paper-key
-ALPACA_SECRET_KEY=your-paper-secret
+ALPACA_API_KEY=<paper-api-key>
+ALPACA_SECRET_KEY=<paper-api-secret>
 ALPACA_PAPER=true
 ALPACA_DATA_FEED=iex
 ALPACA_STOCK_FEED=iex
 ALPACA_OPTIONS_FEED=indicative
 ```
 
-Use paper credentials only for the default lane. Keep withdrawal permissions
-disabled and do not put the file in Git. The checked research config enables a
-bounded replacement adapter (`gpt-5`); if used, load provider keys only from a
-separate optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Invalid or missing LLM
-output leaves a pending replacement and does not retire a family. Runtime
-decision LLM use remains disabled (`llm.enabled: false`); deterministic,
-content-addressed rule execution remains the runtime default.
+Never put live credentials in this file. Never commit it.
 
-For Compose, set `ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of that
-separate file; Compose mounts it read-only and the research container exposes
-it as `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Leaving it unset mounts an empty
-secret and keeps failed replacements pending.
+## 6. Optionally configure the research LLM
 
-The separate file is dotenv-style and should contain only the selected model
-provider credentials, for example `OPENAI_API_KEY=...` (or
-`ANTHROPIC_API_KEY=...`), plus an optional provider base URL.
+The checked configuration enables bounded LLM replacement generation with
+`gpt-5`. The trader's runtime decision LLM remains disabled. If no research
+provider key is supplied, failed families remain pending and are not retired.
 
-Run the local checks before starting a loop:
+To enable replacement generation, create a separate provider-only secret:
 
 ```bash
-./.venv/bin/python main.py check --offline
-./.venv/bin/python main.py check
-./.venv/bin/python main.py status
-./.venv/bin/python main.py run
+sudo install -m 0600 /dev/null /etc/alpaca-agent-trading/research-llm.env
+sudoedit /etc/alpaca-agent-trading/research-llm.env
 ```
 
-`check` is the authenticated preflight by default and must confirm the Alpaca
-paper endpoint, credentials, market clock, and feed settings. `check --offline`
-validates local configuration only; it never authenticates or serves as a
-trading preflight. On a fresh edge ledger the trader will remain safely idle
-until research has passed an initial backtest and a strictly later unseen
-shadow tail. Confirm that expected hold in `main.py status`, then run the
-trader once in the foreground before switching to Compose or systemd.
+For OpenAI:
 
-## Explicit live mode
+```dotenv
+OPENAI_API_KEY=<research-provider-key>
+```
 
-Live mode is not a paper-lane toggle. Use a separately reviewed config,
-credentials, and runtime root (`ALPACA_AGENT_RUNTIME_ROOT`) and stop the paper
-process before starting it. All of the following are required:
+Or for Anthropic:
+
+```dotenv
+ANTHROPIC_API_KEY=<research-provider-key>
+```
+
+Do not place Alpaca credentials in the research LLM file.
+
+## 7. Review the trading configuration
+
+Open `config.yaml` and verify at least these values before building:
+
+```json
+{
+  "mode": "paper",
+  "broker": {"paper": true, "allow_live": false},
+  "strategy": {
+    "selection_mode": "all_proved",
+    "execution_mode": "shares"
+  },
+  "execution": {"time_in_force": "day"},
+  "research": {
+    "enabled": true,
+    "require_validated_variant": true
+  }
+}
+```
+
+Choose exactly one execution profile per trader process:
+
+- `shares` trades the proved equity variants;
+- `options` selects single-leg long listed options for proved option variants.
+
+Keep the checked universe as US equity/ETF symbols. Option symbols are selected
+from the provider chain and validated as OCC contracts.
+
+## 8. Export deployment paths and validate Compose
+
+Run these exports in every administrative shell, or put them in a root-owned
+deployment environment file:
+
+```bash
+cd /opt/alpaca-agent-trading
+export ALPACA_AGENT_SECRET_FILE=/etc/alpaca-agent-trading/agent.env
+export ALPACA_RESEARCH_LLM_SECRET_FILE=/etc/alpaca-agent-trading/research-llm.env
+```
+
+If the optional research LLM file was not created, omit the second export.
+
+Validate and build:
+
+```bash
+docker compose config --quiet
+docker compose --profile research config --quiet
+docker compose build
+```
+
+Any validation or build failure is a deployment blocker.
+
+## 9. Run local safety and authentication checks in containers
+
+Validate configuration without contacting Alpaca:
+
+```bash
+docker compose run --rm trader python main.py check --offline
+```
+
+Then authenticate against the paper endpoint:
+
+```bash
+docker compose run --rm trader python main.py check
+```
+
+The authenticated command may return non-zero on a fresh ledger because no
+edge is proved yet. It must still show paper mode, the paper endpoint, account
+details, and the selected feeds. A live endpoint or live-account response is a
+hard stop.
+
+## 10. Start recording market data
+
+Start the recorder and read-only dashboard first:
+
+```bash
+docker compose up -d recorder dashboard
+docker compose ps
+docker compose logs --tail=100 recorder
+```
+
+The recorder writes normalized bars, quotes, and bounded option snapshots to
+the `runtime-data` volume. Check that its health becomes healthy and that the
+logs show successful cycles rather than credential, feed, timestamp, or data
+continuity errors.
+
+## 11. Start the trader in safely blocked mode
+
+```bash
+docker compose up -d trader
+docker compose logs --tail=150 trader
+```
+
+On a fresh deployment the trader must remain idle because no validated edge
+exists. Do not disable `research.require_validated_variant` to force entries.
+
+The runtime always uses day orders, rejects entries outside the NYSE regular
+session, cancels working orders at startup, flattens residual positions, and
+forces a close before the session ends.
+
+## 12. Run the first research cycle
+
+Wait until the recorder has produced a meaningful initial corpus. The default
+acceptance floors require at least 100 executed trades and 10 sessions in each
+required window, so a first proof is not expected immediately.
+
+Start the scheduled research service:
+
+```bash
+docker compose --profile research up -d research
+docker compose logs --tail=150 research
+```
+
+The scheduler runs the cycle daily at 03:00 UTC by default. To run one cycle
+manually now:
+
+```bash
+docker compose --profile research run --rm research \
+  /bin/bash deploy/research-cycle.sh
+```
+
+Inspect the edge and factory ledgers:
+
+```bash
+docker compose --profile research run --rm research \
+  python research.py edge status
+docker compose --profile research run --rm research \
+  python research.py factory status
+```
+
+`completed_no_edge` is not an operational failure; it means nothing passed all
+proof gates yet. `no_data` means the recorder corpus is unavailable or empty
+and must be fixed. `failed` is an operational error.
+
+An initial backtest alone cannot validate an edge. Keep the recorder running;
+the factory requires a strictly later, unseen shadow tail before validation.
+
+## 13. Verify a proved edge and reports
+
+When an edge qualifies:
+
+1. The SQLite candidate becomes `validated` or `champion`.
+2. A deterministic edge proof report is written under
+   `research/results/edges/<vehicle>/` inside the research-results volume.
+3. The dashboard lists the edge only while its latest verified shadow gate
+   still passes.
+4. The paper trader may select it on a later cycle under the global risk
+   limits.
+
+Reach the dashboard through an SSH tunnel from your workstation:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 <vm-user>@<vm-address>
+```
+
+Then open `http://127.0.0.1:8080` locally.
+
+## 14. Daily operation
+
+Use these commands from `/opt/alpaca-agent-trading` with the deployment-path
+exports set:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 recorder
+docker compose logs --tail=100 trader
+docker compose --profile research logs --tail=100 research
+docker compose restart recorder trader dashboard
+```
+
+For an operator-requested exit:
+
+```bash
+docker compose run --rm trader \
+  python main.py flatten --reason operator
+```
+
+A non-zero flatten result requires immediate broker reconciliation.
+
+## 15. Back up before updates
+
+Back up the Docker volumes containing:
+
+- `runtime/` and the execution journal;
+- `research/cache/` and the edge ledger;
+- `research/results/`, including generated edge proof reports;
+- the reviewed `config.yaml` and deployed Git revision.
+
+The backup must be off-host or on a different durable device. Do not use
+`docker compose down -v` and do not prune volumes unless deletion is explicit
+and the backup has been tested.
+
+See [OPERATIONS.md](OPERATIONS.md) for reconciliation, backup, recovery, and
+incident procedures.
+
+## 16. Optional guarded live mode
+
+Do this only after extended paper validation and a separate review. Do not
+reuse the paper runtime directory, secrets file, or running process.
+
+Required live configuration:
 
 ```yaml
 mode: live
@@ -79,144 +365,38 @@ broker:
 strategy:
   selection_mode: specific
   variant_id: <exact-validated-or-champion-variant>
+research:
+  enabled: true
+  require_validated_variant: true
 ```
 
-Set `ALPACA_LIVE_ENABLE=true` in that live process and do not set
-`ALPACA_PAPER=true`. The named edge must already be `validated` or `champion`
-in the vehicle-local ledger. Live startup pins its candidate/configuration and
-does not auto-switch to a new champion. The authenticated live preflight also
-requires the account to report `pattern_day_trader=true`; a missing or false
-value blocks startup. The shipped Compose and systemd launch lanes set
-`ALPACA_PAPER=true` and remain paper defaults.
-
-## Behavioural defaults
-
-- Strategy: paper `selection_mode: all_proved` selects one best proven variant
-  per independent family under one global risk book; `specific` pins one
-  validated/champion variant. IBR remains an explicit baseline and replay
-  contract.
-- Instruments: US-listed equities/ETFs and listed OCC options, with options
-  limited to single-leg long contracts selected from a validated chain.
-- Entries: regular NYSE session only, with a close-time cutoff.
-- Orders/exits: `time_in_force: day`; startup cancels working orders and
-  flattens residuals, and a mandatory pre-close flatten leaves no overnight
-  position or option contract.
-- Account: Alpaca paper endpoint and paper credentials by default; live mode
-  requires the separate guard and scope above.
-- Data: `iex` stock feed by default; set an entitled feed explicitly if the
-  paper account supports one. Record the feed in run metadata.
-
-Every generated hypothesis is unproven. The research cycle runs seven
-independent strategy families in parallel by default, with four isolated
-simulated accounts per family. Fit-only diagnostics create bounded variants;
-untouched held-out data decides whether they pass. Lifecycle proof requires fit
-and held-out structural floors, matched controls, placebo/falsification,
-family-level FDR, and a durable verified gate before validation/champion
-selection. Underpowered data is not failure. Retirement is allowed only after
-all intended variants are adequately tested and fail; when LLM replacement is
-enabled, a valid bounded replacement must be registered first. The lifecycle is
-forward-only: an initial corpus backtest precedes a strictly later unseen
-shadow tail. Paper outcomes are append-only forward evidence and may demote a
-champion. Runtime entries remain blocked without a validated/champion SQLite
-record.
-
-For an operator-initiated close, run
-`./.venv/bin/python main.py flatten --reason operator` (or the equivalent
-Compose command) and treat a non-zero exit as an incomplete flatten requiring
-broker reconciliation.
-
-## Docker Compose on a VM
-
-The supported container path uses an Ubuntu VM with Docker Engine and Compose
-v2. Keep the checkout and volumes on a durable disk. A typical layout is
-`/opt/alpaca-agent-trading` for source and `/etc/alpaca-agent-trading/agent.env`
-for the secret file (mode 0600, owned by root). Set the file path when running
-Compose:
+The live process also requires:
 
 ```bash
-cd /opt/alpaca-agent-trading
-export ALPACA_AGENT_SECRET_FILE=/etc/alpaca-agent-trading/agent.env
-docker compose config
-docker compose build
-docker compose up -d recorder trader dashboard
-docker compose ps
-docker compose logs --tail=100 trader
+export ALPACA_LIVE_ENABLE=true
+export ALPACA_PAPER=false
+export ALPACA_AGENT_RUNTIME_ROOT=/opt/alpaca-agent-live-runtime
 ```
 
-The trader may start before research, but it cannot open an entry on a fresh
-ledger. Start the research profile after the recorder has an initial corpus;
-keep recording so a later unseen tail can qualify a champion. Do not weaken
-the entry gate to make a new deployment trade immediately.
+Live startup fails unless the exact named vehicle-local edge has a latest
+passing verified shadow proof. The edge is pinned for the process lifetime and
+never auto-switches. The account must report `pattern_day_trader=true`.
 
-The Compose services are `recorder`, `trader`, optional `research`, and
-`dashboard`;
-their container names are `alpaca-recorder`, `alpaca-trader`,
-`alpaca-research`, and `alpaca-dashboard`. The dashboard binds to localhost
-only. Use an SSH tunnel or a private network rather than exposing port 8080.
-Do not run a second trader against the same paper account and journal.
+The shipped Compose services are paper-scoped. Build a separately reviewed
+live service/configuration rather than modifying the running paper deployment
+in place.
 
-Named volumes survive an ordinary `docker compose down`. Do not use
-`down -v` or prune volumes unless the journal and research artifacts have been
-backed up and the reset is intentional.
+## Local developer setup (without a VM)
 
-Research is a broker-independent profile and does not run on a default
-startup. When the recorder has written the mixed bars/quotes/options dataset at
-`runtime/research/recorded/market.csv`, the research cycle discovers and routes
-it automatically. An explicit normalized JSONL dataset can override it when
-needed:
+For tests and offline development:
 
 ```bash
-export ALPACA_RESEARCH_DATASET=/app/runtime/research/input/market.jsonl
-docker compose --profile research up -d research
+python3.12 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.lock.txt
+cp .env.example .env
+chmod 600 .env
+./.venv/bin/python main.py check --offline
+./.venv/bin/python -m unittest discover -v
 ```
 
-The edge-lab ledger defaults to `runtime/research/edge_lab.sqlite3` (override
-with `ALPACA_EDGE_DB`). Inspect its append-only lifecycle with
-`python research.py edge status`. The scheduled cycle performs normal
-backtest-to-unseen-shadow validation and champion selection automatically;
-manual `edge promote` remains an audited control subject to lifecycle/evidence
-rules. Backward rollback is rejected; explicit demotion is the operator safety
-action.
-
-## Legacy systemd lane
-
-For hosts that do not use Compose, install the trader/recorder units and the
-research units in `deploy/` as the `alpaca` service user. The research process
-has no broker credentials, but it must produce a champion before entries are
-enabled on a fresh deployment:
-
-```bash
-sudo useradd --system --home /opt/alpaca-agent-trading --shell /usr/sbin/nologin alpaca
-sudo install -d -o alpaca -g alpaca /opt/alpaca-agent-trading
-sudo cp deploy/alpaca-*.service deploy/alpaca-*.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now alpaca-recorder.service
-sudo systemctl enable --now alpaca-trader.service
-```
-
-Enable `alpaca-research.timer` after the recorder has produced its default
-dataset, or set `ALPACA_RESEARCH_DATASET` to a normalized JSONL input in the
-`/etc/alpaca-agent-trading/research.env` file. Research has no broker
-credentials and is optional as a service; if the bounded LLM replacement is
-used, point `ALPACA_RESEARCH_LLM_SECRETS_FILE` at its separate provider-secret
-file. The trader still requires a validated/champion edge record in SQLite
-before opening entries.
-
-Compose and the systemd application lane are alternatives. Do not enable both
-on one host. The trader remains one replica/process. Put credentials in an
-EnvironmentFile outside the checkout and set `ALPACA_AGENT_SECRETS_FILE` only
-where the launcher needs it. These shipped units are paper-scoped; use a
-separate reviewed live unit/config/runtime if live mode is approved.
-
-## Azure notes
-
-Create or select the VM, network rules, managed disk, and backup destination
-according to your organization's policy. This repository does not provision
-Azure resources. Before deleting a VM, verify that a backup of
-`runtime/`, `research/cache/`, `research/results/`, and `findings/` exists on a
-different device or off-host service. A second directory on the VM is not an
-off-host backup.
-
-See [OPERATIONS.md](OPERATIONS.md) for update, backup, session-close,
-reconciliation, and incident procedures. See [deploy/README.md](deploy/README.md)
-for service ownership and health checks.
+Do not use the developer path as an unattended production deployment.

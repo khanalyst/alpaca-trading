@@ -74,7 +74,7 @@
       "max_response_bytes": 16384
     },
     "proof": {
-      "directory": "findings",
+      "directory": "research/results/edges",
       "webhook_url": "",
       "webhook_timeout_seconds": 10
     }

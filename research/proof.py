@@ -564,7 +564,8 @@ def send_webhook(url: str, metadata: Mapping[str, Any], *,
 
 
 def write_proof(ledger: Any, candidate_id: str, context: Mapping[str, Any] | None = None,
-                output_root: str | Path = "findings", webhook_url: str | None = None,
+                output_root: str | Path = "research/results/edges",
+                webhook_url: str | None = None,
                 webhook_sender: Callable[..., Any] | None = None,
                 webhook_timeout_seconds: float = 5.0,
                 hash_prefix_length: int = 16) -> ProofResult:
@@ -612,17 +613,7 @@ def write_proof(ledger: Any, candidate_id: str, context: Mapping[str, Any] | Non
                        created=created, webhook=webhook)
 
 
-# Compatibility aliases for callers using imperative or artifact terminology.
-create_proof = write_proof
-emit_proof = write_proof
-build_proof = write_proof
-write_proof_artifact = write_proof
-generate_proof = write_proof
-
-
 __all__ = [
     "PROOF_SCHEMA", "ProofResult", "canonical_json", "payload_hash",
     "build_proof_payload", "render_markdown", "send_webhook", "write_proof",
-    "create_proof", "emit_proof", "build_proof", "write_proof_artifact",
-    "generate_proof",
 ]

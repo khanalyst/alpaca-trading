@@ -7,9 +7,8 @@ __pycache__/
 venv/
 
 # Generated research caches: binary, large, and rebuildable from the journal.
-# findings/ is deliberately NOT here - the scorecards are committed so the
-# history of a variant's results is diffable.
 research/cache/
+research/results/edges/
 
 # Imported VM databases/results are audit fixtures only; production and test
 # code must use explicit temporary stores or configured runtime paths.

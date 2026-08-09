@@ -221,7 +221,7 @@ def _emit_proofs(args: argparse.Namespace, result: dict,
     research = dict(config.get("research") or {})
     proof_cfg = dict(research.get("proof") or {})
     root = Path(os.getenv("ALPACA_RESEARCH_PROOF_DIR") or
-                proof_cfg.get("directory") or "findings")
+                proof_cfg.get("directory") or "research/results/edges")
     if not root.is_absolute():
         root = REPO / root
     webhook = (os.getenv("ALPACA_EDGE_WEBHOOK_URL") or

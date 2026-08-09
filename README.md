@@ -74,7 +74,8 @@ snapshots), or an explicit normalized JSONL path from
 four isolated accounts per strategy, and up to seven worker processes. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
-status, latest re-verified passing edges, findings, and the execution journal.
+status, latest re-verified passing edges, edge proof reports, and the execution
+journal.
 
 ## Quick start
 

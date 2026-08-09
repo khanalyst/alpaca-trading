@@ -120,7 +120,7 @@ destination:
 
 - `runtime/` (journal, state, health, and recorder receipts);
 - `research/cache/` and `research/results/`;
-- `findings/` and any generated reports; and
+- generated edge proof reports under `research/results/edges/`; and
 - the exact Git revision and a redacted configuration snapshot.
 
 Example export (run only when the destination has been verified):
@@ -181,7 +181,7 @@ demote a champion. Passing gates advance validated/champion state without
 manual promotion. Manual `edge promote` remains an audited control subject to
 lifecycle/evidence rules. Backward rollback is rejected; explicit demotion is
 the operator safety action. Good edges emit deterministic,
-content-addressed findings and may send an optional HTTPS webhook. Keep data
+content-addressed edge proof reports and may send an optional HTTPS webhook. Keep data
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
 

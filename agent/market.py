@@ -8,8 +8,7 @@ from decimal import Decimal
 import math
 from typing import Any, Iterable, Mapping
 
-from .alpaca_domain import (Asset, Bar, CalendarDay, MarketClock, OptionContract,
-                            Quote)
+from .alpaca_domain import Asset, Bar, CalendarDay, MarketClock, OptionContract
 from .alpaca_session import NEW_YORK, SessionPolicy, session_for
 from .alpaca_provider import AlpacaError
 
@@ -79,19 +78,6 @@ def attach_atr(bars: Iterable[Any], period: int = 14) -> list[Any]:
         else:
             output.append(row)
     return output
-
-
-@dataclass(frozen=True)
-class MarketSnapshot:
-    symbol: str
-    quote: Quote | None = None
-    bars: tuple[Bar, ...] = ()
-    option_chain: Any = None
-    observed_at: datetime | None = None
-
-    @property
-    def price(self) -> Decimal | None:
-        return self.quote.mid if self.quote else (self.bars[-1].close if self.bars else None)
 
 
 @dataclass
@@ -175,10 +161,3 @@ class MarketData:
 
     def option_snapshots(self, underlying_symbol: str, **kwargs):
         return self.provider.option_snapshots(underlying_symbol, **kwargs)
-
-    def snapshot(self, symbol: str, *, timeframe="1Day", start=None, end=None,
-                 include_options=False) -> MarketSnapshot:
-        quotes = self.stock_quotes([symbol], start=start, end=end).get(symbol, [])
-        bars = self.stock_bars([symbol], timeframe=timeframe, start=start, end=end).get(symbol, [])
-        chain = self.option_chain(symbol, start=start, end=end) if include_options else None
-        return MarketSnapshot(symbol.upper(), quotes[-1] if quotes else None, tuple(bars), chain, datetime.now(tz=NEW_YORK))

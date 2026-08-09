@@ -146,7 +146,6 @@ services:
       - runtime-data:/app/runtime
       - research-cache:/app/research/cache
       - research-results:/app/research/results
-      - findings-reports:/app/findings
     healthcheck:
       test: ["CMD", "python", "deploy/health.py", "research", "--max-age", "180"]
       interval: 30s
@@ -176,7 +175,6 @@ services:
       - runtime-data:/app/runtime:ro
       - research-cache:/app/research/cache:ro
       - research-results:/app/research/results:ro
-      - findings-reports:/app/findings:ro
     healthcheck:
       test: ["CMD", "python", "deploy/health.py", "dashboard"]
       interval: 30s
@@ -202,4 +200,3 @@ volumes:
   runtime-data:
   research-cache:
   research-results:
-  findings-reports:
