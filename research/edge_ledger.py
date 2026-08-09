@@ -156,10 +156,25 @@ class EdgeLedger:
             session = str(trade.get("entry_timestamp"))[:10]
         if not session:
             raise ValueError("trade session_date is required")
+        net_source = trade.get("net_pnl", 0.0)
+        if isinstance(net_source, (bool, bytes, bytearray)):
+            raise ValueError("trade net_pnl must be numeric")
         try:
-            net = float(trade.get("net_pnl", 0.0))
-        except (TypeError, ValueError) as exc:
+            net = float(net_source)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("trade net_pnl must be numeric") from exc
+        if not math.isfinite(net):
+            raise ValueError("trade net_pnl must be finite")
+        return_source = trade.get("return_value")
+        if isinstance(return_source, (bool, bytes, bytearray)):
+            raise ValueError("trade return_value must be numeric")
+        try:
+            return_value = (float(return_source)
+                            if return_source is not None else None)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("trade return_value must be numeric") from exc
+        if return_value is not None and not math.isfinite(return_value):
+            raise ValueError("trade return_value must be finite")
         tid = trade_id or uuid.uuid4().hex
         payload = dict(trade)
         with closing(_connect(self.path)) as db, db:
@@ -169,7 +184,7 @@ class EdgeLedger:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (tid, run_id, run["candidate_id"], vehicle, session, opportunity,
                  trade.get("entry_timestamp"), trade.get("exit_timestamp"), net,
-                 float(trade["return_value"]) if trade.get("return_value") is not None else None,
+                 return_value,
                  _json(payload), _utc()))
             row = db.execute("SELECT * FROM trades WHERE trade_id=?", (tid,)).fetchone()
         return _row(row) or {}

@@ -133,6 +133,36 @@ class EdgeLedgerStoreExtractionTests(unittest.TestCase):
 
 
 class EdgeDiscoveryLifecycleTests(unittest.TestCase):
+    def test_trade_metrics_reject_nonfinite_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="finite evidence", config={})
+            run = ledger.append_run(candidate["candidate_id"], lane="backtest")
+            base = {
+                "session_date": "2024-01-02",
+                "opportunity_id": "finite-check",
+            }
+            for value in ("inf", "-inf", "nan"):
+                with self.subTest(net_pnl=value), self.assertRaisesRegex(
+                        ValueError, "net_pnl must be finite"):
+                    ledger.append_trade(run["run_id"], {**base, "net_pnl": value})
+                with self.subTest(return_value=value), self.assertRaisesRegex(
+                        ValueError, "return_value must be finite"):
+                    ledger.append_trade(run["run_id"], {
+                        **base, "opportunity_id": f"return-{value}",
+                        "net_pnl": 1.0, "return_value": value,
+                    })
+            for field in ("net_pnl", "return_value"):
+                for invalid in (True, b"1.0", 10 ** 10000):
+                    with self.subTest(field=field, value=type(invalid).__name__), \
+                            self.assertRaisesRegex(ValueError, f"{field} must be numeric"):
+                        ledger.append_trade(run["run_id"], {
+                            **base, "opportunity_id": f"invalid-{field}",
+                            "net_pnl": 1.0, field: invalid,
+                        })
+
     def test_paper_outcomes_demote_a_champion_that_breaks_the_rolling_guard(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
