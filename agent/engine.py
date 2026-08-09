@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import time
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -245,7 +246,11 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
 
     def _collect(self, symbols: list[str], now: datetime, supplied: Mapping | None):
         """Fetch only configured symbols and completed one-minute bars."""
+        if self._timestamp(now) is None:
+            return {}
         if supplied is not None:
+            if not isinstance(supplied, Mapping):
+                return {}
             raw = supplied
             if any(symbol in raw for symbol in symbols):
                 rows = {symbol: raw.get(symbol, {}) for symbol in symbols}
@@ -267,21 +272,58 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         max_age = float(self.cfg.get("execution", {}).get("max_market_data_age_seconds", 30))
         result = {}
         for symbol in symbols:
-            row = rows.get(symbol, {}) if isinstance(rows, Mapping) else {}
-            row = dict(row) if isinstance(row, Mapping) else {}
-            if row.get("stale") is True or row.get("quote_stale") is True:
+            raw_row = rows.get(symbol, {}) if isinstance(rows, Mapping) else {}
+            if not isinstance(raw_row, Mapping):
+                continue
+            row = dict(raw_row)
+            # Freshness flags are safety-critical.  Treating a string such as
+            # ``"false"`` as valid would allow an untrusted row through.
+            invalid_freshness = False
+            for flag in ("stale", "quote_stale"):
+                if flag in row and not isinstance(row.get(flag), bool):
+                    invalid_freshness = True
+                    break
+            if invalid_freshness or row.get("stale") is True or row.get("quote_stale") is True:
                 continue
             bars = row.get("bars") or row.get("candles") or []
             quotes = row.get("quotes") or row.get("quote") or []
-            if isinstance(quotes, Mapping):
+            if isinstance(quotes, (str, bytes)) or not isinstance(quotes, (list, tuple, set)):
                 quotes = [quotes]
-            normalized_bars = [self._bar_mapping(item, symbol) for item in bars]
-            normalized_bars = [item for item in normalized_bars if item.get("timestamp") is not None]
-            normalized_bars.sort(key=lambda item: str(item.get("timestamp")))
-            normalized_bars = [item for item in normalized_bars if self._completed(item, now)]
-            quote = self._quote_mapping(quotes[-1], symbol) if quotes else {}
-            if quote.get("stale") is True or quote.get("quote_stale") is True:
+            elif isinstance(quotes, set):
+                quotes = list(quotes)
+            try:
+                normalized_bars = [self._bar_mapping(item, symbol) for item in (bars or [])]
+            except (TypeError, ValueError, AttributeError):
+                # One malformed symbol/bar row must not abort the cycle.
                 continue
+            normalized_bars = [item for item in normalized_bars
+                               if item.get("symbol") == symbol and
+                               self._timestamp(item.get("timestamp")) is not None]
+            normalized_bars.sort(
+                key=lambda item: self._timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc))
+            normalized_bars = [item for item in normalized_bars if self._completed(item, now)]
+            normalized_quotes = []
+            for item in quotes or []:
+                try:
+                    quote_item = self._quote_mapping(item, symbol)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if quote_item.get("symbol") != symbol:
+                    continue
+                quote_flags_invalid = any(
+                    flag in quote_item and not isinstance(quote_item.get(flag), bool)
+                    for flag in ("stale", "quote_stale"))
+                if quote_flags_invalid or quote_item.get("stale") is True or quote_item.get("quote_stale") is True:
+                    continue
+                quote_ts = self._timestamp(quote_item.get("timestamp"))
+                if quote_ts is None:
+                    continue
+                normalized_quotes.append((quote_ts, quote_item))
+            # Provider order is not an ordering contract; choose the newest
+            # valid, aware quote rather than trusting the final list item.
+            if not normalized_quotes:
+                continue
+            _quote_ts, quote = max(normalized_quotes, key=lambda item: item[0])
             quote_ts = self._timestamp(quote.get("timestamp"))
             # Future-dated quotes are look-ahead and must be rejected rather
             # than having their negative age clamped to zero below.
@@ -307,23 +349,40 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
 
     @staticmethod
     def _number(value):
+        if isinstance(value, bool):
+            return None
         try:
             number = float(value)
             return number if number == number and abs(number) != float("inf") else None
         except (TypeError, ValueError, OverflowError):
             return None
 
+    @classmethod
+    def _required_number(cls, value: Any, field: str) -> float:
+        number = cls._number(value)
+        if number is None:
+            raise AlpacaError(f"{field} measurement is malformed")
+        return number
+
     @staticmethod
     def _timestamp(value):
         if isinstance(value, datetime):
-            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None or value.utcoffset() is None:
+                return None
+            return value
+        if isinstance(value, bool):
+            return None
         try:
             text = str(value).replace("Z", "+00:00")
-            if text.isdigit():
-                number = float(text); number /= 1000 if abs(number) > 100_000_000_000 else 1
+            try:
+                number = float(text)
+            except (TypeError, ValueError):
+                number = None
+            if number is not None and number == number and abs(number) != float("inf"):
+                number /= 1000 if abs(number) > 100_000_000_000 else 1
                 return datetime.fromtimestamp(number, timezone.utc)
             parsed = datetime.fromisoformat(text)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
         except (TypeError, ValueError, OverflowError, OSError):
             return None
 
@@ -399,8 +458,29 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         outcome: dict[str, Any] = {}
         def update(current: dict) -> dict:
             prior = current.get("risk_day", {})
-            if not isinstance(prior, Mapping) or prior.get("date") != day:
+            if prior in (None, {}):
                 prior = {"date": day, "start_equity": equity}
+            elif not isinstance(prior, Mapping):
+                raise AlpacaError("durable risk_day state is malformed")
+            else:
+                prior_date = prior.get("date")
+                if not isinstance(prior_date, str):
+                    raise AlpacaError("same-day risk date is malformed")
+                try:
+                    parsed_date = date.fromisoformat(prior_date)
+                except (TypeError, ValueError):
+                    raise AlpacaError("same-day risk date is malformed") from None
+                if parsed_date.isoformat() != prior_date:
+                    raise AlpacaError("same-day risk date is malformed")
+                if prior_date != day:
+                    prior = {"date": day, "start_equity": equity}
+            if isinstance(prior, Mapping) and prior.get("date") == day:
+                # A same-day baseline is durable risk evidence.  Replacing a
+                # malformed value with current equity would erase a loss and
+                # silently bypass the daily stop.
+                start = self._number(prior.get("start_equity"))
+                if start is None or start <= 0:
+                    raise AlpacaError("same-day risk baseline is malformed")
             start = self._number(prior.get("start_equity"))
             if start is None or start <= 0:
                 start = equity
@@ -427,23 +507,28 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
     def _fail_closed(self, reason: str, error: Exception) -> dict[str, Any]:
         """Reduce existing exposure when a safety prerequisite fails."""
         self._event("cycle_blocked", {"reason": reason, "error": str(error)})
+        positions = None
+        position_error = None
         try:
             positions = self.provider.positions()
-        except Exception as position_error:  # noqa: BLE001
-            try:
-                state.commit({"operator_pause": True},
-                             transition=(state.RUNNING, state.PAUSED))
-            except Exception:  # noqa: BLE001
-                pass
-            return {"action": "hold", "reason": reason, "error": str(error),
-                    "position_error": str(position_error), "residual_unknown": True}
+        except Exception as exc:  # noqa: BLE001
+            # A failed preliminary poll is not proof of no exposure.  Still
+            # issue cancel/flatten so the broker gets a best-effort safety
+            # command, then report the unknown state and pause below.
+            position_error = exc
         try:
             complete = self.flatten_all(reason)
         except Exception as flatten_error:  # noqa: BLE001
             complete = False
             self._event("fail_closed_flatten_failed", {
                 "reason": reason, "error": str(flatten_error)})
-        if not complete:
+        pause_reasons = {
+            "account_unavailable", "post_risk_positions_unavailable",
+            "daily_risk_state_invalid", "position_exposure_invalid",
+            "durable_risk_state_invalid", "planned_risk_invalid",
+        }
+        if (not complete or position_error is not None or
+                reason in pause_reasons):
             try:
                 state.commit({"operator_pause": True},
                              transition=(state.RUNNING, state.PAUSED))
@@ -457,19 +542,26 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             residual_unknown = True
             self._event("fail_closed_residual_unknown", {
                 "reason": reason, "error": str(residual_error)})
-        if not positions and complete and not residual_unknown:
+        if (positions is not None and not positions and complete and
+                not residual_unknown and reason not in pause_reasons):
             return {"action": "hold", "reason": reason, "error": str(error),
                     "closed": True, "residual": residual}
-        return {"action": "fail_closed", "reason": reason,
+        result = {"action": "fail_closed", "reason": reason,
                 "closed": complete, "residual": residual,
                 "residual_unknown": residual_unknown}
+        if position_error is not None:
+            result["position_error"] = str(position_error)
+        return result
 
     def _risk_order(self, symbol: str, signal: Mapping, row: Mapping,
                     account: Any, positions: list[Any], now: datetime,
                     cfg: Mapping | None = None):
         equity = self._number(_value(account, "equity", 0)) or 0
         mapped_positions = [_plain(position) for position in positions]
-        gross = sum(abs(self._number(_value(position, "market_value", 0)) or 0) for position in positions)
+        gross = sum(abs(value) for value in (
+            self._required_number(_value(position, "market_value", None),
+                                  f"position {str(_value(position, 'symbol', '')).upper()} market_value")
+            for position in positions))
         decision = dict(signal)
         decision["symbol"] = symbol
         edge_cfg = cfg or self.cfg
@@ -486,7 +578,10 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                 "symbol": symbol, "reason": "asset is not shortable"})
             return None
         if decision["execution_profile"] == "options":
-            candidates = row.get("option_chain") or row.get("options") or []
+            candidates = (row.get("option_chain") or row.get("options") or
+                          row.get("option_snapshots") or [])
+            if isinstance(candidates, Mapping):
+                candidates = [candidates]
             if not candidates:
                 try:
                     quote = row.get("quote", {}) if isinstance(row.get("quote"), Mapping) else {}
@@ -495,6 +590,9 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                     spot = (bid + ask) / 2 if bid is not None and ask is not None else None
                     candidates = self.provider.option_candidates(
                         symbol, now=now, underlying_price=spot,
+                        feed=(edge_cfg.get("broker", {}).get("options_feed") or
+                              edge_cfg.get("data", {}).get("options_feed") or
+                              getattr(self.provider, "options_feed", None)),
                         min_dte=int(edge_cfg.get("risk", {}).get("options_min_dte", 7)),
                         max_dte=int(edge_cfg.get("risk", {}).get("options_max_dte", 60)),
                     )
@@ -503,7 +601,18 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                     candidates = []
             decision["option_chain"] = candidates
         runtime = state.load_state()
-        active = runtime.get("active_trades", {}) if isinstance(runtime, Mapping) else {}
+        if not isinstance(runtime, Mapping):
+            raise AlpacaError("durable runtime state is malformed")
+        active = runtime.get("active_trades", {})
+        if active is None:
+            active = {}
+        if not isinstance(active, Mapping):
+            raise AlpacaError("active trade state is malformed")
+        orders_state = runtime.get("orders", {})
+        if orders_state is None:
+            orders_state = {}
+        if not isinstance(orders_state, Mapping):
+            raise AlpacaError("order state is malformed")
         if any(isinstance(item, Mapping) and
                str(item.get("underlying_symbol", item.get("symbol", ""))).upper() == symbol
                for item in active.values() if isinstance(active, Mapping)):
@@ -556,10 +665,30 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                             client_order_id=self._client_id("open", signal)), plan
 
     def _client_id(self, action: str, signal: Mapping, attempt: int = 0) -> str:
-        prefix = str(self.cfg.get("execution", {}).get("client_order_id_prefix", "ibr"))
-        setup = str(signal.get("setup_id") or signal.get("signal_ts") or int(time.time()))
+        execution = self.cfg.get("execution", {})
+        prefix = str(execution.get("client_order_id_prefix", "ibr")) \
+            if isinstance(execution, Mapping) else "ibr"
+        setup = signal.get("setup_id") or signal.get("signal_ts")
+        if setup is None:
+            # Never use wall-clock entropy: retries and process restarts must
+            # derive the same id from the same signal content.
+            try:
+                payload = json.dumps(_plain(signal), sort_keys=True,
+                                     separators=(",", ":"), default=str,
+                                     allow_nan=False)
+            except (TypeError, ValueError):
+                payload = repr(sorted((str(key), repr(value))
+                                      for key, value in signal.items()))
+            setup = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        setup = str(setup)
         suffix = f"-{attempt}" if attempt else ""
-        return f"{prefix}-{action}-{str(signal.get('symbol', '')).lower()}-{setup}{suffix}"[:48]
+        tail = f"-{action}-{str(signal.get('symbol', '')).lower()}-{setup}"
+        # Alpaca caps client ids at 48 chars.  Truncate only the core so the
+        # attempt suffix remains visible and distinct for retries.
+        prefix_budget = max(0, 48 - len(tail) - len(suffix))
+        if prefix_budget + len(tail) + len(suffix) > 48:
+            tail = tail[-max(0, 48 - len(suffix)):]
+        return f"{prefix[:prefix_budget]}{tail}{suffix}"
 
     def run_once(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         """Run one safely gated cycle, taking a temporary process lock."""
@@ -611,6 +740,13 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         except Exception as exc:  # noqa: BLE001
             self._reconciled = False
             return self._fail_closed("cycle_reconciliation_failed", exc)
+        try:
+            for position in positions:
+                self._required_number(
+                    _value(position, "market_value", None),
+                    f"position {str(_value(position, 'symbol', '')).upper()} market_value")
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("position_exposure_invalid", exc)
         if not self._inside_regular_session(clock):
             try:
                 self._enforce_intraday_cleanup(
@@ -638,7 +774,7 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         if not self._refresh_edge():
             return {"action": "hold", "reason": self._edge_error or
                     "validated edge champion is required"}
-        if not clock.is_open or not self.market.can_enter(now):
+        if _value(clock, "is_open", None) is not True or not self.market.can_enter(now):
             return {"action": "hold", "reason": "outside_regular_session"}
         if not self._latest_entry_allowed(now):
             return {"action": "hold", "reason": "latest_entry_time_passed"}
@@ -653,46 +789,106 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             force_flat_at = session_close - timedelta(minutes=max(0, minutes))
         symbols = self._universe()
         rows = self._collect(symbols, now, snapshot)
-        account = self.provider.account()
-        daily_pnl, daily_stop = self._update_daily_risk(account, now)
+        try:
+            account = self.provider.account()
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("account_unavailable", exc)
+        try:
+            daily_pnl, daily_stop = self._update_daily_risk(account, now)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("daily_risk_state_invalid", exc)
         if daily_stop:
             complete = self.flatten_all("daily_loss_limit")
             self._event("daily_loss_limit", {"daily_pnl": daily_pnl,
                                               "flatten_complete": complete})
+            try:
+                residual = _plain(self.provider.positions())
+            except Exception as exc:  # noqa: BLE001
+                return self._fail_closed("post_risk_positions_unavailable", exc)
             return {"action": "day_stopped", "daily_pnl": daily_pnl,
-                    "closed": complete, "residual": _plain(self.provider.positions())}
-        positions = self.provider.positions()
+                    "closed": complete, "residual": residual}
+        try:
+            positions = self.provider.positions()
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("post_risk_positions_unavailable", exc)
         portfolio_data = portfolio or {"account": _plain(account), "positions": _plain(positions)}
         placed = []; signals = []; placed_keys: set[tuple[str, str]] = set()
         planned_risk = 0.0; planned_notional = 0.0
         risk_cfg = self._edge_base_cfg.get("risk", {})
-        gross = sum(abs(self._number(_value(position, "market_value", 0)) or 0)
+        try:
+            gross = sum(abs(self._required_number(
+                _value(position, "market_value", None),
+                f"position {str(_value(position, 'symbol', '')).upper()} market_value"))
                     for position in positions)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("position_exposure_invalid", exc)
         runtime = state.load_state()
-        active = runtime.get("active_trades", {}) if isinstance(runtime, Mapping) else {}
-        open_risk = sum(self._number(item.get("risk_usd")) or 0 for item in active.values()
-                        if isinstance(item, Mapping)) if isinstance(active, Mapping) else 0.0
+        if not isinstance(runtime, Mapping):
+            return self._fail_closed("durable_risk_state_invalid",
+                                    AlpacaError("durable runtime state is malformed"))
+        active = runtime.get("active_trades", {})
+        if active is None:
+            active = {}
+        if not isinstance(active, Mapping):
+            return self._fail_closed("durable_risk_state_invalid",
+                                    AlpacaError("active trade state is malformed"))
+        orders_state = runtime.get("orders", {})
+        if orders_state is None:
+            orders_state = {}
+        if not isinstance(orders_state, Mapping):
+            return self._fail_closed("durable_risk_state_invalid",
+                                    AlpacaError("order state is malformed"))
         pending_keys: set[tuple[str, str]] = set()
+        pending_underlyings: set[str] = set()
         pending_risk = 0.0; pending_notional = 0.0
-        for item in runtime.get("orders", {}).values() if isinstance(
-                runtime.get("orders"), Mapping) else ():
-            if (not isinstance(item, Mapping) or
-                    str(item.get("status", "")).lower() in _TERMINAL_ORDER_STATUSES):
-                continue
-            plan = item.get("risk_plan") if isinstance(item.get("risk_plan"), Mapping) else {}
-            underlying = str(plan.get("underlying_symbol") or item.get("symbol") or "").upper()
-            direction = str(plan.get("direction") or
-                            ("long" if item.get("side") == "buy" else "short"))
-            if underlying:
+        try:
+            open_risk = 0.0
+            if isinstance(active, Mapping):
+                for active_symbol, item in active.items():
+                    if not isinstance(item, Mapping):
+                        raise AlpacaError(f"active trade {active_symbol} is malformed")
+                    risk_usd = self._required_number(
+                        item.get("risk_usd"), f"active trade {active_symbol} risk_usd")
+                    notional = self._required_number(
+                        item.get("notional"), f"active trade {active_symbol} notional")
+                    if risk_usd < 0 or notional < 0:
+                        raise AlpacaError(f"active trade {active_symbol} risk is negative")
+                    open_risk += risk_usd
+            for item in orders_state.values():
+                if not isinstance(item, Mapping):
+                    raise AlpacaError("durable order row is malformed")
+                if str(item.get("status", "")).lower() in _TERMINAL_ORDER_STATUSES:
+                    continue
+                action = str(item.get("action", "submit")).lower()
+                if action in {"flatten", "close"}:
+                    continue
+                plan = item.get("risk_plan")
+                if not isinstance(plan, Mapping):
+                    raise AlpacaError("pending order risk_plan is malformed")
+                risk_usd = self._required_number(
+                    plan.get("risk_usd"), "pending order risk_usd")
+                notional = self._required_number(
+                    plan.get("notional"), "pending order notional")
+                if risk_usd < 0 or notional < 0:
+                    raise AlpacaError("pending order risk is negative")
+                underlying = str(plan.get("underlying_symbol") or
+                                 item.get("symbol") or "").upper()
+                if not underlying:
+                    raise AlpacaError("pending order underlying symbol is missing")
+                direction = str(plan.get("direction") or
+                                ("long" if item.get("side") == "buy" else "short"))
                 pending_keys.add((underlying, direction))
-                pending_risk += self._number(plan.get("risk_usd")) or 0.0
-                pending_notional += self._number(plan.get("notional")) or 0.0
+                pending_underlyings.add(underlying)
+                pending_risk += risk_usd
+                pending_notional += notional
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("durable_risk_state_invalid", exc)
         held_underlyings = {
             str(item.get("underlying_symbol") or item.get("symbol") or "").upper()
             for item in active.values() if isinstance(item, Mapping)
         } if isinstance(active, Mapping) else set()
         pending_position_count = sum(
-            1 for underlying, _direction in pending_keys
+            1 for underlying in pending_underlyings
             if underlying not in held_underlyings)
         edge_configs = self._edge_configs or ([(None, self._edge_base_cfg)]
                                                if not self._edge_required else [])
@@ -725,9 +921,13 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                                "spread_bps": row.get("spread_bps"),
                                "stale": bool(row.get("stale", False)),
                                "quote_stale": bool(row.get("quote_stale", False))})
+                signal_entry = signal.get("entry_price")
                 plan_snapshot = {
                     **row,
-                    "price": self._number(row.get("quote", {}).get("ask")),
+                    # Strategy planning and execution slippage must share the
+                    # signal's reference entry, not the current quote ask.
+                    "price": signal_entry,
+                    "entry_price": signal_entry,
                     "close": signal.get("entry_price"),
                     "relative_volume": signal.get("relative_volume"),
                     "spread_bps": row.get("spread_bps"),
@@ -750,16 +950,28 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                 if not self._llm_allows(plan, row, portfolio_data):
                     continue
                 key = (symbol, str(plan.get("direction") or ""))
-                if key in placed_keys or key in pending_keys:
+                if key in placed_keys or symbol in pending_underlyings:
                     self._event("entry_duplicate_blocked", {
                         "symbol": symbol, "direction": key[1],
                         "variant_id": (edge_record or {}).get("variant_id")})
                     continue
-                sized = self._risk_order(
-                    symbol, plan, row, account, positions, now, cfg=edge_cfg)
+                try:
+                    sized = self._risk_order(
+                        symbol, plan, row, account, positions, now, cfg=edge_cfg)
+                except AlpacaError as exc:
+                    return self._fail_closed("durable_risk_state_invalid", exc)
                 if sized is None:
                     continue
                 request, risk_plan = sized
+                try:
+                    candidate_risk = self._required_number(
+                        risk_plan.get("risk_usd"), "planned risk_usd")
+                    candidate_notional = self._required_number(
+                        risk_plan.get("notional"), "planned notional")
+                    if candidate_risk < 0 or candidate_notional < 0:
+                        raise AlpacaError("planned risk or notional is negative")
+                except Exception as exc:  # noqa: BLE001
+                    return self._fail_closed("planned_risk_invalid", exc)
                 max_positions = int(risk_cfg.get("max_concurrent_positions", 1) or 1)
                 if (len(positions) + pending_position_count + len(placed) >=
                         max_positions):
@@ -770,14 +982,14 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                 risk_cap = self._number(risk_cfg.get(
                     "max_open_risk_pct", risk_cfg.get("max_total_open_risk_pct")))
                 if (risk_cap is not None and open_risk + pending_risk + planned_risk +
-                        float(risk_plan.get("risk_usd", 0) or 0) >
+                        candidate_risk >
                         equity * risk_cap / 100.0 + 1e-9):
                     self._event("risk_reject", {"symbol": symbol,
                                                   "reason": "max open risk cap reached"})
                     continue
                 gross_cap = self._number(risk_cfg.get("max_gross_exposure_pct"))
                 if (gross_cap is not None and gross + pending_notional + planned_notional +
-                        float(risk_plan.get("notional", 0) or 0) >
+                        candidate_notional >
                         equity * gross_cap / 100.0 + 1e-9):
                     self._event("risk_reject", {"symbol": symbol,
                                                   "reason": "max gross exposure reached"})
@@ -788,9 +1000,11 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
                     continue
                 try:
                     order = self.provider.submit_order(request)
-                    placed.append(order); placed_keys.add(key); pending_keys.add(key)
-                    planned_risk += float(risk_plan.get("risk_usd", 0) or 0)
-                    planned_notional += float(risk_plan.get("notional", 0) or 0)
+                    placed.append(order); placed_keys.add(key)
+                    pending_keys.add((symbol, str(risk_plan.get("direction") or "")))
+                    pending_underlyings.add(symbol)
+                    planned_risk += candidate_risk
+                    planned_notional += candidate_notional
                     try:
                         self._record_open_order(request, order, risk_plan)
                     except Exception as exc:  # noqa: BLE001

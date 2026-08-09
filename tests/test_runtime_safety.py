@@ -13,7 +13,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position
+from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order, Position, Quote
 from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, PaperModeError
 from agent.config import ConfigError, validate_config
 from agent import engine as engine_module
@@ -418,6 +418,148 @@ class RuntimeSafetyTests(unittest.TestCase):
         result = engine.run_once(snapshot)
         self.assertEqual(result["orders"], [])
         self.assertEqual(provider.orders_sent, [])
+
+    def test_collect_uses_latest_valid_quote_not_provider_order(self):
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        now = provider.now
+        older = {"symbol": "SPY", "timestamp": now - timedelta(seconds=20),
+                 "bid_price": 100, "ask_price": 100.1}
+        latest = Quote("SPY", timestamp=now - timedelta(seconds=2),
+                       bid=Decimal("101"), ask=Decimal("101.1"))
+        rows = engine._collect(["SPY"], now,
+                               {"SPY": {"bars": [], "quotes": [latest, older]}})
+        self.assertEqual(rows["SPY"]["quote"]["bid"], Decimal("101"))
+
+    def test_collect_rejects_naive_timestamp_and_non_boolean_freshness(self):
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        now = provider.now
+        malformed = {
+            "SPY": {"quote_stale": "false", "quote": {
+                "symbol": "SPY", "timestamp": now,
+                "bid": 100, "ask": 100.1}},
+            "AAPL": {"quote": {
+                "symbol": "AAPL", "timestamp": datetime(2026, 8, 7, 14),
+                "bid": 100, "ask": 100.1}},
+            "MSFT": {"stale": None, "quote": {
+                "symbol": "MSFT", "timestamp": now,
+                "bid": 100, "ask": 100.1}},
+        }
+        self.assertEqual(engine._collect(["SPY", "AAPL", "MSFT"], now, malformed), {})
+
+    def test_plan_snapshot_uses_signal_entry_for_slippage_reference(self):
+        provider = FakeProvider()
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
+        seen = {}
+        signal = {"symbol": "SPY", "direction": "long", "setup_type": "ibr_breakout",
+                  "entry_price": 100.0, "signal_ts": provider.now.timestamp(),
+                  "range_high": 99.0, "range_low": 98.0, "range_width": 1.0,
+                  "relative_volume": 2.0, "session": "2026-08-07"}
+        snapshot = {"SPY": {"bars": [], "quote": {
+            "symbol": "SPY", "timestamp": provider.now,
+            "bid": 100.48, "ask": 100.51}}}
+
+        def capture_plan(_signal, plan_snapshot, _cfg):
+            seen.update(plan_snapshot)
+            return None, "test rejection"
+
+        with patch.object(engine_module, "generate_ibr_signal", return_value=signal), \
+             patch.object(engine_module, "build_setup_plan", side_effect=capture_plan):
+            result = engine.run_once(snapshot)
+        self.assertEqual(result["orders"], [])
+        self.assertEqual(seen["entry_price"], 100.0)
+        self.assertEqual(seen["price"], 100.0)
+
+    def test_entry_slippage_strictly_above_fifty_bps_is_rejected(self):
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(ValueError, r"51\.00 bps"):
+            engine._entry_execution("buy", {"bid": 100, "ask": 100.51}, 100)
+
+    def test_client_id_is_deterministic_and_retry_suffix_survives_prefix_truncation(self):
+        cfg = _cfg()
+        cfg["execution"]["client_order_id_prefix"] = "x" * 100
+        engine = Engine(cfg, light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        signal = {"symbol": "SPY", "direction": "long", "setup_id": "setup"}
+        first = engine._client_id("flatten", signal, attempt=0)
+        retry = engine._client_id("flatten", signal, attempt=1)
+        other = engine._client_id("flatten", {**signal, "symbol": "AAPL"}, attempt=0)
+        self.assertEqual(first, engine._client_id("flatten", signal, attempt=0))
+        self.assertNotEqual(first, retry)
+        self.assertNotEqual(first, other)
+        self.assertTrue(retry.endswith("-1"))
+        self.assertLessEqual(len(retry), 48)
+
+    def test_account_failure_cancels_and_pauses_via_fail_closed(self):
+        class BrokenAccountProvider(FakeProvider):
+            def account(self):
+                raise RuntimeError("account unavailable")
+
+        provider = BrokenAccountProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        engine._ensure_order_ready = lambda: True
+        engine._wall_clock = lambda: provider.now
+        result = engine.run_once({})
+        self.assertEqual(result["reason"], "account_unavailable")
+        self.assertGreaterEqual(provider.cancel_calls, 1)
+        self.assertTrue(__import__("agent.state", fromlist=["load_state"]).load_state()["operator_pause"])
+
+    def test_post_risk_positions_failure_cancels_and_pauses_via_fail_closed(self):
+        class BrokenPostRiskPositionsProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.position_calls = 0
+
+            def positions(self):
+                self.position_calls += 1
+                if self.position_calls >= 2:
+                    raise RuntimeError("positions unavailable")
+                return []
+
+        provider = BrokenPostRiskPositionsProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        engine._ensure_order_ready = lambda: True
+        engine._wall_clock = lambda: provider.now
+        result = engine.run_once({})
+        self.assertEqual(result["reason"], "post_risk_positions_unavailable")
+        self.assertGreaterEqual(provider.cancel_calls, 1)
+
+    def test_malformed_risk_day_date_does_not_reset_baseline(self):
+        from agent import state
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        state.update_state(lambda current: {
+            **current,
+            "risk_day": {"date": True, "start_equity": 1},
+        })
+        with self.assertRaisesRegex(AlpacaError, "risk date is malformed"):
+            engine._update_daily_risk(provider.account(), provider.now)
+
+    def test_malformed_active_risk_fails_closed_without_tuple_unpack_error(self):
+        from agent import state
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        engine._ensure_order_ready = lambda: True
+        engine._wall_clock = lambda: provider.now
+        state.update_state(lambda current: {
+            **current,
+            "active_trades": {"SPY": {"risk_usd": "nan", "notional": 100}},
+        })
+        with patch.object(engine, "reconcile", return_value={"positions": []}):
+            result = engine.run_once({})
+        self.assertEqual(result["action"], "fail_closed")
+        self.assertEqual(result["reason"], "durable_risk_state_invalid")
+        self.assertGreaterEqual(provider.cancel_calls, 1)
 
     def test_required_edge_blocks_the_real_order_path_until_champion_exists(self):
         provider = FakeProvider()

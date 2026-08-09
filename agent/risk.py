@@ -3,9 +3,119 @@
 from __future__ import annotations
 
 import math
+import re
 import time
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timezone
-from typing import Mapping
+from collections.abc import Mapping
+
+from .instruments import validate_equity_symbol, validate_option_symbol
+
+
+_OCC_OPTION_RE = re.compile(
+    r"^(?P<root>[A-Z0-9.]{1,8})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$")
+
+
+def _object_mapping(value):
+    """Return a shallow, safe mapping for provider rows and dataclass models."""
+    if isinstance(value, Mapping):
+        try:
+            return dict(value)
+        except (TypeError, ValueError, RuntimeError):
+            return {}
+    if is_dataclass(value) and not isinstance(value, type):
+        result = {}
+        for field in fields(value):
+            try:
+                result[field.name] = getattr(value, field.name)
+            except Exception:  # noqa: BLE001 - malformed model rows fail closed
+                continue
+        return result
+    try:
+        data = vars(value)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, Mapping):
+        return dict(data)
+    # SDK models can expose slots/properties without a __dict__.  Read only
+    # the fields used by risk; arbitrary attribute traversal is intentionally
+    # avoided so malformed provider objects fail closed.
+    names = (
+        "symbol", "contract", "underlying_symbol", "underlying",
+        "expiration", "expiration_date", "expiry", "strike",
+        "strike_price", "type", "right", "option_type", "multiplier",
+        "contract_multiplier", "contract_size", "size", "dte", "bid",
+        "ask", "bid_price", "ask_price", "last", "last_price",
+        "bid_size", "ask_size", "volume", "day_volume", "open_interest", "oi",
+        "latest_quote", "quote", "timestamp", "quote_ts",
+        "quote_timestamp", "quote_age_seconds", "stale", "quote_stale",
+        "debit", "net_debit", "side", "strategy", "structure",
+        "position_intent", "moneyness_distance", "underlying_price",
+        "underlying_last", "spot",
+    )
+    result = {}
+    for name in names:
+        try:
+            result[name] = getattr(value, name)
+        except AttributeError:
+            continue
+        except Exception:  # noqa: BLE001 - a provider property must not abort selection
+            continue
+    return result
+
+
+def _normalize_option_candidate(value):
+    """Flatten a mapping/dataclass-like option row and nested quote/contract."""
+    option = _object_mapping(value)
+    if not option:
+        return None
+    # OptionSnapshot carries identity on ``contract`` and quote fields on the
+    # outer object.  Fill missing fields from nested records without allowing
+    # them to overwrite explicit outer values.
+    nested_contract = _object_mapping(option.get("contract"))
+    outer_symbol = option.get("symbol")
+    nested_symbol = nested_contract.get("symbol")
+    if (outer_symbol is not None and nested_symbol is not None and
+            str(getattr(outer_symbol, "value", outer_symbol)).strip().upper() !=
+            str(getattr(nested_symbol, "value", nested_symbol)).strip().upper()):
+        option["_nested_identity_conflict"] = True
+    for outer_name in ("underlying_symbol", "underlying"):
+        outer_value = option.get(outer_name)
+        if outer_value is None:
+            continue
+        for nested_name in ("underlying_symbol", "underlying"):
+            nested_value = nested_contract.get(nested_name)
+            if (nested_value is not None and
+                    str(getattr(outer_value, "value", outer_value)).strip().upper() !=
+                    str(getattr(nested_value, "value", nested_value)).strip().upper()):
+                option["_nested_identity_conflict"] = True
+    for nested_name in ("contract", "latest_quote", "quote"):
+        nested = _object_mapping(option.get(nested_name))
+        for key, nested_value in nested.items():
+            option.setdefault(key, nested_value)
+    for canonical, aliases in {
+        "bid": ("bid_price",), "ask": ("ask_price",),
+        "last": ("last_price",), "volume": ("day_volume",),
+        "quote_ts": ("quote_timestamp", "timestamp"),
+    }.items():
+        if canonical not in option:
+            for alias in aliases:
+                if alias in option:
+                    option[canonical] = option[alias]
+                    break
+    return option
+
+
+def _candidate_sequence(candidates):
+    """Treat one mapping/model as one row while retaining iterable callers."""
+    if candidates is None:
+        return ()
+    if isinstance(candidates, (Mapping, str, bytes)):
+        return (candidates,)
+    try:
+        return iter(candidates)
+    except (TypeError, ValueError, RuntimeError):
+        return (candidates,)
 
 
 def _num(value, default=None):
@@ -18,7 +128,7 @@ def _num(value, default=None):
 
 def _timestamp(value):
     """Normalize quote timestamps expressed as epoch or ISO text."""
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, datetime):
         parsed = value
@@ -35,9 +145,38 @@ def _timestamp(value):
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        # A naive provider timestamp has no safe point-in-time meaning.  Do
+        # not silently interpret it as UTC: callers may otherwise pair it
+        # with a fabricated fresh quote age and bypass the freshness gate.
+        return None
     return parsed.timestamp()
+
+
+def _expiration_date(value):
+    """Normalize option expiry metadata to a calendar date."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(getattr(value, "value", value)).strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_option_kind(value):
+    kind = _option_kind(value)
+    if kind in {"c", "call"}:
+        return "call"
+    if kind in {"p", "put"}:
+        return "put"
+    return None
 
 
 def _option_kind(value) -> str:
@@ -62,7 +201,12 @@ class RiskEngine:
         self.strategy_id = str(strategy.get("id") or "ibr")
 
     def _risk_usd(self, equity: float, decision: Mapping) -> float:
-        explicit = _num(decision.get("risk_usd"))
+        if "risk_usd" in decision:
+            explicit = _num(decision.get("risk_usd"))
+            if explicit is None:
+                raise ValueError("risk_usd measurement is invalid")
+        else:
+            explicit = None
         if explicit is not None and explicit > 0:
             return explicit
         pct = _num(self.r.get("risk_per_trade_pct"), 1.0) or 1.0
@@ -120,7 +264,8 @@ class RiskEngine:
         return minimum, maximum, spread_pct
 
     def select_option_contract(self, candidates, direction: str,
-                               now: float | None = None) -> dict:
+                               now: float | None = None,
+                               underlying: str | None = None) -> dict:
         """Select one liquid long call/put contract.
 
         Multi-leg debit spreads and short/naked structures remain explicitly
@@ -128,17 +273,87 @@ class RiskEngine:
         """
         if direction not in {"long", "short"}:
             raise ValueError("option direction must be long or short")
+        requested_underlying = None
+        if underlying is not None:
+            try:
+                requested_underlying = validate_equity_symbol(underlying)
+            except ValueError as exc:
+                raise ValueError("option underlying is invalid") from exc
         minimum, maximum, max_spread = self._option_limits()
         now_value = time.time() if now is None else float(now)
         wanted = "call" if direction == "long" else "put"
         accepted = []
         rejected = []
-        for raw in candidates or ():
-            if not isinstance(raw, Mapping):
+        for raw in _candidate_sequence(candidates):
+            option = _normalize_option_candidate(raw)
+            if option is None:
                 rejected.append("not a mapping"); continue
-            option = dict(raw)
-            raw_kind = option.get("type", option.get("right", option.get("option_type", "")))
-            kind = _option_kind(raw_kind)
+            if option.get("_nested_identity_conflict"):
+                rejected.append("option identity metadata mismatch"); continue
+            # Freshness and identity aliases must agree rather than relying
+            # on whichever provider field happens to win a precedence chain.
+            flag_invalid = False
+            for flag_name in ("stale", "quote_stale"):
+                if flag_name in option and not isinstance(option[flag_name], bool):
+                    flag_invalid = True
+                    break
+            if flag_invalid:
+                rejected.append("malformed stale flag"); continue
+
+            underlying_values = [option[name] for name in ("underlying_symbol", "underlying")
+                                 if name in option and option[name] is not None and
+                                 str(option[name]).strip()]
+            candidate_underlyings = []
+            try:
+                candidate_underlyings = [validate_equity_symbol(value)
+                                         for value in underlying_values]
+            except ValueError:
+                rejected.append("invalid option underlying"); continue
+            if candidate_underlyings and any(
+                    value != candidate_underlyings[0] for value in candidate_underlyings[1:]):
+                rejected.append("option underlying metadata mismatch"); continue
+            candidate_underlying = candidate_underlyings[0] if candidate_underlyings else None
+            if (requested_underlying is not None and
+                    candidate_underlying is not None and
+                    candidate_underlying != requested_underlying):
+                rejected.append("wrong underlying"); continue
+
+            symbol = option.get("symbol")
+            symbol_text = str(getattr(symbol, "value", symbol)).strip() if symbol is not None else ""
+            occ = None
+            if symbol_text:
+                try:
+                    normalized_symbol = validate_option_symbol(
+                        symbol_text, requested_underlying or candidate_underlying)
+                except ValueError:
+                    rejected.append("invalid OCC option symbol"); continue
+                option["symbol"] = normalized_symbol
+                occ = _OCC_OPTION_RE.fullmatch(normalized_symbol)
+                if occ is None:  # defensive: validate_option_symbol is the authority
+                    rejected.append("invalid OCC option symbol"); continue
+                occ_root = occ.group("root")
+                if (candidate_underlying is not None and
+                        candidate_underlying != occ_root):
+                    rejected.append("wrong underlying"); continue
+                candidate_underlying = candidate_underlying or occ_root
+
+            raw_kinds = [option[name] for name in ("type", "right", "option_type")
+                         if name in option and option[name] is not None]
+            kinds = [_normalized_option_kind(value) for value in raw_kinds]
+            if raw_kinds and any(kind is None for kind in kinds):
+                rejected.append("invalid option right"); continue
+            if kinds and any(kind != kinds[0] for kind in kinds[1:]):
+                rejected.append("option right metadata mismatch"); continue
+            kind = kinds[0] if kinds else None
+            if occ is not None:
+                occ_kind = "call" if occ.group("right") == "C" else "put"
+                if kind is not None and kind != occ_kind:
+                    rejected.append("option right metadata mismatch"); continue
+                kind = occ_kind
+            if kind is not None:
+                option.setdefault("type", kind)
+                option.setdefault("right", kind)
+                option.setdefault("option_type", kind)
             strategy = str(option.get("strategy", option.get("structure", "single"))).lower()
             side = str(option.get("side", "buy")).lower()
             intent = str(option.get("position_intent", "buy_to_open")).lower()
@@ -148,33 +363,89 @@ class RiskEngine:
                 rejected.append("multi-leg option structure unsupported"); continue
             if strategy in {"naked_short", "short", "sell", "credit_spread"} or side in {"sell", "short"}:
                 rejected.append("naked short"); continue
-            if kind in {"c", "p"}:
-                kind = {"c": "call", "p": "put"}[kind]
             if kind != wanted:
                 rejected.append("wrong right"); continue
-            dte = _num(option.get("dte"))
-            if dte is None:
-                expiry = option.get("expiration", option.get("expiry"))
-                if expiry is not None:
-                    try:
-                        if isinstance(expiry, date) and not isinstance(expiry, datetime):
-                            dte = (expiry - datetime.fromtimestamp(now_value, timezone.utc).date()).days
-                        else:
-                            exp = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
-                            if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
-                            dte = (exp.timestamp() - now_value) / 86400.0
-                    except (TypeError, ValueError, OverflowError):
-                        dte = None
+
+            # Every supplied expiry alias must identify one calendar day, and
+            # OCC identity (when present) is authoritative for that day.
+            expiry_values = [option[name] for name in ("expiration", "expiration_date", "expiry")
+                             if name in option and option[name] is not None]
+            parsed_expiries = [_expiration_date(value) for value in expiry_values]
+            if expiry_values and any(value is None for value in parsed_expiries):
+                rejected.append("invalid option expiration"); continue
+            if parsed_expiries and any(value != parsed_expiries[0] for value in parsed_expiries[1:]):
+                rejected.append("option expiration metadata mismatch"); continue
+            expiry = parsed_expiries[0] if parsed_expiries else None
+            if occ is not None:
+                try:
+                    occ_expiry = date(2000 + int(occ.group("expiry")[:2]),
+                                      int(occ.group("expiry")[2:4]),
+                                      int(occ.group("expiry")[4:]))
+                except ValueError:
+                    rejected.append("invalid option expiration"); continue
+                if expiry is not None and expiry != occ_expiry:
+                    rejected.append("option expiration metadata mismatch"); continue
+                expiry = occ_expiry
+                strike_values = [option[name] for name in ("strike", "strike_price")
+                                 if name in option and option[name] is not None]
+                occ_strike = int(occ.group("strike")) / 1000.0
+                if any(isinstance(value, bool) or _num(value) is None or
+                       abs(_num(value) - occ_strike) > 0.0005
+                       for value in strike_values):
+                    rejected.append("option strike metadata mismatch"); continue
+
+            supplied_dte = _num(option.get("dte")) if "dte" in option else None
+            if ("dte" in option and
+                    (option.get("dte") is None or isinstance(option.get("dte"), bool) or
+                     supplied_dte is None)):
+                rejected.append("invalid dte"); continue
+            dte = supplied_dte
+            if expiry is not None:
+                dte = float((expiry - datetime.fromtimestamp(now_value, timezone.utc).date()).days)
+                if supplied_dte is not None and abs(supplied_dte - dte) > 1e-9:
+                    rejected.append("dte does not match expiration"); continue
             if dte is None or dte < minimum or dte > maximum:
                 rejected.append("dte out of bounds"); continue
             if dte <= 0:
                 rejected.append("0DTE"); continue
-            stale = option.get("stale") is True or option.get("quote_stale") is True
+
+            stale = option.get("stale", False) or option.get("quote_stale", False)
             max_age = _num(self.execution.get("max_market_data_age_seconds"), 30) or 30
-            quote_age = _num(option.get("quote_age_seconds"))
-            quote_ts = _timestamp(option.get("quote_ts", option.get("quote_timestamp", option.get("timestamp"))))
-            if quote_age is None and quote_ts is not None:
-                quote_age = now_value - quote_ts
+            quote_age_raw = option.get("quote_age_seconds") if "quote_age_seconds" in option else None
+            if isinstance(quote_age_raw, bool):
+                rejected.append("invalid quote age"); continue
+            quote_age = _num(quote_age_raw)
+            if "quote_age_seconds" in option and quote_age is None:
+                rejected.append("invalid quote age"); continue
+            quote_time_keys = [name for name in ("quote_ts", "quote_timestamp", "timestamp")
+                               if name in option]
+            quote_times = []
+            timestamp_invalid = False
+            for quote_time_key in quote_time_keys:
+                quote_raw = option[quote_time_key]
+                quote_ts = _timestamp(quote_raw)
+                if quote_raw is not None and quote_ts is None:
+                    rejected.append("invalid quote timestamp")
+                    timestamp_invalid = True
+                    break
+                if quote_ts is not None:
+                    quote_times.append(quote_ts)
+            if timestamp_invalid:
+                continue
+            if quote_time_keys:
+                if quote_times:
+                    derived_ages = [now_value - quote_ts for quote_ts in quote_times]
+                    if any(age < 0 for age in derived_ages):
+                        rejected.append("future quote timestamp"); continue
+                    # Every timestamp alias describes the same quote. A
+                    # future or materially older alias cannot be hidden by a
+                    # fresh value in the first alias position.
+                    if max(derived_ages) - min(derived_ages) > 2.0:
+                        rejected.append("quote timestamp metadata mismatch"); continue
+                    if (quote_age is not None and
+                            any(abs(quote_age - age) > 2.0 for age in derived_ages)):
+                        rejected.append("quote age mismatch"); continue
+                    quote_age = max(derived_ages)
             # A caller that supplies an evaluation clock opts into strict
             # point-in-time validation.  The no-clock form remains compatible
             # with offline fixtures, while provider candidates always include
@@ -212,7 +483,8 @@ class RiskEngine:
             ) if bid_size is not None and ask_size is not None else 0.0
             if volume <= 0 and open_interest <= 0 and displayed_size <= 0:
                 rejected.append("illiquid option"); continue
-            multiplier = _num(option.get("multiplier", option.get("contract_multiplier", option.get("size"))))
+            multiplier = _num(option.get("multiplier", option.get(
+                "contract_multiplier", option.get("contract_size", option.get("size")))))
             if multiplier is None or multiplier <= 0:
                 rejected.append("invalid contract multiplier"); continue
             if multiplier != math.floor(multiplier):
@@ -248,16 +520,23 @@ class RiskEngine:
             float(row["debit"]), str(row.get("symbol", ""))))
 
     def size_options(self, equity: float, risk_usd: float,
-                     candidates, direction: str, now: float | None = None) -> dict:
-        rows = list(candidates or ())
+                     candidates, direction: str, now: float | None = None,
+                     underlying: str | None = None) -> dict:
+        rows = list(_candidate_sequence(candidates))
         # Provider-generated candidates carry quote_age_seconds/quote_ts.  A
         # bare offline fixture predating those fields remains usable without
         # an artificial clock, while any timestamped candidate is checked
         # strictly against ``now``.
-        has_freshness = any(isinstance(row, Mapping) and any(key in row for key in (
-            "quote_ts", "quote_timestamp", "quote_age_seconds", "timestamp")) for row in rows)
+        has_freshness = False
+        for row in rows:
+            normalized = _normalize_option_candidate(row)
+            if normalized and any(key in normalized for key in (
+                    "quote_ts", "quote_timestamp", "quote_age_seconds", "timestamp")):
+                has_freshness = True
+                break
         contract = self.select_option_contract(rows, direction=direction,
-                                               now=now if has_freshness else None)
+                                               now=now if has_freshness else None,
+                                               underlying=underlying)
         max_loss = float(contract["max_loss_per_contract"])
         contracts = math.floor(float(risk_usd) / max_loss)
         liquidity_cap = _num(contract.get("liquidity_cap_contracts", contract.get("max_contracts")))
@@ -307,6 +586,9 @@ class RiskEngine:
         spread = _num(market.get("spread_bps"))
         max_spread = _num(self.execution.get("max_spread_bps"), 100.0) or 100.0
         if spread is not None and spread > max_spread: return None, "spread is too wide"
+        if any(flag in market and not isinstance(market.get(flag), bool)
+               for flag in ("stale", "quote_stale")):
+            return None, "market freshness flag is invalid"
         if market.get("stale") is True or market.get("quote_stale") is True:
             return None, "market data is stale"
         # Existing planned stop risk is durable state. Never let a malformed
@@ -325,7 +607,10 @@ class RiskEngine:
         strategy_cfg = self.cfg.get("strategy", {}) if isinstance(self.cfg, Mapping) else {}
         profile = str(decision.get("execution_profile", decision.get(
             "profile", strategy_cfg.get("execution_profile", "shares")))).lower()
-        budget = self._risk_usd(equity, decision)
+        try:
+            budget = self._risk_usd(equity, decision)
+        except ValueError as exc:
+            return None, str(exc)
         try:
             if profile in {"shares", "stock", "etf", "stock_etf", "stock_etf_shares"}:
                 sized = self.size_shares(equity=equity, entry_price=entry, stop_distance=distance, symbol_data=market, risk_usd=budget)
@@ -335,7 +620,9 @@ class RiskEngine:
                         "notional": sized["notional"], "risk_usd": sized["risk_usd"]}
             elif profile in {"options", "option", "defined_risk_options", "options_defined_risk"}:
                 candidates = decision.get("option_chain") or market.get("option_chain") or market.get("options") or []
-                option = self.size_options(equity=equity, risk_usd=budget, candidates=candidates, direction=direction, now=now_value)
+                option = self.size_options(equity=equity, risk_usd=budget, candidates=candidates,
+                                            direction=direction, now=now_value,
+                                            underlying=symbol)
                 plan = {"execution_profile": "options", "contracts": option["contracts"],
                         "option": option, "contract_multiplier": option["multiplier"],
                         "max_loss": option["max_loss"], "risk_usd": option["risk_usd"],
@@ -354,7 +641,13 @@ class RiskEngine:
             return None, "max gross exposure cap reached"
         # Account snapshots may provide realized/unrealized daily P&L.  A
         # negative loss at or beyond the configured stop can only close risk.
-        daily_pnl = _num(decision.get("daily_pnl", decision.get("day_pnl")))
+        pnl_key = "daily_pnl" if "daily_pnl" in decision else (
+            "day_pnl" if "day_pnl" in decision else None)
+        daily_pnl = None
+        if pnl_key is not None and decision.get(pnl_key) is not None:
+            daily_pnl = _num(decision.get(pnl_key))
+            if daily_pnl is None:
+                return None, "daily P&L measurement is invalid"
         daily_limit = _num(self.r.get("daily_loss_limit_pct"))
         if daily_pnl is not None and daily_limit is not None and daily_pnl <= -equity * daily_limit / 100.0:
             return None, "daily loss limit reached"
@@ -382,14 +675,16 @@ def size_shares(equity: float, entry_price: float, stop_distance: float,
 
 def select_option_contract(candidates, direction: str,
                            risk_config: Mapping | None = None,
-                           now: float | None = None) -> dict:
+                           now: float | None = None,
+                           underlying: str | None = None) -> dict:
     return RiskEngine({"risk": dict(risk_config or {})}).select_option_contract(
-        candidates, direction=direction, now=now)
+        candidates, direction=direction, now=now, underlying=underlying)
 
 
 def size_options(equity: float, risk_usd: float, candidates,
                  direction: str, risk_config: Mapping | None = None,
-                 now: float | None = None) -> dict:
+                 now: float | None = None,
+                 underlying: str | None = None) -> dict:
     return RiskEngine({"risk": dict(risk_config or {})}).size_options(
         equity=equity, risk_usd=risk_usd, candidates=candidates,
-        direction=direction, now=now)
+        direction=direction, now=now, underlying=underlying)

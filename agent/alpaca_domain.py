@@ -180,6 +180,8 @@ class OptionContract(Asset):
         option_type = _text(data.get("option_type") or data.get("right") or data.get("type"), "call")
         if option_type not in {"call", "put"}:
             raise ValueError("option_type must be call or put")
+        if occ is not None and option_type != occ["option_type"]:
+            raise ValueError("option_type does not match OCC symbol")
         return cls(
             **{k: getattr(base, k) for k in (
                 "symbol", "exchange", "status", "tradable",

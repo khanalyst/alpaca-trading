@@ -98,6 +98,9 @@ class AlpacaRuntimeTests(unittest.TestCase):
         contract = OptionContract.from_sdk({"symbol": "SPY260821C00600000"})
         self.assertTrue(contract.tradable)
         self.assertEqual(contract.underlying_symbol, "SPY")
+        with self.assertRaisesRegex(ValueError, "does not match OCC"):
+            OptionContract.from_sdk({
+                "symbol": "SPY260821C00600000", "option_type": "put"})
 
     def test_provider_rejects_non_boolean_clock_open_flag(self):
         class StringClockTrading(TradingFake):
