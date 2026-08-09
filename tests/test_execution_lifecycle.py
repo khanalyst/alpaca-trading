@@ -151,6 +151,248 @@ class ExecutionLifecycleTests(unittest.TestCase):
                 "FROM trades ORDER BY id"
             ).fetchall()
 
+    def _submit_stock_entry(self, quantity=Decimal("10"),
+                            client_order_id="entry-lifecycle"):
+        request = OrderRequest(
+            "SPY", quantity, "buy", client_order_id=client_order_id)
+        order = self.provider.submit_order(request)
+        plan = {
+            "execution_profile": "shares", "direction": "long",
+            "entry_price": 101.5, "stop_price": 99, "target_price": 105,
+            "underlying_stop_price": 99, "underlying_target_price": 105,
+            "underlying_symbol": "SPY", "contract_multiplier": Decimal("1"),
+            "setup_id": client_order_id, "setup_type": "ibr",
+            "risk_usd": 100, "notional": 1000,
+        }
+        self.engine._record_open_order(request, order, plan)
+        return request, order
+
+    def test_partial_fill_progression_is_monotonic_and_incremental(self):
+        self._bind_engine(runtime_name="runtime-partial")
+        _, entry = self._submit_stock_entry()
+
+        for status, filled_qty in (
+                ("partially_filled", 3), ("partially_filled", 7),
+                ("partially_filled", 3), ("filled", 10)):
+            self.provider.set_order(entry.id, status=status,
+                                    filled_qty=filled_qty, filled_avg_price=101.5)
+            self.engine.reconcile()
+        # A repeated terminal fill snapshot with no position must not turn the
+        # just-observed fill into a phantom disappearance/close.
+        self.engine.reconcile()
+
+        runtime = state.load_state()
+        saved = runtime["orders"][entry.id]
+        self.assertEqual(saved["status"], "filled")
+        self.assertEqual(saved["filled_qty"], 10)
+        self.assertEqual(saved["logged_filled_qty"], 10)
+        self.assertEqual(runtime["active_trades"]["SPY"]["qty"], "10.0")
+        trades = self._journal_trades()
+        self.assertEqual([row[1] for row in trades], ["open"] * 3)
+        self.assertEqual([row[2] for row in trades], [3.0, 4.0, 3.0])
+        self.assertEqual(sum(row[2] for row in trades), 10.0)
+
+    def test_terminal_rejection_keeps_max_partial_fill_and_is_not_pending(self):
+        self._bind_engine(runtime_name="runtime-terminal-partial")
+        _, entry = self._submit_stock_entry(client_order_id="entry-terminal")
+        self.provider.set_order(entry.id, status="partially_filled",
+                                filled_qty=7, filled_avg_price=101.5)
+        self.engine.reconcile()
+        self.provider.set_order(entry.id, status="rejected", filled_qty=3,
+                                filled_avg_price=101.5)
+        self.engine.reconcile()
+        self.engine.reconcile()
+
+        saved = state.load_state()["orders"][entry.id]
+        self.assertEqual(saved["status"], "rejected")
+        self.assertEqual(saved["filled_qty"], 7)
+        self.assertFalse(self.engine._client_order_pending("entry-terminal"))
+        self.assertEqual([row[2] for row in self._journal_trades()], [7.0])
+
+    def test_terminal_rejection_with_positive_fill_keeps_status_when_position_first(self):
+        for status, runtime_name in (("partially_filled", "runtime-position-partial"),
+                                     ("rejected", "runtime-position-rejected"),
+                                     ("canceled", "runtime-position-canceled")):
+            self._bind_engine(runtime_name=runtime_name)
+            _, entry = self._submit_stock_entry(
+                client_order_id=f"entry-position-{status}")
+            self.provider.set_order(entry.id, status=status, filled_qty=3,
+                                    filled_avg_price=101.5)
+            self.provider.positions_live = [Position(
+                "SPY", Decimal("3"), "long", avg_entry_price=Decimal("101.5"),
+                current_price=Decimal("100"),
+            )]
+            self.engine.reconcile()
+
+            runtime = state.load_state()
+            self.assertEqual(runtime["orders"][entry.id]["status"], status)
+            self.assertEqual(runtime["active_trades"]["SPY"]["status"], "open")
+            self.assertEqual(runtime["active_trades"]["SPY"]["qty"], "3")
+            self.assertEqual([row[2] for row in self._journal_trades()], [3.0])
+
+    def test_terminal_status_absorbs_later_filled_snapshot_without_duplicate_open(self):
+        for terminal, runtime_name in (("rejected", "runtime-terminal-absorbing-rejected"),
+                                        ("canceled", "runtime-terminal-absorbing-canceled")):
+            self._bind_engine(runtime_name=runtime_name)
+            _, entry = self._submit_stock_entry(
+                client_order_id=f"entry-absorbing-{terminal}")
+            self.provider.set_order(entry.id, status=terminal, filled_qty=3,
+                                    filled_avg_price=101.5)
+            self.provider.positions_live = []
+            self.engine.reconcile()
+            self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                    filled_avg_price=101.5)
+            self.engine.reconcile()
+
+            runtime = state.load_state()
+            saved = runtime["orders"][entry.id]
+            self.assertEqual(saved["status"], terminal)
+            self.assertEqual(saved["filled_qty"], 10)
+            self.assertEqual(saved["logged_filled_qty"], 10)
+            self.assertEqual([row[2] for row in self._journal_trades()], [3.0, 7.0])
+
+    def test_durable_fill_growth_activates_before_status_catches_up(self):
+        self._bind_engine(runtime_name="runtime-accepted-filled")
+        _, entry = self._submit_stock_entry(client_order_id="entry-accepted-filled")
+        self.provider.set_order(entry.id, status="accepted", filled_qty=3,
+                                filled_avg_price=101.5)
+        self.provider.positions_live = []
+        self.engine.reconcile()
+
+        runtime = state.load_state()
+        self.assertEqual(runtime["orders"][entry.id]["filled_qty"], 3)
+        self.assertEqual(runtime["orders"][entry.id]["logged_filled_qty"], 3)
+        self.assertEqual(runtime["active_trades"]["SPY"]["qty"], "3.0")
+        self.assertEqual([row[2] for row in self._journal_trades()], [3.0])
+
+    def test_partial_fill_without_position_is_retained_until_position_appears(self):
+        self._bind_engine(runtime_name="runtime-partial-no-position")
+        _, entry = self._submit_stock_entry(client_order_id="entry-no-position")
+        self.provider.set_order(entry.id, status="partially_filled",
+                                filled_qty=3, filled_avg_price=101.5)
+        self.provider.positions_live = []
+        self.engine.reconcile()
+
+        runtime = state.load_state()
+        self.assertEqual(runtime["active_trades"]["SPY"]["qty"], "3.0")
+        self.assertEqual([row[1] for row in self._journal_trades()], ["open"])
+
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("3"), "long", avg_entry_price=Decimal("101.5"),
+            current_price=Decimal("100"),
+        )]
+        self.engine.reconcile()
+        runtime = state.load_state()
+        self.assertEqual(runtime["active_trades"]["SPY"]["qty"], "3")
+        self.assertEqual([row[1] for row in self._journal_trades()], ["open"])
+
+    def test_unprotected_position_stays_unprotected_and_fail_closed_close_dedupes(self):
+        self._bind_engine(runtime_name="runtime-unprotected")
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("2"), "long", avg_entry_price=Decimal("101"),
+            current_price=Decimal("100"),
+        )]
+        self.engine.reconcile()
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["status"], "unprotected")
+        self.assertEqual(trade["execution_profile"], "unknown")
+        self.assertEqual(trade["risk_usd"], 0.0)
+
+        monitored = self.engine._monitor_positions(
+            datetime(2026, 8, 7, 14, tzinfo=timezone.utc),
+            list(self.provider.positions_live),
+        )
+        self.assertEqual(monitored["closed"],
+                         [{"symbol": "SPY", "reason": "protection_missing"}])
+        self.assertEqual(len(self.provider.close_requests), 1)
+        self.assertEqual(
+            self.engine._monitor_positions(
+                datetime(2026, 8, 7, 14, tzinfo=timezone.utc),
+                list(self.provider.positions_live),
+            )["closed"], [])
+        self.assertEqual(len(self.provider.close_requests), 1)
+
+    def test_rejected_zero_fill_entry_cannot_attribute_same_symbol_position(self):
+        self._bind_engine(runtime_name="runtime-rejected-zero-fill")
+        _, entry = self._submit_stock_entry(client_order_id="entry-rejected-zero")
+        self.provider.set_order(entry.id, status="rejected", filled_qty=0)
+        position = Position(
+            "SPY", Decimal("2"), "long", avg_entry_price=Decimal("101"),
+            current_price=Decimal("100"),
+        )
+        self.provider.positions_live = [position]
+        self.engine.reconcile()
+
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["status"], "unprotected")
+        self.assertEqual(trade["execution_profile"], "unknown")
+        self.assertEqual([row[1] for row in self._journal_trades()], [])
+        monitored = self.engine._monitor_positions(
+            datetime(2026, 8, 7, 14, tzinfo=timezone.utc), [position])
+        self.assertEqual(monitored["closed"],
+                         [{"symbol": "SPY", "reason": "protection_missing"}])
+        self.assertEqual(len(self.provider.close_requests), 1)
+
+    def test_rejected_close_retries_once_with_distinct_attempt_id(self):
+        self._bind_engine(runtime_name="runtime-close-retry")
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("2"), "long", avg_entry_price=Decimal("101"),
+            current_price=Decimal("100"),
+        )]
+        self.engine.reconcile()
+        now = datetime(2026, 8, 7, 14, tzinfo=timezone.utc)
+        self.engine._monitor_positions(now, list(self.provider.positions_live))
+        first_id = next(iter(self.provider.close_requests)).client_order_id
+        first_order = next(item for item in self.provider.orders_by_id.values()
+                           if item.client_order_id == first_id)
+        self.provider.set_order(first_order.id, status="rejected")
+        self.engine.reconcile()
+
+        self.engine._monitor_positions(now, list(self.provider.positions_live))
+        self.assertEqual(len(self.provider.close_requests), 2)
+        second_id = self.provider.close_requests[-1].client_order_id
+        self.assertNotEqual(first_id, second_id)
+        self.engine._monitor_positions(now, list(self.provider.positions_live))
+        self.assertEqual(len(self.provider.close_requests), 2)
+
+    def test_reappearing_closed_position_is_unprotected_residual_not_reactivated(self):
+        self._bind_engine(runtime_name="runtime-reappearing")
+        _, entry = self._submit_stock_entry(client_order_id="entry-reappearing")
+        self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                filled_avg_price=101.5)
+        position = Position("SPY", Decimal("10"), "long",
+                            avg_entry_price=Decimal("101.5"),
+                            current_price=Decimal("98.5"))
+        self.provider.positions_live = [position]
+        self.engine.reconcile()
+        now = datetime(2026, 8, 7, 14, tzinfo=timezone.utc)
+        self.engine._monitor_positions(now, [position])
+        first_close = self.provider.close_requests[-1].client_order_id
+        close_order = next(item for item in self.provider.orders_by_id.values()
+                           if item.client_order_id == first_close)
+        self.provider.set_order(close_order.id, status="filled", filled_qty=10,
+                                filled_avg_price=99)
+        self.provider.positions_live = []
+        self.engine.reconcile()
+        self.assertTrue(state.load_state()["orders"][entry.id]["position_closed"])
+        self.assertEqual([row[1] for row in self._journal_trades()], ["open", "close"])
+
+        # A later broker position is real exposure, but it is not evidence that
+        # the completed entry should be reactivated.
+        residual = replace(position, current_price=Decimal("100"))
+        self.provider.positions_live = [residual]
+        self.engine.reconcile()
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["status"], "unprotected")
+        self.assertEqual(trade["execution_profile"], "unknown")
+        self.assertEqual([row[1] for row in self._journal_trades()], ["open", "close"])
+        self.engine._monitor_positions(now, [residual])
+        self.assertEqual(len(self.provider.close_requests), 2)
+        self.assertNotEqual(first_close,
+                            self.provider.close_requests[-1].client_order_id)
+        self.assertEqual(sum(row[4] or 0 for row in self._journal_trades()),
+                         Decimal("-25"))
+
     def _run_lifecycle(self, *, option=False):
         symbol = "SPY260821C00600000" if option else "SPY"
         quantity = Decimal("1") if option else Decimal("246")

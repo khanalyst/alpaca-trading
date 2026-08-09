@@ -1161,6 +1161,15 @@ class Engine:
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
             "contract_multiplier": plan.get("contract_multiplier", 1),
         }
+        # A newly observed fill may precede the broker position endpoint.  An
+        # explicit false marker lets reconciliation retain that exposure over
+        # repeated empty-position snapshots; legacy trades without this field
+        # keep their historical disappearance behavior.
+        if existing:
+            if "position_confirmed" in existing:
+                trade["position_confirmed"] = existing.get("position_confirmed")
+        else:
+            trade["position_confirmed"] = False
         current.setdefault("active_trades", {})[symbol] = trade
         current.setdefault("protection", {})[symbol] = {
             key: trade.get(key) for key in (
@@ -1340,6 +1349,7 @@ class Engine:
                             "side": "sell" if str(_value(position, "side", "long")).lower()
                             in {"long", "buy"} else "buy",
                             "action": "close", "reason": reason,
+                            "attempt": attempt, "closing_attempt": attempt,
                             "updated_ts": time.time(),
                         }
                         changed = True
@@ -1389,8 +1399,12 @@ class Engine:
             if tif != "day":
                 raise AlpacaError("broker reconciliation found a non-day order")
         current = state.load_state()
+        # Keep an immutable view of the active trades from the start of this
+        # snapshot.  Order fills can activate or update a trade below; using
+        # the live mapping here would make those new fills look like trades
+        # that disappeared from the broker in this same reconciliation.
         previous = current.get("active_trades", {})
-        previous = previous if isinstance(previous, Mapping) else {}
+        previous = deepcopy(previous) if isinstance(previous, Mapping) else {}
         order_state = current.get("orders", {})
         order_state = order_state if isinstance(order_state, dict) else {}
         by_id = {str(getattr(order, "id", "")): order for order in broker_orders
@@ -1413,33 +1427,40 @@ class Engine:
                     if misses >= 3:
                         saved["status"] = "not_found"
                 continue
-            old_status = str(saved.get("status", ""))
-            status = str(getattr(broker_order, "status", old_status) or old_status).lower()
-            filled_qty = self._number(getattr(broker_order, "filled_qty", None)) or 0.0
+            old_status = str(saved.get("status", "")).lower()
+            broker_status = str(getattr(broker_order, "status", old_status) or old_status).lower()
+            broker_filled_qty = self._number(getattr(broker_order, "filled_qty", None)) or 0.0
+            saved_filled_qty = self._number(saved.get("filled_qty")) or 0.0
+            # Filled quantity is durable evidence.  A lagging broker snapshot
+            # may report a smaller quantity than one already observed, but it
+            # must never erase that evidence or duplicate a later increment.
+            filled_qty = max(saved_filled_qty, broker_filled_qty)
             fill_price = self._number(getattr(broker_order, "filled_avg_price", None))
+            saved_fill_price = self._number(saved.get("filled_avg_price"))
             # Broker order snapshots and position snapshots can settle in a
             # different order.  Never regress durable fill evidence to an
             # older accepted/new view returned by a lagging order endpoint.
-            if old_status == "filled" and status != "filled":
+            status = broker_status
+            if old_status in _TERMINAL_ORDER_STATUSES:
+                # Terminal evidence is absorbing across terminal subtypes:
+                # rejected/canceled/expired must not be rewritten as filled
+                # by a later contradictory order snapshot.
                 status = old_status
-                filled_qty = self._number(saved.get("filled_qty")) or filled_qty
-                fill_price = self._number(saved.get("filled_avg_price")) or fill_price
             elif (old_status == "partially_filled" and
-                  status not in _FILLED_ORDER_STATUSES):
+                  broker_status not in _FILLED_ORDER_STATUSES and
+                  broker_status not in _TERMINAL_ORDER_STATUSES):
                 status = old_status
-                filled_qty = max(filled_qty,
-                                 self._number(saved.get("filled_qty")) or 0.0)
-                fill_price = self._number(saved.get("filled_avg_price")) or fill_price
-            elif (old_status in _TERMINAL_ORDER_STATUSES and
-                  status not in _TERMINAL_ORDER_STATUSES):
-                status = old_status
+            if fill_price is None or broker_filled_qty < saved_filled_qty:
+                fill_price = saved_fill_price or fill_price
             saved.update({"status": status, "filled_qty": filled_qty,
                           "filled_avg_price": fill_price, "not_found_count": 0,
                           "updated_ts": time.time()})
             logged_qty = self._number(saved.get("logged_filled_qty")) or 0.0
-            if (filled_qty > 0 and status in _FILLED_ORDER_STATUSES and
-                    saved.get("risk_plan") and
+            if (filled_qty > 0 and saved.get("risk_plan") and
                     (not saved.get("fill_logged") or filled_qty > logged_qty)):
+                # Some broker snapshots expose filled_qty before updating the
+                # order status.  Durable quantity growth is enough evidence
+                # to protect and journal the incremental fill.
                 self._activate_filled_trade(current, saved, filled_qty, fill_price)
             if status != old_status:
                 state.log_order(
@@ -1450,8 +1471,19 @@ class Engine:
 
         pending_by_symbol: dict[str, list[dict]] = {}
         for saved in order_state.values():
-            if isinstance(saved, dict) and saved.get("risk_plan"):
-                pending_by_symbol.setdefault(str(saved.get("symbol", "")).upper(), []).append(saved)
+            if not (isinstance(saved, dict) and saved.get("risk_plan") and
+                    not saved.get("position_closed")):
+                continue
+            status = str(saved.get("status", "")).lower()
+            filled_qty = self._number(saved.get("filled_qty")) or 0.0
+            # A terminal order with no durable fill cannot explain a later
+            # broker position.  Keep accepted/working orders eligible because
+            # the position endpoint may settle before order status, and keep
+            # terminal orders with positive fill evidence eligible for partial
+            # exposure attribution.
+            if status in _TERMINAL_ORDER_STATUSES and filled_qty <= 0:
+                continue
+            pending_by_symbol.setdefault(str(saved.get("symbol", "")).upper(), []).append(saved)
         for rows in pending_by_symbol.values():
             rows.sort(key=lambda item: float(item.get("updated_ts", 0) or 0), reverse=True)
 
@@ -1461,10 +1493,12 @@ class Engine:
             if not symbol:
                 continue
             item = dict(previous.get(symbol, {}))
-            pending = pending_by_symbol.get(symbol, [None])[0]
+            pending = next((row for row in pending_by_symbol.get(symbol, [])
+                            if not row.get("position_closed")), None)
             if not item and isinstance(pending, dict):
-                pending["status"] = "filled"
-                pending["filled_qty"] = self._number(_value(position, "qty", 0)) or 0.0
+                pending["filled_qty"] = max(
+                    self._number(pending.get("filled_qty")) or 0.0,
+                    self._number(_value(position, "qty", 0)) or 0.0)
                 pending["filled_avg_price"] = self._number(
                     _value(position, "avg_entry_price", None))
                 item = self._activate_filled_trade(
@@ -1475,15 +1509,49 @@ class Engine:
                 item = {"symbol": symbol, "underlying_symbol": symbol,
                         "execution_profile": "unknown", "opened_at": time.time(),
                         "status": "unprotected", "risk_usd": 0.0}
+                prior_attempts = [
+                    self._number(saved.get("attempt", saved.get("closing_attempt")))
+                    for saved in order_state.values()
+                    if isinstance(saved, Mapping) and
+                    str(saved.get("symbol", "")).upper() == symbol and
+                    (str(saved.get("action", "")).lower() == "close" or
+                     saved.get("position_closed"))
+                ]
+                prior_attempts = [attempt for attempt in prior_attempts
+                                  if attempt is not None]
+                if prior_attempts:
+                    item["closing_attempt"] = int(max(prior_attempts))
                 self._event("unprotected_position", {"symbol": symbol})
+            unprotected = (str(item.get("status", "")).lower() == "unprotected" or
+                           str(item.get("execution_profile", "")).lower() == "unknown")
             item.update({"symbol": symbol, "qty": str(_value(position, "qty", 0)),
                          "direction": str(_value(position, "side", "long")).lower(),
                          "current_price": str(_value(position, "current_price", "")),
-                         "status": "closing" if item.get("closing_reason") else "open",
+                         "status": ("closing" if item.get("closing_reason") else
+                                    "unprotected" if unprotected else "open"),
+                         "position_confirmed": True,
                          "updated_ts": time.time()})
             active[symbol] = item
+        # Include fill-first trades created earlier in this same reconcile.
+        # Their explicit false marker is the only safe basis for retaining an
+        # exposure that the position endpoint has not confirmed yet.
+        current_active = current.get("active_trades", {})
+        if isinstance(current_active, Mapping):
+            for symbol, fresh in current_active.items():
+                if symbol in active or not isinstance(fresh, Mapping):
+                    continue
+                if fresh.get("position_confirmed") is False:
+                    active[symbol] = dict(fresh)
         for symbol, trade in previous.items():
             if symbol in active or not isinstance(trade, Mapping):
+                continue
+            if trade.get("position_confirmed") is False:
+                # The order endpoint has durable fill evidence, but this
+                # trade has never been confirmed by a position snapshot.
+                # Do not infer a close from an empty position list yet.
+                fresh = current.get("active_trades", {}).get(symbol)
+                if isinstance(fresh, Mapping):
+                    active[symbol] = dict(fresh)
                 continue
             qty = self._number(trade.get("qty")) or 0.0
             entry = self._number(trade.get("entry_price"))
@@ -1509,6 +1577,17 @@ class Engine:
                 variant_id=trade.get("variant_id"), runtime_mode=self.mode,
                 account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
             self._record_edge_outcome(trade, realized, pnl_pct, exit_price)
+            entry_order_id = str(trade.get("order_id") or "")
+            entry_order = order_state.get(entry_order_id)
+            if isinstance(entry_order, dict):
+                closing_attempt = self._number(trade.get("closing_attempt"))
+                prior_attempt = self._number(
+                    entry_order.get("closing_attempt", entry_order.get("attempt")))
+                attempts = [attempt for attempt in (closing_attempt, prior_attempt)
+                            if attempt is not None]
+                entry_order["position_closed"] = True
+                if attempts:
+                    entry_order["closing_attempt"] = int(max(attempts))
             current.setdefault("protection", {}).pop(symbol, None)
         reconciled_at = time.time()
         protection = current.get("protection", {})
