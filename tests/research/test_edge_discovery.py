@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from research import edge_lab, edge_ledger, edge_ledger_store
 from research.edge_lab import DiscoveryError, EdgeLedger, discover
@@ -163,6 +164,254 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                             **base, "opportunity_id": f"invalid-{field}",
                             "net_pnl": 1.0, field: invalid,
                         })
+
+    def test_verified_gate_rejects_malformed_scalars_without_evidence_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="scalar proof",
+                config={})
+            run, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+
+            def rehash(value):
+                value["content_hash"] = content_hash({
+                    key: item for key, item in value.items()
+                    if key != "content_hash"})
+                return value
+
+            malformed = [
+                ("floor count None", lambda value: value["floors"]["fit"].__setitem__(
+                    "trades", None)),
+                ("floor count bool", lambda value: value["floors"]["fit"].__setitem__(
+                    "trades", True)),
+                ("floor minimum huge", lambda value: value["floors"]["fit"]["minimums"].__setitem__(
+                    "trades", 10 ** 4000)),
+                ("floor structural string", lambda value: value["floors"]["fit"][
+                    "structural_checks"].__setitem__("trades", "true")),
+                ("floor required number", lambda value: value["floors"]["fit"].__setitem__(
+                    "required", 1)),
+                ("statistics None", lambda value: value["statistics"].__setitem__(
+                    "p_value", None)),
+                ("statistics bool", lambda value: value["statistics"].__setitem__(
+                    "alpha", True)),
+                ("statistics huge", lambda value: value["statistics"].__setitem__(
+                    "q_value", 10 ** 4000)),
+                ("control delta None", lambda value: value["control"].__setitem__(
+                    "mean_delta", None)),
+                ("control delta string", lambda value: value["control"].__setitem__(
+                    "mean_delta", "bad")),
+                ("matched bool", lambda value: value["control"].__setitem__(
+                    "matched", True)),
+                ("matched huge", lambda value: value["control"].__setitem__(
+                    "matched", 10 ** 4000)),
+                ("performance bool", lambda value: value["performance"].__setitem__(
+                    "heldout_delta", True)),
+                ("performance drawdown negative", lambda value: value["performance"].__setitem__(
+                    "max_drawdown", -1.0)),
+                ("falsification string", lambda value: value["falsification"].__setitem__(
+                    "passes", "yes")),
+            ]
+            for name, mutate in malformed:
+                with self.subTest(name=name):
+                    candidate_gate = json.loads(json.dumps(envelope))
+                    mutate(candidate_gate)
+                    with self.assertRaises(ValueError):
+                        ledger.record_verified_gate(run["run_id"], rehash(candidate_gate))
+                    with closing(sqlite3.connect(ledger.path)) as db:
+                        self.assertEqual(
+                            db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 0)
+
+            for invalid_gate in (None, True, b"gate", []):
+                with self.subTest(gate=type(invalid_gate).__name__), self.assertRaises(
+                        ValueError):
+                    ledger.record_verified_gate(run["run_id"], invalid_gate)
+
+    def test_select_champion_skips_corrupt_scoring_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="corrupt score",
+                config={})
+            candidate_id = candidate["candidate_id"]
+            _persist_gate(ledger, candidate_id, "backtest")
+            ledger.transition(candidate_id, "backtest_passed", reason="backtest proof")
+            run, envelope = _persist_gate(ledger, candidate_id, "shadow")
+            ledger.transition(candidate_id, "shadow", reason="shadow proof")
+            ledger.transition(candidate_id, "validated", reason="validated proof")
+            malformed = json.loads(json.dumps(envelope))
+            malformed["performance"]["heldout_delta"] = True
+            with mock.patch.object(ledger, "_latest_verified_gate",
+                                   return_value=(run, malformed)):
+                self.assertIsNone(ledger.select_champion(
+                    vehicle="equity", min_confidence=.9))
+
+    def test_failed_verified_gate_rejects_malformed_control_and_proof_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="failed scalar proof",
+                config={})
+            run, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", passes=False,
+                record=False)
+
+            def rehash(value):
+                value["content_hash"] = content_hash({
+                    key: item for key, item in value.items()
+                    if key != "content_hash"})
+                return value
+
+            def remove(mapping, key):
+                mapping.pop(key, None)
+
+            malformed = [
+                ("matched None", lambda value: value["control"].__setitem__(
+                    "matched", None)),
+                ("matched bool", lambda value: value["control"].__setitem__(
+                    "matched", True)),
+                ("actual control missing", lambda value: remove(
+                    value["control"], "actual_control")),
+                ("available missing", lambda value: remove(
+                    value["control"], "available")),
+                ("falsification missing", lambda value: remove(
+                    value, "falsification")),
+                ("falsification scalar", lambda value: value.__setitem__(
+                    "falsification", "bad")),
+                ("falsification pass missing", lambda value: remove(
+                    value["falsification"], "passes")),
+                ("separation missing", lambda value: remove(value, "separation")),
+                ("separation scalar", lambda value: value.__setitem__(
+                    "separation", 1)),
+                ("separation pass missing", lambda value: remove(
+                    value["separation"], "passes")),
+            ]
+            for name, mutate in malformed:
+                with self.subTest(name=name):
+                    candidate_gate = json.loads(json.dumps(envelope))
+                    mutate(candidate_gate)
+                    with self.assertRaises(ValueError):
+                        ledger.record_verified_gate(run["run_id"], rehash(candidate_gate))
+                    with closing(sqlite3.connect(ledger.path)) as db:
+                        self.assertEqual(
+                            db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 0)
+
+    def test_failed_zero_match_gate_with_none_delta_reverifies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="no control proof",
+                config={})
+            run, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", passes=False,
+                record=False)
+            envelope["control"].update({
+                "matched": 0, "available": False, "mean_delta": None,
+            })
+            envelope["checks"]["heldout_delta_positive"] = False
+            envelope["performance"]["heldout_delta"] = None
+            envelope["content_hash"] = content_hash({
+                key: item for key, item in envelope.items()
+                if key != "content_hash"})
+            ledger.record_verified_gate(run["run_id"], envelope)
+            proof = ledger.latest_verified_run(candidate["candidate_id"], lane="backtest")
+            self.assertIsNotNone(proof)
+            self.assertIsNone(proof["verified_gate"]["control"]["mean_delta"])
+            self.assertIsNone(proof["verified_gate"]["performance"]["heldout_delta"])
+
+    def test_none_delta_is_rejected_for_contradictory_gate_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="contradictory proof",
+                config={})
+
+            def rehash(value):
+                value["content_hash"] = content_hash({
+                    key: item for key, item in value.items()
+                    if key != "content_hash"})
+                return value
+
+            malformed = [
+                ("matched positive", lambda value: value["control"].__setitem__(
+                    "matched", 1)),
+                ("control available", lambda value: value["control"].__setitem__(
+                    "available", True)),
+                ("heldout check positive", lambda value: value["checks"].__setitem__(
+                    "heldout_delta_positive", True)),
+                ("control delta missing", lambda value: value["control"].pop(
+                    "mean_delta", None)),
+                ("performance delta missing", lambda value: value["performance"].pop(
+                    "heldout_delta", None)),
+                ("performance drawdown missing", lambda value: value["performance"].pop(
+                    "max_drawdown", None)),
+                ("performance string", lambda value: value["performance"].__setitem__(
+                    "heldout_delta", "bad")),
+            ]
+            for name, mutate in malformed:
+                with self.subTest(name=name):
+                    run, envelope = _persist_gate(
+                        ledger, candidate["candidate_id"], "backtest", passes=False,
+                        record=False)
+                    envelope["control"].update({
+                        "matched": 0, "available": False, "mean_delta": None,
+                    })
+                    envelope["checks"]["heldout_delta_positive"] = False
+                    envelope["performance"]["heldout_delta"] = None
+                    mutate(envelope)
+                    with self.assertRaises(ValueError):
+                        ledger.record_verified_gate(run["run_id"], rehash(envelope))
+                    with closing(sqlite3.connect(ledger.path)) as db:
+                        self.assertEqual(
+                            db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 0)
+
+    def test_paper_outcomes_reject_malformed_input_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="paper scalar",
+                config={})
+            invalid = [
+                None, True, b"outcome", bytearray(b"outcome"),
+                {"net_pnl": True, "risk_usd": 1},
+                {"net_pnl": b"1", "risk_usd": 1},
+                {"net_pnl": 10 ** 10000, "risk_usd": 1},
+                {"net_pnl": 1, "risk_usd": 10 ** 10000},
+                {"net_pnl": 1, "risk_usd": 0},
+                {"net_pnl": 1, "risk_usd": float("inf")},
+            ]
+            for value in invalid:
+                with self.subTest(value=type(value).__name__), self.assertRaisesRegex(
+                        ValueError, "paper outcome requires finite net_pnl and positive risk_usd"):
+                    ledger.ingest_paper_outcome(candidate["candidate_id"], value)
+            with closing(sqlite3.connect(ledger.path)) as db:
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM paper_outcomes").fetchone()[0], 0)
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM events").fetchone()[0], 1)
+
+    def test_paper_replay_skips_malformed_persisted_r_multiple(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="paper replay",
+                config={})
+            candidate_id = candidate["candidate_id"]
+            malformed = (True, [], 10 ** 4000)
+            with closing(sqlite3.connect(ledger.path)) as db, db:
+                for index, value in enumerate(malformed):
+                    db.execute(
+                        "INSERT INTO paper_outcomes "
+                        "(outcome_id,candidate_id,vehicle,opportunity_id,session_date,net_pnl,outcome_json,created_at) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (f"legacy-{index}", candidate_id, "equity", f"legacy-{index}",
+                         "2024-01-01", 0.0, json.dumps({"r_multiple": value}), index))
+            result = ledger.ingest_paper_outcome(candidate_id, {
+                "vehicle": "equity", "opportunity_id": "paper-valid",
+                "net_pnl": 1, "risk_usd": 10,
+            })
+            self.assertEqual(result["rolling_outcomes"], 1)
+            self.assertEqual(result["rolling_r"], .1)
 
     def test_paper_outcomes_demote_a_champion_that_breaks_the_rolling_guard(self):
         with tempfile.TemporaryDirectory() as directory:

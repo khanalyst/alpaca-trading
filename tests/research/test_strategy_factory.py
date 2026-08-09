@@ -106,7 +106,8 @@ def persist_rule_gate(ledger, candidate_id, lane):
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_floor=fit_floor, heldout_floor=held_floor,
-        control={"actual_control": True, "available": True, "matched": 2},
+        control={"actual_control": True, "available": True, "matched": 2,
+                 "mean_delta": 1.0},
         p_value=.01, q_value=.01, alpha=.05,
         falsification={"passes": True}, separation=separation,
         checks={"family_fdr_significant": True}, passes=True,

@@ -20,6 +20,28 @@ from .edge_ledger_store import (
 from .gates import sample_counts, verify_gate_envelope
 
 
+def _finite_number(value: Any) -> float | None:
+    """Return a finite numeric value, rejecting JSON scalar impostors."""
+    if isinstance(value, (bool, bytes, bytearray, str)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _nonnegative_integer(value: Any) -> int | None:
+    """Return a finite, integer-valued, non-negative number or ``None``."""
+    number = _finite_number(value)
+    if number is None or number < 0 or not number.is_integer():
+        return None
+    try:
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class EdgeLedger:
     """SQLite-backed ledger; methods never mutate an experiment row."""
 
@@ -212,12 +234,17 @@ class EdgeLedger:
 
     def record_verified_gate(self, run_id: str, gate: Mapping) -> dict:
         """Persist a gate only after its envelope agrees with durable run trades."""
+        if not isinstance(gate, Mapping):
+            raise ValueError("verified gate envelope/hash is invalid")
+        nested = gate.get("verified_gate")
+        if "verified_gate" in gate and not isinstance(nested, Mapping):
+            raise ValueError("verified gate envelope/hash is invalid")
+        envelope = nested if isinstance(nested, Mapping) else gate
+        if not isinstance(envelope, Mapping) or not verify_gate_envelope(envelope):
+            raise ValueError("verified gate envelope/hash is invalid")
         run = self.run(run_id)
         if run is None:
             raise KeyError(run_id)
-        envelope = gate.get("verified_gate") if isinstance(gate.get("verified_gate"), Mapping) else gate
-        if not isinstance(envelope, Mapping) or not verify_gate_envelope(envelope):
-            raise ValueError("verified gate envelope/hash is invalid")
         error = self._gate_envelope_error(run, envelope)
         if error:
             raise ValueError(error)
@@ -277,79 +304,151 @@ class EdgeLedger:
         }
         if expected != actual:
             return "verified gate counts do not match persisted trades"
-        floors = envelope.get("floors") or {}
+        floors = envelope.get("floors")
+        if not isinstance(floors, Mapping):
+            return "verified gate floor report is missing"
         for name in ("fit", "heldout"):
             report = floors.get(name)
             if not isinstance(report, Mapping):
                 return "verified gate floor report is missing"
             counts = actual[name]
-            if any(int(report.get(key, -1)) != int(counts[key])
-                   for key in ("trades", "sessions", "clusters")):
+            reported_counts = {
+                key: _nonnegative_integer(report.get(key))
+                for key in ("trades", "sessions", "clusters")
+            }
+            if (any(value is None for value in reported_counts.values()) or
+                    any(reported_counts[key] != counts[key]
+                        for key in ("trades", "sessions", "clusters"))):
                 return "verified gate floor report does not match persisted trades"
             structural = report.get("structural_checks")
             minimums = report.get("minimums")
             if (not isinstance(structural, Mapping) or
                     set(structural) != {"trades", "sessions", "clusters"} or
+                    not all(isinstance(value, bool) for value in structural.values()) or
                     not isinstance(minimums, Mapping) or
                     set(minimums) != {"trades", "sessions", "clusters"}):
                 return "verified gate structural floor checks are missing"
-            try:
-                expected_checks = {key: counts[key] >= int(minimums[key])
-                                   for key in ("trades", "sessions", "clusters")}
-            except (TypeError, ValueError):
+            normalized_minimums = {
+                key: _nonnegative_integer(minimums.get(key))
+                for key in ("trades", "sessions", "clusters")
+            }
+            if any(value is None for value in normalized_minimums.values()):
                 return "verified gate structural floor checks are invalid"
+            expected_checks = {
+                key: counts[key] >= normalized_minimums[key]
+                for key in ("trades", "sessions", "clusters")
+            }
             if dict(structural) != expected_checks:
                 return "verified gate structural floor checks are inconsistent"
             structural_passes = all(bool(value) for value in structural.values())
-            required = bool(report.get("required", True))
-            if bool(report.get("structural_passes")) != structural_passes:
+            required = report.get("required")
+            if not isinstance(required, bool):
                 return "verified gate structural floor result is inconsistent"
-            if bool(report.get("adequate")) != (structural_passes if required else True):
+            reported_structural_passes = report.get("structural_passes")
+            reported_adequate = report.get("adequate")
+            if (not isinstance(reported_structural_passes, bool) or
+                    not isinstance(reported_adequate, bool)):
+                return "verified gate structural floor result is inconsistent"
+            if reported_structural_passes != structural_passes:
+                return "verified gate structural floor result is inconsistent"
+            if reported_adequate != (structural_passes if required else True):
                 return "verified gate adequacy result is inconsistent"
         checks = envelope.get("checks")
         if not isinstance(checks, Mapping) or not checks:
             return "verified gate decision checks are missing"
-        if bool(envelope.get("passes")) != all(bool(value) for value in checks.values()):
+        if not all(isinstance(value, bool) for value in checks.values()):
+            return "verified gate decision checks are invalid"
+        if envelope.get("passes") != all(checks.values()):
             return "verified gate pass decision is inconsistent"
-        statistics = envelope.get("statistics") or {}
-        try:
-            p_value = float(statistics["p_value"])
-            q_value = float(statistics["q_value"])
-            alpha = float(statistics["alpha"])
-        except (KeyError, TypeError, ValueError):
+        statistics = envelope.get("statistics")
+        if not isinstance(statistics, Mapping):
+            return "verified gate p/q evidence is invalid"
+        p_value = _finite_number(statistics.get("p_value"))
+        q_value = _finite_number(statistics.get("q_value"))
+        alpha = _finite_number(statistics.get("alpha"))
+        if p_value is None or q_value is None or alpha is None:
             return "verified gate p/q evidence is invalid"
         if not (0.0 <= p_value <= 1.0 and 0.0 <= q_value <= 1.0 and 0.0 < alpha <= 1.0):
             return "verified gate p/q evidence is invalid"
         if "family_fdr_significant" in checks and \
                 bool(checks["family_fdr_significant"]) != (q_value <= alpha):
             return "verified gate FDR decision is inconsistent"
-        control = envelope.get("control") or {}
+        control = envelope.get("control")
+        if not isinstance(control, Mapping):
+            return "verified gate control decision is inconsistent"
+        if (not all(key in control for key in ("actual_control", "available", "matched")) or
+                not isinstance(control["actual_control"], bool) or
+                not isinstance(control["available"], bool)):
+            return "verified gate control decision is inconsistent"
+        matched = _nonnegative_integer(control.get("matched"))
+        if matched is None:
+            return "verified gate control decision is inconsistent"
+        for key in ("actual_control", "available"):
+            if key in control and not isinstance(control[key], bool):
+                return "verified gate control decision is inconsistent"
         if "actual_control_available" in checks and bool(checks["actual_control_available"]) != bool(
                 control.get("actual_control") is True and control.get("available") is True):
             return "verified gate control decision is inconsistent"
+        no_control_failure = (
+            matched == 0 and control["available"] is False and
+            envelope.get("passes") is False and
+            checks.get("heldout_delta_positive") is False)
+        if "mean_delta" not in control:
+            return "verified gate control delta decision is inconsistent"
+        delta = _finite_number(control.get("mean_delta"))
+        if control.get("mean_delta") is None and not no_control_failure:
+            return "verified gate control delta decision is inconsistent"
+        if control.get("mean_delta") is not None and delta is None:
+            return "verified gate control delta decision is inconsistent"
         if "heldout_delta_positive" in checks:
-            delta = control.get("mean_delta")
-            positive = delta is not None and float(delta) > 0
+            if delta is None and not no_control_failure:
+                return "verified gate control delta decision is inconsistent"
+            positive = delta is not None and delta > 0
             if bool(checks["heldout_delta_positive"]) != positive:
                 return "verified gate control delta decision is inconsistent"
         if "heldout_p_significant" in checks and \
                 bool(checks["heldout_p_significant"]) != (p_value <= alpha):
             return "verified gate raw p decision is inconsistent"
-        if "falsification" in checks and bool(checks["falsification"]) != bool(
-                (envelope.get("falsification") or {}).get("passes")):
+        falsification = envelope.get("falsification")
+        if (not isinstance(falsification, Mapping) or
+                not isinstance(falsification.get("passes"), bool)):
             return "verified gate falsification decision is inconsistent"
-        if "separated" in checks and bool(checks["separated"]) != bool(
-                (envelope.get("separation") or {}).get("passes")):
+        if "falsification" in checks:
+            if not isinstance(falsification, Mapping):
+                return "verified gate falsification decision is inconsistent"
+            if bool(checks["falsification"]) != bool(falsification.get("passes")):
+                return "verified gate falsification decision is inconsistent"
+        separation = envelope.get("separation")
+        if (not isinstance(separation, Mapping) or
+                not isinstance(separation.get("passes"), bool)):
             return "verified gate separation decision is inconsistent"
+        if "separated" in checks:
+            if not isinstance(separation, Mapping):
+                return "verified gate separation decision is inconsistent"
+            if bool(checks["separated"]) != bool(separation.get("passes")):
+                return "verified gate separation decision is inconsistent"
         if envelope.get("passes"):
-            control = envelope.get("control") or {}
             if not (control.get("actual_control") is True and control.get("available") is True and
-                    int(control.get("matched", 0)) > 0):
+                    matched is not None and matched > 0):
                 return "passing verified gate lacks an actual matched control"
-            if not bool((envelope.get("falsification") or {}).get("passes")):
+            if not isinstance(falsification, Mapping) or not bool(falsification.get("passes")):
                 return "passing verified gate lacks a passing falsification"
-            if not bool((envelope.get("separation") or {}).get("passes")):
+            if not isinstance(separation, Mapping) or not bool(separation.get("passes")):
                 return "passing verified gate lacks fit/heldout separation"
+        performance = envelope.get("performance")
+        if not isinstance(performance, Mapping):
+            return "verified gate performance evidence is invalid"
+        if not all(key in performance for key in ("heldout_delta", "max_drawdown")):
+            return "verified gate performance evidence is invalid"
+        heldout_delta = _finite_number(performance.get("heldout_delta"))
+        max_drawdown = _finite_number(performance.get("max_drawdown"))
+        if (performance.get("heldout_delta") is None and no_control_failure):
+            heldout_delta = None
+        elif heldout_delta is None:
+            return "verified gate performance evidence is invalid"
+        if (max_drawdown is None or
+                max_drawdown < 0):
+            return "verified gate performance evidence is invalid"
         return None
 
     def _latest_verified_gate(self, candidate_id: str) -> tuple[dict, dict]:
@@ -552,21 +651,35 @@ class EdgeLedger:
         for candidate in eligible:
             try:
                 run, gate = self._latest_verified_gate(candidate["candidate_id"])
-            except ValueError:
+            except (TypeError, ValueError, OverflowError):
                 continue
-            if run["lane"] != "shadow" or gate.get("passes") is not True:
+            if (not isinstance(run, Mapping) or not isinstance(gate, Mapping) or
+                    run.get("lane") != "shadow" or gate.get("passes") is not True):
                 continue
             # Conservative ranking: held-out lower confidence bound first,
             # then drawdown and sample size.  No metric can cross vehicles.
-            statistics = gate.get("statistics") or {}
-            performance = gate.get("performance") or {}
-            held_counts = ((gate.get("counts") or {}).get("heldout") or {})
-            confidence = 1.0 - float(statistics.get("q_value", 1.0) or 1.0)
+            statistics = gate.get("statistics")
+            performance = gate.get("performance")
+            counts = gate.get("counts")
+            if (not isinstance(statistics, Mapping) or
+                    not isinstance(performance, Mapping) or
+                    not isinstance(counts, Mapping)):
+                continue
+            held_counts = counts.get("heldout")
+            if not isinstance(held_counts, Mapping):
+                continue
+            q_value = _finite_number(statistics.get("q_value"))
+            heldout_delta = _finite_number(performance.get("heldout_delta"))
+            max_drawdown = _finite_number(performance.get("max_drawdown"))
+            heldout_trades = _nonnegative_integer(held_counts.get("trades"))
+            if (q_value is None or not 0.0 <= q_value <= 1.0 or
+                    heldout_delta is None or max_drawdown is None or
+                    max_drawdown < 0 or heldout_trades is None):
+                continue
+            confidence = 1.0 - q_value
             if confidence < min_confidence:
                 continue
-            scored.append((float(performance.get("heldout_delta", -float("inf"))),
-                           -float(performance.get("max_drawdown", float("inf"))),
-                           int(held_counts.get("trades", 0)), candidate))
+            scored.append((heldout_delta, -max_drawdown, heldout_trades, candidate))
         if not scored:
             return None
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
@@ -587,18 +700,32 @@ class EdgeLedger:
         candidate = self.candidate(candidate_id)
         if candidate is None:
             raise KeyError(candidate_id)
+        error = "paper outcome requires finite net_pnl and positive risk_usd"
+        if not isinstance(outcome, Mapping):
+            raise ValueError(error)
         vehicle = str(outcome.get("vehicle") or candidate["vehicle"])
         if vehicle != candidate["vehicle"]:
             raise ValueError("paper outcome vehicle differs from candidate")
         opportunity = str(outcome.get("opportunity_id") or outcome.get("entry_timestamp") or uuid.uuid4().hex)
+        net_source = outcome.get("net_pnl")
+        risk_source = outcome.get("risk_usd")
+        if (isinstance(net_source, (bool, bytes, bytearray)) or
+                isinstance(risk_source, (bool, bytes, bytearray))):
+            raise ValueError(error)
         try:
-            net = float(outcome["net_pnl"])
-            risk_usd = float(outcome["risk_usd"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("paper outcome requires finite net_pnl and positive risk_usd") from exc
+            net = float(net_source)
+            risk_usd = float(risk_source)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(error) from exc
         if not (math.isfinite(net) and math.isfinite(risk_usd) and risk_usd > 0):
-            raise ValueError("paper outcome requires finite net_pnl and positive risk_usd")
-        normalized = {**dict(outcome), "r_multiple": net / risk_usd,
+            raise ValueError(error)
+        try:
+            r_multiple = net / risk_usd
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
+            raise ValueError(error) from exc
+        if not math.isfinite(r_multiple):
+            raise ValueError(error)
+        normalized = {**dict(outcome), "r_multiple": r_multiple,
                       "net_pnl": net, "risk_usd": risk_usd}
         oid = uuid.uuid4().hex
         with closing(_connect(self.path)) as db, db:
@@ -619,11 +746,14 @@ class EdgeLedger:
         r_values = []
         for row in rows:
             try:
-                value = json.loads(row["outcome_json"]).get("r_multiple")
-                number = float(value)
-                if number == number and abs(number) != float("inf"):
+                payload = json.loads(row["outcome_json"])
+                if not isinstance(payload, Mapping):
+                    continue
+                value = payload.get("r_multiple")
+                number = _finite_number(value)
+                if number is not None:
                     r_values.append(number)
-            except (TypeError, ValueError, json.JSONDecodeError):
+            except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
                 continue
         recent_r = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
         automatic_guard = (
