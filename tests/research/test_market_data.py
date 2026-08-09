@@ -1,11 +1,17 @@
 from datetime import datetime, timezone
+from decimal import Decimal
 import unittest
 
 from research.market_data import (
+    EventIdentity,
     NormalizationError,
+    OptionContract,
+    UnderlyingBar,
     normalize_option_contract,
+    normalize_option_snapshot,
     normalize_quote,
     normalize_underlying_bar,
+    parse_timestamp,
 )
 
 
@@ -68,3 +74,90 @@ class MarketDataNormalizationTests(unittest.TestCase):
         self.assertEqual(contract.right, "call")
         self.assertEqual(contract.multiplier, 100)
 
+    def test_crypto_and_unknown_asset_classes_are_rejected(self):
+        base = {
+            "symbol": "BTC/USD", "timestamp": "2024-01-02T14:30:00Z",
+            "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 1,
+            "provider": "alpaca", "feed": "iex",
+        }
+        with self.assertRaisesRegex(NormalizationError, "slash pair"):
+            normalize_underlying_bar(base)
+        base["symbol"] = "SPY"
+        base["asset_class"] = "crypto"
+        with self.assertRaisesRegex(NormalizationError, "crypto"):
+            normalize_underlying_bar(base)
+        base["asset_class"] = "unknown"
+        with self.assertRaisesRegex(NormalizationError, "unsupported asset class"):
+            normalize_underlying_bar(base)
+
+    def test_option_contract_requires_listed_occ_identity(self):
+        payload = {
+            "symbol": "SPY-CALL", "underlying": "SPY",
+            "expiration": "2024-01-19", "strike": 500, "right": "C",
+            "provider": "alpaca", "feed": "opra",
+        }
+        with self.assertRaisesRegex(NormalizationError, "OCC"):
+            normalize_option_contract(payload)
+        payload.update(symbol="BTC/USD", underlying="BTC/USD")
+        with self.assertRaisesRegex(NormalizationError, "slash pair"):
+            normalize_option_contract(payload)
+
+    def test_timestamp_parser_wraps_boolean_and_nonfinite_inputs(self):
+        for value in (True, False, float("nan"), float("inf"), Decimal("NaN")):
+            with self.subTest(value=value):
+                with self.assertRaises(NormalizationError):
+                    parse_timestamp(value)
+
+    def test_direct_bar_constructor_still_fails_closed(self):
+        identity = EventIdentity(
+            provider="alpaca", feed="iex",
+            as_of=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+            observed_at=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+            session_date=datetime(2024, 1, 2).date())
+        with self.assertRaisesRegex(NormalizationError, "timezone"):
+            UnderlyingBar("SPY", datetime(2024, 1, 2, 14, 30),
+                          1, 2, 1, 1.5, 10, identity)
+        with self.assertRaisesRegex(NormalizationError, "finite"):
+            UnderlyingBar("SPY", datetime(2024, 1, 2, 14, 30,
+                                           tzinfo=timezone.utc),
+                          1, 2, 1, float("nan"), 10, identity)
+
+    def test_supplied_option_contract_does_not_bypass_payload_scope(self):
+        contract = OptionContract(
+            symbol="SPY240119C00500000", underlying="SPY",
+            expiration=datetime(2024, 1, 19).date(), strike=500,
+            right="call", multiplier=100, currency="USD",
+            provider="alpaca", feed="opra")
+        payload = {
+            "timestamp": "2024-01-02T14:30:00Z", "bid": 1, "ask": 1.1,
+            "asset_class": "crypto", "symbol": "BTC/USD",
+            "provider": "alpaca", "feed": "opra",
+        }
+        with self.assertRaisesRegex(NormalizationError, "crypto"):
+            normalize_option_snapshot(payload, contract=contract)
+
+    def test_option_multiplier_errors_use_normalization_contract(self):
+        with self.assertRaisesRegex(NormalizationError, "multiplier"):
+            normalize_option_contract({
+                "symbol": "SPY240119C00500000", "underlying": "SPY",
+                "expiration": "2024-01-19", "strike": 500, "right": "C",
+                "multiplier": "many", "provider": "alpaca", "feed": "opra",
+            })
+
+    def test_option_occ_identity_matches_expiration_and_strike(self):
+        base = {
+            "symbol": "SPY240119C00500000", "underlying": "SPY",
+            "expiration": "2024-01-20", "strike": 500, "right": "C",
+            "provider": "alpaca", "feed": "opra",
+        }
+        with self.assertRaisesRegex(NormalizationError, "expiration"):
+            normalize_option_contract(base)
+        base.update(expiration="2024-01-19", strike=501)
+        with self.assertRaisesRegex(NormalizationError, "strike"):
+            normalize_option_contract(base)
+        with self.assertRaisesRegex(NormalizationError, "expiration"):
+            OptionContract(
+                symbol="SPY240119C00500000", underlying="SPY",
+                expiration=datetime(2024, 1, 20).date(), strike=500,
+                right="call", multiplier=100, currency="USD",
+                provider="alpaca", feed="opra")

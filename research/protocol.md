@@ -1,6 +1,7 @@
 # Research protocol
 
-The research boundary is normalized, point-in-time market data. Provider
+The research boundary is normalized, point-in-time market data for US-listed
+equities/ETFs and listed OCC options only. Provider
 payloads are converted to `research.market_data` records before feature
 calculation or replay. An event is eligible only when its `as_of` timestamp is
 no later than its observation timestamp and no later than the decision cutoff.
@@ -44,6 +45,9 @@ the finite, validated data-only grammar in `agent/contracts/rule.py`; generated
 variant ids are content hashes of those specifications. Arbitrary source code
 or unbounded fields are rejected. `agent.edge` resolves only a SQLite candidate
 whose status is `validated` or `champion` for the configured strategy/vehicle.
+Paper `selection_mode: all_proved` may run one strongest passing variant per
+independent family under one global risk book; live mode must pin one named
+variant with `selection_mode: specific`.
 
 Backtests and forward-shadow runs are persisted with immutable hashes and
 trade/evidence rows. The autonomous lane first evaluates the initial corpus as
@@ -53,9 +57,9 @@ evidence. Passing gates advance `candidate` -> `backtest_passed` -> `shadow` ->
 blocked until a validated/champion record exists for the selected vehicle.
 A candidate cannot skip the lifecycle or silently move backwards. Paper
 outcomes are append-only and may demote a champion. Normal operation needs no
-manual promotion; explicit `edge promote`/rollback commands are supported only
-as audited controls subject to lifecycle/evidence rules. Demote, retire, and
-rollback are operator safety actions.
+manual promotion. Explicit `edge promote` is supported only as an audited
+control subject to lifecycle/evidence rules. Backward rollback is rejected;
+explicit demotion is the operator safety action.
 
 Factory mutations may inspect only the chronological fit partition. Held-out
 and later-forward sessions must not influence hypothesis or parameter
@@ -65,8 +69,20 @@ replacement hypothesis may be generated only after the root family has an
 adequate trade/session sample and no variant passes; underpowered data must not
 cause autonomous hypothesis churn.
 
-Each transition requires a chronological fit/held-out boundary, minimum trades
-and sessions in each window, matched baseline deltas, cluster-level sign
-randomisation, family-level false-discovery correction, and a
-placebo/falsification comparison. Drawdown is persisted and used to rank
+Each transition requires a chronological fit/held-out boundary, fit and
+held-out structural floors for trades/sessions/clusters, matched baseline
+deltas, cluster-level sign randomisation, family-level false-discovery
+correction, and a placebo/falsification comparison. The complete gate is
+durably persisted and re-verified before validation or champion selection.
+Underpowered data is not failure. Retirement is permitted only after every
+intended variant is adequately tested and fails; an enabled LLM lane must first
+register a valid bounded replacement. Drawdown is persisted and used to rank
 otherwise qualified champions conservatively.
+
+The checked research config enables the bounded strategy LLM with model
+`gpt-5`. It reads only the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing
+or invalid credentials/output leave a pending replacement and cannot trigger
+premature retirement. Good edges produce deterministic content-addressed
+findings, with an optional HTTPS webhook notification. Scheduled cycles report
+`completed`, `completed_no_edge`, `no_data`, or `failed`; no status bypasses the
+runtime edge gate.

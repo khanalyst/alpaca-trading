@@ -13,6 +13,7 @@ from contextlib import closing
 from datetime import date, datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -20,9 +21,12 @@ from typing import Any, Mapping, Sequence
 import uuid
 from zoneinfo import ZoneInfo
 
-from .gates import (AcceptanceFloor, chronological_split, falsification_gate,
-                    heldout_separation, max_drawdown_of, paired_delta)
-from .stats import benjamini_hochberg, paired_cluster_sign_flip
+from .gates import (chronological_split, deterministic_placebo_deltas,
+                    falsification_gate, heldout_separation,
+                    matched_cluster_test, max_drawdown_of, paired_delta,
+                    sample_counts, structural_floor, verified_gate_envelope,
+                    verify_gate_envelope)
+from .stats import benjamini_hochberg
 from .ibr import IBRConfig, replay_ibr
 from .market_data import (OptionSnapshot, UnderlyingBar,
                           normalize_option_snapshot, normalize_underlying_bar)
@@ -35,7 +39,7 @@ CANDIDATE, BACKTEST_PASSED, SHADOW, VALIDATED, CHAMPION, RETIRED, DEMOTED = LIFE
 DEFAULT_DB_PATH = Path(os.getenv(
     "ALPACA_EDGE_DB",
     str(Path(__file__).resolve().parents[1] / "runtime" / "research" / "edge_lab.sqlite3")))
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 
@@ -183,6 +187,8 @@ def init_ledger(path: str | Path = DEFAULT_DB_PATH) -> dict:
             CREATE INDEX IF NOT EXISTS runs_candidate ON runs(candidate_id, created_at);
             CREATE INDEX IF NOT EXISTS trades_candidate ON trades(candidate_id, vehicle, session_date);
             CREATE INDEX IF NOT EXISTS events_candidate ON events(candidate_id, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS evidence_verified_gate_run
+                ON evidence(run_id) WHERE kind='verified_gate';
             CREATE TRIGGER IF NOT EXISTS candidates_no_update BEFORE UPDATE ON candidates BEGIN
                 SELECT RAISE(ABORT, 'candidates are immutable');
             END;
@@ -388,6 +394,8 @@ class EdgeLedger:
 
     def append_evidence(self, candidate_id: str, kind: str, payload: Any,
                         *, run_id: str | None = None) -> dict:
+        if str(kind) == "verified_gate":
+            raise ValueError("verified_gate evidence must be recorded through record_verified_gate")
         if self.candidate(candidate_id) is None:
             raise KeyError(candidate_id)
         if run_id is not None:
@@ -404,6 +412,173 @@ class EdgeLedger:
                 (eid, candidate_id, run_id, str(kind), _json(payload), content_hash(payload), _utc()))
             row = db.execute("SELECT * FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
         return _row(row) or {}
+
+    def record_verified_gate(self, run_id: str, gate: Mapping) -> dict:
+        """Persist a gate only after its envelope agrees with durable run trades."""
+        run = self.run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        envelope = gate.get("verified_gate") if isinstance(gate.get("verified_gate"), Mapping) else gate
+        if not isinstance(envelope, Mapping) or not verify_gate_envelope(envelope):
+            raise ValueError("verified gate envelope/hash is invalid")
+        error = self._gate_envelope_error(run, envelope)
+        if error:
+            raise ValueError(error)
+        payload = {"run_id": run_id, "candidate_id": run["candidate_id"],
+                   "lane": run["lane"], "vehicle": run["vehicle"],
+                   "gate_hash": envelope["content_hash"],
+                   "gate": dict(envelope)}
+        eid = uuid.uuid4().hex
+        with closing(_connect(self.path)) as db, db:
+            existing = db.execute(
+                "SELECT 1 FROM evidence WHERE run_id=? AND kind='verified_gate' LIMIT 1",
+                (run_id,)).fetchone()
+            if existing is not None:
+                raise ValueError("run already has immutable verified gate evidence")
+            db.execute("""INSERT INTO evidence
+                (evidence_id,candidate_id,run_id,kind,payload_json,evidence_hash,created_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (eid, run["candidate_id"], run_id, "verified_gate", _json(payload),
+                 content_hash(payload), _utc()))
+            row = db.execute("SELECT * FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
+        return _row(row) or {}
+
+    def _gate_envelope_error(self, run: Mapping, envelope: Mapping) -> str | None:
+        if envelope.get("lane") != run.get("lane") or envelope.get("vehicle") != run.get("vehicle"):
+            return "verified gate lane/vehicle does not match the persisted run"
+        with closing(_connect(self.path)) as db:
+            durable = db.execute(
+                "SELECT payload_json FROM trades WHERE run_id=? ORDER BY session_date,trade_id",
+                (run["run_id"],)).fetchall()
+        rows = []
+        for item in durable:
+            try:
+                payload = json.loads(item["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                return "persisted trade payload is invalid"
+            if not isinstance(payload, Mapping):
+                return "persisted trade payload is invalid"
+            rows.append(payload)
+        if run["lane"] == "shadow":
+            fit_rows, heldout_rows = [], rows
+        else:
+            fit_end = run.get("fit_end")
+            held_start = run.get("heldout_start")
+            if not fit_end or not held_start or str(fit_end) >= str(held_start):
+                return "persisted run does not have a separated fit/heldout boundary"
+            fit_rows = [row for row in rows
+                        if str(row.get("session_date") or row.get("entry_timestamp") or "") <= str(fit_end)]
+            heldout_rows = [row for row in rows
+                            if str(row.get("session_date") or row.get("entry_timestamp") or "") >= str(held_start)]
+            if len(fit_rows) + len(heldout_rows) != len(rows):
+                return "persisted trades do not fit the recorded chronological boundary"
+        expected = envelope.get("counts") or {}
+        actual = {
+            "fit": sample_counts(fit_rows, vehicle=run["vehicle"]),
+            "heldout": sample_counts(heldout_rows, vehicle=run["vehicle"]),
+            "total": sample_counts(rows, vehicle=run["vehicle"]),
+        }
+        if expected != actual:
+            return "verified gate counts do not match persisted trades"
+        floors = envelope.get("floors") or {}
+        for name in ("fit", "heldout"):
+            report = floors.get(name)
+            if not isinstance(report, Mapping):
+                return "verified gate floor report is missing"
+            counts = actual[name]
+            if any(int(report.get(key, -1)) != int(counts[key])
+                   for key in ("trades", "sessions", "clusters")):
+                return "verified gate floor report does not match persisted trades"
+            structural = report.get("structural_checks")
+            minimums = report.get("minimums")
+            if (not isinstance(structural, Mapping) or
+                    set(structural) != {"trades", "sessions", "clusters"} or
+                    not isinstance(minimums, Mapping) or
+                    set(minimums) != {"trades", "sessions", "clusters"}):
+                return "verified gate structural floor checks are missing"
+            try:
+                expected_checks = {key: counts[key] >= int(minimums[key])
+                                   for key in ("trades", "sessions", "clusters")}
+            except (TypeError, ValueError):
+                return "verified gate structural floor checks are invalid"
+            if dict(structural) != expected_checks:
+                return "verified gate structural floor checks are inconsistent"
+            structural_passes = all(bool(value) for value in structural.values())
+            required = bool(report.get("required", True))
+            if bool(report.get("structural_passes")) != structural_passes:
+                return "verified gate structural floor result is inconsistent"
+            if bool(report.get("adequate")) != (structural_passes if required else True):
+                return "verified gate adequacy result is inconsistent"
+        checks = envelope.get("checks")
+        if not isinstance(checks, Mapping) or not checks:
+            return "verified gate decision checks are missing"
+        if bool(envelope.get("passes")) != all(bool(value) for value in checks.values()):
+            return "verified gate pass decision is inconsistent"
+        statistics = envelope.get("statistics") or {}
+        try:
+            p_value = float(statistics["p_value"])
+            q_value = float(statistics["q_value"])
+            alpha = float(statistics["alpha"])
+        except (KeyError, TypeError, ValueError):
+            return "verified gate p/q evidence is invalid"
+        if not (0.0 <= p_value <= 1.0 and 0.0 <= q_value <= 1.0 and 0.0 < alpha <= 1.0):
+            return "verified gate p/q evidence is invalid"
+        if "family_fdr_significant" in checks and \
+                bool(checks["family_fdr_significant"]) != (q_value <= alpha):
+            return "verified gate FDR decision is inconsistent"
+        control = envelope.get("control") or {}
+        if "actual_control_available" in checks and bool(checks["actual_control_available"]) != bool(
+                control.get("actual_control") is True and control.get("available") is True):
+            return "verified gate control decision is inconsistent"
+        if "heldout_delta_positive" in checks:
+            delta = control.get("mean_delta")
+            positive = delta is not None and float(delta) > 0
+            if bool(checks["heldout_delta_positive"]) != positive:
+                return "verified gate control delta decision is inconsistent"
+        if "heldout_p_significant" in checks and \
+                bool(checks["heldout_p_significant"]) != (p_value <= alpha):
+            return "verified gate raw p decision is inconsistent"
+        if "falsification" in checks and bool(checks["falsification"]) != bool(
+                (envelope.get("falsification") or {}).get("passes")):
+            return "verified gate falsification decision is inconsistent"
+        if "separated" in checks and bool(checks["separated"]) != bool(
+                (envelope.get("separation") or {}).get("passes")):
+            return "verified gate separation decision is inconsistent"
+        if envelope.get("passes"):
+            control = envelope.get("control") or {}
+            if not (control.get("actual_control") is True and control.get("available") is True and
+                    int(control.get("matched", 0)) > 0):
+                return "passing verified gate lacks an actual matched control"
+            if not bool((envelope.get("falsification") or {}).get("passes")):
+                return "passing verified gate lacks a passing falsification"
+            if not bool((envelope.get("separation") or {}).get("passes")):
+                return "passing verified gate lacks fit/heldout separation"
+        return None
+
+    def _latest_verified_gate(self, candidate_id: str) -> tuple[dict, dict]:
+        runs = self._runs(candidate_id)
+        if not runs:
+            raise ValueError("lifecycle transition requires persisted verified gate evidence")
+        run = dict(runs[-1])
+        with closing(_connect(self.path)) as db:
+            row = db.execute("""SELECT * FROM evidence
+                WHERE candidate_id=? AND run_id=? AND kind='verified_gate'
+                ORDER BY created_at DESC,evidence_id DESC LIMIT 1""",
+                (candidate_id, run["run_id"])).fetchone()
+        if row is None:
+            raise ValueError("latest persisted run lacks verified gate evidence")
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("latest persisted verified gate evidence is invalid") from exc
+        if row["evidence_hash"] != content_hash(payload):
+            raise ValueError("latest persisted verified gate evidence hash is invalid")
+        envelope = payload.get("gate") if isinstance(payload, Mapping) else None
+        if not isinstance(envelope, Mapping) or payload.get("gate_hash") != envelope.get("content_hash"):
+            raise ValueError("latest persisted verified gate envelope/hash is invalid")
+        if not verify_gate_envelope(envelope) or self._gate_envelope_error(run, envelope):
+            raise ValueError("latest persisted verified gate envelope is invalid")
+        return run, dict(envelope)
 
     def append_event(self, *, candidate_id: str | None, event_type: str,
                      reason: str, actor: str = "edge_lab",
@@ -435,38 +610,52 @@ class EdgeLedger:
         if current is None:
             raise KeyError(candidate_id)
         from_status = current["status"]
+        if rollback:
+            raise ValueError("rollback cannot bypass evidence; use an auditable demotion")
         allowed = {
             "candidate": {"backtest_passed", "retired"},
             "backtest_passed": {"shadow", "retired"},
             "shadow": {"validated", "demoted", "retired"},
             "validated": {"champion", "demoted", "retired"},
-            "champion": {"demoted", "retired"},
+            # A stronger champion does not invalidate this candidate's proof.
+            # It returns to the validated pool and remains available to paper
+            # ``all_proved`` selection.  ``demoted`` is reserved for an actual
+            # safety/performance failure.
+            "champion": {"validated", "demoted", "retired"},
             "demoted": {"shadow", "retired"},
             "retired": set(),
         }
-        backwards = LIFECYCLE.index(to_status) < LIFECYCLE.index(from_status)
-        if to_status not in allowed.get(from_status, set()) and not (rollback and backwards):
+        if to_status not in allowed.get(from_status, set()):
             raise ValueError(f"invalid lifecycle transition {from_status}->{to_status}")
-        if rollback and not backwards:
-            raise ValueError("rollback must move to an earlier lifecycle state")
         required_lane = {
             "backtest_passed": "backtest",
             "shadow": "shadow",
             "validated": "shadow",
             "champion": "shadow",
         }.get(to_status)
-        if required_lane and not rollback:
-            runs = self._runs(candidate_id, lane=required_lane)
-            if not runs:
+        if required_lane:
+            run, gate = self._latest_verified_gate(candidate_id)
+            if run["lane"] != required_lane or gate.get("passes") is not True:
                 raise ValueError(
-                    f"{to_status} requires persisted passing {required_lane} evidence")
-            metrics = json.loads(runs[-1]["metrics_json"])
-            gate = metrics.get("gate") if isinstance(metrics.get("gate"), Mapping) else metrics
-            if not isinstance(gate, Mapping) or gate.get("passes") is not True:
-                raise ValueError(
-                    f"{to_status} requires persisted passing {required_lane} evidence")
+                    f"{to_status} requires latest persisted passing {required_lane} verified evidence")
+            if from_status == "demoted" and to_status == "shadow":
+                with closing(_connect(self.path)) as db:
+                    demotion = db.execute("""SELECT created_at FROM events
+                        WHERE candidate_id=? AND to_status='demoted'
+                        ORDER BY created_at DESC,event_id DESC LIMIT 1""",
+                        (candidate_id,)).fetchone()
+                if demotion is not None and float(run["created_at"]) <= float(demotion["created_at"]):
+                    raise ValueError("shadow re-entry after demotion requires a newer verified shadow run")
+        if to_status == "retired":
+            _run, gate = self._latest_verified_gate(candidate_id)
+            floors = gate.get("floors") or {}
+            structurally_adequate = all(
+                isinstance(floors.get(name), Mapping) and floors[name].get("adequate") is True
+                for name in ("fit", "heldout"))
+            if gate.get("passes") is not False or not structurally_adequate:
+                raise ValueError("retirement requires latest adequate failed verified gate evidence")
         now = _utc()
-        event_type = "rollback" if rollback else "lifecycle_transition"
+        event_type = "safety_demotion" if to_status == "demoted" else "lifecycle_transition"
         with closing(_connect(self.path)) as db, db:
             db.execute("""INSERT INTO candidate_state VALUES(?,?,?)
                        ON CONFLICT(candidate_id)
@@ -527,6 +716,33 @@ class EdgeLedger:
             result.append(item)
         return result
 
+    def latest_verified_run(self, candidate_id: str, *,
+                            lane: str | None = None) -> dict | None:
+        """Return the latest run only when its durable gate proof re-verifies."""
+        try:
+            run, gate = self._latest_verified_gate(candidate_id)
+        except ValueError:
+            return None
+        if lane is not None and run.get("lane") != lane:
+            return None
+        result = dict(run)
+        result["metrics"] = json.loads(result.pop("metrics_json"))
+        result["verified_gate"] = gate
+        result["gate_hash"] = gate["content_hash"]
+        return result
+
+    def eligibility(self, candidate_id: str, *, lane: str = "shadow") -> dict:
+        """Explain latest-proof eligibility without trusting caller run metrics."""
+        candidate = self.candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(candidate_id)
+        proof = self.latest_verified_run(candidate_id, lane=lane)
+        eligible = bool(
+            candidate.get("status") in {"validated", "champion"} and
+            proof is not None and proof["verified_gate"].get("passes") is True)
+        return {"candidate_id": candidate_id, "status": candidate["status"],
+                "lane": lane, "eligible": eligible, "latest_verified_run": proof}
+
     def select_champion(self, *, vehicle: str, min_confidence: float = .95,
                         strategy_id: str | None = None) -> dict | None:
         """Select one conservative validated candidate for a vehicle only."""
@@ -537,17 +753,23 @@ class EdgeLedger:
                     and (strategy_id is None or r["strategy_id"] == strategy_id)]
         scored = []
         for candidate in eligible:
-            runs = self._runs(candidate["candidate_id"], lane="shadow")
-            metrics = [json.loads(r["metrics_json"]) for r in runs]
-            latest = metrics[-1] if metrics else {}
+            try:
+                run, gate = self._latest_verified_gate(candidate["candidate_id"])
+            except ValueError:
+                continue
+            if run["lane"] != "shadow" or gate.get("passes") is not True:
+                continue
             # Conservative ranking: held-out lower confidence bound first,
             # then drawdown and sample size.  No metric can cross vehicles.
-            confidence = float(latest.get("confidence", latest.get("ci_low", 0.0)) or 0.0)
+            statistics = gate.get("statistics") or {}
+            performance = gate.get("performance") or {}
+            held_counts = ((gate.get("counts") or {}).get("heldout") or {})
+            confidence = 1.0 - float(statistics.get("q_value", 1.0) or 1.0)
             if confidence < min_confidence:
                 continue
-            scored.append((float(latest.get("heldout_ci_low", latest.get("ci_low", -float("inf")))),
-                           -float(latest.get("max_drawdown", float("inf"))),
-                           int(latest.get("heldout_trades", 0)), candidate))
+            scored.append((float(performance.get("heldout_delta", -float("inf"))),
+                           -float(performance.get("max_drawdown", float("inf"))),
+                           int(held_counts.get("trades", 0)), candidate))
         if not scored:
             return None
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
@@ -555,10 +777,13 @@ class EdgeLedger:
         if selected["status"] != "champion":
             self.transition(selected["candidate_id"], "champion", reason="conservative evidence selection")
             selected = self.candidate(selected["candidate_id"]) or selected
-        # Demote a previous champion only through an auditable event.
+        # Retain every still-proved edge.  Selection names one conservative
+        # champion, but paper mode may continue evaluating all validated
+        # candidates under the shared risk limits.
         for other in rows:
             if other["candidate_id"] != selected["candidate_id"] and other["status"] == "champion":
-                self.transition(other["candidate_id"], "demoted", reason="replaced by stronger evidence")
+                self.transition(other["candidate_id"], "validated",
+                                reason="superseded as champion; proof remains valid")
         return selected
 
     def ingest_paper_outcome(self, candidate_id: str, outcome: Mapping) -> dict:
@@ -569,19 +794,27 @@ class EdgeLedger:
         if vehicle != candidate["vehicle"]:
             raise ValueError("paper outcome vehicle differs from candidate")
         opportunity = str(outcome.get("opportunity_id") or outcome.get("entry_timestamp") or uuid.uuid4().hex)
-        net = float(outcome.get("net_pnl", 0.0))
+        try:
+            net = float(outcome["net_pnl"])
+            risk_usd = float(outcome["risk_usd"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("paper outcome requires finite net_pnl and positive risk_usd") from exc
+        if not (math.isfinite(net) and math.isfinite(risk_usd) and risk_usd > 0):
+            raise ValueError("paper outcome requires finite net_pnl and positive risk_usd")
+        normalized = {**dict(outcome), "r_multiple": net / risk_usd,
+                      "net_pnl": net, "risk_usd": risk_usd}
         oid = uuid.uuid4().hex
         with closing(_connect(self.path)) as db, db:
             db.execute("""INSERT INTO paper_outcomes
                 (outcome_id,candidate_id,vehicle,opportunity_id,session_date,net_pnl,outcome_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?)""",
                 (oid, candidate_id, vehicle, opportunity, outcome.get("session_date"),
-                 net, _json(dict(outcome)), _utc()))
+                 net, _json(normalized), _utc()))
             db.execute("""INSERT INTO events
                 (event_id,candidate_id,event_type,from_status,to_status,actor,reason,payload_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?)""",
                 (uuid.uuid4().hex, candidate_id, "paper_outcome", candidate["status"],
-                 candidate["status"], "paper", "paper outcome ingested", _json(dict(outcome)), _utc()))
+                 candidate["status"], "paper", "paper outcome ingested", _json(normalized), _utc()))
         with closing(_connect(self.path)) as db:
             rows = db.execute(
                 "SELECT outcome_json FROM paper_outcomes WHERE candidate_id=? "
@@ -599,8 +832,7 @@ class EdgeLedger:
         automatic_guard = (
             len(recent_r) >= PAPER_DEMOTION_MIN_OUTCOMES and
             sum(recent_r) <= PAPER_DEMOTION_R_FLOOR)
-        if candidate["status"] == "champion" and (
-                bool(outcome.get("demote", False)) or automatic_guard):
+        if candidate["status"] == "champion" and automatic_guard:
             self.transition(
                 candidate_id, "demoted",
                 reason="paper outcomes failed the registered rolling R guard",
@@ -733,36 +965,11 @@ def _opportunity_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> li
     return rows
 
 
-def _row_timestamp(row: Mapping, fallback: int) -> float:
-    value = row.get("entry_timestamp") or row.get("session_date")
-    try:
-        parsed = datetime.fromisoformat(str(value))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-    except (TypeError, ValueError, OverflowError):
-        return float(fallback)
-
-
-def _paired_test(left: Sequence[Mapping], right: Sequence[Mapping]) -> dict:
-    right_by_key = {str(row.get("opportunity_id")): row for row in right}
-    pairs = []
-    for index, row in enumerate(left):
-        other = right_by_key.get(str(row.get("opportunity_id")))
-        if other is not None:
-            pairs.append((_row_timestamp(row, index),
-                          float(row.get("net_pnl", 0.0)),
-                          float(other.get("net_pnl", 0.0))))
-    result = paired_cluster_sign_flip(pairs)
-    result["mean_delta"] = (sum(item[1] - item[2] for item in pairs) / len(pairs)
-                             if pairs else None)
-    result["matched"] = len(pairs)
-    return result
-
-
 def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                    vehicle: str, min_trades: int, min_sessions: int,
-                   alpha: float, shadow: bool = False) -> dict:
+                   alpha: float, shadow: bool = False,
+                   actual_control: bool = True,
+                   control_kind: str = "matched_actual_baseline") -> dict:
     """Evaluate one chronological backtest or a genuinely new shadow sample.
 
     A backtest is split into fit/held-out partitions.  A shadow evaluation is
@@ -779,43 +986,94 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         base_fit, base_heldout = [], base_ordered
     else:
         fit, heldout = chronological_split(ordered, fit_fraction=.7)
-        base_fit, base_heldout = chronological_split(base_ordered, fit_fraction=.7)
-    floor = AcceptanceFloor(min_trades=min_trades, min_sessions=min_sessions).check(ordered, vehicle=vehicle)
-    held_floor = AcceptanceFloor(min_trades=min_trades, min_sessions=min_sessions).check(heldout, vehicle=vehicle)
+        fit_sessions = {str(row.get("session_date") or "") for row in fit}
+        held_sessions = {str(row.get("session_date") or "") for row in heldout}
+        base_fit = [row for row in base_ordered
+                    if str(row.get("session_date") or "") in fit_sessions]
+        base_heldout = [row for row in base_ordered
+                       if str(row.get("session_date") or "") in held_sessions]
+    fit_floor = structural_floor(
+        fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
+        required=not shadow)
+    held_floor = structural_floor(
+        heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+    overall_floor = structural_floor(
+        ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
     separation = (heldout_separation(fit, heldout) if not shadow else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": bool(heldout), "mode": "new_data"})
     delta_all = paired_delta(ordered, baseline, vehicle=vehicle)
-    delta_held = _paired_test(heldout, base_heldout)
-    baseline_zero = [{**row, "net_pnl": 0.0, "return_value": 0.0}
-                     for row in baseline]
-    baseline_control = _paired_test(baseline, baseline_zero)
-    placebo = [{**row, "net_pnl": -float(row.get("net_pnl", 0.0)),
-                "return_value": -float(row.get("return_value", row.get("net_pnl", 0.0)))}
-               for row in base_heldout]
-    falsification = falsification_gate(
-        [float(row.get("net_pnl", 0.0)) for row in heldout],
-        [float(row.get("net_pnl", 0.0)) for row in placebo])
+    delta_fit = (matched_cluster_test(fit, base_fit, vehicle=vehicle) if not shadow else
+                 {"available": True, "actual_control": True, "matched": 0,
+                  "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
+    delta_held = matched_cluster_test(heldout, base_heldout, vehicle=vehicle)
+    delta_fit["actual_control"] = bool(actual_control)
+    delta_held["actual_control"] = bool(actual_control)
+    placebo = deterministic_placebo_deltas(
+        heldout, base_heldout, vehicle=vehicle)
+    falsification = {
+        **falsification_gate(placebo["observed"], placebo["placebo"]),
+        "method": placebo["method"],
+        "assignments_hash": placebo["assignments_hash"],
+        "observations": len(placebo["observed"]),
+    }
     candidate_p = float(delta_held.get("p_value", 1.0))
-    base_p = float(baseline_control.get("p_value", 1.0))
+    checks = {
+        "fit_structurally_adequate": bool(fit_floor["adequate"]),
+        "heldout_structurally_adequate": bool(held_floor["adequate"]),
+        "separated": bool(separation["passes"]),
+        "actual_control_available": bool(delta_held.get("available") and
+                                         delta_held.get("actual_control")),
+        "fit_delta_positive": bool(shadow or (
+            delta_fit.get("mean_delta") is not None and float(delta_fit["mean_delta"]) > 0)),
+        "heldout_delta_positive": bool(delta_held.get("mean_delta") is not None and
+                                        float(delta_held["mean_delta"]) > 0),
+        "heldout_p_significant": candidate_p <= float(alpha),
+        "falsification": bool(falsification["passes"]),
+    }
     passes_without_family = bool(
-        floor["passes"] and held_floor["passes"] and separation["passes"] and
-        baseline_control.get("mean_delta", baseline_control.get("observed_mean", 0.0)) > 0 and
-        base_p <= alpha and delta_all.get("mean_delta") is not None and
-        float(delta_all["mean_delta"]) > 0 and delta_held.get("mean_delta") is not None and
-        float(delta_held["mean_delta"]) > 0 and falsification["passes"])
+        all(checks.values()) and delta_all.get("mean_delta") is not None and
+        float(delta_all["mean_delta"]) > 0)
     return {"vehicle": vehicle, "shadow": shadow,
+            "alpha": float(alpha),
             "passes_without_family": passes_without_family,
-            "candidate_p_raw": candidate_p, "baseline_p": base_p,
-            "floor": floor, "heldout_floor": held_floor,
+            "candidate_p_raw": candidate_p,
+            "floor": overall_floor, "fit_floor": fit_floor, "heldout_floor": held_floor,
             "heldout_separation": separation, "paired_baseline": delta_all,
+            "fit_paired_baseline": delta_fit,
             "heldout_paired_baseline": delta_held,
-            "baseline_zero_control": baseline_control,
+            "control": {**delta_held, "kind": control_kind},
             "falsification": falsification,
+            "checks_without_family": checks,
             "max_drawdown": max_drawdown_of(ordered),
-            "fit_trades": len(fit), "heldout_trades": len(heldout),
+            "fit_trades": sample_counts(fit, vehicle=vehicle)["trades"],
+            "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
             "fit_sessions": len({row.get("session_date") for row in fit}),
-            "heldout_sessions": len({row.get("session_date") for row in heldout})}
+            "heldout_sessions": len({row.get("session_date") for row in heldout}),
+            "_fit_rows": fit, "_heldout_rows": heldout}
+
+
+def _finalize_gate(gate: dict, *, lane: str, family: Mapping) -> dict:
+    checks = {**gate["checks_without_family"],
+              "family_fdr_significant": bool(family.get("significant", False))}
+    passes = bool(gate["passes_without_family"] and checks["family_fdr_significant"])
+    gate["multiple_tests"] = {"candidate": dict(family),
+                              "method": "benjamini_hochberg"}
+    gate["passes"] = passes
+    fit = gate.pop("_fit_rows")
+    heldout = gate.pop("_heldout_rows")
+    envelope = verified_gate_envelope(
+        lane=lane, vehicle=gate["vehicle"], fit=fit, heldout=heldout,
+        fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
+        control=gate["control"], p_value=gate["candidate_p_raw"],
+        q_value=float(family.get("p_adjusted", 1.0)), alpha=gate.get("alpha", 0.05),
+        falsification=gate["falsification"], separation=gate["heldout_separation"],
+        checks=checks, passes=passes,
+        performance={"heldout_delta": gate["heldout_paired_baseline"].get("mean_delta"),
+                     "max_drawdown": gate["max_drawdown"]})
+    gate["verified_gate"] = envelope
+    gate["gate_hash"] = envelope["content_hash"]
+    return gate
 
 
 def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFAULT_DB_PATH,
@@ -954,11 +1212,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         family = corrected.get(variant.variant_id, {"p": gate["candidate_p_raw"],
                                                      "p_adjusted": 1.0,
                                                      "significant": False})
-        gate["multiple_tests"] = {"candidate": family,
-                                  "family_size": len(corrected),
-                                  "method": "benjamini_hochberg"}
-        gate["passes"] = bool(gate["passes_without_family"] and
-                               family.get("significant", False))
+        _finalize_gate(gate, lane=modes[variant.variant_id], family=family)
     forward_success = any(
         modes[variant.variant_id] == "shadow" and
         gates.get(variant.variant_id, {}).get("passes", False)
@@ -974,11 +1228,18 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     baseline_gate = _discover_gate(
         baseline_eval, baseline_zero, vehicle=vehicle,
         min_trades=min_trades, min_sessions=min_sessions, alpha=alpha,
-        shadow=(baseline_mode == "shadow"))
+        shadow=(baseline_mode == "shadow"), actual_control=False,
+        control_kind="synthetic_zero_reference")
+    _finalize_gate(
+        baseline_gate, lane=baseline_mode,
+        family={"p": baseline_gate["candidate_p_raw"],
+                "p_adjusted": baseline_gate["candidate_p_raw"],
+                "significant": baseline_gate["candidate_p_raw"] <= alpha,
+                "family_size": 1})
     baseline_run = None
     baseline_adequate = bool(
-        baseline_gate.get("floor", {}).get("passes") and
-        baseline_gate.get("heldout_floor", {}).get("passes"))
+        baseline_gate.get("fit_floor", {}).get("adequate") and
+        baseline_gate.get("heldout_floor", {}).get("adequate"))
     if baseline_eval and not baseline_adequate:
         ledger.append_event(
             candidate_id=baseline_record["candidate_id"],
@@ -1002,6 +1263,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             metrics={"gate": baseline_gate, "role": "baseline"})
         for row in baseline_eval:
             ledger.append_trade(baseline_run["run_id"], row)
+        ledger.record_verified_gate(baseline_run["run_id"], baseline_gate)
         ledger.append_evidence(baseline_record["candidate_id"], "baseline_control",
                                baseline_gate, run_id=baseline_run["run_id"])
 
@@ -1024,8 +1286,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             continue
         gate = gates[variant.variant_id]
         family = gate["multiple_tests"]["candidate"]
-        adequate = bool(gate.get("floor", {}).get("passes") and
-                        gate.get("heldout_floor", {}).get("passes"))
+        adequate = bool(gate.get("fit_floor", {}).get("adequate") and
+                        gate.get("heldout_floor", {}).get("adequate"))
         run = None
         shadow_run = None
         status = record.get("status", "candidate")
@@ -1058,12 +1320,13 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 provenance={"lane": lane, "vehicle": vehicle},
                 fit=fit_rows, heldout=heldout_rows,
                 metrics={"gate": gate, "confidence": 1.0 - family.get("p_adjusted", 1.0),
-                         "heldout_ci_low": gate["heldout_paired_baseline"].get("mean_delta") or 0.0,
+                         "heldout_delta": gate["heldout_paired_baseline"].get("mean_delta") or 0.0,
                          "max_drawdown": gate["max_drawdown"],
                          "heldout_trades": gate["heldout_trades"],
                          "role": "forward_shadow" if mode == "shadow" else "candidate"})
             for row in rows:
                 ledger.append_trade(run["run_id"], row)
+            ledger.record_verified_gate(run["run_id"], gate)
             ledger.append_evidence(record["candidate_id"],
                                    "shadow_gate" if mode == "shadow" else "gate_report",
                                    gate, run_id=run["run_id"])

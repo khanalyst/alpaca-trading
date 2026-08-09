@@ -11,8 +11,8 @@ import json
 from pathlib import Path
 from typing import Mapping
 
-from .registry import known_variant_ids
-from .variants import from_record, load_registry, apply as apply_variant_config
+from .registry import baseline_variant_id, known_variant_ids
+from .variants import from_record, apply as apply_variant_config
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
 
 
@@ -32,8 +32,88 @@ def _vehicle(config: Mapping, vehicle: str | None) -> str | None:
     return "equity"
 
 
+def _decoded(record: Mapping) -> dict | None:
+    result = dict(record)
+    try:
+        result["config"] = json.loads(result.get("config_json") or "{}")
+        result["axes"] = json.loads(result.get("axes_json") or "{}")
+    except (TypeError, ValueError):
+        return None
+    return result
+
+
+def _latest_passing_proof(ledger: EdgeLedger, record: Mapping) -> dict | None:
+    candidate_id = str(record.get("candidate_id") or "")
+    latest = ledger.latest_verified_run(candidate_id, lane="shadow")
+    if not isinstance(latest, Mapping):
+        return None
+    gate = latest.get("verified_gate")
+    if not isinstance(gate, Mapping) or gate.get("passes") is not True:
+        return None
+    return dict(latest)
+
+
+def _proof_confidence(proof: Mapping) -> float:
+    gate = proof.get("verified_gate") if isinstance(
+        proof.get("verified_gate"), Mapping) else {}
+    statistics = gate.get("statistics") if isinstance(
+        gate.get("statistics"), Mapping) else {}
+    q_value = statistics.get("q_value")
+    if q_value is not None:
+        try:
+            return max(0.0, min(1.0, 1.0 - float(q_value)))
+        except (TypeError, ValueError):
+            return 0.0
+    metrics = proof.get("metrics") if isinstance(proof.get("metrics"), Mapping) else {}
+    try:
+        return max(0.0, min(1.0, float(metrics.get("confidence", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _eligible(ledger: EdgeLedger, record: Mapping | None, *, strategy_id: str,
+              vehicle: str, min_confidence: float = 0.0) -> dict | None:
+    if (record is None or record.get("strategy_id") != strategy_id or
+            record.get("vehicle") != vehicle or
+            record.get("status") not in {"validated", "champion"}):
+        return None
+    proof = _latest_passing_proof(ledger, record)
+    decoded = _decoded(record)
+    if (proof is None or decoded is None or
+            _proof_confidence(proof) < float(min_confidence)):
+        return None
+    decoded["latest_proof"] = proof
+    return decoded
+
+
+def _family(record: Mapping) -> str:
+    axes = record.get("axes") if isinstance(record.get("axes"), Mapping) else {}
+    config = record.get("config") if isinstance(record.get("config"), Mapping) else {}
+    strategy = config.get("strategy") if isinstance(config.get("strategy"), Mapping) else {}
+    spec = strategy.get("rule_spec") if isinstance(strategy.get("rule_spec"), Mapping) else {}
+    return str(axes.get("hypothesis_id") or axes.get("family") or
+               spec.get("family") or record.get("strategy_id") or "unknown")
+
+
+def _proof_score(record: Mapping) -> tuple:
+    proof = record.get("latest_proof") if isinstance(record.get("latest_proof"), Mapping) else {}
+    gate = proof.get("verified_gate") if isinstance(proof.get("verified_gate"), Mapping) else {}
+    performance = gate.get("performance") if isinstance(
+        gate.get("performance"), Mapping) else {}
+    counts = gate.get("counts") if isinstance(gate.get("counts"), Mapping) else {}
+    heldout = counts.get("heldout") if isinstance(counts.get("heldout"), Mapping) else {}
+    confidence = _proof_confidence(proof)
+    heldout_delta = float(performance.get("heldout_delta", -float("inf")))
+    drawdown = float(performance.get("max_drawdown", float("inf")))
+    trades = int(heldout.get("trades", 0) or 0)
+    return (confidence, heldout_delta, -drawdown, trades,
+            str(record.get("variant_id") or ""),
+            str(record.get("candidate_id") or ""))
+
+
 def resolve_validated_variant(config: Mapping, vehicle: str | None = None,
-                              db_path: str | Path | None = None) -> dict | None:
+                              db_path: str | Path | None = None,
+                              candidate_id: str | None = None) -> dict | None:
     """Resolve a config's variant only when the ledger proves it validated."""
     strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
     strategy_id = str(strategy.get("id") or "ibr")
@@ -41,27 +121,60 @@ def resolve_validated_variant(config: Mapping, vehicle: str | None = None,
     if selected_vehicle not in {"equity", "option"}:
         return None
     ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
+    research = config.get("research", {}) if isinstance(config, Mapping) else {}
+    min_confidence = float(research.get("champion_min_confidence", .95) or .95) \
+        if isinstance(research, Mapping) else .95
     requested = str(strategy.get("variant_id") or "").strip()
     if requested and requested.lower() != "auto":
         if strategy_id != "rule" and requested not in set(known_variant_ids(strategy_id)):
             return None
         record = ledger.candidate_by_variant(requested, selected_vehicle)
     else:
-        research = config.get("research", {}) if isinstance(config, Mapping) else {}
-        confidence = float(research.get("champion_min_confidence", .95) or .95) \
-            if isinstance(research, Mapping) else .95
         record = ledger.select_champion(
-            vehicle=selected_vehicle, min_confidence=confidence,
+            vehicle=selected_vehicle, min_confidence=min_confidence,
             strategy_id=strategy_id)
-    if (record is None or record.get("strategy_id") != strategy_id or
-            record.get("status") not in {"validated", "champion"}):
+    record = _eligible(
+        ledger, record, strategy_id=strategy_id, vehicle=selected_vehicle,
+        min_confidence=min_confidence)
+    if record is None:
         return None
-    try:
-        record["config"] = json.loads(record.get("config_json") or "{}")
-        record["axes"] = json.loads(record.get("axes_json") or "{}")
-    except (TypeError, ValueError):
+    if candidate_id is not None and record.get("candidate_id") != candidate_id:
         return None
     return record
+
+
+def resolve_validated_variants(config: Mapping, vehicle: str | None = None,
+                               db_path: str | Path | None = None) -> list[dict]:
+    """Resolve deterministic vehicle-local proved edges for paper execution.
+
+    ``specific`` retains the single-record behavior.  ``all_proved`` selects
+    the strongest latest passing proof in each independent hypothesis/family,
+    preventing every mutation of one idea from becoming concurrent risk.
+    """
+    strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
+    if str(strategy.get("selection_mode") or "specific") == "specific":
+        record = resolve_validated_variant(config, vehicle=vehicle, db_path=db_path)
+        return [record] if record is not None else []
+    selected_vehicle = _vehicle(config, vehicle)
+    if selected_vehicle not in {"equity", "option"}:
+        return []
+    strategy_id = str(strategy.get("id") or "ibr")
+    research = config.get("research", {}) if isinstance(config, Mapping) else {}
+    min_confidence = float(research.get("champion_min_confidence", .95) or .95) \
+        if isinstance(research, Mapping) else .95
+    ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
+    grouped: dict[str, dict] = {}
+    for raw in ledger.status(vehicle=selected_vehicle):
+        record = _eligible(
+            ledger, raw, strategy_id=strategy_id, vehicle=selected_vehicle,
+            min_confidence=min_confidence)
+        if record is None:
+            continue
+        family = _family(record)
+        current = grouped.get(family)
+        if current is None or _proof_score(record) > _proof_score(current):
+            grouped[family] = record
+    return [grouped[key] for key in sorted(grouped)]
 
 
 def apply_variant(config: Mapping, record: Mapping) -> dict:
@@ -100,11 +213,8 @@ def apply_variant(config: Mapping, record: Mapping) -> dict:
     overrides = record.get("overrides") or {}
     if not overrides and isinstance(record.get("axes"), Mapping):
         overrides = record["axes"].get("overrides") or {}
-    if not overrides:
-        registry_path = Path(__file__).resolve().parents[1] / "research" / "variants.yaml"
-        registered = load_registry(registry_path).get(variant_id)
-        if registered is not None:
-            overrides = dict(registered.overrides)
+    if not overrides and variant_id != baseline_variant_id(strategy_id):
+        raise ValueError("validated variant record lacks immutable overrides")
     if isinstance(overrides, str):
         try:
             overrides = json.loads(overrides)
@@ -140,4 +250,5 @@ def record_paper_outcome(outcome: Mapping, *, candidate_id: str | None = None,
     return ledger.ingest_paper_outcome(str(cid), outcome)
 
 
-__all__ = ["apply_variant", "record_paper_outcome", "resolve_validated_variant"]
+__all__ = ["apply_variant", "record_paper_outcome", "resolve_validated_variant",
+           "resolve_validated_variants"]

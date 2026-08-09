@@ -11,18 +11,13 @@ from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
-from .contracts.ibr import build_ibr_range, setup_evidence as _ibr_evidence
-from .contracts.rule import (rule_variant_id, setup_evidence as _rule_evidence,
-                             validate_rule_spec)
+from .contracts.ibr import build_ibr_range
+from .contracts.rule import rule_variant_id, validate_rule_spec
 
 from .registry import (baseline_variant_id, contract_for_variant,
                        validate_contract_config)
 
 SETUP_TYPES = {"ibr_breakout", "range_breakout", "rule_signal"}
-INVALIDATION_ANCHORS = {"structure", "range"}
-EXIT_POLICIES = {"fixed_rr", "force_flat", "fixed_target_r"}
-EXECUTION_CHOICES = {"normal", "retry_smaller"}
-SETUP_STATUSES = {"proposed", "risk_rejected", "attempted", "execution_rejected", "opened", "closed"}
 
 
 def _hash(payload: object) -> str:
@@ -37,59 +32,6 @@ def identity(cfg: Mapping) -> tuple[str, str]:
 def variant_identity(cfg: Mapping) -> str:
     strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
     return str(strategy.get("variant_id") or baseline_variant_id(str(strategy.get("id") or "ibr")))
-
-
-def signal_probe(decision: Mapping, symbol_snapshot: Mapping, cfg: Mapping) -> dict | None:
-    ts = _finite(symbol_snapshot.get("signal_ts"))
-    symbol = decision.get("symbol")
-    if ts is None or ts < 0 or not isinstance(symbol, str) or not symbol:
-        return None
-    direction = decision.get("direction")
-    if direction not in {"long", "short"}:
-        return None
-    strategy_id, version = identity(cfg)
-    setup_type = str(decision.get("setup_type") or "ibr_breakout")
-    session = str(symbol_snapshot.get("session") or symbol_snapshot.get("ibr_session") or "")
-    key = _hash({"strategy_id": strategy_id, "version": version,
-                 "variant_id": variant_identity(cfg), "symbol": symbol,
-                 "direction": direction, "setup_type": setup_type, "session": session})
-    return {"strategy_id": strategy_id, "strategy_version": version,
-            "variant_id": variant_identity(cfg), "setup_id": _hash({"key": key, "signal_ts": ts}),
-            "setup_key": key, "setup_type": setup_type, "symbol": symbol,
-            "direction": direction, "signal_ts": ts, "session": session}
-
-
-def setup_evidence(snapshot: Mapping, cfg: Mapping) -> dict:
-    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
-    if str(strategy.get("id")) == "rule":
-        return _rule_evidence(snapshot, cfg)
-    return _ibr_evidence(snapshot, cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {})
-
-
-def enrich_snapshot(snapshot: dict, cfg: Mapping) -> dict:
-    snapshot["setup_evidence"] = setup_evidence(snapshot, cfg)
-    return snapshot
-
-
-def evidence_fingerprint(snapshot: Mapping) -> str:
-    return _hash({"session": snapshot.get("session") or snapshot.get("ibr_session"),
-                 "ibr_high": snapshot.get("ibr_high") or (snapshot.get("ibr_range") or {}).get("high"),
-                 "ibr_low": snapshot.get("ibr_low") or (snapshot.get("ibr_range") or {}).get("low"),
-                 "relative_volume": snapshot.get("relative_volume"),
-                 "signal_ts": snapshot.get("signal_ts")})
-
-
-def compact_entry_evidence(snapshot: Mapping, market_context: Mapping | None = None) -> dict:
-    keys = ("signal_ts", "session", "ibr_session", "ibr_high", "ibr_low",
-            "range_width", "relative_volume", "spread_bps", "halted",
-            "entry_price", "stop_price", "target_price", "force_flat_at")
-    out = {key: snapshot.get(key) for key in keys if key in snapshot}
-    if isinstance(snapshot.get("ibr_range"), Mapping):
-        out["ibr_range"] = dict(snapshot["ibr_range"])
-    out["evidence_fingerprint"] = evidence_fingerprint(snapshot)
-    if isinstance(market_context, Mapping):
-        out["market_context"] = {key: market_context.get(key) for key in ("session", "timestamp") if key in market_context}
-    return out
 
 
 def _range_for_snapshot(snapshot: Mapping, cfg: Mapping) -> dict | None:
@@ -205,7 +147,6 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
     })
     return plan, None
 
-
 def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
                      cfg: Mapping, *, hypothesis_params: Mapping | None = None):
     """Validate one close-confirmed IBR signal and derive all exits."""
@@ -261,10 +202,8 @@ def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         return None, "spread is unavailable"
     if spread > max_spread:
         return None, "spread is too wide"
-    if symbol_snapshot.get("stale") is not False and symbol_snapshot.get("quote_stale") is not False:
+    if symbol_snapshot.get("stale") is not False or symbol_snapshot.get("quote_stale") is not False:
         return None, "market data freshness is unavailable"
-    if symbol_snapshot.get("stale") is True or symbol_snapshot.get("quote_stale") is True:
-        return None, "market data is stale"
     stop = float(rng["low"] if direction == "long" else rng["high"])
     distance = abs(entry - stop)
     if distance <= 0:
@@ -312,56 +251,3 @@ def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         "force_flat_reason": "regular_session_close", "size_pct_equity": 0.0,
     })
     return plan, None
-
-
-def new_setup_record(plan: Mapping, cfg: Mapping, now: float | None = None) -> dict:
-    current = float(time.time() if now is None else now)
-    strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
-    memory = _finite(strategy.get("setup_memory_hours"), 24.0) or 24.0
-    return {"strategy_id": str(plan.get("strategy_id") or "ibr"), "strategy_version": str(plan.get("strategy_version") or "v1"),
-            "variant_id": str(plan.get("variant_id") or variant_identity(cfg)), "setup_key": str(plan["setup_key"]),
-            "setup_type": str(plan.get("setup_type") or "ibr_breakout"), "symbol": str(plan["symbol"]),
-            "direction": str(plan["direction"]), "signal_ts": float(plan["signal_ts"]),
-            "session": plan.get("session"), "first_seen_at": current, "last_seen_at": current,
-            "blocked_until": 0.0, "expires_at": current + memory * 3600, "status": "proposed",
-            "entry_evidence_fingerprint": plan.get("entry_evidence_fingerprint"), "outcome": None}
-
-
-def mark_setup(record: dict, status: str, cfg: Mapping, *, now: float | None = None,
-               apply_cooldown: bool = False, realized_pnl_usd: float | None = None) -> None:
-    if status not in SETUP_STATUSES:
-        raise ValueError(f"invalid setup status: {status}")
-    current = float(time.time() if now is None else now); record["status"] = status; record["last_seen_at"] = current
-    if status == "closed":
-        record["closed_at"] = current
-        record["outcome"] = "win" if (realized_pnl_usd or 0) > 0 else "loss" if (realized_pnl_usd or 0) < 0 else "flat"
-        if realized_pnl_usd is not None: record["realized_pnl_usd"] = float(realized_pnl_usd)
-    if apply_cooldown:
-        strategy = cfg.get("strategy", cfg) if isinstance(cfg, Mapping) else {}
-        minutes = _finite(strategy.get("setup_cooldown_minutes"), 0.0) or 0.0
-        record["blocked_until"] = max(float(record.get("blocked_until") or 0), current + minutes * 60)
-    record["expires_at"] = max(float(record.get("expires_at") or 0), current + 24 * 3600, float(record.get("blocked_until") or 0))
-
-
-def semantic_block(records: Mapping, setup_key: str, now: float | None = None) -> dict | None:
-    current = float(time.time() if now is None else now)
-    matches = [record for record in records.values() if isinstance(record, Mapping) and record.get("setup_key") == setup_key and float(record.get("blocked_until") or 0) > current]
-    return max(matches, key=lambda item: float(item.get("blocked_until") or 0)) if matches else None
-
-
-def evaluated_signal(records: Mapping, plan: Mapping) -> dict | None:
-    ts = _finite(plan.get("signal_ts"), -1)
-    return next((record for record in records.values() if isinstance(record, Mapping) and record.get("symbol") == plan.get("symbol") and _finite(record.get("signal_ts"), -2) == ts), None)
-
-
-def prune_records(records: Mapping, now: float | None = None) -> dict:
-    current = float(time.time() if now is None else now)
-    return {key: value for key, value in records.items() if isinstance(value, Mapping) and _finite(value.get("expires_at"), 0) > current}
-
-
-def recent_setup_view(records: Mapping, now: float | None = None) -> list[dict]:
-    current = float(time.time() if now is None else now); rows = []
-    for setup_id, record in records.items():
-        if not isinstance(record, Mapping) or _finite(record.get("expires_at"), 0) <= current: continue
-        rows.append({"setup_id": setup_id, "symbol": record.get("symbol"), "direction": record.get("direction"), "setup_type": record.get("setup_type"), "status": record.get("status"), "signal_ts": record.get("signal_ts"), "outcome": record.get("outcome"), "closed_at": record.get("closed_at"), "retry_after_minutes": round(max(0, _finite(record.get("blocked_until"), 0) - current) / 60, 1)})
-    return rows[-20:]

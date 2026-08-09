@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 
 from .alpaca_domain import (Asset, Bar, CalendarDay, MarketClock, OptionContract,
                             Quote)
-from .alpaca_session import NEW_YORK, SessionPolicy, as_new_york, session_for
+from .alpaca_session import NEW_YORK, SessionPolicy, session_for
 from .alpaca_provider import AlpacaError
 
 
@@ -182,12 +182,3 @@ class MarketData:
         bars = self.stock_bars([symbol], timeframe=timeframe, start=start, end=end).get(symbol, [])
         chain = self.option_chain(symbol, start=start, end=end) if include_options else None
         return MarketSnapshot(symbol.upper(), quotes[-1] if quotes else None, tuple(bars), chain, datetime.now(tz=NEW_YORK))
-
-
-def regular_session(now: datetime | None = None, calendar: Iterable[CalendarDay] = ()) -> bool:
-    """Return whether *now* is inside the NYSE regular session."""
-    current = as_new_york(now or datetime.now(tz=NEW_YORK))
-    session = session_for(current, calendar)
-    if session is None and current.weekday() < 5:
-        return current.replace(hour=9, minute=30, second=0, microsecond=0) <= current < current.replace(hour=16, minute=0, second=0, microsecond=0)
-    return bool(session and session.open <= current < session.close)

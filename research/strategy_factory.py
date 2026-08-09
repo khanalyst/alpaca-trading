@@ -29,19 +29,28 @@ from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, canonical_json,
     content_hash,
 )
-from .gates import AcceptanceFloor, chronological_split, max_drawdown_of
+from .gates import (chronological_split, deterministic_placebo_deltas,
+                    falsification_gate, heldout_separation,
+                    matched_cluster_test, max_drawdown_of, sample_counts,
+                    structural_floor, verified_gate_envelope,
+                    verify_gate_envelope)
+from .llm_strategy import ProposalResult, RuleProposalAdapter
 from .market_data import OptionSnapshot, UnderlyingBar
-from .stats import benjamini_hochberg, paired_cluster_sign_flip
+from .stats import benjamini_hochberg
 
 
 DEFAULT_STRATEGIES = 7
 DEFAULT_VARIANTS = 4
 DEFAULT_WORKERS = 7
-MAX_STRATEGIES = 16
+MAX_STRATEGIES = 7
 MAX_VARIANTS = 8
 MAX_WORKERS = 16
 FACTORY_SCHEMA = "strategy-factory.v1"
-ACTIVE_HYPOTHESIS_STATES = {"queued", "testing", "backtest_passed"}
+ACTIVE_HYPOTHESIS_STATES = {
+    "queued", "testing", "backtest_passed", "pending_generation_limit",
+    "pending_llm_replacement",
+}
+FACTORY_STATUSES = ACTIVE_HYPOTHESIS_STATES | {"validated", "retired"}
 
 
 class FactoryError(ValueError):
@@ -103,9 +112,7 @@ def initial_hypotheses(count: int = DEFAULT_STRATEGIES, *,
     ]
     output = []
     for slot in range(int(count)):
-        raw = templates[slot % len(templates)]
-        if slot >= len(templates):
-            raw = {**raw, "lookback": min(120, int(raw.get("lookback", 15)) + slot)}
+        raw = templates[slot]
         spec = validate_rule_spec(raw)
         output.append(StrategyHypothesis(
             _hypothesis_id(vehicle, slot, 0, spec), slot, 0, vehicle, spec["family"],
@@ -195,6 +202,22 @@ class FactoryLedger:
                     BEFORE DELETE ON factory_accounts BEGIN
                     SELECT RAISE(ABORT, 'factory accounts are immutable');
                 END;
+                CREATE TRIGGER IF NOT EXISTS factory_events_no_update
+                    BEFORE UPDATE ON factory_events BEGIN
+                    SELECT RAISE(ABORT, 'factory events are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_events_no_delete
+                    BEFORE DELETE ON factory_events BEGIN
+                    SELECT RAISE(ABORT, 'factory events are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_cycles_no_update
+                    BEFORE UPDATE ON factory_cycles BEGIN
+                    SELECT RAISE(ABORT, 'factory cycles are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_cycles_no_delete
+                    BEFORE DELETE ON factory_cycles BEGIN
+                    SELECT RAISE(ABORT, 'factory cycles are immutable');
+                END;
             """)
 
     def register(self, hypothesis: StrategyHypothesis) -> dict:
@@ -220,11 +243,71 @@ class FactoryLedger:
               payload: Mapping | None = None) -> None:
         if not reason.strip():
             raise FactoryError("factory event reason is required")
+        if status not in FACTORY_STATUSES:
+            raise FactoryError(f"unknown factory status: {status}")
+        if status == "retired":
+            raise FactoryError("retirement requires retire_hypothesis evidence verification")
+        if self.hypothesis(hypothesis_id) is None:
+            raise KeyError(hypothesis_id)
+        self._append_event(hypothesis_id, status, reason, payload)
+
+    def _append_event(self, hypothesis_id: str, status: str, reason: str,
+                      payload: Mapping | None = None) -> None:
         with closing(_connect(self.path)) as db, db:
             db.execute("INSERT INTO factory_events VALUES(?,?,?,?,?,?)", (
                 uuid.uuid4().hex, hypothesis_id, status, reason,
                 canonical_json(dict(payload or {})), datetime.now().timestamp(),
             ))
+
+    def events(self, hypothesis_id: str) -> list[dict]:
+        if self.hypothesis(hypothesis_id) is None:
+            raise KeyError(hypothesis_id)
+        with closing(_connect(self.path)) as db:
+            rows = db.execute("""SELECT * FROM factory_events
+                WHERE hypothesis_id=? ORDER BY created_at,event_id""",
+                (hypothesis_id,)).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            output.append(item)
+        return output
+
+    def retire_hypothesis(self, hypothesis_id: str, *, cycle_id: str,
+                          expected_variants: int, reason: str,
+                          payload: Mapping | None = None) -> None:
+        """Retire only after a replacement exists and every intended gate failed."""
+        if not reason.strip():
+            raise FactoryError("factory retirement reason is required")
+        with closing(_connect(self.path)) as db:
+            child = db.execute("""SELECT 1 FROM factory_hypotheses
+                WHERE parent_hypothesis_id=? LIMIT 1""", (hypothesis_id,)).fetchone()
+            rows = db.execute("""SELECT result_json FROM factory_accounts
+                WHERE cycle_id=? AND hypothesis_id=? ORDER BY variant_id""",
+                (cycle_id, hypothesis_id)).fetchall()
+        if child is None:
+            raise FactoryError("hypothesis cannot retire before its replacement is registered")
+        if len(rows) != int(expected_variants) or int(expected_variants) < 1:
+            raise FactoryError("hypothesis retirement requires every intended variant account")
+        gate_hashes = []
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"])
+                gate = result["gate"]
+                envelope = gate["verified_gate"]
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise FactoryError("hypothesis retirement evidence is incomplete") from exc
+            if (gate.get("sample_adequate") is not True or
+                    gate.get("heldout_sample_adequate") is not True or
+                    gate.get("passes") is not False or
+                    not verify_gate_envelope(envelope) or
+                    envelope.get("passes") is not False):
+                raise FactoryError("hypothesis retirement requires adequate failed verified gates")
+            gate_hashes.append(str(envelope["content_hash"]))
+        detail = {**dict(payload or {}), "cycle_id": cycle_id,
+                  "expected_variants": int(expected_variants),
+                  "verified_gate_hashes": sorted(gate_hashes)}
+        self._append_event(hypothesis_id, "retired", reason, detail)
 
     def hypothesis(self, hypothesis_id: str) -> dict | None:
         with closing(_connect(self.path)) as db:
@@ -568,15 +651,23 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
             continue
         if rule_variant_id(candidate) not in {rule_variant_id(item) for item in variants}:
             variants.append(candidate)
-    while len(variants) < int(count):
-        step = len(variants)
+    attempt = 0
+    while len(variants) < int(count) and attempt < 64:
+        attempt += 1
+        lookback = 3 + ((int(root["lookback"]) - 3 + attempt) % 118)
         candidate = _safe_variant(
-            root, threshold_bps=min(500.0, root["threshold_bps"] + step * 3),
-            target_r=max(.25, min(10.0, root["target_r"] + (step - 1) * .25)),
+            root,
+            lookback=lookback,
+            slow_lookback=max(lookback + 2,
+                              min(240, int(root["slow_lookback"]) + attempt)),
+            threshold_bps=(float(root["threshold_bps"]) + attempt * 7.0) % 500.0,
+            target_r=.25 + ((float(root["target_r"]) - .25 + attempt * .25) % 9.75),
         )
-        if rule_variant_id(candidate) in {rule_variant_id(item) for item in variants}:
-            break
-        variants.append(candidate)
+        if rule_variant_id(candidate) not in {
+                rule_variant_id(item) for item in variants}:
+            variants.append(candidate)
+    if len(variants) != int(count):
+        raise FactoryError("could not form the requested number of unique variants")
     return variants
 
 
@@ -608,6 +699,55 @@ def replacement_hypothesis(previous: Mapping[str, Any], diagnostic: Mapping[str,
     )
 
 
+def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any], *,
+                     config: Mapping[str, Any], max_generations: int,
+                     not_before: str | None,
+                     existing_variant_ids: set[str],
+                     adapter: RuleProposalAdapter | None = None
+                     ) -> tuple[StrategyHypothesis | None, ProposalResult | None, str | None]:
+    generation = int(previous["generation"]) + 1
+    if generation >= int(max_generations):
+        return None, None, "generation_limit"
+    selected = adapter or RuleProposalAdapter(
+        provider=str(config.get("provider") or "openai"),
+        model=str(config.get("model") or ""),
+        max_attempts=int(config.get("max_attempts", 1)),
+        timeout_seconds=float(config.get("timeout_seconds", 30)),
+        max_response_bytes=int(config.get("max_response_bytes", 16_384)),
+    )
+    proposal = selected.propose(
+        vehicle=str(previous["vehicle"]), generation=generation,
+        prior_validated_rule_spec=previous["rule_spec"], diagnosis=diagnostic)
+    if not proposal.success or proposal.rule_spec is None or not proposal.variant_id:
+        return None, proposal, "llm_proposal_failed"
+    if proposal.variant_id in existing_variant_ids:
+        return None, proposal, "duplicate_llm_variant"
+    spec = validate_rule_spec(proposal.rule_spec)
+    vehicle = str(previous["vehicle"])
+    slot = int(previous["slot"])
+    hypothesis = StrategyHypothesis(
+        _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
+        vehicle, str(spec["family"]), _thesis(spec), _falsification(spec),
+        spec, str(previous["hypothesis_id"]), not_before,
+    )
+    return hypothesis, proposal, None
+
+
+def _llm_lineage_evidence(factory: FactoryLedger,
+                          hypothesis: Mapping[str, Any]) -> dict | None:
+    parent = hypothesis.get("parent_hypothesis_id")
+    if not parent:
+        return None
+    for event in reversed(factory.events(str(parent))):
+        payload = event.get("payload") or {}
+        if (payload.get("replacement_hypothesis_id") == hypothesis.get("hypothesis_id") and
+                isinstance(payload.get("llm_evidence"), Mapping)):
+            return {"schema": payload.get("proposal_schema"),
+                    "evidence": dict(payload["llm_evidence"]),
+                    "replacement_hypothesis_id": hypothesis.get("hypothesis_id")}
+    return None
+
+
 def _worker(payload: Mapping[str, Any]) -> dict:
     hypothesis = dict(payload["hypothesis"])
     bars = list(payload["bars"])
@@ -631,6 +771,11 @@ def _worker(payload: Mapping[str, Any]) -> dict:
     else:
         diagnostic = {"primary_failure": "forward_validation"}
         specs = [validate_rule_spec(item) for item in payload["existing_specs"]]
+    control_account = simulate_account(
+        bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
+        account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
+        starting_cash=starting_cash,
+    )
     variants = []
     for spec in specs:
         variant_id = rule_variant_id(spec)
@@ -648,46 +793,78 @@ def _worker(payload: Mapping[str, Any]) -> dict:
     return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
             "evaluation_start": sessions[0] if sessions else None,
             "evaluation_end": sessions[-1] if sessions else None,
-            "variants": variants, "worker_pid": os.getpid()}
+            "variants": sorted(variants, key=lambda item: item["variant_id"]),
+            "control_rows": control_account["rows"],
+            "expected_variants": len(specs), "worker_pid": os.getpid()}
 
 
-def _gate(rows: Sequence[Mapping], *, vehicle: str, mode: str,
+def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
+          vehicle: str, mode: str,
           min_trades: int, min_sessions: int, alpha: float) -> dict:
     ordered = sorted(rows, key=lambda row: (str(row.get("session_date", "")),
                                              str(row.get("entry_timestamp", ""))))
-    fit, heldout = ([], ordered) if mode == "shadow" else chronological_split(ordered, fit_fraction=.7)
-    floor = AcceptanceFloor(min_trades=min_trades, min_sessions=min_sessions).check(ordered, vehicle=vehicle)
-    held_floor = AcceptanceFloor(min_trades=min_trades, min_sessions=min_sessions).check(heldout, vehicle=vehicle)
-    sample_adequate = bool(floor["checks"]["trades"] and floor["checks"]["sessions"])
-    heldout_adequate = bool(
-        held_floor["checks"]["trades"] and held_floor["checks"]["sessions"])
-    pairs = []
-    for index, row in enumerate(heldout):
-        stamp = row.get("entry_timestamp") or row.get("session_date")
-        try:
-            parsed = datetime.fromisoformat(str(stamp))
-            timestamp = parsed.timestamp()
-        except (TypeError, ValueError):
-            timestamp = float(index)
-        pairs.append((timestamp, float(row.get("net_pnl", 0.0)), 0.0))
-    test = paired_cluster_sign_flip(pairs)
+    base_ordered = sorted(baseline, key=lambda row: (str(row.get("session_date", "")),
+                                                      str(row.get("entry_timestamp", ""))))
+    if mode == "shadow":
+        fit, heldout, base_fit, base_heldout = [], ordered, [], base_ordered
+    else:
+        fit, heldout = chronological_split(ordered, fit_fraction=.7)
+        fit_sessions = {str(row.get("session_date") or "") for row in fit}
+        held_sessions = {str(row.get("session_date") or "") for row in heldout}
+        base_fit = [row for row in base_ordered
+                    if str(row.get("session_date") or "") in fit_sessions]
+        base_heldout = [row for row in base_ordered
+                       if str(row.get("session_date") or "") in held_sessions]
+    fit_floor = structural_floor(
+        fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
+        required=mode != "shadow")
+    held_floor = structural_floor(
+        heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+    overall_floor = structural_floor(
+        ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+    fit_test = (matched_cluster_test(fit, base_fit, vehicle=vehicle) if mode != "shadow" else
+                {"available": True, "actual_control": True, "matched": 0,
+                 "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
+    test = matched_cluster_test(heldout, base_heldout, vehicle=vehicle)
+    placebo = deterministic_placebo_deltas(heldout, base_heldout, vehicle=vehicle)
+    falsification = {
+        **falsification_gate(placebo["observed"], placebo["placebo"]),
+        "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
+        "observations": len(placebo["observed"]),
+    }
+    separation = (heldout_separation(fit, heldout) if mode != "shadow" else
+                  {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
+                   "passes": bool(heldout), "mode": "new_data"})
     fit_net = sum(float(row.get("net_pnl", 0.0)) for row in fit)
     held_net = sum(float(row.get("net_pnl", 0.0)) for row in heldout)
-    adequate = bool(sample_adequate and heldout_adequate and heldout)
+    checks = {
+        "fit_structurally_adequate": bool(fit_floor["adequate"]),
+        "heldout_structurally_adequate": bool(held_floor["adequate"]),
+        "separated": bool(separation["passes"]),
+        "actual_control_available": bool(test.get("available") and test.get("actual_control")),
+        "fit_delta_positive": bool(mode == "shadow" or (
+            fit_test.get("mean_delta") is not None and float(fit_test["mean_delta"]) > 0)),
+        "heldout_delta_positive": bool(test.get("mean_delta") is not None and
+                                        float(test["mean_delta"]) > 0),
+        "heldout_p_significant": float(test["p_value"]) <= float(alpha),
+        "falsification": bool(falsification["passes"]),
+    }
     return {
-        "passes_without_family": bool(
-            adequate and held_net > 0 and (mode == "shadow" or fit_net > 0)
-            and float(test["p_value"]) <= float(alpha)),
+        "passes_without_family": bool(all(checks.values())),
         "passes": False, "p_raw": float(test["p_value"]),
-        "sample_adequate": sample_adequate,
-        "heldout_sample_adequate": heldout_adequate,
+        "sample_adequate": bool(fit_floor["adequate"]),
+        "heldout_sample_adequate": bool(held_floor["adequate"]),
         "confidence": 1.0 - float(test["p_value"]),
-        "floor": floor, "heldout_floor": held_floor,
+        "floor": overall_floor, "fit_floor": fit_floor, "heldout_floor": held_floor,
         "fit_net_pnl": fit_net, "heldout_net_pnl": held_net,
-        "fit_trades": len([r for r in fit if r.get("no_trade") is not True]),
-        "heldout_trades": len([r for r in heldout if r.get("no_trade") is not True]),
+        "fit_trades": sample_counts(fit, vehicle=vehicle)["trades"],
+        "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
         "max_drawdown": max_drawdown_of(ordered), "test": test,
+        "fit_test": fit_test, "control": {**test, "kind": "matched_root_baseline"},
+        "falsification": falsification, "heldout_separation": separation,
+        "checks_without_family": checks,
         "mode": mode, "alpha": float(alpha),
+        "_fit_rows": fit, "_heldout_rows": heldout,
     }
 
 
@@ -715,7 +892,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 variants_per_strategy: int = DEFAULT_VARIANTS,
                 workers: int = DEFAULT_WORKERS, starting_cash: float = 100_000.0,
                 min_trades: int = 100, min_sessions: int = 10,
-                alpha: float = .05, max_generations: int = 5) -> dict:
+                alpha: float = .05, max_generations: int = 5,
+                strategy_llm: Mapping[str, Any] | None = None,
+                proposal_adapter: RuleProposalAdapter | None = None) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
     if vehicle not in {"equity", "option"}:
         raise FactoryError("vehicle must be equity or option")
@@ -729,6 +908,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError("starting_cash, min_trades and min_sessions must be positive")
     if not 0 < alpha <= 1:
         raise FactoryError("alpha must be in (0,1]")
+    llm_config = dict(strategy_llm or {})
+    llm_enabled = bool(llm_config.get("enabled", False))
+    if llm_enabled and not str(llm_config.get("model") or "").strip() and proposal_adapter is None:
+        raise FactoryError("strategy LLM model is required when autonomous LLM replacement is enabled")
     raw_rows, bars, snapshot_map = _read_discovery_rows(data)
     dataset_hash = content_hash(raw_rows)
     factory = FactoryLedger(db_path)
@@ -738,6 +921,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     if not factory.hypotheses(vehicle=vehicle):
         for hypothesis in initial_hypotheses(strategies, vehicle=vehicle):
             factory.register(hypothesis)
+    existing_variant_ids = {
+        rule_variant_id(item["rule_spec"])
+        for item in factory.hypotheses(vehicle=vehicle)
+    }
     active = factory.active(vehicle)[:int(strategies)]
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
@@ -753,8 +940,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         selected_snapshots = [snap for snap in snapshots if boundary is None or snap.session_date.isoformat() > boundary]
         specs = _existing_specs(edge, hypothesis["hypothesis_id"], vehicle) if mode == "shadow" else []
         if mode == "shadow" and not specs:
-            factory.event(hypothesis["hypothesis_id"], "retired",
-                          "forward validation had no persisted backtest-passed variants")
+            factory.event(hypothesis["hypothesis_id"], "backtest_passed",
+                          "forward validation is waiting for a persisted eligible variant")
             continue
         if not selected_bars:
             factory.event(hypothesis["hypothesis_id"], hypothesis["status"],
@@ -776,6 +963,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
 
     max_workers = min(int(workers), len(tasks))
     worker_results = []
+    worker_failures = []
     backend = "process"
     try:
         pool = ProcessPoolExecutor(max_workers=max_workers)
@@ -785,29 +973,69 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         pool = ThreadPoolExecutor(max_workers=max_workers)
         backend = "thread_fallback"
     with pool:
-        futures = [pool.submit(_worker, task) for task in tasks]
+        futures = {pool.submit(_worker, task): task for task in tasks}
         for future in as_completed(futures):
-            worker_results.append(future.result())
+            task = futures[future]
+            try:
+                worker_results.append(future.result())
+            except Exception as exc:
+                hypothesis = task["hypothesis"]
+                resume_status = ("backtest_passed" if task["mode"] == "shadow" else "queued")
+                factory.event(
+                    hypothesis["hypothesis_id"], resume_status,
+                    "worker failed; hypothesis requeued without a failure conclusion",
+                    {"error_type": type(exc).__name__, "error": str(exc)[:500]},
+                )
+                worker_failures.append({"hypothesis_id": hypothesis["hypothesis_id"],
+                                        "error_type": type(exc).__name__})
+    worker_results.sort(key=lambda item: (int(item["hypothesis"]["slot"]),
+                                          str(item["hypothesis"]["hypothesis_id"])))
+    for worker in worker_results:
+        worker["variants"] = sorted(worker["variants"],
+                                    key=lambda item: str(item["variant_id"]))
 
     variant_rows = []
     for worker in worker_results:
         for variant in worker["variants"]:
             gate = _gate(variant["account"]["rows"], vehicle=vehicle,
+                         baseline=worker["control_rows"],
                          mode=worker["mode"], min_trades=min_trades,
                          min_sessions=min_sessions, alpha=alpha)
             variant_rows.append((worker, variant, gate))
-    correction = benjamini_hochberg(
-        {variant["variant_id"]: gate["p_raw"] for _, variant, gate in variant_rows},
-        alpha=alpha)
-    for _, variant, gate in variant_rows:
-        family = correction[variant["variant_id"]]
-        gate["multiple_tests"] = {**family, "method": "benjamini_hochberg"}
-        gate["passes"] = bool(gate["passes_without_family"] and family["significant"])
-        gate["confidence"] = 1.0 - float(family["p_adjusted"])
+    partitions: dict[str, tuple[list, list]] = {}
+    for worker in worker_results:
+        local_rows = [(variant, gate) for owner, variant, gate in variant_rows
+                      if owner is worker]
+        correction = benjamini_hochberg(
+            {variant["variant_id"]: gate["p_raw"] for variant, gate in local_rows},
+            alpha=alpha)
+        for variant, gate in local_rows:
+            family = correction[variant["variant_id"]]
+            checks = {**gate["checks_without_family"],
+                      "family_fdr_significant": bool(family["significant"])}
+            gate["multiple_tests"] = {**family, "method": "benjamini_hochberg"}
+            gate["passes"] = bool(gate["passes_without_family"] and family["significant"])
+            gate["confidence"] = 1.0 - float(family["p_adjusted"])
+            fit = gate.pop("_fit_rows")
+            heldout = gate.pop("_heldout_rows")
+            envelope = verified_gate_envelope(
+                lane=worker["mode"], vehicle=vehicle, fit=fit, heldout=heldout,
+                fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
+                control=gate["control"], p_value=gate["p_raw"],
+                q_value=family["p_adjusted"], alpha=alpha,
+                falsification=gate["falsification"],
+                separation=gate["heldout_separation"], checks=checks,
+                passes=gate["passes"],
+                performance={"heldout_delta": gate["test"].get("mean_delta"),
+                             "max_drawdown": gate["max_drawdown"]})
+            gate["verified_gate"] = envelope
+            gate["gate_hash"] = envelope["content_hash"]
+            partitions[variant["account"]["account_id"]] = (fit, heldout)
 
     cycle_id = uuid.uuid4().hex
     summaries = []
     replacements = []
+    pending = []
     for worker in worker_results:
         hypothesis = worker["hypothesis"]
         local = [(variant, gate) for owner, variant, gate in variant_rows
@@ -815,6 +1043,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         adequate = [item for item in local
                     if item[1]["sample_adequate"] and
                     item[1]["heldout_sample_adequate"]]
+        all_intended_adequate = bool(
+            int(worker.get("expected_variants", 0)) > 0 and
+            len(local) == int(worker.get("expected_variants", 0)) and
+            len(adequate) == len(local))
         passing = [item for item in local if item[1]["passes"]]
         for variant, gate in local:
             result = {**variant, "evaluation_start": worker["evaluation_start"],
@@ -834,10 +1066,16 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 dataset=raw_rows, code=Path(__file__),
                 provenance={"factory": FACTORY_SCHEMA, "mode": worker["mode"],
                             "worker_pid": variant["worker_pid"]})
+            lineage = _llm_lineage_evidence(factory, hypothesis)
+            if lineage is not None:
+                prior = [item for item in edge.evidence(candidate["candidate_id"])
+                         if item.get("kind") == "llm_strategy_proposal"]
+                if not prior:
+                    edge.append_evidence(
+                        candidate["candidate_id"], "llm_strategy_proposal", lineage)
             run = None
             if gate["sample_adequate"] and gate["heldout_sample_adequate"]:
-                fit, held = ([], variant["account"]["rows"]) if worker["mode"] == "shadow" else \
-                    chronological_split(variant["account"]["rows"], fit_fraction=.7)
+                fit, held = partitions[variant["account"]["account_id"]]
                 run = edge.append_run(
                     candidate["candidate_id"], lane=worker["mode"], vehicle=vehicle,
                     dataset=raw_rows, config=config, code=Path(__file__),
@@ -848,10 +1086,11 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                                                        if k != "rows"},
                              "diagnostic": variant["diagnostic"],
                              "confidence": gate["confidence"],
-                             "heldout_ci_low": gate["heldout_net_pnl"],
+                             "heldout_delta": gate["test"].get("mean_delta"),
                              "max_drawdown": gate["max_drawdown"]})
                 for trade in variant["account"]["rows"]:
                     edge.append_trade(run["run_id"], trade)
+                edge.record_verified_gate(run["run_id"], gate)
                 edge.append_evidence(candidate["candidate_id"], "autonomous_diagnosis", {
                     "fit_diagnosis": worker["diagnostic"],
                     "variant_diagnosis": variant["diagnostic"], "gate": gate,
@@ -868,11 +1107,15 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     if current == "shadow":
                         edge.transition(candidate["candidate_id"], "validated",
                                         reason="backtest and forward simulated paper gates passed")
-                elif not gate["passes"] and current in {"candidate", "backtest_passed", "shadow"}:
+                elif not gate["passes"] and current in {"candidate", "backtest_passed"}:
                     edge.transition(candidate["candidate_id"], "retired",
                                     reason="adequately powered autonomous gate failed")
+                elif not gate["passes"] and current in {"shadow", "validated", "champion"}:
+                    edge.transition(candidate["candidate_id"], "demoted",
+                                    reason="latest autonomous gate failed mandatory checks")
             summaries.append({
                 "hypothesis_id": hypothesis["hypothesis_id"],
+                "candidate_id": candidate["candidate_id"],
                 "variant_id": variant["variant_id"], "mode": worker["mode"],
                 "evaluation_start": worker["evaluation_start"],
                 "evaluation_end": worker["evaluation_end"],
@@ -886,23 +1129,73 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             factory.event(hypothesis["hypothesis_id"], new_state,
                           f"{len(passing)} autonomous variant(s) passed {worker['mode']}",
                           {"passing": [item[0]["variant_id"] for item in passing]})
-        elif any(variant["variant_id"] == rule_variant_id(hypothesis["rule_spec"])
-                 for variant, _gate_result in adequate):
+        elif all_intended_adequate:
             aggregate = max((item[0]["diagnostic"] for item in local),
                             key=lambda value: abs(float(value.get("net_pnl", 0.0))))
-            factory.event(hypothesis["hypothesis_id"], "retired",
-                          "all adequately powered variants failed to prove positive edge",
-                          {"diagnostic": aggregate})
-            replacement = replacement_hypothesis(
-                hypothesis, aggregate, max_generations=max_generations,
-                not_before=worker["evaluation_end"])
+            proposal = None
+            replacement_error = None
+            if llm_enabled:
+                replacement, proposal, replacement_error = _llm_replacement(
+                    hypothesis, aggregate, config=llm_config,
+                    max_generations=max_generations,
+                    not_before=worker["evaluation_end"],
+                    existing_variant_ids=existing_variant_ids,
+                    adapter=proposal_adapter)
+            else:
+                replacement = replacement_hypothesis(
+                    hypothesis, aggregate, max_generations=max_generations,
+                    not_before=worker["evaluation_end"])
             if replacement is not None:
                 factory.register(replacement)
+                existing_variant_ids.add(rule_variant_id(replacement.rule_spec))
+                retirement_payload = {
+                    "diagnostic": aggregate, "tested_variants": len(local),
+                    "replacement_hypothesis_id": replacement.hypothesis_id,
+                    "replacement_variant_id": rule_variant_id(replacement.rule_spec),
+                }
+                if proposal is not None:
+                    retirement_payload.update({
+                        "proposal_schema": proposal.schema,
+                        "llm_evidence": proposal.evidence,
+                    })
+                    factory.event(
+                        hypothesis["hypothesis_id"], "testing",
+                        "LLM replacement proposal passed the bounded rule grammar",
+                        retirement_payload)
+                factory.retire_hypothesis(
+                    hypothesis["hypothesis_id"], cycle_id=cycle_id,
+                    expected_variants=int(worker.get("expected_variants", 0)),
+                    reason=("LLM replacement registered after every intended variant failed"
+                            if proposal is not None else
+                            "deterministic replacement registered after every intended variant failed"),
+                    payload=retirement_payload)
                 replacements.append(asdict(replacement))
+            elif llm_enabled and replacement_error != "generation_limit":
+                detail = {
+                    "diagnostic": aggregate,
+                    "failure": replacement_error or "llm_proposal_failed",
+                    "llm_evidence": proposal.evidence if proposal is not None else {},
+                    "error": proposal.error if proposal is not None else None,
+                }
+                factory.event(
+                    hypothesis["hypothesis_id"], "pending_llm_replacement",
+                    "adequate failure proven; retirement waits for a valid LLM replacement",
+                    detail)
+                pending.append({"hypothesis_id": hypothesis["hypothesis_id"],
+                                "reason": detail["failure"]})
+            else:
+                factory.event(
+                    hypothesis["hypothesis_id"], "pending_generation_limit",
+                    "all variants failed, but the generation cap leaves this slot pending explicit rotation",
+                    {"diagnostic": aggregate, "max_generations": int(max_generations)},
+                )
+                pending.append({"hypothesis_id": hypothesis["hypothesis_id"],
+                                "reason": "generation_limit"})
         else:
             factory.event(hypothesis["hypothesis_id"], hypothesis.get("status", "queued"),
                           "sample floor not met; observations were not treated as failure",
-                          {"evaluated_variants": len(local), "adequate_variants": len(adequate)})
+                          {"evaluated_variants": len(local), "adequate_variants": len(adequate),
+                           "intended_variants": int(worker.get("expected_variants", 0))})
 
     validated = [row for row in summaries if row["status"] in {"validated", "champion"}]
     champion = None
@@ -910,7 +1203,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         champion = edge.select_champion(vehicle=vehicle, min_confidence=1.0 - alpha,
                                         strategy_id="rule")
     result = {
-        "schema": FACTORY_SCHEMA, "status": "complete", "cycle_id": cycle_id,
+        "schema": FACTORY_SCHEMA,
+        "status": ("partial_worker_failure" if worker_failures else
+                   "pending_replacement_capacity" if pending else "complete"),
+        "cycle_id": cycle_id,
         "dataset_hash": dataset_hash, "vehicle": vehicle,
         "parallel_workers": max_workers,
         "parallel_backend": backend,
@@ -918,12 +1214,17 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,
         "replacements": replacements,
+        "pending": pending, "worker_failures": worker_failures,
+        "strategy_llm": {"enabled": llm_enabled,
+                         "provider": llm_config.get("provider") if llm_enabled else None,
+                         "model": llm_config.get("model") if llm_enabled else None},
         "champion": ({key: champion.get(key) for key in
                       ("candidate_id", "variant_id", "strategy_id", "vehicle", "status")}
                      if champion else None),
     }
-    factory.add_cycle(cycle_id, dataset_hash, vehicle, max_workers,
-                      len(worker_results), len(summaries), result)
+    if not worker_failures:
+        factory.add_cycle(cycle_id, dataset_hash, vehicle, max_workers,
+                          len(worker_results), len(summaries), result)
     return result
 
 

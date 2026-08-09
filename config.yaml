@@ -2,6 +2,7 @@
   "mode": "paper",
   "broker": {
     "paper": true,
+    "allow_live": false,
     "data_feed": "iex",
     "options_feed": "indicative"
   },
@@ -23,6 +24,7 @@
     "id": "rule",
     "version": "v1",
     "variant_id": "auto",
+    "selection_mode": "all_proved",
     "execution_mode": "shares",
     "range_minutes": 15,
     "breakout_buffer_bps": 5,
@@ -62,7 +64,20 @@
   "research": {
     "enabled": true,
     "require_validated_variant": true,
-    "champion_min_confidence": 0.95
+    "champion_min_confidence": 0.95,
+    "strategy_llm": {
+      "enabled": true,
+      "provider": "openai",
+      "model": "gpt-5",
+      "max_attempts": 2,
+      "timeout_seconds": 30,
+      "max_response_bytes": 16384
+    },
+    "proof": {
+      "directory": "findings",
+      "webhook_url": "",
+      "webhook_timeout_seconds": 10
+    }
   },
   "cycle": {
     "interval_seconds": 60

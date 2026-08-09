@@ -19,7 +19,10 @@ from typing import Any
 from .alpaca_domain import (Account, Asset, Bar, CalendarDay, MarketClock, Order,
                             OrderRequest, OptionContract, OptionSnapshot, Position,
                             Quote, parse_occ_symbol)
-from .alpaca_session import normalize_calendar_day, paper_env_guard
+from .alpaca_session import normalize_calendar_day, trading_env_guard
+from .instruments import (reject_crypto, validate_asset_class,
+                          validate_equity_symbol, validate_instrument,
+                          validate_option_symbol)
 
 EQUITY_FEEDS = {"iex", "sip", "delayed_sip"}
 OPTION_FEEDS = {"indicative", "opra"}
@@ -64,7 +67,7 @@ class CredentialsError(AlpacaError):
 
 
 class PaperModeError(AlpacaError):
-    """The runtime refuses live Alpaca endpoints unconditionally."""
+    """The configured endpoint scope failed its explicit safety guard."""
 
 
 class IdempotencyConflict(AlpacaError):
@@ -167,15 +170,13 @@ class AlpacaSession:
                  option_data_client: Any = None) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("ALPACA_API_KEY")
         self.secret_key = secret_key if secret_key is not None else os.getenv("ALPACA_SECRET_KEY")
-        try:
-            paper_env_guard()
-        except ValueError as exc:
-            raise PaperModeError(str(exc)) from exc
         if not isinstance(paper, bool) or not isinstance(allow_live, bool):
             raise ValueError("paper and allow_live must be booleans")
-        if not paper or allow_live:
-            raise PaperModeError("live Alpaca trading is disabled; paper=true and allow_live=false are required")
-        self.paper = True
+        try:
+            trading_env_guard(paper=paper, allow_live=allow_live)
+        except ValueError as exc:
+            raise PaperModeError(str(exc)) from exc
+        self.paper = paper
         self._trading = trading_client
         self._stock_data = stock_data_client
         self._option_data = option_data_client
@@ -186,10 +187,6 @@ class AlpacaSession:
 
     @classmethod
     def from_env(cls, *, paper: bool = True, allow_live: bool = False, **kwargs):
-        try:
-            paper_env_guard()
-        except ValueError as exc:
-            raise PaperModeError(str(exc)) from exc
         return cls(api_key=os.getenv("ALPACA_API_KEY"), secret_key=os.getenv("ALPACA_SECRET_KEY"), paper=paper, allow_live=allow_live, **kwargs)
 
     @property
@@ -239,18 +236,24 @@ class AlpacaProvider:
         mode = str(cfg.get("mode") or cfg.get("broker", {}).get("mode") or "paper").lower()
         if mode == "demo":
             mode = "paper"
-        if mode != "paper":
-            raise PaperModeError("only paper mode is supported")
+        if mode not in {"paper", "live"}:
+            raise PaperModeError("mode must be paper or live")
         broker = cfg.get("broker") if isinstance(cfg.get("broker"), Mapping) else {}
         data_cfg = cfg.get("data") if isinstance(cfg.get("data"), Mapping) else {}
-        paper_value = broker.get("paper", True)
+        paper_value = broker.get("paper", mode == "paper")
         allow_live_value = broker.get("allow_live", cfg.get("allow_live", False))
         if not isinstance(paper_value, bool) or not isinstance(allow_live_value, bool):
             raise ValueError("broker.paper and broker.allow_live must be booleans")
-        if not paper_value or allow_live_value:
-            raise PaperModeError("broker.paper must be true and allow_live must be false")
+        if mode == "paper" and (paper_value is not True or allow_live_value is not False):
+            raise PaperModeError("paper mode requires broker.paper=true and allow_live=false")
+        if mode == "live" and (paper_value is not False or allow_live_value is not True):
+            raise PaperModeError("live mode requires broker.paper=false and allow_live=true")
+        try:
+            trading_env_guard(paper=paper_value, allow_live=allow_live_value)
+        except ValueError as exc:
+            raise PaperModeError(str(exc)) from exc
         # Endpoint overrides are deliberately not accepted: TradingClient's
-        # paper flag is the sole endpoint selector and is pinned true.
+        # paper flag is the sole endpoint selector and is pinned to the mode.
         if broker.get("endpoint"):
             raise PaperModeError("broker endpoint overrides are disabled")
         import_env_feed = os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
@@ -259,14 +262,17 @@ class AlpacaProvider:
         configured_options_feed = broker.get("options_feed") if "options_feed" in broker else data_cfg.get("options_feed", "indicative")
         self.data_feed = _canonical_feed(import_env_feed or configured_data_feed)
         self.options_feed = _canonical_feed(import_env_option_feed or configured_options_feed, options=True)
-        paper = True
-        allow_live = False
+        paper = paper_value
+        allow_live = allow_live_value
         self.session = session or AlpacaSession(
             api_key=broker.get("api_key"), secret_key=broker.get("secret_key"),
             paper=paper, allow_live=allow_live,
             trading_client=clients.get("trading_client"),
             stock_data_client=clients.get("stock_data_client"),
             option_data_client=clients.get("option_data_client"))
+        if self.session.paper is not paper:
+            raise PaperModeError("injected Alpaca session endpoint does not match configured mode")
+        self.mode = mode
         self._seen_requests: dict[str, OrderRequest] = {}
         self._submitted_orders: dict[str, Order] = {}
 
@@ -314,6 +320,7 @@ class AlpacaProvider:
         return [normalize_calendar_day(row) for row in (rows or [])]
 
     def assets(self, *, asset_class: str = "us_equity", status: str = "active") -> list[Asset]:
+        asset_class = validate_asset_class(asset_class)
         try:
             from alpaca.trading.requests import GetAssetsRequest
             from alpaca.trading.enums import AssetClass, AssetStatus
@@ -331,6 +338,8 @@ class AlpacaProvider:
         return [Asset.from_sdk(row) for row in rows]
 
     def option_contracts(self, underlying_symbol: str | None = None, **kwargs) -> list[OptionContract]:
+        if underlying_symbol is not None:
+            underlying_symbol = validate_equity_symbol(underlying_symbol)
         try:
             from alpaca.trading.requests import GetOptionContractsRequest
             try:
@@ -398,7 +407,24 @@ class AlpacaProvider:
     def positions(self) -> list[Position]:
         try:
             rows = self.session.trading.get_all_positions()
-            return [Position(symbol=str(_value(row, "symbol", "")).upper(), qty=Decimal(str(_value(row, "qty", 0))), side=_text(_value(row, "side"), "long"), market_value=Decimal(str(_value(row, "market_value"))) if _value(row, "market_value") is not None else None, avg_entry_price=Decimal(str(_value(row, "avg_entry_price"))) if _value(row, "avg_entry_price") is not None else None, current_price=Decimal(str(_value(row, "current_price"))) if _value(row, "current_price") is not None else None, unrealized_pl=Decimal(str(_value(row, "unrealized_pl"))) if _value(row, "unrealized_pl") is not None else None, raw=dict(row) if isinstance(row, Mapping) else {}) for row in rows]
+            result = []
+            for row in rows:
+                reject_crypto(row, "position")
+                asset_class = _value(row, "asset_class", _value(row, "class", None))
+                if asset_class is None or not _text(asset_class):
+                    raise ValueError("position asset_class is required")
+                symbol = validate_instrument(
+                    _value(row, "symbol", ""),
+                    validate_asset_class(asset_class))
+                result.append(Position(
+                    symbol=symbol, qty=Decimal(str(_value(row, "qty", 0))),
+                    side=_text(_value(row, "side"), "long"),
+                    market_value=Decimal(str(_value(row, "market_value"))) if _value(row, "market_value") is not None else None,
+                    avg_entry_price=Decimal(str(_value(row, "avg_entry_price"))) if _value(row, "avg_entry_price") is not None else None,
+                    current_price=Decimal(str(_value(row, "current_price"))) if _value(row, "current_price") is not None else None,
+                    unrealized_pl=Decimal(str(_value(row, "unrealized_pl"))) if _value(row, "unrealized_pl") is not None else None,
+                    raw=dict(row) if isinstance(row, Mapping) else {}))
+            return result
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -455,9 +481,24 @@ class AlpacaProvider:
         return [self._order(row) for row in rows]
 
     def _order(self, row: Any) -> Order:
-        return Order(id=str(_value(row, "id", "")), symbol=str(_value(row, "symbol", "")).upper(), qty=Decimal(str(_value(row, "qty", 0))), side=_text(_value(row, "side")), status=_text(_value(row, "status")), type=_text(_value(row, "type"), "market"), time_in_force=_text(_value(row, "time_in_force"), "day"), client_order_id=_value(row, "client_order_id"), filled_qty=Decimal(str(_value(row, "filled_qty", 0))), filled_avg_price=Decimal(str(_value(row, "filled_avg_price"))) if _value(row, "filled_avg_price") is not None else None, submitted_at=_dt(_value(row, "submitted_at")), updated_at=_dt(_value(row, "updated_at")), raw=dict(row) if isinstance(row, Mapping) else {})
+        reject_crypto(row, "order")
+        asset_class = _value(row, "asset_class", _value(row, "class", None))
+        if asset_class is None or not _text(asset_class):
+            raise ValueError("order asset_class is required")
+        symbol = validate_instrument(
+            _value(row, "symbol", ""),
+            validate_asset_class(asset_class))
+        tif = _text(_value(row, "time_in_force", None))
+        if not tif:
+            raise AlpacaError("broker order time_in_force is required")
+        if tif != "day":
+            raise AlpacaError("broker order time_in_force must be day")
+        return Order(id=str(_value(row, "id", "")), symbol=symbol, qty=Decimal(str(_value(row, "qty", 0))), side=_text(_value(row, "side")), status=_text(_value(row, "status")), type=_text(_value(row, "type"), "market"), time_in_force=tif, client_order_id=_value(row, "client_order_id"), filled_qty=Decimal(str(_value(row, "filled_qty", 0))), filled_avg_price=Decimal(str(_value(row, "filled_avg_price"))) if _value(row, "filled_avg_price") is not None else None, submitted_at=_dt(_value(row, "submitted_at")), updated_at=_dt(_value(row, "updated_at")), raw=dict(row) if isinstance(row, Mapping) else {})
 
     def submit_order(self, request: OrderRequest) -> Order:
+        validate_instrument(request.symbol)
+        if request.time_in_force != "day":
+            raise AlpacaError("order time_in_force must be day")
         cid = request.client_order_id or f"alpaca-{uuid.uuid4().hex[:24]}"
         if request.client_order_id != cid:
             request = replace(request, client_order_id=cid)
@@ -529,6 +570,7 @@ class AlpacaProvider:
             raise AlpacaError(f"cancel orders failed: {exc}") from exc
 
     def bars(self, symbols, timeframe="1Day", start=None, end=None, feed: str | None = None) -> dict[str, list[Bar]]:
+        symbols = [validate_equity_symbol(symbol) for symbol in symbols]
         requested_feed = _canonical_feed(feed or self.data_feed)
         try:
             from alpaca.data.requests import StockBarsRequest
@@ -565,6 +607,7 @@ class AlpacaProvider:
             raise AlpacaError(f"stock bars request failed: {exc}") from exc
 
     def quotes(self, symbols, start=None, end=None, feed: str | None = None) -> dict[str, list[Quote]]:
+        symbols = [validate_equity_symbol(symbol) for symbol in symbols]
         requested_feed = _canonical_feed(feed or self.data_feed)
         try:
             from alpaca.data.requests import StockQuotesRequest
@@ -586,6 +629,7 @@ class AlpacaProvider:
 
     def option_chain(self, underlying_symbol: str, start=None, end=None,
                      feed: str | None = None, **kwargs):
+        underlying_symbol = validate_equity_symbol(underlying_symbol)
         requested_feed = _canonical_feed(feed or self.options_feed, options=True)
         try:
             # OptionHistoricalDataClient.get_option_chain in alpaca-py 0.43.5
@@ -618,6 +662,7 @@ class AlpacaProvider:
     def option_snapshots(self, underlying_symbol: str, feed: str | None = None,
                          **kwargs) -> list[OptionSnapshot]:
         """Return normalized option snapshots when SDK data is mapping-like."""
+        underlying_symbol = validate_equity_symbol(underlying_symbol)
         requested_feed = _canonical_feed(feed or self.options_feed, options=True)
         raw = self.option_chain(underlying_symbol, feed=requested_feed, **kwargs)
         if isinstance(raw, Mapping):
@@ -678,9 +723,7 @@ class AlpacaProvider:
         the returned mapping so risk can fail closed on stale/future quotes.
         No order is submitted by this method.
         """
-        underlying = str(underlying_symbol or "").strip().upper()
-        if not underlying:
-            raise ValueError("underlying_symbol is required")
+        underlying = validate_equity_symbol(underlying_symbol)
         requested_feed = _canonical_feed(feed or self.options_feed, options=True)
         if now is None:
             now_dt = datetime.now(timezone.utc)
@@ -728,6 +771,10 @@ class AlpacaProvider:
             symbol_value = _value(row, "symbol") or _value(contract_value, "symbol")
             symbol = str(symbol_value or "").strip().upper()
             if not symbol:
+                continue
+            try:
+                symbol = validate_option_symbol(symbol, underlying)
+            except ValueError:
                 continue
             contract_raw = _mapping(_value(row, "contract") or row)
             contract = metadata.get(symbol)
@@ -810,9 +857,9 @@ class AlpacaProvider:
         normal sell.  The caller can reconcile the returned order exactly as
         any other :class:`Order`.
         """
-        wanted = str(symbol or "").strip().upper()
-        if not wanted:
-            raise ValueError("position symbol is required")
+        wanted = validate_instrument(symbol)
+        if str(time_in_force).lower() != "day":
+            raise ValueError("close position time_in_force must be day")
         held = next((position for position in self.positions()
                      if str(position.symbol).upper() == wanted), None)
         if held is None:

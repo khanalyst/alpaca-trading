@@ -81,7 +81,8 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         hung = status == "running" and deadline is not None and current > float(deadline)
     except (TypeError, ValueError):
         hung = status == "running"
-    ok = fresh and not hung and status in {"waiting", "running", "completed"} and (
+    ok = fresh and not hung and status in {
+        "waiting", "running", "completed", "completed_no_edge"} and (
         last_exit in {None, 0})
     return {
         "ok": ok,
@@ -115,8 +116,8 @@ def _trader_path(args) -> Path:
     raw = load_config(args.config)
     broker = raw.get("broker") if isinstance(raw.get("broker"), dict) else {}
     mode = str(raw.get("mode") or broker.get("mode") or "paper").lower()
-    if mode != "paper":
-        raise ValueError("config mode must select the Alpaca paper endpoint")
+    if mode not in {"paper", "live"}:
+        raise ValueError("config mode must be paper or live")
     return Path(args.runtime_root) / mode / "heartbeat.json"
 
 

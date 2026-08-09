@@ -95,6 +95,32 @@ class IBRContractTests(unittest.TestCase):
         self.assertTrue(plan["force_flat"])
         self.assertIsNotNone(plan["force_flat_at"])
 
+    def test_setup_plan_requires_both_freshness_flags(self):
+        cfg = {"strategy": {"id": "ibr", "version": "v1",
+                             "target_r": 2.0,
+                             "breakout_buffer_bps": 5,
+                             "min_relative_volume": 1}}
+        snapshot = {
+            "price": 101, "close": 101, "signal_ts": 1710164760,
+            "ibr_range": {"high": 100.5, "low": 99.5, "width": 1,
+                          "range_end_ts": 1710164700, "complete": True},
+            "relative_volume": 2, "spread_bps": 10,
+            "stale": False, "session": "2024-03-11",
+        }
+        plan, why = strategy.build_setup_plan(
+            {"symbol": "SPY", "direction": "long",
+             "setup_type": "ibr_breakout"}, snapshot, cfg)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "market data freshness is unavailable")
+
+        snapshot["quote_stale"] = False
+        snapshot.pop("stale")
+        plan, why = strategy.build_setup_plan(
+            {"symbol": "SPY", "direction": "long",
+             "setup_type": "ibr_breakout"}, snapshot, cfg)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "market data freshness is unavailable")
+
     def test_validated_rule_signal_uses_the_same_runtime_plan_boundary(self):
         spec = validate_rule_spec({
             "family": "momentum_continuation", "lookback": 3,

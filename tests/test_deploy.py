@@ -45,6 +45,35 @@ class _MarketFake:
             bid=100, ask=101, last=100.5)]}
 
 
+class _WindowFake(_MarketFake):
+    def __init__(self):
+        super().__init__()
+        self.starts = []
+
+    def bars(self, symbols, *, start, end, feed, **kwargs):
+        self.starts.append(start)
+        return super().bars(symbols, start=start, end=end, feed=feed, **kwargs)
+
+    def quotes(self, symbols, *, start, end, feed):
+        self.starts.append(start)
+        return super().quotes(symbols, start=start, end=end, feed=feed)
+
+
+class _MissingQuoteTimestampFake(_MarketFake):
+    def quotes(self, symbols, *, start, end, feed):
+        self.seen.append(("quotes", feed))
+        return {"SPY": [SimpleNamespace(
+            timestamp=None, bid=100, ask=101, last=100.5)]}
+
+
+class _FutureBarFake(_MarketFake):
+    def bars(self, symbols, *, start, end, feed, **kwargs):
+        self.seen.append(("bars", feed))
+        return {"SPY": [SimpleNamespace(
+            timestamp=end + timedelta(minutes=1),
+            open=100, high=101, low=99, close=100.5, volume=10)]}
+
+
 class _OptionFake(_MarketFake):
     def __init__(self):
         super().__init__(feed="iex")
@@ -55,15 +84,14 @@ class _OptionFake(_MarketFake):
         self.option_calls.append((symbol, underlying_price, feed,
                                   min_dte, max_dte))
         timestamp = datetime(2026, 8, 8, 13, 30, 2, tzinfo=timezone.utc)
+        expiration = datetime.now(timezone.utc).date() + timedelta(days=30)
         rows = []
         for right in ("call", "put"):
             for index in range(6):
                 strike = 100 + index if right == "call" else 100 - index
                 rows.append({
-                    "symbol": f"SPY260808{right[0].upper()}{index:03d}",
-                    "underlying": "SPY", "expiration": (
-                        datetime.now(timezone.utc).date() + timedelta(days=30)
-                    ).isoformat(),
+                    "symbol": f"SPY{expiration:%y%m%d}{right[0].upper()}{int(strike * 1000):08d}",
+                    "underlying": "SPY", "expiration": expiration.isoformat(),
                     "strike": strike, "right": right, "multiplier": 100,
                     "timestamp": timestamp, "bid": 1 + index / 10,
                     "ask": 1.1 + index / 10, "bid_size": 10 + index,
@@ -72,6 +100,12 @@ class _OptionFake(_MarketFake):
                     "underlying_price": 100, "feed": feed,
                 })
         return rows
+
+
+class _MismatchedOptionFake(_OptionFake):
+    def option_candidates(self, *args, **kwargs):
+        rows = super().option_candidates(*args, **kwargs)
+        return [{**row, "underlying": "BTC"} for row in rows]
 
 
 class _StockDataFake:
@@ -121,6 +155,12 @@ class DeployTests(unittest.TestCase):
         research = text.split("  research:", 1)[1].split("  dashboard:", 1)[0]
         self.assertNotIn("ALPACA_AGENT_SECRETS_FILE", research)
         self.assertNotIn("agent_credentials", research)
+        self.assertIn(
+            "ALPACA_RESEARCH_LLM_SECRETS_FILE: /run/secrets/research_llm_credentials",
+            research)
+        self.assertIn("source: research_llm_credentials", research)
+        self.assertNotIn("OPENAI_API_KEY:", research)
+        self.assertNotIn("ANTHROPIC_API_KEY:", research)
         unit = Path("deploy/alpaca-research.service").read_text(encoding="utf-8")
         self.assertNotIn("ALPACA_AGENT_SECRETS_FILE", unit)
         self.assertNotIn("agent.env", unit)
@@ -155,8 +195,74 @@ class DeployTests(unittest.TestCase):
                 self.assertGreater(db.execute(
                     "SELECT COUNT(*) FROM candidates").fetchone()[0], 0)
 
+    def test_research_cycle_reports_no_data_as_structured_nonzero_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "empty.jsonl"
+            dataset.write_text("\n", encoding="utf-8")
+            result = subprocess.run(
+                ["deploy/research-cycle.sh"],
+                cwd=Path(__file__).resolve().parents[1],
+                env=dict(os.environ, PYTHON=sys.executable,
+                         ALPACA_RESEARCH_DATASET=str(dataset)),
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["schema"], "research-cycle.v1")
+            self.assertEqual(payload["status"], "no_data")
+            self.assertEqual(payload["exit_code"], 2)
+
+    def test_scheduler_preserves_research_cycle_statuses_in_health_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("mode: paper\nbroker:\n  paper: true\n",
+                              encoding="utf-8")
+            script = root / "cycle.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$CYCLE_RESULT\"\n"
+                "exit \"${CYCLE_EXIT:-0}\"\n", encoding="utf-8")
+            script.chmod(0o755)
+            status = root / "health.json"
+            for expected, exit_code in (("completed_no_edge", 0),
+                                        ("completed_no_edge", 2),
+                                        ("no_data", 2)):
+                scheduler._running = True
+                env = dict(os.environ, CYCLE_RESULT=json.dumps({
+                    "schema": "research-cycle.v1", "status": expected,
+                    "reason": "test", "exit_code": exit_code,
+                }), CYCLE_EXIT=str(exit_code))
+                with patch.dict(os.environ, env, clear=True):
+                    args = SimpleNamespace(
+                        status_file=str(status), config=str(config),
+                        script=str(script), root=str(root), hour=3, minute=0,
+                        once=True, timeout_seconds=10,
+                        output_limit_chars=4096)
+                    expected_exit = (0 if expected == "completed_no_edge"
+                                     else exit_code)
+                    self.assertEqual(scheduler.run_scheduler(args), expected_exit)
+                payload = json.loads(status.read_text(encoding="utf-8"))
+                self.assertEqual(payload["status"], expected)
+                self.assertEqual(payload["cycle_status"], expected)
+                self.assertEqual(payload["research_cycle"]["status"], expected)
+
+    def test_research_health_distinguishes_no_edge_from_no_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            now = datetime.now(timezone.utc).timestamp()
+            path.write_text(json.dumps({
+                "status": "completed_no_edge", "updated_ts": now,
+                "last_exit_code": 0}), encoding="utf-8")
+            self.assertTrue(health.research(path, 60, now=now)["ok"])
+            path.write_text(json.dumps({
+                "status": "no_data", "updated_ts": now,
+                "last_exit_code": 2}), encoding="utf-8")
+            self.assertFalse(health.research(path, 60, now=now)["ok"])
+
     def test_research_cycle_sends_recorded_options_to_autonomous_discovery(self):
         expiry = (datetime.now(timezone.utc).date() + timedelta(days=30)).isoformat()
+        contract_symbol = f"SPY{datetime.fromisoformat(expiry):%y%m%d}C00100000"
         fields = list(recorder.FIELDS)
         csv_buffer = io.StringIO()
         writer = csv.DictWriter(csv_buffer, fieldnames=fields)
@@ -171,8 +277,8 @@ class DeployTests(unittest.TestCase):
         writer.writerow({
             "event_key": "option", "observed_at": "2026-08-08T13:31:00+00:00",
             "provider": "alpaca", "feed": "indicative",
-            "event_type": "option_snapshot", "symbol": "SPY260918C00100",
-            "contract": "SPY260918C00100",
+            "event_type": "option_snapshot", "symbol": contract_symbol,
+            "contract": contract_symbol,
             "timestamp": "2026-08-08T13:30:02+00:00",
             "as_of": "2026-08-08T13:30:02+00:00", "volume": 100, "bid": 1,
             "ask": 1.1, "underlying": "SPY", "expiration": expiry,
@@ -215,6 +321,104 @@ class DeployTests(unittest.TestCase):
                                          ("bars", "sip"), ("quotes", "sip")])
             self.assertEqual(len({row.split(",", 1)[0] for row in rows[1:]}), 2)
 
+    def test_recorder_resumes_from_durable_watermark_after_long_outage(self):
+        fake = _WindowFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path,
+                                                  feed="iex"), 2)
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path,
+                                                  feed="iex"), 0)
+            expected = datetime(2026, 8, 8, 13, 29, 1,
+                                tzinfo=timezone.utc)
+            self.assertEqual(fake.starts[-2:], [expected, expected])
+
+    def test_recorder_skips_quotes_without_point_in_time_timestamp(self):
+        fake = _MissingQuoteTimestampFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 1)
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["event_type"] for row in rows], ["bar_1m"])
+
+    def test_recorder_fails_closed_on_corrupt_existing_csv(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            path.write_text(
+                "event_key,event_type,symbol,timestamp\n"
+                "x,bar_1m,SPY,2026-08-08T13:30:00+00:00,unexpected\n",
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "malformed CSV"):
+                recorder.record_once(fake, ["SPY"], path)
+
+    def test_recorder_rejects_crypto_symbols_before_provider_calls(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            with self.assertRaisesRegex(ValueError, "slash pair"):
+                recorder.record_once(fake, ["BTC/USD"], path)
+            self.assertEqual(fake.seen, [])
+
+    def test_recorder_rejects_future_provider_events(self):
+        fake = _FutureBarFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            with self.assertRaisesRegex(RuntimeError, "future"):
+                recorder.record_once(fake, ["SPY"], path)
+            self.assertFalse(path.exists())
+
+    def test_recorder_does_not_mutate_invalid_legacy_csv(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            original = ("event_type,symbol,timestamp\n"
+                        "bar_1m,SPY,not-a-timestamp\n")
+            path.write_text(original, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "invalid timestamp"):
+                recorder.record_once(fake, ["SPY"], path)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_recorder_skips_option_rows_with_mismatched_underlying(self):
+        fake = _MismatchedOptionFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            self.assertEqual(recorder.record_once(
+                fake, ["SPY"], path, include_options=True), 2)
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual({row["event_type"] for row in rows},
+                             {"bar_1m", "quote"})
+
+    def test_recorder_rejects_invalid_existing_row_semantics(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            writer_buffer = io.StringIO()
+            writer = csv.DictWriter(writer_buffer, fieldnames=recorder.FIELDS)
+            writer.writeheader()
+            writer.writerow({
+                "event_key": "bad", "event_type": "evil", "symbol": "BTC/USD",
+                "timestamp": "2026-08-08T13:30:00+00:00"})
+            path.write_text(writer_buffer.getvalue(), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "invalid recorder dataset row"):
+                recorder.record_once(fake, ["SPY"], path)
+            self.assertEqual(fake.seen, [])
+
+    def test_recorder_detects_intraday_bar_continuity_gap(self):
+        previous = datetime(2026, 8, 3, 13, 30, tzinfo=timezone.utc)
+        current = previous + timedelta(hours=2)
+        rows = [{"event_type": "bar_1m", "symbol": "SPY",
+                 "timestamp": current.isoformat()}]
+        with self.assertRaisesRegex(RuntimeError, "continuity gap"):
+            recorder._verify_bar_continuity(
+                rows, {"SPY": previous}, current, ["SPY"])
+        recorder._verify_bar_continuity(
+            [{"event_type": "bar_1m", "symbol": "SPY",
+              "timestamp": (previous + timedelta(minutes=1)).isoformat()}],
+            {"SPY": previous}, previous + timedelta(minutes=1), ["SPY"])
+
     def test_recorder_records_bounded_lossless_option_snapshots(self):
         from research.market_data import normalize_option_snapshot
         fake = _OptionFake()
@@ -236,7 +440,10 @@ class DeployTests(unittest.TestCase):
             options = [row for row in rows if row["event_type"] == "option_snapshot"]
             self.assertEqual(len(options), 10)
             self.assertEqual({row["right"] for row in options}, {"call", "put"})
-            self.assertNotIn("SPY260808C005", {row["symbol"] for row in options})
+            expiry = datetime.now(timezone.utc).date() + timedelta(days=30)
+            self.assertNotIn(
+                f"SPY{expiry:%y%m%d}C00105000",
+                {row["symbol"] for row in options})
             required = {"contract", "underlying", "expiration", "strike", "right",
                         "multiplier", "bid", "ask", "bid_size", "ask_size",
                         "volume", "open_interest", "observed_at", "timestamp"}
@@ -313,22 +520,41 @@ class DeployTests(unittest.TestCase):
         self.assertIn("d.strategy.execution_mode", dashboard.HTML)
         self.assertIn("d.research.entry_gate_required", dashboard.HTML)
         self.assertIn("d.research.service_optional", dashboard.HTML)
+        self.assertIn("d.edge.proved_edges", dashboard.HTML)
+        self.assertIn("cycle outcome", dashboard.HTML)
+        self.assertIn("Execution journal", dashboard.HTML)
         self.assertNotIn("d.research_feed_version", dashboard.HTML)
         self.assertNotIn("d.research.optional", dashboard.HTML)
         self.assertNotIn("d.trader.heartbeat.research_available", dashboard.HTML)
 
     def test_dashboard_exposes_edge_ledger_status(self):
-        from research.edge_lab import init_ledger
+        from research.edge_lab import EdgeLedger, init_ledger
+        from tests.research.test_edge_discovery import _persist_gate
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "runtime" / "research").mkdir(parents=True)
             (root / "config.yaml").write_text(
                 "mode: paper\nstrategy:\n  id: ibr\n  version: v1\n",
                 encoding="utf-8")
-            init_ledger(root / "runtime" / "research" / "edge_lab.sqlite3")
-            snapshot = dashboard.snapshot(root)
-            self.assertTrue(snapshot["edge"]["available"])
-            self.assertEqual(snapshot["edge"]["status"], "ready")
+            ledger_path = root / "runtime" / "research" / "edge_lab.sqlite3"
+            init_ledger(ledger_path)
+            ledger = EdgeLedger(ledger_path)
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="dashboard proof visibility",
+                config={"strategy": {"target_r": 1.5}})
+            _persist_gate(ledger, candidate["candidate_id"], "shadow")
+            with closing(sqlite3.connect(ledger_path)) as db, db:
+                db.execute("UPDATE candidate_state SET status='validated' WHERE candidate_id=?",
+                           (candidate["candidate_id"],))
+            result = dashboard._edge_status(ledger_path)
+            self.assertTrue(result["available"])
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["proved_edges"][0]["variant_id"],
+                             "ibr.target.1_5r")
+            _persist_gate(ledger, candidate["candidate_id"], "shadow",
+                          passes=False)
+            self.assertEqual(dashboard._edge_status(ledger_path)["proved_edges"], [])
 
     def test_report_is_a_small_usd_paper_summary(self):
         with closing(sqlite3.connect(":memory:")) as db:

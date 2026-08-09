@@ -13,7 +13,7 @@ import os
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from .alpaca_domain import CalendarDay, MarketClock
+from .alpaca_domain import CalendarDay
 
 NEW_YORK = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -44,8 +44,12 @@ class SessionPolicy:
     def __post_init__(self) -> None:
         if self.timezone != "America/New_York":
             raise ValueError("only America/New_York is supported")
-        if self.force_flat_minutes_before_close < 0:
-            raise ValueError("force_flat_minutes_before_close must be >= 0")
+        if self.entries_regular_session_only is not True:
+            raise ValueError("entries_regular_session_only must be true")
+        if self.allow_exits_outside_session is not True:
+            raise ValueError("allow_exits_outside_session must be true")
+        if self.force_flat_minutes_before_close < 1:
+            raise ValueError("force_flat_minutes_before_close must be >= 1")
         if self.reject_new_entries_minutes_before_close < 0:
             raise ValueError("reject_new_entries_minutes_before_close must be >= 0")
 
@@ -70,19 +74,27 @@ class SessionPolicy:
         return local >= session.close - timedelta(minutes=self.force_flat_minutes_before_close)
 
 
-def paper_env_guard() -> None:
-    """Reject an explicit live environment declaration.
-
-    The runtime is intentionally paper-only until a separately reviewed live
-    implementation exists.  A false value must not be silently overridden by
-    a paper config or an injected client.
-    """
+def trading_env_guard(*, paper: bool, allow_live: bool) -> None:
+    """Require an environment declaration consistent with endpoint scope."""
+    truthy = {"1", "true", "yes", "on"}
     raw = os.getenv("ALPACA_PAPER")
-    if raw is None:
+    if paper:
+        if allow_live:
+            raise ValueError("paper mode requires allow_live=false")
+        if raw is not None and raw.strip().lower() not in truthy:
+            raise ValueError("paper mode requires ALPACA_PAPER=true when set")
         return
-    normalized = raw.strip().lower()
-    if normalized not in {"1", "true", "yes", "on"}:
-        raise ValueError("ALPACA_PAPER must be true; live Alpaca endpoints are disabled")
+    if not allow_live:
+        raise ValueError("live mode requires allow_live=true")
+    if os.getenv("ALPACA_LIVE_ENABLE", "").strip().lower() not in truthy:
+        raise ValueError("live mode requires ALPACA_LIVE_ENABLE=true")
+    if raw is not None and raw.strip().lower() in truthy:
+        raise ValueError("live mode conflicts with ALPACA_PAPER=true")
+
+
+def paper_env_guard() -> None:
+    """Backward-compatible paper-mode environment guard."""
+    trading_env_guard(paper=True, allow_live=False)
 
 
 def normalize_calendar_day(value, *, timezone: ZoneInfo = NEW_YORK) -> CalendarDay:
@@ -93,20 +105,20 @@ def normalize_calendar_day(value, *, timezone: ZoneInfo = NEW_YORK) -> CalendarD
     raw_date = data.get("date")
     day = raw_date if isinstance(raw_date, date) else date.fromisoformat(str(raw_date)[:10])
 
-    def parse(name: str, default: time) -> datetime:
+    def parse(name: str) -> datetime:
         raw = data.get(name)
+        if raw in {None, ""}:
+            raise ValueError(f"calendar {name} is required")
         if isinstance(raw, datetime):
             dt = raw
             return dt.astimezone(timezone) if dt.tzinfo else dt.replace(tzinfo=timezone)
-        if raw:
-            text = str(raw)
-            if "T" in text:
-                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-                return dt.astimezone(timezone) if dt.tzinfo else dt.replace(tzinfo=timezone)
-            return datetime.combine(day, time.fromisoformat(text), timezone)
-        return datetime.combine(day, default, timezone)
+        text = str(raw)
+        if "T" in text:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return dt.astimezone(timezone) if dt.tzinfo else dt.replace(tzinfo=timezone)
+        return datetime.combine(day, time.fromisoformat(text), timezone)
 
-    return CalendarDay(day, parse("open", time(9, 30)), parse("close", time(16)))
+    return CalendarDay(day, parse("open"), parse("close"))
 
 
 def session_for(now: datetime, calendar: Iterable[CalendarDay]) -> CalendarDay | None:
@@ -116,27 +128,3 @@ def session_for(now: datetime, calendar: Iterable[CalendarDay]) -> CalendarDay |
         if day.date == local.date():
             return day
     return None
-
-
-def local_clock(now: datetime | None = None, calendar: Iterable[CalendarDay] = ()) -> MarketClock:
-    """Create a deterministic clock from local calendar entries.
-
-    An empty calendar still reports regular NYSE weekday hours, useful for
-    status output without credentials.  Real deployments should replace it
-    with the provider's calendar response before permitting entries.
-    """
-    current = as_new_york(now or datetime.now(tz=UTC))
-    days = [normalize_calendar_day(x) for x in calendar]
-    today = session_for(current, days)
-    if today is None and current.weekday() < 5:
-        today = CalendarDay(current.date(), datetime.combine(current.date(), time(9, 30), NEW_YORK), datetime.combine(current.date(), time(16), NEW_YORK))
-    if today and today.open <= current < today.close:
-        return MarketClock(current, True, None, today.close)
-    for offset in range(0, 15):
-        day = current.date() + timedelta(days=offset)
-        candidate = next((x for x in days if x.date == day), None)
-        if candidate is None and day.weekday() < 5:
-            candidate = CalendarDay(day, datetime.combine(day, time(9, 30), NEW_YORK), datetime.combine(day, time(16), NEW_YORK))
-        if candidate and current < candidate.open:
-            return MarketClock(current, False, candidate.open, candidate.close)
-    return MarketClock(current, False)

@@ -60,6 +60,18 @@ class CliSafetyTests(unittest.TestCase):
         parsed = main.parser().parse_args(["check", "--offline"])
         self.assertFalse(parsed.authenticated)
 
+    def test_offline_check_never_constructs_engine_or_requires_edge(self):
+        output = StringIO()
+        cfg = {"mode": "paper", "research": {
+            "enabled": True, "require_validated_variant": True}}
+        with patch.object(main, "_engine") as factory, redirect_stdout(output):
+            code = main.cmd_check(SimpleNamespace(authenticated=False), cfg)
+        self.assertEqual(code, 0)
+        factory.assert_not_called()
+        self.assertIn("local_config_valid", output.getvalue())
+        self.assertIn("edge_checked", output.getvalue())
+        self.assertIn("true", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

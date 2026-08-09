@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command line control for the Alpaca paper-trading runtime."""
+"""Command line control for the Alpaca trading runtime."""
 
 from __future__ import annotations
 
@@ -52,6 +52,15 @@ def _engine(cfg, light=False):
 
 
 def cmd_check(args, cfg) -> int:
+    if not bool(args.authenticated):
+        print(_dump_yaml({
+            "mode": cfg.get("mode", "paper"),
+            "paper": cfg.get("mode", "paper") == "paper",
+            "authenticated": False,
+            "local_config_valid": True,
+            "edge_checked": False,
+        }))
+        return 0
     engine = _engine(cfg, light=True)
     try:
         result = engine.check(authenticated=bool(args.authenticated))
@@ -104,18 +113,19 @@ def cmd_flatten(args, cfg) -> int:
     finally:
         engine.close()
     if not complete:
-        print("flatten incomplete: residual paper positions remain", file=sys.stderr)
+        print(f"flatten incomplete: residual {cfg.get('mode', 'paper')} positions remain",
+              file=sys.stderr)
         return 1
     print("Flatten requested")
     return 0
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Alpaca paper trading agent")
+    p = argparse.ArgumentParser(description="Alpaca trading agent")
     p.add_argument("--config", default=str(ROOT / "config.yaml"))
     p.add_argument("--env-file", default=None)
     sub = p.add_subparsers(dest="command", required=True)
-    check = sub.add_parser("check", help="validate config and authenticated paper connectivity")
+    check = sub.add_parser("check", help="validate config and authenticated broker connectivity")
     auth = check.add_mutually_exclusive_group()
     auth.add_argument("--authenticated", dest="authenticated", action="store_true",
                       help="query account, broker clock, calendar and configured feeds (default)")

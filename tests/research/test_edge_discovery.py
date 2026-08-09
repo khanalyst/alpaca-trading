@@ -7,6 +7,9 @@ import tempfile
 import unittest
 
 from research.edge_lab import DiscoveryError, EdgeLedger, discover
+from research.gates import (
+    heldout_separation, structural_floor, verified_gate_envelope,
+)
 
 
 def _sessions(start: datetime, count: int) -> list[dict]:
@@ -29,6 +32,50 @@ def _sessions(start: datetime, count: int) -> list[dict]:
     return rows
 
 
+def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
+                  passes: bool = True, record: bool = True,
+                  score: float = 1.0) -> tuple[dict, dict]:
+    prefix = f"{lane}-{'pass' if passes else 'fail'}"
+    fit = [] if lane == "shadow" else [
+        {"vehicle": "equity", "session_date": "2024-01-02",
+         "opportunity_id": f"{prefix}-fit", "net_pnl": 1.0},
+    ]
+    heldout = [
+        {"vehicle": "equity", "session_date": f"2024-01-0{day}",
+         "opportunity_id": f"{prefix}-held-{day}",
+         "net_pnl": score if passes else -1.0}
+        for day in (3, 4)
+    ]
+    fit_floor = structural_floor(
+        fit, vehicle="equity", min_trades=1, min_sessions=1,
+        required=lane != "shadow")
+    held_floor = structural_floor(
+        heldout, vehicle="equity", min_trades=1, min_sessions=1)
+    separation = (heldout_separation(fit, heldout) if lane == "backtest" else
+                  {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
+                   "passes": True, "mode": "new_data"})
+    checks = {"edge_positive": passes, "family_fdr_significant": True}
+    envelope = verified_gate_envelope(
+        lane=lane, vehicle="equity", fit=fit, heldout=heldout,
+        fit_floor=fit_floor, heldout_floor=held_floor,
+        control={"kind": "matched_actual_baseline", "actual_control": True,
+                 "available": True, "matched": len(heldout),
+                 "mean_delta": score if passes else -1.0},
+        p_value=.01, q_value=.02, alpha=.05,
+        falsification={"passes": passes, "method": "test_placebo"},
+        separation=separation, checks=checks, passes=passes,
+        performance={"heldout_delta": score if passes else -1.0,
+                     "max_drawdown": 0.0 if passes else 2.0})
+    run = ledger.append_run(
+        candidate_id, lane=lane, vehicle="equity", fit=fit, heldout=heldout,
+        metrics={"gate": {"passes": not passes}, "confidence": 0.0})
+    for row in [*fit, *heldout]:
+        ledger.append_trade(run["run_id"], row)
+    if record:
+        ledger.record_verified_gate(run["run_id"], envelope)
+    return run, envelope
+
+
 class EdgeDiscoveryLifecycleTests(unittest.TestCase):
     def test_paper_outcomes_demote_a_champion_that_breaks_the_rolling_guard(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -38,13 +85,7 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                 hypothesis="earlier target", config={"strategy": {"target_r": 1.5}})
             candidate_id = candidate["candidate_id"]
             for lane in ("backtest", "shadow"):
-                ledger.append_run(
-                    candidate_id, lane=lane, vehicle="equity",
-                    fit=[{"session_date": "2024-01-02"}],
-                    heldout=[{"session_date": "2024-01-03"}],
-                    metrics={"gate": {"passes": True}, "confidence": .99,
-                             "heldout_ci_low": .1, "max_drawdown": 1,
-                             "heldout_trades": 100})
+                _persist_gate(ledger, candidate_id, lane)
                 if lane == "backtest":
                     ledger.transition(candidate_id, "backtest_passed",
                                       reason="backtest gates passed")
@@ -59,9 +100,28 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                 outcome = ledger.ingest_paper_outcome(candidate_id, {
                     "vehicle": "equity", "opportunity_id": f"paper-{index}",
                     "session_date": f"2024-02-{index + 1:02d}",
-                    "net_pnl": -1, "r_multiple": -.1,
+                    "net_pnl": -1, "risk_usd": 10, "r_multiple": 999,
                 })
             self.assertEqual(outcome["status"], "demoted")
+
+    def test_paper_outcomes_recompute_r_and_reject_manual_demotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="paper guard", config={"strategy": {"target_r": 1.5}})
+            with self.assertRaisesRegex(ValueError, "positive risk_usd"):
+                ledger.ingest_paper_outcome(candidate["candidate_id"], {
+                    "vehicle": "equity", "net_pnl": -1, "r_multiple": -100,
+                    "demote": True,
+                })
+            result = ledger.ingest_paper_outcome(candidate["candidate_id"], {
+                "vehicle": "equity", "opportunity_id": "paper-safe",
+                "net_pnl": -1, "risk_usd": 10, "r_multiple": -100,
+                "demote": True,
+            })
+            self.assertEqual(result["rolling_r"], -0.1)
+            self.assertEqual(result["status"], "candidate")
 
     def test_discovery_operational_error_is_distinct_from_insufficient_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -84,19 +144,94 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                 "ibr.target.1_5r", vehicle="equity",
                 hypothesis="earlier target", config={"strategy": {"target_r": 1.5}})
             candidate_id = candidate["candidate_id"]
-            with self.assertRaisesRegex(ValueError, "passing backtest evidence"):
+            with self.assertRaisesRegex(ValueError, "verified gate evidence"):
                 ledger.transition(candidate_id, "backtest_passed", reason="operator request")
             ledger.append_run(
                 candidate_id, lane="backtest", vehicle="equity",
                 fit=[{"session_date": "2024-01-02"}],
                 heldout=[{"session_date": "2024-01-03"}],
                 metrics={"gate": {"passes": True}})
-            self.assertEqual(
-                ledger.transition(candidate_id, "backtest_passed",
-                                  reason="gates passed")["status"],
+            with self.assertRaisesRegex(ValueError, "lacks verified gate evidence"):
+                ledger.transition(candidate_id, "backtest_passed", reason="forged metrics")
+            _persist_gate(ledger, candidate_id, "backtest")
+            self.assertEqual(ledger.transition(
+                candidate_id, "backtest_passed", reason="gates passed")["status"],
                 "backtest_passed")
-            with self.assertRaisesRegex(ValueError, "passing shadow evidence"):
+            with self.assertRaisesRegex(ValueError, "passing shadow verified evidence"):
                 ledger.transition(candidate_id, "shadow", reason="operator request")
+
+    def test_retirement_rollback_and_forged_gate_cannot_bypass_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="earlier target",
+                config={"strategy": {"target_r": 1.5}})
+            candidate_id = candidate["candidate_id"]
+            with self.assertRaisesRegex(ValueError, "verified gate evidence"):
+                ledger.transition(candidate_id, "retired", reason="manual retirement")
+            with self.assertRaisesRegex(ValueError, "rollback cannot bypass evidence"):
+                ledger.transition(candidate_id, "candidate", reason="rollback", rollback=True)
+            run, envelope = _persist_gate(
+                ledger, candidate_id, "backtest", passes=True, record=False)
+            envelope["passes"] = False
+            with self.assertRaisesRegex(ValueError, "envelope/hash"):
+                ledger.record_verified_gate(run["run_id"], envelope)
+
+    def test_latest_failing_proof_makes_a_champion_ineligible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="earlier target",
+                config={"strategy": {"target_r": 1.5}})
+            candidate_id = candidate["candidate_id"]
+            _persist_gate(ledger, candidate_id, "backtest")
+            ledger.transition(candidate_id, "backtest_passed", reason="backtest proof")
+            _persist_gate(ledger, candidate_id, "shadow")
+            ledger.transition(candidate_id, "shadow", reason="shadow proof")
+            ledger.transition(candidate_id, "validated", reason="validated proof")
+            self.assertIsNotNone(ledger.select_champion(
+                vehicle="equity", min_confidence=.9))
+            self.assertTrue(ledger.eligibility(candidate_id)["eligible"])
+            self.assertEqual(
+                ledger.latest_verified_run(candidate_id, lane="shadow")["lane"],
+                "shadow")
+            _persist_gate(ledger, candidate_id, "shadow", passes=False)
+            self.assertIsNone(ledger.select_champion(
+                vehicle="equity", min_confidence=.9))
+            self.assertFalse(ledger.eligibility(candidate_id)["eligible"])
+
+    def test_new_champion_keeps_previous_proved_edge_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.baseline", vehicle="equity", hypothesis="proved edge 1",
+                config={"strategy": {"target_r": 2.0}})
+            first_id = candidate["candidate_id"]
+            _persist_gate(ledger, first_id, "backtest")
+            ledger.transition(first_id, "backtest_passed", reason="backtest proof")
+            _persist_gate(ledger, first_id, "shadow")
+            ledger.transition(first_id, "shadow", reason="shadow proof")
+            ledger.transition(first_id, "validated", reason="validated proof")
+            first = ledger.select_champion(vehicle="equity", min_confidence=.9)
+            self.assertIsNotNone(first)
+
+            candidate = ledger.register_candidate(
+                "ibr.target.3r", vehicle="equity", hypothesis="proved edge 2",
+                config={"strategy": {"target_r": 3.0}})
+            second_id = candidate["candidate_id"]
+            _persist_gate(ledger, second_id, "backtest", score=2.0)
+            ledger.transition(second_id, "backtest_passed", reason="backtest proof")
+            _persist_gate(ledger, second_id, "shadow", score=2.0)
+            ledger.transition(second_id, "shadow", reason="shadow proof")
+            ledger.transition(second_id, "validated", reason="validated proof")
+
+            # Explicit evidence-authorized champion selection is also used by
+            # the conservative ranker when a stronger candidate appears.
+            ledger.transition(second_id, "champion", reason="stronger conservative evidence")
+            selected = ledger.select_champion(vehicle="equity", min_confidence=.9)
+            self.assertIsNotNone(selected)
+            self.assertEqual((ledger.candidate(first_id) or {})["status"], "validated")
+            self.assertEqual((ledger.candidate(second_id) or {})["status"], "champion")
 
     def test_auto_requires_a_later_forward_tail_for_shadow(self):
         registry = {"variants": [

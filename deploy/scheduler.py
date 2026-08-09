@@ -50,6 +50,7 @@ class _BoundedCapture:
         self.tail = ""
         self.total_chars = 0
         self.structured_failures: list[dict] = []
+        self.research_cycles: list[dict] = []
 
     def feed(self, text: str) -> None:
         value = str(text)
@@ -62,6 +63,9 @@ class _BoundedCapture:
             payload = json.loads(candidate)
         except (TypeError, ValueError):
             return
+        cycle = structured_research_cycle(payload)
+        if cycle is not None and len(self.research_cycles) < 8:
+            self.research_cycles.append(cycle)
         reason = structured_failure(payload)
         if reason is not None and len(self.structured_failures) < 32:
             self.structured_failures.append(reason)
@@ -97,6 +101,43 @@ def structured_failure(payload: object) -> dict | None:
     return None
 
 
+def structured_research_cycle(payload: object) -> dict | None:
+    """Recognize the terminal JSON emitted by ``research-cycle.sh``.
+
+    The scheduler must not infer a green result from a zero child exit alone:
+    a valid corpus can complete without an eligible edge, and an empty corpus
+    is an explicit no-data outcome.  Keep the payload small and predictable in
+    status/history files while preserving its reason and per-vehicle outcomes.
+    """
+    if not isinstance(payload, dict):
+        return None
+    schema = str(payload.get("schema") or "")
+    component = str(payload.get("component") or "")
+    if schema != "research-cycle.v1" and component not in {
+            "research-cycle", "research_cycle"}:
+        return None
+    status = str(payload.get("status") or "").lower()
+    if status not in {"completed", "completed_no_edge", "no_data", "failed"}:
+        return None
+    outcomes = payload.get("outcomes")
+    if not isinstance(outcomes, list):
+        outcomes = []
+    raw_exit = payload.get("exit_code")
+    try:
+        exit_code = None if raw_exit is None else int(raw_exit)
+    except (TypeError, ValueError):
+        exit_code = None
+    return {
+        "schema": schema or "research-cycle.v1",
+        "status": status,
+        "reason": str(payload.get("reason") or ""),
+        "exit_code": exit_code,
+        "outcomes": [str(item) for item in outcomes[:32]],
+        "proofs": bool(payload.get("proofs")),
+        "no_edge": bool(payload.get("no_edge")),
+    }
+
+
 def _drain(stream, capture: _BoundedCapture) -> None:
     try:
         for line in iter(stream.readline, ""):
@@ -130,6 +171,7 @@ def _capture_detail(stdout: _BoundedCapture | None,
         "stderr_truncated": err.truncated,
         "structured_failures": [
             *out.structured_failures, *err.structured_failures],
+        "research_cycles": [*out.research_cycles, *err.research_cycles],
     }
 
 
@@ -196,8 +238,8 @@ def configured_mode(path: Path) -> str:
     raw = load_config(path)
     broker = raw.get("broker") if isinstance(raw.get("broker"), dict) else {}
     mode = str(raw.get("mode") or broker.get("mode") or "paper").lower()
-    if mode != "paper":
-        raise ValueError("config must select the Alpaca paper endpoint")
+    if mode not in {"paper", "live"}:
+        raise ValueError("config mode must be paper or live")
     os.environ["AGENT_MODE"] = mode
     return mode
 
@@ -266,7 +308,8 @@ def run_scheduler(args) -> int:
         key: previous[key] for key in (
             "job_id", "started_ts", "completed_ts", "run_date",
             "timeout_seconds", "structured_failures", "stdout_chars",
-            "stderr_chars", "stdout_truncated", "stderr_truncated")
+            "stderr_chars", "stdout_truncated", "stderr_truncated",
+            "cycle_status", "research_cycle")
         if key in previous
     }
     signal.signal(signal.SIGTERM, _stop)
@@ -352,6 +395,10 @@ def run_scheduler(args) -> int:
         stderr = (stderr_capture[0] if stderr_capture else _BoundedCapture(1))
         structured_failures = list(stdout.structured_failures)
         structured_failures.extend(stderr.structured_failures)
+        research_cycles = [*stdout.research_cycles, *stderr.research_cycles]
+        research_cycle = research_cycles[-1] if research_cycles else None
+        cycle_status = (str(research_cycle.get("status")).lower()
+                        if research_cycle else None)
         if stdout.tail:
             sys.stdout.write(stdout.tail)
             sys.stdout.flush()
@@ -363,17 +410,46 @@ def run_scheduler(args) -> int:
             # state. The scheduler is the service boundary and must not turn
             # that structured failure into a green job.
             last_exit = 1
+        if cycle_status == "failed":
+            # A malformed/operational cycle must never be reported as green
+            # merely because the shell wrapper itself exited zero.
+            if last_exit == 0:
+                last_exit = 1
+            structured_failures.append({
+                "component": "research_cycle", "status": "FAILED",
+                "reason": research_cycle.get("reason") if research_cycle else None,
+            })
+        elif cycle_status == "no_data" and last_exit == 0:
+            # The contract requires no-data to carry a non-zero child result,
+            # even for a test harness that accidentally omitted it.
+            last_exit = int(research_cycle.get("exit_code") or 2)
+        elif cycle_status == "completed_no_edge" and last_exit == 2:
+            # A caller may propagate the documented edge-gate exit code.  The
+            # structured cycle outcome still says this was a valid, completed
+            # run without proof, so do not turn it into an operational error.
+            last_exit = 0
         last_date = run_date
         completed_ts = time.time()
-        final_status = (
-            "timed_out" if timed_out else
-            "completed" if last_exit == 0 else "failed")
+        if timed_out:
+            final_status = "timed_out"
+        elif cycle_status == "failed":
+            final_status = "failed"
+        elif cycle_status == "no_data":
+            # A no-data cycle is expected to exit 2.  A different non-zero
+            # result indicates an operational failure despite its payload.
+            final_status = "no_data" if last_exit in {0, 2} else "failed"
+        elif cycle_status in {"completed", "completed_no_edge"}:
+            final_status = (cycle_status if last_exit == 0 else "failed")
+        else:
+            final_status = "completed" if last_exit == 0 else "failed"
         write_status(
             status_path, final_status, job_id=job_id,
             started_ts=started_ts, completed_ts=completed_ts,
             run_date=run_date, timeout_seconds=timeout_seconds,
             last_run_date=last_date, last_exit_code=last_exit,
             structured_failures=structured_failures,
+            cycle_status=cycle_status,
+            research_cycle=research_cycle,
             stdout_tail=stdout.tail, stderr_tail=stderr.tail,
             stdout_chars=stdout.total_chars, stderr_chars=stderr.total_chars,
             stdout_truncated=stdout.truncated,
@@ -383,6 +459,8 @@ def run_scheduler(args) -> int:
             "completed_ts": completed_ts, "run_date": run_date,
             "timeout_seconds": timeout_seconds,
             "structured_failures": structured_failures,
+            "cycle_status": cycle_status,
+            "research_cycle": research_cycle,
             "stdout_chars": stdout.total_chars,
             "stderr_chars": stderr.total_chars,
             "stdout_truncated": stdout.truncated,

@@ -1,9 +1,11 @@
 """Focused paper-runtime safety checks using injected provider fakes."""
 
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import types
@@ -14,8 +16,10 @@ from agent.alpaca_domain import Account, Asset, CalendarDay, MarketClock, Order,
 from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, PaperModeError
 from agent.config import ConfigError, validate_config
 from agent.engine import Engine
+from agent.edge import resolve_validated_variants
 from agent.market import MarketData
 from agent.risk import RiskEngine
+from research.edge_lab import EdgeLedger
 
 
 class FakeProvider:
@@ -30,6 +34,7 @@ class FakeProvider:
     def __init__(self, *, early_close=False):
         self.orders_sent = []
         self.positions_live = []
+        self.cancel_calls = 0
         close = datetime(2026, 8, 7, 13 if early_close else 16,
                          tzinfo=timezone.utc)
         self.day = CalendarDay(date(2026, 8, 7),
@@ -61,6 +66,7 @@ class FakeProvider:
                      client_order_id=request.client_order_id)
 
     def cancel_all_orders(self):
+        self.cancel_calls += 1
         return None
 
 
@@ -217,6 +223,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             def get_orders(self, request):
                 return types.SimpleNamespace(orders=[{
                     "id": "order-1", "symbol": "SPY", "qty": "1",
+                    "asset_class": "us_equity",
                     "side": "buy", "status": "open",
                     "type": "market", "time_in_force": "day",
                 }])
@@ -274,8 +281,9 @@ class RuntimeSafetyTests(unittest.TestCase):
                                "quote": {"timestamp": now,
                                          "bid": 1, "ask": 1.1}},
         }
-        result = Engine(_cfg(), provider=provider,
-                        brain=BrainFake()).run_once(snapshot)
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        engine._wall_clock = lambda: provider.now
+        result = engine.run_once(snapshot)
         self.assertEqual([order.symbol for order in provider.orders_sent],
                          ["SPY"])
         self.assertEqual(result["orders"][0].qty, Decimal("246"))
@@ -295,8 +303,9 @@ class RuntimeSafetyTests(unittest.TestCase):
             "SPY": {"bars": bars, "quote": {"timestamp": now + timedelta(seconds=1),
                                                "bid": 101.4, "ask": 101.5}},
         }
-        result = Engine(_cfg(), provider=provider,
-                        brain=BrainFake()).run_once(snapshot)
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        engine._wall_clock = lambda: provider.now
+        result = engine.run_once(snapshot)
         self.assertEqual(result["orders"], [])
         self.assertEqual(provider.orders_sent, [])
 
@@ -311,9 +320,10 @@ class RuntimeSafetyTests(unittest.TestCase):
         }
         engine = Engine(cfg, provider=provider, brain=BrainFake())
         self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
         result = engine.run_once({})
         self.assertEqual(result["action"], "hold")
-        self.assertIn("no validated edge champion", result["reason"])
+        self.assertIn("no latest-passing validated edge", result["reason"])
         self.assertEqual(provider.orders_sent, [])
         self.assertFalse(engine.check()["edge_ready"])
 
@@ -349,8 +359,9 @@ class RuntimeSafetyTests(unittest.TestCase):
             "SPY": {"bars": bars, "quote": {"timestamp": provider.now,
                                                "bid": 101.4, "ask": 101.5}},
         }
-        result = Engine(_cfg(), provider=provider,
-                        brain=BrainFake()).run_once(snapshot)
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        engine._wall_clock = lambda: provider.now
+        result = engine.run_once(snapshot)
         self.assertTrue(result["signals"])
         self.assertEqual(result["signals"][0]["force_flat_at"],
                          "2026-08-07T14:50:00+00:00")
@@ -376,6 +387,254 @@ class RuntimeSafetyTests(unittest.TestCase):
         with patch.object(engine, "_flatten_all_impl", return_value=False):
             with self.assertRaisesRegex(AlpacaError, "shutdown flatten incomplete"):
                 engine.run(max_cycles=0)
+
+    def test_preopen_startup_cancels_orders_and_flattens_residual_position(self):
+        class PreopenProvider(FakeProvider):
+            def clock(self):
+                now = self.day.open - timedelta(minutes=30)
+                return MarketClock(now, False, next_open=self.day.open,
+                                   next_close=self.day.close)
+
+        provider = PreopenProvider()
+        provider.positions_live = [Position("SPY", Decimal("2"), "long")]
+        engine = Engine(_cfg(), provider=provider)
+        self.addCleanup(engine.close)
+        self.assertGreaterEqual(provider.cancel_calls, 1)
+        self.assertEqual(provider.positions_live, [])
+
+    def test_intraday_restart_also_cleans_unknown_residual_exposure(self):
+        provider = FakeProvider()
+        provider.positions_live = [Position("SPY", Decimal("2"), "long")]
+        engine = Engine(_cfg(), provider=provider)
+        self.addCleanup(engine.close)
+        self.assertGreaterEqual(provider.cancel_calls, 1)
+        self.assertEqual(provider.positions_live, [])
+
+    def test_outside_session_cleanup_failure_pauses_and_blocks(self):
+        class BrokenPreopenProvider(FakeProvider):
+            def clock(self):
+                now = self.day.open - timedelta(minutes=30)
+                return MarketClock(now, False, next_open=self.day.open,
+                                   next_close=self.day.close)
+
+            def cancel_all_orders(self):
+                raise RuntimeError("cancel unavailable")
+
+        provider = BrokenPreopenProvider()
+        provider.positions_live = [Position("SPY", Decimal("2"), "long")]
+        engine = Engine(_cfg(), provider=provider)
+        self.addCleanup(engine.close)
+        runtime = __import__("agent.state", fromlist=["load_state"]).load_state()
+        self.assertEqual(runtime["state"], "PAUSED")
+        self.assertTrue(runtime["operator_pause"])
+        result = engine.run_once({})
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(provider.positions_live[0].symbol, "SPY")
+
+    def test_latest_entry_time_blocks_rule_independent_entry_path(self):
+        provider = FakeProvider()
+        cfg = _cfg()
+        cfg["strategy"]["latest_entry_time"] = "09:00"
+        engine = Engine(cfg, provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
+        result = engine.run_once({})
+        self.assertEqual(result["reason"], "latest_entry_time_passed")
+        self.assertEqual(provider.orders_sent, [])
+
+    @staticmethod
+    def _prove(ledger, variant_id, *, confidence=.99):
+        record = ledger.register_candidate(
+            variant_id, strategy_id="ibr", vehicle="equity",
+            hypothesis=f"proof for {variant_id}", config={}, axes={})
+        passing = {"gate": {"passes": True, "heldout_delta": .1,
+                            "heldout_trades": 20},
+                   "confidence": confidence}
+        ledger.append_run(record["candidate_id"], lane="shadow",
+                          vehicle="equity", metrics=passing)
+        with closing(sqlite3.connect(ledger.path)) as db, db:
+            db.execute("UPDATE candidate_state SET status='validated' WHERE candidate_id=?",
+                       (record["candidate_id"],))
+            db.commit()
+        return ledger.candidate(record["candidate_id"])
+
+    @staticmethod
+    def _verified_proof(confidence=.99):
+        return {"lane": "shadow", "metrics": {"confidence": confidence},
+                "verified_gate": {"passes": True, "heldout_delta": .1,
+                                  "heldout_trades": 20}}
+
+    def test_live_edge_is_pinned_and_never_switches_after_demotion(self):
+        db = Path(self.runtime_tmp.name) / "live-edge.sqlite3"
+        ledger = EdgeLedger(db)
+        pinned = self._prove(ledger, "ibr.baseline", confidence=.99)
+        other = self._prove(ledger, "ibr.range.30", confidence=1.0)
+
+        class LiveProvider(FakeProvider):
+            paper = False
+            endpoint = "https://api.alpaca.markets"
+
+        raw = {
+            "mode": "live", "broker": {"paper": False, "allow_live": True},
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "selection_mode": "specific", "execution_mode": "shares"},
+            "research": {"enabled": True, "require_validated_variant": True,
+                         "db_path": str(db)},
+        }
+        with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
+                patch.object(EdgeLedger, "latest_verified_run",
+                             return_value=self._verified_proof()):
+            cfg = validate_config(raw)
+            engine = Engine(cfg, light=True, provider=LiveProvider())
+        self.addCleanup(engine.close)
+        self.assertEqual(engine._edge_record["candidate_id"], pinned["candidate_id"])
+        ledger.transition(pinned["candidate_id"], "demoted",
+                          reason="proof no longer eligible")
+        self.assertFalse(engine._refresh_edge())
+        self.assertIsNone(engine._edge_record)
+        self.assertNotEqual(engine._edge_pinned_candidate_id,
+                            other["candidate_id"])
+
+    def test_live_edge_blocks_when_latest_proof_fails(self):
+        db = Path(self.runtime_tmp.name) / "live-proof.sqlite3"
+        ledger = EdgeLedger(db)
+        pinned = self._prove(ledger, "ibr.baseline")
+
+        class LiveProvider(FakeProvider):
+            paper = False
+            endpoint = "https://api.alpaca.markets"
+
+        with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
+                patch.object(EdgeLedger, "latest_verified_run",
+                             return_value=self._verified_proof()):
+            cfg = validate_config({
+                "mode": "live", "broker": {"paper": False, "allow_live": True},
+                "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                             "selection_mode": "specific"},
+                "research": {"enabled": True, "require_validated_variant": True,
+                             "db_path": str(db)},
+            })
+            engine = Engine(cfg, light=True, provider=LiveProvider())
+        self.addCleanup(engine.close)
+        self.assertFalse(engine._refresh_edge())
+        self.assertIn("no latest-passing", engine._edge_error)
+
+    def test_live_preflight_requires_explicit_pdt_eligibility(self):
+        db = Path(self.runtime_tmp.name) / "live-pdt.sqlite3"
+        ledger = EdgeLedger(db)
+        self._prove(ledger, "ibr.baseline")
+
+        class LiveProvider(FakeProvider):
+            paper = False
+            endpoint = "https://api.alpaca.markets"
+
+        with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
+                patch.object(EdgeLedger, "latest_verified_run",
+                             return_value=self._verified_proof()):
+            cfg = validate_config({
+                "mode": "live", "broker": {"paper": False, "allow_live": True},
+                "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                             "selection_mode": "specific"},
+                "research": {"enabled": True, "require_validated_variant": True,
+                             "db_path": str(db)},
+            })
+            engine = Engine(cfg, light=True, provider=LiveProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "pattern_day_trader=true"):
+            engine.preflight()
+
+    def test_live_engine_cannot_bypass_validated_edge_gate(self):
+        class LiveProvider(FakeProvider):
+            paper = False
+            endpoint = "https://api.alpaca.markets"
+
+        with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False):
+            with self.assertRaisesRegex(AlpacaError, "validated research edge gate"):
+                Engine({
+                    "mode": "live",
+                    "broker": {"paper": False, "allow_live": True},
+                    "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                                 "selection_mode": "specific"},
+                }, light=True, provider=LiveProvider())
+
+    def test_preflight_rejects_endpoint_hostname_confusion(self):
+        class ConfusedEndpointProvider(FakeProvider):
+            endpoint = "https://paper-api.alpaca.markets.attacker.invalid"
+
+        engine = Engine(_cfg(), light=True, provider=ConfusedEndpointProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "endpoint validation failed"):
+            engine.preflight()
+
+    def test_all_proved_resolver_keeps_one_deterministic_edge_per_family(self):
+        db = Path(self.runtime_tmp.name) / "all-proved.sqlite3"
+        ledger = EdgeLedger(db)
+        rows = [
+            ("rule.alpha.0000000000000001", "mean_reversion"),
+            ("rule.alpha.0000000000000002", "mean_reversion"),
+            ("rule.beta.0000000000000001", "volume_breakout"),
+        ]
+        for variant_id, family in rows:
+            record = ledger.register_candidate(
+                variant_id, strategy_id="rule", vehicle="equity",
+                hypothesis=family,
+                config={"strategy": {"rule_spec": {"family": family}}})
+            with closing(sqlite3.connect(ledger.path)) as db_handle, db_handle:
+                db_handle.execute(
+                    "UPDATE candidate_state SET status='validated' WHERE candidate_id=?",
+                    (record["candidate_id"],))
+                db_handle.commit()
+        proof = self._verified_proof()
+        with patch.object(EdgeLedger, "latest_verified_run", return_value=proof):
+            selected = resolve_validated_variants({
+                "strategy": {"id": "rule", "execution_mode": "shares",
+                             "selection_mode": "all_proved"}}, db_path=db)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({row["variant_id"] for row in selected}, {
+            "rule.alpha.0000000000000002",
+            "rule.beta.0000000000000001",
+        })
+
+    def test_stale_broker_clock_blocks_entry_but_runs_cleanup_path(self):
+        class StaleClockProvider(FakeProvider):
+            def clock(self):
+                return MarketClock(
+                    datetime.now(timezone.utc) - timedelta(minutes=5), True,
+                    next_close=self.day.close)
+
+        provider = StaleClockProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        self.addCleanup(engine.close)
+        result = engine.run_once({})
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(result["reason"], "broker_clock_invalid")
+        self.assertIn("stale", result["error"])
+        self.assertGreaterEqual(provider.cancel_calls, 1)
+
+    def test_post_submit_journal_failure_pauses_for_reconciliation(self):
+        provider = FakeProvider()
+        now = provider.now
+        bars = []
+        for index in range(16):
+            timestamp = now - timedelta(minutes=30 - index)
+            bars.append({"timestamp": timestamp, "open": 100,
+                         "high": 100.5 if index < 15 else 102,
+                         "low": 99.5 if index < 15 else 100,
+                         "close": 100 if index < 15 else 101.5,
+                         "volume": 10 if index < 15 else 20, "atr": 1})
+        snapshot = {"SPY": {"bars": bars, "quote": {
+            "timestamp": now, "bid": 101.4, "ask": 101.5}}}
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
+        with patch.object(engine, "_record_open_order",
+                          side_effect=RuntimeError("journal unavailable")):
+            with self.assertRaisesRegex(AlpacaError, "reconciliation required"):
+                engine.run_once(snapshot)
+        self.assertEqual(len(provider.orders_sent), 1)
+        self.assertFalse(engine._reconciled)
+        runtime = __import__("agent.state", fromlist=["load_state"]).load_state()
+        self.assertTrue(runtime["operator_pause"])
 
 
 if __name__ == "__main__":

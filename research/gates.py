@@ -7,9 +7,15 @@ know how a signal was generated and never combine equity and option returns.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import hashlib
+import json
 from statistics import mean
 import math
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+
+
+GATE_ENVELOPE_SCHEMA = "verified-research-gate.v1"
 
 
 @dataclass(frozen=True)
@@ -40,28 +46,65 @@ class AcceptanceFloor:
         }
         if self.max_drawdown is not None:
             checks["max_drawdown"] = drawdown <= float(self.max_drawdown)
+        structural_checks = {
+            "trades": checks["trades"],
+            "sessions": checks["sessions"],
+            "clusters": checks["clusters"],
+        }
+        performance_checks = {key: value for key, value in checks.items()
+                              if key not in structural_checks}
         return {
             "vehicle": vehicle, "trades": len(executed),
             "sessions": len(sessions), "net_pnl": net,
             "max_drawdown": drawdown, "clusters": clusters,
+            "structural_passes": all(structural_checks.values()),
+            "performance_passes": all(performance_checks.values()),
             "passes": all(checks.values()), "checks": checks,
+            "structural_checks": structural_checks,
+            "performance_checks": performance_checks,
         }
 
 
 def chronological_split(rows: Sequence[Mapping], *, fit_fraction: float = .6,
                         require_order: bool = False) -> tuple[list, list]:
-    """Split rows chronologically, preserving the no-look-ahead boundary."""
+    """Split whole trading sessions across one chronological boundary."""
     if not 0 < fit_fraction < 1:
         raise ValueError("fit_fraction must be between zero and one")
     original = list(rows)
-    key = lambda row: (str(row.get("session_date", "")),
-                       str(row.get("entry_timestamp", "")))
+    key = lambda row: (_session_key(row), str(row.get("entry_timestamp", "")),
+                       str(row.get("opportunity_id", "")))
     if require_order and any(key(left) > key(right)
                              for left, right in zip(original, original[1:])):
         raise ValueError("rows must already be chronological")
     ordered = sorted(original, key=key)
-    cut = max(1, min(len(ordered) - 1, int(len(ordered) * fit_fraction))) if len(ordered) > 1 else len(ordered)
-    return ordered[:cut], ordered[cut:]
+    sessions = sorted({_session_key(row) for row in ordered})
+    if len(sessions) < 2:
+        return ordered, []
+    cut = max(1, min(len(sessions) - 1, int(len(sessions) * fit_fraction)))
+    fit_sessions = set(sessions[:cut])
+    return ([row for row in ordered if _session_key(row) in fit_sessions],
+            [row for row in ordered if _session_key(row) not in fit_sessions])
+
+
+def _session_key(row: Mapping) -> str:
+    return str(row.get("session_date") or row.get("entry_timestamp") or
+               row.get("opportunity_id") or "")
+
+
+def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
+                     min_trades: int, min_sessions: int,
+                     min_clusters: int = 0, required: bool = True) -> dict:
+    """Report structural adequacy without treating profitability as sample size."""
+    report = AcceptanceFloor(
+        min_trades=min_trades, min_sessions=min_sessions,
+        min_clusters=min_clusters,
+    ).check(rows, vehicle=vehicle)
+    report["minimums"] = {"trades": int(min_trades),
+                          "sessions": int(min_sessions),
+                          "clusters": int(min_clusters)}
+    report["required"] = bool(required)
+    report["adequate"] = bool(report["structural_passes"] if required else True)
+    return report
 
 
 def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *, vehicle: str) -> dict:
@@ -91,6 +134,98 @@ def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *, v
     return {"vehicle": vehicle, "matched": len(deltas),
             "mean_delta": mean(deltas) if deltas else None,
             "deltas": deltas}
+
+
+def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
+                         vehicle: str, seed: int = 20260728) -> dict:
+    """Test matched opportunity deltas with deterministic session clustering."""
+    from .stats import paired_cluster_sign_flip
+
+    def unique(rows: Iterable[Mapping]) -> dict[str, Mapping]:
+        values: dict[str, Mapping] = {}
+        duplicates: set[str] = set()
+        for row in rows:
+            if row.get("vehicle", vehicle) != vehicle:
+                continue
+            key = _match_key(row, vehicle)
+            if not key or key in values:
+                duplicates.add(key)
+            else:
+                values[key] = row
+        for key in duplicates:
+            values.pop(key, None)
+        return values
+
+    left = unique(candidate)
+    right = unique(baseline)
+    pairs: list[tuple[float, float, float]] = []
+    matched_ids: list[str] = []
+    for index, key in enumerate(sorted(left)):
+        other = right.get(key)
+        if other is None:
+            continue
+        stamp = left[key].get("entry_timestamp") or left[key].get("session_date")
+        try:
+            timestamp = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            timestamp = float(index * 86_400)
+        pairs.append((timestamp, float(left[key].get("net_pnl", 0.0)),
+                      float(other.get("net_pnl", 0.0))))
+        matched_ids.append(key)
+    result = paired_cluster_sign_flip(pairs, cluster_seconds=86_400, seed=seed)
+    result["matched"] = len(pairs)
+    result["matched_ids_hash"] = _content_hash(matched_ids)
+    result["mean_delta"] = (sum(left - right for _, left, right in pairs) / len(pairs)
+                            if pairs else None)
+    result["actual_control"] = True
+    result["available"] = bool(pairs)
+    return result
+
+
+def deterministic_placebo_deltas(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
+                                  vehicle: str) -> dict:
+    """Apply a deterministic mixed-sign session-label falsification to matched deltas."""
+    def unique(rows: Iterable[Mapping]) -> dict[str, Mapping]:
+        values: dict[str, Mapping] = {}
+        duplicates: set[str] = set()
+        for row in rows:
+            if row.get("vehicle", vehicle) != vehicle:
+                continue
+            key = _match_key(row, vehicle)
+            if not key or key in values:
+                duplicates.add(key)
+            else:
+                values[key] = row
+        for key in duplicates:
+            values.pop(key, None)
+        return values
+
+    left = unique(candidate)
+    right = unique(baseline)
+    keys = sorted(key for key in left if key and key in right)
+    observed = [float(left[key].get("net_pnl", 0.0)) -
+                float(right[key].get("net_pnl", 0.0)) for key in keys]
+    if len(observed) < 2:
+        return {"method": "deterministic_mixed_sign_session_labels",
+                "available": False, "observed": observed, "placebo": [],
+                "assignments_hash": _content_hash(keys)}
+    phase = int(hashlib.sha256("|".join(keys).encode("utf-8")).hexdigest(), 16) % 2
+    placebo = [value if (index + phase) % 2 == 0 else -value
+               for index, value in enumerate(observed)]
+    return {"method": "deterministic_mixed_sign_session_labels",
+            "available": True, "observed": observed, "placebo": placebo,
+            "assignments_hash": _content_hash({"keys": keys, "phase": phase})}
+
+
+def _match_key(row: Mapping, vehicle: str) -> str:
+    explicit = row.get("comparison_id")
+    if explicit:
+        return str(explicit)
+    symbol = row.get("symbol")
+    session = row.get("session_date")
+    if symbol and session:
+        return f"{row.get('vehicle', vehicle)}:{symbol}:{session}"
+    return str(row.get("opportunity_id") or row.get("entry_timestamp") or "")
 
 
 def placebo_ratio(observed: Sequence[float], placebo: Sequence[float]) -> float | None:
@@ -137,17 +272,86 @@ def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
     ratio = placebo_ratio(observed, placebo)
     observed_mean = mean([float(x) for x in observed]) if observed else 0.0
     placebo_mean = mean([float(x) for x in placebo]) if placebo else 0.0
-    zero_placebo = bool(placebo and ratio is None and placebo_mean == 0.0 and observed_mean > 0)
-    if zero_placebo:
-        # Keep the JSON evidence finite while recording that the ratio is an
-        # unbounded lower bound rather than pretending to estimate infinity.
-        ratio = float(minimum_ratio)
+    zero_placebo = bool(placebo and all(abs(float(x)) <= 1e-15 for x in placebo))
+    distinct = bool(placebo and (len(observed) != len(placebo) or
+                    any(abs(float(left) - float(right)) > 1e-15
+                        for left, right in zip(observed, placebo))))
     return {"observed_mean": observed_mean, "placebo_mean": placebo_mean,
             "ratio": ratio, "available": bool(placebo),
             "zero_placebo": zero_placebo,
-            "passes": bool(placebo) and observed_mean > placebo_mean and
+            "distinct": distinct,
+            "passes": bool(placebo) and not zero_placebo and distinct and
+            observed_mean > 0 and observed_mean > placebo_mean and
             ratio is not None and ratio >= minimum_ratio}
 
 
-__all__ = ["AcceptanceFloor", "chronological_split", "paired_delta", "placebo_ratio",
-           "max_drawdown_of", "heldout_separation", "falsification_gate"]
+def sample_counts(rows: Iterable[Mapping], *, vehicle: str) -> dict:
+    selected = [row for row in rows if row.get("vehicle", vehicle) == vehicle]
+    return {
+        "rows": len(selected),
+        "trades": len([row for row in selected if row.get("no_trade") is not True]),
+        "sessions": len({_session_key(row) for row in selected if _session_key(row)}),
+        "clusters": len({str(row.get("cluster") or _session_key(row)) for row in selected
+                         if row.get("cluster") or _session_key(row)}),
+    }
+
+
+def verified_gate_envelope(*, lane: str, vehicle: str,
+                           fit: Sequence[Mapping], heldout: Sequence[Mapping],
+                           fit_floor: Mapping, heldout_floor: Mapping,
+                           control: Mapping, p_value: float, q_value: float,
+                           alpha: float,
+                           falsification: Mapping, separation: Mapping,
+                           checks: Mapping[str, bool], passes: bool,
+                           performance: Mapping | None = None) -> dict:
+    """Build the immutable, content-addressed gate decision persisted per run."""
+    body: dict[str, Any] = {
+        "schema": GATE_ENVELOPE_SCHEMA,
+        "lane": str(lane),
+        "vehicle": str(vehicle),
+        "counts": {
+            "fit": sample_counts(fit, vehicle=vehicle),
+            "heldout": sample_counts(heldout, vehicle=vehicle),
+            "total": sample_counts([*fit, *heldout], vehicle=vehicle),
+        },
+        "floors": {"fit": dict(fit_floor), "heldout": dict(heldout_floor)},
+        "control": dict(control),
+        "statistics": {"p_value": float(p_value), "q_value": float(q_value),
+                       "alpha": float(alpha)},
+        "performance": dict(performance or {}),
+        "falsification": dict(falsification),
+        "separation": dict(separation),
+        "checks": {str(key): bool(value) for key, value in checks.items()},
+        "passes": bool(passes),
+    }
+    return {**body, "content_hash": _content_hash(body)}
+
+
+def verify_gate_envelope(envelope: Mapping) -> bool:
+    try:
+        body = {key: value for key, value in envelope.items() if key != "content_hash"}
+        return bool(
+            envelope.get("schema") == GATE_ENVELOPE_SCHEMA and
+            envelope.get("lane") in {"backtest", "shadow"} and
+            envelope.get("vehicle") in {"equity", "option"} and
+            isinstance(envelope.get("passes"), bool) and
+            isinstance(envelope.get("counts"), Mapping) and
+            isinstance(envelope.get("floors"), Mapping) and
+            isinstance(envelope.get("control"), Mapping) and
+            isinstance(envelope.get("statistics"), Mapping) and
+            envelope.get("content_hash") == _content_hash(body))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _content_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+__all__ = ["AcceptanceFloor", "GATE_ENVELOPE_SCHEMA", "chronological_split",
+           "deterministic_placebo_deltas", "falsification_gate",
+           "heldout_separation", "matched_cluster_test", "max_drawdown_of",
+           "paired_delta", "placebo_ratio", "sample_counts", "structural_floor",
+           "verified_gate_envelope", "verify_gate_envelope"]

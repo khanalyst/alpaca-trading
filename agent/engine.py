@@ -1,4 +1,4 @@
-"""Deterministic, paper-only orchestration for the IBR strategy."""
+"""Deterministic, mode-scoped orchestration for proved strategies."""
 
 from __future__ import annotations
 
@@ -10,17 +10,20 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError, AlpacaProvider
-from .alpaca_session import SessionPolicy
+from .alpaca_session import SessionPolicy, as_new_york, trading_env_guard
 from .brain import DecisionBrain
 from .contracts.ibr import generate_ibr_signal
 from .contracts.rule import generate_rule_signal
 from .market import MarketData
 from .risk import RiskEngine
 from .strategy import build_setup_plan
+from .instruments import (validate_asset_class, validate_equity_symbol,
+                          validate_instrument)
 
 log = logging.getLogger("engine")
 
@@ -53,15 +56,38 @@ class Engine:
     def __init__(self, cfg: dict, light: bool = False, *, provider=None,
                  market_data: MarketData | None = None, brain=None):
         self.cfg = cfg
-        # Config validation and AlpacaProvider both enforce this invariant;
-        # keeping the assertion here prevents hand-built test configs from
-        # accidentally selecting a non-paper client.
         broker = cfg.get("broker", {}) if isinstance(cfg, Mapping) else {}
-        if str(cfg.get("mode", "paper")).lower() not in {"paper", "demo"}:
-            raise AlpacaError("only paper mode is supported")
-        if broker.get("paper", True) is not True or broker.get("allow_live", False):
-            raise AlpacaError("paper=true and allow_live=false are required")
+        self.mode = str(cfg.get("mode", "paper")).lower()
+        if self.mode == "demo":
+            self.mode = "paper"
+        if self.mode not in {"paper", "live"}:
+            raise AlpacaError("mode must be paper or live")
+        expected_paper = self.mode == "paper"
+        paper = broker.get("paper", expected_paper)
+        allow_live = broker.get("allow_live", False)
+        if (self.mode == "paper" and (paper is not True or allow_live is not False)):
+            raise AlpacaError("paper mode requires paper=true and allow_live=false")
+        if (self.mode == "live" and (paper is not False or allow_live is not True)):
+            raise AlpacaError("live mode requires paper=false and allow_live=true")
+        try:
+            trading_env_guard(paper=paper, allow_live=allow_live)
+        except ValueError as exc:
+            raise AlpacaError(str(exc)) from exc
+        strategy_cfg = cfg.get("strategy", {}) if isinstance(cfg.get("strategy"), Mapping) else {}
+        self._edge_selection_mode = str(
+            strategy_cfg.get("selection_mode") or
+            ("specific" if self.mode == "live" else "all_proved"))
+        if self.mode == "live":
+            requested = str(strategy_cfg.get("variant_id") or "").strip()
+            if (not requested or requested.lower() == "auto" or
+                    self._edge_selection_mode != "specific"):
+                raise AlpacaError("live mode requires one named specific strategy variant")
         research_cfg = cfg.get("research", {}) if isinstance(cfg, Mapping) else {}
+        if self.mode == "live" and (
+                not isinstance(research_cfg, Mapping) or
+                research_cfg.get("enabled") is not True or
+                research_cfg.get("require_validated_variant") is not True):
+            raise AlpacaError("live mode requires the validated research edge gate")
         self._edge_base_cfg = deepcopy(cfg)
         self._edge_requested_variant = str(
             cfg.get("strategy", {}).get("variant_id") or "")
@@ -70,29 +96,51 @@ class Engine:
             isinstance(research_cfg, Mapping) and research_cfg.get("enabled", False) and
             research_cfg.get("require_validated_variant", True))
         self._edge_record: dict | None = None
+        self._edge_records: list[dict] = []
+        self._edge_configs: list[tuple[dict | None, dict]] = []
+        self._edge_pinned_candidate_id: str | None = None
+        self._edge_pinned_config_hash: str | None = None
+        self._edge_pinned_runtime_cfg: dict | None = None
         self._edge_error: str | None = None
         if isinstance(research_cfg, Mapping) and research_cfg.get("enabled", False):
             try:
-                from .edge import apply_variant, resolve_validated_variant
-                self._edge_record = resolve_validated_variant(
-                    cfg, db_path=self._edge_db_path or None)
-                if self._edge_record is not None:
-                    cfg = apply_variant(cfg, self._edge_record)
-                    self.cfg = cfg
-                elif self._edge_required:
-                    mode = str(cfg.get("strategy", {}).get("execution_mode", "shares"))
-                    self._edge_error = f"no validated edge champion for {mode}"
+                from .edge import (apply_variant, resolve_validated_variant,
+                                   resolve_validated_variants)
+                if self.mode == "live" or self._edge_selection_mode == "specific":
+                    record = resolve_validated_variant(
+                        cfg, db_path=self._edge_db_path or None)
+                    records = [record] if record is not None else []
+                else:
+                    records = resolve_validated_variants(
+                        cfg, db_path=self._edge_db_path or None)
+                self._edge_records = records
+                self._edge_record = records[0] if records else None
+                self._edge_configs = [(record, apply_variant(cfg, record))
+                                      for record in records]
+                if len(self._edge_configs) == 1:
+                    self.cfg = self._edge_configs[0][1]
+                if self.mode == "live" and len(records) == 1:
+                    self._edge_pinned_candidate_id = str(records[0].get("candidate_id") or "")
+                    self._edge_pinned_config_hash = str(records[0].get("config_hash") or "")
+                    self._edge_pinned_runtime_cfg = deepcopy(self._edge_configs[0][1])
+                if not records and self._edge_required:
+                    vehicle = str(cfg.get("strategy", {}).get("execution_mode", "shares"))
+                    self._edge_error = f"no latest-passing validated edge for {vehicle}"
+                elif not records:
+                    self._edge_configs = [(None, cfg)]
             except Exception as exc:  # noqa: BLE001
                 self._edge_error = f"edge resolution failed: {exc}"
+        else:
+            self._edge_configs = [(None, cfg)]
         self.provider = provider or AlpacaProvider(cfg)
-        if not self.provider.paper:
-            raise AlpacaError("provider is not paper scoped")
+        if bool(self.provider.paper) is not expected_paper:
+            raise AlpacaError(f"provider is not {self.mode} scoped")
         session_cfg = cfg.get("session", {})
         self.market = market_data or MarketData(self.provider, SessionPolicy(**session_cfg))
         llm_cfg = cfg.get("llm", {})
         llm_enabled = bool(llm_cfg.get("enabled", False)) if isinstance(llm_cfg, Mapping) else False
         self.brain = brain or (DecisionBrain(llm_cfg) if llm_enabled and not light else None)
-        self.risk = RiskEngine(cfg)
+        self.risk = RiskEngine(self._edge_base_cfg)
         self.light = light
         self.running = False
         self.shutdown_reason: str | None = None
@@ -104,9 +152,10 @@ class Engine:
         self._preflight: dict[str, Any] | None = None
         self._preflight_error: str | None = None
         self._reconciled = False
+        self._startup_cleanup_checked = False
         self._assets: dict[str, Any] = {}
         try:
-            state.configure_runtime("paper")
+            state.configure_runtime(self.mode)
             state.ensure_ready()
             self._runtime_state = state.load_state()
             state.write_heartbeat("starting", run_id=self.run_id)
@@ -114,24 +163,34 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             log.warning("state startup unavailable: %s", exc)
         if not light:
-            try:
-                self.preflight()
-                self.reconcile()
-            except Exception as exc:  # noqa: BLE001
-                # A REST reconciliation failure must prevent entries, but it
-                # need not make a status/check command unusable.
-                log.warning("startup reconciliation unavailable: %s", exc)
-                self._preflight_error = str(exc)
+            if not self._acquire_lock():
+                self._preflight_error = "runtime lock held during startup reconciliation"
+                log.warning(self._preflight_error)
+            else:
+                try:
+                    self.preflight()
+                    self.reconcile()
+                    self._enforce_intraday_cleanup(
+                        self._preflight.get("clock") if self._preflight else None,
+                        reason="startup_reconciliation", force=True)
+                except Exception as exc:  # noqa: BLE001
+                    # A REST reconciliation failure must prevent entries, but
+                    # it need not make a status/check command unusable.
+                    log.warning("startup reconciliation unavailable: %s", exc)
+                    self._preflight_error = str(exc)
+                finally:
+                    self._release_lock()
 
     def check(self, authenticated: bool = False) -> dict[str, Any]:
         result = {
-            "mode": "paper", "paper": True,
+            "mode": self.mode, "paper": self.mode == "paper",
             "credentials_configured": bool(self.provider.session.api_key and self.provider.session.secret_key),
             "authenticated": False,
             "edge_required": self._edge_required,
             "edge_ready": self._edge_record is not None,
             "edge_error": self._edge_error,
             "variant_id": (self._edge_record or {}).get("variant_id"),
+            "variant_ids": [record.get("variant_id") for record in self._edge_records],
             "edge_vehicle": (self._edge_record or {}).get("vehicle"),
         }
         if authenticated:
@@ -170,22 +229,31 @@ class Engine:
         self._persistent_lock = False
 
     def preflight(self) -> dict[str, Any]:
-        """Authenticate and validate the paper endpoint before any order path."""
+        """Authenticate and validate the configured endpoint before orders."""
         if self._preflight is not None:
             return self._preflight
         if not self._state_ready:
             state.ensure_ready()
             self._state_ready = True
-        if not getattr(self.provider, "paper", False):
-            raise AlpacaError("provider is not paper scoped")
+        if bool(getattr(self.provider, "paper", False)) is not (self.mode == "paper"):
+            raise AlpacaError(f"provider is not {self.mode} scoped")
         session = getattr(self.provider, "session", None)
         api_key = getattr(session, "api_key", None)
         secret_key = getattr(session, "secret_key", None)
         if not api_key or not secret_key:
-            raise AlpacaError("authenticated paper credentials are required before trading")
+            raise AlpacaError(f"authenticated {self.mode} credentials are required before trading")
         endpoint = getattr(self.provider, "endpoint", None) or getattr(session, "endpoint", None)
-        if endpoint is not None and "paper-api.alpaca.markets" not in str(endpoint):
-            raise AlpacaError("paper endpoint validation failed")
+        endpoint_text = str(endpoint or "")
+        expected_host = ("paper-api.alpaca.markets" if self.mode == "paper"
+                         else "api.alpaca.markets")
+        if endpoint is not None:
+            parsed_endpoint = urlparse(endpoint_text)
+            if (parsed_endpoint.scheme.lower() != "https" or
+                    parsed_endpoint.hostname != expected_host or
+                    parsed_endpoint.port is not None or
+                    parsed_endpoint.username is not None or
+                    parsed_endpoint.password is not None):
+                raise AlpacaError(f"{self.mode} endpoint validation failed")
         data_feed = str(getattr(self.provider, "data_feed", "iex")).lower()
         options_feed = str(getattr(self.provider, "options_feed", "indicative")).lower()
         if data_feed not in {"iex", "sip", "delayed_sip"}:
@@ -200,19 +268,25 @@ class Engine:
             self.market.refresh_calendar()
             assets = assets_method() if assets_supported else []
         except Exception as exc:  # noqa: BLE001
-            raise AlpacaError(f"authenticated paper preflight failed: {exc}") from exc
+            raise AlpacaError(f"authenticated {self.mode} preflight failed: {exc}") from exc
         account_id = _value(account, "id")
         if not account_id:
-            raise AlpacaError("paper account identity is unavailable")
+            raise AlpacaError(f"{self.mode} account identity is unavailable")
         if str(_value(account, "status", "")).lower() not in {"active", "account_status.active"}:
-            raise AlpacaError("paper account is not active")
+            raise AlpacaError(f"{self.mode} account is not active")
         if (self._number(_value(account, "equity", None)) or 0) <= 0:
-            raise AlpacaError("paper account equity is unavailable")
+            raise AlpacaError(f"{self.mode} account equity is unavailable")
+        if self.mode == "live" and _value(account, "pattern_day_trader", None) is not True:
+            raise AlpacaError(
+                "live account must explicitly report pattern_day_trader=true")
         if assets_supported:
-            self._assets = {
-                str(_value(asset, "symbol", "")).upper(): asset for asset in assets
-                if _value(asset, "symbol", None)
-            }
+            self._assets = {}
+            for asset in assets:
+                symbol = validate_instrument(
+                    _value(asset, "symbol", ""),
+                    validate_asset_class(_value(asset, "asset_class",
+                                                _value(asset, "class", ""))))
+                self._assets[symbol] = asset
             invalid = [symbol for symbol in self._universe()
                        if symbol not in self._assets or
                        not bool(_value(self._assets[symbol], "tradable", False)) or
@@ -223,26 +297,26 @@ class Engine:
                     "configured symbols are inactive or not tradable: " +
                     ", ".join(sorted(invalid)))
         fingerprint = state.account_fingerprint(
-            "paper", f"{api_key}\0{account_id}")
+            self.mode, f"{api_key}\0{account_id}")
         state.bind_account_identity(fingerprint)
         self._runtime_state = state.load_state()
         self._preflight = {"account": account, "clock": clock,
-                           "endpoint": endpoint or "paper-api.alpaca.markets",
+                           "endpoint": endpoint or expected_host,
                            "data_feed": data_feed, "options_feed": options_feed,
                            "account_fingerprint": fingerprint}
         self._preflight_error = None
         try:
-            state.commit({"runtime_mode": "paper", "account_fingerprint": fingerprint,
+            state.commit({"runtime_mode": self.mode, "account_fingerprint": fingerprint,
                           "preflight": {"endpoint": self._preflight["endpoint"],
                                          "data_feed": data_feed,
                                          "options_feed": options_feed,
                                          "authenticated": True}})
             state.log_equity(_value(account, "equity", None), "starting",
-                             runtime_mode="paper", account_fingerprint=fingerprint,
+                             runtime_mode=self.mode, account_fingerprint=fingerprint,
                              run_id=self.run_id)
         except Exception as exc:  # noqa: BLE001
             self._state_ready = False
-            raise AlpacaError(f"paper journal preflight write failed: {exc}") from exc
+            raise AlpacaError(f"{self.mode} journal preflight write failed: {exc}") from exc
         return self._preflight
 
     def _ensure_order_ready(self) -> bool:
@@ -252,7 +326,7 @@ class Engine:
             state.check_journal()
         except Exception as exc:  # noqa: BLE001
             self._state_ready = False
-            self._preflight_error = f"paper journal unavailable: {exc}"
+            self._preflight_error = f"{self.mode} journal unavailable: {exc}"
             return False
         runtime = state.load_state()
         if runtime.get("state") == state.KILLED or runtime.get("operator_pause") is True:
@@ -271,31 +345,100 @@ class Engine:
                 self._preflight_error = f"startup reconciliation failed: {exc}"
                 self._event("cycle_blocked", {"reason": "reconciliation_failed", "error": str(exc)})
                 return False
+        if not self._startup_cleanup_checked:
+            try:
+                self._enforce_intraday_cleanup(
+                    self.market.clock(), reason="startup_reconciliation",
+                    force=True)
+            except Exception as exc:  # noqa: BLE001
+                self._preflight_error = str(exc)
+                return False
         return True
 
+    def _inside_regular_session(self, clock: Any) -> bool:
+        now = _value(clock, "timestamp")
+        session = self.market.session(now)
+        return bool(_value(clock, "is_open", False) and session is not None and
+                    session.open <= now < session.close)
+
+    def _enforce_intraday_cleanup(self, clock: Any, *, reason: str,
+                                  force: bool = False) -> bool:
+        """Cancel working orders and flatten startup/out-of-session exposure."""
+        if self._inside_regular_session(clock) and not force:
+            self._startup_cleanup_checked = True
+            return True
+        cleanup_error = None
+        try:
+            complete = self.flatten_all(reason)
+        except Exception as exc:  # noqa: BLE001
+            complete = False
+            cleanup_error = exc
+        self._startup_cleanup_checked = complete
+        if complete:
+            return True
+        try:
+            state.commit({"operator_pause": True},
+                         transition=(state.RUNNING, state.PAUSED))
+            state.write_heartbeat("degraded", run_id=self.run_id,
+                                  reason="intraday_cleanup_incomplete")
+        except Exception:  # noqa: BLE001
+            pass
+        detail = f": {cleanup_error}" if cleanup_error is not None else ""
+        raise AlpacaError(
+            f"outside-session cleanup incomplete; entries remain blocked{detail}")
+
+    def _latest_entry_allowed(self, now: datetime, cfg: Mapping | None = None) -> bool:
+        strategy = (cfg or self.cfg).get("strategy", {})
+        raw = str(strategy.get("latest_entry_time", "15:00"))
+        try:
+            if len(raw) != 5 or raw[2] != ":":
+                return False
+            cutoff = datetime.strptime(raw, "%H:%M").time()
+        except (TypeError, ValueError):
+            return False
+        local = as_new_york(now)
+        return local.time().replace(second=0, microsecond=0) <= cutoff
+
     def _refresh_edge(self) -> bool:
-        """Refresh the selected vehicle champion before opening new risk."""
+        """Refresh paper proofs or re-verify the one pinned live candidate."""
         research = self._edge_base_cfg.get("research", {})
         if not isinstance(research, Mapping) or not research.get("enabled", False):
             return True
         try:
-            from .edge import apply_variant, resolve_validated_variant
+            from .edge import (apply_variant, resolve_validated_variant,
+                               resolve_validated_variants)
             lookup = deepcopy(self._edge_base_cfg)
             if self._edge_requested_variant:
                 lookup.setdefault("strategy", {})["variant_id"] = self._edge_requested_variant
             else:
                 lookup.setdefault("strategy", {}).pop("variant_id", None)
-            record = resolve_validated_variant(
-                lookup, db_path=self._edge_db_path or None)
-            if record is None:
+            if self.mode == "live":
+                record = resolve_validated_variant(
+                    lookup, db_path=self._edge_db_path or None,
+                    candidate_id=self._edge_pinned_candidate_id)
+                if (record is not None and
+                        str(record.get("config_hash") or "") !=
+                        self._edge_pinned_config_hash):
+                    record = None
+                records = [record] if record is not None else []
+            elif self._edge_selection_mode == "specific":
+                record = resolve_validated_variant(
+                    lookup, db_path=self._edge_db_path or None)
+                records = [record] if record is not None else []
+            else:
+                records = resolve_validated_variants(
+                    lookup, db_path=self._edge_db_path or None)
+            if not records:
                 self._edge_record = None
-                self._edge_error = "no validated edge champion for " + str(
+                self._edge_records = []
+                self._edge_configs = ([] if self._edge_required else
+                                      [(None, self._edge_base_cfg)])
+                self._edge_error = "no latest-passing validated edge for " + str(
                     lookup.get("strategy", {}).get("execution_mode", "shares"))
                 if self._edge_required:
                     try:
-                        runtime = state.load_state()
-                        runtime["state"] = state.PAUSED
-                        state.save_state(runtime)
+                        state.update_state(lambda runtime: {
+                            **runtime, "state": state.PAUSED})
                         state.write_heartbeat(
                             "paused", run_id=self.run_id,
                             reason="validated_edge_required",
@@ -304,27 +447,46 @@ class Engine:
                     except Exception:  # noqa: BLE001
                         pass
                 return not self._edge_required
-            if (self._edge_record or {}).get("candidate_id") != record.get("candidate_id"):
-                self.cfg = apply_variant(self._edge_base_cfg, record)
-                self.risk = RiskEngine(self.cfg)
+            prior_ids = [record.get("candidate_id") for record in self._edge_records]
+            next_ids = [record.get("candidate_id") for record in records]
+            if self.mode == "live" and prior_ids and prior_ids != next_ids:
+                self._edge_error = "pinned live edge changed identity"
+                return False
+            if prior_ids != next_ids:
                 self._event("edge_selected", {
-                    "candidate_id": record.get("candidate_id"),
-                    "variant_id": record.get("variant_id"),
-                    "vehicle": record.get("vehicle"),
+                    "candidate_ids": next_ids,
+                    "variant_ids": [record.get("variant_id") for record in records],
+                    "vehicle": records[0].get("vehicle"),
                 })
-            self._edge_record = record
+            self._edge_records = records
+            self._edge_record = records[0]
+            if self.mode == "live":
+                if self._edge_pinned_runtime_cfg is None:
+                    self._edge_error = "pinned live strategy config is unavailable"
+                    return False
+                self._edge_configs = [
+                    (records[0], deepcopy(self._edge_pinned_runtime_cfg))]
+            else:
+                self._edge_configs = [
+                    (record, apply_variant(self._edge_base_cfg, record))
+                    for record in records]
+            if len(self._edge_configs) == 1:
+                self.cfg = self._edge_configs[0][1]
             self._edge_error = None
             try:
-                runtime = state.load_state()
-                if (self.running and runtime.get("state") == state.PAUSED and
-                        runtime.get("operator_pause") is not True):
-                    runtime["state"] = state.RUNNING
-                    state.save_state(runtime)
+                def resume(runtime: dict) -> dict:
+                    if (self.running and runtime.get("state") == state.PAUSED and
+                            runtime.get("operator_pause") is not True):
+                        runtime["state"] = state.RUNNING
+                    return runtime
+                state.update_state(resume)
             except Exception:  # noqa: BLE001
                 pass
             return True
         except Exception as exc:  # noqa: BLE001
             self._edge_record = None
+            self._edge_records = []
+            self._edge_configs = []
             self._edge_error = f"edge resolution failed: {exc}"
             self._event("edge_resolution_failed", {"error": str(exc)})
             return not self._edge_required
@@ -341,19 +503,23 @@ class Engine:
         if not isinstance(row, Mapping):
             return {}
         out = dict(row)
-        out["symbol"] = str(out.get("symbol") or symbol).upper()
+        out["symbol"] = validate_equity_symbol(out.get("symbol") or symbol)
         return out
 
     @staticmethod
     def _quote_mapping(quote: Any, symbol: str) -> dict:
         row = _plain(quote)
-        return dict(row) if isinstance(row, Mapping) else {"symbol": symbol}
+        result = dict(row) if isinstance(row, Mapping) else {"symbol": symbol}
+        result["symbol"] = validate_equity_symbol(result.get("symbol") or symbol)
+        return result
 
     def _universe(self) -> list[str]:
         universe = self.cfg.get("universe", {})
         rows = universe.get("symbols", []) if isinstance(universe, Mapping) else []
-        deny = {str(item).upper() for item in universe.get("denylist", [])} if isinstance(universe, Mapping) else set()
-        return [str(symbol).upper() for symbol in rows if str(symbol).strip() and str(symbol).upper() not in deny][:int(universe.get("max_symbols", 50) or 50)]
+        deny = {validate_equity_symbol(item) for item in universe.get("denylist", [])} if isinstance(universe, Mapping) else set()
+        symbols = [validate_equity_symbol(symbol) for symbol in rows]
+        return [symbol for symbol in symbols if symbol not in deny][
+            :int(universe.get("max_symbols", 50) or 50)]
 
     def _collect(self, symbols: list[str], now: datetime, supplied: Mapping | None):
         """Fetch only configured symbols and completed one-minute bars."""
@@ -439,6 +605,23 @@ class Engine:
         except (TypeError, ValueError, OverflowError, OSError):
             return None
 
+    def _wall_clock(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _validated_clock_timestamp(self, clock: Any) -> datetime:
+        timestamp = self._timestamp(_value(clock, "timestamp", None))
+        if timestamp is None:
+            raise AlpacaError("broker clock timestamp is missing")
+        current = self._wall_clock()
+        age = (current - timestamp.astimezone(timezone.utc)).total_seconds()
+        maximum = float(self._edge_base_cfg.get("execution", {}).get(
+            "max_market_data_age_seconds", 30) or 30)
+        if age < 0:
+            raise AlpacaError("broker clock timestamp is in the future")
+        if age > maximum:
+            raise AlpacaError("broker clock timestamp is stale")
+        return timestamp
+
     def _completed(self, bar: Mapping, now: datetime) -> bool:
         ts = self._timestamp(bar.get("timestamp"))
         return bool(ts is not None and ts + timedelta(minutes=1) <= now and ts <= now)
@@ -490,48 +673,60 @@ class Engine:
             raise AlpacaError("account equity measurement is unavailable")
         session = self.market.session(now)
         day = session.date.isoformat() if session is not None else now.date().isoformat()
-        current = state.load_state()
-        prior = current.get("risk_day", {})
-        if not isinstance(prior, Mapping) or prior.get("date") != day:
-            prior = {"date": day, "start_equity": equity}
-        start = self._number(prior.get("start_equity"))
-        if start is None or start <= 0:
-            start = equity
-        daily_pnl = equity - start
-        risk_day = {
-            "date": day, "start_equity": start, "current_equity": equity,
-            "daily_pnl": daily_pnl, "updated_ts": time.time(),
-        }
         limit_pct = self._number(self.cfg.get("risk", {}).get("daily_loss_limit_pct"))
-        hit = bool(limit_pct is not None and daily_pnl <= -(start * limit_pct / 100.0))
-        risk_day["limit_hit"] = hit
-        current["risk_day"] = risk_day
-        if hit:
-            current["state"] = state.DAY_STOPPED
-        elif current.get("state") == state.DAY_STOPPED:
-            current["state"] = state.RUNNING if self.running else state.PAUSED
-        state.save_state(current)
+        outcome: dict[str, Any] = {}
+        def update(current: dict) -> dict:
+            prior = current.get("risk_day", {})
+            if not isinstance(prior, Mapping) or prior.get("date") != day:
+                prior = {"date": day, "start_equity": equity}
+            start = self._number(prior.get("start_equity"))
+            if start is None or start <= 0:
+                start = equity
+            daily_pnl = equity - start
+            hit = bool(limit_pct is not None and
+                       daily_pnl <= -(start * limit_pct / 100.0))
+            current["risk_day"] = {
+                "date": day, "start_equity": start, "current_equity": equity,
+                "daily_pnl": daily_pnl, "updated_ts": time.time(),
+                "limit_hit": hit,
+            }
+            if hit:
+                current["state"] = state.DAY_STOPPED
+            elif current.get("state") == state.DAY_STOPPED:
+                current["state"] = state.RUNNING if self.running else state.PAUSED
+            outcome.update(daily_pnl=daily_pnl, hit=hit)
+            return current
+        current = state.update_state(update)
         state.log_equity(
-            equity, "running", runtime_mode="paper", run_id=self.run_id,
+            equity, "running", runtime_mode=self.mode, run_id=self.run_id,
             account_fingerprint=current.get("account_fingerprint"))
-        return daily_pnl, hit
+        return float(outcome["daily_pnl"]), bool(outcome["hit"])
 
     def _fail_closed(self, reason: str, error: Exception) -> dict[str, Any]:
-        """Reduce existing paper exposure when a safety prerequisite fails."""
+        """Reduce existing exposure when a safety prerequisite fails."""
         self._event("cycle_blocked", {"reason": reason, "error": str(error)})
         try:
             positions = self.provider.positions()
         except Exception as position_error:  # noqa: BLE001
+            try:
+                state.commit({"operator_pause": True},
+                             transition=(state.RUNNING, state.PAUSED))
+            except Exception:  # noqa: BLE001
+                pass
             return {"action": "hold", "reason": reason, "error": str(error),
                     "position_error": str(position_error), "residual_unknown": True}
-        if not positions:
-            return {"action": "hold", "reason": reason, "error": str(error)}
         try:
             complete = self.flatten_all(reason)
         except Exception as flatten_error:  # noqa: BLE001
             complete = False
             self._event("fail_closed_flatten_failed", {
                 "reason": reason, "error": str(flatten_error)})
+        if not complete:
+            try:
+                state.commit({"operator_pause": True},
+                             transition=(state.RUNNING, state.PAUSED))
+            except Exception:  # noqa: BLE001
+                pass
         try:
             residual = _plain(self.provider.positions())
             residual_unknown = False
@@ -540,18 +735,23 @@ class Engine:
             residual_unknown = True
             self._event("fail_closed_residual_unknown", {
                 "reason": reason, "error": str(residual_error)})
+        if not positions and complete and not residual_unknown:
+            return {"action": "hold", "reason": reason, "error": str(error),
+                    "closed": True, "residual": residual}
         return {"action": "fail_closed", "reason": reason,
                 "closed": complete, "residual": residual,
                 "residual_unknown": residual_unknown}
 
     def _risk_order(self, symbol: str, signal: Mapping, row: Mapping,
-                    account: Any, positions: list[Any], now: datetime):
+                    account: Any, positions: list[Any], now: datetime,
+                    cfg: Mapping | None = None):
         equity = self._number(_value(account, "equity", 0)) or 0
         mapped_positions = [_plain(position) for position in positions]
         gross = sum(abs(self._number(_value(position, "market_value", 0)) or 0) for position in positions)
         decision = dict(signal)
         decision["symbol"] = symbol
-        strategy = self.cfg.get("strategy", {})
+        edge_cfg = cfg or self.cfg
+        strategy = edge_cfg.get("strategy", {})
         profile = str(decision.get("execution_profile") or
                       strategy.get("execution_profile",
                                    strategy.get("execution_mode", "shares"))).lower()
@@ -573,8 +773,8 @@ class Engine:
                     spot = (bid + ask) / 2 if bid is not None and ask is not None else None
                     candidates = self.provider.option_candidates(
                         symbol, now=now, underlying_price=spot,
-                        min_dte=int(self.cfg.get("risk", {}).get("options_min_dte", 7)),
-                        max_dte=int(self.cfg.get("risk", {}).get("options_max_dte", 60)),
+                        min_dte=int(edge_cfg.get("risk", {}).get("options_min_dte", 7)),
+                        max_dte=int(edge_cfg.get("risk", {}).get("options_max_dte", 60)),
                     )
                     candidates = [_plain(item) for item in candidates]
                 except (AttributeError, AlpacaError, TypeError, ValueError):
@@ -668,13 +868,25 @@ class Engine:
             try: state.write_heartbeat("degraded", reason="calendar_or_clock_unavailable")
             except Exception: pass
             return self._fail_closed("calendar_or_clock_unavailable", exc)
-        now = clock.timestamp
+        try:
+            now = self._validated_clock_timestamp(clock)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_closed("broker_clock_invalid", exc)
         try:
             reconciliation = self.reconcile()
             positions = reconciliation.get("positions", []) if isinstance(reconciliation, Mapping) else []
         except Exception as exc:  # noqa: BLE001
             self._reconciled = False
             return self._fail_closed("cycle_reconciliation_failed", exc)
+        if not self._inside_regular_session(clock):
+            try:
+                self._enforce_intraday_cleanup(
+                    clock, reason="outside_regular_session")
+            except Exception as exc:  # noqa: BLE001
+                return {"action": "hold", "reason": "intraday_cleanup_failed",
+                        "error": str(exc)}
+            return {"action": "force_flat", "reason": "outside_regular_session",
+                    "closed": True, "residual": _plain(self.provider.positions())}
         if self.market.should_force_flat(now):
             closed = self.flatten_all("before_close")
             return {"action": "force_flat", "closed": closed,
@@ -688,13 +900,15 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 return {"action": "hold", "reason": "close_reconciliation_failed", "error": str(exc)}
             # A submitted close must be reconciled before any new exposure is
-            # considered, even if the paper broker has not filled it yet.
+            # considered, even if the broker has not filled it yet.
             return {"action": "close", **monitored}
         if not self._refresh_edge():
             return {"action": "hold", "reason": self._edge_error or
                     "validated edge champion is required"}
         if not clock.is_open or not self.market.can_enter(now):
             return {"action": "hold", "reason": "outside_regular_session"}
+        if not self._latest_entry_allowed(now):
+            return {"action": "hold", "reason": "latest_entry_time_passed"}
         session = self.market.session(now)
         session_close = session.close if session is not None else None
         force_flat_at = None
@@ -716,70 +930,152 @@ class Engine:
                     "closed": complete, "residual": _plain(self.provider.positions())}
         positions = self.provider.positions()
         portfolio_data = portfolio or {"account": _plain(account), "positions": _plain(positions)}
-        placed = []; signals = []
-        for symbol in symbols:
-            row = rows.get(symbol)
-            if not row:
+        placed = []; signals = []; placed_keys: set[tuple[str, str]] = set()
+        planned_risk = 0.0; planned_notional = 0.0
+        risk_cfg = self._edge_base_cfg.get("risk", {})
+        gross = sum(abs(self._number(_value(position, "market_value", 0)) or 0)
+                    for position in positions)
+        runtime = state.load_state()
+        active = runtime.get("active_trades", {}) if isinstance(runtime, Mapping) else {}
+        open_risk = sum(self._number(item.get("risk_usd")) or 0 for item in active.values()
+                        if isinstance(item, Mapping)) if isinstance(active, Mapping) else 0.0
+        pending_keys: set[tuple[str, str]] = set()
+        pending_risk = 0.0; pending_notional = 0.0
+        for item in runtime.get("orders", {}).values() if isinstance(
+                runtime.get("orders"), Mapping) else ():
+            if (not isinstance(item, Mapping) or
+                    str(item.get("status", "")).lower() in _TERMINAL_ORDER_STATUSES):
                 continue
-            bars = row.get("bars", [])
-            if str(self.cfg.get("strategy", {}).get("id")) == "rule":
-                signal = generate_rule_signal(symbol, bars, config=self.cfg, now=now)
-            else:
-                signal = generate_ibr_signal(
-                    symbol, bars, config=self.cfg.get("strategy", {}), now=now)
-            if signal is None:
+            plan = item.get("risk_plan") if isinstance(item.get("risk_plan"), Mapping) else {}
+            underlying = str(plan.get("underlying_symbol") or item.get("symbol") or "").upper()
+            direction = str(plan.get("direction") or
+                            ("long" if item.get("side") == "buy" else "short"))
+            if underlying:
+                pending_keys.add((underlying, direction))
+                pending_risk += self._number(plan.get("risk_usd")) or 0.0
+                pending_notional += self._number(plan.get("notional")) or 0.0
+        held_underlyings = {
+            str(item.get("underlying_symbol") or item.get("symbol") or "").upper()
+            for item in active.values() if isinstance(item, Mapping)
+        } if isinstance(active, Mapping) else set()
+        pending_position_count = sum(
+            1 for underlying, _direction in pending_keys
+            if underlying not in held_underlyings)
+        edge_configs = self._edge_configs or ([(None, self._edge_base_cfg)]
+                                               if not self._edge_required else [])
+        for edge_record, edge_cfg in edge_configs:
+            if not self._latest_entry_allowed(now, edge_cfg):
                 continue
-            # Complete signal evidence must carry the latest quote controls.
-            signal = dict(signal)
-            # The broker calendar is authoritative for early closes.  Replace
-            # the IBR contract's regular-session default with this day's
-            # close before setup validation and journaling.
-            if force_flat_at is not None:
-                signal["force_flat_at"] = force_flat_at.isoformat()
-                signal["force_flat_ts"] = force_flat_at.timestamp()
-            signal.update({"symbol": symbol,
-                           "relative_volume": signal.get("relative_volume"),
-                           "spread_bps": row.get("spread_bps"),
-                           "stale": bool(row.get("stale", False)),
-                           "quote_stale": bool(row.get("quote_stale", False))})
-            plan_snapshot = {
-                **row,
-                "price": self._number(row.get("quote", {}).get("ask")),
-                "close": signal.get("entry_price"),
-                "relative_volume": signal.get("relative_volume"),
-                "spread_bps": row.get("spread_bps"),
-                "stale": bool(row.get("stale", False)),
-                "quote_stale": bool(row.get("quote_stale", False)),
-                "signal_ts": signal.get("signal_ts"),
-                "session": signal.get("session"),
-                "ibr_range": {"high": signal.get("range_high"), "low": signal.get("range_low"),
-                               "width": signal.get("range_width"),
-                               "range_end_ts": float(signal.get("signal_ts", 0)) - 60,
-                               "complete": True,
-                               "force_flat_at": signal.get("force_flat_at"),
-                               "force_flat_ts": signal.get("force_flat_ts")},
-            }
-            plan, why = build_setup_plan(signal, plan_snapshot, self.cfg)
-            if plan is None:
-                self._event("setup_reject", {"symbol": symbol, "reason": why})
-                continue
-            signals.append(plan)
-            if not self._llm_allows(plan, row, portfolio_data):
-                continue
-            sized = self._risk_order(symbol, plan, row, account, positions, now)
-            if sized is None:
-                continue
-            request, risk_plan = sized
-            if self._client_order_pending(request.client_order_id):
-                self._event("entry_pending", {"symbol": request.symbol,
-                                                "client_order_id": request.client_order_id})
-                continue
-            try:
-                order = self.provider.submit_order(request)
-                placed.append(order)
-                self._record_open_order(request, order, risk_plan)
-            except AlpacaError:
-                raise
+            edge_minutes = int(edge_cfg.get("strategy", {}).get(
+                "force_flat_minutes_before_close",
+                edge_cfg.get("session", {}).get("force_flat_minutes_before_close", 10)))
+            edge_force_flat_at = (session_close - timedelta(minutes=max(0, edge_minutes))
+                                  if session_close is not None else force_flat_at)
+            for symbol in symbols:
+                row = rows.get(symbol)
+                if not row:
+                    continue
+                bars = row.get("bars", [])
+                if str(edge_cfg.get("strategy", {}).get("id")) == "rule":
+                    signal = generate_rule_signal(symbol, bars, config=edge_cfg, now=now)
+                else:
+                    signal = generate_ibr_signal(
+                        symbol, bars, config=edge_cfg.get("strategy", {}), now=now)
+                if signal is None:
+                    continue
+                signal = dict(signal)
+                if edge_force_flat_at is not None:
+                    signal["force_flat_at"] = edge_force_flat_at.isoformat()
+                    signal["force_flat_ts"] = edge_force_flat_at.timestamp()
+                signal.update({"symbol": symbol,
+                               "relative_volume": signal.get("relative_volume"),
+                               "spread_bps": row.get("spread_bps"),
+                               "stale": bool(row.get("stale", False)),
+                               "quote_stale": bool(row.get("quote_stale", False))})
+                plan_snapshot = {
+                    **row,
+                    "price": self._number(row.get("quote", {}).get("ask")),
+                    "close": signal.get("entry_price"),
+                    "relative_volume": signal.get("relative_volume"),
+                    "spread_bps": row.get("spread_bps"),
+                    "stale": bool(row.get("stale", False)),
+                    "quote_stale": bool(row.get("quote_stale", False)),
+                    "signal_ts": signal.get("signal_ts"),
+                    "session": signal.get("session"),
+                    "ibr_range": {"high": signal.get("range_high"), "low": signal.get("range_low"),
+                                   "width": signal.get("range_width"),
+                                   "range_end_ts": float(signal.get("signal_ts", 0)) - 60,
+                                   "complete": True,
+                                   "force_flat_at": signal.get("force_flat_at"),
+                                   "force_flat_ts": signal.get("force_flat_ts")},
+                }
+                plan, why = build_setup_plan(signal, plan_snapshot, edge_cfg)
+                if plan is None:
+                    self._event("setup_reject", {"symbol": symbol, "reason": why})
+                    continue
+                signals.append(plan)
+                if not self._llm_allows(plan, row, portfolio_data):
+                    continue
+                key = (symbol, str(plan.get("direction") or ""))
+                if key in placed_keys or key in pending_keys:
+                    self._event("entry_duplicate_blocked", {
+                        "symbol": symbol, "direction": key[1],
+                        "variant_id": (edge_record or {}).get("variant_id")})
+                    continue
+                sized = self._risk_order(
+                    symbol, plan, row, account, positions, now, cfg=edge_cfg)
+                if sized is None:
+                    continue
+                request, risk_plan = sized
+                max_positions = int(risk_cfg.get("max_concurrent_positions", 1) or 1)
+                if (len(positions) + pending_position_count + len(placed) >=
+                        max_positions):
+                    self._event("risk_reject", {"symbol": symbol,
+                                                  "reason": "max concurrent positions reached"})
+                    continue
+                equity = self._number(_value(account, "equity", 0)) or 0
+                risk_cap = self._number(risk_cfg.get(
+                    "max_open_risk_pct", risk_cfg.get("max_total_open_risk_pct")))
+                if (risk_cap is not None and open_risk + pending_risk + planned_risk +
+                        float(risk_plan.get("risk_usd", 0) or 0) >
+                        equity * risk_cap / 100.0 + 1e-9):
+                    self._event("risk_reject", {"symbol": symbol,
+                                                  "reason": "max open risk cap reached"})
+                    continue
+                gross_cap = self._number(risk_cfg.get("max_gross_exposure_pct"))
+                if (gross_cap is not None and gross + pending_notional + planned_notional +
+                        float(risk_plan.get("notional", 0) or 0) >
+                        equity * gross_cap / 100.0 + 1e-9):
+                    self._event("risk_reject", {"symbol": symbol,
+                                                  "reason": "max gross exposure reached"})
+                    continue
+                if self._client_order_pending(request.client_order_id):
+                    self._event("entry_pending", {"symbol": request.symbol,
+                                                    "client_order_id": request.client_order_id})
+                    continue
+                try:
+                    order = self.provider.submit_order(request)
+                    placed.append(order); placed_keys.add(key); pending_keys.add(key)
+                    planned_risk += float(risk_plan.get("risk_usd", 0) or 0)
+                    planned_notional += float(risk_plan.get("notional", 0) or 0)
+                    try:
+                        self._record_open_order(request, order, risk_plan)
+                    except Exception as exc:  # noqa: BLE001
+                        self._reconciled = False
+                        self._preflight_error = (
+                            "post-submit durability failure; broker reconciliation required")
+                        try:
+                            state.commit({"operator_pause": True},
+                                         transition=(state.RUNNING, state.PAUSED))
+                            state.write_heartbeat(
+                                "degraded", run_id=self.run_id,
+                                reason="post_submit_durability_failure")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise AlpacaError(
+                            f"{self._preflight_error}: {exc}") from exc
+                except AlpacaError:
+                    raise
         try: state.write_heartbeat("running", run_id=self.run_id, orders=len(placed))
         except Exception: pass
         return {"action": "decide", "orders": placed, "signals": signals}
@@ -804,7 +1100,6 @@ class Engine:
         if status == "filled" and filled_qty <= 0:
             filled_qty = float(request.qty)
         fill_price = self._number(getattr(order, "filled_avg_price", None))
-        current = state.load_state()
         order_state = {
             "order_id": order_id, "symbol": symbol, "status": status,
             "client_order_id": request.client_order_id, "qty": str(request.qty),
@@ -816,12 +1111,15 @@ class Engine:
             "logged_filled_qty": 0.0,
             "updated_ts": time.time(),
         }
-        current.setdefault("orders", {})[order_id] = order_state
-        if filled_qty > 0 and status in _FILLED_ORDER_STATUSES:
-            self._activate_filled_trade(current, order_state, filled_qty, fill_price)
-        state.save_state(current)
+        def update(current: dict) -> dict:
+            current.setdefault("orders", {})[order_id] = order_state
+            if filled_qty > 0 and status in _FILLED_ORDER_STATUSES:
+                self._activate_filled_trade(
+                    current, order_state, filled_qty, fill_price)
+            return current
+        current = state.update_state(update)
         state.log_order(order, request, action="submit", run_id=self.run_id,
-                        runtime_mode="paper", account_fingerprint=current.get("account_fingerprint"),
+                        runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                         setup_id=risk_plan.get("setup_id"))
         self._event("order_submitted", {"symbol": request.symbol, "qty": str(request.qty),
                                          "status": status, "filled_qty": filled_qty,
@@ -883,7 +1181,7 @@ class Engine:
                 strategy_id=trade.get("strategy_id"),
                 strategy_version=trade.get("strategy_version"),
                 variant_id=trade.get("variant_id"), fill_status="filled",
-                runtime_mode="paper", account_fingerprint=current.get("account_fingerprint"),
+                runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                 run_id=self.run_id)
             order_state["fill_logged"] = True
             order_state["logged_filled_qty"] = filled_qty
@@ -906,17 +1204,39 @@ class Engine:
                     result = close(symbol, qty=qty)
                 except TypeError:
                     result = close(symbol)
-            state.log_order(result, None, action="close", reason=reason,
-                            symbol=symbol, qty=float(qty), runtime_mode="paper",
-                            run_id=self.run_id,
-                            client_order_id=client_order_id)
+            try:
+                state.log_order(result, None, action="close", reason=reason,
+                                symbol=symbol, qty=float(qty), runtime_mode=self.mode,
+                                run_id=self.run_id,
+                                client_order_id=client_order_id)
+            except Exception as exc:  # noqa: BLE001
+                self._reconciled = False
+                self._preflight_error = (
+                    "post-submit close durability failure; reconciliation required")
+                try:
+                    state.commit({"operator_pause": True},
+                                 transition=(state.RUNNING, state.PAUSED))
+                except Exception:  # noqa: BLE001
+                    pass
+                raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
             return result
         side = "sell" if str(_value(position, "side", "long")).lower() in {"long", "buy"} else "buy"
         request = OrderRequest(symbol, qty, side, type="market", time_in_force="day",
                                client_order_id=client_order_id)
         result = self.provider.submit_order(request)
-        state.log_order(result, request, action="close", reason=reason,
-                        runtime_mode="paper", run_id=self.run_id)
+        try:
+            state.log_order(result, request, action="close", reason=reason,
+                            runtime_mode=self.mode, run_id=self.run_id)
+        except Exception as exc:  # noqa: BLE001
+            self._reconciled = False
+            self._preflight_error = (
+                "post-submit close durability failure; reconciliation required")
+            try:
+                state.commit({"operator_pause": True},
+                             transition=(state.RUNNING, state.PAUSED))
+            except Exception:  # noqa: BLE001
+                pass
+            raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
         return result
 
     def _protection_price(self, trade: Mapping, position: Any,
@@ -1029,8 +1349,23 @@ class Engine:
                     self._event("close_failed", {"symbol": symbol, "reason": reason,
                                                   "error": str(exc)})
         if changed:
-            runtime["active_trades"] = active
-            state.save_state(runtime)
+            try:
+                runtime = state.update_state(lambda current: {
+                    **current,
+                    "active_trades": dict(active),
+                    "orders": {**current.get("orders", {}),
+                               **runtime.get("orders", {})},
+                })
+            except Exception as exc:  # noqa: BLE001
+                self._reconciled = False
+                self._preflight_error = (
+                    "post-submit close state failure; reconciliation required")
+                try:
+                    state.commit({"operator_pause": True},
+                                 transition=(state.RUNNING, state.PAUSED))
+                except Exception:  # noqa: BLE001
+                    pass
+                raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
         return {"closed": closed, "failed": failed, "force_flat": force_flat}
 
     def reconcile(self):
@@ -1040,6 +1375,19 @@ class Engine:
             result = {"positions": self.provider.positions(), "orders": self.provider.orders()}
         positions = result.get("positions", []) if isinstance(result, Mapping) else []
         broker_orders = result.get("orders", []) if isinstance(result, Mapping) else []
+        for position in positions:
+            validate_instrument(
+                _value(position, "symbol", ""),
+                _value(position, "asset_class", _value(position, "class", None)))
+        for broker_order in broker_orders:
+            validate_instrument(
+                _value(broker_order, "symbol", ""),
+                _value(broker_order, "asset_class", _value(broker_order, "class", None)))
+            tif = str(_value(broker_order, "time_in_force", "") or "").lower()
+            if not tif:
+                raise AlpacaError("broker reconciliation found an order without time_in_force")
+            if tif != "day":
+                raise AlpacaError("broker reconciliation found a non-day order")
         current = state.load_state()
         previous = current.get("active_trades", {})
         previous = previous if isinstance(previous, Mapping) else {}
@@ -1096,7 +1444,7 @@ class Engine:
             if status != old_status:
                 state.log_order(
                     broker_order, None, action="reconcile", run_id=self.run_id,
-                    runtime_mode="paper", account_fingerprint=current.get("account_fingerprint"),
+                    runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                     setup_id=(saved.get("risk_plan") or {}).get("setup_id")
                     if isinstance(saved.get("risk_plan"), Mapping) else None)
 
@@ -1158,14 +1506,19 @@ class Engine:
                 setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
                 strategy_id=trade.get("strategy_id"),
                 strategy_version=trade.get("strategy_version"),
-                variant_id=trade.get("variant_id"), runtime_mode="paper",
+                variant_id=trade.get("variant_id"), runtime_mode=self.mode,
                 account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
             self._record_edge_outcome(trade, realized, pnl_pct, exit_price)
             current.setdefault("protection", {}).pop(symbol, None)
-        current["active_trades"] = active
-        current["orders"] = order_state
-        current["last_reconciliation_ts"] = time.time()
-        state.save_state(current)
+        reconciled_at = time.time()
+        protection = current.get("protection", {})
+        current = state.update_state(lambda latest: {
+            **latest,
+            "active_trades": active,
+            "orders": {**latest.get("orders", {}), **order_state},
+            "protection": protection,
+            "last_reconciliation_ts": reconciled_at,
+        })
         self._runtime_state = current
         self._reconciled = True
         self._event("rest_reconcile", {"positions": len(result.get("positions", [])) if isinstance(result, Mapping) else 0})
@@ -1173,6 +1526,8 @@ class Engine:
 
     def _record_edge_outcome(self, trade: Mapping, realized: float | None,
                              pnl_pct: float | None, exit_price: float | None) -> None:
+        if self.mode != "paper":
+            return
         variant_id = trade.get("variant_id")
         if not variant_id or realized is None:
             return
@@ -1185,6 +1540,7 @@ class Engine:
                               f"{trade.get('symbol')}:{opened:.6f}",
             "session_date": datetime.fromtimestamp(opened, timezone.utc).date().isoformat(),
             "net_pnl": realized, "pnl_pct": pnl_pct,
+            "risk_usd": risk_usd,
             "r_multiple": (realized / risk_usd if risk_usd and risk_usd > 0 else None),
             "entry_price": trade.get("entry_price"), "exit_price": exit_price,
             "reason": trade.get("closing_reason", "broker_reconcile"),
@@ -1260,9 +1616,6 @@ class Engine:
                             order = close(symbol, qty=qty)
                         except TypeError:
                             order = close(symbol)
-                    state.log_order(order, None, action="flatten", reason=reason,
-                                    symbol=symbol, qty=float(qty), runtime_mode="paper",
-                                    run_id=self.run_id)
                 else:
                     side = "sell" if str(_value(position, "side", "long")).lower() in {"long", "buy"} else "buy"
                     request = OrderRequest(symbol, qty, side, type="market", time_in_force="day",
@@ -1271,14 +1624,11 @@ class Engine:
                                                            "setup_id": reason},
                                                close_attempt))
                     order = self.provider.submit_order(request)
-                    state.log_order(order, request, action="flatten", reason=reason,
-                                    runtime_mode="paper", run_id=self.run_id)
                 order_id = str(getattr(order, "id", None) or client_order_id
                                if callable(close) else
                                getattr(order, "id", None) or request.client_order_id)
                 status = str(getattr(order, "status", "submitted") or "submitted").lower()
-                current = state.load_state()
-                current.setdefault("orders", {})[order_id] = {
+                order_state = {
                     "order_id": order_id, "symbol": symbol,
                     "status": status,
                     "client_order_id": (client_order_id if callable(close)
@@ -1286,7 +1636,27 @@ class Engine:
                     "qty": str(qty), "action": "flatten", "reason": reason,
                     "attempt": close_attempt, "updated_ts": time.time(),
                 }
-                state.save_state(current)
+                try:
+                    state.log_order(
+                        order, None if callable(close) else request,
+                        action="flatten", reason=reason, symbol=symbol,
+                        qty=float(qty), runtime_mode=self.mode,
+                        run_id=self.run_id)
+                    state.update_state(lambda current: {
+                        **current,
+                        "orders": {**current.get("orders", {}),
+                                   order_id: order_state},
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    self._reconciled = False
+                    self._preflight_error = (
+                        "post-submit flatten durability failure; reconciliation required")
+                    try:
+                        state.commit({"operator_pause": True},
+                                     transition=(state.RUNNING, state.PAUSED))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
                 submitted[symbol] = {"order_id": order_id, "status": status,
                                      "attempt": close_attempt}
             try:
@@ -1321,14 +1691,19 @@ class Engine:
 
     def run(self, *, max_cycles: int | None = None) -> None:
         if not self._acquire_lock(persistent=True):
-            raise AlpacaError("another paper runtime process already holds the run lock")
-        runtime = state.load_state()
-        if runtime.get("state") == state.KILLED:
+            raise AlpacaError(f"another {self.mode} runtime process already holds the run lock")
+        def start_runtime(runtime: dict) -> dict:
+            if runtime.get("state") == state.KILLED:
+                raise AlpacaError(runtime.get("kill_reason") or
+                                  f"{self.mode} runtime is killed")
+            runtime["state"] = state.RUNNING
+            runtime["operator_pause"] = False
+            return runtime
+        try:
+            state.update_state(start_runtime)
+        except Exception:
             self._release_lock()
-            raise AlpacaError(runtime.get("kill_reason") or "paper runtime is killed")
-        runtime["state"] = state.RUNNING
-        runtime["operator_pause"] = False
-        state.save_state(runtime)
+            raise
         if not self._ensure_order_ready():
             self._release_lock()
             raise AlpacaError(self._preflight_error or
@@ -1363,12 +1738,12 @@ class Engine:
                         "degraded", run_id=self.run_id,
                         reason="shutdown_flatten_incomplete")
                     flatten_failure = AlpacaError(
-                        "shutdown flatten incomplete; paper positions may remain")
+                        f"shutdown flatten incomplete; {self.mode} positions may remain")
             except Exception as exc:  # noqa: BLE001
                 self._event("shutdown_flatten_failed", {
                     "reason": exit_reason, "error": str(exc)})
                 flatten_failure = AlpacaError(
-                    f"shutdown flatten failed; paper positions may remain: {exc}")
+                    f"shutdown flatten failed; {self.mode} positions may remain: {exc}")
             self.close()
             if flatten_failure is not None and run_failure is None:
                 raise flatten_failure

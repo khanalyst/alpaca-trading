@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free summaries for the Alpaca paper journal.
+"""Small, dependency-free summaries for a mode-scoped Alpaca journal.
 
 The runtime journal is deliberately an append-only execution ledger.  This
 module only reads it and emits a compact JSON or CSV summary; it does not
@@ -15,7 +15,6 @@ import json
 import math
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -84,9 +83,13 @@ def _summary(events: list[dict[str, Any]], equity: list[dict[str, Any]]) -> dict
     wins = sum(value > 0 for value in realized)
     latest_equity = _finite(equity[-1].get("equity")) if equity else None
     first_equity = _finite(equity[0].get("equity")) if equity else None
+    modes = {str(row.get("runtime_mode") or "").lower() for row in events
+             if str(row.get("runtime_mode") or "").lower() in {"paper", "live"}}
+    scope = (f"alpaca-{next(iter(modes))}" if len(modes) == 1 else
+             "alpaca-mixed" if len(modes) > 1 else "alpaca-paper")
     return {
         "schema": 1,
-        "scope": "alpaca-paper",
+        "scope": scope,
         "events": len(events),
         "closed_trades": len(closes),
         "realized_pnl_usd": sum(realized) if realized else 0.0,
@@ -102,16 +105,9 @@ def _summary(events: list[dict[str, Any]], equity: list[dict[str, Any]]) -> dict
 
 
 def json_report(db: sqlite3.Connection) -> dict[str, Any]:
-    """Return a compact machine-readable paper-journal summary."""
+    """Return a compact machine-readable journal summary."""
     events = load_trade_events(db)
     return _safe(_summary(events, _equity_rows(db)))  # type: ignore[return-value]
-
-
-def _fmt_ts(value: object) -> str:
-    timestamp = _finite(value)
-    if timestamp is None:
-        return ""
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
 def csv_report(db: sqlite3.Connection) -> str:

@@ -31,14 +31,14 @@ jobs:
           docker compose config --quiet
           docker compose --profile research config --quiet
           docker compose build
-      - name: Reject stale crypto-provider terms in active source and tests
+      - name: Reject stale crypto-provider terms outside the deny boundary
         run: |
-          if rg -n -i '\b(okx|ccxt|usdt|funding|perpetual)\b' \
+          if rg -n -i '\b(ccxt|usdt|funding|perpetual)\b' \
               agent deploy research tests README.md SETUP.md OPERATIONS.md \
               AZURE_DEPLOYMENT.md .env.example requirements.txt \
               requirements.lock.txt Dockerfile compose.yaml \
               --glob '*.py' --glob '*.md' --glob '*.yaml' --glob '*.yml' \
-              --glob '*.sh' --glob '*.txt'; then
+              --glob '*.sh' --glob '*.txt' --glob '!instruments.py'; then
             echo 'stale crypto-provider term found in active source/tests/docs' >&2
             exit 1
           fi

@@ -1,11 +1,13 @@
 # Operations runbook
 
-This runbook covers the paper-only Alpaca runtime. It assumes the checkout is
+This runbook covers the default paper Alpaca runtime and the controls required
+for an explicitly approved live scope. It assumes the checkout is
 `/opt/alpaca-agent-trading`, the secret is outside Git, and one trader process
-owns the paper account with one execution profile (`shares` or `options`). The
-order path is intraday: the market calendar and IBR strategy reject entries
-outside the regular session and flatten before the NYSE close. Overnight
-positions are an incident, not a supported state.
+owns one account with one execution profile (`shares` or `options`). The
+supported universe is US-listed equities/ETFs and listed OCC options only. The
+order path is intraday: day-only orders, regular NYSE session entries, startup
+cleanup, and force-flat before the close. Overnight positions are an incident,
+not a supported state.
 
 ## Daily checks
 
@@ -19,11 +21,12 @@ docker compose exec -T trader python main.py status
 docker compose --profile research ps research
 ```
 
-`main.py check` is authenticated by default and must report the paper endpoint,
-configured stock/options feeds, current market clock, and a reachable
-credentials path. Use `--offline` only for local configuration checks. A live
-endpoint or missing key is a failed check. Verify recorder/research timestamps
-are fresh, the dashboard is healthy, and the trader has exactly one replica.
+`main.py check` is authenticated by default and must report the configured
+mode endpoint, credentials, stock/options feeds, current market clock, and
+account state. Use `--offline` only for local configuration checks; it does not
+authenticate and is not a trading preflight. A wrong endpoint, missing key, or
+inactive account is a failed check. Verify recorder/research timestamps are
+fresh, the dashboard is healthy, and the trader has exactly one replica.
 
 For systemd hosts:
 
@@ -42,22 +45,34 @@ closes. The trader must:
 1. complete the 09:30–09:45 America/New_York IBR window before evaluating a
    breakout;
 2. reject new entries near the close and whenever the clock/calendar is stale;
-3. maintain stops and long-option exits while the session is open;
-4. flatten all shares and long-option contracts before the configured close cutoff; and
-5. reconcile broker positions and orders after flattening.
+3. submit only `time_in_force: day` orders and maintain stops and long-option
+   exits while the session is open;
+4. at startup, cancel working orders and flatten residual shares/contracts;
+5. flatten all shares and long-option contracts before the configured close
+   cutoff; and
+6. reconcile broker positions and orders after flattening.
 
 If the process is restarted during a session, reconcile first. Never infer a
 flat account from a local journal alone. A long option contract is one risk
 unit: close or cancel it and confirm no residual contract remains.
 
-## Paper-only guard
+## Mode guard and live preflight
 
-`ALPACA_PAPER=true` is mandatory for this deployment. The provider refuses a
-non-paper session unless a separate explicit live-enable control exists; no
-such control is shipped or supported. If a secret, endpoint, or config change
-would select live trading, stop the trader, restore the paper setting, rotate
-the affected key, and record the incident. Do not attempt to work around the
-guard.
+Paper is the default and the shipped Compose/systemd lanes set
+`ALPACA_PAPER=true`. A live process is allowed only with `mode: live`,
+`broker.paper: false`, `broker.allow_live: true`, and
+`ALPACA_LIVE_ENABLE=true`; `ALPACA_PAPER=true` must not be set. It must use
+`strategy.selection_mode: specific` and one exact named validated/champion
+`strategy.variant_id`. The runtime pins that candidate/configuration and does
+not auto-switch. Keep live credentials, config, and
+`ALPACA_AGENT_RUNTIME_ROOT` separate from paper; never run both against shared
+state or a shared account.
+
+The authenticated live preflight requires the account to report
+`pattern_day_trader=true` in addition to endpoint, identity, active status,
+equity, asset, clock, and calendar checks. A missing or false PDT flag blocks
+startup. If any mode guard or preflight fails, stop the process, preserve the
+evidence, and correct the scoped configuration before retrying.
 
 ## Start, stop, and pause
 
@@ -73,9 +88,8 @@ Before stopping during a session, run
 `docker compose exec -T trader python main.py flatten --reason operator` and
 confirm Alpaca reports no open positions or orders. A non-zero flatten result
 means residual positions remain and requires manual reconciliation. If the
-trader is unhealthy, stop it, cancel
-open orders, flatten manually in the
-Alpaca paper dashboard/API, and leave it stopped until reconciliation passes.
+trader is unhealthy, stop it, cancel open orders, flatten manually in the
+scoped Alpaca account, and leave it stopped until reconciliation passes.
 
 ## Reconciliation and incident response
 
@@ -120,7 +134,7 @@ docker run --rm -v alpaca-agent-trading_runtime-data:/src:ro \
 
 Verify the archive can be listed and copied to another host. A bind mount on
 the same VM does not prove recoverability from VM loss. Restore into a new
-checkout, run compile/tests and `main.py check`, then reconcile the paper
+checkout, run compile/tests and `main.py check`, then reconcile the scoped
 account before starting the trader.
 
 ## Updating
@@ -140,8 +154,8 @@ docker compose exec -T trader python main.py check
 
 Do not update by replacing a running journal or starting a second trader.
 Rollback means restoring the prior reviewed Git revision and image, then
-re-running the paper check and reconciliation. Record the revision, operator,
-time, and check output in the deployment log.
+re-running the mode-appropriate check and reconciliation. Record the revision,
+operator, mode, time, and check output in the deployment log.
 
 ## Research and evidence
 
@@ -152,17 +166,24 @@ recorder's mixed bars/quotes/options dataset at
 plus the explicit IBR baseline, scores shares and single-leg long-option
 vehicles separately, and writes evidence. Each variant has its own simulated
 cash/equity account; default capacity is seven parallel strategy workers and
-four variants per strategy. The edge ledger is
+four variants per strategy. Paper `selection_mode: all_proved` keeps one best
+proven variant per independent family under one global risk book. The edge
+ledger is
 initialized at `runtime/research/edge_lab.sqlite3`; inspect it with
 `python research.py edge status`. The autonomous lifecycle requires an initial
-corpus backtest followed by later unseen shadow evidence; paper outcomes are
-appended for forward monitoring and may demote a champion. Passing gates
-advance validated/champion state without manual promotion. Manual
-`edge promote`/rollback operations remain available only as audited controls
-subject to lifecycle/evidence rules; demote, retire, and rollback are operator
-safety actions. Keep data provenance, session date, feed, contract
-identity, and costs with each result. Do not combine regular-session evidence
-with pre/post-market or overnight data.
+corpus backtest followed by later unseen shadow evidence. Validation requires
+fit and held-out structural floors, matched controls, placebo/falsification,
+family-level FDR, and a durable verified gate. Underpowered data is not a
+failure. Retirement waits until all intended variants are adequately tested
+and fail, and a valid bounded LLM replacement is registered first when that
+lane is enabled. Paper outcomes are appended for forward monitoring and may
+demote a champion. Passing gates advance validated/champion state without
+manual promotion. Manual `edge promote` remains an audited control subject to
+lifecycle/evidence rules. Backward rollback is rejected; explicit demotion is
+the operator safety action. Good edges emit deterministic,
+content-addressed findings and may send an optional HTTPS webhook. Keep data
+provenance, session date, feed, contract identity, and costs with each result.
+Do not combine regular-session evidence with pre/post-market or overnight data.
 
 Inspect autonomous lineage and isolated-account counts with
 `python research.py factory status`. Tune bounded capacity with
@@ -173,6 +194,12 @@ The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this
 journal and edge ledger in read-only mode.
 
+The scheduler records one of four terminal research statuses:
+`completed` (proof produced), `completed_no_edge` (valid run, no eligible
+edge), `no_data` (input unavailable/empty), or `failed` (validation or job
+failure). Treat `completed_no_edge` and `no_data` as distinct from scheduler
+failure; neither permits bypassing the runtime edge gate.
+
 The dashboard is read-only and localhost-bound. It is an observation aid, not
 an execution console. Protect SSH and host credentials using your normal
 organization controls.
@@ -181,10 +208,10 @@ organization controls.
 
 | Symptom | Action |
 | --- | --- |
-| `paper endpoint required` | Restore `ALPACA_PAPER=true`, check the endpoint, and restart only after `main.py check`. |
+| mode/endpoint guard failure | Restore the scoped paper or live guard, check the endpoint, and restart only after authenticated `main.py check`; live also needs `pattern_day_trader=true`. |
 | `market closed` or stale calendar | Do not force an entry; refresh the calendar and wait for the next regular session. |
 | Missing bars/quotes | Check the selected Alpaca feed entitlement and recorder health; mark the interval unavailable. |
 | Option chain lacks a valid single-leg long contract | Skip the trade. Never substitute a multi-leg, uncovered, or short option. |
-| Position remains after close cutoff | Stop new entries, cancel orders, flatten manually through Alpaca, and keep the trader paused. |
+| Position remains after close cutoff or startup cleanup | Stop new entries, cancel orders, flatten manually through the scoped Alpaca account, and keep the trader paused. |
 | Local/broker state differs | Broker state wins; preserve logs and reconcile before resuming. |
 | Research reports disagree | Preserve both artifacts and compare feed/session/contract provenance; do not merge silently. |

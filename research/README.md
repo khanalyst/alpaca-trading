@@ -1,8 +1,9 @@
 # Alpaca intraday research
 
-This directory contains offline, deterministic research utilities for US
-equities, ETFs, and listed options. Options are single-leg long calls or puts
-only; multi-leg, naked, and short structures are not supported. Data adapters
+This directory contains offline replay and bounded research utilities for
+US-listed equities/ETFs and listed OCC options; crypto is outside scope.
+Options are single-leg long calls or puts only; multi-leg, naked, and short
+structures are not supported. Data adapters
 normalize their payloads through `research.market_data` before any analysis.
 Every normalized event
 records its provider, feed, schema, session date/timezone, observation time,
@@ -24,6 +25,8 @@ routes the available bar/option events to the vehicle-local discovery lanes.
 It also invokes `research.strategy_factory`, which evaluates seven distinct
 rule families concurrently by default. Each generated variant owns an
 isolated simulated account; no capital or P&L is shared between arms.
+Paper runtime selection can then use `selection_mode: all_proved`, which keeps
+one best proven variant per independent family under one global risk book.
 
 The default session timezone is `America/New_York`. Session dates are derived
 after timezone conversion, so the daylight-saving transitions in March and
@@ -65,9 +68,11 @@ Research artifacts should retain the normalized input digest, provider/feed
 identity, configuration, and code version alongside results.  Any feature or
 label must be computed from events at or before its as-of timestamp.  A
 completed-bar fixture and a no-look-ahead test are required for every new
-replay path.  Walk-forward, paired-baseline, placebo, and acceptance-floor
-checks remain useful gates, but are applied per vehicle and per session rather
-than to a pooled equity/options series.
+replay path.  Walk-forward, paired-baseline, placebo/falsification, and
+acceptance-floor checks are mandatory gates, with fit/held-out structural
+floors, family-level false-discovery correction, and a durable verified gate.
+They are applied per vehicle and per session rather than to a pooled
+equity/options series.
 
 ## Edge laboratory
 
@@ -83,12 +88,15 @@ persisted boundary, and passing unseen shadow gates moves it through `shadow`
 to `validated` and automatic champion selection. Paper outcomes are append-only
 evidence and may demote a champion. Candidates are scored separately for
 `equity` and `option` vehicles. Gates require chronological held-out data,
-trade/session floors, a paired baseline, cluster-aware randomisation,
-multiple-test correction, and placebo falsification. Drawdown is measured and
-used in conservative champion ranking. Normal
-operation needs no manual promotion; the `edge promote`/rollback CLI is only
-for explicit, audited controls and remains subject to lifecycle/evidence
-rules. Demote, retire, and rollback are operator safety actions.
+fit/held-out trade and session structural floors, matched controls,
+cluster-aware randomisation, family-level FDR, and placebo/falsification.
+Underpowered data is not failure. Retirement is allowed only after all intended
+variants are adequately tested and fail; a valid bounded LLM replacement must
+be registered first when that lane is enabled. Drawdown is measured and used
+in conservative champion ranking. Normal operation needs no manual promotion;
+the `edge promote` CLI is only for explicit, audited controls and remains
+subject to lifecycle/evidence rules. Backward rollback is rejected; explicit
+demotion is the operator safety action.
 
 ## Autonomous strategy factory
 
@@ -101,11 +109,25 @@ parameters. It never generates or imports source code.
 On a fresh corpus, each worker diagnoses its baseline only from the
 chronological fit partition, creates bounded variants based on the observed
 failure mode, and evaluates those variants on untouched held-out sessions.
-Every variant has a separate simulated cash/equity account. An adequately
-powered family whose variants all fail is retired; a content-addressed new
-hypothesis is immediately queued for the next independent corpus. Insufficient
-data is not treated as failure. Backtest winners must still pass strictly later
-forward data before runtime can select them.
+Every variant has a separate simulated cash/equity account. A family is
+retired only when all intended variants are adequately powered and fail; if
+LLM replacement is enabled, a valid bounded proposal is registered first. A
+missing or invalid LLM proposal leaves the family pending replacement, not
+retired. Insufficient data is not treated as failure. Backtest winners must
+still pass strictly later forward data before runtime can select them.
+
+The checked config enables the bounded strategy-replacement adapter with
+OpenAI `gpt-5`. It is optional and reads provider keys only from
+`ALPACA_RESEARCH_LLM_SECRETS_FILE`, never from the broker secret file. Missing,
+invalid, or rejected model output records a pending replacement; it cannot
+retire a family prematurely. Successful proof produces a deterministic,
+content-addressed finding. `research.proof.webhook_url` may send that finding
+to an HTTPS webhook without changing the durable artifact.
+
+The scheduled cycle reports `completed`, `completed_no_edge`, `no_data`, or
+`failed`. `completed_no_edge` means the input was valid but no candidate passed
+the gates; `no_data` means the input was unavailable or empty. Neither status
+permits bypassing the runtime edge gate.
 
 ```bash
 python research.py factory run --data market.jsonl --strategies 7 --variants 4 --workers 7

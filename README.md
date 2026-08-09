@@ -1,36 +1,43 @@
-# Alpaca intraday paper-trading agent
+# Alpaca intraday trading agent
 
 This repository is a research and execution skeleton for US equities, ETFs,
-and listed options through Alpaca. The intended workflow is paper-only:
-collect regular-session data, evaluate multiple strategy hypotheses and their
-variants, and record every decision and fill for review. Options
-are single-leg long calls or puts (buy-to-open, sell-to-close); multi-leg and
-naked/short option structures are unsupported. It is not a live-trading system
-and makes no claim of a profitable edge.
+and listed OCC options through Alpaca. Paper mode is the default: collect
+regular-session data, evaluate multiple strategy hypotheses and their variants,
+and record every decision and fill for review. The supported universe is
+US-listed equities/ETFs and listed OCC options only; crypto is rejected.
+Options are single-leg long calls or puts
+(buy-to-open, sell-to-close); multi-leg and naked/short option structures are
+unsupported. No performance claim is made.
 
-The research factory starts with seven audited rule families and four isolated
-simulated-account variants per family. It evaluates the seven families in
-parallel, diagnoses failures from chronological fit data, mutates bounded
-data-only rule specifications, and judges them on untouched held-out data.
-Adequately tested failures are retired and replaced by a new hypothesis for a
-later cycle. A trader process selects one validated/champion rule and one
-execution profile (`shares` or `options`) in `strategy.execution_mode`; do not
-mix profiles in one process. The market
-calendar is America/New_York (NYSE regular session). New entries are rejected
-outside the regular session, positions are force-closed before the close, and
-overnight positions are not supported.
+The research factory starts with seven independent rule families and four
+isolated simulated-account variants per family. It evaluates independent
+families in parallel, diagnoses failures from chronological fit data, mutates
+bounded data-only rule specifications, and judges them on untouched held-out
+data. Paper `strategy.selection_mode: all_proved` selects one best proven
+variant per independent family under one global risk book. A trader process
+uses one execution profile (`shares` or `options`) at a time; do not mix
+profiles in one process. The market calendar is America/New_York (NYSE regular
+session). New entries are rejected outside the regular session, orders are
+day-only, startup cancels working orders and flattens residuals, and positions
+are force-closed before the close.
 
 ## Safety boundary
 
-- `paper: true` and Alpaca's paper endpoint are the documented defaults.
-- Live endpoints are disabled unless a future, explicit configuration and
-  code review enables them. Do not set a live endpoint for this checkout.
+- Paper mode (`mode: paper`, `broker.paper: true`, `ALPACA_PAPER=true`) and
+  Alpaca's paper endpoint are the documented defaults.
+- Live mode is an explicit, separately reviewed configuration only: set
+  `mode: live`, `broker.paper: false`, `broker.allow_live: true`, and
+  `ALPACA_LIVE_ENABLE=true`; use `strategy.selection_mode: specific` with one
+  exact named validated/champion `strategy.variant_id`. Live mode pins that
+  edge and does not auto-switch. Keep live configuration, credentials, and
+  `ALPACA_AGENT_RUNTIME_ROOT` in a separate runtime scope from paper.
 - Keep API keys in `.env` or a host secret; never commit them. Use trading
   permissions only and disable withdrawals.
 - Research, recorder, trader, and dashboard state is isolated in named
   volumes. Runtime entries require a vehicle-local `validated` or `champion`
   edge record in the SQLite ledger; research cannot place orders or mutate
-  paper state.
+  broker state. A live preflight additionally requires the account to report
+  `pattern_day_trader=true`.
 
 The source and tests are the behavioural authority. [SETUP.md](SETUP.md) is
 the installation authority, [OPERATIONS.md](OPERATIONS.md) is the runbook, and
@@ -53,8 +60,8 @@ The lean deployment topology is:
 
 | Service | Responsibility | Durable state |
 | --- | --- | --- |
-| `recorder` | Public/paper Alpaca bars, quotes, and option snapshots | `runtime-data` |
-| `trader` | One paper decision loop in its configured execution profile; no overnight book | `runtime-data` |
+| `recorder` | Alpaca bars, quotes, and option snapshots (paper by default) | `runtime-data` |
+| `trader` | One intraday decision loop in its configured execution profile; no overnight book | `runtime-data` |
 | `research` | Scheduled replay, evidence, and reports | `runtime-data`, research volumes |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
@@ -67,7 +74,7 @@ snapshots), or an explicit normalized JSONL path from
 four isolated accounts per strategy, and up to seven worker processes. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
-status and the paper journal.
+status, latest re-verified passing edges, findings, and the execution journal.
 
 ## Quick start
 
@@ -85,16 +92,18 @@ chmod 600 .env
 
 Set `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER=true`, and the
 selected `ALPACA_DATA_FEED`/`ALPACA_OPTIONS_FEED` in `.env`. `check` is the
-authenticated paper preflight by default; use `check --offline` only for local
-configuration validation. Unit tests use fakes and do not need credentials.
-The deterministic rule champion is the default and LLM use is disabled by default;
-setting `llm.enabled: true` is an explicit, credentialed opt-in. The default
-stock feed is IEX. Long options remain subject to liquidity and contract
-checks. On a fresh ledger, `run` starts safely but will not submit entries:
-first collect an initial corpus, let the strategy factory pass its backtest, and
-then collect a strictly later unseen tail for shadow validation and automatic
-champion selection. This delay is an intentional evidence gate, not a startup
-error.
+authenticated preflight by default; `check --offline` validates local
+configuration only and is not a trading preflight. Unit tests use fakes and do
+not need credentials. The checked config enables the bounded research
+replacement adapter with model `gpt-5`; it reads optional provider credentials
+only from the separate `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Missing or invalid
+LLM output leaves a pending replacement and does not retire a family. Runtime
+decision LLM use remains disabled (`llm.enabled: false`). The default stock
+feed is IEX. Long options remain subject to liquidity and contract checks. On a
+fresh ledger, `run` starts safely but will not submit entries: first collect an
+initial corpus, let the strategy factory pass its backtest, and then collect a
+strictly later unseen tail for shadow validation and automatic champion
+selection. This delay is an intentional evidence gate, not a startup error.
 
 For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow
@@ -111,12 +120,13 @@ docker compose --profile research config
 docker compose build
 ```
 
-Treat a failing safety, session, paper-mode, or no-overnight test as a release
-blocker. Root discovery includes the deployment and research suites.
+Treat a failing safety, session, mode-boundary, or no-overnight test as a
+release blocker. Root discovery includes the deployment and research suites.
 
 ## What is deliberately not included
 
-There is no overnight strategy, withdrawal flow, unattended live deployment,
-multi-leg/naked option path, or assertion that any generated signal has positive
-expectancy. Any future live work requires a separate review of the provider
-guard, risk policy, session-close behaviour, tests, and operational controls.
+There is no overnight strategy, withdrawal flow, default unattended live
+deployment, multi-leg/naked option path, crypto path, or assertion that any
+generated signal has positive expectancy. Any live launch requires a separate
+reviewed config/runtime scope, provider guard, named edge, risk policy,
+session-close behaviour, tests, and operational controls.

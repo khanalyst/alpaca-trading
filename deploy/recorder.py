@@ -17,6 +17,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +36,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent.alpaca_provider import AlpacaProvider  # noqa: E402
+from agent.instruments import (  # noqa: E402
+    validate_equity_symbol,
+    validate_option_symbol,
+)
 
 
 FIELDS = (
@@ -162,6 +167,22 @@ def _point_in_time(value) -> bool:
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
+def _timestamp(value) -> datetime | None:
+    """Parse an aware timestamp without inventing missing point-in-time data."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None and value.utcoffset() is not None else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
 def _underlying_price(values) -> object:
     """Return the latest observed quote mid/last without inventing a price."""
     rows = sorted(values or (), key=lambda item: _iso(getattr(item, "timestamp", "")))
@@ -208,7 +229,8 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
     min_dte = int(risk.get("options_min_dte", 7) or 7)
     max_dte = int(risk.get("options_max_dte", 60) or 60)
     option_feed = _options_feed(config)
-    for underlying in symbols:
+    for raw_underlying in symbols:
+        underlying = validate_equity_symbol(raw_underlying)
         spot = _underlying_price(quotes.get(underlying) or quotes.get(str(underlying).upper()))
         candidates = _call_options(
             method, underlying, now=now, underlying_price=spot,
@@ -218,13 +240,25 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             if not isinstance(candidate, dict):
                 continue
             right = _option_right(candidate)
-            symbol = str(candidate.get("symbol") or "").strip().upper()
-            timestamp = candidate.get("timestamp") or candidate.get("quote_ts")
+            raw_symbol = str(candidate.get("symbol") or "").strip().upper()
             expiration = candidate.get("expiration") or candidate.get("expiration_date")
             strike = candidate.get("strike") or candidate.get("strike_price")
+            try:
+                symbol = validate_option_symbol(
+                    raw_symbol, underlying=underlying,
+                    expiration=expiration, strike=strike)
+                candidate_underlying = validate_equity_symbol(
+                    candidate.get("underlying") or
+                    candidate.get("underlying_symbol") or underlying)
+            except ValueError:
+                continue
+            if candidate_underlying != underlying:
+                continue
+            timestamp = candidate.get("timestamp") or candidate.get("quote_ts")
             multiplier = candidate.get("multiplier") or candidate.get("contract_size")
-            if (right not in selected or not symbol or timestamp is None or
-                    not _point_in_time(timestamp)):
+            parsed_timestamp = _timestamp(timestamp)
+            if (right not in selected or not symbol or parsed_timestamp is None or
+                    parsed_timestamp > now + timedelta(seconds=5)):
                 continue
             bid = _number(candidate.get("bid")); ask = _number(candidate.get("ask"))
             strike_number = _number(strike); multiplier_number = _number(multiplier)
@@ -238,6 +272,8 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                     dte is None or dte < min_dte or dte > max_dte or
                     bid is None or ask is None or bid < 0 or ask < bid):
                 continue
+            candidate = dict(candidate)
+            candidate["symbol"] = symbol
             selected[right].append(candidate)
         for right in selected:
             selected[right].sort(key=lambda item: _option_rank(item, spot))
@@ -264,7 +300,7 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                     "low": "", "close": "", "volume": _value(candidate.get("volume")),
                     "bid": _value(candidate.get("bid")), "ask": _value(candidate.get("ask")),
                     "last": _value(candidate.get("last")),
-                    "underlying": candidate.get("underlying") or candidate.get("underlying_symbol") or underlying,
+                    "underlying": underlying,
                     "expiration": _iso(candidate.get("expiration") or candidate.get("expiration_date")),
                     "strike": _value(candidate.get("strike") or candidate.get("strike_price")),
                     "right": right,
@@ -278,20 +314,29 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
 
 def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           *, feed: str | None = None, config: dict | None = None,
-          include_options: bool = False, option_limit: int = 5):
-    start = now - timedelta(minutes=3)
+          include_options: bool = False, option_limit: int = 5,
+          start: datetime | None = None):
+    start = start or now - timedelta(minutes=3)
+    if start.tzinfo is None or start.utcoffset() is None or start > now:
+        raise ValueError("recorder start must be an aware timestamp at or before now")
     # The provider owns environment/config precedence and canonicalization.
     # ``feed`` remains an explicit test seam; production callers leave it unset.
     feed = str(feed if feed is not None else
                getattr(provider, "data_feed", None) or _feed()).strip().lower() or "iex"
+    symbols = [validate_equity_symbol(symbol) for symbol in symbols]
     bars = _call_market_data(provider.bars, symbols, start=start, end=now,
                               feed=feed)
     quotes = _call_quotes(provider.quotes, symbols, start=start, end=now,
                           feed=feed)
     observed = now.isoformat()
-    for symbol, values in bars.items():
+    for raw_symbol, values in bars.items():
+        symbol = validate_equity_symbol(raw_symbol)
         for bar in values:
-            timestamp = bar.timestamp.isoformat()
+            timestamp = _iso(getattr(bar, "timestamp", None))
+            if not _point_in_time(timestamp):
+                raise RuntimeError(f"bar {symbol!r} has no point-in-time timestamp")
+            if _timestamp(timestamp) > now + timedelta(seconds=5):
+                raise RuntimeError(f"bar {symbol!r} timestamp is in the future")
             yield {
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
@@ -302,9 +347,14 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
                 "close": _value(bar.close), "volume": _value(bar.volume),
                 "bid": "", "ask": "", "last": "",
             }
-    for symbol, values in quotes.items():
+    for raw_symbol, values in quotes.items():
+        symbol = validate_equity_symbol(raw_symbol)
         for quote in values:
-            timestamp = _value(quote.timestamp)
+            timestamp = _iso(getattr(quote, "timestamp", None))
+            if not _point_in_time(timestamp):
+                continue
+            if _timestamp(timestamp) > now + timedelta(seconds=5):
+                raise RuntimeError(f"quote {symbol!r} timestamp is in the future")
             yield {
                 "event_key": _event_key("quote", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
@@ -320,24 +370,103 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             limit=max(1, min(5, int(option_limit))))
 
 
-def _existing_keys(output: Path) -> set[str]:
+def _validate_dataset_row(row: dict) -> tuple[str, str, datetime]:
+    event = str(row.get("event_type") or "").strip().lower()
+    timestamp = _timestamp(row.get("timestamp") or row.get("as_of"))
+    if timestamp is None:
+        raise RuntimeError("recorder dataset row has an invalid timestamp")
+    try:
+        if event in {"bar", "bar_1m", "quote"}:
+            symbol = validate_equity_symbol(row.get("symbol"))
+        elif event in {"option", "option_snapshot"}:
+            underlying = validate_equity_symbol(row.get("underlying"))
+            symbol = validate_option_symbol(
+                row.get("contract") or row.get("symbol"),
+                underlying=underlying, expiration=row.get("expiration"),
+                strike=row.get("strike"))
+        else:
+            raise ValueError(f"unsupported recorder event_type {event!r}")
+    except ValueError as exc:
+        raise RuntimeError(f"invalid recorder dataset row: {exc}") from exc
+    return event, symbol, timestamp
+
+
+def _existing_state(output: Path) -> tuple[set[str], datetime | None, dict[str, datetime]]:
     if not output.exists() or output.stat().st_size == 0:
-        return set()
+        return set(), None, {}
     keys: set[str] = set()
+    latest: datetime | None = None
+    latest_bars: dict[str, datetime] = {}
     try:
         with output.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
+            fields = set(reader.fieldnames or ())
+            required = {"event_key", "event_type", "symbol", "timestamp"}
+            if not required.issubset(fields):
+                raise RuntimeError(
+                    f"recorder dataset has invalid header; missing {sorted(required - fields)}")
             for row in reader:
+                if None in row:
+                    raise RuntimeError("recorder dataset contains a malformed CSV row")
                 key = str(row.get("event_key") or "").strip()
                 if key:
                     keys.add(key)
-                elif row.get("event_type") and row.get("symbol"):
-                    # Migrate legacy rows in-place without duplicating them.
-                    keys.add(_event_key(row["event_type"], row["symbol"],
-                                        row.get("timestamp", "")))
-    except (OSError, csv.Error):
-        return set()
-    return keys
+                else:
+                    raise RuntimeError("recorder dataset row has no event_key")
+                event, symbol, parsed = _validate_dataset_row(row)
+                if latest is None or parsed > latest:
+                    latest = parsed
+                if event in {"bar", "bar_1m"} and (
+                        symbol not in latest_bars or parsed > latest_bars[symbol]):
+                    latest_bars[symbol] = parsed
+    except (OSError, csv.Error) as exc:
+        raise RuntimeError(f"cannot read recorder dataset {output}: {exc}") from exc
+    return keys, latest, latest_bars
+
+
+def _existing_keys(output: Path) -> set[str]:
+    """Compatibility wrapper used by tests and operational inspection."""
+    return _existing_state(output)[0]
+
+
+def _regular_session_gap(previous: datetime, current: datetime) -> bool:
+    zone = ZoneInfo("America/New_York")
+    before = previous.astimezone(zone)
+    after = current.astimezone(zone)
+    if before.date() != after.date() or before.weekday() >= 5:
+        return False
+    open_minute = 9 * 60 + 30
+    close_minute = 16 * 60
+    before_minute = before.hour * 60 + before.minute
+    after_minute = after.hour * 60 + after.minute
+    return (open_minute <= before_minute <= close_minute and
+            open_minute <= after_minute <= close_minute and
+            current - previous > timedelta(minutes=5))
+
+
+def _verify_bar_continuity(rows: list[dict], latest_bars: dict[str, datetime],
+                           now: datetime, symbols: list[str]) -> None:
+    by_symbol: dict[str, list[datetime]] = {symbol: [] for symbol in symbols}
+    for row in rows:
+        if row.get("event_type") != "bar_1m":
+            continue
+        symbol = validate_equity_symbol(row.get("symbol"))
+        parsed = _timestamp(row.get("timestamp"))
+        if parsed is not None:
+            by_symbol.setdefault(symbol, []).append(parsed)
+    for symbol in symbols:
+        previous = latest_bars.get(symbol)
+        if previous is None:
+            continue
+        fresh = sorted({item for item in by_symbol.get(symbol, ()) if item > previous})
+        if not fresh:
+            if _regular_session_gap(previous, now):
+                raise RuntimeError(f"recorder bar continuity gap for {symbol}")
+            continue
+        for current in fresh:
+            if _regular_session_gap(previous, current):
+                raise RuntimeError(f"recorder bar continuity gap for {symbol}")
+            previous = current
 
 
 def _migrate_header(output: Path) -> None:
@@ -349,12 +478,20 @@ def _migrate_header(output: Path) -> None:
             reader = csv.DictReader(handle)
             if "event_key" in (reader.fieldnames or []):
                 return
+            required = {"event_type", "symbol", "timestamp"}
+            fields = set(reader.fieldnames or ())
+            if not required.issubset(fields):
+                raise RuntimeError(
+                    f"legacy recorder dataset has invalid header; missing {sorted(required - fields)}")
             rows = list(reader)
-    except (OSError, csv.Error):
-        return
+            if any(None in row for row in rows):
+                raise RuntimeError("legacy recorder dataset contains a malformed CSV row")
+    except (OSError, csv.Error) as exc:
+        raise RuntimeError(f"cannot migrate recorder dataset {output}: {exc}") from exc
     migrated = []
     for row in rows:
         row = {str(key): value for key, value in row.items() if key is not None}
+        _validate_dataset_row(row)
         row["event_key"] = _event_key(row.get("event_type", ""),
                                        row.get("symbol", ""),
                                        row.get("timestamp", ""))
@@ -372,20 +509,30 @@ def _migrate_header(output: Path) -> None:
 def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
                 *, feed: str | None = None, config: dict | None = None,
                 include_options: bool | None = None, option_limit: int = 5) -> int:
+    symbols = [validate_equity_symbol(symbol) for symbol in symbols]
+    if not symbols:
+        raise ValueError("at least one US equity symbol is required")
     now = datetime.now(timezone.utc)
     if include_options is None:
         classes = (config or {}).get("universe", {}).get("asset_classes", [])
         include_options = any(str(value).lower() in {"us_option", "option"}
                               for value in classes)
-    rows = list(_rows(provider, symbols, now, feed=feed, config=config,
-                      include_options=bool(include_options),
-                      option_limit=option_limit))
-    if not rows:
-        raise RuntimeError("Alpaca returned no bars or quotes")
     output.parent.mkdir(parents=True, exist_ok=True)
     _migrate_header(output)
+    seen, watermark, latest_bars = _existing_state(output)
+    if watermark is not None and watermark > now + timedelta(seconds=5):
+        raise RuntimeError("recorder dataset watermark is in the future")
+    # Resume from durable data rather than a fixed three-minute lookback. The
+    # one-minute overlap makes retries safe while the event key removes dupes.
+    start = (watermark - timedelta(minutes=1)
+             if watermark is not None else now - timedelta(minutes=3))
+    rows = list(_rows(provider, symbols, now, feed=feed, config=config,
+                      include_options=bool(include_options),
+                      option_limit=option_limit, start=start))
+    if not rows:
+        raise RuntimeError("Alpaca returned no point-in-time bars or quotes")
+    _verify_bar_continuity(rows, latest_bars, now, symbols)
     new_file = not output.exists() or output.stat().st_size == 0
-    seen = _existing_keys(output)
     unique_rows = []
     for row in rows:
         key = row["event_key"]

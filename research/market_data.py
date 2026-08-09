@@ -16,6 +16,13 @@ import math
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
+from agent.instruments import (
+    reject_crypto,
+    validate_asset_class,
+    validate_equity_symbol,
+    validate_option_symbol,
+)
+
 
 NEW_YORK = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -37,10 +44,17 @@ def parse_timestamp(value: Any, *, name: str = "timestamp") -> datetime:
     Naive timestamps are rejected.  Assuming a timezone for an ambiguous
     provider timestamp is a silent session-boundary/look-ahead bug.
     """
+    if isinstance(value, bool):
+        raise NormalizationError(f"invalid {name}: {value!r}")
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, (int, float, Decimal)):
-        number = float(value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise NormalizationError(f"invalid {name}: {value!r}") from exc
+        if not math.isfinite(number):
+            raise NormalizationError(f"invalid {name}: {value!r}")
         # Alpaca commonly emits nanoseconds while CSV exports use seconds or
         # milliseconds.  Magnitude is unambiguous for market dates.
         if abs(number) >= 1e17:
@@ -49,7 +63,10 @@ def parse_timestamp(value: Any, *, name: str = "timestamp") -> datetime:
             number /= 1e6
         elif abs(number) >= 1e11:
             number /= 1e3
-        parsed = datetime.fromtimestamp(number, UTC)
+        try:
+            parsed = datetime.fromtimestamp(number, UTC)
+        except (OSError, OverflowError, ValueError) as exc:
+            raise NormalizationError(f"invalid {name}: {value!r}") from exc
     elif isinstance(value, str):
         raw = value.strip()
         if not raw:
@@ -84,6 +101,25 @@ def _field(payload: Mapping[str, Any], *names: str, default: Any = None) -> Any:
         if name in payload and payload[name] is not None:
             return payload[name]
     return default
+
+
+def _scoped_symbol(payload: Mapping[str, Any], value: Any, *, option: bool = False,
+                   underlying: Any = None, expiration: Any = None,
+                   strike: Any = None) -> str:
+    """Enforce the repository-wide US equity/listed-option boundary."""
+    try:
+        reject_crypto(payload, "market event")
+        asset_class = _field(payload, "asset_class", "class", "asset_type")
+        if asset_class is not None:
+            expected = "us_option" if option else "us_equity"
+            if validate_asset_class(asset_class) != expected:
+                raise ValueError(f"asset_class must be {expected}")
+        return (validate_option_symbol(
+                    value, underlying=underlying,
+                    expiration=expiration, strike=strike) if option
+                else validate_equity_symbol(value))
+    except ValueError as exc:
+        raise NormalizationError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -162,6 +198,24 @@ class UnderlyingBar:
     interval_seconds: int = 60
     atr: float | None = None
 
+    def __post_init__(self) -> None:
+        try:
+            validate_equity_symbol(self.symbol)
+        except ValueError as exc:
+            raise NormalizationError(str(exc)) from exc
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise NormalizationError("bar timestamp must include a timezone")
+        values = (self.open, self.high, self.low, self.close, self.volume)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise NormalizationError("bar values must be finite")
+        if (self.high < max(self.open, self.close) or
+                self.low > min(self.open, self.close) or self.high < self.low):
+            raise NormalizationError("OHLC bounds are inconsistent")
+        if self.volume < 0:
+            raise NormalizationError("volume cannot be negative")
+        if self.interval_seconds <= 0:
+            raise NormalizationError("interval_seconds must be positive")
+
     @property
     def end(self) -> datetime:
         return self.timestamp + timedelta(seconds=self.interval_seconds)
@@ -195,61 +249,6 @@ class UnderlyingBar:
         return self.identity.timezone
 
 
-def atr_series(bars: Iterable[Any], period: int = 14) -> list[float | None]:
-    """Compute a no-lookahead Wilder ATR series for normalized OHLCV bars.
-
-    Each result uses true ranges through that bar's completed close and the
-    immediately preceding close.  Values before a complete period are None;
-    this avoids partial-window volatility estimates at session start.
-    """
-    period = int(period)
-    if period <= 0:
-        raise ValueError("ATR period must be positive")
-    rows = list(bars or ())
-    output: list[float | None] = [None] * len(rows)
-    ranges: list[float] = []
-    previous_close: float | None = None
-    current_atr: float | None = None
-    for index, row in enumerate(rows):
-        def value(name):
-            return getattr(row, name, None) if not isinstance(row, Mapping) else row.get(name)
-        try:
-            high = float(value("high")); low = float(value("low")); close = float(value("close"))
-        except (TypeError, ValueError):
-            ranges.append(float("nan")); previous_close = None; continue
-        if not all(math.isfinite(item) for item in (high, low, close)) or high < low:
-            ranges.append(float("nan")); previous_close = close; continue
-        tr = high - low if previous_close is None else max(
-            high - low, abs(high - previous_close), abs(low - previous_close))
-        ranges.append(tr)
-        window = ranges[index + 1 - period:index + 1]
-        if index + 1 >= period and all(math.isfinite(item) for item in window):
-            current_atr = (sum(window) / period if current_atr is None else
-                           ((current_atr * (period - 1)) + tr) / period)
-            output[index] = current_atr
-        previous_close = close
-    return output
-
-
-def attach_atr(bars: Iterable[Any], period: int = 14) -> list[Any]:
-    """Attach ATR values while retaining immutable normalized records."""
-    from dataclasses import replace
-    rows = list(bars or ())
-    values = atr_series(rows, period=period)
-    output = []
-    for row, atr in zip(rows, values):
-        if isinstance(row, UnderlyingBar):
-            output.append(replace(row, atr=atr))
-        elif isinstance(row, Mapping):
-            item = dict(row)
-            if atr is not None:
-                item["atr"] = atr; item["atr_period"] = int(period)
-            output.append(item)
-        else:
-            output.append(row)
-    return output
-
-
 @dataclass(frozen=True)
 class QuoteSnapshot:
     symbol: str
@@ -261,8 +260,19 @@ class QuoteSnapshot:
     identity: EventIdentity
 
     def __post_init__(self) -> None:
+        try:
+            validate_equity_symbol(self.symbol)
+        except ValueError as exc:
+            raise NormalizationError(str(exc)) from exc
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise NormalizationError("quote timestamp must include a timezone")
+        if not all(math.isfinite(float(value)) for value in (self.bid, self.ask)):
+            raise NormalizationError("quote prices must be finite")
         if self.bid <= 0 or self.ask <= 0 or self.ask < self.bid:
             raise NormalizationError("quote must have 0 < bid <= ask")
+        for name, value in (("bid_size", self.bid_size), ("ask_size", self.ask_size)):
+            if value is not None and (not math.isfinite(float(value)) or value < 0):
+                raise NormalizationError(f"{name} must be finite and non-negative")
 
     @property
     def session_date(self) -> date:
@@ -298,10 +308,19 @@ class OptionContract:
     feed: str
 
     def __post_init__(self) -> None:
+        try:
+            validate_equity_symbol(self.underlying)
+            validate_option_symbol(
+                self.symbol, underlying=self.underlying,
+                expiration=self.expiration, strike=self.strike)
+        except ValueError as exc:
+            raise NormalizationError(str(exc)) from exc
         if self.right.lower() not in {"call", "put", "c", "p"}:
             raise NormalizationError("option right must be call or put")
         if self.multiplier <= 0 or self.strike <= 0:
             raise NormalizationError("option multiplier and strike must be positive")
+        if self.currency.upper() != "USD":
+            raise NormalizationError("option currency must be USD")
 
 
 @dataclass(frozen=True)
@@ -315,8 +334,19 @@ class OptionSnapshot:
     identity: EventIdentity
 
     def __post_init__(self) -> None:
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise NormalizationError("option timestamp must include a timezone")
+        numeric = [self.bid, self.ask]
+        numeric.extend(value for value in (self.last, self.underlying_price)
+                       if value is not None)
+        if not all(math.isfinite(float(value)) for value in numeric):
+            raise NormalizationError("option prices must be finite")
         if self.bid < 0 or self.ask < 0 or self.ask < self.bid:
             raise NormalizationError("option quote must have 0 <= bid <= ask")
+        if self.last is not None and self.last < 0:
+            raise NormalizationError("option last must be non-negative")
+        if self.underlying_price is not None and self.underlying_price <= 0:
+            raise NormalizationError("underlying price must be positive")
 
     @property
     def session_date(self) -> date:
@@ -353,7 +383,8 @@ def normalize_underlying_bar(payload: Mapping[str, Any], *, provider: str | None
     if volume < 0:
         raise NormalizationError("volume cannot be negative")
     return UnderlyingBar(
-        symbol=str(_required(_field(payload, "symbol", "S"), "symbol")),
+        symbol=_scoped_symbol(
+            payload, _required(_field(payload, "symbol", "S"), "symbol")),
         timestamp=ts,
         **values,
         volume=volume,
@@ -366,7 +397,9 @@ def normalize_quote(payload: Mapping[str, Any], *, provider: str | None = None,
                     feed: str | None = None) -> QuoteSnapshot:
     ts = parse_timestamp(_field(payload, "timestamp", "ts", "t", "time"))
     return QuoteSnapshot(
-        symbol=str(_required(_field(payload, "symbol", "S"), "symbol")), timestamp=ts,
+        symbol=_scoped_symbol(
+            payload, _required(_field(payload, "symbol", "S"), "symbol")),
+        timestamp=ts,
         bid=_number(_field(payload, "bid", "bp", "bid_price"), "bid"),
         ask=_number(_field(payload, "ask", "ap", "ask_price"), "ask"),
         bid_size=None if _field(payload, "bid_size", "bs") is None else _number(_field(payload, "bid_size", "bs"), "bid_size"),
@@ -383,13 +416,25 @@ def normalize_option_contract(payload: Mapping[str, Any], *, provider: str | Non
     except ValueError as exc:
         raise NormalizationError("invalid option expiration") from exc
     right = str(_required(_field(payload, "right", "type", "option_type"), "right")).lower()
+    underlying = _scoped_symbol(
+        payload,
+        _required(_field(payload, "underlying", "underlying_symbol"), "underlying"))
+    symbol = _scoped_symbol(
+        payload,
+        _required(_field(payload, "symbol", "contract", "option_symbol"), "symbol"),
+        option=True, underlying=underlying, expiration=expiration,
+        strike=_field(payload, "strike", "strike_price"))
+    try:
+        multiplier = int(_field(payload, "multiplier", default=100))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise NormalizationError("option multiplier must be an integer") from exc
     return OptionContract(
-        symbol=str(_required(_field(payload, "symbol", "contract", "option_symbol"), "symbol")),
-        underlying=str(_required(_field(payload, "underlying", "underlying_symbol"), "underlying")),
+        symbol=symbol,
+        underlying=underlying,
         expiration=expiration,
         strike=_number(_field(payload, "strike", "strike_price"), "strike", positive=True),
         right={"c": "call", "p": "put"}.get(right, right),
-        multiplier=int(_field(payload, "multiplier", default=100)),
+        multiplier=multiplier,
         currency=str(_field(payload, "currency", default="USD")),
         provider=str(_required(provider or _field(payload, "provider"), "provider")),
         feed=str(_required(feed or _field(payload, "feed", "feed_id"), "feed")),
@@ -399,7 +444,25 @@ def normalize_option_contract(payload: Mapping[str, Any], *, provider: str | Non
 def normalize_option_snapshot(payload: Mapping[str, Any], contract: OptionContract | None = None,
                               *, provider: str | None = None, feed: str | None = None) -> OptionSnapshot:
     ts = parse_timestamp(_field(payload, "timestamp", "ts", "t", "time"))
-    contract = contract or normalize_option_contract(payload, provider=provider, feed=feed)
+    if contract is None:
+        contract = normalize_option_contract(payload, provider=provider, feed=feed)
+    else:
+        # A supplied contract must not let the payload bypass asset/symbol
+        # scope checks. Optional identity fields, when present, must agree.
+        try:
+            reject_crypto(payload, "option snapshot")
+            asset_class = _field(payload, "asset_class", "class", "asset_type")
+            if asset_class is not None and validate_asset_class(asset_class) != "us_option":
+                raise ValueError("asset_class must be us_option")
+            raw_underlying = _field(payload, "underlying", "underlying_symbol")
+            if raw_underlying is not None and validate_equity_symbol(raw_underlying) != contract.underlying:
+                raise ValueError("option snapshot underlying does not match contract")
+            raw_symbol = _field(payload, "symbol", "contract", "option_symbol")
+            if (raw_symbol is not None and
+                    validate_option_symbol(raw_symbol, underlying=contract.underlying) != contract.symbol):
+                raise ValueError("option snapshot symbol does not match contract")
+        except ValueError as exc:
+            raise NormalizationError(str(exc)) from exc
     return OptionSnapshot(
         contract=contract,
         timestamp=ts,
@@ -416,5 +479,5 @@ __all__ = [
     "QuoteSnapshot", "UnderlyingBar", "normalize_option_contract",
     "normalize_option_snapshot", "normalize_quote",
     "normalize_underlying_bar",
-    "parse_timestamp", "atr_series", "attach_atr", "NEW_YORK", "UTC",
+    "parse_timestamp", "NEW_YORK", "UTC",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+import hashlib
 import json
 import mimetypes
 import os
@@ -22,6 +23,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from deploy import health, load_config
+from research.gates import verify_gate_envelope
 
 
 SAFE_STATE_FIELDS = (
@@ -35,6 +37,12 @@ SAFE_TRADE_FIELDS = (
 )
 _CACHE: dict[str, tuple[float, object]] = {}
 _CACHE_LOCK = threading.Lock()
+
+
+def _content_hash(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _cached(key: str, ttl_seconds: float, loader):
@@ -109,20 +117,69 @@ def _edge_status(path: Path) -> dict:
     """
     if not path.is_file():
         return {"available": False, "status": "not_initialized",
-                "candidates": 0, "by_status": {}, "by_vehicle": {}}
+                "candidates": 0, "by_status": {}, "by_vehicle": {},
+                "proved_edges": []}
     try:
         factory = {"hypotheses": 0, "accounts": 0, "cycles": 0}
         with closing(_ro_connect(path)) as connection:
             tables = _tables(connection)
             if not {"candidates", "candidate_state"}.issubset(tables):
                 return {"available": False, "status": "invalid_ledger",
-                        "candidates": 0, "by_status": {}, "by_vehicle": {}}
+                        "candidates": 0, "by_status": {}, "by_vehicle": {},
+                        "proved_edges": []}
             rows = connection.execute(
                 """SELECT c.vehicle, s.status, COUNT(*) AS count
                    FROM candidates c JOIN candidate_state s
                      ON s.candidate_id=c.candidate_id
                    GROUP BY c.vehicle, s.status
                    ORDER BY c.vehicle, s.status""").fetchall()
+            proved_candidates = connection.execute(
+                """SELECT c.candidate_id, c.variant_id, c.strategy_id,
+                          c.vehicle, s.status
+                   FROM candidates c JOIN candidate_state s
+                     ON s.candidate_id=c.candidate_id
+                   WHERE s.status IN ('validated','champion')
+                   ORDER BY CASE s.status WHEN 'champion' THEN 0 ELSE 1 END,
+                            c.vehicle, c.strategy_id, c.variant_id
+                   LIMIT 100""").fetchall()
+            proved = []
+            if {"runs", "evidence"}.issubset(tables):
+                for candidate in proved_candidates:
+                    run = connection.execute(
+                        """SELECT run_id, lane FROM runs
+                           WHERE candidate_id=?
+                           ORDER BY created_at DESC, run_id DESC LIMIT 1""",
+                        (candidate["candidate_id"],)).fetchone()
+                    if run is None or run["lane"] != "shadow":
+                        continue
+                    evidence = connection.execute(
+                        """SELECT payload_json, evidence_hash FROM evidence
+                           WHERE candidate_id=? AND run_id=?
+                             AND kind='verified_gate'
+                           ORDER BY created_at DESC, evidence_id DESC LIMIT 1""",
+                        (candidate["candidate_id"], run["run_id"])).fetchone()
+                    if evidence is None:
+                        continue
+                    try:
+                        payload = json.loads(evidence["payload_json"])
+                        gate = payload["gate"]
+                        valid = bool(
+                            evidence["evidence_hash"] == _content_hash(payload) and
+                            payload.get("gate_hash") == gate.get("content_hash") and
+                            gate.get("passes") is True and
+                            verify_gate_envelope(gate))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        valid = False
+                    if not valid:
+                        continue
+                    statistics = gate.get("statistics") or {}
+                    try:
+                        confidence = 1.0 - float(statistics.get("q_value", 1.0))
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    proved.append({**dict(candidate), "run_id": run["run_id"],
+                                   "gate_hash": gate["content_hash"],
+                                   "confidence": round(confidence, 6)})
             if {"factory_hypotheses", "factory_accounts", "factory_cycles"}.issubset(tables):
                 factory = {
                     "hypotheses": int(connection.execute(
@@ -143,10 +200,12 @@ def _edge_status(path: Path) -> dict:
         return {"available": True, "status": "ready",
                 "candidates": sum(by_status.values()),
                 "by_status": by_status, "by_vehicle": by_vehicle,
+                "proved_edges": [dict(row) for row in proved],
                 "factory": factory}
     except (OSError, sqlite3.Error, ValueError):
         return {"available": False, "status": "unreadable",
-                "candidates": 0, "by_status": {}, "by_vehicle": {}}
+                "candidates": 0, "by_status": {}, "by_vehicle": {},
+                "proved_edges": []}
 
 
 def _reports(root: Path) -> list[dict]:
@@ -177,7 +236,8 @@ def _safe_heartbeat(path: Path) -> dict:
         "last_exit_code", "started_ts", "completed_ts", "job_id",
         "run_date", "timeout_seconds", "deadline_ts",
         "structured_failures", "stdout_chars", "stderr_chars",
-        "stdout_truncated", "stderr_truncated",
+        "stdout_truncated", "stderr_truncated", "cycle_status",
+        "research_cycle",
     }
     return {key: value for key, value in raw.items() if key in allowed}
 
@@ -278,9 +338,10 @@ function table(parent,rows,cols){const t=el('table'),h=el('tr');cols.forEach(c=>
 async function showReport(path){const r=await fetch('/api/report?path='+encodeURIComponent(path));const j=await r.json();const p=card(path,true);p.append(el('pre',j.text||j.error||'unavailable'));p.scrollIntoView({behavior:'smooth'})}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();cards.replaceChildren();
  let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
- c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
- c=card('Paper journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
- c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);c.append(el('p',d.research.note||'No research status.','muted'));
+ c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
+ c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
+ c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);c.append(el('p',d.research.note||'No research status.','muted'));
+ c=card('Proved edges',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}

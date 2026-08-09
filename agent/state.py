@@ -1,4 +1,4 @@
-"""Small paper-runtime state and append-only operational journal."""
+"""Small mode-scoped runtime state and append-only operational journal."""
 
 from __future__ import annotations
 
@@ -9,10 +9,9 @@ import os
 import sqlite3
 import tempfile
 import time
-import uuid
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 RUNTIME_BASE = Path(os.getenv("ALPACA_AGENT_RUNTIME_ROOT") or
                     Path(__file__).resolve().parent.parent / "runtime")
@@ -35,7 +34,6 @@ DEFAULT = {
     "runtime_mode": None,
     "account_fingerprint": None,
     "active_trades": {},
-    "recent_setups": {},
     "protection": {},
     "opened_at": {},
     "kill_reason": None,
@@ -48,7 +46,11 @@ DEFAULT = {
 
 
 class RuntimeIdentityError(RuntimeError):
-    """Runtime files are not scoped to the requested paper account."""
+    """Runtime files are not scoped to the requested mode/account."""
+
+
+class StateCorruptionError(RuntimeError):
+    """The durable runtime state exists but cannot be trusted."""
 
 
 class JournalNotReady(RuntimeError):
@@ -80,61 +82,62 @@ def _set_paths(runtime: Path, scope: str) -> Path:
 
 
 def configure_runtime(mode: str, base: Path | None = None) -> Path:
-    if mode not in {"paper", "test", "_unconfigured"}:
-        raise ValueError("runtime mode must be paper, test, or _unconfigured")
+    if mode not in {"paper", "live", "test", "_unconfigured"}:
+        raise ValueError("runtime mode must be paper, live, test, or _unconfigured")
     root = Path(base) if base is not None else RUNTIME_BASE
     return _set_paths(root / mode, mode)
 
 
 def account_fingerprint(mode: str, api_key: str) -> str:
-    if mode != "paper" or not isinstance(api_key, str) or not api_key:
-        raise RuntimeIdentityError("paper mode and API key are required")
-    digest = hashlib.sha256(f"alpaca-agent\0paper\0{api_key}".encode()).hexdigest()[:20]
-    return f"alpaca-paper-{digest}"
+    if mode not in {"paper", "live"} or not isinstance(api_key, str) or not api_key:
+        raise RuntimeIdentityError("paper/live mode and API key are required")
+    digest = hashlib.sha256(f"alpaca-agent\0{mode}\0{api_key}".encode()).hexdigest()[:20]
+    return f"alpaca-{mode}-{digest}"
 
 
 def bind_account_identity(fingerprint: str) -> dict:
-    """Bind this runtime directory to one paper account identity.
+    """Bind this mode-specific runtime directory to one account identity.
 
     A state directory must never silently change accounts.  The fingerprint is
     intentionally non-secret and may be displayed by the read-only dashboard.
     """
-    if not isinstance(fingerprint, str) or not fingerprint:
-        raise RuntimeIdentityError("a paper-account fingerprint is required")
-    value = load_state()
-    existing = value.get("account_fingerprint")
-    if existing and existing != fingerprint:
-        raise RuntimeIdentityError("runtime state belongs to a different paper account")
-    value["account_fingerprint"] = fingerprint
-    value["runtime_mode"] = "paper"
-    return save_state(value)
+    mode = "live" if str(fingerprint).startswith("alpaca-live-") else (
+        "paper" if str(fingerprint).startswith("alpaca-paper-") else None)
+    if mode is None:
+        raise RuntimeIdentityError("a paper/live account fingerprint is required")
+    if RUNTIME_SCOPE != mode:
+        raise RuntimeIdentityError("account fingerprint does not match runtime mode")
 
+    def bind(value: dict) -> dict:
+        existing = value.get("account_fingerprint")
+        if existing and existing != fingerprint:
+            raise RuntimeIdentityError(
+                f"runtime state belongs to a different {mode} account")
+        value["account_fingerprint"] = fingerprint
+        value["runtime_mode"] = mode
+        return value
 
-def bind_runtime_identity(mode: str, api_key: str, account_id: str | None = None) -> str:
-    """Bind a paper runtime using provider credentials and optional account id."""
-    if mode != "paper":
-        raise RuntimeIdentityError("only paper runtime identity is supported")
-    material = f"{api_key}\0{account_id}" if account_id else api_key
-    fingerprint = account_fingerprint(mode, material)
-    bind_account_identity(fingerprint)
-    return fingerprint
+    return update_state(bind)
 
 
 def _validated(data: Mapping[str, Any]) -> dict:
     # Drop fields from older state formats instead of propagating them into
-    # the paper control file.
+    # the mode-scoped control file.
     value = deepcopy(DEFAULT)
     value.update({key: data[key] for key in DEFAULT if key in data})
     if value.get("state") not in {RUNNING, PAUSED, DAY_STOPPED, KILLED}:
         raise ValueError("invalid state")
-    if value.get("runtime_mode") not in {None, "paper", "test"}:
-        raise ValueError("runtime_mode must be paper or test")
+    if value.get("runtime_mode") not in {None, "paper", "live", "test"}:
+        raise ValueError("runtime_mode must be paper, live, or test")
     fingerprint = value.get("account_fingerprint")
     if fingerprint is not None and (not isinstance(fingerprint, str)
-                                    or not fingerprint.startswith("alpaca-paper-")
+                                    or not fingerprint.startswith(("alpaca-paper-", "alpaca-live-"))
                                     or len(fingerprint) > 80):
         raise ValueError("account_fingerprint is invalid")
-    for key in ("active_trades", "recent_setups", "protection", "opened_at",
+    if (value.get("runtime_mode") in {"paper", "live"} and fingerprint and
+            not fingerprint.startswith(f"alpaca-{value['runtime_mode']}-")):
+        raise ValueError("account_fingerprint does not match runtime_mode")
+    for key in ("active_trades", "protection", "opened_at",
                 "orders", "risk_day", "preflight"):
         if not isinstance(value.get(key), dict):
             raise ValueError(f"{key} must be an object")
@@ -159,9 +162,16 @@ def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
 def _read(path: Path, fallback: Mapping[str, Any]) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        return _validated(value) if isinstance(value, Mapping) else deepcopy(fallback)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except FileNotFoundError:
         return deepcopy(fallback)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateCorruptionError(f"runtime state is unreadable: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise StateCorruptionError("runtime state must be a JSON object")
+    try:
+        return _validated(value)
+    except ValueError as exc:
+        raise StateCorruptionError(f"runtime state is invalid: {exc}") from exc
 
 
 def load_state() -> dict:
@@ -181,6 +191,35 @@ def save_state(value: Mapping[str, Any]) -> dict:
         finally:
             lock.close()
     return result
+
+
+def update_state(update: Mapping[str, Any] | Callable[[dict], Mapping[str, Any] | None]) -> dict:
+    """Lock one complete state read-modify-write transaction.
+
+    Callers performing safety-sensitive mutations should use this helper so
+    another process cannot replace fields between their read and atomic write.
+    """
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = STATE_LOCK_FILE.open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        current = _read(STATE_FILE, DEFAULT)
+        if callable(update):
+            working = deepcopy(current)
+            changed = update(working)
+            candidate = working if changed is None else changed
+        else:
+            candidate = deepcopy(current)
+            candidate.update({key: value for key, value in update.items()
+                              if key in DEFAULT})
+        result = _validated(candidate)
+        _atomic_write(STATE_FILE, result)
+        return result
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
 
 
 _JOURNAL_TABLES = {
@@ -264,7 +303,7 @@ def initialize_journal() -> Path:
                        ("runtime_schema", "2"))
             db.commit()
     except (OSError, sqlite3.Error) as exc:
-        raise JournalNotReady(f"paper journal unavailable: {exc}") from exc
+        raise JournalNotReady(f"{RUNTIME_SCOPE} journal unavailable: {exc}") from exc
     return JOURNAL_FILE
 
 
@@ -286,10 +325,13 @@ def ensure_ready() -> None:
     initialize_journal()
     if not STATE_FILE.exists():
         initial = deepcopy(DEFAULT)
-        initial["runtime_mode"] = "paper" if RUNTIME_SCOPE == "paper" else None
+        initial["runtime_mode"] = RUNTIME_SCOPE if RUNTIME_SCOPE in {
+            "paper", "live", "test"} else None
         save_state(initial)
+    else:
+        load_state()
     if not journal_ready():
-        raise JournalNotReady("paper journal schema is incomplete")
+        raise JournalNotReady(f"{RUNTIME_SCOPE} journal schema is incomplete")
 
 
 def check_journal() -> None:
@@ -320,12 +362,15 @@ def _journal_insert(table: str, payload: Mapping[str, Any]) -> None:
 
 
 def commit(value: Mapping[str, Any], transition=None, kill: str | None = None) -> dict:
-    current = load_state(); current.update({k: value[k] for k in DEFAULT if k in value})
-    if kill is not None:
-        current["state"] = KILLED; current["kill_reason"] = kill
-    elif transition and current.get("state") == transition[0]:
-        current["state"] = transition[1]
-    result = save_state(current)
+    def mutate(current: dict) -> dict:
+        current.update({k: value[k] for k in DEFAULT if k in value})
+        if kill is not None:
+            current["state"] = KILLED; current["kill_reason"] = kill
+        elif transition and current.get("state") == transition[0]:
+            current["state"] = transition[1]
+        return current
+
+    result = update_state(mutate)
     if isinstance(value, dict):
         value.clear(); value.update(result)
     return result
@@ -356,7 +401,7 @@ def write_heartbeat(status: str, **detail) -> dict:
     if status not in {"starting", "running", "degraded", "pausing", "paused", "killed", "stopped"}:
         raise ValueError(f"unsupported heartbeat status {status!r}")
     payload = {"schema": 1, "status": status, "updated_ts": time.time(),
-               "pid": os.getpid(), "runtime_mode": RUNTIME_SCOPE if RUNTIME_SCOPE == "paper" else None,
+               "pid": os.getpid(), "runtime_mode": RUNTIME_SCOPE if RUNTIME_SCOPE in {"paper", "live"} else None,
                **detail}
     _atomic_write(HEARTBEAT_FILE, payload)
     try: append_operational_history(operational_history_path(HEARTBEAT_FILE), payload)
@@ -378,7 +423,7 @@ def log_event(kind: str, payload: str, **detail) -> None:
 
 def log_order(order=None, request=None, *, action: str = "submit",
               reason: str | None = None, **detail) -> None:
-    """Persist an order lifecycle row in the durable paper journal."""
+    """Persist an order lifecycle row in the mode-scoped durable journal."""
     source = order or request
     row = {
         "ts": time.time(), "order_id": getattr(source, "id", None),
@@ -420,19 +465,6 @@ def log_trade(symbol, side, action, qty, price=None, notional=None,
         pass
 
 
-def stable_fingerprint(value: object) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str,
-                                     separators=(",", ":")).encode()).hexdigest()[:16]
-
-
-def new_run_id() -> str:
-    return f"run_{uuid.uuid4().hex}"
-
-
-def new_cycle_id() -> str:
-    return f"cycle_{uuid.uuid4().hex}"
-
-
 def acquire_run_lock():
     RUNTIME.mkdir(parents=True, exist_ok=True)
     handle = PID_FILE.open("a+")
@@ -456,16 +488,6 @@ def release_run_lock(handle) -> None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
-
-
-def read_pid() -> int | None:
-    try: return int(PID_FILE.read_text().strip())
-    except (OSError, ValueError): return None
-
-
-def pid_alive(pid: int) -> bool:
-    try: os.kill(pid, 0); return True
-    except OSError: return False
 
 
 if os.getenv("ALPACA_AGENT_RUNTIME_SCOPE"):

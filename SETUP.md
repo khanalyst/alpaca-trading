@@ -1,11 +1,10 @@
 # Setup and deployment
 
-This is the installation authority for the Alpaca intraday paper-trading
-runtime. The default account is Alpaca paper, the data universe is US stocks
-and ETFs, and options are available only as single-leg long intraday calls or
-puts. A trader process runs one execution profile (`shares` or `options`) at a
-time; multi-leg, naked, and short option structures are unsupported. Live
-trading is unsupported and explicitly guarded in the provider.
+This is the installation authority for the Alpaca intraday runtime. Paper is
+the default account mode. The supported universe is US-listed equities/ETFs
+and listed OCC options; options are single-leg long intraday calls or puts.
+Crypto, multi-leg, naked, and short option structures are unsupported. A
+trader process runs one execution profile (`shares` or `options`) at a time.
 
 ## Local setup
 
@@ -32,11 +31,22 @@ ALPACA_STOCK_FEED=iex
 ALPACA_OPTIONS_FEED=indicative
 ```
 
-Use paper credentials only. Keep withdrawal permissions disabled and do not
-put the file in Git. `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` are optional. LLM use
-is disabled by default and those keys are needed only when `llm.enabled: true`
-is explicitly set for an analyst feature. Deterministic, content-addressed
-rule execution remains the default.
+Use paper credentials only for the default lane. Keep withdrawal permissions
+disabled and do not put the file in Git. The checked research config enables a
+bounded replacement adapter (`gpt-5`); if used, load provider keys only from a
+separate optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Invalid or missing LLM
+output leaves a pending replacement and does not retire a family. Runtime
+decision LLM use remains disabled (`llm.enabled: false`); deterministic,
+content-addressed rule execution remains the runtime default.
+
+For Compose, set `ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of that
+separate file; Compose mounts it read-only and the research container exposes
+it as `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Leaving it unset mounts an empty
+secret and keeps failed replacements pending.
+
+The separate file is dotenv-style and should contain only the selected model
+provider credentials, for example `OPENAI_API_KEY=...` (or
+`ANTHROPIC_API_KEY=...`), plus an optional provider base URL.
 
 Run the local checks before starting a loop:
 
@@ -48,37 +58,67 @@ Run the local checks before starting a loop:
 ```
 
 `check` is the authenticated preflight by default and must confirm the Alpaca
-paper endpoint, credentials, market clock, and feed settings; it fails closed
-if a live endpoint is requested. `check --offline` validates local
-configuration only and is not a trading preflight. On a fresh edge ledger the
-trader will remain safely idle until research has passed an initial backtest
-and a strictly later unseen shadow tail. Confirm that expected hold in
-`main.py status`, then run the trader once in the foreground before switching
-to Compose or systemd.
+paper endpoint, credentials, market clock, and feed settings. `check --offline`
+validates local configuration only; it never authenticates or serves as a
+trading preflight. On a fresh edge ledger the trader will remain safely idle
+until research has passed an initial backtest and a strictly later unseen
+shadow tail. Confirm that expected hold in `main.py status`, then run the
+trader once in the foreground before switching to Compose or systemd.
+
+## Explicit live mode
+
+Live mode is not a paper-lane toggle. Use a separately reviewed config,
+credentials, and runtime root (`ALPACA_AGENT_RUNTIME_ROOT`) and stop the paper
+process before starting it. All of the following are required:
+
+```yaml
+mode: live
+broker:
+  paper: false
+  allow_live: true
+strategy:
+  selection_mode: specific
+  variant_id: <exact-validated-or-champion-variant>
+```
+
+Set `ALPACA_LIVE_ENABLE=true` in that live process and do not set
+`ALPACA_PAPER=true`. The named edge must already be `validated` or `champion`
+in the vehicle-local ledger. Live startup pins its candidate/configuration and
+does not auto-switch to a new champion. The authenticated live preflight also
+requires the account to report `pattern_day_trader=true`; a missing or false
+value blocks startup. The shipped Compose and systemd launch lanes set
+`ALPACA_PAPER=true` and remain paper defaults.
 
 ## Behavioural defaults
 
-- Strategy: `rule/auto`; the runtime accepts only a validated/champion rule
-  selected from the autonomous research ledger. IBR remains an explicit
-  baseline and replay contract.
-- Instruments: liquid US equities/ETFs, or single-leg long options selected
-  from a validated chain, according to the configured execution profile.
+- Strategy: paper `selection_mode: all_proved` selects one best proven variant
+  per independent family under one global risk book; `specific` pins one
+  validated/champion variant. IBR remains an explicit baseline and replay
+  contract.
+- Instruments: US-listed equities/ETFs and listed OCC options, with options
+  limited to single-leg long contracts selected from a validated chain.
 - Entries: regular NYSE session only, with a close-time cutoff.
-- Exits: stop/target and risk controls, followed by a mandatory pre-close
-  flatten. No position or option contract may cross the session close.
-- Account: paper endpoint and paper credentials; there is no live-ready mode.
+- Orders/exits: `time_in_force: day`; startup cancels working orders and
+  flattens residuals, and a mandatory pre-close flatten leaves no overnight
+  position or option contract.
+- Account: Alpaca paper endpoint and paper credentials by default; live mode
+  requires the separate guard and scope above.
 - Data: `iex` stock feed by default; set an entitled feed explicitly if the
   paper account supports one. Record the feed in run metadata.
 
-Every generated hypothesis is unproven. The research cycle runs seven strategy
-families in parallel by default, with four isolated simulated accounts per
-family. Fit-only diagnostics create bounded variants; untouched held-out data
-decides whether they pass. An adequately tested family with no positive edge
-is retired and a replacement hypothesis is queued automatically. The edge
-lifecycle remains forward-only for proof: an initial corpus backtest must pass before a
-later unseen shadow tail can validate and select a champion; paper outcomes
-are appended for forward monitoring and may demote a champion. Runtime entries
-remain blocked without a validated/champion SQLite record.
+Every generated hypothesis is unproven. The research cycle runs seven
+independent strategy families in parallel by default, with four isolated
+simulated accounts per family. Fit-only diagnostics create bounded variants;
+untouched held-out data decides whether they pass. Lifecycle proof requires fit
+and held-out structural floors, matched controls, placebo/falsification,
+family-level FDR, and a durable verified gate before validation/champion
+selection. Underpowered data is not failure. Retirement is allowed only after
+all intended variants are adequately tested and fail; when LLM replacement is
+enabled, a valid bounded replacement must be registered first. The lifecycle is
+forward-only: an initial corpus backtest precedes a strictly later unseen
+shadow tail. Paper outcomes are append-only forward evidence and may demote a
+champion. Runtime entries remain blocked without a validated/champion SQLite
+record.
 
 For an operator-initiated close, run
 `./.venv/bin/python main.py flatten --reason operator` (or the equivalent
@@ -119,8 +159,8 @@ Named volumes survive an ordinary `docker compose down`. Do not use
 `down -v` or prune volumes unless the journal and research artifacts have been
 backed up and the reset is intentional.
 
-Research is an offline profile and does not run on a default startup. When the
-recorder has written the mixed bars/quotes/options dataset at
+Research is a broker-independent profile and does not run on a default
+startup. When the recorder has written the mixed bars/quotes/options dataset at
 `runtime/research/recorded/market.csv`, the research cycle discovers and routes
 it automatically. An explicit normalized JSONL dataset can override it when
 needed:
@@ -134,9 +174,9 @@ The edge-lab ledger defaults to `runtime/research/edge_lab.sqlite3` (override
 with `ALPACA_EDGE_DB`). Inspect its append-only lifecycle with
 `python research.py edge status`. The scheduled cycle performs normal
 backtest-to-unseen-shadow validation and champion selection automatically;
-manual `edge promote`/rollback commands are available only as audited controls
-subject to lifecycle/evidence rules; demote, retire, and rollback are operator
-safety actions.
+manual `edge promote` remains an audited control subject to lifecycle/evidence
+rules. Backward rollback is rejected; explicit demotion is the operator safety
+action.
 
 ## Legacy systemd lane
 
@@ -156,15 +196,17 @@ sudo systemctl enable --now alpaca-trader.service
 
 Enable `alpaca-research.timer` after the recorder has produced its default
 dataset, or set `ALPACA_RESEARCH_DATASET` to a normalized JSONL input in the
-credential-free `/etc/alpaca-agent-trading/research.env` file. Research runs
-offline and is optional as a service,
-but the trader still requires a validated/champion edge record in SQLite
+`/etc/alpaca-agent-trading/research.env` file. Research has no broker
+credentials and is optional as a service; if the bounded LLM replacement is
+used, point `ALPACA_RESEARCH_LLM_SECRETS_FILE` at its separate provider-secret
+file. The trader still requires a validated/champion edge record in SQLite
 before opening entries.
 
 Compose and the systemd application lane are alternatives. Do not enable both
 on one host. The trader remains one replica/process. Put credentials in an
 EnvironmentFile outside the checkout and set `ALPACA_AGENT_SECRETS_FILE` only
-where the launcher needs it.
+where the launcher needs it. These shipped units are paper-scoped; use a
+separate reviewed live unit/config/runtime if live mode is approved.
 
 ## Azure notes
 

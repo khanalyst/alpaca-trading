@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parent
 if str(REPO) not in sys.path:
@@ -21,8 +24,11 @@ from research.market_data import (
     normalize_option_snapshot,
     normalize_quote,
     normalize_underlying_bar,
+    parse_timestamp,
 )
+from research.proof import write_proof
 from research.strategy_factory import factory_status, run_factory
+from agent.config import load_config as load_agent_config
 
 
 def _json_rows(path: str | Path) -> list[dict[str, Any]]:
@@ -154,6 +160,114 @@ def _db(args):
     return Path(getattr(args, "db", None) or DEFAULT_DB_PATH)
 
 
+def _agent_config(args: argparse.Namespace) -> dict:
+    path = (getattr(args, "agent_config", None) or
+            os.getenv("ALPACA_AGENT_CONFIG") or REPO / "config.yaml")
+    return load_agent_config(path)
+
+
+def _dataset_context(path: str | Path) -> dict[str, Any]:
+    """Summarize point-in-time source identity without copying raw rows."""
+    if str(path) == "-":
+        return {}
+    source = Path(path)
+    if not source.is_file():
+        return {}
+    providers: set[str] = set()
+    feeds: set[str] = set()
+    kinds: set[str] = set()
+    latest: datetime | None = None
+    with source.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                return {}
+            if not isinstance(row, dict):
+                continue
+            if row.get("provider"):
+                providers.add(str(row["provider"]))
+            if row.get("feed"):
+                feeds.add(str(row["feed"]))
+            kinds.add(str(row.get("kind") or "bar").lower())
+            raw_time = row.get("as_of") or row.get("observed_at") or row.get("timestamp")
+            if raw_time is None:
+                continue
+            try:
+                timestamp = parse_timestamp(raw_time)
+            except (NormalizationError, ValueError):
+                continue
+            if latest is None or timestamp > latest:
+                latest = timestamp
+    result: dict[str, Any] = {
+        "provider": ",".join(sorted(providers)) or None,
+        "feed": ",".join(sorted(feeds)) or None,
+        "schema": "normalized-market.v1:" + ",".join(sorted(kinds)),
+    }
+    if latest is not None:
+        result.update({
+            "as_of": latest.isoformat(),
+            "session_timestamp": latest.isoformat(),
+            "session_date": latest.astimezone(
+                ZoneInfo("America/New_York")).date().isoformat(),
+        })
+    return result
+
+
+def _emit_proofs(args: argparse.Namespace, result: dict,
+                 config: dict) -> list[dict[str, Any]]:
+    research = dict(config.get("research") or {})
+    proof_cfg = dict(research.get("proof") or {})
+    root = Path(os.getenv("ALPACA_RESEARCH_PROOF_DIR") or
+                proof_cfg.get("directory") or "findings")
+    if not root.is_absolute():
+        root = REPO / root
+    webhook = (os.getenv("ALPACA_EDGE_WEBHOOK_URL") or
+               proof_cfg.get("webhook_url") or "")
+    timeout = float(proof_cfg.get("webhook_timeout_seconds", 10))
+    context = _dataset_context(getattr(args, "data", "-"))
+    ledger = EdgeLedger(_db(args))
+    emitted: list[dict[str, Any]] = []
+    for candidate in ledger.status(vehicle=getattr(args, "vehicle", None)):
+        if candidate.get("status") not in {"validated", "champion"}:
+            continue
+        eligibility = ledger.eligibility(candidate["candidate_id"])
+        if not eligibility.get("eligible"):
+            continue
+        proof = write_proof(
+            ledger, candidate["candidate_id"], context=context,
+            output_root=root, webhook_url=str(webhook) or None,
+            webhook_timeout_seconds=timeout)
+        item = {
+            "candidate_id": candidate["candidate_id"],
+            "status": candidate["status"], "vehicle": candidate["vehicle"],
+            "payload_hash": proof.payload_hash, "artifact": str(proof.path),
+            "created": proof.created, "webhook": proof.webhook,
+        }
+        emitted.append(item)
+        if proof.created:
+            ledger.append_event(
+                candidate_id=candidate["candidate_id"],
+                event_type="proof_created", actor="research_cli",
+                reason="content-addressed edge proof created",
+                payload={"payload_hash": proof.payload_hash,
+                         "artifact": str(proof.path)})
+            if proof.webhook is not None:
+                sent = bool(proof.webhook.get("ok"))
+                ledger.append_event(
+                    candidate_id=candidate["candidate_id"],
+                    event_type="proof_webhook_sent" if sent else "proof_webhook_failed",
+                    actor="research_cli",
+                    reason=("edge proof notification sent" if sent else
+                            "edge proof notification failed; artifact remains durable"),
+                    payload={"payload_hash": proof.payload_hash,
+                             "result": proof.webhook})
+    result["proofs"] = emitted
+    return emitted
+
+
 def cmd_edge_init(args: argparse.Namespace) -> int:
     print(json.dumps(init_ledger(_db(args)), sort_keys=True))
     return 0
@@ -167,8 +281,11 @@ def cmd_edge_status(args: argparse.Namespace) -> int:
 def cmd_edge_promote(args: argparse.Namespace) -> int:
     ledger = EdgeLedger(_db(args))
     record = ledger.transition(args.candidate, args.status, reason=args.reason,
-                               actor=args.actor, rollback=args.rollback)
-    print(json.dumps(record, sort_keys=True))
+                               actor=args.actor)
+    output = {"candidate": record}
+    if record.get("status") in {"validated", "champion"}:
+        _emit_proofs(args, output, _agent_config(args))
+    print(json.dumps(output, sort_keys=True))
     return 0
 
 
@@ -182,6 +299,7 @@ def cmd_edge_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_edge_discover(args: argparse.Namespace) -> int:
+    agent_config = _agent_config(args)
     config = _read_json(args.config, {})
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
@@ -190,6 +308,7 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
         config=config, variants_path=args.variants,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha)
+    _emit_proofs(args, result, agent_config)
     print(json.dumps(result, sort_keys=True, default=str))
     promoted = any(item.get("status") in {"validated", "champion"}
                    for item in result.get("variants", []))
@@ -197,14 +316,17 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_factory_run(args: argparse.Namespace) -> int:
+    agent_config = _agent_config(args)
     result = run_factory(
         args.data, db_path=_db(args), vehicle=args.vehicle,
         strategies=args.strategies, variants_per_strategy=args.variants,
         workers=args.workers, starting_cash=args.starting_cash,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
-        alpha=args.alpha, max_generations=args.max_generations)
+        alpha=args.alpha, max_generations=args.max_generations,
+        strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"))
+    proofs = _emit_proofs(args, result, agent_config)
     print(json.dumps(result, sort_keys=True, default=str))
-    return 0
+    return 0 if proofs else 2
 
 
 def cmd_factory_status(args: argparse.Namespace) -> int:
@@ -219,6 +341,8 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.set_defaults(func=cmd_factory_status)
     else:
         parser.add_argument("--data", required=True, help="normalized mixed market JSONL")
+        parser.add_argument("--agent-config", default=None,
+                            help="validated agent config (default: config.yaml)")
         parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")
         parser.add_argument("--strategies", type=int, default=7)
         parser.add_argument("--variants", type=int, default=4,
@@ -246,7 +370,8 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("status", choices=("backtest_passed", "shadow", "validated", "champion", "demoted", "retired"))
         parser.add_argument("--reason", required=True)
         parser.add_argument("--actor", default="cli")
-        parser.add_argument("--rollback", action="store_true")
+        parser.add_argument("--agent-config", default=None,
+                            help="validated agent config (default: config.yaml)")
         parser.set_defaults(func=cmd_edge_promote)
     elif command == "ingest":
         parser.add_argument("candidate")
@@ -258,6 +383,8 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")
         parser.add_argument("--lane", choices=("auto", "backtest", "shadow"), default="auto")
         parser.add_argument("--config", help="optional base runtime config JSON")
+        parser.add_argument("--agent-config", default=None,
+                            help="validated agent config (default: config.yaml)")
         parser.add_argument("--variants", help="optional preregistration JSON/YAML path")
         parser.add_argument("--min-trades", type=int, default=100)
         parser.add_argument("--min-sessions", type=int, default=10)

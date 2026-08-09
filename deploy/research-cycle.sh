@@ -8,6 +8,83 @@ python_bin="${PYTHON:-python}"
 if ! command -v "$python_bin" >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   python_bin=python3
 fi
+
+# ``research.py`` emits detailed proof/result JSON itself. Keep those lines on
+# their original streams and add one terminal record for the scheduler.
+cycle_finalized=0
+cycle_success=0
+cycle_no_edge=0
+cycle_outcomes=()
+
+emit_cycle() {
+  local status="$1"
+  local reason="$2"
+  local exit_code="$3"
+  local outcomes="${cycle_outcomes[*]-}"
+  "$python_bin" - "$status" "$reason" "$exit_code" "$outcomes" "$cycle_success" "$cycle_no_edge" <<'PY'
+import json
+import sys
+
+status, reason, exit_code, raw_outcomes, success, no_edge = sys.argv[1:]
+print(json.dumps({
+    "schema": "research-cycle.v1", "status": status, "reason": reason,
+    "exit_code": int(exit_code),
+    "outcomes": raw_outcomes.split() if raw_outcomes else [],
+    "proofs": bool(int(success)), "no_edge": bool(int(no_edge)),
+}, sort_keys=True))
+PY
+}
+
+finish() {
+  local status="$1"
+  local reason="$2"
+  local exit_code="$3"
+  cycle_finalized=1
+  emit_cycle "$status" "$reason" "$exit_code"
+  exit "$exit_code"
+}
+
+on_exit() {
+  local code=$?
+  if [ "$cycle_finalized" -eq 0 ]; then
+    emit_cycle "failed" "research cycle aborted before completion" "$code"
+  fi
+  rm -rf "${tmp_dir:-}" 2>/dev/null || true
+  exit "$code"
+}
+trap on_exit EXIT
+
+# Load only provider keys from an optional, separate dotenv-style file. Never
+# source arbitrary shell and never consult the broker credential file.
+load_llm_secrets() {
+  local source="${ALPACA_RESEARCH_LLM_SECRETS_FILE:-}"
+  local line key value
+  [ -z "$source" ] && return 0
+  if [[ "$source" != /* ]]; then
+    source="$repo_root/$source"
+  fi
+  [ -r "$source" ] || finish "failed" "LLM secrets file is unreadable" 3
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#${line%%[![:space:]]*}}"
+    [ -z "$line" ] || [[ "$line" == \#* ]] || {
+      line="${line#export }"
+      if [[ "$line" =~ ^(OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENAI_BASE_URL|ANTHROPIC_BASE_URL)[[:space:]]*=(.*)$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value#${value%%[![:space:]]*}}"
+        value="${value%${value##*[![:space:]]}}"
+        if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+          value="${value:1:${#value}-2}"
+        elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+          value="${value:1:${#value}-2}"
+        fi
+        export "$key=$value"
+      fi
+    }
+  done < "$source"
+}
+
+load_llm_secrets
 dataset="${ALPACA_RESEARCH_DATASET:-}"
 recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-$repo_root/runtime/research/recorded}"
 if [[ "$recorded_root" != /* ]]; then
@@ -33,17 +110,18 @@ if [ -d "$dataset" ]; then
     fi
   done
 fi
-if [ -z "$dataset" ] || { [ "$dataset" != "-" ] && [ ! -s "$dataset" ]; }; then
-  printf '%s\n' '{"status":"skipped","reason":"recorded dataset unavailable"}' >&2
-  exit 0
+if [ -z "$dataset" ] || { [ "$dataset" != "-" ] && { [ -d "$dataset" ] || [ ! -s "$dataset" ]; }; }; then
+  finish "no_data" "recorded dataset unavailable" 2
 fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/alpaca-research.XXXXXX")"
-trap 'rm -rf "$tmp_dir"' EXIT
 validated_input="$dataset"
 if [ "$dataset" = "-" ]; then
   validated_input="$tmp_dir/input.jsonl"
   cat > "$validated_input"
+fi
+if [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; then
+  finish "no_data" "recorded dataset is empty" 2
 fi
 bars_input="$tmp_dir/bars.jsonl"
 options_input="$tmp_dir/options.jsonl"
@@ -124,38 +202,67 @@ with open(source, encoding="utf-8") as source_handle, open(
 PY
 fi
 
+# A CSV containing only its header is not a usable research dataset even
+# though the source file itself is non-empty.
+if [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; then
+  finish "no_data" "recorded dataset contains no rows" 2
+fi
+
 feed="${ALPACA_DATA_FEED:-${ALPACA_STOCK_FEED:-iex}}"
+set +e
 "$python_bin" "$repo_root/research.py" validate-data "$validated_input" \
   --provider alpaca --feed "$feed"
+validation_status=$?
+set -e
+if [ "$validation_status" -ne 0 ]; then
+  finish "failed" "research dataset validation failed" "$validation_status"
+fi
 
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
+  set +e
   "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
     --provider alpaca --feed "$feed" --vehicle equity
+  backtest_status=$?
+  set -e
+  if [ "$backtest_status" -ne 0 ]; then
+    finish "failed" "research backtest failed" "$backtest_status"
+  fi
 fi
 
 edge_db="${ALPACA_EDGE_DB:-$repo_root/runtime/research/edge_lab.sqlite3}"
 if [[ "$edge_db" != /* ]]; then
   edge_db="$repo_root/$edge_db"
 fi
+agent_config="${ALPACA_AGENT_CONFIG:-$repo_root/config.yaml}"
+if [[ "$agent_config" != /* ]]; then
+  agent_config="$repo_root/$agent_config"
+fi
 
 run_discovery() {
   local vehicle="$1"
   set +e
   "$python_bin" "$repo_root/research.py" edge discover \
-    --data "$validated_input" --vehicle "$vehicle" --lane auto --db "$edge_db"
+    --data "$validated_input" --vehicle "$vehicle" --lane auto --db "$edge_db" \
+    --agent-config "$agent_config"
   local status=$?
   set -e
-  # Exit 2 is the documented insufficient/gate-failed outcome. Operational
-  # errors use a distinct code and fail the scheduler cycle.
-  if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
-    exit "$status"
+  if [ "$status" -eq 0 ]; then
+    cycle_success=1
+    cycle_outcomes+=("$vehicle:discover:completed")
+  elif [ "$status" -eq 2 ]; then
+    cycle_no_edge=1
+    cycle_outcomes+=("$vehicle:discover:no_edge")
+  else
+    finish "failed" "$vehicle edge discovery failed" "$status"
   fi
 }
 
 run_factory() {
   local vehicle="$1"
+  set +e
   "$python_bin" "$repo_root/research.py" factory run \
     --data "$validated_input" --vehicle "$vehicle" --db "$edge_db" \
+    --agent-config "$agent_config" \
     --strategies "${ALPACA_FACTORY_STRATEGIES:-7}" \
     --variants "${ALPACA_FACTORY_VARIANTS:-4}" \
     --workers "${ALPACA_FACTORY_WORKERS:-7}" \
@@ -164,6 +271,17 @@ run_factory() {
     --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-10}" \
     --alpha "${ALPACA_FACTORY_ALPHA:-0.05}" \
     --max-generations "${ALPACA_FACTORY_MAX_GENERATIONS:-5}"
+  local status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    cycle_success=1
+    cycle_outcomes+=("$vehicle:factory:completed")
+  elif [ "$status" -eq 2 ]; then
+    cycle_no_edge=1
+    cycle_outcomes+=("$vehicle:factory:no_proof")
+  else
+    finish "failed" "$vehicle factory failed" "$status"
+  fi
 }
 
 if [ -s "$bars_input" ]; then
@@ -178,3 +296,9 @@ if [ -s "$options_input" ]; then
     run_factory option
   fi
 fi
+
+if [ "$cycle_success" -eq 1 ]; then
+  finish "completed" "research cycle completed with proof" 0
+fi
+cycle_no_edge=1
+finish "completed_no_edge" "no edge or proof passed the research gates" 0

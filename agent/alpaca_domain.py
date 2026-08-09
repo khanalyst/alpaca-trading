@@ -13,6 +13,9 @@ from decimal import Decimal
 from typing import Any, Mapping
 import re
 
+from .instruments import (validate_asset_class, validate_equity_symbol,
+                          validate_instrument, validate_option_symbol)
+
 
 _OCC_SYMBOL_RE = re.compile(r"^(?P<root>[A-Z0-9.]{1,8})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$")
 
@@ -75,6 +78,16 @@ def _text(value: Any, default: str = "") -> str:
     return str(raw).split(".")[-1].lower()
 
 
+def _boolean(value: Any, field: str, *, default: bool | None = None) -> bool:
+    if value is None:
+        if default is None:
+            raise ValueError(f"asset {field} is required")
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"asset {field} must be true or false")
+    return value
+
+
 @dataclass(frozen=True)
 class Asset:
     symbol: str
@@ -87,6 +100,12 @@ class Asset:
     easy_to_borrow: bool = False
     marginable: bool = False
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        asset_class = validate_asset_class(self.asset_class)
+        symbol = validate_instrument(self.symbol, asset_class)
+        object.__setattr__(self, "asset_class", asset_class)
+        object.__setattr__(self, "symbol", symbol)
 
     @property
     def is_option(self) -> bool:
@@ -102,14 +121,14 @@ class Asset:
             raise ValueError("asset is missing symbol")
         return cls(
             symbol=symbol,
-            asset_class=_text(data.get("asset_class") or data.get("class"), "us_equity"),
+            asset_class=_text(data.get("asset_class") or data.get("class")),
             exchange=_text(data.get("exchange"), "") or None,
             status=_text(data.get("status"), "active"),
-            tradable=bool(data.get("tradable", True)),
-            fractionable=bool(data.get("fractionable", False)),
-            shortable=bool(data.get("shortable", False)),
-            easy_to_borrow=bool(data.get("easy_to_borrow", False)),
-            marginable=bool(data.get("marginable", False)),
+            tradable=_boolean(data.get("tradable"), "tradable"),
+            fractionable=_boolean(data.get("fractionable"), "fractionable", default=False),
+            shortable=_boolean(data.get("shortable"), "shortable", default=False),
+            easy_to_borrow=_boolean(data.get("easy_to_borrow"), "easy_to_borrow", default=False),
+            marginable=_boolean(data.get("marginable"), "marginable", default=False),
             raw=dict(data) if isinstance(data, Mapping) else {},
         )
 
@@ -125,6 +144,16 @@ class OptionContract(Asset):
     volume: Decimal | None = None
     open_interest: Decimal | None = None
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        symbol = validate_option_symbol(
+            self.symbol, self.underlying_symbol or None,
+            expiration=self.expiration_date, strike=self.strike_price)
+        object.__setattr__(self, "symbol", symbol)
+        if self.underlying_symbol:
+            object.__setattr__(self, "underlying_symbol",
+                               validate_equity_symbol(self.underlying_symbol))
+
     @classmethod
     def from_sdk(cls, value: Any) -> "OptionContract":
         data = dict(_object_mapping(value))
@@ -135,7 +164,13 @@ class OptionContract(Asset):
         if occ:
             for key, fallback in occ.items():
                 data.setdefault(key, fallback)
-        base = Asset.from_sdk(value)
+        data.setdefault("asset_class", "us_option")
+        # Option-chain snapshots often provide OCC identity and quotes without
+        # repeating the contracts endpoint's tradable flag. A syntactically
+        # valid listed OCC contract is the narrow safe fallback here; generic
+        # equity assets still require explicit provider metadata.
+        data.setdefault("tradable", True)
+        base = Asset.from_sdk(data)
         raw_expiry = data.get("expiration_date") or data.get("expiration")
         expiry = raw_expiry if isinstance(raw_expiry, date) else (
             date.fromisoformat(str(raw_expiry)[:10]) if raw_expiry else None)
@@ -255,6 +290,9 @@ class Position:
     unrealized_pl: Decimal | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "symbol", validate_instrument(self.symbol))
+
 
 @dataclass(frozen=True)
 class OrderRequest:
@@ -270,9 +308,7 @@ class OrderRequest:
     position_intent: str | None = None
 
     def __post_init__(self) -> None:
-        symbol = str(self.symbol or "").strip().upper()
-        if not symbol:
-            raise ValueError("order symbol is required")
+        symbol = validate_instrument(self.symbol)
         object.__setattr__(self, "symbol", symbol)
         side = _text(self.side).lower()
         if side not in {"buy", "sell"}:
@@ -296,8 +332,8 @@ class OrderRequest:
             raise ValueError("option order qty must be an integer number of contracts")
         tif = _text(self.time_in_force).lower()
         object.__setattr__(self, "time_in_force", tif)
-        if tif not in {"day", "gtc", "opg", "cls", "ioc", "fok"}:
-            raise ValueError(f"unsupported time_in_force {self.time_in_force!r}")
+        if tif != "day":
+            raise ValueError("time_in_force must be day")
         if order_type == "limit" and (self.limit_price is None or Decimal(str(self.limit_price)) <= 0):
             raise ValueError("limit orders require a positive limit_price")
         if self.position_intent is not None:
