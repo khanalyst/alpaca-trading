@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
+import ast
 import json
 import inspect
 from pathlib import Path
@@ -9,8 +10,10 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from typing import get_args, get_type_hints
 
 from research import edge_lab, edge_ledger, edge_ledger_proof, edge_ledger_store
+from research import edge_discovery_core
 from research.edge_lab import DiscoveryError, EdgeLedger, discover
 from research.edge_ledger import (
     SCHEMA_VERSION, canonical_json, content_hash, hash_config, hash_dataset,
@@ -181,6 +184,72 @@ class EdgeLedgerStoreExtractionTests(unittest.TestCase):
                         "UPDATE candidates SET hypothesis='changed' WHERE candidate_id=?",
                         (candidate["candidate_id"],),
                     )
+
+
+class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
+    def test_core_helpers_are_facade_identity_aliases(self):
+        names = (
+            "DiscoveryError", "_read_discovery_rows", "_effective_ibr_config",
+            "_opportunity_rows", "_discover_gate", "_finalize_gate",
+        )
+        for name in names:
+            self.assertIs(getattr(edge_lab, name), getattr(edge_discovery_core, name))
+        self.assertIs(
+            __import__("research.strategy_factory", fromlist=["_read_discovery_rows"])._read_discovery_rows,
+            edge_lab._read_discovery_rows,
+        )
+
+    def test_helpers_are_not_local_edge_lab_definitions(self):
+        source = inspect.getsource(edge_lab)
+        tree = ast.parse(source)
+        local_names = {
+            node.name for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        for name in (
+            "DiscoveryError", "_read_discovery_rows", "_effective_ibr_config",
+            "_opportunity_rows", "_discover_gate", "_finalize_gate",
+        ):
+            self.assertNotIn(name, local_names)
+
+    def test_core_import_is_lazy_and_does_not_load_edge_lab_or_ledger(self):
+        root = Path(__file__).resolve().parents[2]
+        script = (
+            "import sys; import research.edge_discovery_core; "
+            "assert 'research.edge_lab' not in sys.modules; "
+            "assert 'research.edge_ledger' not in sys.modules; "
+            "assert 'sqlite3' not in sys.modules"
+        )
+        result = subprocess.run([sys.executable, "-c", script], cwd=root,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_moved_helper_type_hints_resolve(self):
+        result = get_type_hints(edge_discovery_core._read_discovery_rows)["return"]
+        _, bars, snapshots = get_args(result)
+        self.assertIs(get_args(bars)[0], edge_discovery_core.UnderlyingBar)
+        self.assertIs(get_args(snapshots)[1], edge_discovery_core.OptionSnapshot)
+
+    def test_moved_read_helper_forwards_legacy_facade_normalizer_patch(self):
+        row = {
+            "symbol": "SPY", "timestamp": "2024-01-02T14:30:00+00:00",
+            "open": 100, "high": 101, "low": 99, "close": 100,
+            "volume": 1,
+        }
+        bar = mock.Mock()
+        with mock.patch.object(edge_lab, "normalize_underlying_bar",
+                               return_value=bar) as normalizer:
+            raw, bars, snapshots = edge_discovery_core._read_discovery_rows([row])
+        self.assertEqual(raw, [row])
+        self.assertEqual(bars, [bar])
+        self.assertEqual(snapshots, {})
+        normalizer.assert_called_once_with(row, provider="alpaca", feed="sip")
+
+    def test_discover_uses_patchable_edge_lab_helper_alias(self):
+        with mock.patch.object(edge_lab, "_read_discovery_rows",
+                               side_effect=DiscoveryError("patched facade")):
+            with self.assertRaisesRegex(DiscoveryError, "patched facade"):
+                discover([], lane="backtest")
 
 
 class EdgeDiscoveryLifecycleTests(unittest.TestCase):
