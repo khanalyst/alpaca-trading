@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 try:
-    from deploy import dashboard, health, recorder, scheduler
+    from deploy import dashboard, health, recorder, scheduler, scheduler_output
 except ModuleNotFoundError as exc:  # dependency-independent local test runs
     if exc.name == "yaml":
         raise unittest.SkipTest("PyYAML is supplied by the deployment lockfile")
@@ -169,6 +169,71 @@ class DeployTests(unittest.TestCase):
     def test_scheduler_default_points_to_deploy_cycle(self):
         self.assertEqual(scheduler.build_parser().parse_args([]).script,
                          "deploy/research-cycle.sh")
+
+    def test_scheduler_output_facade_reexports_moved_symbols(self):
+        names = (
+            "_BoundedCapture", "structured_failure",
+            "structured_research_cycle", "_drain", "_start_capture",
+            "_capture_detail",
+        )
+        for name in names:
+            self.assertIs(getattr(scheduler, name),
+                          getattr(scheduler_output, name))
+
+    def test_scheduler_output_bounded_capture_and_structured_results(self):
+        capture = scheduler_output._BoundedCapture(8)
+        capture.feed("prefix\n")
+        capture.feed(json.dumps({
+            "generation": 2, "accepted_count": 0, "status": "FAILED",
+            "attempt_id": "attempt-1", "error": "author failed",
+        }) + "\n")
+        cycle_line = json.dumps({
+            "schema": "research-cycle.v1", "status": "completed_no_edge",
+            "reason": "no eligible edge", "exit_code": 0,
+            "outcomes": ["equity", "option"], "proofs": True,
+        }) + "\n"
+        capture.feed(cycle_line)
+        self.assertEqual(capture.tail, cycle_line[-8:])
+        self.assertTrue(capture.truncated)
+        self.assertEqual(capture.structured_failures, [{
+            "component": "authoring", "status": "FAILED",
+            "attempt_id": "attempt-1", "error": "author failed",
+        }])
+        self.assertEqual(capture.research_cycles, [{
+            "schema": "research-cycle.v1", "status": "completed_no_edge",
+            "reason": "no eligible edge", "exit_code": 0,
+            "outcomes": ["equity", "option"], "proofs": True,
+            "no_edge": False,
+        }])
+
+    def test_scheduler_output_capture_detail_combines_streams(self):
+        stdout = scheduler_output._BoundedCapture(4)
+        stderr = scheduler_output._BoundedCapture(200)
+        stdout.feed("abcdef")
+        stderr.feed(json.dumps({
+            "max_reviews": 2, "reviewed": 2, "retry_pending": 1,
+            "failed": 0, "status": "RETRY_PENDING",
+        }) + "\n")
+        detail = scheduler_output._capture_detail(stdout, stderr)
+        self.assertEqual(detail["stdout_tail"], "cdef")
+        self.assertEqual(detail["stdout_chars"], 6)
+        self.assertTrue(detail["stdout_truncated"])
+        self.assertEqual(detail["stderr_chars"], len(stderr.tail))
+        self.assertFalse(detail["stderr_truncated"])
+        self.assertEqual(detail["structured_failures"], [{
+            "component": "review", "status": "RETRY_PENDING",
+            "reviewed": 2, "retry_pending": 1, "failed": 0,
+        }])
+
+    def test_scheduler_output_start_capture_drains_text_stream(self):
+        stream = io.StringIO("line one\nline two\n")
+        result = scheduler_output._start_capture(stream, 100)
+        self.assertIsNotNone(result)
+        capture, thread = result
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(capture.total_chars, len("line one\nline two\n"))
+        self.assertEqual(capture.tail, "line one\nline two\n")
 
     def test_recorder_facade_reexports_market_symbols(self):
         from deploy import recorder_market
