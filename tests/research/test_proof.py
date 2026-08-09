@@ -5,8 +5,9 @@ import time
 import unittest
 
 from agent.contracts.rule import DEFAULT_RULE_SPEC
+import research.proof_payload as proof_payload
 from research.proof import (PROOF_SCHEMA, build_proof_payload, payload_hash,
-                             write_proof)
+                             canonical_json, render_markdown, write_proof)
 
 
 class FakeLedger:
@@ -45,6 +46,12 @@ class FakeLedger:
 
 
 class ProofTests(unittest.TestCase):
+    def test_payload_helpers_are_reexported_without_wrappers(self):
+        self.assertIs(canonical_json, proof_payload.canonical_json)
+        self.assertIs(payload_hash, proof_payload.payload_hash)
+        self.assertIs(build_proof_payload, proof_payload.build_proof_payload)
+        self.assertIs(render_markdown, proof_payload.render_markdown)
+
     def test_payload_is_canonical_and_has_required_fields(self):
         ledger = FakeLedger()
         context = {"session_timestamp": "2024-01-02T15:00:00Z"}
