@@ -48,6 +48,37 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertFalse(session.paper)
         self.assertEqual(session.endpoint, "https://api.alpaca.markets")
 
+    def test_legacy_facade_aliases_and_policy_session_are_sdk_lazy(self):
+        from agent import alpaca_provider as provider_module
+        from agent import alpaca_sdk as sdk_module
+        from agent import alpaca_session as session_module
+
+        for name in ("EQUITY_FEEDS", "OPTION_FEEDS", "_canonical_feed",
+                     "_sdk_feed", "_value", "_text", "_dt", "_mapping",
+                     "_decimal_or_none", "_first", "normalize_quote",
+                     "normalize_bar"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(provider_module, name),
+                              getattr(sdk_module, name))
+        for name in ("AlpacaError", "CredentialsError", "PaperModeError",
+                     "AlpacaSession"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(provider_module, name),
+                              getattr(session_module, name))
+        self.assertTrue(issubclass(provider_module.IdempotencyConflict,
+                                   session_module.AlpacaError))
+
+        # Constructing policy/session objects must not import or instantiate SDK
+        # clients.  Client imports remain inside the lazy properties.
+        with patch("builtins.__import__",
+                   side_effect=AssertionError("unexpected SDK import")):
+            session = session_module.AlpacaSession(
+                api_key="key", secret_key="secret", paper=True)
+            session_module.SessionPolicy()
+        self.assertIsNone(session._trading)
+        self.assertIsNone(session._stock_data)
+        self.assertIsNone(session._option_data)
+
     def test_early_close_and_session_policy(self):
         day = normalize_calendar_day({"date": "2026-07-03", "open": "09:30", "close": "13:00"})
         policy = SessionPolicy(force_flat_minutes_before_close=10)

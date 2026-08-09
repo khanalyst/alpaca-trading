@@ -1,8 +1,11 @@
-"""NYSE session and market-clock policy.
+"""NYSE session and market-clock policy plus the lazy Alpaca session boundary.
 
 Alpaca's clock endpoint is authoritative while connected; the calendar
 endpoint supplies holidays and early closes.  This module also provides a
-deterministic local policy for tests and for startup before credentials exist.
+deterministic local policy for tests and for startup before credentials exist,
+along with the authenticated client session and its provider errors.  SDK
+clients remain lazy so importing policy/configuration code never constructs
+network clients.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import os
-from typing import Iterable
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from .alpaca_domain import CalendarDay
@@ -90,6 +93,84 @@ def trading_env_guard(*, paper: bool, allow_live: bool) -> None:
         raise ValueError("live mode requires ALPACA_LIVE_ENABLE=true")
     if raw is not None and raw.strip().lower() in truthy:
         raise ValueError("live mode conflicts with ALPACA_PAPER=true")
+
+
+class AlpacaError(RuntimeError):
+    """Base provider failure."""
+
+
+class CredentialsError(AlpacaError):
+    """Authenticated operation requested without usable credentials."""
+
+
+class PaperModeError(AlpacaError):
+    """The configured endpoint scope failed its explicit safety guard."""
+
+
+class AlpacaSession:
+    """Lazy construction and endpoint guard for alpaca-py clients."""
+
+    def __init__(self, *, api_key: str | None = None, secret_key: str | None = None,
+                 paper: bool = True, allow_live: bool = False,
+                 trading_client: Any = None, stock_data_client: Any = None,
+                 option_data_client: Any = None) -> None:
+        self.api_key = api_key if api_key is not None else os.getenv("ALPACA_API_KEY")
+        self.secret_key = secret_key if secret_key is not None else os.getenv("ALPACA_SECRET_KEY")
+        if not isinstance(paper, bool) or not isinstance(allow_live, bool):
+            raise ValueError("paper and allow_live must be booleans")
+        try:
+            trading_env_guard(paper=paper, allow_live=allow_live)
+        except ValueError as exc:
+            raise PaperModeError(str(exc)) from exc
+        self.paper = paper
+        self._trading = trading_client
+        self._stock_data = stock_data_client
+        self._option_data = option_data_client
+
+    def require_credentials(self) -> None:
+        if not self.api_key or not self.secret_key:
+            raise CredentialsError("ALPACA_API_KEY and ALPACA_SECRET_KEY are required for authenticated actions")
+
+    @classmethod
+    def from_env(cls, *, paper: bool = True, allow_live: bool = False, **kwargs):
+        return cls(api_key=os.getenv("ALPACA_API_KEY"), secret_key=os.getenv("ALPACA_SECRET_KEY"), paper=paper, allow_live=allow_live, **kwargs)
+
+    @property
+    def endpoint(self) -> str:
+        return "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+
+    @property
+    def trading(self):
+        if self._trading is None:
+            self.require_credentials()
+            try:
+                from alpaca.trading.client import TradingClient
+            except ImportError as exc:
+                raise AlpacaError("alpaca-py is not installed; install it for broker actions") from exc
+            self._trading = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+        return self._trading
+
+    @property
+    def stock_data(self):
+        if self._stock_data is None:
+            self.require_credentials()
+            try:
+                from alpaca.data.historical import StockHistoricalDataClient
+            except ImportError as exc:
+                raise AlpacaError("alpaca-py is not installed; install it for market data") from exc
+            self._stock_data = StockHistoricalDataClient(self.api_key, self.secret_key)
+        return self._stock_data
+
+    @property
+    def option_data(self):
+        if self._option_data is None:
+            self.require_credentials()
+            try:
+                from alpaca.data.historical import OptionHistoricalDataClient
+            except ImportError as exc:
+                raise AlpacaError("alpaca-py is not installed; install it for option data") from exc
+            self._option_data = OptionHistoricalDataClient(self.api_key, self.secret_key)
+        return self._option_data
 
 
 def paper_env_guard() -> None:
