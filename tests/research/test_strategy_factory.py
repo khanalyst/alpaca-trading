@@ -15,10 +15,11 @@ from agent.edge import apply_variant, resolve_validated_variant
 from research.edge_lab import EdgeLedger
 from research.gates import heldout_separation, structural_floor, verified_gate_envelope
 from research.llm_strategy import PROPOSAL_SCHEMA, ProposalResult
+import research.factory_core as core_module
 import research.strategy_factory as factory_module
 from research.strategy_factory import (
     FactoryError, FactoryLedger, initial_hypotheses, mutate_from_diagnosis,
-    run_factory,
+    replacement_hypothesis, run_factory,
 )
 
 
@@ -118,6 +119,29 @@ def persist_rule_gate(ledger, candidate_id, lane):
 
 
 class StrategyFactoryTests(unittest.TestCase):
+    def test_facade_reexports_deterministic_core_symbols_by_identity(self):
+        moved = (
+            "DEFAULT_STRATEGIES", "DEFAULT_VARIANTS", "MAX_STRATEGIES", "MAX_VARIANTS",
+            "StrategyHypothesis", "_hypothesis_id", "_thesis", "_falsification",
+            "initial_hypotheses", "_session", "_visible", "_option_at",
+            "_simulate_trade", "simulate_account", "diagnose", "_safe_variant",
+            "mutate_from_diagnosis", "replacement_hypothesis",
+        )
+        for name in moved:
+            self.assertIs(getattr(factory_module, name), getattr(core_module, name), name)
+
+    def test_initial_and_replacement_results_are_deterministic(self):
+        first = initial_hypotheses()
+        second = initial_hypotheses()
+        self.assertEqual(first, second)
+        previous = vars(first[0])
+        diagnosis = {"primary_failure": "negative_expectancy"}
+        replacement_one = replacement_hypothesis(
+            previous, diagnosis, max_generations=4)
+        replacement_two = replacement_hypothesis(
+            previous, diagnosis, max_generations=4)
+        self.assertEqual(replacement_one, replacement_two)
+
     def test_rule_grammar_is_bounded_and_content_addressed(self):
         spec = validate_rule_spec({"family": "mean_reversion", "lookback": 10,
                                    "slow_lookback": 30})
