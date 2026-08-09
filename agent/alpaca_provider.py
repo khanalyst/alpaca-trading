@@ -93,7 +93,10 @@ class AlpacaProvider:
             timestamp = _dt(_value(value, "timestamp"))
             if timestamp is None:
                 raise ValueError("clock timestamp is missing")
-            return MarketClock(timestamp, bool(_value(value, "is_open", False)), _dt(_value(value, "next_open")), _dt(_value(value, "next_close")))
+            is_open = _value(value, "is_open", None)
+            if not isinstance(is_open, bool):
+                raise ValueError("clock is_open must be true or false")
+            return MarketClock(timestamp, is_open, _dt(_value(value, "next_open")), _dt(_value(value, "next_close")))
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -205,7 +208,10 @@ class AlpacaProvider:
     def account(self) -> Account:
         try:
             value = self.session.trading.get_account()
-            return Account(id=_value(value, "id"), status=_text(_value(value, "status")), equity=Decimal(str(_value(value, "equity", 0))), cash=Decimal(str(_value(value, "cash", 0))), buying_power=Decimal(str(_value(value, "buying_power", 0))), currency=_text(_value(value, "currency"), "usd").upper(), pattern_day_trader=bool(_value(value, "pattern_day_trader", False)))
+            pattern_day_trader = _value(value, "pattern_day_trader", False)
+            if not isinstance(pattern_day_trader, bool):
+                raise ValueError("account pattern_day_trader must be true or false")
+            return Account(id=_value(value, "id"), status=_text(_value(value, "status")), equity=Decimal(str(_value(value, "equity", 0))), cash=Decimal(str(_value(value, "cash", 0))), buying_power=Decimal(str(_value(value, "buying_power", 0))), currency=_text(_value(value, "currency"), "usd").upper(), pattern_day_trader=pattern_day_trader)
         except AlpacaError:
             raise
         except Exception as exc:  # noqa: BLE001

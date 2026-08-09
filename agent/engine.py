@@ -116,7 +116,9 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         else:
             self._edge_configs = [(None, cfg)]
         self.provider = provider or AlpacaProvider(cfg)
-        if bool(self.provider.paper) is not expected_paper:
+        provider_paper = getattr(self.provider, "paper", None)
+        if (not isinstance(provider_paper, bool) or
+                provider_paper is not expected_paper):
             raise AlpacaError(f"provider is not {self.mode} scoped")
         session_cfg = cfg.get("session", {})
         self.market = market_data or MarketData(self.provider, SessionPolicy(**session_cfg))

@@ -1,5 +1,6 @@
 """Durable paper-runtime identity and single-process ownership checks."""
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -46,6 +47,17 @@ class StateSafetyTests(unittest.TestCase):
             state.bind_account_identity(
                 state.account_fingerprint("paper", "paper-account"))
         self.assertEqual(state.STATE_FILE.read_text(encoding="utf-8"), corrupt)
+
+    def test_persisted_state_missing_operator_pause_fails_closed(self):
+        original = json.loads(state.STATE_FILE.read_text(encoding="utf-8"))
+        original.pop("operator_pause")
+        state.STATE_FILE.write_text(json.dumps(original), encoding="utf-8")
+        persisted = state.STATE_FILE.read_text(encoding="utf-8")
+        with self.assertRaises(state.StateCorruptionError):
+            state.load_state()
+        with self.assertRaises(state.StateCorruptionError):
+            state.ensure_ready()
+        self.assertEqual(state.STATE_FILE.read_text(encoding="utf-8"), persisted)
 
     def test_paper_and_live_state_are_mode_isolated(self):
         root = Path(self.tmp.name) / "scoped"

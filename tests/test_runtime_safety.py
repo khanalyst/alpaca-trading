@@ -18,16 +18,18 @@ from agent.alpaca_provider import AlpacaError, AlpacaProvider, AlpacaSession, Pa
 from agent.config import ConfigError, validate_config
 from agent import engine as engine_module
 from agent.engine import Engine
-from agent.edge import resolve_validated_variants
+from agent.edge import resolve_validated_variant, resolve_validated_variants
 from agent.market import MarketData
 from agent.risk import RiskEngine
 from agent.runtime_control import RuntimeControlMixin
 from agent.startup_edge_policy import StartupEdgePolicyMixin
 from research.edge_lab import EdgeLedger
+from research.edge_ledger_store import hash_config
 
 
 class FakeProvider:
     paper = True
+    endpoint = "https://paper-api.alpaca.markets"
 
     class Session:
         api_key = "key"
@@ -280,6 +282,84 @@ class RuntimeSafetyTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             validate_config({"broker": {"paper": False}})
 
+    def test_engine_scope_requires_actual_boolean_provider_paper(self):
+        class StringPaperProvider(FakeProvider):
+            paper = "false"
+
+        with self.assertRaisesRegex(AlpacaError, "provider is not paper scoped"):
+            Engine(_cfg(), light=True, provider=StringPaperProvider())
+
+    def test_string_clock_open_flag_cannot_submit_through_run_once(self):
+        class StringOpenProvider(FakeProvider):
+            def clock(self):
+                return {"timestamp": self.now.isoformat(),
+                        "is_open": "false", "next_close": self.day.close}
+
+        provider = StringOpenProvider()
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        result = engine.run_once({})
+        self.assertEqual(provider.orders_sent, [])
+        self.assertIn(result["action"], {"force_flat", "hold"})
+
+    def test_operator_pause_requires_exact_false(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        for value in ("yes", None, 0, 1):
+            with self.subTest(value=value):
+                state.update_state(lambda current, value=value: {
+                    **current, "operator_pause": value})
+                self.assertFalse(engine._ensure_order_ready())
+        state.update_state(lambda current: {**current, "operator_pause": False})
+
+    def test_run_does_not_clear_malformed_durable_operator_pause(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        state.update_state(lambda current: {**current, "operator_pause": "yes"})
+        with self.assertRaisesRegex(AlpacaError, "operator_pause"):
+            engine.run(max_cycles=0)
+        self.assertEqual(state.load_state()["operator_pause"], "yes")
+
+    def test_preflight_rejects_missing_endpoint_metadata(self):
+        class MissingEndpointProvider(FakeProvider):
+            endpoint = ""
+
+        engine = Engine(_cfg(), light=True, provider=MissingEndpointProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "endpoint validation failed"):
+            engine.preflight()
+
+    def test_preflight_requires_asset_tradable_to_be_boolean_true(self):
+        class StringTradableProvider(FakeProvider):
+            def assets(self):
+                return [Asset("SPY", tradable="true")]
+
+        engine = Engine(_cfg(), light=True, provider=StringTradableProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "inactive or not tradable"):
+            engine.preflight()
+
+    def test_preflight_validates_injected_clock_boundary(self):
+        malformed_clocks = (
+            {"timestamp": "2026-08-07T14:00:00+00:00"},
+            {"timestamp": "2026-08-07T14:00:00+00:00", "is_open": "false"},
+            {"timestamp": None, "is_open": True},
+        )
+
+        for clock in malformed_clocks:
+            class MalformedClockProvider(FakeProvider):
+                def clock(self):
+                    return clock
+
+            with self.subTest(clock=clock):
+                engine = Engine(_cfg(), light=True,
+                                provider=MalformedClockProvider())
+                self.addCleanup(engine.close)
+                with self.assertRaisesRegex(
+                        AlpacaError, "authenticated paper preflight failed"):
+                    engine.preflight()
+
     def test_market_data_is_closed_before_calendar_load(self):
         market = MarketData(FakeProvider())
         self.assertFalse(market.can_enter(FakeProvider().now))
@@ -403,6 +483,76 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(engine.flatten_all("test"))
         self.assertEqual(len(provider.orders_sent), 1)
         self.assertIn("flatten", provider.orders_sent[0].client_order_id)
+
+    def test_flatten_requires_working_order_cancellation_confirmation(self):
+        class PersistentOrderProvider(FakeProvider):
+            def orders(self, **_):
+                return [Order("accepted", "SPY", Decimal("1"), "buy",
+                               "accepted", "market", "day")]
+
+        provider = PersistentOrderProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        with patch("agent.runtime_control.time.sleep") as sleep, \
+                patch.object(engine, "_event") as event:
+            self.assertFalse(engine.flatten_all("persistent-order"))
+        self.assertEqual(sleep.call_count, 5)
+        flatten = [call for call in event.call_args_list
+                   if call.args and call.args[0] == "flatten_incomplete"]
+        self.assertEqual(len(flatten), 1)
+        payload = flatten[0].args[1]
+        self.assertEqual(payload["residual_positions"], [])
+        self.assertEqual(len(payload["residual_working_orders"]), 1)
+
+    def test_flatten_ignores_terminal_orders_after_cancellation(self):
+        class TerminalOrderProvider(FakeProvider):
+            def orders(self, **_):
+                return [Order("filled", "SPY", Decimal("1"), "buy",
+                               "filled", "market", "day")]
+
+        engine = Engine(_cfg(), light=True, provider=TerminalOrderProvider())
+        self.assertTrue(engine.flatten_all("terminal-order"))
+
+    def test_flatten_fails_closed_when_order_poll_errors(self):
+        class BrokenOrderProvider(FakeProvider):
+            def orders(self, **_):
+                raise RuntimeError("orders unavailable")
+
+        engine = Engine(_cfg(), light=True, provider=BrokenOrderProvider())
+        with patch.object(engine, "_event") as event:
+            self.assertFalse(engine.flatten_all("orders-error"))
+        self.assertTrue(any(call.args and call.args[0] == "flatten_orders_error"
+                            for call in event.call_args_list))
+
+    def test_flatten_fails_closed_when_final_position_poll_errors(self):
+        class FinalPositionErrorProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.position_calls = 0
+                self.order_calls = 0
+
+            def positions(self):
+                self.position_calls += 1
+                if self.position_calls > 12:
+                    raise RuntimeError("positions unavailable")
+                return []
+
+            def orders(self, **_):
+                self.order_calls += 1
+                if self.order_calls > 12:
+                    return []
+                return [Order("accepted", "SPY", Decimal("1"), "buy",
+                               "accepted", "market", "day")]
+
+        engine = Engine(_cfg(), light=True,
+                        provider=FinalPositionErrorProvider())
+        with patch("agent.runtime_control.time.sleep"), \
+                patch.object(engine, "_event") as event:
+            self.assertFalse(engine.flatten_all("final-positions-error"))
+        flatten = [call for call in event.call_args_list
+                   if call.args and call.args[0] == "flatten_incomplete"]
+        self.assertEqual(len(flatten), 1)
+        self.assertEqual(flatten[0].args[1]["positions_error"],
+                         "positions unavailable")
 
     def test_flatten_close_position_retries_rejected_with_distinct_attempt_ids(self):
         class CloseProvider(FakeProvider):
@@ -709,8 +859,11 @@ class RuntimeSafetyTests(unittest.TestCase):
         return ledger.candidate(record["candidate_id"])
 
     @staticmethod
-    def _verified_proof(confidence=.99):
+    def _verified_proof(confidence=.99,
+                        config_hash=None):
+        config_hash = hash_config({}) if config_hash is None else config_hash
         return {"lane": "shadow", "metrics": {"confidence": confidence},
+                "config_hash": config_hash,
                 "verified_gate": {"passes": True, "heldout_delta": .1,
                                   "heldout_trades": 20}}
 
@@ -768,6 +921,25 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.addCleanup(engine.close)
         self.assertFalse(engine._refresh_edge())
         self.assertIn("no latest-passing", engine._edge_error)
+
+    def test_edge_rejects_shadow_proof_without_matching_candidate_config_hash(self):
+        db = Path(self.runtime_tmp.name) / "edge-config-hash.sqlite3"
+        ledger = EdgeLedger(db)
+        record = self._prove(ledger, "ibr.baseline")
+        cfg = {"strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                             "selection_mode": "specific",
+                             "execution_mode": "shares"}}
+        for proof_hash in (None, "different-config"):
+            with self.subTest(proof_hash=proof_hash), \
+                    patch.object(
+                        EdgeLedger, "latest_verified_run",
+                        return_value=self._verified_proof(
+                            config_hash=proof_hash or "")):
+                self.assertIsNone(resolve_validated_variant(cfg, db_path=db))
+        with patch.object(EdgeLedger, "latest_verified_run",
+                          return_value=self._verified_proof(
+                              config_hash=record["config_hash"])):
+            self.assertIsNotNone(resolve_validated_variant(cfg, db_path=db))
 
     def test_live_preflight_requires_explicit_pdt_eligibility(self):
         db = Path(self.runtime_tmp.name) / "live-pdt.sqlite3"
@@ -834,8 +1006,11 @@ class RuntimeSafetyTests(unittest.TestCase):
                     "UPDATE candidate_state SET status='validated' WHERE candidate_id=?",
                     (record["candidate_id"],))
                 db_handle.commit()
-        proof = self._verified_proof()
-        with patch.object(EdgeLedger, "latest_verified_run", return_value=proof):
+        def proof_for(candidate_id, *, lane=None):
+            return self._verified_proof(
+                config_hash=ledger.candidate(candidate_id)["config_hash"])
+        with patch.object(EdgeLedger, "latest_verified_run",
+                          side_effect=proof_for):
             selected = resolve_validated_variants({
                 "strategy": {"id": "rule", "execution_mode": "shares",
                              "selection_mode": "all_proved"}}, db_path=db)

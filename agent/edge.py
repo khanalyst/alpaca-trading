@@ -47,6 +47,17 @@ def _latest_passing_proof(ledger: EdgeLedger, record: Mapping) -> dict | None:
     latest = ledger.latest_verified_run(candidate_id, lane="shadow")
     if not isinstance(latest, Mapping):
         return None
+    # The proof must attest the immutable candidate configuration itself.
+    # Dataset and code hashes describe the evidence corpus/build and may
+    # legitimately differ between candidate and shadow run; config identity
+    # cannot drift without invalidating the edge.
+    candidate_config_hash = record.get("config_hash")
+    proof_config_hash = latest.get("config_hash")
+    if (not isinstance(candidate_config_hash, str) or
+            not isinstance(proof_config_hash, str) or
+            not candidate_config_hash or not proof_config_hash or
+            proof_config_hash != candidate_config_hash):
+        return None
     gate = latest.get("verified_gate")
     if not isinstance(gate, Mapping) or gate.get("passes") is not True:
         return None

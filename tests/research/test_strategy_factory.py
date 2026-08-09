@@ -87,6 +87,8 @@ def fake_adequate_worker(payload):
 
 
 def persist_rule_gate(ledger, candidate_id, lane):
+    candidate = ledger.candidate(candidate_id)
+    candidate_config = json.loads(candidate["config_json"])
     fit = [] if lane == "shadow" else [
         {"vehicle": "equity", "session_date": "2026-01-05",
          "opportunity_id": f"{lane}-fit", "net_pnl": 1.0}]
@@ -110,6 +112,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
         checks={"family_fdr_significant": True}, passes=True,
         performance={"heldout_delta": 1.0, "max_drawdown": 0.0})
     run = ledger.append_run(candidate_id, lane=lane, fit=fit, heldout=heldout,
+                            config=candidate_config,
                             metrics={"gate": {"passes": True}, "confidence": .99,
                                      "heldout_delta": 1.0, "max_drawdown": 0.0,
                                      "heldout_trades": len(heldout)})

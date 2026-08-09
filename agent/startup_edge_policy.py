@@ -22,25 +22,30 @@ class StartupEdgePolicyMixin:
         if not self._state_ready:
             state.ensure_ready()
             self._state_ready = True
-        if bool(getattr(self.provider, "paper", False)) is not (self.mode == "paper"):
+        provider_paper = getattr(self.provider, "paper", None)
+        if (not isinstance(provider_paper, bool) or
+                provider_paper is not (self.mode == "paper")):
             raise AlpacaError(f"provider is not {self.mode} scoped")
         session = getattr(self.provider, "session", None)
         api_key = getattr(session, "api_key", None)
         secret_key = getattr(session, "secret_key", None)
         if not api_key or not secret_key:
             raise AlpacaError(f"authenticated {self.mode} credentials are required before trading")
-        endpoint = getattr(self.provider, "endpoint", None) or getattr(session, "endpoint", None)
-        endpoint_text = str(endpoint or "")
+        endpoint = getattr(self.provider, "endpoint", None)
+        if endpoint is None:
+            endpoint = getattr(session, "endpoint", None)
+        endpoint_text = str(endpoint or "").strip()
         expected_host = ("paper-api.alpaca.markets" if self.mode == "paper"
                          else "api.alpaca.markets")
-        if endpoint is not None:
-            parsed_endpoint = urlparse(endpoint_text)
-            if (parsed_endpoint.scheme.lower() != "https" or
-                    parsed_endpoint.hostname != expected_host or
-                    parsed_endpoint.port is not None or
-                    parsed_endpoint.username is not None or
-                    parsed_endpoint.password is not None):
-                raise AlpacaError(f"{self.mode} endpoint validation failed")
+        if not endpoint_text:
+            raise AlpacaError(f"{self.mode} endpoint validation failed")
+        parsed_endpoint = urlparse(endpoint_text)
+        if (parsed_endpoint.scheme.lower() != "https" or
+                parsed_endpoint.hostname != expected_host or
+                parsed_endpoint.port is not None or
+                parsed_endpoint.username is not None or
+                parsed_endpoint.password is not None):
+            raise AlpacaError(f"{self.mode} endpoint validation failed")
         data_feed = str(getattr(self.provider, "data_feed", "iex")).lower()
         options_feed = str(getattr(self.provider, "options_feed", "indicative")).lower()
         if data_feed not in {"iex", "sip", "delayed_sip"}:
@@ -52,6 +57,10 @@ class StartupEdgePolicyMixin:
         try:
             account = self.provider.account()
             clock = self.provider.clock()
+            if not isinstance(_value(clock, "is_open", None), bool):
+                raise ValueError("broker clock is_open must be true or false")
+            if self._timestamp(_value(clock, "timestamp", None)) is None:
+                raise ValueError("broker clock timestamp is invalid")
             self.market.refresh_calendar()
             assets = assets_method() if assets_supported else []
         except Exception as exc:  # noqa: BLE001
@@ -76,7 +85,7 @@ class StartupEdgePolicyMixin:
                 self._assets[symbol] = asset
             invalid = [symbol for symbol in self._universe()
                        if symbol not in self._assets or
-                       not bool(_value(self._assets[symbol], "tradable", False)) or
+                       _value(self._assets[symbol], "tradable", False) is not True or
                        str(_value(self._assets[symbol], "status", "")).lower()
                        not in {"active", "asset_status.active"}]
             if invalid:
@@ -88,7 +97,7 @@ class StartupEdgePolicyMixin:
         state.bind_account_identity(fingerprint)
         self._runtime_state = state.load_state()
         self._preflight = {"account": account, "clock": clock,
-                           "endpoint": endpoint or expected_host,
+                           "endpoint": endpoint_text,
                            "data_feed": data_feed, "options_feed": options_feed,
                            "account_fingerprint": fingerprint}
         self._preflight_error = None
@@ -116,7 +125,8 @@ class StartupEdgePolicyMixin:
             self._preflight_error = f"{self.mode} journal unavailable: {exc}"
             return False
         runtime = state.load_state()
-        if runtime.get("state") == state.KILLED or runtime.get("operator_pause") is True:
+        if (runtime.get("state") == state.KILLED or
+                runtime.get("operator_pause") is not False):
             self._preflight_error = runtime.get("kill_reason") or "operator_pause"
             return False
         try:
@@ -143,10 +153,13 @@ class StartupEdgePolicyMixin:
         return True
 
     def _inside_regular_session(self, clock: Any) -> bool:
-        now = _value(clock, "timestamp")
+        if _value(clock, "is_open", None) is not True:
+            return False
+        now = self._timestamp(_value(clock, "timestamp", None))
+        if now is None:
+            return False
         session = self.market.session(now)
-        return bool(_value(clock, "is_open", False) and session is not None and
-                    session.open <= now < session.close)
+        return bool(session is not None and session.open <= now < session.close)
 
     def _enforce_intraday_cleanup(self, clock: Any, *, reason: str,
                                   force: bool = False) -> bool:
@@ -263,7 +276,7 @@ class StartupEdgePolicyMixin:
             try:
                 def resume(runtime: dict) -> dict:
                     if (self.running and runtime.get("state") == state.PAUSED and
-                            runtime.get("operator_pause") is not True):
+                            runtime.get("operator_pause") is False):
                         runtime["state"] = state.RUNNING
                     return runtime
                 state.update_state(resume)

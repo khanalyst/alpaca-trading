@@ -99,6 +99,36 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertTrue(contract.tradable)
         self.assertEqual(contract.underlying_symbol, "SPY")
 
+    def test_provider_rejects_non_boolean_clock_open_flag(self):
+        class StringClockTrading(TradingFake):
+            def get_clock(self):
+                return {"timestamp": "2026-08-07T14:00:00+00:00",
+                        "is_open": "false"}
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True,
+                                  trading_client=StringClockTrading()))
+        with self.assertRaisesRegex(AlpacaError,
+                                     "clock is_open must be true or false"):
+            provider.clock()
+
+    def test_provider_rejects_non_boolean_pattern_day_trader(self):
+        class StringPdtTrading(TradingFake):
+            def get_account(self):
+                return {"id": "account", "status": "active",
+                        "equity": "100000", "cash": "100000",
+                        "buying_power": "100000", "currency": "USD",
+                        "pattern_day_trader": "false"}
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True,
+                                  trading_client=StringPdtTrading()))
+        with self.assertRaisesRegex(AlpacaError,
+                                     "pattern_day_trader must be true or false"):
+            provider.account()
+
     def test_market_status_does_not_construct_network_client(self):
         provider = AlpacaProvider({"mode": "paper"})
         market = MarketData(provider)

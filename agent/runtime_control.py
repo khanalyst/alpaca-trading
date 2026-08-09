@@ -11,6 +11,7 @@ from . import state
 from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
 from .execution_lifecycle import (
+    _TERMINAL_ORDER_STATUSES,
     _plain,
     _value,
 )
@@ -33,6 +34,10 @@ class RuntimeControlMixin:
                 self._release_lock()
 
     def _flatten_all_impl(self, reason: str = "operator") -> bool:
+        def order_status(order: Any) -> str:
+            value = _value(order, "status", "")
+            return str(getattr(value, "value", value)).split(".")[-1].lower()
+
         try:
             self.provider.cancel_all_orders()
         except Exception as exc:  # noqa: BLE001
@@ -42,8 +47,24 @@ class RuntimeControlMixin:
         retryable = {"canceled", "cancelled", "expired", "rejected",
                      "failed", "not_found"}
         for poll in range(6):
-            positions = self.provider.positions()
-            if not positions:
+            try:
+                positions = self.provider.positions()
+            except Exception as exc:  # noqa: BLE001
+                self._event("flatten_positions_error", {"reason": str(exc)})
+                return False
+            try:
+                broker_orders = self.provider.orders()
+            except Exception as exc:  # noqa: BLE001
+                # A missing order snapshot cannot prove cancellation.  Never
+                # report a successful flatten while the broker boundary is
+                # unavailable.
+                self._event("flatten_orders_error", {"reason": str(exc)})
+                return False
+            working_orders = [
+                order for order in (broker_orders or [])
+                if order_status(order) not in _TERMINAL_ORDER_STATUSES
+            ]
+            if not positions and not working_orders:
                 try:
                     self.reconcile()
                 except Exception as exc:  # noqa: BLE001
@@ -132,9 +153,39 @@ class RuntimeControlMixin:
                 return False
             if poll < 5:
                 time.sleep(0.25)
-        residual = self.provider.positions()
-        self._event("flatten_incomplete", {"reason": reason, "residual": _plain(residual)})
-        return not residual
+        positions_error = None
+        try:
+            residual_positions = self.provider.positions()
+        except Exception as exc:  # noqa: BLE001
+            self._event("flatten_positions_error", {"reason": str(exc)})
+            residual_positions = []
+            positions_error = str(exc)
+        try:
+            residual_orders = self.provider.orders()
+        except Exception as exc:  # noqa: BLE001
+            self._event("flatten_orders_error", {"reason": str(exc)})
+            residual_orders = []
+            orders_error = str(exc)
+        else:
+            orders_error = None
+        residual_working_orders = [
+            order for order in (residual_orders or [])
+            if order_status(order) not in _TERMINAL_ORDER_STATUSES
+        ]
+        evidence = {
+            "reason": reason,
+            "residual": _plain(residual_positions),
+            "residual_positions": _plain(residual_positions),
+            "residual_working_orders": _plain(residual_working_orders),
+            "residual_orders": _plain(residual_working_orders),
+        }
+        if positions_error is not None:
+            evidence["positions_error"] = positions_error
+        if orders_error is not None:
+            evidence["orders_error"] = orders_error
+        self._event("flatten_incomplete", evidence)
+        return (not residual_positions and not residual_working_orders and
+                positions_error is None and orders_error is None)
 
     def request_shutdown(self, reason: str = "shutdown") -> None:
         self.shutdown_reason = reason
@@ -175,7 +226,6 @@ class RuntimeControlMixin:
                 raise AlpacaError(runtime.get("kill_reason") or
                                   f"{self.mode} runtime is killed")
             runtime["state"] = state.RUNNING
-            runtime["operator_pause"] = False
             return runtime
         try:
             state.update_state(start_runtime)

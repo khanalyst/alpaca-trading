@@ -82,6 +82,11 @@ def _read(path: Path, fallback: Mapping[str, Any]) -> dict:
         raise StateCorruptionError(f"runtime state is unreadable: {exc}") from exc
     if not isinstance(value, Mapping):
         raise StateCorruptionError("runtime state must be a JSON object")
+    # A state file that predates the durable pause field cannot safely be
+    # interpreted as unpaused.  Keep DEFAULT fallback behavior for a missing
+    # file, while treating an existing incomplete file as corruption.
+    if "operator_pause" not in value:
+        raise StateCorruptionError("runtime state is missing operator_pause")
     try:
         return _validated(value)
     except ValueError as exc:
