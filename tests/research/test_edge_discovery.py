@@ -1,12 +1,18 @@
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 
+from research import edge_lab, edge_ledger, edge_ledger_store
 from research.edge_lab import DiscoveryError, EdgeLedger, discover
+from research.edge_ledger import (
+    SCHEMA_VERSION, canonical_json, content_hash, hash_config, hash_dataset,
+    hash_provenance, init_db, init_ledger,
+)
 from research.gates import (
     heldout_separation, structural_floor, verified_gate_envelope,
 )
@@ -74,6 +80,56 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     if record:
         ledger.record_verified_gate(run["run_id"], envelope)
     return run, envelope
+
+
+class EdgeLedgerStoreExtractionTests(unittest.TestCase):
+    def test_store_symbols_are_identical_through_edge_facades(self):
+        names = (
+            "VEHICLES", "LANES", "LIFECYCLE", "CANDIDATE", "BACKTEST_PASSED",
+            "SHADOW", "VALIDATED", "CHAMPION", "RETIRED", "DEMOTED",
+            "SCHEMA_VERSION", "DEFAULT_DB_PATH", "PAPER_DEMOTION_MIN_OUTCOMES",
+            "PAPER_DEMOTION_R_FLOOR",
+            "canonical_json", "content_hash", "hash_dataset", "hash_config",
+            "hash_provenance", "hash_file", "provenance_hash", "init_ledger", "init_db",
+        )
+        for name in names:
+            self.assertIs(getattr(edge_ledger, name), getattr(edge_ledger_store, name))
+            self.assertIs(getattr(edge_lab, name), getattr(edge_ledger_store, name))
+        self.assertIs(edge_ledger.EdgeLedger, edge_lab.EdgeLedger)
+
+    def test_hash_aliases_are_deterministic_and_reject_nonfinite_json(self):
+        value = {"z": "café", "a": [1, True, None]}
+        self.assertEqual(canonical_json(value), '{"a":[1,true,null],"z":"café"}')
+        self.assertIs(hash_dataset, content_hash)
+        self.assertIs(hash_config, content_hash)
+        self.assertIs(hash_provenance, content_hash)
+        expected = content_hash(value)
+        self.assertEqual(hash_dataset(value), expected)
+        self.assertEqual(hash_config(value), expected)
+        self.assertEqual(hash_provenance(value), expected)
+        with self.assertRaises(ValueError):
+            canonical_json(float("nan"))
+        with self.assertRaises(ValueError):
+            canonical_json(float("inf"))
+
+    def test_fresh_schema_initialization_is_idempotent_and_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "edge.sqlite3"
+            self.assertEqual(init_ledger(path), {"db_path": str(path), "schema": SCHEMA_VERSION})
+            self.assertEqual(init_db(path), {"db_path": str(path), "schema": SCHEMA_VERSION})
+            with sqlite3.connect(path) as db:
+                self.assertEqual(
+                    db.execute("SELECT value FROM ledger_meta WHERE key='schema'").fetchone()[0],
+                    str(SCHEMA_VERSION),
+                )
+            candidate = EdgeLedger(path).register_candidate(
+                "ibr.target.1_5r", hypothesis="immutable", config={})
+            with sqlite3.connect(path) as db:
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    db.execute(
+                        "UPDATE candidates SET hypothesis='changed' WHERE candidate_id=?",
+                        (candidate["candidate_id"],),
+                    )
 
 
 class EdgeDiscoveryLifecycleTests(unittest.TestCase):
