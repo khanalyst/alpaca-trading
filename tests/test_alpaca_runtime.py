@@ -2,7 +2,9 @@
 
 from datetime import datetime
 from decimal import Decimal
+import inspect
 import os
+import pickle
 import unittest
 from unittest.mock import patch
 
@@ -79,6 +81,66 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertIsNone(session._trading)
         self.assertIsNone(session._stock_data)
         self.assertIsNone(session._option_data)
+
+    def test_market_data_mixin_facade_identity_lazy_seam_and_pickle(self):
+        from agent import alpaca_provider as provider_module
+        from agent.alpaca_market_data import AlpacaMarketDataMixin
+
+        methods = ("option_contracts", "bars", "quotes", "option_chain",
+                   "option_snapshots", "option_candidates")
+        self.assertIs(provider_module.AlpacaMarketDataMixin, AlpacaMarketDataMixin)
+        self.assertTrue(issubclass(provider_module.AlpacaProvider,
+                                    AlpacaMarketDataMixin))
+        for name in methods:
+            with self.subTest(name=name):
+                self.assertIs(inspect.getattr_static(provider_module.AlpacaProvider, name),
+                              inspect.getattr_static(AlpacaMarketDataMixin, name))
+
+        provider = AlpacaProvider({"mode": "paper"})
+        bound = provider.option_chain
+        self.assertIs(bound.__self__, provider)
+        restored = pickle.loads(pickle.dumps(provider))
+        self.assertEqual(type(restored), provider_module.AlpacaProvider)
+        self.assertEqual(type(restored).__module__, "agent.alpaca_provider")
+
+        class OptionData:
+            def get_option_chain(self, request):
+                return {}
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True, option_data_client=OptionData()))
+        original = provider_module._canonical_feed
+        with patch.object(provider_module, "_canonical_feed",
+                          wraps=original) as feed:
+            provider.option_chain("SPY")
+        self.assertTrue(feed.called)
+
+        class ChainOptionData:
+            def get_option_chain(self, request):
+                return {"SPY260821C00600000": {
+                    "symbol": "SPY260821C00600000",
+                    "latest_quote": {
+                        "bid_price": "1", "ask_price": "2",
+                        "timestamp": "2026-08-09T12:00:00+00:00"}}}
+
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True, trading_client=object(),
+                                  option_data_client=ChainOptionData()))
+        with (patch.object(provider_module, "parse_occ_symbol",
+                           wraps=provider_module.parse_occ_symbol) as parse_occ,
+              patch.object(provider_module, "validate_equity_symbol",
+                           wraps=provider_module.validate_equity_symbol) as equity,
+              patch.object(provider_module, "validate_option_symbol",
+                           wraps=provider_module.validate_option_symbol) as option):
+            provider.option_snapshots("SPY")
+            provider.option_candidates(
+                "SPY", now=datetime(2026, 8, 9, 13, tzinfo=NEW_YORK),
+                underlying_price=Decimal("600"))
+        self.assertTrue(parse_occ.called)
+        self.assertTrue(equity.called)
+        self.assertTrue(option.called)
 
     def test_early_close_and_session_policy(self):
         day = normalize_calendar_day({"date": "2026-07-03", "open": "09:30", "close": "13:00"})
