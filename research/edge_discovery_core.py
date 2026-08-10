@@ -556,7 +556,7 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     placebo = deterministic_placebo_deltas(
         heldout, base_heldout, vehicle=vehicle)
     falsification = {
-        **falsification_gate(placebo["observed"], placebo["placebo"]),
+        **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
         "method": placebo["method"],
         "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),

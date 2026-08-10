@@ -1040,6 +1040,37 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertTrue(all(row["session_date"] >= "2024-02-01" for row in trades))
 
 
+def _sessions_failing_the_sealed_tail(start: datetime, count: int,
+                                     symbols=("SPY", "QQQ", "IWM", "DIA")) -> list[dict]:
+    """Profitable development sessions, then a losing final fifth.
+
+    ``seal_final_window`` reserves the last 20% of sessions, so this corpus
+    earns every development check and then loses on the one window selection
+    never saw.  That is the only shape in which the qualification checks can
+    be the sole reason a variant fails.
+    """
+    winner = [(100, 101, 99, 100), (100, 102, 99, 102),
+              (102, 103, 101, 102), (102, 107, 101, 106)]
+    loser = [(100, 101, 99, 100), (100, 102, 99, 102),
+             (102, 103, 101, 102), (102, 102, 94, 95)]
+    sealed_from = count - max(1, int(count * .2))
+    rows: list[dict] = []
+    for offset in range(count):
+        session = start + timedelta(days=offset)
+        values = winner if offset < sealed_from else loser
+        for index, symbol in enumerate(symbols):
+            shift = index * .01
+            for minute, (open_, high, low, close) in enumerate(values):
+                rows.append({
+                    "symbol": symbol,
+                    "timestamp": (session + timedelta(minutes=minute)).isoformat(),
+                    "open": open_ + shift, "high": high + shift,
+                    "low": low + shift, "close": close + shift,
+                    "volume": 1, "provider": "alpaca", "feed": "sip",
+                })
+    return rows
+
+
 def _drift_sessions(start: datetime, count: int,
                     symbols=("SPY", "QQQ", "IWM", "DIA")) -> list[dict]:
     """One session-long move and nothing else: pure directional drift.
@@ -1146,6 +1177,37 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         self.assertFalse(checks["null_control_delta_positive"])
         self.assertFalse(candidate["gate"]["passes"])
         self.assertEqual(candidate["status"], "retired")
+
+    def test_the_requested_alpha_reaches_the_falsification_decision(self):
+        # The factory passed alpha through; the IBR lane decided falsification
+        # at a hardcoded .05 whatever discover() was asked for.
+        rows = _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20)
+        with tempfile.TemporaryDirectory() as directory:
+            lenient = self._discover(rows, directory)
+        with tempfile.TemporaryDirectory() as directory:
+            strict = self._discover(rows, directory, alpha=.0005)
+        lenient_gate = lenient["variants"][0]["gate"]
+        strict_gate = strict["variants"][0]["gate"]
+        # Identical corpus and identical p-value; only the threshold moved.
+        self.assertEqual(strict_gate["falsification"]["p_value"],
+                         lenient_gate["falsification"]["p_value"])
+        self.assertTrue(lenient_gate["checks_without_family"]["falsification"])
+        self.assertFalse(strict_gate["checks_without_family"]["falsification"])
+
+    def test_a_losing_sealed_window_fails_a_variant_that_passed_development(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._discover(
+                _sessions_failing_the_sealed_tail(
+                    datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
+                directory)
+        candidate = result["variants"][0]
+        checks = candidate["gate"]["checks_without_family"]
+        # Development evidence is intact: the window is the only thing wrong.
+        self.assertTrue(checks["heldout_delta_positive"])
+        self.assertTrue(checks["heldout_net_pnl_positive"])
+        self.assertTrue(candidate["gate"]["qualification"]["available"])
+        self.assertFalse(checks["qualification_net_positive"])
+        self.assertFalse(candidate["gate"]["passes"])
 
     def test_a_corpus_too_thin_to_seal_a_window_is_underpowered_not_failed(self):
         with tempfile.TemporaryDirectory() as directory:
