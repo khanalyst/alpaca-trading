@@ -103,6 +103,13 @@ The last sessions of every evaluation corpus are sealed into a final
 qualification window before any worker is scheduled. Selection, mutation and
 diagnosis never receive them; the window is opened exactly once, by the
 orchestrator, for the last go/no-go, and refuses to be copied or serialized.
+Sealed sessions are scored, never split, so they enter no run, trade row or
+family correction, and the forward-only boundary clears them afterwards.
+
+Both research lanes are held to this standard. The explicit IBR lane and the
+autonomous factory lane share one randomized-entry null control and one sealed
+final window rather than each carrying its own; a corpus too thin to seal a
+window or to support rolling-origin folds is underpowered, not failed.
 
 The complete gate is durably persisted and re-verified before validation or
 champion selection. Re-verification recomputes the analysis — matched deltas,

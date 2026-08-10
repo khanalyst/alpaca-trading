@@ -156,11 +156,26 @@ def _llm_lineage_evidence(factory: FactoryLedger,
     return None
 
 
+def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
+    """Resolve one task's books, re-reading the corpus where it has a path.
+
+    A recorded corpus is re-read by the worker that needs it instead of being
+    sliced into every task dict and copied into every process.  The descriptor
+    carries the orchestrator's own three predicates, so the books are the same
+    objects in the same order and every hash computed from them is unchanged.
+    An in-memory corpus has nothing to re-read and still travels with the task.
+    """
+    corpus = payload.get("corpus")
+    if corpus is None:
+        return (list(payload["bars"]), list(payload["snapshots"]),
+                list(payload["quotes"]))
+    return corpus_slice(corpus["source"], after=corpus["after"],
+                        until=corpus["until"], exclude=corpus["exclude"])
+
+
 def _worker(payload: Mapping[str, Any]) -> dict:
     hypothesis = dict(payload["hypothesis"])
-    bars = list(payload["bars"])
-    snapshots = list(payload["snapshots"])
-    quotes = list(payload["quotes"])
+    bars, snapshots, quotes = _task_corpus(payload)
     vehicle = str(payload["vehicle"])
     mode = str(payload["mode"])
     starting_cash = float(payload["starting_cash"])
@@ -400,6 +415,14 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
     quotes = list(quote_rows)
+    # A recorded corpus is re-read by each worker from its own descriptor; an
+    # in-memory one has no path to re-read and still travels with the task.
+    # ``corpus_end`` pins the window against an append-only recorder writing
+    # further sessions while this cycle runs.
+    corpus_source = str(data) if isinstance(data, (str, Path)) else None
+    corpus_end = max([_session(bar) for bar in bars] +
+                     [snap.session_date.isoformat() for snap in snapshots] +
+                     [quote.session_date.isoformat() for quote in quotes])
     for hypothesis in active:
         mode = "shadow" if hypothesis.get("status") == "backtest_passed" else "backtest"
         boundary = (factory.last_boundary(hypothesis["hypothesis_id"], vehicle)
@@ -432,16 +455,24 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
              if snap.session_date.isoformat() in sealed_sessions],
             [quote for quote in selected_quotes
              if quote.session_date.isoformat() in sealed_sessions])
-        tasks.append({
-            "hypothesis": hypothesis, "bars": development_bars,
-            "snapshots": [snap for snap in selected_snapshots
-                          if snap.session_date.isoformat() not in sealed_sessions],
-            "quotes": [quote for quote in selected_quotes
-                       if quote.session_date.isoformat() not in sealed_sessions],
-            "vehicle": vehicle, "mode": mode,
+        task = {
+            "hypothesis": hypothesis, "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
             "starting_cash": starting_cash, "costs": model,
-        })
+        }
+        if corpus_source is None:
+            task.update({
+                "bars": development_bars,
+                "snapshots": [snap for snap in selected_snapshots
+                              if snap.session_date.isoformat() not in sealed_sessions],
+                "quotes": [quote for quote in selected_quotes
+                           if quote.session_date.isoformat() not in sealed_sessions],
+            })
+        else:
+            task["corpus"] = {"source": corpus_source, "after": boundary,
+                              "until": corpus_end,
+                              "exclude": sorted(sealed_sessions)}
+        tasks.append(task)
     if not tasks:
         return {"schema": FACTORY_SCHEMA, "status": "waiting_for_new_data",
                 "dataset_hash": dataset_hash, "vehicle": vehicle,
