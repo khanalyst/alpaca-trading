@@ -187,7 +187,16 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             exit_bar = entry_bar
             exit_at = entry_bar.timestamp
         else:
-            for bar in session_bars[index + 2:last_index + 1]:
+            # The scan starts at the entry bar, not the one after it.  Since
+            # commit 11e87c8 the broker's bracket legs are live the moment the
+            # entry fills, so a level touched later inside the entry bar does
+            # execute.  Entry is the bar's open — its first instant — so the
+            # whole of that bar's remaining range is after the entry and none
+            # of it is lookahead; nothing before index+1 is ever examined, and
+            # the signal itself still only saw bars[:index+1].  The intrabar
+            # path is unknowable either way, so the established stop-wins-ties
+            # rule resolves it against the strategy here too.
+            for bar in session_bars[index + 1:last_index + 1]:
                 if not _visible(bar, bar.end):
                     continue
                 if direction == "long":

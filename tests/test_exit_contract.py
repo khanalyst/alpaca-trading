@@ -38,29 +38,35 @@ RISING = [100.2, 100.4, 100.6, 100.8]
 FLAT = [100.8] * 8
 
 
-def _payloads(closes, opens=None):
+def _payloads(closes, opens=None, ranges=None):
     """``opens`` overrides an index's open, i.e. gaps that bar away from the
     previous close.  Without it every bar opens where the last one closed,
-    which is exactly the case that hides an anchor divergence."""
+    which is exactly the case that hides an anchor divergence.  ``ranges``
+    widens an index's ``(high, low)`` beyond its open/close, i.e. a wick that
+    trades through a resting leg and comes back."""
     rows = []
     opened = 100.0
     for index, close in enumerate(closes):
         opened = float((opens or {}).get(index, opened))
+        high, low = max(opened, close) + .05, min(opened, close) - .05
+        override = (ranges or {}).get(index)
+        if override is not None:
+            high, low = max(high, float(override[0])), min(low, float(override[1]))
         timestamp = BASE + timedelta(minutes=index)
         end = timestamp + timedelta(minutes=1)
         rows.append({
             "kind": "bar", "provider": "test", "feed": "sip", "symbol": "SPY",
             "timestamp": timestamp.isoformat(), "as_of": end.isoformat(),
             "observed_at": end.isoformat(), "open": opened,
-            "high": max(opened, close) + .05, "low": min(opened, close) - .05,
+            "high": high, "low": low,
             "close": close, "volume": 1000,
         })
         opened = close
     return rows
 
 
-def _bars(closes, opens=None):
-    return [normalize_underlying_bar(row) for row in _payloads(closes, opens)]
+def _bars(closes, opens=None, ranges=None):
+    return [normalize_underlying_bar(row) for row in _payloads(closes, opens, ranges)]
 
 
 class ExitBroker:
@@ -295,8 +301,9 @@ class ExitContractDifferentialTests(unittest.TestCase):
                 return result["closed"][0]["reason"], bar.end
         return None, None
 
-    def _differential(self, closes, name, *, force_flat_from=None, opens=None):
-        bars = _bars(closes, opens)
+    def _differential(self, closes, name, *, force_flat_from=None, opens=None,
+                      ranges=None, start_index=5):
+        bars = _bars(closes, opens, ranges)
         simulated = _simulate_trade(bars, SPEC, [], "equity")
         self.assertIsNotNone(simulated)
         engine, plan = self._open_runtime_trade(bars, name)
@@ -305,8 +312,9 @@ class ExitContractDifferentialTests(unittest.TestCase):
                 lambda now=None: now is not None and
                 now >= bars[force_flat_from].end)
         self.provider.positions_live = [self._position(bars[-1].close)]
-        # The simulator evaluates protective exits from the bar after entry.
-        reason, exit_at = self._drive(engine, bars, start_index=5)
+        # The simulator evaluates protective exits from the entry bar onwards;
+        # a caller testing the entry bar itself drives the runtime from it too.
+        reason, exit_at = self._drive(engine, bars, start_index=start_index)
         # The protective levels themselves, not only their timing, are part of
         # the shared contract: both engines anchor them to the signal close.
         self.assertAlmostEqual(simulated["stop_price"], plan["stop_price"], places=9)
@@ -418,6 +426,65 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.assertEqual(simulated["exit_reason"], "target")
         self.assertEqual(reason, "target")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+
+    def test_the_entry_bar_own_range_can_stop_the_trade_in_both_engines(self):
+        # Entry is bar 4's open at 100.80, above the 100.50 stop, so this is
+        # not a gap-through entry.  The rest of that same bar trades down to
+        # 100.40: the broker's stop leg is live from the fill and triggers.
+        closes = RISING + [100.45] + FLAT[:6]
+        simulated, _, reason, exit_at = self._differential(
+            closes, "runtime-entry-bar-stop", start_index=4)
+        self.assertEqual(simulated["exit_reason"], "stop")
+        self.assertIs(simulated["entry_gap_fill"], False)
+        self.assertEqual(simulated["exit_reference"], simulated["stop_price"])
+        self.assertEqual(reason, "stop")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertEqual(exit_at, _bars(closes)[4].end)
+
+    def test_the_entry_bar_own_range_can_target_the_trade_in_both_engines(self):
+        closes = RISING + [101.5] + FLAT[:6]
+        simulated, _, reason, exit_at = self._differential(
+            closes, "runtime-entry-bar-target", start_index=4)
+        self.assertEqual(simulated["exit_reason"], "target")
+        self.assertEqual(simulated["exit_reference"], simulated["target_price"])
+        self.assertEqual(reason, "target")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertEqual(exit_at, _bars(closes)[4].end)
+
+    def test_an_entry_bar_wick_alone_triggers_the_resting_leg(self):
+        # The close comes back inside the bracket, so only the wick touches.
+        # A resting broker leg does not wait for the close, so research must
+        # not either; the local poller cannot observe this and is not driven.
+        bars = _bars(RISING + FLAT, ranges={4: (100.85, 100.4)})
+        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        self.assertEqual(simulated["exit_reason"], "stop")
+        self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
+        self.assertAlmostEqual(simulated["exit_reference"], 100.5, places=9)
+        bars = _bars(RISING + FLAT, ranges={4: (101.45, 100.75)})
+        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        self.assertEqual(simulated["exit_reason"], "target")
+        self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
+        self.assertAlmostEqual(simulated["exit_reference"], 101.4, places=9)
+
+    def test_the_entry_bar_stop_wins_a_two_sided_tie(self):
+        # Both levels inside one bar's range: the intrabar path is unknowable,
+        # so the established rule resolves it against the strategy.
+        bars = _bars(RISING + FLAT, ranges={4: (101.45, 100.4)})
+        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        self.assertEqual(simulated["exit_reason"], "stop")
+        self.assertIs(simulated["tie_broken"], True)
+
+    def test_a_gapped_entry_still_fills_at_the_entry_not_the_entry_bar_low(self):
+        # The open is already through the stop, so the gap branch owns this
+        # trade: the fill is the entry price, never the better level the
+        # widened range would otherwise offer.
+        bars = _bars(RISING + FLAT, opens={4: 100.3}, ranges={4: (100.9, 100.0)})
+        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        self.assertEqual(simulated["exit_reason"], "stop")
+        self.assertIs(simulated["entry_gap_fill"], True)
+        self.assertEqual(simulated["exit_reference"], 100.3)
+        self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
+        self.assertAlmostEqual(simulated["realized_risk_per_unit"], 0.0, places=9)
 
     def test_a_legacy_trade_without_the_field_keeps_its_behaviour(self):
         bars = _bars(RISING + FLAT)
