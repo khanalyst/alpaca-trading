@@ -69,7 +69,8 @@ def _sessions(start: datetime, count: int) -> list[dict]:
 
 def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   passes: bool = True, record: bool = True,
-                  score: float = 1.0) -> tuple[dict, dict]:
+                  score: float = 1.0,
+                  scores: list[float] | None = None) -> tuple[dict, dict]:
     prefix = f"{lane}-{'pass' if passes else 'fail'}"
     fit = [] if lane == "shadow" else [
         {"vehicle": "equity", "session_date": "2024-01-02",
@@ -78,12 +79,17 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     # Eight held-out sessions: a sign-flip null over two clusters cannot
     # reach any useful significance level, so the old two-session fixture
     # could never have supported a passing falsification.
+    # ``scores`` gives one P&L per held-out session, which lets a fixture hold
+    # the mean delta fixed while moving its dispersion, and therefore its
+    # lower confidence bound.
+    values = list(scores) if scores is not None else [
+        score if passes else -1.0] * 8
     heldout = [
         {"vehicle": "equity", "symbol": "SPY",
          "session_date": f"2024-01-{day:02d}",
          "opportunity_id": f"{prefix}-held-{day}",
-         "net_pnl": score if passes else -1.0}
-        for day in range(3, 11)
+         "net_pnl": value}
+        for day, value in zip(range(3, 3 + len(values)), values)
     ]
     fit_floor = structural_floor(
         fit, vehicle="equity", min_trades=1, min_sessions=1,
@@ -696,6 +702,56 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertIsNone(ledger.select_champion(
                 vehicle="equity", min_confidence=.9))
             self.assertFalse(ledger.eligibility(candidate_id)["eligible"])
+
+    def _validated_candidate(self, ledger, variant, hypothesis, scores):
+        candidate = ledger.register_candidate(
+            variant, vehicle="equity", hypothesis=hypothesis, config={})
+        candidate_id = candidate["candidate_id"]
+        for lane in ("backtest", "shadow"):
+            _persist_gate(ledger, candidate_id, lane, scores=scores)
+            ledger.transition(candidate_id,
+                              "backtest_passed" if lane == "backtest" else "shadow",
+                              reason=f"{lane} proof")
+        ledger.transition(candidate_id, "validated", reason="validated proof")
+        return candidate_id
+
+    # A positive point estimate is not evidence.  SPIKY carries the higher
+    # mean held-out delta; STEADY the higher lower bound.  Both are positive,
+    # so both pass the gate and the ranking rule alone separates them.
+    STEADY = [3.5] * 8
+    SPIKY = [9.0, 1.0, 9.0, 1.0, 9.0, 1.0, 9.0, 1.0]
+    # Same mean as a flat +1 series, but a lower bound below zero.
+    ERRATIC = [30.0, -28.0, 25.0, -22.0, 20.0, -18.0, 15.0, -14.0]
+
+    def test_a_non_positive_lower_bound_cannot_be_recorded_as_a_passing_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.range.30", vehicle="equity",
+                hypothesis="positive mean, lower bound below zero", config={})
+            run, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest",
+                scores=self.ERRATIC, record=False)
+            self.assertGreater(envelope["performance"]["heldout_delta"], 0)
+            self.assertLessEqual(envelope["performance"]["heldout_delta_lcb"], 0)
+            self.assertFalse(envelope["checks"]["heldout_delta_lcb_positive"])
+            # A positive point estimate with a lower bound straddling zero
+            # cannot be claimed as a pass, so it can never reach champion.
+            with self.assertRaises(ValueError):
+                ledger.record_verified_gate(run["run_id"], envelope)
+
+    def test_champion_ranks_by_lower_bound_not_raw_heldout_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            steady = self._validated_candidate(
+                ledger, "ibr.baseline", "lower mean, tighter spread", self.STEADY)
+            spiky = self._validated_candidate(
+                ledger, "ibr.range.45", "higher mean, wider spread", self.SPIKY)
+            selected = ledger.select_champion(vehicle="equity", min_confidence=.9)
+            self.assertIsNotNone(selected)
+            # Ranking on raw held-out delta would have picked ``spiky``.
+            self.assertEqual(selected["candidate_id"], steady)
+            self.assertNotEqual(selected["candidate_id"], spiky)
 
     def test_new_champion_keeps_previous_proved_edge_validated(self):
         with tempfile.TemporaryDirectory() as directory:
