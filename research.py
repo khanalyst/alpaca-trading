@@ -16,6 +16,9 @@ REPO = Path(__file__).resolve().parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from research.calibration import json_report as calibration_report
+from research.costs import (CostModel, DEFAULT_FEE_BPS, DEFAULT_SLIPPAGE_BPS,
+                            DEFAULT_SPREAD_BPS)
 from research.ibr import IBRConfig, replay_ibr, replay_ibr_vehicles
 from research.edge_lab import (EdgeLedger, DEFAULT_DB_PATH, discover,
                                init_ledger)
@@ -61,9 +64,9 @@ def _config(args: argparse.Namespace) -> IBRConfig:
         range_minutes=args.range_minutes,
         stop_pct=args.stop_pct,
         target_pct=args.target_pct,
-        spread_bps=args.spread_bps,
-        slippage_bps=args.slippage_bps,
-        fee_bps=args.fee_bps,
+        costs=CostModel(spread_bps=args.spread_bps,
+                        slippage_bps=args.slippage_bps,
+                        fee_bps=args.fee_bps),
         force_flat=args.force_flat,
     )
 
@@ -116,9 +119,9 @@ def _add_cost_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--range-minutes", type=int, default=30)
     parser.add_argument("--stop-pct", type=float, default=.003)
     parser.add_argument("--target-pct", type=float, default=.006)
-    parser.add_argument("--spread-bps", type=float, default=1.0)
-    parser.add_argument("--slippage-bps", type=float, default=1.0)
-    parser.add_argument("--fee-bps", type=float, default=.5)
+    parser.add_argument("--spread-bps", type=float, default=DEFAULT_SPREAD_BPS)
+    parser.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
+    parser.add_argument("--fee-bps", type=float, default=DEFAULT_FEE_BPS)
     parser.add_argument("--force-flat", type=_time, default=_time("15:55"))
 
 
@@ -317,16 +320,36 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
 
 def cmd_factory_run(args: argparse.Namespace) -> int:
     agent_config = _agent_config(args)
+    config = _read_json(getattr(args, "config", None), {})
+    if not isinstance(config, dict):
+        raise ValueError("--config JSON must be an object")
     result = run_factory(
         args.data, db_path=_db(args), vehicle=args.vehicle,
         strategies=args.strategies, variants_per_strategy=args.variants,
         workers=args.workers, starting_cash=args.starting_cash,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha, max_generations=args.max_generations,
+        costs=CostModel.from_config(config),
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"))
     proofs = _emit_proofs(args, result, agent_config)
     print(json.dumps(result, sort_keys=True, default=str))
     return 0 if proofs else 2
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Score the shared cost model against the runtime's recorded fills."""
+    import sqlite3
+    from contextlib import closing
+    journal = Path(args.journal)
+    if not journal.is_file():
+        raise SystemExit(f"journal not found: {journal}")
+    config = _read_json(getattr(args, "config", None), {})
+    if not isinstance(config, dict):
+        raise ValueError("--config JSON must be an object")
+    with closing(sqlite3.connect(journal)) as db:
+        report = calibration_report(db, CostModel.from_config(config))
+    print(json.dumps(report, sort_keys=True, allow_nan=False))
+    return 2 if report["verdict"] == "optimistic" else 0
 
 
 def cmd_factory_status(args: argparse.Namespace) -> int:
@@ -353,6 +376,8 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--min-sessions", type=int, default=10)
         parser.add_argument("--alpha", type=float, default=.05)
         parser.add_argument("--max-generations", type=int, default=5)
+        parser.add_argument("--config", default=None,
+                            help="optional base runtime config JSON")
         parser.set_defaults(func=cmd_factory_run)
     return parser
 
@@ -417,6 +442,11 @@ def build_parser() -> argparse.ArgumentParser:
         _edge_parser(edge_sub, name, name)
     for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest", "edge-discover"):
         _edge_parser(sub, name, name.split("-", 1)[1])
+    calibrate = sub.add_parser(
+        "calibrate", help="compare modelled fill costs against journaled fills")
+    calibrate.add_argument("journal")
+    calibrate.add_argument("--config", default=None)
+    calibrate.set_defaults(func=cmd_calibrate)
     factory = sub.add_parser("factory", help="parallel autonomous strategy factory")
     factory_sub = factory.add_subparsers(dest="factory_command", required=True)
     for name in ("run", "status"):

@@ -269,9 +269,10 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
 
     def test_moved_helper_type_hints_resolve(self):
         result = get_type_hints(edge_discovery_core._read_discovery_rows)["return"]
-        _, bars, snapshots = get_args(result)
+        _, bars, snapshots, quotes = get_args(result)
         self.assertIs(get_args(bars)[0], edge_discovery_core.UnderlyingBar)
         self.assertIs(get_args(snapshots)[1], edge_discovery_core.OptionSnapshot)
+        self.assertIs(get_args(quotes)[0], edge_discovery_core.QuoteSnapshot)
 
     def test_moved_read_helper_forwards_legacy_facade_normalizer_patch(self):
         row = {
@@ -282,10 +283,11 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
         bar = mock.Mock()
         with mock.patch.object(edge_lab, "normalize_underlying_bar",
                                return_value=bar) as normalizer:
-            raw, bars, snapshots = edge_discovery_core._read_discovery_rows([row])
+            raw, bars, snapshots, quotes = edge_discovery_core._read_discovery_rows([row])
         self.assertEqual(raw, [row])
         self.assertEqual(bars, [bar])
         self.assertEqual(snapshots, {})
+        self.assertEqual(quotes, [])
         normalizer.assert_called_once_with(row, provider="alpaca", feed="sip")
 
     def test_discover_uses_patchable_edge_lab_helper_alias(self):

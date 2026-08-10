@@ -21,10 +21,11 @@ from .gates import (
     performance_floor, sample_counts, structural_floor, verified_gate_envelope,
     walk_forward_report,
 )
+from .costs import CostModel
 from .ibr import IBRConfig, replay_ibr
 from .market_data import (
     OptionSnapshot, UnderlyingBar, normalize_option_snapshot,
-    normalize_underlying_bar,
+    normalize_quote, normalize_underlying_bar,
 )
 from .stats import benjamini_hochberg
 
@@ -83,7 +84,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         raise DiscoveryError("vehicle must be equity or option")
     if lane not in {"auto", "backtest", "shadow"}:
         raise DiscoveryError("lane must be auto, backtest, or shadow")
-    raw_rows, bars, snapshots = _read_discovery_rows(data)
+    raw_rows, bars, snapshots, quotes = _read_discovery_rows(data)
     from agent.variants import load_registry
     registry_path = variants_path or Path(__file__).with_name("variants.yaml")
     variants = load_registry(registry_path)
@@ -105,7 +106,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     for variant in selected:
         cfg, effective = _effective_ibr_config(config, variant.overrides)
         result = replay_ibr(bars, config=cfg, vehicle=vehicle,
-                            option_snapshots=snapshots if vehicle == "option" else None)
+                            option_snapshots=snapshots if vehicle == "option" else None,
+                            quotes=quotes if vehicle == "equity" else None)
         base_results[variant.variant_id] = _opportunity_rows(result, bars, vehicle)
         effective_configs[variant.variant_id] = effective
 

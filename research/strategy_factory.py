@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 from agent.contracts.rule import hold_deadline, rule_variant_id, validate_rule_spec
+from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
@@ -36,7 +37,7 @@ from .llm_strategy import ProposalResult, RuleProposalAdapter
 from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
-    StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
+    NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
     _session, _simulate_trade, _thesis, _visible, diagnose, initial_hypotheses,
     mutate_from_diagnosis, replacement_hypothesis, simulate_account,
 )
@@ -109,8 +110,8 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                          spec: Mapping[str, Any], *, vehicle: str,
                          reference_rows: Sequence[Mapping], account_id: str,
                          starting_cash: float = 100_000.0, risk_pct: float = .5,
-                         spread_bps: float = 1.0, slippage_bps: float = 1.0,
-                         fee_bps: float = .5) -> dict:
+                         costs: CostModel | None = None,
+                         quotes: Sequence[Any] | None = None) -> dict:
     """Replay a chance-entry null with the strategy's own exit and cost rules.
 
     The null keeps the candidate's session/symbol/direction distribution and
@@ -118,6 +119,8 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
     cannot beat this is timing nothing: comparing only against the parent
     specification measures relative improvement, not edge against chance.
     """
+    model = costs or CostModel()
+    quote_index = index_quotes(quotes)
     grouped: dict[tuple[str, str], list] = {}
     for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
         grouped.setdefault((bar.symbol, bar.session_date.isoformat()), []).append(bar)
@@ -169,20 +172,42 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             last_index = probe
         exit_bar = session_bars[last_index]
         exit_ref = float(exit_bar.close)
+        exit_at = exit_bar.end
+        boundary_exit = True
         for bar in session_bars[entry_index + 1:last_index + 1]:
             if not _visible(bar, bar.end):
                 continue
             if direction == "long":
+                gap_stop, gap_target = bar.open <= stop, bar.open >= target
                 hit_stop, hit_target = bar.low <= stop, bar.high >= target
             else:
+                gap_stop, gap_target = bar.open >= stop, bar.open <= target
                 hit_stop, hit_target = bar.high >= stop, bar.low <= target
+            # The null shares the candidate's exit rules, gap-through included.
+            # Giving chance entries an exit realism the candidate does not have
+            # would bias every delta measured against them.
+            if gap_stop or gap_target:
+                exit_ref, exit_bar, exit_at = float(bar.open), bar, bar.timestamp
+                break
             if hit_stop or hit_target:
                 exit_ref = stop if hit_stop else target
-                exit_bar = bar
+                exit_bar, exit_at, boundary_exit = bar, bar.end, False
                 break
         entry_ref = entry_underlying
+        entry_source = exit_source = BAR
         multiplier = 1
         risk_per_unit = distance
+        if vehicle == "equity":
+            side = "buy" if direction == "long" else "sell"
+            quoted = quote_fill(quote_index, symbol=symbol,
+                                at=entry_bar.timestamp, side=side)
+            if quoted is not None:
+                entry_ref, entry_source = quoted, QUOTE
+            quoted_exit = (quote_fill(quote_index, symbol=symbol, at=exit_at,
+                                      side="sell" if direction == "long" else "buy")
+                           if boundary_exit else None)
+            if quoted_exit is not None:
+                exit_ref, exit_source = quoted_exit, QUOTE
         if vehicle == "option":
             entry_snap = _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
                                     direction=direction, cutoff=entry_bar.end)
@@ -200,22 +225,27 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         quantity = math.floor(max(0.0, cash * float(risk_pct) / 100.0) /
                               max(float(risk_per_unit), 1e-9))
         if vehicle == "equity":
-            quantity = min(quantity, math.floor(max(0.0, cash * .25) /
-                                                max(float(entry_ref), 1e-9)))
+            # A chance entry derives its own stop from its own fill, so the
+            # plan anchor and the fill are the same price here.
+            quantity = min(quantity, math.floor(
+                max(0.0, cash * NOTIONAL_CAP_PCT / 100.0) /
+                max(float(entry_underlying), 1e-9)))
         if quantity <= 0:
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "isolated account risk budget cannot fund one unit"))
             continue
         execution_direction = "long" if vehicle == "option" else direction
-        spread = 0.0 if vehicle == "option" else spread_bps / 20_000.0
-        slip = slippage_bps / 10_000.0
-        entry_sign = 1.0 if execution_direction == "long" else -1.0
-        entry = float(entry_ref) * (1 + entry_sign * (spread + slip))
-        exit_price = float(exit_ref) * (1 - entry_sign * (spread + slip))
+        executable = vehicle == "option"
+        entry = model.execution_price(
+            entry_ref, execution_direction, entry=True,
+            executable_quote=executable or entry_source == QUOTE)
+        exit_price = model.execution_price(
+            exit_ref, execution_direction, entry=False,
+            executable_quote=executable or exit_source == QUOTE)
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
-        costs = (abs(entry) + abs(exit_price)) * quantity * multiplier * fee_bps / 10_000.0
-        net = gross - costs
+        fees = model.fees(entry, exit_price, quantity, multiplier)
+        net = gross - fees
         before = cash
         cash += net
         peak = max(peak, cash)
@@ -225,7 +255,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "entry_timestamp": entry_bar.timestamp.isoformat(),
                      "exit_timestamp": exit_bar.end.isoformat(),
                      "quantity": quantity, "entry_price": entry,
-                     "exit_price": exit_price, "gross_pnl": gross, "costs": costs,
+                     "exit_price": exit_price, "gross_pnl": gross, "costs": fees,
                      "net_pnl": net,
                      "return_value": net / before if before > 0 else 0.0,
                      "no_trade": False})
@@ -239,9 +269,11 @@ def _worker(payload: Mapping[str, Any]) -> dict:
     hypothesis = dict(payload["hypothesis"])
     bars = list(payload["bars"])
     snapshots = list(payload["snapshots"])
+    quotes = list(payload["quotes"])
     vehicle = str(payload["vehicle"])
     mode = str(payload["mode"])
     starting_cash = float(payload["starting_cash"])
+    costs = payload["costs"]
     if mode == "backtest":
         sessions = sorted({_session(bar) for bar in bars})
         cut = max(1, min(len(sessions) - 1, int(len(sessions) * .7))) if len(sessions) > 1 else len(sessions)
@@ -250,7 +282,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         root_account = simulate_account(
             fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
             account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
-            starting_cash=starting_cash,
+            starting_cash=starting_cash, costs=costs, quotes=quotes,
         )
         diagnostic = diagnose(root_account["rows"], starting_cash=starting_cash)
         specs = mutate_from_diagnosis(
@@ -261,7 +293,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
     control_account = simulate_account(
         bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
         account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
-        starting_cash=starting_cash,
+        starting_cash=starting_cash, costs=costs, quotes=quotes,
     )
     variants = []
     null_rows: dict[str, list] = {}
@@ -270,12 +302,12 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         account_id = f"sim:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}:{uuid.uuid4().hex[:8]}"
         account = simulate_account(
             bars, snapshots, spec, vehicle=vehicle, account_id=account_id,
-            starting_cash=starting_cash,
+            starting_cash=starting_cash, costs=costs, quotes=quotes,
         )
         null_rows[variant_id] = null_control_account(
             bars, snapshots, spec, vehicle=vehicle, reference_rows=account["rows"],
             account_id=f"null:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}",
-            starting_cash=starting_cash)["rows"]
+            starting_cash=starting_cash, costs=costs, quotes=quotes)["rows"]
         variants.append({
             "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
             "account": account, "diagnostic": diagnose(account["rows"], starting_cash=starting_cash),
@@ -444,6 +476,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 min_trades: int = 100, min_sessions: int = 10,
                 alpha: float = .05, max_generations: int = 5,
                 strategy_llm: Mapping[str, Any] | None = None,
+                costs: CostModel | None = None,
                 proposal_adapter: RuleProposalAdapter | None = None) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
     if vehicle not in {"equity", "option"}:
@@ -458,11 +491,12 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError("starting_cash, min_trades and min_sessions must be positive")
     if not 0 < alpha <= 1:
         raise FactoryError("alpha must be in (0,1]")
+    model = costs or CostModel()
     llm_config = dict(strategy_llm or {})
     llm_enabled = bool(llm_config.get("enabled", False))
     if llm_enabled and not str(llm_config.get("model") or "").strip() and proposal_adapter is None:
         raise FactoryError("strategy LLM model is required when autonomous LLM replacement is enabled")
-    raw_rows, bars, snapshot_map = _read_discovery_rows(data)
+    raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(data)
     dataset_hash = content_hash(raw_rows)
     factory = FactoryLedger(db_path)
     duplicate = factory.existing_cycle(dataset_hash, vehicle)
@@ -481,14 +515,17 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0}
     edge = EdgeLedger(db_path)
     tasks = []
-    sealed_windows: dict[str, tuple[Any, list]] = {}
+    sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
+    quotes = list(quote_rows)
     for hypothesis in active:
         mode = "shadow" if hypothesis.get("status") == "backtest_passed" else "backtest"
         boundary = (factory.last_boundary(hypothesis["hypothesis_id"], vehicle)
                     if mode == "shadow" else hypothesis.get("not_before"))
         selected_bars = [bar for bar in bars if boundary is None or _session(bar) > boundary]
         selected_snapshots = [snap for snap in snapshots if boundary is None or snap.session_date.isoformat() > boundary]
+        selected_quotes = [quote for quote in quotes
+                           if boundary is None or quote.session_date.isoformat() > boundary]
         specs = _existing_specs(edge, hypothesis["hypothesis_id"], vehicle) if mode == "shadow" else []
         if mode == "shadow" and not specs:
             factory.event(hypothesis["hypothesis_id"], "backtest_passed",
@@ -510,14 +547,18 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         sealed_windows[hypothesis["hypothesis_id"]] = (
             sealed,
             [snap for snap in selected_snapshots
-             if snap.session_date.isoformat() in sealed_sessions])
+             if snap.session_date.isoformat() in sealed_sessions],
+            [quote for quote in selected_quotes
+             if quote.session_date.isoformat() in sealed_sessions])
         tasks.append({
             "hypothesis": hypothesis, "bars": development_bars,
             "snapshots": [snap for snap in selected_snapshots
                           if snap.session_date.isoformat() not in sealed_sessions],
+            "quotes": [quote for quote in selected_quotes
+                       if quote.session_date.isoformat() not in sealed_sessions],
             "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
-            "starting_cash": starting_cash,
+            "starting_cash": starting_cash, "costs": model,
         })
     if not tasks:
         return {"schema": FACTORY_SCHEMA, "status": "waiting_for_new_data",
@@ -562,20 +603,23 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     qualifications: dict[str, dict] = {}
     for worker in worker_results:
         hypothesis_id = str(worker["hypothesis"]["hypothesis_id"])
-        sealed, sealed_snapshots = sealed_windows.get(hypothesis_id, (None, []))
+        sealed, sealed_snapshots, sealed_quotes = sealed_windows.get(
+            hypothesis_id, (None, [], []))
         qualification_bars = (sealed.release(reason=f"final qualification {hypothesis_id}")
                               if sealed is not None and sealed.session_dates else None)
         sessions = tuple(sealed.session_dates) if sealed is not None else ()
         control_rows = (simulate_account(
             qualification_bars, sealed_snapshots, worker["hypothesis"]["rule_spec"],
             vehicle=vehicle, account_id=f"qualification:control:{hypothesis_id}",
-            starting_cash=starting_cash)["rows"] if qualification_bars else [])
+            starting_cash=starting_cash, costs=model,
+            quotes=sealed_quotes)["rows"] if qualification_bars else [])
         for variant in worker["variants"]:
             rows = (simulate_account(
                 qualification_bars, sealed_snapshots, variant["rule_spec"],
                 vehicle=vehicle,
                 account_id=f"qualification:{hypothesis_id}:{variant['variant_id']}",
-                starting_cash=starting_cash)["rows"] if qualification_bars else [])
+                starting_cash=starting_cash, costs=model,
+                quotes=sealed_quotes)["rows"] if qualification_bars else [])
             qualifications[f"{hypothesis_id}:{variant['variant_id']}"] = (
                 _qualification_report(rows, control_rows, vehicle=vehicle,
                                       sessions=sessions))

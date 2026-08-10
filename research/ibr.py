@@ -14,7 +14,8 @@ from datetime import date, datetime, time, timedelta
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from .market_data import OptionSnapshot, UnderlyingBar
+from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
+from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 
 
 class ReplayError(ValueError):
@@ -28,9 +29,9 @@ class IBRConfig:
     force_flat: time = time(15, 55)
     stop_pct: float = 0.003
     target_pct: float = 0.006
-    spread_bps: float = 1.0
-    slippage_bps: float = 1.0
-    fee_bps: float = 0.5
+    # One shared executable-cost model; there are deliberately no per-replay
+    # spread/slippage/fee knobs left to drift from the other lanes.
+    costs: CostModel = field(default_factory=CostModel)
     timezone: str = "America/New_York"
     quantity: float = 1.0
     target_r: float | None = None
@@ -49,9 +50,8 @@ class IBRConfig:
         for name in ("stop_pct", "target_pct"):
             if getattr(self, name) <= 0:
                 raise ReplayError(f"{name} must be positive")
-        for name in ("spread_bps", "slippage_bps", "fee_bps"):
-            if getattr(self, name) < 0:
-                raise ReplayError(f"{name} cannot be negative")
+        if not isinstance(self.costs, CostModel):
+            raise ReplayError("costs must be a CostModel")
         if self.quantity <= 0:
             raise ReplayError("quantity must be positive")
         if self.target_r is not None and self.target_r <= 0:
@@ -92,6 +92,10 @@ class IBRTrade:
     tie_broken: bool = False
     gap_fill: bool = False
     contract_multiplier: int = 1
+    # Which observation priced each side: a recorded quote at the fill instant,
+    # or the bar it fell back to.  Calibration needs to know the difference.
+    entry_fill_source: str = BAR
+    exit_fill_source: str = BAR
 
 
 @dataclass
@@ -160,42 +164,31 @@ def _validate_bars(bars: Sequence[UnderlyingBar], cfg: IBRConfig) -> list[Underl
     return ordered
 
 
-def _execution_price(reference: float, direction: str, *, entry: bool,
-                     cfg: IBRConfig, executable_quote: bool = False) -> float:
-    """Apply half-spread plus adverse slippage to an execution reference."""
-    # An option ``ask``/``bid`` is already executable. Applying a modelled
-    # half-spread on top would charge the same spread twice. Underlying OHLC
-    # references still use the configured spread model.
-    spread = 0.0 if executable_quote else cfg.spread_bps / 20_000.0
-    slip = cfg.slippage_bps / 10_000.0
-    # Long buys at ask and sells at bid; short mirrors it.
-    sign = 1.0 if ((direction == "long") == entry) else -1.0
-    return reference * (1.0 + sign * (spread + slip))
-
-
 def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      range_high: float, range_low: float, signal: UnderlyingBar,
                      entry_bar: UnderlyingBar, entry_reference: float,
                      exit_bar: UnderlyingBar, exit_reference: float,
                      reason: str, tie: bool, gap: bool, cfg: IBRConfig,
                      stop_price: float, target_price: float, multiplier: int = 1,
-                     entry_timestamp: datetime | None = None) -> IBRTrade:
+                     entry_timestamp: datetime | None = None,
+                     entry_source: str = BAR, exit_source: str = BAR) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
     # P&L even when the underlying direction is short.
     execution_direction = "long" if vehicle == "option" else direction
-    executable_quote = vehicle == "option"
-    entry_price = _execution_price(entry_reference, execution_direction,
-                                   entry=True, cfg=cfg,
-                                   executable_quote=executable_quote)
-    exit_price = _execution_price(exit_reference, execution_direction,
-                                  entry=False, cfg=cfg,
-                                  executable_quote=executable_quote)
+    # An option ``ask``/``bid`` and a recorded equity quote are already
+    # executable; charging a modelled half-spread on top would bill the same
+    # spread twice.  A bar-derived reference still pays the modelled spread.
+    entry_price = cfg.costs.execution_price(
+        entry_reference, execution_direction, entry=True,
+        executable_quote=vehicle == "option" or entry_source == QUOTE)
+    exit_price = cfg.costs.execution_price(
+        exit_reference, execution_direction, entry=False,
+        executable_quote=vehicle == "option" or exit_source == QUOTE)
     signed_move = ((exit_price - entry_price) if execution_direction == "long"
                    else (entry_price - exit_price))
     gross = signed_move * cfg.quantity * multiplier
-    notional = (abs(entry_price) + abs(exit_price)) * cfg.quantity * multiplier
-    costs = notional * cfg.fee_bps / 10_000.0
+    costs = cfg.costs.fees(entry_price, exit_price, cfg.quantity, multiplier)
     return IBRTrade(
         vehicle=vehicle, session_date=day, symbol=symbol, direction=direction,
         range_high=range_high, range_low=range_low,
@@ -205,12 +198,14 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         exit_timestamp=exit_bar.timestamp, exit_reference=exit_reference,
         exit_price=exit_price, exit_reason=reason, gross_pnl=gross,
         costs=costs, net_pnl=gross - costs, tie_broken=tie, gap_fill=gap,
-        contract_multiplier=multiplier,
+        contract_multiplier=multiplier, entry_fill_source=entry_source,
+        exit_fill_source=exit_source,
     )
 
 
 def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     cfg: IBRConfig, option_snapshots: Mapping[datetime, OptionSnapshot] | None = None,
+                    quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None,
                     multiplier: int = 1) -> IBRTrade | None:
     if not bars:
         return None
@@ -277,9 +272,18 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         direction = "long" if (high - signal.open) <= (signal.open - low) else "short"
     underlying_entry = entry_bar.open
     entry_ref = underlying_entry
+    entry_source = BAR
     # Option snapshots are selected at/before the entry bar.  A caller may pass
     # a sparse mapping from timestamp to snapshot; absence is explicit no-data.
     selected_contract = None
+    if vehicle == "equity":
+        # The fill instant is the entry bar's open.  A quote recorded at that
+        # instant is the real executable price; the bar open is a trade print
+        # that has to be marked up by the modelled spread instead.
+        quoted = quote_fill(quotes, symbol=symbol, at=entry_bar.timestamp,
+                            side="buy" if direction == "long" else "sell")
+        if quoted is not None:
+            entry_ref, entry_source = quoted, QUOTE
     if vehicle == "option":
         if option_snapshots is None:
             return None
@@ -332,6 +336,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         if not eligible_exits:
             return None
         return max(eligible_exits, key=lambda item: item.timestamp).bid
+
+    exit_side = "sell" if direction == "long" else "buy"
+
+    def boundary_exit(reference: float, at: datetime) -> tuple[float, str]:
+        """Price a fill that happens at a bar boundary, quote-first."""
+        if vehicle != "equity":
+            return reference, BAR
+        quoted = quote_fill(quotes, symbol=symbol, at=at, side=exit_side)
+        return (quoted, QUOTE) if quoted is not None else (reference, BAR)
+
     for bar in post[signal_idx + 1:]:
         if _local(bar.timestamp, zone) >= close_at:
             break
@@ -349,8 +363,11 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             hit_stop, hit_target = bar.high >= stop, bar.low <= target
         if gap_stop or gap_target:
             reason = "stop" if gap_stop else "target"
-            exit_reference = (option_exit_reference(bar.timestamp)
-                              if vehicle == "option" else bar.open)
+            exit_source = BAR
+            if vehicle == "option":
+                exit_reference = option_exit_reference(bar.timestamp)
+            else:
+                exit_reference, exit_source = boundary_exit(bar.open, bar.timestamp)
             if exit_reference is None:
                 return None
             return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
@@ -359,7 +376,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     exit_bar=bar, exit_reference=exit_reference,
                                     reason=reason, tie=False, gap=True, cfg=cfg,
                                     multiplier=multiplier, stop_price=stop,
-                                    target_price=target)
+                                    target_price=target, entry_source=entry_source,
+                                    exit_source=exit_source)
         if hit_stop or hit_target:
             # Stop wins if both are touched by one candle.
             reason = "stop" if hit_stop else "target"
@@ -374,19 +392,21 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     exit_bar=bar, exit_reference=exit_reference,
                                     reason=reason, tie=hit_stop and hit_target, gap=False,
                                     cfg=cfg, multiplier=multiplier,
-                                    stop_price=stop, target_price=target)
+                                    stop_price=stop, target_price=target,
+                                    entry_source=entry_source)
     # Force-flat at the last completed bar before the configured close.
     boundary = next((b for b in post if _local(b.timestamp, zone) >= close_at
                      and _visible(b, b.timestamp)), None)
+    exit_source = BAR
     if boundary is not None:
         last = boundary
-        exit_ref = last.open
+        exit_ref, exit_source = boundary_exit(last.open, last.timestamp)
     else:
         candidates = [b for b in post if b.end <= close_at and _visible(b, b.end)]
         if not candidates:
             return None
         last = candidates[-1]
-        exit_ref = last.close
+        exit_ref, exit_source = boundary_exit(last.close, last.end)
     if vehicle == "option":
         exit_ref = option_exit_reference(last.timestamp)
         if exit_ref is None:
@@ -397,12 +417,14 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             exit_bar=last, exit_reference=exit_ref,
                             reason="force_flat", tie=False, gap=False, cfg=cfg,
                             multiplier=multiplier, stop_price=stop,
-                            target_price=target)
+                            target_price=target, entry_source=entry_source,
+                            exit_source=exit_source)
 
 
 def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
                config: IBRConfig | None = None, vehicle: str = "equity",
-               option_snapshots: Mapping[datetime, OptionSnapshot] | None = None) -> IBRResult:
+               option_snapshots: Mapping[datetime, OptionSnapshot] | None = None,
+               quotes: Iterable[QuoteSnapshot] | None = None) -> IBRResult:
     """Replay each session and return a result scoped to one vehicle.
 
     ``vehicle`` is either ``equity`` or ``option``.  To compare vehicles call
@@ -411,6 +433,7 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
     if vehicle not in {"equity", "option"}:
         raise ReplayError("vehicle must be 'equity' or 'option'")
     cfg = config or IBRConfig()
+    quote_index = index_quotes(quotes)
     rows = _validate_bars(list(bars), cfg)
     if symbol is not None:
         rows = [b for b in rows if b.symbol == symbol]
@@ -421,7 +444,8 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
     result = IBRResult(vehicle=vehicle)
     for (sym, _), session_bars in sorted(sessions.items(), key=lambda item: item[0]):
         trade = _replay_session(session_bars, vehicle=vehicle, symbol=sym, cfg=cfg,
-                                option_snapshots=option_snapshots)
+                                option_snapshots=option_snapshots,
+                                quotes=quote_index)
         if trade is not None:
             result.trades.append(trade)
     return result
@@ -431,6 +455,7 @@ def replay_ibr_vehicles(
         bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
         config: IBRConfig | None = None,
         option_snapshots: Mapping[datetime, OptionSnapshot] | None = None,
+        quotes: Iterable[QuoteSnapshot] | None = None,
         vehicles: Sequence[str] = ("equity", "option"),
     ) -> dict[str, IBRResult]:
     """Run independent vehicle books and return them keyed by vehicle.
@@ -442,10 +467,11 @@ def replay_ibr_vehicles(
     if len(set(requested)) != len(requested):
         raise ReplayError("vehicles must be unique")
     materialized = list(bars)
+    materialized_quotes = list(quotes or ())
     return {
         vehicle: replay_ibr(
             materialized, symbol=symbol, config=config, vehicle=vehicle,
-            option_snapshots=option_snapshots)
+            option_snapshots=option_snapshots, quotes=materialized_quotes)
         for vehicle in requested
     }
 

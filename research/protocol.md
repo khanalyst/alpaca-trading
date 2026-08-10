@@ -16,11 +16,22 @@ Every replay must establish the following invariants:
 - entries occur on the next bar, never on the signal bar;
 - an early, reversed, or duplicate bar fails closed;
 - same-bar stop/target ties resolve to the stop;
-- a gap through a level fills at the gap open;
-- spread, slippage, and both-side fees are charged;
+- a gap through a level, on entry or exit, fills at the gap open;
+- a fill landing on a bar boundary uses a recorded quote at that instant when
+  one exists, and otherwise records that it fell back to the bar;
+- spread, slippage, and both-side fees are charged from one shared model;
 - positions are force-flat before the session close;
 - equity and single-leg long-option books have separate samples, costs, and
   P&L; multi-leg and short option structures are outside the protocol.
+
+`research/costs.py` owns the single expected-cost model and the fill
+arithmetic every lane spends it through; no lane carries its own
+spread/slippage/fee numbers. Its parameters come from one `costs` config
+block. The runtime's `execution.max_slippage_bps` and `max_spread_bps` are
+rejection caps, not expectations: they bound the model, and a model expecting
+a cost the runtime would refuse to submit fails closed. `research/calibration.py`
+scores that model against the entry fills recorded in the runtime journal and
+names an optimistic model rather than absorbing it.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
 missing or partial opening range is `no trade`, not an imputed range. A missing

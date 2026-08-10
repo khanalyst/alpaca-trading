@@ -13,7 +13,8 @@ import json
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .market_data import OptionSnapshot, UnderlyingBar
+from .costs import CostModel
+from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 
 
 def _facade_dependency(name: str):
@@ -27,6 +28,10 @@ def normalize_underlying_bar(*args, **kwargs):
 
 def normalize_option_snapshot(*args, **kwargs):
     return _facade_dependency("normalize_option_snapshot")(*args, **kwargs)
+
+
+def normalize_quote(*args, **kwargs):
+    return _facade_dependency("normalize_quote")(*args, **kwargs)
 
 
 def IBRConfig(*args, **kwargs):
@@ -81,8 +86,9 @@ class DiscoveryError(ValueError):
     """Raised when a discovery corpus cannot be evaluated safely."""
 
 
-def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[list[dict], list[UnderlyingBar], dict[str, OptionSnapshot]]:
-    """Load one normalized JSONL corpus, retaining bars and option quotes."""
+def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
+        list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
+    """Load one normalized JSONL corpus: bars, option quotes, equity quotes."""
     if isinstance(data, (str, Path)):
         source = Path(data)
         try:
@@ -96,6 +102,7 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[list[dic
         raise DiscoveryError("discovery rows must be JSON objects")
     bars: list[UnderlyingBar] = []
     snapshots: dict[str, OptionSnapshot] = {}
+    quotes: list[QuoteSnapshot] = []
     for number, source_row in enumerate(raw_rows, 1):
         row = dict(source_row)
         kind = str(row.get("kind", "bar")).lower()
@@ -113,13 +120,19 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[list[dic
                     row = flattened
                 snap = normalize_option_snapshot(row, provider=provider, feed=feed)
                 snapshots[f"{snap.timestamp.isoformat()}|{snap.contract.symbol}"] = snap
-            # Quotes and metadata are retained in the dataset hash but are not
-            # silently fed into an OHLC replay.
+            elif kind in {"quote", "equity_quote", "underlying_quote"}:
+                # An equity quote is the executable price at its instant.  It
+                # is used only where a fill lands on that instant; everything
+                # else still falls back to the bar and says so.
+                quotes.append(normalize_quote(row, provider=provider, feed=feed))
+            # Other metadata stays in the dataset hash without being fed into
+            # an OHLC replay.
         except (TypeError, ValueError) as exc:
             raise DiscoveryError(f"row {number}: {exc}") from exc
     if not bars:
         raise DiscoveryError("discovery corpus contains no underlying bars")
-    return raw_rows, bars, snapshots
+    quotes.sort(key=lambda item: (item.symbol, item.timestamp))
+    return raw_rows, bars, snapshots, quotes
 
 
 def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
@@ -144,8 +157,10 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
             node = node.setdefault(part, {})
         if parts:
             node[parts[-1]] = value
-    research = dict(source.get("research") or {})
-    execution = dict(source.get("execution") or {})
+    # One cost model for every lane.  `execution.max_slippage_bps` is a
+    # rejection cap, not an expectation: it bounds the model rather than
+    # supplying it.
+    costs = CostModel.from_config(source)
     cfg = IBRConfig(
         range_minutes=int(strategy.get("range_minutes", 15)),
         stop_pct=float(strategy.get("stop_pct", .003)),
@@ -153,9 +168,7 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
         target_r=float(strategy["target_r"]) if strategy.get("target_r") is not None else None,
         range_stop=bool(strategy.get("range_stop", True)),
         breakout_buffer_bps=float(strategy.get("breakout_buffer_bps", 5.0)),
-        spread_bps=float(research.get("spread_bps", strategy.get("spread_bps", 1.0))),
-        slippage_bps=float(research.get("slippage_bps", execution.get("max_slippage_bps", 1.0))),
-        fee_bps=float(research.get("fee_bps", .5)),
+        costs=costs,
         close_confirmed=bool(close_confirmed),
         timezone=str((source.get("session") or {}).get("timezone", "America/New_York")),
     )
@@ -163,6 +176,7 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
     effective["strategy"] = strategy
     effective["replay"] = {"close_confirmed": cfg.close_confirmed,
                             "range_stop": cfg.range_stop}
+    effective["costs"] = costs.as_dict()
     return cfg, effective
 
 
