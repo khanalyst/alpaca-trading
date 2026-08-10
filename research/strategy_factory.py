@@ -419,7 +419,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     # in-memory one has no path to re-read and still travels with the task.
     # ``corpus_end`` pins the window against an append-only recorder writing
     # further sessions while this cycle runs.
-    corpus_source = str(data) if isinstance(data, (str, Path)) else None
+    # Absolute: a worker resolves the descriptor in its own process, and a
+    # relative path is only the same file by coincidence of working directory.
+    corpus_source = (str(Path(data).resolve()) if isinstance(data, (str, Path))
+                     else None)
     corpus_end = max([_session(bar) for bar in bars] +
                      [snap.session_date.isoformat() for snap in snapshots] +
                      [quote.session_date.isoformat() for quote in quotes])
