@@ -18,7 +18,8 @@ import random
 from typing import Any, Mapping, Sequence
 import uuid
 
-from agent.contracts.rule import hold_deadline, rule_variant_id, validate_rule_spec
+from agent.contracts.rule import (RULE_FAMILIES, hold_deadline, rule_variant_id,
+                                  validate_rule_spec)
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
@@ -44,6 +45,60 @@ from .factory_core import (
 
 DEFAULT_WORKERS = 7
 MAX_WORKERS = 16
+# Rotation makes generation exhaustion recoverable without removing the cap.
+# A slot may be reseeded with a fresh family at most ``MAX_ROTATIONS`` times,
+# each rotation granting one further ``max_generations`` mutation budget, and
+# at most ``ROTATION_BUDGET`` rotations may happen in one cycle.  Hypotheses
+# per slot therefore stay bounded by
+# ``max_generations * (MAX_ROTATIONS + 1)`` for the life of the ledger.
+ROTATION_BUDGET = 1
+MAX_ROTATIONS = 2
+
+
+def _slot_rotations(factory: FactoryLedger, vehicle: str, slot: int) -> int:
+    """Count the bounded family rotations a slot has already spent."""
+    total = 0
+    for item in factory.hypotheses(vehicle=vehicle):
+        if int(item["slot"]) != int(slot):
+            continue
+        for event in factory.events(str(item["hypothesis_id"])):
+            payload = event.get("payload")
+            if (event.get("status") == "retired" and isinstance(payload, Mapping)
+                    and payload.get("rotation") is True):
+                total += 1
+    return total
+
+
+def _slot_families(factory: FactoryLedger, vehicle: str, slot: int) -> set[str]:
+    return {str(item["family"]) for item in factory.hypotheses(vehicle=vehicle)
+            if int(item["slot"]) == int(slot)}
+
+
+def _rotation_hypothesis(previous: Mapping[str, Any], *, generation: int,
+                         not_before: str | None, existing_variant_ids: set[str],
+                         tried_families: set[str]) -> StrategyHypothesis | None:
+    """Reseed an exhausted slot with an untried family at template defaults.
+
+    Rotation is not a mutation: it deliberately discards the exhausted
+    lineage's tuned parameters instead of carrying a failed family's shape
+    into the fresh hypothesis.
+    """
+    vehicle = str(previous["vehicle"])
+    slot = int(previous["slot"])
+    current = str(previous["family"])
+    start = RULE_FAMILIES.index(current) if current in RULE_FAMILIES else 0
+    for offset in range(1, len(RULE_FAMILIES) + 1):
+        family = RULE_FAMILIES[(start + offset) % len(RULE_FAMILIES)]
+        if family in tried_families:
+            continue
+        spec = validate_rule_spec({"family": family})
+        if rule_variant_id(spec) in existing_variant_ids:
+            continue
+        return StrategyHypothesis(
+            _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
+            vehicle, family, _thesis(spec), _falsification(spec), spec,
+            str(previous["hypothesis_id"]), not_before)
+    return None
 
 
 def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any], *,
@@ -443,6 +498,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 workers: int = DEFAULT_WORKERS, starting_cash: float = 100_000.0,
                 min_trades: int = 100, min_sessions: int = 10,
                 alpha: float = .05, max_generations: int = 5,
+                max_rotations: int = MAX_ROTATIONS,
+                rotation_budget: int = ROTATION_BUDGET,
                 strategy_llm: Mapping[str, Any] | None = None,
                 proposal_adapter: RuleProposalAdapter | None = None) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
@@ -458,6 +515,12 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError("starting_cash, min_trades and min_sessions must be positive")
     if not 0 < alpha <= 1:
         raise FactoryError("alpha must be in (0,1]")
+    if int(max_rotations) < 0 or int(rotation_budget) < 0:
+        raise FactoryError("max_rotations and rotation_budget must not be negative")
+    if int(max_rotations) > MAX_ROTATIONS or int(rotation_budget) > ROTATION_BUDGET:
+        raise FactoryError(
+            f"rotation stays bounded: max_rotations<={MAX_ROTATIONS}, "
+            f"rotation_budget<={ROTATION_BUDGET}")
     llm_config = dict(strategy_llm or {})
     llm_enabled = bool(llm_config.get("enabled", False))
     if llm_enabled and not str(llm_config.get("model") or "").strip() and proposal_adapter is None:
@@ -647,6 +710,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     cycle_id = uuid.uuid4().hex
     summaries = []
     replacements = []
+    rotations: list[dict] = []
     pending = []
     for worker in worker_results:
         hypothesis = worker["hypothesis"]
@@ -746,16 +810,21 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                             key=lambda value: abs(float(value.get("net_pnl", 0.0))))
             proposal = None
             replacement_error = None
+            # Each rotation grants the slot one further mutation budget, so a
+            # freshly seeded family is not born at the generation cap.
+            slot = int(hypothesis["slot"])
+            rotations_used = _slot_rotations(factory, vehicle, slot)
+            generation_cap = int(max_generations) * (rotations_used + 1)
             if llm_enabled:
                 replacement, proposal, replacement_error = _llm_replacement(
                     hypothesis, aggregate, config=llm_config,
-                    max_generations=max_generations,
+                    max_generations=generation_cap,
                     not_before=worker["evaluation_end"],
                     existing_variant_ids=existing_variant_ids,
                     adapter=proposal_adapter)
             else:
                 replacement = replacement_hypothesis(
-                    hypothesis, aggregate, max_generations=max_generations,
+                    hypothesis, aggregate, max_generations=generation_cap,
                     not_before=worker["evaluation_end"])
             if replacement is not None:
                 factory.register(replacement)
@@ -796,13 +865,45 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 pending.append({"hypothesis_id": hypothesis["hypothesis_id"],
                                 "reason": detail["failure"]})
             else:
-                factory.event(
-                    hypothesis["hypothesis_id"], "pending_generation_limit",
-                    "all variants failed, but the generation cap leaves this slot pending explicit rotation",
-                    {"diagnostic": aggregate, "max_generations": int(max_generations)},
-                )
-                pending.append({"hypothesis_id": hypothesis["hypothesis_id"],
-                                "reason": "generation_limit"})
+                seed = None
+                # Only a family that actually spent a mutation budget may be
+                # rotated away; reseeding one that was never mutated would be
+                # family churn rather than bounded exploration.
+                if (int(hypothesis["generation"]) >= 1 and
+                        rotations_used < int(max_rotations) and
+                        len(rotations) < int(rotation_budget)):
+                    seed = _rotation_hypothesis(
+                        hypothesis, generation=int(hypothesis["generation"]) + 1,
+                        not_before=worker["evaluation_end"],
+                        existing_variant_ids=existing_variant_ids,
+                        tried_families=_slot_families(factory, vehicle, slot))
+                if seed is None:
+                    factory.event(
+                        hypothesis["hypothesis_id"], "pending_generation_limit",
+                        "all variants failed, but the generation cap leaves this slot pending explicit rotation",
+                        {"diagnostic": aggregate, "max_generations": generation_cap,
+                         "rotations_used": rotations_used,
+                         "max_rotations": int(max_rotations)},
+                    )
+                    pending.append({"hypothesis_id": hypothesis["hypothesis_id"],
+                                    "reason": "generation_limit"})
+                else:
+                    factory.register(seed)
+                    existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+                    rotation_payload = {
+                        "diagnostic": aggregate, "tested_variants": len(local),
+                        "rotation": True, "rotation_index": rotations_used,
+                        "max_rotations": int(max_rotations),
+                        "generation_cap": generation_cap,
+                        "replacement_hypothesis_id": seed.hypothesis_id,
+                        "replacement_variant_id": rule_variant_id(seed.rule_spec),
+                    }
+                    factory.retire_hypothesis(
+                        hypothesis["hypothesis_id"], cycle_id=cycle_id,
+                        expected_variants=int(worker.get("expected_variants", 0)),
+                        reason="generation budget exhausted; slot rotated to a fresh family",
+                        payload=rotation_payload)
+                    rotations.append(asdict(seed))
         else:
             factory.event(hypothesis["hypothesis_id"], hypothesis.get("status", "queued"),
                           "sample floor not met; observations were not treated as failure",
@@ -825,7 +926,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         "worker_pids": sorted({row["worker_pid"] for row in summaries}),
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,
-        "replacements": replacements,
+        "replacements": replacements, "rotations": rotations,
+        "rotation_budget": int(rotation_budget), "max_rotations": int(max_rotations),
         "pending": pending, "worker_failures": worker_failures,
         "strategy_llm": {"enabled": llm_enabled,
                          "provider": llm_config.get("provider") if llm_enabled else None,

@@ -27,6 +27,10 @@ DEFAULT = {
     "risk_day": {},
     "last_reconciliation_ts": None,
     "preflight": {},
+    # Closed-trade learning events awaiting durable ingestion by the research
+    # ledger.  They ride the same atomic replacement as the trade close that
+    # produced them, so a crash cannot book a close and forget its outcome.
+    "edge_outbox": [],
 }
 
 
@@ -55,6 +59,9 @@ def _validated(data: Mapping[str, Any]) -> dict:
                 "orders", "risk_day", "preflight"):
         if not isinstance(value.get(key), dict):
             raise ValueError(f"{key} must be an object")
+    outbox = value.get("edge_outbox")
+    if not isinstance(outbox, list) or any(not isinstance(item, dict) for item in outbox):
+        raise ValueError("edge_outbox must be a list of objects")
     return value
 
 

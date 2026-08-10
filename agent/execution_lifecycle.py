@@ -21,6 +21,15 @@ _TERMINAL_ORDER_STATUSES = {
 }
 
 
+_EDGE_OUTBOX_WARN = 500
+
+
+def _outbox_entry_id(outcome: Mapping) -> str:
+    """Identify a learning event by the opportunity the ledger keys on."""
+    return (f"{outcome.get('variant_id')}\0{outcome.get('vehicle')}"
+            f"\0{outcome.get('opportunity_id')}")
+
+
 def _plain(value):
     if is_dataclass(value):
         return {key: _plain(item) for key, item in asdict(value).items()}
@@ -730,15 +739,22 @@ class ExecutionLifecycleMixin:
             current.setdefault("protection", {}).pop(symbol, None)
         reconciled_at = time.time()
         protection = current.get("protection", {})
+        # The learning events for the closes booked above are written in this
+        # same atomic replacement.  Either the trade is still active and its
+        # close is re-derived next cycle, or the close and its outcome are both
+        # durable; there is no interleaving that books one without the other.
         current = state.update_state(lambda latest: {
             **latest,
             "active_trades": active,
             "orders": {**latest.get("orders", {}), **order_state},
             "protection": protection,
             "last_reconciliation_ts": reconciled_at,
+            "edge_outbox": self._queued_edge_outbox(latest),
         })
         self._runtime_state = current
+        self._pending_edge_outcome_rows = []
         self._reconciled = True
+        self._drain_edge_outbox()
         self._event("rest_reconcile", {"positions": len(result.get("positions", [])) if isinstance(result, Mapping) else 0})
         return result
 
@@ -747,7 +763,8 @@ class ExecutionLifecycleMixin:
         if self.mode != "paper":
             return
         variant_id = trade.get("variant_id")
-        if not variant_id or realized is None:
+        realized_value = self._number(realized)
+        if not variant_id or realized_value is None:
             return
         vehicle = "option" if str(trade.get("execution_profile")) == "options" else "equity"
         risk_usd = self._number(trade.get("risk_usd"))
@@ -757,16 +774,104 @@ class ExecutionLifecycleMixin:
             "opportunity_id": trade.get("setup_id") or
                               f"{trade.get('symbol')}:{opened:.6f}",
             "session_date": datetime.fromtimestamp(opened, timezone.utc).date().isoformat(),
-            "net_pnl": realized, "pnl_pct": pnl_pct,
+            "net_pnl": realized_value, "pnl_pct": self._number(pnl_pct),
             "risk_usd": risk_usd,
-            "r_multiple": (realized / risk_usd if risk_usd and risk_usd > 0 else None),
-            "entry_price": trade.get("entry_price"), "exit_price": exit_price,
+            "r_multiple": (realized_value / risk_usd
+                           if risk_usd and risk_usd > 0 else None),
+            "entry_price": self._number(trade.get("entry_price")),
+            "exit_price": self._number(exit_price),
             "reason": trade.get("closing_reason", "broker_reconcile"),
             "paper": True,
         }
-        try:
-            from .edge import record_paper_outcome
-            record_paper_outcome(outcome, db_path=self._edge_db_path or None)
-        except Exception as exc:  # noqa: BLE001
-            self._event("edge_outcome_failed", {"error": str(exc),
-                                                 "variant_id": variant_id})
+        # Queue only.  The outcome becomes durable in the same atomic state
+        # replacement that removes the closed trade, and is ingested by
+        # ``_drain_edge_outbox`` from that durable record.
+        self._pending_edge_outcomes.append(
+            {"entry_id": _outbox_entry_id(outcome), "queued_ts": time.time(),
+             "attempts": 0, "outcome": outcome})
+
+    @property
+    def _pending_edge_outcomes(self) -> list:
+        pending = getattr(self, "_pending_edge_outcome_rows", None)
+        if pending is None:
+            pending = []
+            self._pending_edge_outcome_rows = pending
+        return pending
+
+    def _queued_edge_outbox(self, latest: Mapping) -> list:
+        """Merge this cycle's outcomes into the durable outbox exactly once."""
+        existing = latest.get("edge_outbox")
+        rows = [dict(row) for row in existing if isinstance(row, Mapping)] \
+            if isinstance(existing, list) else []
+        known = {str(row.get("entry_id")) for row in rows}
+        for row in self._pending_edge_outcomes:
+            if str(row.get("entry_id")) not in known:
+                rows.append(dict(row))
+                known.add(str(row.get("entry_id")))
+        if len(rows) > _EDGE_OUTBOX_WARN:
+            self._event("edge_outbox_saturated", {"queued": len(rows)})
+        return rows
+
+    def _drain_edge_outbox(self) -> int:
+        """Ingest durably queued outcomes, retaining whatever is unproven.
+
+        Ingestion is keyed on ``opportunity_id`` in the ledger, so replaying an
+        entry after a crash between the ledger write and the outbox removal is
+        a no-op rather than a duplicated observation.
+        """
+        if self.mode != "paper":
+            return 0
+        queued = (self._runtime_state or {}).get("edge_outbox")
+        if not isinstance(queued, list) or not queued:
+            return 0
+        from .edge import record_paper_outcome
+        settled: set[str] = set()
+        deferred: dict[str, int] = {}
+        drained = 0
+        for entry in queued:
+            entry_id = str(entry.get("entry_id")) if isinstance(entry, Mapping) else ""
+            outcome = entry.get("outcome") if isinstance(entry, Mapping) else None
+            if not entry_id or not isinstance(outcome, Mapping):
+                # An unreadable entry can never become ingestible; record the
+                # loss in the durable journal instead of retrying forever.
+                self._event("edge_outcome_rejected", {"reason": "malformed outbox entry"})
+                settled.add(entry_id)
+                continue
+            try:
+                record_paper_outcome(dict(outcome), db_path=self._edge_db_path or None)
+            except (ValueError, KeyError) as exc:
+                self._event("edge_outcome_rejected",
+                            {"error": str(exc), "entry_id": entry_id,
+                             "variant_id": outcome.get("variant_id")})
+                settled.add(entry_id)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                attempts = self._number(entry.get("attempts")) or 0.0
+                deferred[entry_id] = int(attempts) + 1
+                self._event("edge_outcome_deferred",
+                            {"error": str(exc), "entry_id": entry_id,
+                             "attempts": deferred[entry_id],
+                             "variant_id": outcome.get("variant_id")})
+                continue
+            settled.add(entry_id)
+            drained += 1
+        if not settled and not deferred:
+            return 0
+
+        def prune(latest: dict) -> dict:
+            rows = latest.get("edge_outbox")
+            rows = [dict(row) for row in rows if isinstance(row, Mapping)] \
+                if isinstance(rows, list) else []
+            kept = []
+            for row in rows:
+                entry_id = str(row.get("entry_id"))
+                if entry_id in settled:
+                    continue
+                if entry_id in deferred:
+                    row["attempts"] = deferred[entry_id]
+                kept.append(row)
+            latest["edge_outbox"] = kept
+            return latest
+
+        self._runtime_state = state.update_state(prune)
+        return drained

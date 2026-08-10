@@ -21,6 +21,18 @@ from .gates import sample_counts, verify_gate_envelope
 from .edge_ledger_proof import EdgeLedgerProofMixin
 
 
+# Sequential degradation surveillance.  ``PAPER_DRIFT_THRESHOLD`` is the
+# log-likelihood boundary of a one-sided sequential probability ratio test of
+# "the validated held-out expectancy still holds" against "the edge is gone".
+# Wald's inequality bounds the probability that an undegraded candidate ever
+# crosses it at ``exp(-threshold)``, so 4.0 nats accepts a ~1.8% false
+# retirement rate over an entire paper deployment.
+PAPER_DRIFT_THRESHOLD = 4.0
+PAPER_DRIFT_MIN_OUTCOMES = 20
+PAPER_DRIFT_MIN_REFERENCE = 20
+DEPLOYED_STATUSES = (VALIDATED, CHAMPION)
+
+
 def _finite_number(value: Any) -> float | None:
     """Return a finite numeric value, rejecting JSON scalar impostors."""
     if isinstance(value, (bool, bytes, bytearray, str)):
@@ -436,6 +448,106 @@ class EdgeLedger(EdgeLedgerProofMixin):
                                 reason="superseded as champion; proof remains valid")
         return selected
 
+    def heldout_reference(self, candidate_id: str) -> dict | None:
+        """Return the held-out R distribution this candidate was validated on.
+
+        The reference is read from the same persisted trades the latest
+        re-verified shadow proof was computed over, so drift is measured
+        against the evidence that authorized deployment rather than against a
+        floor chosen at runtime.
+        """
+        run = self.latest_verified_run(candidate_id, lane="shadow")
+        if not isinstance(run, Mapping):
+            return None
+        start, end = run.get("heldout_start"), run.get("heldout_end")
+        if not isinstance(start, str) or not isinstance(end, str) or not start or not end:
+            return None
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT payload_json FROM trades WHERE run_id=? AND session_date>=? "
+                "AND session_date<=? ORDER BY session_date,trade_id",
+                (run["run_id"], start, end)).fetchall()
+        values = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping) or payload.get("no_trade") is True:
+                continue
+            number = _finite_number(payload.get("r_multiple"))
+            if number is not None:
+                values.append(number)
+        if len(values) < PAPER_DRIFT_MIN_REFERENCE:
+            return None
+        count = len(values)
+        mean = sum(values) / count
+        variance = sum((value - mean) ** 2 for value in values) / (count - 1)
+        deviation = math.sqrt(variance) if variance > 0 else 0.0
+        # Never let the surveillance become more sensitive than one whole
+        # expectancy of noise: a degenerate held-out spread would otherwise
+        # retire a healthy edge on its first ordinary loss.
+        return {"run_id": run["run_id"], "created_at": float(run["created_at"]),
+                "trades": count, "mean_r": mean,
+                "sd_r": max(deviation, abs(mean), 1e-6)}
+
+    def paper_drift(self, candidate_id: str) -> dict:
+        """Score live paper R against the validated held-out distribution.
+
+        One-sided SPRT with H0: mean R equals the validated held-out
+        expectancy and H1: the expectancy is fully gone (mean R of zero).  The
+        accumulated log-likelihood ratio is a pure function of the append-only
+        outcomes recorded after the proof, so repeating this is free of state.
+        """
+        reference = self.heldout_reference(candidate_id)
+        report = {"applicable": False, "degraded": False, "outcomes": 0,
+                  "statistic": None, "threshold": PAPER_DRIFT_THRESHOLD,
+                  "reference": reference}
+        if reference is None or reference["mean_r"] <= 0:
+            return report
+        sample = [value for created_at, value in self._paper_r_history(candidate_id)
+                  if created_at > reference["created_at"]]
+        report["outcomes"] = len(sample)
+        if len(sample) < PAPER_DRIFT_MIN_OUTCOMES:
+            return report
+        mean0, deviation = reference["mean_r"], reference["sd_r"]
+        scale = mean0 / (deviation * deviation)
+        statistic = sum(scale * (mean0 / 2.0 - value) for value in sample)
+        if not math.isfinite(statistic):
+            return report
+        report.update({"applicable": True, "statistic": statistic,
+                       "degraded": statistic >= PAPER_DRIFT_THRESHOLD})
+        return report
+
+    def _paper_r_history(self, candidate_id: str) -> list[tuple[float, float]]:
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT created_at,outcome_json FROM paper_outcomes WHERE candidate_id=? "
+                "ORDER BY created_at,outcome_id", (candidate_id,)).fetchall()
+        history: list[tuple[float, float]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["outcome_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            number = _finite_number(payload.get("r_multiple"))
+            created_at = _finite_number(row["created_at"])
+            if number is not None and created_at is not None:
+                history.append((created_at, number))
+        return history
+
+    def _paper_summary(self, candidate_id: str, outcome_id: str,
+                       *, duplicate: bool = False) -> dict:
+        r_values = [value for _created_at, value in self._paper_r_history(candidate_id)]
+        recent_r = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
+        return {"outcome_id": outcome_id, "candidate_id": candidate_id,
+                "status": (self.candidate(candidate_id) or {}).get("status"),
+                "rolling_outcomes": len(recent_r),
+                "rolling_r": sum(recent_r) if recent_r else None,
+                "duplicate": duplicate}
+
     def ingest_paper_outcome(self, candidate_id: str, outcome: Mapping) -> dict:
         candidate = self.candidate(candidate_id)
         if candidate is None:
@@ -467,6 +579,15 @@ class EdgeLedger(EdgeLedgerProofMixin):
             raise ValueError(error)
         normalized = {**dict(outcome), "r_multiple": r_multiple,
                       "net_pnl": net, "risk_usd": risk_usd}
+        # An outcome is identified by its opportunity, so a retried delivery
+        # from the runtime's durable outbox is a no-op rather than a second
+        # observation of the same closed trade.
+        with closing(_connect(self.path)) as db:
+            prior = db.execute(
+                "SELECT outcome_id FROM paper_outcomes WHERE candidate_id=? AND opportunity_id=?",
+                (candidate_id, opportunity)).fetchone()
+        if prior is not None:
+            return self._paper_summary(candidate_id, prior["outcome_id"], duplicate=True)
         oid = uuid.uuid4().hex
         with closing(_connect(self.path)) as db, db:
             db.execute("""INSERT INTO paper_outcomes
@@ -479,35 +600,34 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 VALUES(?,?,?,?,?,?,?,?,?)""",
                 (uuid.uuid4().hex, candidate_id, "paper_outcome", candidate["status"],
                  candidate["status"], "paper", "paper outcome ingested", _json(normalized), _utc()))
-        with closing(_connect(self.path)) as db:
-            rows = db.execute(
-                "SELECT outcome_json FROM paper_outcomes WHERE candidate_id=? "
-                "ORDER BY created_at,outcome_id", (candidate_id,)).fetchall()
-        r_values = []
-        for row in rows:
-            try:
-                payload = json.loads(row["outcome_json"])
-                if not isinstance(payload, Mapping):
-                    continue
-                value = payload.get("r_multiple")
-                number = _finite_number(value)
-                if number is not None:
-                    r_values.append(number)
-            except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
-                continue
+        r_values = [value for _created_at, value in self._paper_r_history(candidate_id)]
         recent_r = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
         automatic_guard = (
             len(recent_r) >= PAPER_DEMOTION_MIN_OUTCOMES and
             sum(recent_r) <= PAPER_DEMOTION_R_FLOOR)
-        if candidate["status"] == "champion" and automatic_guard:
-            self.transition(
-                candidate_id, "demoted",
-                reason="paper outcomes failed the registered rolling R guard",
-                payload={"outcomes": len(recent_r), "rolling_r": sum(recent_r)})
-        return {"outcome_id": oid, "candidate_id": candidate_id,
-                "status": (self.candidate(candidate_id) or {}).get("status"),
-                "rolling_outcomes": len(recent_r),
-                "rolling_r": sum(recent_r) if recent_r else None}
+        drift = self.paper_drift(candidate_id)
+        # Every deployed candidate is guarded, not only the champion: paper
+        # ``all_proved`` selection trades one validated candidate per family,
+        # and an unguarded validated loser would trade indefinitely.
+        if candidate["status"] in DEPLOYED_STATUSES:
+            if automatic_guard:
+                self.transition(
+                    candidate_id, "demoted",
+                    reason="paper outcomes failed the registered rolling R guard",
+                    payload={"outcomes": len(recent_r), "rolling_r": sum(recent_r),
+                             "from_status": candidate["status"]})
+            elif drift.get("degraded"):
+                self.transition(
+                    candidate_id, "demoted",
+                    reason="paper R degraded against the validated held-out distribution",
+                    payload={"outcomes": drift.get("outcomes"),
+                             "statistic": drift.get("statistic"),
+                             "threshold": drift.get("threshold"),
+                             "from_status": candidate["status"]})
+        summary = self._paper_summary(candidate_id, oid)
+        summary["drift"] = {key: drift[key] for key in
+                            ("applicable", "degraded", "outcomes", "statistic", "threshold")}
+        return summary
 
     def _runs(self, candidate_id: str, *, lane: str | None = None) -> list[sqlite3.Row]:
         query = "SELECT * FROM runs WHERE candidate_id=?"; params: list = [candidate_id]
@@ -519,8 +639,10 @@ class EdgeLedger(EdgeLedgerProofMixin):
 
 __all__ = [
     "BACKTEST_PASSED", "CANDIDATE", "CHAMPION", "DEFAULT_DB_PATH",
-    "DEMOTED", "EdgeLedger", "LANES", "LIFECYCLE",
-    "PAPER_DEMOTION_MIN_OUTCOMES", "PAPER_DEMOTION_R_FLOOR", "RETIRED",
+    "DEMOTED", "DEPLOYED_STATUSES", "EdgeLedger", "LANES", "LIFECYCLE",
+    "PAPER_DEMOTION_MIN_OUTCOMES", "PAPER_DEMOTION_R_FLOOR",
+    "PAPER_DRIFT_MIN_OUTCOMES", "PAPER_DRIFT_MIN_REFERENCE",
+    "PAPER_DRIFT_THRESHOLD", "RETIRED",
     "SCHEMA_VERSION", "SHADOW", "VALIDATED", "VEHICLES", "canonical_json",
     "content_hash", "hash_config", "hash_dataset", "hash_file",
     "hash_provenance", "init_db", "init_ledger", "provenance_hash",
