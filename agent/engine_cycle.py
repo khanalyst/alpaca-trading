@@ -64,6 +64,44 @@ class EngineCycleMixin:
                 if self._lock_handle is not None:
                     self._release_lock()
 
+    def _allocate_edges(self, edge_configs: list, *, free_slots: int) -> list:
+        """Order and bound concurrently proved edges by evidence and correlation.
+
+        Only ``all_proved`` paper selection allocates: a pinned ``specific``
+        variant is one record and is returned untouched.  Allocation never
+        admits anything the sequential path would have refused — it can only
+        drop or reorder candidates, and every per-order risk check downstream
+        still runs — so no configured cap can be exceeded here.
+        """
+        records = [record for record, _cfg in edge_configs]
+        if (len(edge_configs) < 2 or self.mode == "live" or
+                getattr(self, "_edge_selection_mode", "specific") == "specific" or
+                any(record is None for record in records)):
+            return edge_configs
+        try:
+            from .allocation import allocate
+            result = allocate(records, free_slots=free_slots,
+                              db_path=self._edge_db_path or None)
+        except Exception as exc:  # noqa: BLE001
+            # An unreadable evidence corpus is not a licence to trade every
+            # candidate; keep the single best-ranked edge only.
+            from .allocation import evidence_rank
+            best = max(edge_configs, key=lambda item: evidence_rank(item[0]))
+            self._event("allocation_failed", {"error": str(exc),
+                                              "variant_id": best[0].get("variant_id")})
+            return [best]
+        by_candidate = {str(record.get("candidate_id") or ""): (record, cfg)
+                        for record, cfg in edge_configs}
+        for row in result["rejected"]:
+            self._event("allocation_reject", dict(row))
+        admitted = [by_candidate[str(record.get("candidate_id") or "")]
+                    for record in result["admitted"]]
+        self._event("allocation", {
+            "free_slots": max(0, free_slots),
+            "admitted": [record.get("variant_id") for record, _cfg in admitted],
+            "rejected": [row.get("variant_id") for row in result["rejected"]]})
+        return admitted
+
     def _run_once_impl(self, snapshot: dict | None = None, portfolio: dict | None = None) -> dict[str, Any]:
         if not self._ensure_order_ready():
             reason = self._preflight_error or "startup_reconciliation_required"
@@ -241,6 +279,10 @@ class EngineCycleMixin:
             if underlying not in held_underlyings)
         edge_configs = self._edge_configs or ([(None, self._edge_base_cfg)]
                                                if not self._edge_required else [])
+        edge_configs = self._allocate_edges(
+            edge_configs,
+            free_slots=int(risk_cfg.get("max_concurrent_positions", 1) or 1) -
+            (len(positions) + pending_position_count))
         for edge_record, edge_cfg in edge_configs:
             if not self._latest_entry_allowed(now, edge_cfg):
                 continue
