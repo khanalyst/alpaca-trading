@@ -194,8 +194,10 @@ timezone conversion.
 `research.ibr` implements the initial-balance-range reference strategy. It
 requires contiguous completed opening-range bars, detects a breakout only
 after bar close, enters at the next bar open, applies gap-aware fills,
-resolves same-bar stop/target ties against the strategy, charges spread,
-slippage and fees, and closes before the session boundary. Equity and option
+resolves same-bar stop/target ties against the strategy, fills exit gaps at
+the gap open, prices boundary fills from recorded quotes where they exist,
+charges spread, slippage and fees through the shared cost model, and closes
+before the session boundary. Equity and option
 vehicles have separate books.
 
 `research.edge_discovery_core` owns deterministic corpus loading, effective
@@ -297,6 +299,7 @@ identity stable while moving cohesive responsibilities.
 | `agent.risk` | Pure normalization and identity helpers in `risk_inputs` |
 | `research.edge_ledger` | SQLite/hash primitives in `edge_ledger_store`; proof operations in `edge_ledger_proof` |
 | `research.edge_lab` | Deterministic discovery helpers in `edge_discovery_core` |
+| replay cost/fill arithmetic | One shared model in `research.costs` |
 | `research.strategy_factory` | Pure simulation/diagnosis/mutation in `factory_core`; lineage storage in `factory_ledger` |
 
 Compatibility tests assert facade identities, MRO, method ownership, reverse

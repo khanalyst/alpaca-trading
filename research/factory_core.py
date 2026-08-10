@@ -18,11 +18,16 @@ from agent.contracts.rule import (
     RULE_FAMILIES, evaluate_rule_signal, hold_deadline, rule_variant_id,
     validate_rule_spec,
 )
+from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
 from .gates import max_drawdown_of
-from .market_data import OptionSnapshot, UnderlyingBar
+from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 
+
+# `risk.max_position_notional_pct` in the checked runtime config.  Research
+# caps on the same percentage of the account, anchored to the same price.
+NOTIONAL_CAP_PCT = 25.0
 
 DEFAULT_STRATEGIES = 7
 DEFAULT_VARIANTS = 4
@@ -125,7 +130,8 @@ def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
 
 
 def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, Any],
-                    snapshots: Sequence[OptionSnapshot], vehicle: str) -> dict | None:
+                    snapshots: Sequence[OptionSnapshot], vehicle: str,
+                    quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None) -> dict | None:
     for index in range(1, len(session_bars) - 1):
         signal_bar = session_bars[index]
         if not _visible(signal_bar, signal_bar.end):
@@ -159,9 +165,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             last_index = probe
         exit_bar = session_bars[last_index]
         exit_ref = float(exit_bar.close)
+        exit_at = exit_bar.end
         reason = "time"
         tie = False
         gapped = False
+        exit_gapped = False
         if direction == "long":
             through_stop = entry_underlying <= stop
             through_target = entry_underlying >= target
@@ -177,24 +185,53 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             reason = "stop" if through_stop else "target"
             exit_ref = entry_underlying
             exit_bar = entry_bar
+            exit_at = entry_bar.timestamp
         else:
             for bar in session_bars[index + 2:last_index + 1]:
                 if not _visible(bar, bar.end):
                     continue
                 if direction == "long":
+                    gap_stop, gap_target = bar.open <= stop, bar.open >= target
                     hit_stop, hit_target = bar.low <= stop, bar.high >= target
                 else:
+                    gap_stop, gap_target = bar.open >= stop, bar.open <= target
                     hit_stop, hit_target = bar.high >= stop, bar.low <= target
+                if gap_stop or gap_target:
+                    # A bar that opens beyond a resting leg fills at that open,
+                    # not at the level the market never traded again.  Stop
+                    # still wins the tie; the stop side makes results worse and
+                    # that is exactly the point of modelling it.
+                    reason = "stop" if gap_stop else "target"
+                    exit_ref, exit_bar = float(bar.open), bar
+                    exit_at, exit_gapped = bar.timestamp, True
+                    break
                 if hit_stop or hit_target:
                     tie = hit_stop and hit_target
                     reason = "stop" if hit_stop else "target"
                     exit_ref = stop if hit_stop else target
                     exit_bar = bar
+                    exit_at = bar.end
                     break
         day = signal_bar.session_date
         multiplier = 1
         contract = None
         entry_ref = entry_underlying
+        entry_source = exit_source = BAR
+        if vehicle == "equity":
+            # A fill that lands on a bar boundary has a real instant, so a
+            # recorded quote is its executable price.  A level-triggered exit
+            # inside a bar has no such instant and keeps the bar's level.
+            side = "buy" if direction == "long" else "sell"
+            quoted = quote_fill(quotes, symbol=signal_bar.symbol,
+                                at=entry_bar.timestamp, side=side)
+            if quoted is not None:
+                entry_ref, entry_source = quoted, QUOTE
+            if reason == "time" or gapped or exit_gapped:
+                quoted_exit = quote_fill(
+                    quotes, symbol=signal_bar.symbol, at=exit_at,
+                    side="sell" if direction == "long" else "buy")
+                if quoted_exit is not None:
+                    exit_ref, exit_source = quoted_exit, QUOTE
         if vehicle == "option":
             entry_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
                                     direction=direction, cutoff=entry_bar.end)
@@ -220,6 +257,11 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
             "contract": contract, "contract_multiplier": multiplier,
             "stop_distance": distance, "entry_gap_fill": gapped,
+            "exit_gap_fill": exit_gapped,
+            "entry_fill_source": entry_source, "exit_fill_source": exit_source,
+            # The price the runtime plans and caps notional against; the fill
+            # reference above may have gapped away from it.
+            "plan_entry": float(signal["entry_price"]),
             "risk_per_unit": (entry_ref * multiplier if vehicle == "option"
                               else distance),
             # A long option's maximum loss is the premium actually paid, so its
@@ -233,10 +275,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
 def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSnapshot],
                      spec: Mapping[str, Any], *, vehicle: str, account_id: str,
                      starting_cash: float = 100_000.0, risk_pct: float = .5,
-                     spread_bps: float = 1.0, slippage_bps: float = 1.0,
-                     fee_bps: float = .5) -> dict:
+                     costs: CostModel | None = None,
+                     quotes: Sequence[QuoteSnapshot] | None = None) -> dict:
     """Replay one variant in a completely isolated cash/equity book."""
     spec = validate_rule_spec(spec)
+    model = costs or CostModel()
+    quote_index = index_quotes(quotes)
     grouped: dict[tuple[str, date], list[UnderlyingBar]] = {}
     for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
         grouped.setdefault((bar.symbol, bar.session_date), []).append(bar)
@@ -246,7 +290,8 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
     rows = []
     for (symbol, day), session_bars in sorted(grouped.items(), key=lambda item: (item[0][1], item[0][0])):
         opportunity = f"{rule_variant_id(spec)}:{vehicle}:{symbol}:{day.isoformat()}"
-        raw = _simulate_trade(session_bars, spec, snapshots, vehicle)
+        raw = _simulate_trade(session_bars, spec, snapshots, vehicle,
+                              quotes=quote_index)
         if raw is None:
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
@@ -256,8 +301,12 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
         quantity = math.floor(risk_budget / per_unit)
         if vehicle == "equity":
-            notional_cap = max(0.0, cash * .25)
-            quantity = min(quantity, math.floor(notional_cap / max(float(raw["entry_reference"]), 1e-9)))
+            # `RiskEngine.size_shares` caps notional at plan time against the
+            # same signal-close price it prices the bracket from.  Capping on
+            # the gapped fill instead would silently size a different position
+            # than the runtime, exactly as the stop anchor once did.
+            notional_cap = max(0.0, cash * NOTIONAL_CAP_PCT / 100.0)
+            quantity = min(quantity, math.floor(notional_cap / max(float(raw["plan_entry"]), 1e-9)))
         if quantity <= 0:
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
@@ -265,17 +314,18 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                          "reject_reason": "isolated account risk budget cannot fund one unit"})
             continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
-        spread = 0.0 if vehicle == "option" else spread_bps / 20_000.0
-        slip = slippage_bps / 10_000.0
-        entry_sign = 1.0 if execution_direction == "long" else -1.0
-        exit_sign = -entry_sign
-        entry = float(raw["entry_reference"]) * (1 + entry_sign * (spread + slip))
-        exit_price = float(raw["exit_reference"]) * (1 + exit_sign * (spread + slip))
+        executable = vehicle == "option"
+        entry = model.execution_price(
+            raw["entry_reference"], execution_direction, entry=True,
+            executable_quote=executable or raw.get("entry_fill_source") == QUOTE)
+        exit_price = model.execution_price(
+            raw["exit_reference"], execution_direction, entry=False,
+            executable_quote=executable or raw.get("exit_fill_source") == QUOTE)
         multiplier = int(raw["contract_multiplier"])
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
-        costs = (abs(entry) + abs(exit_price)) * quantity * multiplier * fee_bps / 10_000.0
-        net = gross - costs
+        fees = model.fees(entry, exit_price, quantity, multiplier)
+        net = gross - fees
         before = cash
         cash += net
         peak = max(peak, cash)
@@ -286,7 +336,7 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         risk_usd = quantity * float(raw["realized_risk_per_unit"])
         rows.append({**raw, "opportunity_id": opportunity, "quantity": quantity,
                      "entry_price": entry, "exit_price": exit_price,
-                     "gross_pnl": gross, "costs": costs, "net_pnl": net,
+                     "gross_pnl": gross, "costs": fees, "net_pnl": net,
                      "risk_budget": risk_budget, "risk_usd": risk_usd,
                      "r_multiple": net / risk_usd if risk_usd > 0 else None,
                      "return_value": net / before if before > 0 else 0.0,

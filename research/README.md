@@ -42,9 +42,15 @@ timestamp may not be later than its observation/ingestion timestamp.
 2. Detect a breakout only after a range bar has closed.
 3. Enter at the immediate next bar's open; a missing next bar yields no trade.
 4. Apply gap-aware fills and stop-first ties when a candle touches both stop
-   and target.
-5. Apply spread, adverse slippage, and per-side fees to both executions.
-6. Force-flat at the configured pre-close boundary; no position crosses a
+   and target. A bar that opens beyond the stop or target fills at that open,
+   on exit as well as on entry, not at a level the market never traded again.
+5. Price a fill landing on a bar boundary from a recorded quote at that
+   instant when one exists, and record on the trade whether the quote or the
+   bar was used. A level triggered inside a bar has no such instant and keeps
+   the level.
+6. Apply spread, adverse slippage, and per-side fees to both executions
+   through the one shared model in `research.costs`.
+7. Force-flat at the configured pre-close boundary; no position crosses a
    session boundary.
 
 Equity and single-leg long-option vehicles are independent result books. Call
@@ -61,6 +67,39 @@ python research.py backtest-ibr bars.jsonl --vehicle equity
 
 Both commands are offline and read JSONL only. They never download data, call
 an exchange, place orders, or modify trading state.
+
+## Costs and fill calibration
+
+`research.costs.CostModel` is the single expected-cost model: every lane --
+IBR replay, edge discovery, and the strategy factory -- prices its fills
+through it, and none carries its own spread/slippage/fee numbers or its own
+arithmetic. Its parameters come from one `costs` block
+(`spread_bps`, `slippage_bps`, `fee_bps`); the defaults describe a normal
+marketable fill in the configured liquid ETF universe.
+
+The runtime's `execution.max_slippage_bps` and `max_spread_bps` are rejection
+caps, not expectations. They are read into the same model and bound it: a
+model expecting a cost the runtime would refuse to submit fails closed rather
+than simulating fills that could never happen. Sourcing an expected slippage
+from the cap is as wrong as ignoring the cap.
+
+Quote-driven fills need the quote rows to reach the lane. `research.edge_lab`
+and `research.strategy_factory` accept them from a mixed corpus, but
+`deploy/research-cycle.sh` currently splits the recorded dataset into
+bar-only and option-only files, so a scheduled cycle still prices every
+equity fill from the bar and reports `bar` as the source.
+
+```bash
+python research.py calibrate runtime/paper/journal.db
+```
+
+`research.calibration` reads the runtime journal read-only and compares each
+recorded entry fill against the plan price that priced it, recovered from the
+plan's notional and submitted quantity. It reports the observed adverse cost
+in basis points, the model's bias against it, how many fills landed past the
+runtime's own slippage cap, and a verdict of `conservative`, `optimistic`, or
+`insufficient_data`. It never adjusts the model; an optimistic model is a
+finding, and the command exits non-zero so it cannot be missed.
 
 ## Evidence and provenance
 

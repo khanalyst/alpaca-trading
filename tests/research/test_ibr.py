@@ -2,8 +2,16 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from zoneinfo import ZoneInfo
 
+from research.costs import CostModel
 from research.ibr import IBRConfig, ReplayError, replay_ibr, replay_ibr_vehicles
-from research.market_data import normalize_option_snapshot, normalize_underlying_bar
+from research.costs import BAR, QUOTE
+from research.market_data import (normalize_option_snapshot, normalize_quote,
+                                  normalize_underlying_bar)
+
+
+# A zero-cost model isolates the fill geometry under test from the expected
+# cost model, which has its own tests.
+FREE = CostModel(spread_bps=0, slippage_bps=0, fee_bps=0)
 
 
 def bars_for_day(*, breakout=True, gap=False):
@@ -51,7 +59,7 @@ def bars_to_close():
 class IBRReplayTests(unittest.TestCase):
     def test_range_is_completed_and_entry_is_next_bar(self):
         result = replay_ibr(bars_for_day(), config=IBRConfig(
-            stop_pct=.01, target_pct=.02, spread_bps=0, slippage_bps=0, fee_bps=0))
+            stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertEqual(len(result.trades), 1)
         trade = result.trades[0]
         self.assertEqual(trade.signal_timestamp, trade.entry_timestamp)
@@ -67,7 +75,7 @@ class IBRReplayTests(unittest.TestCase):
             "volume": 1, "provider": "alpaca", "feed": "sip",
         })
         result = replay_ibr(bars, config=IBRConfig(
-            stop_pct=.01, target_pct=.02, spread_bps=0, slippage_bps=0, fee_bps=0))
+            stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertEqual(result.trades[0].exit_reason, "stop")
         self.assertTrue(result.trades[0].tie_broken)
 
@@ -84,7 +92,7 @@ class IBRReplayTests(unittest.TestCase):
             "volume": 1, "provider": "alpaca", "feed": "sip",
         })
         result = replay_ibr(bars, config=IBRConfig(
-            stop_pct=.01, target_pct=.02, spread_bps=0, slippage_bps=0, fee_bps=0))
+            stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertTrue(result.trades[0].gap_fill)
         self.assertEqual(result.trades[0].exit_price, 95)
 
@@ -95,13 +103,12 @@ class IBRReplayTests(unittest.TestCase):
             with self.subTest(gap=gap):
                 bars = bars_for_day(gap=gap)
                 percent = replay_ibr(bars, config=IBRConfig(
-                    stop_pct=.01, target_pct=.02, spread_bps=0,
-                    slippage_bps=0, fee_bps=0)).trades[0]
+                    stop_pct=.01, target_pct=.02, costs=FREE)).trades[0]
                 self.assertAlmostEqual(percent.stop_price, 99.99, places=9)
                 self.assertAlmostEqual(percent.target_price, 103.02, places=9)
                 ranged = replay_ibr(bars, config=IBRConfig(
                     range_stop=True, target_r=2.0, stop_pct=.01, target_pct=.02,
-                    spread_bps=0, slippage_bps=0, fee_bps=0)).trades[0]
+                    costs=FREE)).trades[0]
                 self.assertAlmostEqual(ranged.stop_price, 99.0, places=9)
                 self.assertAlmostEqual(ranged.target_price, 105.0, places=9)
                 self.assertEqual(percent.entry_reference, 103 if gap else 101)
@@ -126,8 +133,7 @@ class IBRReplayTests(unittest.TestCase):
             "underlying_price": 103, "provider": "alpaca", "feed": "opra",
         })
         results = replay_ibr_vehicles(
-            bars, config=IBRConfig(stop_pct=.01, target_pct=.02,
-                                   spread_bps=0, slippage_bps=0, fee_bps=0),
+            bars, config=IBRConfig(stop_pct=.01, target_pct=.02, costs=FREE),
             vehicles=("equity", "option"),
             option_snapshots={entry_time: entry, exit_time: exit_quote})
         self.assertEqual(set(results), {"equity", "option"})
@@ -155,9 +161,82 @@ class IBRReplayTests(unittest.TestCase):
 
     def test_force_flat_uses_boundary_open_not_intrabar_range(self):
         result = replay_ibr(bars_to_close(), config=IBRConfig(
-            stop_pct=.01, target_pct=.02, spread_bps=0, slippage_bps=0, fee_bps=0))
+            stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertEqual(len(result.trades), 1)
         self.assertEqual(result.trades[0].exit_reason, "force_flat")
         local = result.trades[0].exit_timestamp.astimezone(ZoneInfo("America/New_York"))
         self.assertEqual(local.hour, 15)
         self.assertEqual(local.minute, 55)
+
+
+def equity_quote(minute, bid, ask):
+    """A quote at the given offset from the 09:30 session open."""
+    ts = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc) + timedelta(minutes=minute)
+    return normalize_quote({
+        "symbol": "SPY", "timestamp": ts.isoformat(), "bid": bid, "ask": ask,
+        "provider": "alpaca", "feed": "sip",
+    })
+
+
+class IBRQuoteFillTests(unittest.TestCase):
+    """A recorded quote at the fill instant beats a bar-derived reference."""
+
+    def test_the_entry_uses_the_recorded_ask_and_records_the_source(self):
+        # The entry bar (minute 31) opens at 101; the book at that instant is
+        # 100.98 x 101.06, so the marketable buy lifts 101.06.
+        trade = replay_ibr(bars_for_day(), config=IBRConfig(
+            stop_pct=.01, target_pct=.02, costs=FREE),
+            quotes=[equity_quote(31, 100.98, 101.06)]).trades[0]
+        self.assertEqual(trade.entry_fill_source, QUOTE)
+        self.assertAlmostEqual(trade.entry_reference, 101.06, places=9)
+        self.assertAlmostEqual(trade.entry_price, 101.06, places=9)
+
+    def test_a_missing_quote_falls_back_to_the_bar_and_says_so(self):
+        trade = replay_ibr(bars_for_day(), config=IBRConfig(
+            stop_pct=.01, target_pct=.02, costs=FREE)).trades[0]
+        self.assertEqual(trade.entry_fill_source, BAR)
+        self.assertEqual(trade.exit_fill_source, BAR)
+        self.assertAlmostEqual(trade.entry_reference, 101, places=9)
+
+    def test_a_quote_after_the_fill_instant_is_not_used(self):
+        trade = replay_ibr(bars_for_day(), config=IBRConfig(
+            stop_pct=.01, target_pct=.02, costs=FREE),
+            quotes=[equity_quote(32, 100.98, 101.06)]).trades[0]
+        self.assertEqual(trade.entry_fill_source, BAR)
+
+    def test_a_gap_exit_is_priced_from_the_quote_at_the_gap_open(self):
+        bars = bars_for_day()
+        bars[31] = normalize_underlying_bar({
+            "symbol": "SPY", "timestamp": bars[31].timestamp.isoformat(),
+            "open": 101, "high": 101.5, "low": 100, "close": 101,
+            "volume": 1, "provider": "alpaca", "feed": "sip"})
+        bars[32] = normalize_underlying_bar({
+            "symbol": "SPY", "timestamp": bars[32].timestamp.isoformat(),
+            "open": 95, "high": 96, "low": 94, "close": 95,
+            "volume": 1, "provider": "alpaca", "feed": "sip"})
+        trade = replay_ibr(bars, config=IBRConfig(
+            stop_pct=.01, target_pct=.02, costs=FREE),
+            quotes=[equity_quote(32, 94.9, 95.1)]).trades[0]
+        self.assertTrue(trade.gap_fill)
+        self.assertEqual(trade.exit_fill_source, QUOTE)
+        # A long exit hits the bid, not the gapped print and not the ask.
+        self.assertAlmostEqual(trade.exit_reference, 94.9, places=9)
+
+    def test_a_level_exit_keeps_the_bar_because_it_has_no_fill_instant(self):
+        # The stop triggers somewhere inside a bar, so a boundary quote is not
+        # the fill's price and must not replace the level.
+        bars = bars_for_day()
+        bars[31] = normalize_underlying_bar({
+            "symbol": "SPY", "timestamp": bars[31].timestamp.isoformat(),
+            "open": 101, "high": 101.5, "low": 100, "close": 101,
+            "volume": 1, "provider": "alpaca", "feed": "sip"})
+        bars[32] = normalize_underlying_bar({
+            "symbol": "SPY", "timestamp": bars[32].timestamp.isoformat(),
+            "open": 101, "high": 101.5, "low": 99, "close": 100,
+            "volume": 1, "provider": "alpaca", "feed": "sip"})
+        trade = replay_ibr(bars, config=IBRConfig(
+            stop_pct=.01, target_pct=.02, costs=FREE),
+            quotes=[equity_quote(32, 80.0, 80.1)]).trades[0]
+        self.assertEqual(trade.exit_reason, "stop")
+        self.assertEqual(trade.exit_fill_source, BAR)
+        self.assertAlmostEqual(trade.exit_reference, trade.stop_price, places=9)

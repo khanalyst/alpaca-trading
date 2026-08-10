@@ -1,0 +1,457 @@
+"""One cost and fill model, shared by every research lane.
+
+These tests pin the three things that let the lanes drift apart before: each
+lane carried its own spread/slippage/fee numbers, each re-implemented the
+arithmetic, and one of them sourced an expected slippage from the runtime's
+*rejection cap*.  They also pin the fill realism the model is worth nothing
+without: exits that gap through a resting leg, and fills priced from a
+recorded quote when one exists at the fill instant.
+"""
+
+from datetime import datetime, timedelta, timezone
+import sqlite3
+import unittest
+
+from agent.contracts.rule import validate_rule_spec
+from agent.risk import RiskEngine
+from research import calibration
+from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
+                            DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
+                            RUNTIME_MAX_SLIPPAGE_BPS, index_quotes, quote_fill)
+from research.edge_discovery_core import (DiscoveryError,
+                                          _effective_ibr_config,
+                                          _read_discovery_rows)
+from research.factory_core import (NOTIONAL_CAP_PCT, _simulate_trade,
+                                   simulate_account)
+from research.strategy_factory import null_control_account
+from research.ibr import IBRConfig
+from research.market_data import normalize_quote, normalize_underlying_bar
+
+BASE = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
+SPEC = validate_rule_spec({
+    "family": "momentum_continuation", "lookback": 3, "slow_lookback": 8,
+    "atr_period": 3, "threshold_bps": 1.0, "stop_atr": 1.0, "target_r": 2.0,
+    "max_hold_bars": 3, "confirmation": "none",
+})
+# Four rising bars signal at index 3, so entry is index 4 and the bounded hold
+# expires at the end of index 7.  Stop 100.50, target 101.40.
+RISING = [100.2, 100.4, 100.6, 100.8]
+FLAT = [100.8] * 8
+
+
+def _bars(closes, opens=None):
+    rows = []
+    opened = 100.0
+    for index, close in enumerate(closes):
+        opened = float((opens or {}).get(index, opened))
+        timestamp = BASE + timedelta(minutes=index)
+        end = timestamp + timedelta(minutes=1)
+        rows.append(normalize_underlying_bar({
+            "kind": "bar", "provider": "test", "feed": "sip", "symbol": "SPY",
+            "timestamp": timestamp.isoformat(), "as_of": end.isoformat(),
+            "observed_at": end.isoformat(), "open": opened,
+            "high": max(opened, close) + .05, "low": min(opened, close) - .05,
+            "close": close, "volume": 1000,
+        }))
+        opened = close
+    return rows
+
+
+def _quote(minute, bid, ask, *, as_of_minute=None):
+    timestamp = BASE + timedelta(minutes=minute)
+    as_of = BASE + timedelta(minutes=as_of_minute if as_of_minute is not None else minute)
+    return normalize_quote({
+        "symbol": "SPY", "timestamp": timestamp.isoformat(),
+        "as_of": as_of.isoformat(), "observed_at": as_of.isoformat(),
+        "bid": bid, "ask": ask, "provider": "test", "feed": "sip",
+    })
+
+
+class CostModelTests(unittest.TestCase):
+    def test_entry_cost_is_half_the_spread_plus_slippage(self):
+        model = CostModel(spread_bps=2.0, slippage_bps=3.0)
+        self.assertAlmostEqual(model.entry_cost_bps, 4.0, places=12)
+        self.assertAlmostEqual(model.per_side_bps(), 4.0, places=12)
+        # An executable quote already contains the spread; only slippage is
+        # charged on top, or the same spread is billed twice.
+        self.assertAlmostEqual(model.per_side_bps(executable_quote=True), 3.0,
+                               places=12)
+
+    def test_execution_price_is_adverse_on_both_sides_and_both_directions(self):
+        model = CostModel(spread_bps=2.0, slippage_bps=3.0)
+        rate = 4.0 / 10_000.0
+        self.assertAlmostEqual(model.execution_price(100.0, "long", entry=True),
+                               100.0 * (1 + rate), places=12)
+        self.assertAlmostEqual(model.execution_price(100.0, "long", entry=False),
+                               100.0 * (1 - rate), places=12)
+        self.assertAlmostEqual(model.execution_price(100.0, "short", entry=True),
+                               100.0 * (1 - rate), places=12)
+        self.assertAlmostEqual(model.execution_price(100.0, "short", entry=False),
+                               100.0 * (1 + rate), places=12)
+
+    def test_fees_are_charged_on_both_sides_of_the_traded_notional(self):
+        model = CostModel(fee_bps=0.5)
+        self.assertAlmostEqual(model.fees(100.0, 110.0, 10, 1),
+                               (100.0 + 110.0) * 10 * 0.5 / 10_000.0, places=12)
+        self.assertAlmostEqual(model.fees(2.0, 3.0, 4, 100),
+                               (2.0 + 3.0) * 4 * 100 * 0.5 / 10_000.0, places=12)
+
+    def test_the_rejection_cap_bounds_the_model_and_never_supplies_it(self):
+        # A cap is the worst fill the runtime will accept, not the fill it
+        # expects.  Expecting the cap is as wrong as ignoring it.
+        self.assertLess(CostModel().entry_cost_bps, RUNTIME_MAX_SLIPPAGE_BPS)
+        with self.assertRaisesRegex(CostError, "slippage cap"):
+            CostModel(slippage_bps=RUNTIME_MAX_SLIPPAGE_BPS, max_slippage_bps=10.0)
+        with self.assertRaisesRegex(CostError, "rejection cap"):
+            CostModel(spread_bps=200.0, max_spread_bps=100.0)
+
+    def test_malformed_parameters_fail_closed(self):
+        for bad in (float("nan"), float("inf"), -1.0, True, "2", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(CostError):
+                    CostModel(spread_bps=bad)
+
+    def test_from_config_reads_one_block_and_the_runtime_caps(self):
+        model = CostModel.from_config({
+            "costs": {"spread_bps": 4.0, "slippage_bps": 6.0},
+            "execution": {"max_slippage_bps": 40, "max_spread_bps": 80}})
+        self.assertEqual((model.spread_bps, model.slippage_bps, model.fee_bps),
+                         (4.0, 6.0, DEFAULT_FEE_BPS))
+        self.assertEqual((model.max_spread_bps, model.max_slippage_bps), (80.0, 40.0))
+        self.assertEqual(CostModel.from_config(None), CostModel())
+        with self.assertRaisesRegex(CostError, "unknown field"):
+            CostModel.from_config({"costs": {"max_slippage_bps": 50}})
+        # Tightening the runtime's tolerance is immediately a research
+        # constraint rather than a number somebody remembers to copy.
+        with self.assertRaises(CostError):
+            CostModel.from_config({"execution": {"max_slippage_bps": 1}})
+
+
+class SharedModelTests(unittest.TestCase):
+    """No lane may carry its own numbers or its own arithmetic."""
+
+    def test_every_lane_defaults_to_the_same_model(self):
+        self.assertEqual(IBRConfig().costs, CostModel())
+        priced = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
+                                  account_id="explicit", risk_pct=.05,
+                                  costs=CostModel())
+        implied = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
+                                   account_id="implied", risk_pct=.05)
+        self.assertEqual(priced["rows"][0]["net_pnl"], implied["rows"][0]["net_pnl"])
+
+    def test_discovery_no_longer_sources_slippage_from_the_rejection_cap(self):
+        cfg, effective = _effective_ibr_config(
+            {"execution": {"max_slippage_bps": 50, "max_spread_bps": 100}}, {})
+        self.assertEqual(cfg.costs.slippage_bps, DEFAULT_SLIPPAGE_BPS)
+        self.assertEqual(cfg.costs.spread_bps, DEFAULT_SPREAD_BPS)
+        self.assertEqual(cfg.costs.max_slippage_bps, 50.0)
+        # The model is persisted with the effective config, so a proof records
+        # what its results were priced at.
+        self.assertEqual(effective["costs"], cfg.costs.as_dict())
+
+    def test_discovery_takes_an_explicit_cost_override_from_the_one_block(self):
+        cfg, _ = _effective_ibr_config({"costs": {"spread_bps": 6.0}}, {})
+        self.assertEqual(cfg.costs.spread_bps, 6.0)
+
+    def test_a_replay_config_cannot_carry_loose_cost_numbers(self):
+        with self.assertRaises(TypeError):
+            IBRConfig(spread_bps=1.0)
+
+
+class RecordedQuotesReachTheReplayTests(unittest.TestCase):
+    """The recorder captures quotes; the corpus loader must not drop them."""
+
+    def _rows(self):
+        bar = {"kind": "bar", "provider": "alpaca", "feed": "sip", "symbol": "SPY",
+               "timestamp": BASE.isoformat(), "open": 100, "high": 101,
+               "low": 99, "close": 100, "volume": 1}
+        quote = {"kind": "quote", "provider": "alpaca", "feed": "sip",
+                 "symbol": "SPY", "timestamp": BASE.isoformat(),
+                 "bid": 99.98, "ask": 100.02}
+        return [bar, quote]
+
+    def test_quote_rows_are_normalized_rather_than_only_hashed(self):
+        raw, bars, snapshots, quotes = _read_discovery_rows(self._rows())
+        self.assertEqual(len(raw), 2)
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(snapshots, {})
+        self.assertEqual([(q.symbol, q.bid, q.ask) for q in quotes],
+                         [("SPY", 99.98, 100.02)])
+
+    def test_a_malformed_quote_fails_the_corpus_rather_than_being_skipped(self):
+        rows = self._rows()
+        rows[1]["ask"] = 0
+        with self.assertRaises(DiscoveryError):
+            _read_discovery_rows(rows)
+
+
+class ExitGapThroughTests(unittest.TestCase):
+    """A bar that opens beyond a resting leg fills at that open."""
+
+    def test_a_gap_through_the_stop_fills_worse_than_the_stop(self):
+        # Stop is 100.50; bar 6 opens at 100.20 and never trades back.
+        row = _simulate_trade(_bars(RISING + FLAT, {6: 100.2}), SPEC, [], "equity")
+        self.assertEqual(row["exit_reason"], "stop")
+        self.assertIs(row["exit_gap_fill"], True)
+        self.assertAlmostEqual(row["exit_reference"], 100.2, places=9)
+        self.assertLess(row["exit_reference"], row["stop_price"])
+
+    def test_a_gap_through_the_target_fills_at_the_open_not_the_target(self):
+        row = _simulate_trade(_bars(RISING + FLAT, {6: 101.9}), SPEC, [], "equity")
+        self.assertEqual(row["exit_reason"], "target")
+        self.assertIs(row["exit_gap_fill"], True)
+        self.assertAlmostEqual(row["exit_reference"], 101.9, places=9)
+        self.assertGreater(row["exit_reference"], row["target_price"])
+
+    def test_an_intrabar_touch_still_fills_at_the_level(self):
+        # 100.4 closes below the 100.50 stop without opening through it, so the
+        # resting leg triggers at its own price.
+        row = _simulate_trade(_bars(RISING + [100.8, 100.4] + FLAT[:5]),
+                              SPEC, [], "equity")
+        self.assertEqual(row["exit_reason"], "stop")
+        self.assertIs(row["exit_gap_fill"], False)
+        self.assertAlmostEqual(row["exit_reference"], row["stop_price"], places=9)
+
+    def test_a_gap_spanning_both_levels_resolves_to_the_stop(self):
+        # A bar opening at 100.20 with a 102.0 close spans stop and target.
+        # The stop is encountered at the open, so ties stay stop-first.
+        row = _simulate_trade(_bars(RISING + FLAT[:1] + [100.8, 102.0] + FLAT[:4],
+                                    {6: 100.2}), SPEC, [], "equity")
+        self.assertEqual(row["exit_reason"], "stop")
+        self.assertAlmostEqual(row["exit_reference"], 100.2, places=9)
+
+    def test_the_gap_makes_the_simulated_result_worse(self):
+        # The same series held to its time exit, versus one whose sixth bar
+        # opens through the stop.  Stop-side gaps must cost money.
+        clean = simulate_account(_bars(RISING + FLAT), [], SPEC,
+                                 vehicle="equity", account_id="clean",
+                                 risk_pct=.05)
+        gapped = simulate_account(_bars(RISING + FLAT, {6: 100.2}), [], SPEC,
+                                  vehicle="equity", account_id="gapped",
+                                  risk_pct=.05)
+        self.assertLess(gapped["rows"][0]["net_pnl"], clean["rows"][0]["net_pnl"])
+
+
+class QuoteDrivenFillTests(unittest.TestCase):
+    def test_the_latest_visible_quote_at_the_instant_wins(self):
+        indexed = index_quotes([_quote(3, 99.0, 99.1), _quote(4, 100.0, 100.1),
+                                _quote(5, 200.0, 200.1)])
+        at = BASE + timedelta(minutes=4)
+        self.assertAlmostEqual(quote_fill(indexed, symbol="SPY", at=at, side="buy"),
+                               100.1, places=9)
+        self.assertAlmostEqual(quote_fill(indexed, symbol="SPY", at=at, side="sell"),
+                               100.0, places=9)
+
+    def test_a_quote_not_yet_available_at_the_instant_is_not_used(self):
+        # Timestamped at the fill instant but only observable a minute later.
+        indexed = index_quotes([_quote(4, 100.0, 100.1, as_of_minute=5)])
+        self.assertIsNone(quote_fill(indexed, symbol="SPY",
+                                     at=BASE + timedelta(minutes=4), side="buy"))
+
+    def test_absence_is_explicit_rather_than_an_invented_price(self):
+        self.assertIsNone(quote_fill(None, symbol="SPY", at=BASE, side="buy"))
+        self.assertIsNone(quote_fill(index_quotes([_quote(4, 100.0, 100.1)]),
+                                     symbol="QQQ", at=BASE, side="buy"))
+
+    def test_an_entry_uses_the_recorded_ask_and_records_the_source(self):
+        bars = _bars(RISING + FLAT)
+        quoted = _simulate_trade(bars, SPEC, [], "equity",
+                                 quotes=index_quotes([_quote(4, 100.70, 100.90)]))
+        self.assertEqual(quoted["entry_fill_source"], QUOTE)
+        self.assertAlmostEqual(quoted["entry_reference"], 100.90, places=9)
+        # A short thesis would lift the bid instead; the long path is enough to
+        # prove the executable side is chosen rather than a mid.
+        self.assertNotEqual(quoted["entry_reference"], bars[4].open)
+
+    def test_a_missing_quote_falls_back_to_the_bar_and_says_so(self):
+        row = _simulate_trade(_bars(RISING + FLAT), SPEC, [], "equity")
+        self.assertEqual(row["entry_fill_source"], BAR)
+        self.assertEqual(row["exit_fill_source"], BAR)
+        self.assertAlmostEqual(row["entry_reference"], 100.8, places=9)
+
+    def test_an_intrabar_level_exit_keeps_the_bar_because_it_has_no_instant(self):
+        # The stop triggers somewhere inside bar 5; no quote is at that instant,
+        # so a quote recorded at the boundary must not be used as the fill.
+        row = _simulate_trade(_bars(RISING + [100.8, 100.4] + FLAT[:5]), SPEC, [],
+                              "equity", quotes=index_quotes([_quote(6, 90.0, 90.1)]))
+        self.assertEqual(row["exit_reason"], "stop")
+        self.assertEqual(row["exit_fill_source"], BAR)
+        self.assertAlmostEqual(row["exit_reference"], row["stop_price"], places=9)
+
+    def test_a_quoted_fill_is_not_charged_a_modelled_spread_twice(self):
+        bars = _bars(RISING + FLAT)
+        quotes = [_quote(4, 100.79, 100.81), _quote(8, 100.79, 100.81)]
+        book = simulate_account(bars, [], SPEC, vehicle="equity", risk_pct=.05,
+                                account_id="quoted", quotes=quotes)
+        row = book["rows"][0]
+        model = CostModel()
+        self.assertEqual(row["entry_fill_source"], QUOTE)
+        self.assertAlmostEqual(
+            row["entry_price"],
+            100.81 * (1 + model.slippage_bps / 10_000.0), places=9)
+
+
+class NullControlSharesTheFillModelTests(unittest.TestCase):
+    """The chance-entry null must not get exit realism the candidate lacks."""
+
+    def _null(self, bars):
+        reference = simulate_account(bars, [], SPEC, vehicle="equity",
+                                     account_id="reference", risk_pct=.05)["rows"]
+        # The entry bar is drawn from a seed derived from account, spec and
+        # session set, so two same-shaped series draw the same bar.
+        return null_control_account(bars, [], SPEC, vehicle="equity",
+                                    reference_rows=reference, account_id="null",
+                                    risk_pct=.05)
+
+    # The null enters at bar 9 and its stop sits at 100.50.  Bar 10 reaches
+    # that stop either way; only the fill differs.
+    STOPPED = RISING + FLAT[:6] + [100.5, 100.8]
+
+    def test_a_gap_through_the_null_stop_costs_it_money(self):
+        touched = self._null(_bars(self.STOPPED))
+        gapped = self._null(_bars(self.STOPPED, {10: 99.0}))
+        self.assertLess(gapped["ending_equity"], touched["ending_equity"])
+
+    def test_the_null_is_priced_by_the_shared_cost_model(self):
+        bars = _bars(RISING + FLAT)
+        reference = simulate_account(bars, [], SPEC, vehicle="equity",
+                                     account_id="reference", risk_pct=.05)["rows"]
+        free = null_control_account(
+            bars, [], SPEC, vehicle="equity", reference_rows=reference,
+            account_id="null", risk_pct=.05,
+            costs=CostModel(spread_bps=0, slippage_bps=0, fee_bps=0))
+        priced = null_control_account(
+            bars, [], SPEC, vehicle="equity", reference_rows=reference,
+            account_id="null", risk_pct=.05)
+        self.assertGreater(free["ending_equity"], priced["ending_equity"])
+
+
+class NotionalCapAnchorTests(unittest.TestCase):
+    """Research and the runtime must cap on the same price."""
+
+    def _runtime_cap_shares(self, equity, plan_entry):
+        risk = RiskEngine({"risk": {"max_position_notional_pct": NOTIONAL_CAP_PCT}})
+        # A budget large enough that the notional cap, not the risk term, binds.
+        return risk.size_shares(equity=equity, entry_price=plan_entry,
+                                stop_distance=.3, risk_usd=1e9)["shares"]
+
+    def test_a_gapped_entry_caps_on_the_plan_price_like_the_runtime(self):
+        book = simulate_account(_bars(RISING + FLAT, {4: 101.0}), [], SPEC,
+                                vehicle="equity", account_id="cap", risk_pct=50.0)
+        row = book["rows"][0]
+        self.assertAlmostEqual(row["plan_entry"], 100.8, places=9)
+        self.assertAlmostEqual(row["underlying_entry"], 101.0, places=9)
+        # The runtime sizes at plan time from the signal close; it cannot see
+        # the gap, so capping on the fill would size a different position.
+        self.assertEqual(row["quantity"],
+                         self._runtime_cap_shares(100_000.0, row["plan_entry"]))
+        self.assertNotEqual(row["quantity"],
+                            self._runtime_cap_shares(100_000.0, row["underlying_entry"]))
+
+    def test_the_cap_percentage_matches_the_runtime_risk_block(self):
+        book = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
+                                account_id="cap-pct", risk_pct=50.0)
+        row = book["rows"][0]
+        self.assertEqual(row["quantity"],
+                         int(100_000.0 * NOTIONAL_CAP_PCT / 100.0 / row["plan_entry"]))
+
+
+class CalibrationTests(unittest.TestCase):
+    """Measure the model against what the broker actually filled."""
+
+    def _journal(self, fills):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE trades (ts REAL, symbol TEXT, side TEXT, "
+                   "action TEXT, qty REAL, price REAL, notional REAL, "
+                   "order_id TEXT, runtime_mode TEXT, variant_id TEXT)")
+        db.execute("CREATE TABLE orders (order_id TEXT, qty REAL)")
+        for index, (fill, reference, qty) in enumerate(fills):
+            order = f"order-{index}"
+            db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (float(index), "SPY", "buy", "open", qty, fill,
+                        reference * qty, order, "paper", "v1"))
+            db.execute("INSERT INTO orders VALUES (?,?)", (order, qty))
+        return db
+
+    def test_a_conservative_model_is_reported_as_conservative(self):
+        # Two bps paid against a four bps expectation.
+        db = self._journal([(100.02, 100.0, 10)] * calibration.MIN_FILLS)
+        report = calibration.json_report(db)
+        self.assertEqual(report["referenced_fills"], calibration.MIN_FILLS)
+        self.assertAlmostEqual(report["observed_mean_bps"], 2.0, places=6)
+        self.assertAlmostEqual(report["expected_entry_cost_bps"], 4.0, places=6)
+        self.assertAlmostEqual(report["bias_bps"], 2.0, places=6)
+        self.assertEqual(report["within_model_rate"], 1.0)
+        self.assertEqual(report["over_runtime_cap"], 0)
+        self.assertEqual(report["verdict"], "conservative")
+
+    def test_an_optimistic_model_is_named_rather_than_absorbed(self):
+        db = self._journal([(100.10, 100.0, 10)] * calibration.MIN_FILLS)
+        report = calibration.json_report(db)
+        self.assertAlmostEqual(report["observed_mean_bps"], 10.0, places=6)
+        self.assertLess(report["bias_bps"], 0)
+        self.assertEqual(report["within_model_rate"], 0.0)
+        self.assertEqual(report["verdict"], "optimistic")
+
+    def test_a_fill_past_the_runtime_cap_is_reported_separately(self):
+        # The pre-trade slippage check accepted it; the fill disagreed.
+        rows = [(100.02, 100.0, 10)] * calibration.MIN_FILLS + [(101.0, 100.0, 10)]
+        report = calibration.json_report(self._journal(rows))
+        self.assertEqual(report["over_runtime_cap"], 1)
+        self.assertAlmostEqual(report["worst_bps"], 100.0, places=6)
+
+    def test_the_reference_survives_a_partial_fill(self):
+        # 10 shares planned, 4 filled: the plan price is notional/planned, and
+        # dividing by the filled quantity would invent a 150 bps cost.
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE trades (ts REAL, symbol TEXT, side TEXT, "
+                   "action TEXT, qty REAL, price REAL, notional REAL, "
+                   "order_id TEXT, runtime_mode TEXT, variant_id TEXT)")
+        db.execute("CREATE TABLE orders (order_id TEXT, qty REAL)")
+        db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (1.0, "SPY", "buy", "open", 4.0, 100.02, 1000.0, "o1",
+                    "paper", "v1"))
+        db.execute("INSERT INTO orders VALUES ('o1', 10.0)")
+        fills = calibration.load_entry_fills(db)
+        report = calibration.calibrate(fills)
+        self.assertAlmostEqual(report["observed_mean_bps"], 2.0, places=6)
+
+    def test_a_sell_side_entry_measures_the_adverse_direction(self):
+        db = self._journal([(100.02, 100.0, 10)])
+        db.execute("UPDATE trades SET side = 'sell'")
+        report = calibration.calibrate(calibration.load_entry_fills(db))
+        # Selling above the reference is a favourable fill, not a cost.
+        self.assertAlmostEqual(report["observed_mean_bps"], -2.0, places=6)
+
+    def test_an_unreferenced_fill_is_counted_not_guessed(self):
+        db = self._journal([(100.02, 100.0, 10)])
+        db.execute("UPDATE trades SET notional = NULL")
+        report = calibration.calibrate(calibration.load_entry_fills(db))
+        self.assertEqual(report["referenced_fills"], 0)
+        self.assertEqual(report["unreferenced_fills"], 1)
+        self.assertIsNone(report["observed_mean_bps"])
+        self.assertEqual(report["verdict"], "insufficient_data")
+
+    def test_a_thin_sample_refuses_to_issue_a_verdict(self):
+        report = calibration.json_report(self._journal([(100.10, 100.0, 10)] * 3))
+        self.assertEqual(report["referenced_fills"], 3)
+        self.assertEqual(report["verdict"], "insufficient_data")
+
+    def test_an_empty_journal_is_insufficient_data_not_a_pass(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        report = calibration.json_report(db)
+        self.assertEqual(report["journal_fills"], 0)
+        self.assertEqual(report["verdict"], "insufficient_data")
+
+    def test_the_report_names_the_model_it_scored(self):
+        db = self._journal([(100.02, 100.0, 10)])
+        model = CostModel(spread_bps=1.0, slippage_bps=1.0)
+        self.assertEqual(calibration.json_report(db, model)["model"],
+                         model.as_dict())
+
+
+if __name__ == "__main__":
+    unittest.main()
