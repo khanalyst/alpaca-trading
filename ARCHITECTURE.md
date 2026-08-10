@@ -274,8 +274,9 @@ identity stable while moving cohesive responsibilities.
 Compatibility tests assert facade identities, MRO, method ownership, reverse
 import order, lazy imports, pickle identity, path rebinding, and legacy helper
 patch interception. During extraction, moved method/helper ASTs and differential
-runtime scenarios were compared with their pre-extraction versions. The final
-canonical warning-as-error suite contains 299 tests.
+runtime scenarios were compared with their pre-extraction versions. The
+canonical suite runs under warnings-as-errors; its size is the suite itself,
+not a number recorded here.
 
 ## Why the remaining larger modules are stop points
 
