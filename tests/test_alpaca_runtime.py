@@ -1,9 +1,12 @@
 """Dependency-free checks for the Alpaca runtime boundary."""
 
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 import inspect
 import os
+import sys
+import types
 import pickle
 import unittest
 from unittest.mock import patch
@@ -313,6 +316,101 @@ class AlpacaRuntimeTests(unittest.TestCase):
                 validate_config({**base, "strategy": {
                     "id": "ibr", "variant_id": "ibr.baseline",
                     "selection_mode": "all_proved"}})
+            with self.assertRaisesRegex(ConfigError, "live mode requires llm.enabled=false"):
+                validate_config({**base, "llm": {"enabled": True, "model": "gpt-4o"}})
+            self.assertFalse(validate_config({**base, "llm": {"enabled": False}})["llm"]["enabled"])
+        self.assertTrue(validate_config({"llm": {"enabled": True, "model": "gpt-4o"}})["llm"]["enabled"])
+
+    def test_bracket_order_requests_are_validated_and_translated(self):
+        bracket = OrderRequest("SPY", Decimal("10"), "buy", order_class="bracket",
+                               take_profit=Decimal("105"), stop_loss=Decimal("95"))
+        self.assertEqual(bracket.order_class, "bracket")
+        self.assertEqual((bracket.take_profit, bracket.stop_loss),
+                         (Decimal("105"), Decimal("95")))
+        plain = OrderRequest("SPY", Decimal("10"), "buy")
+        self.assertIsNone(plain.order_class)
+        self.assertIsNone(plain.take_profit)
+        OrderRequest("SPY", Decimal("10"), "sell", order_class="bracket",
+                     take_profit=Decimal("95"), stop_loss=Decimal("105"))
+        OrderRequest("SPY", Decimal("10"), "buy", type="limit", limit_price=Decimal("100"),
+                     order_class="bracket", take_profit=Decimal("105"), stop_loss=Decimal("95"))
+        cases = [
+            ({"order_class": "bracket", "take_profit": Decimal("105")}, "require both"),
+            ({"order_class": "bracket", "stop_loss": Decimal("95")}, "require both"),
+            ({"take_profit": Decimal("105"), "stop_loss": Decimal("95")}, "order_class=bracket"),
+            ({"order_class": "oco", "take_profit": Decimal("105"),
+              "stop_loss": Decimal("95")}, "unsupported order class"),
+            ({"order_class": "bracket", "take_profit": Decimal("95"),
+              "stop_loss": Decimal("105")}, "take_profit must be above stop_loss"),
+            ({"order_class": "bracket", "take_profit": Decimal("0"),
+              "stop_loss": Decimal("95")}, "finite and positive"),
+            ({"order_class": "bracket", "take_profit": Decimal("nan"),
+              "stop_loss": Decimal("95")}, "finite and positive"),
+            ({"type": "limit", "limit_price": Decimal("110"), "order_class": "bracket",
+              "take_profit": Decimal("105"), "stop_loss": Decimal("95")}, "straddle"),
+        ]
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
+                OrderRequest("SPY", Decimal("10"), "buy", **kwargs)
+        with self.assertRaisesRegex(ValueError, "take_profit must be below stop_loss"):
+            OrderRequest("SPY", Decimal("10"), "sell", order_class="bracket",
+                         take_profit=Decimal("105"), stop_loss=Decimal("95"))
+        with self.assertRaisesRegex(ValueError, "not supported for option symbols"):
+            OrderRequest("SPY260821C00600000", Decimal("1"), "buy", order_class="bracket",
+                         take_profit=Decimal("5"), stop_loss=Decimal("1"))
+        with self.assertRaisesRegex(ValueError, "stop orders are not supported"):
+            OrderRequest("SPY", Decimal("10"), "buy", stop_price=Decimal("95"),
+                         order_class="bracket", take_profit=Decimal("105"),
+                         stop_loss=Decimal("95"))
+        with self.assertRaisesRegex(ValueError, "must be day"):
+            OrderRequest("SPY", Decimal("10"), "buy", time_in_force="gtc",
+                         order_class="bracket", take_profit=Decimal("105"),
+                         stop_loss=Decimal("95"))
+        with self.assertRaisesRegex(ValueError, "extended_hours must be false"):
+            OrderRequest("SPY", Decimal("10"), "buy", extended_hours=True,
+                         order_class="bracket", take_profit=Decimal("105"),
+                         stop_loss=Decimal("95"))
+
+        seen = {}
+
+        class MarketOrderRequest:
+            type = "market"
+
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                seen.update(kwargs)
+
+        class TakeProfitRequest:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class StopLossRequest(TakeProfitRequest):
+            pass
+
+        modules = {
+            name: types.ModuleType(name) for name in (
+                "alpaca", "alpaca.trading", "alpaca.trading.requests",
+                "alpaca.trading.enums")}
+        modules["alpaca.trading.requests"].MarketOrderRequest = MarketOrderRequest
+        modules["alpaca.trading.requests"].LimitOrderRequest = MarketOrderRequest
+        modules["alpaca.trading.requests"].TakeProfitRequest = TakeProfitRequest
+        modules["alpaca.trading.requests"].StopLossRequest = StopLossRequest
+        modules["alpaca.trading.enums"].OrderSide = types.SimpleNamespace(BUY="buy", SELL="sell")
+        modules["alpaca.trading.enums"].TimeInForce = types.SimpleNamespace(DAY="day")
+        modules["alpaca.trading.enums"].OrderClass = types.SimpleNamespace(BRACKET="bracket")
+
+        session = AlpacaSession(paper=True, trading_client=TradingFake())
+        with patch.dict(sys.modules, modules):
+            provider = AlpacaProvider({"mode": "paper", "broker": {"paper": True}},
+                                      session=session)
+            provider.submit_order(replace(bracket, client_order_id="bracket-1"))
+            self.assertEqual(seen["order_class"], "bracket")
+            self.assertEqual(seen["take_profit"].limit_price, 105.0)
+            self.assertEqual(seen["stop_loss"].stop_price, 95.0)
+            seen.clear()
+            provider.submit_order(replace(plain, client_order_id="plain-1"))
+        self.assertNotIn("order_class", seen)
+        self.assertNotIn("take_profit", seen)
 
     def test_crypto_gtc_and_malformed_entry_cutoff_are_rejected(self):
         for symbol in ("BTC/USD", "BTCUSD", "ETHUSD"):

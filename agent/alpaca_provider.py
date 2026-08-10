@@ -409,6 +409,9 @@ class AlpacaProvider(AlpacaMarketDataMixin):
                     raise IdempotencyConflict("client_order_id belongs to a different limit price")
             except ValueError as exc:
                 raise IdempotencyConflict("client_order_id belongs to a malformed limit price") from exc
+        existing_class = _text(_value(raw, "order_class", None)).lower() or "simple"
+        if (request.order_class or "simple") != existing_class:
+            raise IdempotencyConflict("client_order_id belongs to a different order class")
         requested_intent = request.position_intent
         existing_intent = _text(_value(raw, "position_intent", None)) or None
         if requested_intent != existing_intent:
@@ -445,6 +448,12 @@ class AlpacaProvider(AlpacaMarketDataMixin):
                       "extended_hours": request.extended_hours}
             if request.limit_price is not None:
                 kwargs["limit_price"] = float(request.limit_price)
+            if request.order_class == "bracket":
+                from alpaca.trading.enums import OrderClass
+                from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
+                kwargs["order_class"] = OrderClass.BRACKET
+                kwargs["take_profit"] = TakeProfitRequest(limit_price=float(request.take_profit))
+                kwargs["stop_loss"] = StopLossRequest(stop_price=float(request.stop_loss))
             if request.position_intent is not None:
                 # alpaca-py accepts a PositionIntent enum on option orders;
                 # importing it lazily keeps stock-only installs usable.

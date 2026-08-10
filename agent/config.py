@@ -309,6 +309,11 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
             raise ConfigError("live mode requires the validated research edge gate")
         if strategy.get("selection_mode") != "specific":
             raise ConfigError("live mode requires strategy.selection_mode=specific")
+        if llm["enabled"]:
+            raise ConfigError(
+                "live mode requires llm.enabled=false: the validated edge was proven with the "
+                "deterministic rule and no LLM in the loop, so a runtime LLM veto would deploy a "
+                "strategy that differs from the one that passed the gates")
     cycle = _map(out.get("cycle"), "cycle")
     _unknown(cycle, {"interval_seconds"}, "cycle")
     cycle["interval_seconds"] = _num(cycle, "interval_seconds", "cycle", .1, 86_400, 60)
