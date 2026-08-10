@@ -204,9 +204,10 @@ operator, mode, time, and check output in the deployment log.
 ## Research and evidence
 
 Research is read-only with respect to broker authority. It discovers the
-recorder's mixed bars/quotes/options dataset at
-`runtime/research/recorded/market.csv` by default (or uses
-`ALPACA_RESEARCH_DATASET`), runs the seven-family autonomous strategy factory
+recorder's mixed bars/quotes/options corpus under
+`runtime/research/recorded/sessions/` by default (or uses
+`ALPACA_RESEARCH_DATASET`; `ALPACA_RESEARCH_SESSION_WINDOW` loads only the most
+recent N session partitions), runs the seven-family autonomous strategy factory
 plus the explicit IBR baseline, scores shares and single-leg long-option
 vehicles separately, and writes evidence. Each variant has its own simulated
 cash/equity account; default capacity is seven parallel strategy workers and

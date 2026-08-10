@@ -26,6 +26,14 @@ FIELDS = (
 )
 
 
+# A five-contract sample is too narrow to survive a trade: a contract can drift
+# out of the ranking mid-trade. The per-side cap is configurable up to
+# MAX_OPTION_LIMIT, and pinned contracts are sampled on top of it up to
+# MAX_OPTION_SAMPLE so the request volume stays bounded either way.
+MAX_OPTION_LIMIT = 25
+MAX_OPTION_SAMPLE = 50
+
+
 def _value(value):
     return "" if value is None else str(value)
 
@@ -192,8 +200,14 @@ def _option_rank(candidate: dict, underlying_price: object) -> tuple:
 
 
 def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
-                 *, feed: str, config: dict | None, limit: int):
-    """Project bounded provider candidates into append-only option events."""
+                 *, feed: str, config: dict | None, limit: int,
+                 pinned: frozenset[str] = frozenset()):
+    """Project bounded provider candidates into append-only option events.
+
+    ``pinned`` contracts are sampled in addition to the top ``limit`` per side.
+    A contract that drifts out of the ranking mid-trade would otherwise lose its
+    exit quote and destroy the observation.
+    """
     method = getattr(provider, "option_candidates", None)
     if not callable(method):
         return
@@ -253,14 +267,17 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             selected[right].sort(key=lambda item: _option_rank(item, spot))
             unique = []
             symbols_seen = set()
+            held = []
             for candidate in selected[right]:
                 symbol = str(candidate["symbol"]).upper()
                 if symbol in symbols_seen:
                     continue
                 symbols_seen.add(symbol)
-                unique.append(candidate)
-                if len(unique) >= limit:
-                    break
+                if len(unique) < limit:
+                    unique.append(candidate)
+                elif symbol in pinned and len(held) < MAX_OPTION_SAMPLE - limit:
+                    held.append(candidate)
+            unique.extend(held)
             for candidate in unique:
                 timestamp = candidate.get("timestamp") or candidate.get("quote_ts")
                 yield {
@@ -289,7 +306,8 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
 def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           *, feed: str | None = None, config: dict | None = None,
           include_options: bool = False, option_limit: int = 5,
-          start: datetime | None = None):
+          start: datetime | None = None,
+          option_pins: frozenset[str] = frozenset()):
     start = start or now - timedelta(minutes=3)
     if start.tzinfo is None or start.utcoffset() is None or start > now:
         raise ValueError("recorder start must be an aware timestamp at or before now")
@@ -341,4 +359,5 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
     if include_options:
         yield from _option_rows(
             provider, symbols, quotes, now, feed=feed, config=config,
-            limit=max(1, min(5, int(option_limit))))
+            limit=max(1, min(MAX_OPTION_LIMIT, int(option_limit))),
+            pinned=frozenset(str(item).upper() for item in option_pins))

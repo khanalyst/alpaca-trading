@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import closing
 import ast
 import json
+import os
 import inspect
 from pathlib import Path
 import sqlite3
@@ -302,6 +303,88 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
                                side_effect=DiscoveryError("patched facade")):
             with self.assertRaisesRegex(DiscoveryError, "patched facade"):
                 discover([], lane="backtest")
+
+
+class DiscoveryCorpusStreamingTests(unittest.TestCase):
+    """The corpus is fed row by row; what the replay computes is unchanged."""
+
+    @staticmethod
+    def _rows(sessions=3, per_session=4):
+        rows = []
+        for session in range(sessions):
+            day = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc) + timedelta(days=session)
+            for minute in range(per_session):
+                stamp = (day + timedelta(minutes=minute)).isoformat()
+                rows.append({"kind": "bar", "symbol": "SPY", "timestamp": stamp,
+                             "as_of": stamp, "open": 100, "high": 101, "low": 99,
+                             "close": 100.5, "volume": 10})
+        return rows
+
+    def _write(self, root: Path, rows, *, partitioned: bool):
+        if not partitioned:
+            target = root / "market.jsonl"
+            target.write_text("".join(json.dumps(row, sort_keys=True) + "\n"
+                                      for row in rows), encoding="utf-8")
+            return target
+        directory = root / "sessions"
+        directory.mkdir()
+        for row in rows:
+            day = row["timestamp"][:10]
+            with (directory / f"market-{day}.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+        return directory
+
+    def test_partitioned_corpus_loads_exactly_like_one_file(self):
+        rows = self._rows()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flat = edge_discovery_core._read_discovery_rows(
+                self._write(root, rows, partitioned=False))
+            split = edge_discovery_core._read_discovery_rows(
+                self._write(root, rows, partitioned=True))
+        self.assertEqual(flat[0], split[0])
+        self.assertEqual(content_hash(flat[0]), content_hash(split[0]))
+        self.assertEqual([vars(bar) for bar in flat[1]],
+                         [vars(bar) for bar in split[1]])
+        self.assertEqual((flat[2], flat[3]), (split[2], split[3]))
+
+    def test_reader_streams_without_materializing_the_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self._write(Path(directory), self._rows(), partitioned=False)
+            with mock.patch.object(
+                    Path, "read_text",
+                    side_effect=AssertionError("corpus must not be slurped")):
+                raw, bars, _, _ = edge_discovery_core._read_discovery_rows(source)
+        self.assertEqual(len(raw), 12)
+        self.assertEqual(len(bars), 12)
+
+    def test_session_window_bounds_work_by_window_not_corpus_size(self):
+        loaded = {}
+        with tempfile.TemporaryDirectory() as directory:
+            for label, sessions in (("small", 4), ("large", 40)):
+                root = Path(directory) / label
+                root.mkdir()
+                corpus = self._write(root, self._rows(sessions=sessions),
+                                     partitioned=True)
+                self.assertEqual(len(edge_discovery_core.corpus_partitions(
+                    corpus, window=2)), 2)
+                with mock.patch.dict(
+                        os.environ,
+                        {edge_discovery_core.SESSION_WINDOW_ENV: "2"}, clear=False):
+                    windowed = edge_discovery_core._read_discovery_rows(corpus)
+                whole = edge_discovery_core._read_discovery_rows(corpus)
+                loaded[label] = (len(windowed[0]), len(whole[0]))
+        self.assertEqual(loaded["small"][0], loaded["large"][0])
+        self.assertEqual((loaded["small"][1], loaded["large"][1]), (16, 160))
+
+    def test_invalid_partition_line_names_its_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = self._write(Path(directory), self._rows(), partitioned=True)
+            broken = sorted(corpus.glob("*.jsonl"))[-1]
+            with broken.open("a", encoding="utf-8") as handle:
+                handle.write("{not json\n")
+            with self.assertRaisesRegex(DiscoveryError, broken.name):
+                edge_discovery_core._read_discovery_rows(corpus)
 
 
 class EdgeDiscoveryLifecycleTests(unittest.TestCase):

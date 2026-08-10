@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import json
+import os
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -86,16 +87,46 @@ class DiscoveryError(ValueError):
     """Raised when a discovery corpus cannot be evaluated safely."""
 
 
+SESSION_WINDOW_ENV = "ALPACA_RESEARCH_SESSION_WINDOW"
+
+
+def corpus_partitions(source: Path, *, window: int | None = None) -> list[Path]:
+    """Return the session partitions of a corpus directory, oldest first.
+
+    ``window`` keeps only the most recent partitions, so a replay that needs
+    the last few sessions never pays for the whole recorded history.
+    """
+    partitions = sorted(path for path in source.glob("*.jsonl") if path.is_file())
+    if window is None:
+        try:
+            window = int(os.getenv(SESSION_WINDOW_ENV, "0"))
+        except ValueError as exc:
+            raise DiscoveryError(f"invalid {SESSION_WINDOW_ENV}: {exc}") from exc
+    return partitions[-window:] if window and window > 0 else partitions
+
+
+def _stream_rows(source: Path):
+    """Yield decoded rows one line at a time; never hold the file in memory."""
+    for partition in (corpus_partitions(source) if source.is_dir() else [source]):
+        try:
+            with partition.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        yield json.loads(line)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DiscoveryError(f"invalid discovery JSONL {partition}: {exc}") from exc
+
+
 def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
         list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
-    """Load one normalized JSONL corpus: bars, option quotes, equity quotes."""
+    """Load one normalized JSONL corpus: bars, option quotes, equity quotes.
+
+    ``data`` is a JSONL file, a directory of session partitions, or an
+    in-memory sequence. Files are streamed line by line; what the replay then
+    computes is identical either way.
+    """
     if isinstance(data, (str, Path)):
-        source = Path(data)
-        try:
-            raw_rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()
-                        if line.strip()]
-        except (OSError, json.JSONDecodeError) as exc:
-            raise DiscoveryError(f"invalid discovery JSONL {source}: {exc}") from exc
+        raw_rows = list(_stream_rows(Path(data)))
     else:
         raw_rows = [dict(row) for row in data]
     if any(not isinstance(row, Mapping) for row in raw_rows):
@@ -317,5 +348,5 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping) -> dict:
     return gate
 
 
-__all__ = ["DiscoveryError", "_read_discovery_rows", "_effective_ibr_config",
+__all__ = ["DiscoveryError", "corpus_partitions", "_read_discovery_rows", "_effective_ibr_config",
            "_opportunity_rows", "_discover_gate", "_finalize_gate"]
