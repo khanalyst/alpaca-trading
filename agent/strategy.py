@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 from .contracts import finite as _finite
 from .contracts.ibr import build_ibr_range
-from .contracts.rule import rule_variant_id, validate_rule_spec
+from .contracts.rule import (BAR_SECONDS, RuleSpecError, hold_deadline,
+                             rule_variant_id, validate_rule_spec)
 
 from .registry import (baseline_variant_id, contract_for_variant,
                        validate_contract_config)
@@ -126,9 +127,18 @@ def _build_rule_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
             if force_flat_at else None
     except (TypeError, ValueError, OverflowError):
         force_flat_ts = None
+    # The simulated entry is the bar after the signal bar; the runtime holds
+    # for the same bounded number of bars beyond it.
+    try:
+        deadline_ts = hold_deadline(signal_ts + BAR_SECONDS, spec,
+                                    force_flat_ts=force_flat_ts)
+    except RuleSpecError as exc:
+        return None, f"hold deadline is unavailable: {exc}"
     distance = abs(entry - stop)
     plan = dict(decision)
     plan.update({
+        "max_hold_bars": int(spec["max_hold_bars"]),
+        "hold_deadline_ts": deadline_ts,
         "strategy_id": "rule", "strategy_version": "v1",
         "variant_id": variant_id, "contract_hash": contract.semantic_hash,
         "setup_type": setup_type, "setup_key": setup_key,

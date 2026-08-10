@@ -30,6 +30,7 @@ RULE_FAMILIES = (
 )
 CONFIRMATIONS = ("none", "trend", "volume", "volatility")
 SIDES = ("both", "long", "short")
+BAR_SECONDS = 60.0
 
 DEFAULT_RULE_SPEC: dict[str, Any] = {
     "schema": RULE_SCHEMA,
@@ -102,6 +103,47 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if spec["slow_lookback"] <= spec["lookback"]:
         raise RuleSpecError("rule_spec.slow_lookback must exceed lookback")
     return spec
+
+
+def hold_deadline(entry_ts: Any, spec: Mapping[str, Any], *,
+                  force_flat_ts: Any = None) -> float | None:
+    """Absolute epoch second by which a bounded rule position must be flat.
+
+    *entry_ts* is the opening timestamp of the entry bar, which is the bar
+    after the signal bar.  The position is held for at most `max_hold_bars`
+    further one-minute bars, so the deadline is the close of the last
+    permitted bar.  Research simulation and live execution share this one
+    definition; a session force-flat always clamps it.  A spec without
+    `max_hold_bars` has no time exit.
+    """
+    held = spec.get("max_hold_bars") if isinstance(spec, Mapping) else None
+    if held is None:
+        return None
+    lower, upper, _ = _BOUNDS["max_hold_bars"]
+    if isinstance(held, bool) or not isinstance(held, int):
+        raise RuleSpecError("rule_spec.max_hold_bars must be an integer")
+    if not lower <= held <= upper:
+        raise RuleSpecError(
+            f"rule_spec.max_hold_bars must be between {lower:g} and {upper:g}")
+    start = _epoch(entry_ts, "entry timestamp")
+    deadline = start + (held + 1) * BAR_SECONDS
+    if force_flat_ts is not None:
+        deadline = min(deadline, _epoch(force_flat_ts, "force-flat timestamp"))
+    return deadline
+
+
+def _epoch(value: Any, field: str) -> float:
+    if isinstance(value, datetime):
+        value = value.timestamp()
+    if isinstance(value, bool):
+        raise RuleSpecError(f"{field} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuleSpecError(f"{field} must be numeric") from exc
+    if not math.isfinite(number):
+        raise RuleSpecError(f"{field} must be finite")
+    return number
 
 
 def rule_spec_hash(value: Mapping[str, Any]) -> str:
@@ -337,9 +379,10 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
 
 
 __all__ = [
-    "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "RULE_FAMILIES", "RULE_SCHEMA",
-    "RuleSpecError", "evaluate_rule_signal", "generate_rule_signal",
-    "rule_spec_hash", "rule_variant_id", "setup_evidence", "validate_rule_spec",
+    "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "RULE_FAMILIES",
+    "RULE_SCHEMA", "RuleSpecError", "evaluate_rule_signal",
+    "generate_rule_signal", "hold_deadline", "rule_spec_hash",
+    "rule_variant_id", "setup_evidence", "validate_rule_spec",
 ]
 
 

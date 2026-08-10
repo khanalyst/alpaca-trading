@@ -543,6 +543,8 @@ class RiskEngine:
                      "margin_pct_equity": plan["notional"] / equity * 100.0,
                      "force_flat": bool(decision.get("force_flat", True)),
                      "force_flat_at": decision.get("force_flat_at"),
+                     "max_hold_bars": decision.get("max_hold_bars"),
+                     "hold_deadline_ts": decision.get("hold_deadline_ts"),
                      "underlying_stop_price": stop, "underlying_target_price": target})
         return plan, None
 

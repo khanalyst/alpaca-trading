@@ -33,6 +33,29 @@ def _plain(value):
     return value
 
 
+def _hold_expired(trade: Any, now: datetime) -> bool:
+    """Decide the bounded-hold time exit from durable state alone.
+
+    A trade persisted before this field existed, or an IBR trade, has no
+    deadline and keeps its historical stop/target/close-only behavior.  A
+    present but unusable deadline is treated as expired.
+    """
+    if not isinstance(trade, Mapping) or "hold_deadline_ts" not in trade:
+        return False
+    raw = trade.get("hold_deadline_ts")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return True
+    try:
+        deadline = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    if deadline != deadline or abs(deadline) == float("inf"):
+        return True
+    return now.timestamp() >= deadline
+
+
 def _value(obj: Any, name: str, default=None):
     if isinstance(obj, Mapping):
         return obj.get(name, default)
@@ -115,7 +138,11 @@ class ExecutionLifecycleMixin:
             "setup_id": plan.get("setup_id"), "order_id": order_state.get("order_id"),
             "status": "open", "stop_price": plan.get("underlying_stop_price", plan.get("stop_price")),
             "target_price": plan.get("underlying_target_price", plan.get("target_price")),
-            "force_flat_at": plan.get("force_flat_at"), "risk_usd": plan.get("risk_usd"),
+            "force_flat_at": plan.get("force_flat_at"),
+            "max_hold_bars": plan.get("max_hold_bars", existing.get("max_hold_bars")),
+            "hold_deadline_ts": plan.get("hold_deadline_ts",
+                                         existing.get("hold_deadline_ts")),
+            "risk_usd": plan.get("risk_usd"),
             "notional": plan.get("notional"), "variant_id": plan.get("variant_id"),
             "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
@@ -133,7 +160,8 @@ class ExecutionLifecycleMixin:
         current.setdefault("active_trades", {})[symbol] = trade
         current.setdefault("protection", {})[symbol] = {
             key: trade.get(key) for key in (
-                "underlying_symbol", "stop_price", "target_price", "force_flat_at")
+                "underlying_symbol", "stop_price", "target_price", "force_flat_at",
+                "max_hold_bars", "hold_deadline_ts")
         }
         logged_qty = self._number(order_state.get("logged_filled_qty")) or 0.0
         if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
@@ -269,8 +297,6 @@ class ExecutionLifecycleMixin:
                 reason = "before_close"
             elif not trade or stop is None or target is None:
                 reason = "protection_missing"
-            elif price is None:
-                reason = "protection_data_unavailable"
             elif price is not None and direction in {"long", "buy"}:
                 if stop is not None and price <= stop:
                     reason = "stop"
@@ -281,6 +307,13 @@ class ExecutionLifecycleMixin:
                     reason = "stop"
                 elif target is not None and price <= target:
                     reason = "target"
+            if reason is None and _hold_expired(trade, now):
+                # The validated contract's bounded hold is a time exit; it must
+                # fire without a tradable price rather than be reported as a
+                # market-data outage.
+                reason = "max_hold"
+            if reason is None and price is None:
+                reason = "protection_data_unavailable"
             if reason:
                 try:
                     prior_attempt = self._number(trade.get("closing_attempt")) \

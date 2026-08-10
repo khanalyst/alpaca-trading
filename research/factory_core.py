@@ -15,7 +15,8 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    RULE_FAMILIES, evaluate_rule_signal, rule_variant_id, validate_rule_spec,
+    RULE_FAMILIES, evaluate_rule_signal, hold_deadline, rule_variant_id,
+    validate_rule_spec,
 )
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
@@ -140,7 +141,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         distance = float(signal["stop_distance"])
         stop = entry_underlying - distance if direction == "long" else entry_underlying + distance
         target = entry_underlying + distance * float(spec["target_r"]) if direction == "long" else entry_underlying - distance * float(spec["target_r"])
-        last_index = min(len(session_bars) - 1, index + 1 + int(spec["max_hold_bars"]))
+        deadline = hold_deadline(entry_bar.timestamp, spec)
+        last_index = index + 1
+        for probe in range(index + 2, len(session_bars)):
+            if session_bars[probe].end.timestamp() > deadline:
+                break
+            last_index = probe
         exit_bar = session_bars[last_index]
         exit_ref = float(exit_bar.close)
         reason = "time"
