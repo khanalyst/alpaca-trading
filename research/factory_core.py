@@ -29,6 +29,15 @@ from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 # caps on the same percentage of the account, anchored to the same price.
 NOTIONAL_CAP_PCT = 25.0
 
+# The recorder samples on a 60s cycle (`deploy/recorder.py --interval`), so a
+# snapshot within one cycle of the fill instant is the best quote that existed
+# and is priced as executable.  Past that the quote is an approximation: it is
+# still used, but charged the modelled half-spread instead of being trusted as
+# a fill.  Beyond five cycles it is not a fill price at all and the observation
+# is rejected explicitly rather than priced off a quote from another regime.
+FRESH_OPTION_QUOTE_SECONDS = 60.0
+MAX_OPTION_QUOTE_STALENESS_SECONDS = 300.0
+
 DEFAULT_STRATEGIES = 7
 DEFAULT_VARIANTS = 4
 MAX_STRATEGIES = 7
@@ -111,9 +120,16 @@ def _visible(row: Any, cutoff: datetime) -> bool:
 def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
                direction: str, cutoff: datetime, contract_symbol: str | None = None) -> OptionSnapshot | None:
     right = "call" if direction == "long" else "put"
+    # A pinned exit lookup always has at least the entry snapshot available, so
+    # without this bound the "no quote" branch is unreachable and a contract
+    # that stopped being quoted at 10:05 silently prices a 15:30 exit off its
+    # last morning bid.  Bounding staleness turns that fabrication back into a
+    # visible rejection.
+    floor = cutoff.timestamp() - MAX_OPTION_QUOTE_STALENESS_SECONDS
     eligible = [snap for snap in snapshots
                 if snap.contract.underlying.upper() == symbol.upper()
                 and snap.session_date == day and snap.timestamp <= cutoff
+                and snap.timestamp.timestamp() >= floor
                 and _visible(snap, cutoff) and snap.bid > 0 and snap.ask > 0
                 and (contract_symbol is None
                      or snap.contract.symbol == contract_symbol)
@@ -127,6 +143,20 @@ def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
         abs(item.contract.strike - (spot or item.contract.strike)),
         (item.ask - item.bid) / item.ask, -item.timestamp.timestamp(),
         item.contract.symbol))
+
+
+def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
+              direction: str, reason: str, *, contract: str | None = None) -> dict:
+    """Mark a real signal that has no honest fill price.
+
+    Returning ``None`` here would make the observation indistinguishable from a
+    session that never signalled, which deletes exactly the trades whose
+    contract stopped being quoted — the least random subset there is.
+    """
+    return {"unpriced_reason": reason, "direction": direction, "contract": contract,
+            "session_date": day.isoformat(),
+            "signal_timestamp": signal_bar.end.isoformat(),
+            "entry_timestamp": entry_bar.timestamp.isoformat()}
 
 
 def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, Any],
@@ -241,20 +271,29 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     side="sell" if direction == "long" else "buy")
                 if quoted_exit is not None:
                     exit_ref, exit_source = quoted_exit, QUOTE
+        entry_age = exit_age = 0.0
         if vehicle == "option":
             entry_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
                                     direction=direction, cutoff=entry_bar.end)
             if entry_snap is None:
-                return None
+                return _unpriced(signal_bar, entry_bar, day, direction,
+                                 "no option quote within staleness bound at entry")
             exit_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
                                    direction=direction, cutoff=exit_bar.end,
                                    contract_symbol=entry_snap.contract.symbol)
             if exit_snap is None:
-                return None
+                return _unpriced(signal_bar, entry_bar, day, direction,
+                                 "entry contract stopped being quoted before exit",
+                                 contract=entry_snap.contract.symbol)
             contract = entry_snap.contract.symbol
             entry_ref = entry_snap.ask
             exit_ref = exit_snap.bid
             multiplier = entry_snap.contract.multiplier
+            # A snapshot inside the exit bar but after a level-triggered instant
+            # is not stale, it is simply the bar's quote; only genuinely older
+            # quotes carry an age.
+            entry_age = max(0.0, (entry_bar.end - entry_snap.timestamp).total_seconds())
+            exit_age = max(0.0, (exit_at - exit_snap.timestamp).total_seconds())
         return {
             "vehicle": vehicle, "symbol": signal_bar.symbol,
             "session_date": day.isoformat(), "direction": direction,
@@ -268,6 +307,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "stop_distance": distance, "entry_gap_fill": gapped,
             "exit_gap_fill": exit_gapped,
             "entry_fill_source": entry_source, "exit_fill_source": exit_source,
+            "entry_quote_age_seconds": entry_age,
+            "exit_quote_age_seconds": exit_age,
             # The price the runtime plans and caps notional against; the fill
             # reference above may have gapped away from it.
             "plan_entry": float(signal["entry_price"]),
@@ -279,6 +320,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                        if vehicle == "option" else real_risk),
         }
     return None
+
+
+def _fresh(raw: Mapping[str, Any], leg: str) -> bool:
+    return float(raw.get(f"{leg}_quote_age_seconds") or 0.0) <= FRESH_OPTION_QUOTE_SECONDS
 
 
 def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSnapshot],
@@ -301,10 +346,18 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         opportunity = f"{rule_variant_id(spec)}:{vehicle}:{symbol}:{day.isoformat()}"
         raw = _simulate_trade(session_bars, spec, snapshots, vehicle,
                               quotes=quote_index)
-        if raw is None:
-            rows.append({"vehicle": vehicle, "symbol": symbol,
-                         "session_date": day.isoformat(), "opportunity_id": opportunity,
-                         "net_pnl": 0.0, "return_value": 0.0, "no_trade": True})
+        if raw is None or raw.get("unpriced_reason"):
+            row = {"vehicle": vehicle, "symbol": symbol,
+                   "session_date": day.isoformat(), "opportunity_id": opportunity,
+                   "net_pnl": 0.0, "return_value": 0.0, "no_trade": True}
+            if raw is not None:
+                # A no-trade row keeps the session in the structural sample and
+                # out of expectancy/win-rate, which is exactly right: this was a
+                # signal that could not be filled, not a flat trade.
+                row.update({key: value for key, value in raw.items()
+                            if key != "unpriced_reason"})
+                row["reject_reason"] = str(raw["unpriced_reason"])
+            rows.append(row)
             continue
         risk_budget = max(0.0, cash * float(risk_pct) / 100.0)
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
@@ -323,13 +376,17 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                          "reject_reason": "isolated account risk budget cannot fund one unit"})
             continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
-        executable = vehicle == "option"
+        # An option bid/ask is executable only while it is current.  A quote
+        # older than one recorder cycle is an approximation of the fill, so it
+        # is charged the modelled half-spread rather than trusted at face value.
+        fresh = vehicle == "option" and _fresh(raw, "entry")
         entry = model.execution_price(
             raw["entry_reference"], execution_direction, entry=True,
-            executable_quote=executable or raw.get("entry_fill_source") == QUOTE)
+            executable_quote=fresh or raw.get("entry_fill_source") == QUOTE)
+        fresh = vehicle == "option" and _fresh(raw, "exit")
         exit_price = model.execution_price(
             raw["exit_reference"], execution_direction, entry=False,
-            executable_quote=executable or raw.get("exit_fill_source") == QUOTE)
+            executable_quote=fresh or raw.get("exit_fill_source") == QUOTE)
         multiplier = int(raw["contract_multiplier"])
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
