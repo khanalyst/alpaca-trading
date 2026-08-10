@@ -155,6 +155,12 @@ missing or invalid LLM proposal leaves the family pending replacement, not
 retired. Insufficient data is not treated as failure. Backtest winners must
 still pass strictly later forward data before runtime can select them.
 
+A worker is given a corpus descriptor — the session window it needs — rather
+than a copy of the corpus, and re-reads that window itself. The predicates are
+the orchestrator's own, so the trades, statistics and content hashes are the
+same either way; an in-memory corpus has nothing to re-read and still travels
+with the task.
+
 The checked config enables the bounded strategy-replacement adapter with
 OpenAI `gpt-5`. It is optional and reads provider keys only from
 `ALPACA_RESEARCH_LLM_SECRETS_FILE`, never from the broker secret file. Missing,

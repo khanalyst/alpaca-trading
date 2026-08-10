@@ -10,17 +10,36 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import json
+import math
 import os
 from pathlib import Path
-from typing import Mapping, Sequence
+import random
+from typing import Any, Mapping, Sequence
 
-from .costs import CostModel
+from agent.contracts.rule import hold_deadline
+from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
 from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
+from .stats import stable_seed
 
 
 def _facade_dependency(name: str):
     from . import edge_lab
     return getattr(edge_lab, name)
+
+
+def _simulation_dependency(name: str):
+    # `factory_core` reaches this module through the ledger facades, so its
+    # shared replay primitives are resolved at call time rather than imported.
+    from . import factory_core
+    return getattr(factory_core, name)
+
+
+def _visible(*args, **kwargs):
+    return _simulation_dependency("_visible")(*args, **kwargs)
+
+
+def _option_at(*args, **kwargs):
+    return _simulation_dependency("_option_at")(*args, **kwargs)
 
 
 def normalize_underlying_bar(*args, **kwargs):
@@ -117,6 +136,59 @@ def _stream_rows(source: Path):
             raise DiscoveryError(f"invalid discovery JSONL {partition}: {exc}") from exc
 
 
+def _normalize_corpus(rows, *, keep=None) -> tuple[
+        list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
+    """Normalize one row stream into the three replay books.
+
+    ``keep`` is an optional session predicate applied *after* normalization,
+    so a re-read of one partition yields exactly the records a slice of the
+    whole corpus would have yielded, in the same order.
+    """
+    bars: list[UnderlyingBar] = []
+    snapshots: dict[str, OptionSnapshot] = {}
+    quotes: list[QuoteSnapshot] = []
+    for number, source_row in enumerate(rows, 1):
+        if not isinstance(source_row, Mapping):
+            raise DiscoveryError("discovery rows must be JSON objects")
+        row = dict(source_row)
+        kind = str(row.get("kind", "bar")).lower()
+        provider = str(row.get("provider") or "alpaca")
+        feed = str(row.get("feed") or ("opra" if "option" in kind else "sip"))
+        try:
+            if kind in {"bar", "underlying", "underlying_bar"}:
+                bar = normalize_underlying_bar(row, provider=provider, feed=feed)
+                if keep is None or keep(_bar_session(bar)):
+                    bars.append(bar)
+            elif kind in {"option", "option_snapshot", "option_quote"}:
+                contract = row.get("contract")
+                if isinstance(contract, Mapping):
+                    flattened = dict(contract)
+                    flattened.update({key: value for key, value in row.items()
+                                      if key != "contract"})
+                    row = flattened
+                snap = normalize_option_snapshot(row, provider=provider, feed=feed)
+                if keep is None or keep(snap.session_date.isoformat()):
+                    snapshots[f"{snap.timestamp.isoformat()}|{snap.contract.symbol}"] = snap
+            elif kind in {"quote", "equity_quote", "underlying_quote"}:
+                # An equity quote is the executable price at its instant.  It
+                # is used only where a fill lands on that instant; everything
+                # else still falls back to the bar and says so.
+                quote = normalize_quote(row, provider=provider, feed=feed)
+                if keep is None or keep(quote.session_date.isoformat()):
+                    quotes.append(quote)
+            # Other metadata stays in the dataset hash without being fed into
+            # an OHLC replay.
+        except (TypeError, ValueError) as exc:
+            raise DiscoveryError(f"row {number}: {exc}") from exc
+    quotes.sort(key=lambda item: (item.symbol, item.timestamp))
+    return bars, snapshots, quotes
+
+
+def _bar_session(bar: UnderlyingBar) -> str:
+    """The New York session a bar belongs to, as the replay lanes group them."""
+    return bar.timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
 def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
         list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Load one normalized JSONL corpus: bars, option quotes, equity quotes.
@@ -131,39 +203,35 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
         raw_rows = [dict(row) for row in data]
     if any(not isinstance(row, Mapping) for row in raw_rows):
         raise DiscoveryError("discovery rows must be JSON objects")
-    bars: list[UnderlyingBar] = []
-    snapshots: dict[str, OptionSnapshot] = {}
-    quotes: list[QuoteSnapshot] = []
-    for number, source_row in enumerate(raw_rows, 1):
-        row = dict(source_row)
-        kind = str(row.get("kind", "bar")).lower()
-        provider = str(row.get("provider") or "alpaca")
-        feed = str(row.get("feed") or ("opra" if "option" in kind else "sip"))
-        try:
-            if kind in {"bar", "underlying", "underlying_bar"}:
-                bars.append(normalize_underlying_bar(row, provider=provider, feed=feed))
-            elif kind in {"option", "option_snapshot", "option_quote"}:
-                contract = row.get("contract")
-                if isinstance(contract, Mapping):
-                    flattened = dict(contract)
-                    flattened.update({key: value for key, value in row.items()
-                                      if key != "contract"})
-                    row = flattened
-                snap = normalize_option_snapshot(row, provider=provider, feed=feed)
-                snapshots[f"{snap.timestamp.isoformat()}|{snap.contract.symbol}"] = snap
-            elif kind in {"quote", "equity_quote", "underlying_quote"}:
-                # An equity quote is the executable price at its instant.  It
-                # is used only where a fill lands on that instant; everything
-                # else still falls back to the bar and says so.
-                quotes.append(normalize_quote(row, provider=provider, feed=feed))
-            # Other metadata stays in the dataset hash without being fed into
-            # an OHLC replay.
-        except (TypeError, ValueError) as exc:
-            raise DiscoveryError(f"row {number}: {exc}") from exc
+    bars, snapshots, quotes = _normalize_corpus(raw_rows)
     if not bars:
         raise DiscoveryError("discovery corpus contains no underlying bars")
-    quotes.sort(key=lambda item: (item.symbol, item.timestamp))
     return raw_rows, bars, snapshots, quotes
+
+
+def corpus_slice(source: str | Path, *, after: str | None = None,
+                 until: str | None = None,
+                 exclude: Sequence[str] = ()) -> tuple[
+                     list[UnderlyingBar], list[OptionSnapshot], list[QuoteSnapshot]]:
+    """Re-read one recorded corpus and keep only a session window of it.
+
+    This is the worker-side half of "ship a descriptor, not a corpus": the
+    three predicates are exactly the ones an orchestrator would have applied
+    to its own in-memory books, so the records — and therefore every trade,
+    statistic and content hash computed from them — are identical.  ``until``
+    pins the window against an append-only recorder growing underneath a
+    running cycle.  The raw rows are never accumulated.
+    """
+    dropped = {str(value) for value in exclude}
+
+    def keep(session: str) -> bool:
+        return ((after is None or session > str(after)) and
+                (until is None or session <= str(until)) and
+                session not in dropped)
+
+    bars, snapshots, quotes = _normalize_corpus(
+        _stream_rows(Path(source)), keep=keep)
+    return bars, list(snapshots.values()), quotes
 
 
 def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
@@ -237,11 +305,215 @@ def _opportunity_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> li
     return rows
 
 
+def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
+              reason: str | None = None) -> dict:
+    row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
+           "opportunity_id": opportunity, "net_pnl": 0.0, "return_value": 0.0,
+           "no_trade": True}
+    if reason:
+        row["reject_reason"] = reason
+    return row
+
+
+def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
+                         spec: Mapping[str, Any], *, vehicle: str,
+                         reference_rows: Sequence[Mapping], account_id: str,
+                         starting_cash: float = 100_000.0, risk_pct: float = .5,
+                         costs: CostModel | None = None,
+                         quotes: Sequence[Any] | None = None,
+                         fixed_quantity: float | None = None) -> dict:
+    """Replay a chance-entry null with the strategy's own exit and cost rules.
+
+    The null keeps the candidate's session/symbol/direction distribution and
+    its stop geometry, but chooses the entry bar at random.  A candidate that
+    cannot beat this is timing nothing: comparing only against the parent
+    specification measures relative improvement, not edge against chance.
+
+    ``fixed_quantity`` replaces the isolated account's risk sizing for a lane
+    whose own replay trades a fixed size.  A delta between books sized
+    differently would measure position size, not timing.
+    """
+    model = costs or CostModel()
+    quote_index = index_quotes(quotes)
+    grouped: dict[tuple[str, str], list] = {}
+    for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
+        grouped.setdefault((bar.symbol, bar.session_date.isoformat()), []).append(bar)
+    references = {(str(row.get("symbol")), str(row.get("session_date"))): row
+                  for row in reference_rows}
+    rng = random.Random(stable_seed({"account": str(account_id),
+                                     "spec": dict(spec),
+                                     "sessions": sorted(references)}))
+    cash = float(starting_cash)
+    peak = cash
+    drawdown = 0.0
+    rows: list[dict] = []
+    for key in sorted(references):
+        symbol, day = key
+        opportunity = f"null:{account_id}:{symbol}:{day}"
+        reference = references[key]
+        session_bars = grouped.get(key, [])
+        if reference.get("no_trade") is True or len(session_bars) < 3:
+            rows.append(_null_row(symbol, day, opportunity, vehicle))
+            continue
+        try:
+            entry_underlying_ref = float(reference["underlying_entry"])
+            distance = abs(entry_underlying_ref - float(reference["stop_price"]))
+            direction = str(reference["direction"])
+        except (KeyError, TypeError, ValueError):
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "reference trade lacks null-control geometry"))
+            continue
+        if not math.isfinite(distance) or distance <= 0 or direction not in {"long", "short"}:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "reference trade lacks null-control geometry"))
+            continue
+        entry_index = rng.randrange(1, len(session_bars) - 1)
+        entry_bar = session_bars[entry_index]
+        if not _visible(entry_bar, entry_bar.end):
+            rows.append(_null_row(symbol, day, opportunity, vehicle))
+            continue
+        entry_underlying = float(entry_bar.open)
+        stop = (entry_underlying - distance if direction == "long" else
+                entry_underlying + distance)
+        target = (entry_underlying + distance * float(spec["target_r"])
+                  if direction == "long" else
+                  entry_underlying - distance * float(spec["target_r"]))
+        deadline = hold_deadline(entry_bar.timestamp, spec)
+        last_index = entry_index
+        for probe in range(entry_index + 1, len(session_bars)):
+            if session_bars[probe].end.timestamp() > deadline:
+                break
+            last_index = probe
+        exit_bar = session_bars[last_index]
+        exit_ref = float(exit_bar.close)
+        exit_at = exit_bar.end
+        boundary_exit = True
+        for bar in session_bars[entry_index + 1:last_index + 1]:
+            if not _visible(bar, bar.end):
+                continue
+            if direction == "long":
+                gap_stop, gap_target = bar.open <= stop, bar.open >= target
+                hit_stop, hit_target = bar.low <= stop, bar.high >= target
+            else:
+                gap_stop, gap_target = bar.open >= stop, bar.open <= target
+                hit_stop, hit_target = bar.high >= stop, bar.low <= target
+            # The null shares the candidate's exit rules, gap-through included.
+            # Giving chance entries an exit realism the candidate does not have
+            # would bias every delta measured against them.
+            if gap_stop or gap_target:
+                exit_ref, exit_bar, exit_at = float(bar.open), bar, bar.timestamp
+                break
+            if hit_stop or hit_target:
+                exit_ref = stop if hit_stop else target
+                exit_bar, exit_at, boundary_exit = bar, bar.end, False
+                break
+        entry_ref = entry_underlying
+        entry_source = exit_source = BAR
+        multiplier = 1
+        risk_per_unit = distance
+        if vehicle == "equity":
+            side = "buy" if direction == "long" else "sell"
+            quoted = quote_fill(quote_index, symbol=symbol,
+                                at=entry_bar.timestamp, side=side)
+            if quoted is not None:
+                entry_ref, entry_source = quoted, QUOTE
+            quoted_exit = (quote_fill(quote_index, symbol=symbol, at=exit_at,
+                                      side="sell" if direction == "long" else "buy")
+                           if boundary_exit else None)
+            if quoted_exit is not None:
+                exit_ref, exit_source = quoted_exit, QUOTE
+        if vehicle == "option":
+            entry_snap = _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
+                                    direction=direction, cutoff=entry_bar.end)
+            exit_snap = (None if entry_snap is None else
+                         _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
+                                    direction=direction, cutoff=exit_bar.end,
+                                    contract_symbol=entry_snap.contract.symbol))
+            if entry_snap is None or exit_snap is None:
+                rows.append(_null_row(symbol, day, opportunity, vehicle))
+                continue
+            entry_ref = entry_snap.ask
+            exit_ref = exit_snap.bid
+            multiplier = entry_snap.contract.multiplier
+            risk_per_unit = entry_ref * multiplier
+        if fixed_quantity is not None:
+            quantity = float(fixed_quantity)
+        else:
+            quantity = math.floor(max(0.0, cash * float(risk_pct) / 100.0) /
+                                  max(float(risk_per_unit), 1e-9))
+            if vehicle == "equity":
+                # A chance entry derives its own stop from its own fill, so the
+                # plan anchor and the fill are the same price here.
+                quantity = min(quantity, math.floor(
+                    max(0.0, cash * _simulation_dependency("NOTIONAL_CAP_PCT") / 100.0) /
+                    max(float(entry_underlying), 1e-9)))
+        if quantity <= 0:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "isolated account risk budget cannot fund one unit"))
+            continue
+        execution_direction = "long" if vehicle == "option" else direction
+        executable = vehicle == "option"
+        entry = model.execution_price(
+            entry_ref, execution_direction, entry=True,
+            executable_quote=executable or entry_source == QUOTE)
+        exit_price = model.execution_price(
+            exit_ref, execution_direction, entry=False,
+            executable_quote=executable or exit_source == QUOTE)
+        gross = ((exit_price - entry) if execution_direction == "long" else
+                 (entry - exit_price)) * quantity * multiplier
+        fees = model.fees(entry, exit_price, quantity, multiplier)
+        net = gross - fees
+        before = cash
+        cash += net
+        peak = max(peak, cash)
+        drawdown = max(drawdown, peak - cash)
+        rows.append({"vehicle": vehicle, "symbol": symbol, "session_date": day,
+                     "opportunity_id": opportunity, "direction": direction,
+                     "entry_timestamp": entry_bar.timestamp.isoformat(),
+                     "exit_timestamp": exit_bar.end.isoformat(),
+                     "quantity": quantity, "entry_price": entry,
+                     "exit_price": exit_price, "gross_pnl": gross, "costs": fees,
+                     "net_pnl": net,
+                     "return_value": net / before if before > 0 else 0.0,
+                     "no_trade": False})
+    executed = [row for row in rows if row.get("no_trade") is not True]
+    return {"account_id": account_id, "starting_cash": float(starting_cash),
+            "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
+            "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
+
+
+def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> list[dict]:
+    """Describe each replayed opportunity to the randomized-entry null control.
+
+    The null needs the underlying anchor the stop was measured from, which an
+    option trade's ``entry_reference`` is not: that is the contract's ask.  The
+    anchor is the entry bar's open, which is what the replay entered on, so it
+    is read back from the bars rather than re-derived from the trade.
+    """
+    zone = ZoneInfo("America/New_York")
+    opens = {(bar.symbol, bar.timestamp): float(bar.open) for bar in bars}
+    sessions = sorted({(bar.symbol, bar.timestamp.astimezone(zone).date()) for bar in bars})
+    by_session = {(trade.symbol, trade.session_date): trade for trade in result.trades}
+    rows: list[dict] = []
+    for symbol, day in sessions:
+        trade = by_session.get((symbol, day))
+        row = {"vehicle": vehicle, "symbol": symbol, "session_date": day.isoformat(),
+               "no_trade": trade is None}
+        anchor = None if trade is None else opens.get((trade.symbol, trade.entry_timestamp))
+        if trade is not None and anchor is not None:
+            row.update({"direction": trade.direction, "underlying_entry": anchor,
+                        "stop_price": float(trade.stop_price)})
+        rows.append(row)
+    return rows
+
+
 def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                    vehicle: str, min_trades: int, min_sessions: int,
                    alpha: float, shadow: bool = False,
                    actual_control: bool = True,
-                   control_kind: str = "matched_actual_baseline") -> dict:
+                   control_kind: str = "matched_actual_baseline",
+                   null_rows: Sequence[Mapping] = (),
+                   qualification: Mapping | None = None) -> dict:
     """Evaluate one chronological backtest or a genuinely new shadow sample.
 
     A backtest is split into fit/held-out partitions.  A shadow evaluation is
@@ -288,7 +560,28 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "method": placebo["method"],
         "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
+        # The draw count, seed and cluster count are what make the recorded
+        # null reproducible from the stored deltas alone; the factory lane has
+        # always persisted them and re-verification reads them.
+        "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
+        "clusters": int(placebo["cluster_count"]),
     }
+    # A randomized-entry null asks "did this beat chance", which the matched
+    # baseline above cannot: the baseline only asks "did this beat the config
+    # it was derived from".  An edge that is really directional drift beats
+    # its baseline and loses to chance entries on its own sessions.
+    heldout_sessions = {str(row.get("session_date") or "") for row in heldout}
+    null_heldout = [row for row in null_rows
+                    if str(row.get("session_date") or "") in heldout_sessions]
+    null_test = matched_cluster_test(heldout, null_heldout, vehicle=vehicle)
+    null_control = {"kind": "randomized_entry_null",
+                    "matched": null_test["matched"],
+                    "available": bool(null_test["available"]),
+                    "mean_delta": null_test["mean_delta"],
+                    "mean_delta_lcb": null_test["mean_delta_lcb"],
+                    "p_value": float(null_test["p_value"])}
+    final = dict(qualification or {"available": False, "sessions": [],
+                                   "net_positive": False, "delta_positive": False})
     candidate_p = float(delta_held.get("p_value", 1.0))
     checks = {
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
@@ -302,6 +595,15 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                                         float(delta_held["mean_delta"]) > 0),
         "heldout_p_significant": candidate_p <= float(alpha),
         "falsification": bool(falsification["passes"]),
+        "null_control_available": bool(null_control["available"]),
+        "null_control_delta_positive": bool(
+            null_control["mean_delta"] is not None and
+            float(null_control["mean_delta"]) > 0 and
+            float(null_control["p_value"]) <= float(alpha)),
+        "qualification_net_positive": bool(final.get("available") and
+                                           final.get("net_positive")),
+        "qualification_delta_positive": bool(final.get("available") and
+                                             final.get("delta_positive")),
     }
     passes_without_family = bool(
         all(checks.values()) and delta_all.get("mean_delta") is not None and
@@ -315,6 +617,7 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
             "fit_paired_baseline": delta_fit,
             "heldout_paired_baseline": delta_held,
             "control": {**delta_held, "kind": control_kind},
+            "null_control": null_control, "qualification": final,
             "falsification": falsification,
             "checks_without_family": checks,
             "max_drawdown": max_drawdown_of(ordered),
@@ -334,6 +637,17 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping) -> dict:
     gate["passes"] = passes
     fit = gate.pop("_fit_rows")
     heldout = gate.pop("_heldout_rows")
+    # Only report what this gate actually computed: an absent statistic must
+    # stay absent rather than be persisted as a null the proof then has to
+    # reproduce.
+    absolute = gate.get("heldout_performance") or {}
+    performance = {"heldout_delta": gate["heldout_paired_baseline"].get("mean_delta"),
+                   "max_drawdown": gate["max_drawdown"]}
+    if gate.get("heldout_delta_lcb") is not None:
+        performance["heldout_delta_lcb"] = gate["heldout_delta_lcb"]
+    for key in ("net_pnl", "expectancy"):
+        if key in absolute:
+            performance[f"heldout_{key}"] = absolute[key]
     envelope = verified_gate_envelope(
         lane=lane, vehicle=gate["vehicle"], fit=fit, heldout=heldout,
         fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
@@ -341,12 +655,16 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping) -> dict:
         q_value=float(family.get("p_adjusted", 1.0)), alpha=gate.get("alpha", 0.05),
         falsification=gate["falsification"], separation=gate["heldout_separation"],
         checks=checks, passes=passes,
-        performance={"heldout_delta": gate["heldout_paired_baseline"].get("mean_delta"),
-                     "max_drawdown": gate["max_drawdown"]})
+        walk_forward=gate.get("walk_forward"),
+        qualification=gate.get("qualification"),
+        null_control=gate.get("null_control"),
+        performance=performance)
     gate["verified_gate"] = envelope
     gate["gate_hash"] = envelope["content_hash"]
     return gate
 
 
-__all__ = ["DiscoveryError", "corpus_partitions", "_read_discovery_rows", "_effective_ibr_config",
-           "_opportunity_rows", "_discover_gate", "_finalize_gate"]
+__all__ = ["DiscoveryError", "corpus_partitions", "corpus_slice",
+           "_read_discovery_rows", "_effective_ibr_config",
+           "_opportunity_rows", "_null_reference_rows", "_discover_gate",
+           "_finalize_gate"]

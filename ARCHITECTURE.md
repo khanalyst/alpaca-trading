@@ -225,10 +225,17 @@ before the session boundary. Equity and option
 vehicles have separate books.
 
 `research.edge_discovery_core` owns deterministic corpus loading, effective
-IBR configuration, opportunity materialization, gate construction, and gate
-finalization. `research.edge_lab` owns orchestration: variant registry lookup,
-replay, forward-only tail selection, ledger writes, lifecycle transitions, and
+IBR configuration, opportunity materialization, the randomized-entry null
+control both lanes spend, gate construction, and gate finalization.
+`research.edge_lab` owns orchestration: variant registry lookup, replay,
+forward-only tail selection, ledger writes, lifecycle transitions, and
 champion selection.
+
+Corpus loading serves two shapes. `_read_discovery_rows` materializes one
+corpus for an orchestrator; `corpus_slice` re-reads a session window of a
+recorded corpus for a worker that was handed a descriptor instead of a copy.
+The predicates are the orchestrator's own, so the two produce the same records
+in the same order and every hash computed from them is unchanged.
 
 ### Autonomous bounded strategy factory
 
@@ -329,7 +336,7 @@ identity stable while moving cohesive responsibilities.
 | `research.edge_ledger` | SQLite/hash primitives in `edge_ledger_store`; proof operations in `edge_ledger_proof` |
 | `research.edge_lab` | Deterministic discovery helpers in `edge_discovery_core` |
 | replay cost/fill arithmetic | One shared model in `research.costs` |
-| `research.strategy_factory` | Pure simulation/diagnosis/mutation in `factory_core`; lineage storage in `factory_ledger` |
+| `research.strategy_factory` | Pure simulation/diagnosis/mutation in `factory_core`; lineage storage in `factory_ledger`; the randomized-entry null control in `edge_discovery_core` and the sealed-window scorer in `gates`, both now spent by either lane |
 
 Compatibility tests assert facade identities, MRO, method ownership, reverse
 import order, lazy imports, pickle identity, path rebinding, and legacy helper

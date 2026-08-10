@@ -413,6 +413,23 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
             "sessions": len(sessions), "results": results}
 
 
+def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
+                         vehicle: str, sessions: Sequence[str]) -> dict:
+    """Score the sealed final window: go/no-go only, never diagnosis."""
+    if not rows or not sessions:
+        return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
+                "matched": 0, "mean_delta": None, "trades": 0,
+                "net_positive": False, "delta_positive": False}
+    pairs = matched_pairs(rows, baseline, vehicle=vehicle)
+    absolute = performance_floor(rows, vehicle=vehicle)
+    delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
+    return {"available": True, "sessions": list(sessions),
+            "net_pnl": absolute["net_pnl"], "trades": absolute["trades"],
+            "matched": pairs["matched"], "mean_delta": delta,
+            "net_positive": bool(absolute["net_pnl_positive"]),
+            "delta_positive": bool(delta is not None and delta > 0)}
+
+
 @dataclass
 class SealedQualificationWindow:
     """Final-qualification data that may be released exactly once.
@@ -630,7 +647,7 @@ __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
            "deterministic_placebo_deltas", "falsification_gate",
            "heldout_separation", "matched_cluster_test", "matched_pairs",
            "max_drawdown_of", "paired_delta", "performance_floor",
-           "placebo_null_distribution", "placebo_ratio",
+           "placebo_null_distribution", "placebo_ratio", "qualification_report",
            "recompute_gate_statistics", "sample_counts", "seal_final_window",
            "structural_floor", "verified_gate_envelope", "verify_gate_envelope",
            "walk_forward_report"]

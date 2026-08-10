@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 from agent.config import validate_config
@@ -475,6 +476,112 @@ class StrategyFactoryTests(unittest.TestCase):
             applied = apply_variant(config, record)
             self.assertEqual(applied["strategy"]["variant_id"], variant_id)
             self.assertEqual(applied["strategy"]["rule_spec"], spec)
+
+
+class CorpusDescriptorTests(unittest.TestCase):
+    """A worker re-reading its own sessions computes exactly what a copy did."""
+
+    @staticmethod
+    def _write(root: Path, rows, *, partitioned: bool) -> Path:
+        if not partitioned:
+            target = root / "corpus.jsonl"
+            target.write_text("".join(json.dumps(row, sort_keys=True) + "\n"
+                                      for row in rows), encoding="utf-8")
+            return target
+        directory = root / "sessions"
+        directory.mkdir()
+        grouped: dict[str, list] = {}
+        for row in rows:
+            grouped.setdefault(row["timestamp"][:10], []).append(row)
+        for session, session_rows in grouped.items():
+            (directory / f"{session}.jsonl").write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in session_rows),
+                encoding="utf-8")
+        return directory
+
+    def test_a_reread_partition_reproduces_the_sliced_books_exactly(self):
+        rows = losing_breakouts()
+        _, bars, snapshot_map, quotes = factory_module._read_discovery_rows(rows)
+        sealed = {factory_module._session(bar) for bar in bars[-40:]}
+        expected = ([bar for bar in bars if factory_module._session(bar) not in sealed],
+                    [snap for snap in snapshot_map.values()
+                     if snap.session_date.isoformat() not in sealed],
+                    [quote for quote in quotes
+                     if quote.session_date.isoformat() not in sealed])
+        end = max(factory_module._session(bar) for bar in bars)
+        with tempfile.TemporaryDirectory() as directory:
+            for partitioned in (False, True):
+                root = Path(directory) / f"corpus-{partitioned}"
+                root.mkdir()
+                source = self._write(root, rows, partitioned=partitioned)
+                self.assertEqual(
+                    factory_module.corpus_slice(source, after=None, until=end,
+                                                exclude=sorted(sealed)),
+                    expected)
+
+    def test_both_task_shapes_drive_one_identical_worker_result(self):
+        rows = losing_breakouts()
+        _, bars, snapshot_map, quotes = factory_module._read_discovery_rows(rows)
+        hypothesis = {**vars(initial_hypotheses(1, vehicle="equity")[0]),
+                      "status": "queued"}
+        end = max(factory_module._session(bar) for bar in bars)
+        sealed = sorted({factory_module._session(bar) for bar in bars[-40:]})
+        common = {"hypothesis": hypothesis, "vehicle": "equity", "mode": "backtest",
+                  "existing_specs": [], "variants_per_strategy": 2,
+                  "starting_cash": 100_000.0, "costs": factory_module.CostModel()}
+        with tempfile.TemporaryDirectory() as directory:
+            source = self._write(Path(directory), rows, partitioned=False)
+            copied, reread = ({**common, "bars": [
+                bar for bar in bars if factory_module._session(bar) not in set(sealed)],
+                "snapshots": [snap for snap in snapshot_map.values()
+                              if snap.session_date.isoformat() not in set(sealed)],
+                "quotes": [quote for quote in quotes
+                           if quote.session_date.isoformat() not in set(sealed)]},
+                {**common, "corpus": {"source": str(source), "after": None,
+                                      "until": end, "exclude": sealed}})
+            # The account ids carry a random suffix; pin it so the comparison is
+            # of the computed evidence, not of two fresh uuids.
+            with patch.object(factory_module.uuid, "uuid4",
+                              return_value=uuid.UUID(int=7)):
+                first = factory_module._worker(copied)
+                second = factory_module._worker(reread)
+        for result in (first, second):
+            result.pop("worker_pid")
+            for variant in result["variants"]:
+                variant.pop("worker_pid")
+        self.assertEqual(first, second)
+        self.assertTrue(first["variants"][0]["account"]["rows"])
+
+    def test_a_path_corpus_produces_the_same_cycle_on_both_backends(self):
+        rows = losing_breakouts()
+        results = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._write(root, rows, partitioned=False)
+            results["memory"] = run_factory(
+                rows, db_path=root / "memory.sqlite3", strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            results["process"] = run_factory(
+                source, db_path=root / "process.sqlite3", strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0)
+            with patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError):
+                results["thread"] = run_factory(
+                    source, db_path=root / "thread.sqlite3", strategies=1,
+                    variants_per_strategy=2, workers=1, min_trades=1,
+                    min_sessions=1, alpha=1.0)
+        self.assertEqual(results["process"]["parallel_backend"], "process")
+        self.assertEqual(results["thread"]["parallel_backend"], "thread_fallback")
+
+        def evidence(result):
+            return (result["dataset_hash"],
+                    [(row["variant_id"], row["gate"]["gate_hash"],
+                      row["gate"]["p_raw"], row["gate"]["heldout_net_pnl"],
+                      row["status"]) for row in result["results"]])
+
+        self.assertEqual(evidence(results["memory"]), evidence(results["process"]))
+        self.assertEqual(evidence(results["memory"]), evidence(results["thread"]))
 
 
 if __name__ == "__main__":
