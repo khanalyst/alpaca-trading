@@ -385,9 +385,11 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "max_hold")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
-        # Nominal R is unchanged; the gap shows up as real risk per share.
+        # Sizing still uses the nominal distance the runtime sizes on; the gap
+        # shows up only in the risk the fill actually committed.
         self.assertAlmostEqual(simulated["stop_distance"], .3, places=9)
-        self.assertAlmostEqual(simulated["risk_per_unit"], .5, places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], .3, places=9)
+        self.assertAlmostEqual(simulated["realized_risk_per_unit"], .5, places=9)
 
     def test_a_gap_down_entry_does_not_move_the_protective_levels(self):
         simulated, plan, reason, exit_at = self._differential(
@@ -398,7 +400,8 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "max_hold")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
-        self.assertAlmostEqual(simulated["risk_per_unit"], .1, places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], .3, places=9)
+        self.assertAlmostEqual(simulated["realized_risk_per_unit"], .1, places=9)
 
     def test_a_gapped_entry_still_agrees_on_a_stop_exit(self):
         closes = RISING + [100.8, 100.4] + FLAT[:5]
@@ -431,40 +434,65 @@ class ExitContractDifferentialTests(unittest.TestCase):
 
 
 class GappedEntrySizingTests(unittest.TestCase):
-    """Sizing must charge the real fill-to-stop distance, not the nominal one."""
+    """Size like the runtime sizes; account for the risk the fill committed."""
 
+    # 100k at .05% is a $50 budget, small enough that the risk term rather than
+    # the 25%-of-cash notional cap decides the share count on both sides.
     def _row(self, opens=None):
         book = simulate_account(_bars(RISING + FLAT, opens), [], SPEC,
                                 vehicle="equity", account_id="sizing",
                                 risk_pct=.05)
         row = book["rows"][0]
-        self.assertIs(row.get("no_trade"), False)
+        self.assertIs(row["no_trade"], False)
         return row
 
-    def test_a_gap_against_the_stop_shrinks_the_position(self):
+    def _runtime_shares(self, entry, distance):
+        risk = RiskEngine({"risk": {"max_position_notional_pct": 25}})
+        return risk.size_shares(equity=100_000, entry_price=entry,
+                                stop_distance=distance, risk_usd=50.0)["shares"]
+
+    def test_research_and_runtime_agree_on_the_share_count(self):
+        for opens in (None, {4: 101.0}, {4: 100.6}):
+            with self.subTest(opens=opens):
+                row = self._row(opens)
+                # The runtime sizes at plan time from the signal close and the
+                # nominal stop distance; it cannot see the entry gap.
+                self.assertEqual(row["quantity"], self._runtime_shares(
+                    row["stop_price"] + row["stop_distance"],
+                    row["stop_distance"]))
+                self.assertEqual(row["quantity"], 166)
+
+    def test_a_gap_against_the_stop_overspends_the_risk_budget(self):
         flat, gapped = self._row(), self._row({4: 101.0})
-        # 100k * .05% = $50 of risk. Ungapped risk per share is the nominal
-        # .30 ATR stop; the gap widens it to 101.00 - 100.50 = .50.
-        self.assertEqual(flat["quantity"], 166)
-        self.assertEqual(gapped["quantity"], 100)
-        self.assertLess(gapped["quantity"], flat["quantity"])
+        self.assertEqual(gapped["quantity"], flat["quantity"])
+        self.assertAlmostEqual(flat["risk_usd"], 166 * .3, places=6)
+        # 166 shares risking 101.00 - 100.50 is $83 against a $50 budget.
+        self.assertAlmostEqual(gapped["risk_usd"], 166 * .5, places=6)
+        self.assertGreater(gapped["risk_usd"], gapped["risk_budget"])
+        self.assertLess(flat["risk_usd"], flat["risk_budget"] + 1e-9)
 
-    def test_a_gap_toward_the_stop_is_a_smaller_risk_per_share(self):
+    def test_a_gap_toward_the_stop_underspends_the_risk_budget(self):
         row = self._row({4: 100.6})
-        # Real risk is .10/share, so $50 funds 500 shares; the 25%-of-cash
-        # notional cap binds first at floor(25_000 / 100.60) = 248.
-        self.assertEqual(row["quantity"], 248)
-        self.assertGreater(row["quantity"], self._row()["quantity"])
+        self.assertAlmostEqual(row["risk_usd"], 166 * .1, places=6)
+        self.assertLess(row["risk_usd"], row["risk_budget"])
 
-    def test_an_entry_through_the_stop_is_not_booked(self):
+    def test_an_entry_through_the_stop_is_booked_as_a_losing_trade(self):
         book = simulate_account(_bars(RISING + FLAT, {4: 100.3}), [], SPEC,
                                 vehicle="equity", account_id="sizing",
                                 risk_pct=.05)
         row = book["rows"][0]
-        self.assertIs(row["no_trade"], True)
-        self.assertEqual(row["reject_reason"],
-                         "entry gapped through the protective stop")
-        self.assertEqual(book["trades"], 0)
+        # The runtime cannot see this gap: it submits, fills at 100.30, and the
+        # resting stop leg triggers on arrival.  That is an executed trade.
+        self.assertIs(row["no_trade"], False)
+        self.assertIs(row["entry_gap_fill"], True)
+        self.assertEqual(row["exit_reason"], "stop")
+        self.assertEqual(row["quantity"], 166)
+        self.assertEqual(book["trades"], 1)
+        self.assertLess(row["net_pnl"], 0.0)
+        # Exit is the fill, not the unreachable better stop price.
+        self.assertEqual(row["exit_reference"], 100.3)
+        self.assertEqual(row["underlying_entry"], 100.3)
+        self.assertIsNone(row["r_multiple"])
 
 
 if __name__ == "__main__":

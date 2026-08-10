@@ -178,9 +178,8 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      entry_bar: UnderlyingBar, entry_reference: float,
                      exit_bar: UnderlyingBar, exit_reference: float,
                      reason: str, tie: bool, gap: bool, cfg: IBRConfig,
-                     multiplier: int = 1, entry_timestamp: datetime | None = None,
-                     stop_price: float | None = None,
-                     target_price: float | None = None) -> IBRTrade:
+                     stop_price: float, target_price: float, multiplier: int = 1,
+                     entry_timestamp: datetime | None = None) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
     # P&L even when the underlying direction is short.
@@ -202,10 +201,7 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         range_high=range_high, range_low=range_low,
         signal_timestamp=signal.end, entry_timestamp=entry_timestamp or entry_bar.timestamp,
         entry_reference=entry_reference, entry_price=entry_price,
-        stop_price=float(stop_price if stop_price is not None else
-                         entry_reference * (1 - cfg.stop_pct if direction == "long" else 1 + cfg.stop_pct)),
-        target_price=float(target_price if target_price is not None else
-                           entry_reference * (1 + cfg.target_pct if direction == "long" else 1 - cfg.target_pct)),
+        stop_price=float(stop_price), target_price=float(target_price),
         exit_timestamp=exit_bar.timestamp, exit_reference=exit_reference,
         exit_price=exit_price, exit_reason=reason, gross_pnl=gross,
         costs=costs, net_pnl=gross - costs, tie_broken=tie, gap_fill=gap,

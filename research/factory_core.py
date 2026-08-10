@@ -145,14 +145,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # real sizing/R error rather than silently re-anchoring them.
         stop = float(signal["stop_price"])
         target = float(signal["target_price"])
-        # Actual risk per share is the distance from the real fill to that stop.
-        real_risk = (entry_underlying - stop if direction == "long"
-                     else stop - entry_underlying)
-        if real_risk <= 0:
-            # The entry gapped to or through its own protective stop: the
-            # bracket is stopped out on arrival and the trade cannot be sized
-            # against a risk budget at all.
-            return {"reject_reason": "entry gapped through the protective stop"}
+        # Sizing reproduces `RiskEngine.size_shares`, which divides the budget by
+        # this same nominal distance at plan time.  Accounting uses the distance
+        # from the real fill to that stop, which is what the account actually
+        # risked once the entry gapped.
+        real_risk = max(0.0, entry_underlying - stop if direction == "long"
+                        else stop - entry_underlying)
         deadline = hold_deadline(entry_bar.timestamp, spec)
         last_index = index + 1
         for probe in range(index + 2, len(session_bars)):
@@ -163,11 +161,20 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         exit_ref = float(exit_bar.close)
         reason = "time"
         tie = False
-        if (entry_underlying >= target if direction == "long"
-                else entry_underlying <= target):
-            # The entry gapped past its own target; the broker-side leg fills
-            # at the entry, not at an impossible better price.
-            reason = "target"
+        gapped = False
+        if direction == "long":
+            through_stop = entry_underlying <= stop
+            through_target = entry_underlying >= target
+        else:
+            through_stop = entry_underlying >= stop
+            through_target = entry_underlying <= target
+        if through_stop or through_target:
+            # The entry gapped past one of its own levels.  The runtime cannot
+            # see that gap when it sizes or prices the bracket, so it takes the
+            # trade anyway and the resting leg triggers on arrival: a real fill
+            # at the entry, never at the impossible better level.
+            gapped = True
+            reason = "stop" if through_stop else "target"
             exit_ref = entry_underlying
             exit_bar = entry_bar
         else:
@@ -212,8 +219,13 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
             "contract": contract, "contract_multiplier": multiplier,
-            "stop_distance": distance, "risk_per_unit": (
-                entry_ref * multiplier if vehicle == "option" else real_risk),
+            "stop_distance": distance, "entry_gap_fill": gapped,
+            "risk_per_unit": (entry_ref * multiplier if vehicle == "option"
+                              else distance),
+            # A long option's maximum loss is the premium actually paid, so its
+            # nominal and realized risk are the same number.
+            "realized_risk_per_unit": (entry_ref * multiplier
+                                       if vehicle == "option" else real_risk),
         }
     return None
 
@@ -239,12 +251,6 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
                          "net_pnl": 0.0, "return_value": 0.0, "no_trade": True})
-            continue
-        if raw.get("reject_reason"):
-            rows.append({"vehicle": vehicle, "symbol": symbol,
-                         "session_date": day.isoformat(), "opportunity_id": opportunity,
-                         "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
-                         "reject_reason": raw["reject_reason"]})
             continue
         risk_budget = max(0.0, cash * float(risk_pct) / 100.0)
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
@@ -274,9 +280,15 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
         cash += net
         peak = max(peak, cash)
         drawdown = max(drawdown, peak - cash)
+        # Size on the nominal distance because the runtime does; report the risk
+        # the fill actually committed, which a gapped entry can push past the
+        # budget the sizing believed it was spending.
+        risk_usd = quantity * float(raw["realized_risk_per_unit"])
         rows.append({**raw, "opportunity_id": opportunity, "quantity": quantity,
                      "entry_price": entry, "exit_price": exit_price,
                      "gross_pnl": gross, "costs": costs, "net_pnl": net,
+                     "risk_budget": risk_budget, "risk_usd": risk_usd,
+                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
                      "return_value": net / before if before > 0 else 0.0,
                      "no_trade": False})
     executed = [row for row in rows if row.get("no_trade") is not True]
