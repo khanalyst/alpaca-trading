@@ -329,6 +329,23 @@ class BrokerProtectionTests(unittest.TestCase):
         self.assertEqual(self.provider.close_requests, [])
         self.assertEqual(self.provider.cancelled, [])
 
+    def test_poller_does_not_close_when_a_filled_leg_lags_the_position(self):
+        # The order and position endpoints settle in either order.  A filled
+        # stop leg already closed the position, so a poller that still sees
+        # the stale position must not send a second, opposite-side close.
+        self._bind_engine(runtime_name="runtime-poller-leg-lag")
+        order = self._open_bracketed_position()
+        self.provider.set_order(f"{order.id}-stop", status="filled",
+                                filled_qty=10, filled_avg_price=99)
+        self.engine.reconcile()
+        self.assertEqual(self.provider.close_requests, [])
+        monitored = self.engine._monitor_positions(
+            self.NOW, list(self.provider.positions_live))
+        self.assertEqual(monitored["closed"], [])
+        self.assertEqual(self.provider.close_requests, [])
+        self.assertEqual(self.provider.cancelled, [])
+        self.assertEqual([row[1] for row in self._journal_trades()], ["open"])
+
     def test_poller_cancels_legs_before_a_force_flat_close(self):
         self._bind_engine(runtime_name="runtime-poller-force-flat")
         order = self._open_bracketed_position()
