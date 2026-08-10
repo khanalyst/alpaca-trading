@@ -405,6 +405,9 @@ class OrderRequest:
     client_order_id: str | None = None
     extended_hours: bool = False
     position_intent: str | None = None
+    order_class: str | None = None
+    take_profit: Decimal | None = None
+    stop_loss: Decimal | None = None
 
     def __post_init__(self) -> None:
         symbol = validate_instrument(self.symbol)
@@ -427,7 +430,8 @@ class OrderRequest:
         # OCC option symbols are 21 characters (root + YYMMDD + C/P + strike)
         # but roots can be shorter/longer.  This deliberately errs on the
         # side of integer quantities whenever an OCC right is recognizable.
-        if re.fullmatch(r"[A-Z0-9.]{1,8}\d{6}[CP]\d{8}", symbol) and qty != qty.to_integral_value():
+        is_option = bool(re.fullmatch(r"[A-Z0-9.]{1,8}\d{6}[CP]\d{8}", symbol))
+        if is_option and qty != qty.to_integral_value():
             raise ValueError("option order qty must be an integer number of contracts")
         tif = _text(self.time_in_force).lower()
         object.__setattr__(self, "time_in_force", tif)
@@ -445,6 +449,47 @@ class OrderRequest:
             raise ValueError("limit orders require a finite positive limit_price")
         if self.stop_price is not None:
             raise ValueError("stop orders are not supported")
+        order_class = self.order_class
+        if order_class is not None:
+            order_class = _text(order_class).lower()
+            if order_class not in {"simple", "bracket"}:
+                raise ValueError(f"unsupported order class {self.order_class!r}")
+            object.__setattr__(self, "order_class", order_class)
+        for name in ("take_profit", "stop_loss"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            try:
+                leg = Decimal(str(value))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"{name} must be numeric") from exc
+            if not leg.is_finite() or leg <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+            object.__setattr__(self, name, leg)
+        has_legs = self.take_profit is not None or self.stop_loss is not None
+        if order_class == "bracket":
+            # A half-bracket leaves the position protected on one side only,
+            # which is indistinguishable from no protection at all.
+            if self.take_profit is None or self.stop_loss is None:
+                raise ValueError("bracket orders require both take_profit and stop_loss")
+            if is_option:
+                # Alpaca's supported order classes differ for options; this
+                # repo trades single-leg long options only.
+                raise ValueError("bracket orders are not supported for option symbols")
+            if side == "buy":
+                if self.take_profit <= self.stop_loss:
+                    raise ValueError("buy bracket take_profit must be above stop_loss")
+                if self.limit_price is not None and not (
+                        self.stop_loss < self.limit_price < self.take_profit):
+                    raise ValueError("buy bracket legs must straddle the entry limit_price")
+            else:
+                if self.take_profit >= self.stop_loss:
+                    raise ValueError("sell bracket take_profit must be below stop_loss")
+                if self.limit_price is not None and not (
+                        self.take_profit < self.limit_price < self.stop_loss):
+                    raise ValueError("sell bracket legs must straddle the entry limit_price")
+        elif has_legs:
+            raise ValueError("take_profit and stop_loss require order_class=bracket")
         if not isinstance(self.extended_hours, bool):
             raise ValueError("extended_hours must be a boolean")
         if self.extended_hours:
