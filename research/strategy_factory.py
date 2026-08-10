@@ -11,12 +11,14 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 import json
+import math
 import os
 from pathlib import Path
+import random
 from typing import Any, Mapping, Sequence
 import uuid
 
-from agent.contracts.rule import rule_variant_id, validate_rule_spec
+from agent.contracts.rule import hold_deadline, rule_variant_id, validate_rule_spec
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
@@ -24,12 +26,14 @@ from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
     FactoryLedger,
 )
-from .gates import (chronological_split, deterministic_placebo_deltas,
-                    falsification_gate, heldout_separation,
-                    matched_cluster_test, max_drawdown_of, sample_counts,
-                    structural_floor, verified_gate_envelope)
+from .gates import (chronological_split, heldout_separation,
+                    matched_cluster_test, matched_pairs, max_drawdown_of,
+                    performance_floor, placebo_null_distribution,
+                    falsification_gate, sample_counts, seal_final_window,
+                    structural_floor, verified_gate_envelope,
+                    walk_forward_report)
 from .llm_strategy import ProposalResult, RuleProposalAdapter
-from .stats import benjamini_hochberg
+from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
@@ -91,6 +95,146 @@ def _llm_lineage_evidence(factory: FactoryLedger,
     return None
 
 
+def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
+              reason: str | None = None) -> dict:
+    row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
+           "opportunity_id": opportunity, "net_pnl": 0.0, "return_value": 0.0,
+           "no_trade": True}
+    if reason:
+        row["reject_reason"] = reason
+    return row
+
+
+def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
+                         spec: Mapping[str, Any], *, vehicle: str,
+                         reference_rows: Sequence[Mapping], account_id: str,
+                         starting_cash: float = 100_000.0, risk_pct: float = .5,
+                         spread_bps: float = 1.0, slippage_bps: float = 1.0,
+                         fee_bps: float = .5) -> dict:
+    """Replay a chance-entry null with the strategy's own exit and cost rules.
+
+    The null keeps the candidate's session/symbol/direction distribution and
+    its stop geometry, but chooses the entry bar at random.  A candidate that
+    cannot beat this is timing nothing: comparing only against the parent
+    specification measures relative improvement, not edge against chance.
+    """
+    grouped: dict[tuple[str, str], list] = {}
+    for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
+        grouped.setdefault((bar.symbol, bar.session_date.isoformat()), []).append(bar)
+    references = {(str(row.get("symbol")), str(row.get("session_date"))): row
+                  for row in reference_rows}
+    rng = random.Random(stable_seed({"account": str(account_id),
+                                     "spec": dict(spec),
+                                     "sessions": sorted(references)}))
+    cash = float(starting_cash)
+    peak = cash
+    drawdown = 0.0
+    rows: list[dict] = []
+    for key in sorted(references):
+        symbol, day = key
+        opportunity = f"null:{account_id}:{symbol}:{day}"
+        reference = references[key]
+        session_bars = grouped.get(key, [])
+        if reference.get("no_trade") is True or len(session_bars) < 3:
+            rows.append(_null_row(symbol, day, opportunity, vehicle))
+            continue
+        try:
+            entry_underlying_ref = float(reference["underlying_entry"])
+            distance = abs(entry_underlying_ref - float(reference["stop_price"]))
+            direction = str(reference["direction"])
+        except (KeyError, TypeError, ValueError):
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "reference trade lacks null-control geometry"))
+            continue
+        if not math.isfinite(distance) or distance <= 0 or direction not in {"long", "short"}:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "reference trade lacks null-control geometry"))
+            continue
+        entry_index = rng.randrange(1, len(session_bars) - 1)
+        entry_bar = session_bars[entry_index]
+        if not _visible(entry_bar, entry_bar.end):
+            rows.append(_null_row(symbol, day, opportunity, vehicle))
+            continue
+        entry_underlying = float(entry_bar.open)
+        stop = (entry_underlying - distance if direction == "long" else
+                entry_underlying + distance)
+        target = (entry_underlying + distance * float(spec["target_r"])
+                  if direction == "long" else
+                  entry_underlying - distance * float(spec["target_r"]))
+        deadline = hold_deadline(entry_bar.timestamp, spec)
+        last_index = entry_index
+        for probe in range(entry_index + 1, len(session_bars)):
+            if session_bars[probe].end.timestamp() > deadline:
+                break
+            last_index = probe
+        exit_bar = session_bars[last_index]
+        exit_ref = float(exit_bar.close)
+        for bar in session_bars[entry_index + 1:last_index + 1]:
+            if not _visible(bar, bar.end):
+                continue
+            if direction == "long":
+                hit_stop, hit_target = bar.low <= stop, bar.high >= target
+            else:
+                hit_stop, hit_target = bar.high >= stop, bar.low <= target
+            if hit_stop or hit_target:
+                exit_ref = stop if hit_stop else target
+                exit_bar = bar
+                break
+        entry_ref = entry_underlying
+        multiplier = 1
+        risk_per_unit = distance
+        if vehicle == "option":
+            entry_snap = _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
+                                    direction=direction, cutoff=entry_bar.end)
+            exit_snap = (None if entry_snap is None else
+                         _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
+                                    direction=direction, cutoff=exit_bar.end,
+                                    contract_symbol=entry_snap.contract.symbol))
+            if entry_snap is None or exit_snap is None:
+                rows.append(_null_row(symbol, day, opportunity, vehicle))
+                continue
+            entry_ref = entry_snap.ask
+            exit_ref = exit_snap.bid
+            multiplier = entry_snap.contract.multiplier
+            risk_per_unit = entry_ref * multiplier
+        quantity = math.floor(max(0.0, cash * float(risk_pct) / 100.0) /
+                              max(float(risk_per_unit), 1e-9))
+        if vehicle == "equity":
+            quantity = min(quantity, math.floor(max(0.0, cash * .25) /
+                                                max(float(entry_ref), 1e-9)))
+        if quantity <= 0:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "isolated account risk budget cannot fund one unit"))
+            continue
+        execution_direction = "long" if vehicle == "option" else direction
+        spread = 0.0 if vehicle == "option" else spread_bps / 20_000.0
+        slip = slippage_bps / 10_000.0
+        entry_sign = 1.0 if execution_direction == "long" else -1.0
+        entry = float(entry_ref) * (1 + entry_sign * (spread + slip))
+        exit_price = float(exit_ref) * (1 - entry_sign * (spread + slip))
+        gross = ((exit_price - entry) if execution_direction == "long" else
+                 (entry - exit_price)) * quantity * multiplier
+        costs = (abs(entry) + abs(exit_price)) * quantity * multiplier * fee_bps / 10_000.0
+        net = gross - costs
+        before = cash
+        cash += net
+        peak = max(peak, cash)
+        drawdown = max(drawdown, peak - cash)
+        rows.append({"vehicle": vehicle, "symbol": symbol, "session_date": day,
+                     "opportunity_id": opportunity, "direction": direction,
+                     "entry_timestamp": entry_bar.timestamp.isoformat(),
+                     "exit_timestamp": exit_bar.end.isoformat(),
+                     "quantity": quantity, "entry_price": entry,
+                     "exit_price": exit_price, "gross_pnl": gross, "costs": costs,
+                     "net_pnl": net,
+                     "return_value": net / before if before > 0 else 0.0,
+                     "no_trade": False})
+    executed = [row for row in rows if row.get("no_trade") is not True]
+    return {"account_id": account_id, "starting_cash": float(starting_cash),
+            "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
+            "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
+
+
 def _worker(payload: Mapping[str, Any]) -> dict:
     hypothesis = dict(payload["hypothesis"])
     bars = list(payload["bars"])
@@ -120,6 +264,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         starting_cash=starting_cash,
     )
     variants = []
+    null_rows: dict[str, list] = {}
     for spec in specs:
         variant_id = rule_variant_id(spec)
         account_id = f"sim:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}:{uuid.uuid4().hex[:8]}"
@@ -127,6 +272,10 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             bars, snapshots, spec, vehicle=vehicle, account_id=account_id,
             starting_cash=starting_cash,
         )
+        null_rows[variant_id] = null_control_account(
+            bars, snapshots, spec, vehicle=vehicle, reference_rows=account["rows"],
+            account_id=f"null:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}",
+            starting_cash=starting_cash)["rows"]
         variants.append({
             "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
             "account": account, "diagnostic": diagnose(account["rows"], starting_cash=starting_cash),
@@ -137,13 +286,33 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             "evaluation_start": sessions[0] if sessions else None,
             "evaluation_end": sessions[-1] if sessions else None,
             "variants": sorted(variants, key=lambda item: item["variant_id"]),
-            "control_rows": control_account["rows"],
+            "control_rows": control_account["rows"], "null_rows": null_rows,
             "expected_variants": len(specs), "worker_pid": os.getpid()}
+
+
+def _qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
+                          vehicle: str, sessions: Sequence[str]) -> dict:
+    """Score the sealed final window: go/no-go only, never diagnosis."""
+    if not rows or not sessions:
+        return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
+                "matched": 0, "mean_delta": None, "trades": 0,
+                "net_positive": False, "delta_positive": False}
+    pairs = matched_pairs(rows, baseline, vehicle=vehicle)
+    absolute = performance_floor(rows, vehicle=vehicle)
+    delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
+    return {"available": True, "sessions": list(sessions),
+            "net_pnl": absolute["net_pnl"], "trades": absolute["trades"],
+            "matched": pairs["matched"], "mean_delta": delta,
+            "net_positive": bool(absolute["net_pnl_positive"]),
+            "delta_positive": bool(delta is not None and delta > 0)}
 
 
 def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
           vehicle: str, mode: str,
-          min_trades: int, min_sessions: int, alpha: float) -> dict:
+          min_trades: int, min_sessions: int, alpha: float,
+          null_rows: Sequence[Mapping] = (),
+          qualification: Mapping | None = None,
+          folds: int = 3) -> dict:
     ordered = sorted(rows, key=lambda row: (str(row.get("session_date", "")),
                                              str(row.get("entry_timestamp", ""))))
     base_ordered = sorted(baseline, key=lambda row: (str(row.get("session_date", "")),
@@ -169,17 +338,34 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                 {"available": True, "actual_control": True, "matched": 0,
                  "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
     test = matched_cluster_test(heldout, base_heldout, vehicle=vehicle)
-    placebo = deterministic_placebo_deltas(heldout, base_heldout, vehicle=vehicle)
+    placebo = placebo_null_distribution(heldout, base_heldout, vehicle=vehicle)
     falsification = {
-        **falsification_gate(placebo["observed"], placebo["placebo"]),
+        **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
         "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
         "observations": len(placebo["observed"]),
+        "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
+        "clusters": int(placebo["cluster_count"]),
     }
     separation = (heldout_separation(fit, heldout) if mode != "shadow" else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": bool(heldout), "mode": "new_data"})
     fit_net = sum(float(row.get("net_pnl", 0.0)) for row in fit)
-    held_net = sum(float(row.get("net_pnl", 0.0)) for row in heldout)
+    absolute = performance_floor(heldout, vehicle=vehicle)
+    held_net = absolute["net_pnl"]
+    held_sessions = {str(row.get("session_date") or "") for row in heldout}
+    null_heldout = [row for row in null_rows
+                    if str(row.get("session_date") or "") in held_sessions]
+    null_test = matched_cluster_test(heldout, null_heldout, vehicle=vehicle)
+    null_control = {"kind": "randomized_entry_null", "matched": null_test["matched"],
+                    "available": bool(null_test["available"]),
+                    "mean_delta": null_test["mean_delta"],
+                    "mean_delta_lcb": null_test["mean_delta_lcb"],
+                    "p_value": float(null_test["p_value"])}
+    walk_forward = walk_forward_report(heldout, base_heldout, vehicle=vehicle,
+                                       folds=folds)
+    final = dict(qualification or {"available": False, "sessions": [],
+                                   "net_positive": False, "delta_positive": False})
+    lcb = test.get("mean_delta_lcb")
     checks = {
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
         "heldout_structurally_adequate": bool(held_floor["adequate"]),
@@ -189,21 +375,42 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
             fit_test.get("mean_delta") is not None and float(fit_test["mean_delta"]) > 0)),
         "heldout_delta_positive": bool(test.get("mean_delta") is not None and
                                         float(test["mean_delta"]) > 0),
+        "heldout_delta_lcb_positive": bool(lcb is not None and float(lcb) > 0),
         "heldout_p_significant": float(test["p_value"]) <= float(alpha),
         "falsification": bool(falsification["passes"]),
+        "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
+        "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
+        "null_control_available": bool(null_control["available"]),
+        "null_control_delta_positive": bool(
+            null_control["mean_delta"] is not None and
+            float(null_control["mean_delta"]) > 0 and
+            float(null_control["p_value"]) <= float(alpha)),
+        "walk_forward_majority_positive": bool(walk_forward["available"] and
+                                               walk_forward["majority_positive"]),
+        "qualification_net_positive": bool(final.get("available") and
+                                           final.get("net_positive")),
+        "qualification_delta_positive": bool(final.get("available") and
+                                             final.get("delta_positive")),
     }
     return {
         "passes_without_family": bool(all(checks.values())),
         "passes": False, "p_raw": float(test["p_value"]),
         "sample_adequate": bool(fit_floor["adequate"]),
-        "heldout_sample_adequate": bool(held_floor["adequate"]),
+        "heldout_sample_adequate": bool(held_floor["adequate"] and
+                                        walk_forward["available"] and
+                                        bool(final.get("available"))),
         "confidence": 1.0 - float(test["p_value"]),
         "floor": overall_floor, "fit_floor": fit_floor, "heldout_floor": held_floor,
         "fit_net_pnl": fit_net, "heldout_net_pnl": held_net,
+        "heldout_expectancy": absolute["expectancy"],
+        "heldout_performance": absolute,
         "fit_trades": sample_counts(fit, vehicle=vehicle)["trades"],
         "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
+        "heldout_delta_lcb": lcb,
         "max_drawdown": max_drawdown_of(ordered), "test": test,
         "fit_test": fit_test, "control": {**test, "kind": "matched_root_baseline"},
+        "null_control": null_control, "walk_forward": walk_forward,
+        "qualification": final,
         "falsification": falsification, "heldout_separation": separation,
         "checks_without_family": checks,
         "mode": mode, "alpha": float(alpha),
@@ -274,6 +481,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0}
     edge = EdgeLedger(db_path)
     tasks = []
+    sealed_windows: dict[str, tuple[Any, list]] = {}
     snapshots = list(snapshot_map.values())
     for hypothesis in active:
         mode = "shadow" if hypothesis.get("status") == "backtest_passed" else "backtest"
@@ -293,9 +501,21 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             continue
         factory.event(hypothesis["hypothesis_id"], "testing",
                       f"{mode} evaluation started", {"dataset_hash": dataset_hash})
+        # The latest sessions are sealed before any worker is scheduled, so
+        # mutation, diagnosis and selection are structurally unable to consume
+        # the final qualification window.
+        development_bars, sealed = seal_final_window(
+            selected_bars, session_of=_session, fraction=.2)
+        sealed_sessions = set(sealed.session_dates)
+        sealed_windows[hypothesis["hypothesis_id"]] = (
+            sealed,
+            [snap for snap in selected_snapshots
+             if snap.session_date.isoformat() in sealed_sessions])
         tasks.append({
-            "hypothesis": hypothesis, "bars": selected_bars,
-            "snapshots": selected_snapshots, "vehicle": vehicle, "mode": mode,
+            "hypothesis": hypothesis, "bars": development_bars,
+            "snapshots": [snap for snap in selected_snapshots
+                          if snap.session_date.isoformat() not in sealed_sessions],
+            "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
             "starting_cash": starting_cash,
         })
@@ -337,14 +557,48 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         worker["variants"] = sorted(worker["variants"],
                                     key=lambda item: str(item["variant_id"]))
 
+    # The sealed window is opened exactly once per hypothesis, here in the
+    # orchestrator, after every worker has finished proposing and diagnosing.
+    qualifications: dict[str, dict] = {}
+    for worker in worker_results:
+        hypothesis_id = str(worker["hypothesis"]["hypothesis_id"])
+        sealed, sealed_snapshots = sealed_windows.get(hypothesis_id, (None, []))
+        qualification_bars = (sealed.release(reason=f"final qualification {hypothesis_id}")
+                              if sealed is not None and sealed.session_dates else None)
+        sessions = tuple(sealed.session_dates) if sealed is not None else ()
+        control_rows = (simulate_account(
+            qualification_bars, sealed_snapshots, worker["hypothesis"]["rule_spec"],
+            vehicle=vehicle, account_id=f"qualification:control:{hypothesis_id}",
+            starting_cash=starting_cash)["rows"] if qualification_bars else [])
+        for variant in worker["variants"]:
+            rows = (simulate_account(
+                qualification_bars, sealed_snapshots, variant["rule_spec"],
+                vehicle=vehicle,
+                account_id=f"qualification:{hypothesis_id}:{variant['variant_id']}",
+                starting_cash=starting_cash)["rows"] if qualification_bars else [])
+            qualifications[f"{hypothesis_id}:{variant['variant_id']}"] = (
+                _qualification_report(rows, control_rows, vehicle=vehicle,
+                                      sessions=sessions))
+
     variant_rows = []
     for worker in worker_results:
+        hypothesis_id = str(worker["hypothesis"]["hypothesis_id"])
         for variant in worker["variants"]:
             gate = _gate(variant["account"]["rows"], vehicle=vehicle,
                          baseline=worker["control_rows"],
                          mode=worker["mode"], min_trades=min_trades,
-                         min_sessions=min_sessions, alpha=alpha)
+                         min_sessions=min_sessions, alpha=alpha,
+                         null_rows=(worker.get("null_rows") or {}).get(
+                             variant["variant_id"], []),
+                         qualification=qualifications.get(
+                             f"{hypothesis_id}:{variant['variant_id']}"))
             variant_rows.append((worker, variant, gate))
+    # Selection compares candidates across every family and lane in the cycle,
+    # so the false-discovery correction that authorizes a champion has to be
+    # global.  The family-local correction is retained as reported evidence.
+    global_correction = benjamini_hochberg(
+        {f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}": gate["p_raw"]
+         for owner, variant, gate in variant_rows}, alpha=alpha)
     partitions: dict[str, tuple[list, list]] = {}
     for worker in worker_results:
         local_rows = [(variant, gate) for owner, variant, gate in variant_rows
@@ -354,22 +608,37 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             alpha=alpha)
         for variant, gate in local_rows:
             family = correction[variant["variant_id"]]
+            overall = global_correction[
+                f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}"]
             checks = {**gate["checks_without_family"],
-                      "family_fdr_significant": bool(family["significant"])}
-            gate["multiple_tests"] = {**family, "method": "benjamini_hochberg"}
-            gate["passes"] = bool(gate["passes_without_family"] and family["significant"])
-            gate["confidence"] = 1.0 - float(family["p_adjusted"])
+                      "family_fdr_significant": bool(family["significant"]),
+                      "global_fdr_significant": bool(overall["significant"])}
+            gate["multiple_tests"] = {**family, "method": "benjamini_hochberg",
+                                      "scope": "family"}
+            gate["global_multiple_tests"] = {**overall,
+                                             "method": "benjamini_hochberg",
+                                             "scope": "cycle_global"}
+            gate["passes"] = bool(gate["passes_without_family"] and
+                                  family["significant"] and overall["significant"])
+            gate["confidence"] = 1.0 - float(overall["p_adjusted"])
             fit = gate.pop("_fit_rows")
             heldout = gate.pop("_heldout_rows")
             envelope = verified_gate_envelope(
                 lane=worker["mode"], vehicle=vehicle, fit=fit, heldout=heldout,
                 fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
                 control=gate["control"], p_value=gate["p_raw"],
-                q_value=family["p_adjusted"], alpha=alpha,
+                q_value=overall["p_adjusted"],
+                family_q_value=family["p_adjusted"], alpha=alpha,
                 falsification=gate["falsification"],
                 separation=gate["heldout_separation"], checks=checks,
                 passes=gate["passes"],
+                walk_forward=gate["walk_forward"],
+                qualification=gate["qualification"],
+                null_control=gate["null_control"],
                 performance={"heldout_delta": gate["test"].get("mean_delta"),
+                             "heldout_delta_lcb": gate["heldout_delta_lcb"],
+                             "heldout_net_pnl": gate["heldout_net_pnl"],
+                             "heldout_expectancy": gate["heldout_expectancy"],
                              "max_drawdown": gate["max_drawdown"]})
             gate["verified_gate"] = envelope
             gate["gate_hash"] = envelope["content_hash"]

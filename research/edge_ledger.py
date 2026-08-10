@@ -390,6 +390,9 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 continue
             # Conservative ranking: held-out lower confidence bound first,
             # then drawdown and sample size.  No metric can cross vehicles.
+            # The bound, not the point estimate, is what a champion is ranked
+            # on: a large mean over a handful of noisy sessions must not
+            # outrank a smaller, better-supported one.
             statistics = gate.get("statistics")
             performance = gate.get("performance")
             counts = gate.get("counts")
@@ -400,22 +403,27 @@ class EdgeLedger(EdgeLedgerProofMixin):
             held_counts = counts.get("heldout")
             if not isinstance(held_counts, Mapping):
                 continue
+            # The global q is the authority: family-local correction does not
+            # cover the cross-family comparison this selection performs.
             q_value = _finite_number(statistics.get("q_value"))
             heldout_delta = _finite_number(performance.get("heldout_delta"))
+            lower_bound = _finite_number(performance.get("heldout_delta_lcb"))
             max_drawdown = _finite_number(performance.get("max_drawdown"))
             heldout_trades = _nonnegative_integer(held_counts.get("trades"))
             if (q_value is None or not 0.0 <= q_value <= 1.0 or
-                    heldout_delta is None or max_drawdown is None or
+                    heldout_delta is None or lower_bound is None or
+                    max_drawdown is None or
                     max_drawdown < 0 or heldout_trades is None):
                 continue
             confidence = 1.0 - q_value
-            if confidence < min_confidence:
+            if confidence < min_confidence or lower_bound <= 0:
                 continue
-            scored.append((heldout_delta, -max_drawdown, heldout_trades, candidate))
+            scored.append((lower_bound, -max_drawdown, heldout_trades,
+                           heldout_delta, candidate))
         if not scored:
             return None
-        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        selected = scored[0][3]
+        scored.sort(key=lambda item: item[:4], reverse=True)
+        selected = scored[0][4]
         if selected["status"] != "champion":
             self.transition(selected["candidate_id"], "champion", reason="conservative evidence selection")
             selected = self.candidate(selected["candidate_id"]) or selected

@@ -18,7 +18,8 @@ from .edge_ledger import (
 from .gates import (
     chronological_split, deterministic_placebo_deltas, falsification_gate,
     heldout_separation, matched_cluster_test, max_drawdown_of, paired_delta,
-    sample_counts, structural_floor, verified_gate_envelope,
+    performance_floor, sample_counts, structural_floor, verified_gate_envelope,
+    walk_forward_report,
 )
 from .ibr import IBRConfig, replay_ibr
 from .market_data import (
@@ -32,6 +33,37 @@ from .edge_discovery_core import (
     DiscoveryError, _read_discovery_rows, _effective_ibr_config,
     _opportunity_rows, _discover_gate, _finalize_gate,
 )
+
+
+def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -> dict:
+    """Add absolute profitability, lower-bound and walk-forward requirements.
+
+    Beating a control is necessary but not sufficient: an accepted variant
+    must also make money after costs on unseen sessions, keep a positive lower
+    confidence bound, and hold up across a majority of rolling-origin folds.
+    """
+    heldout = gate["_heldout_rows"]
+    sessions = {str(row.get("session_date") or "") for row in heldout}
+    base_heldout = [row for row in baseline
+                    if str(row.get("session_date") or "") in sessions]
+    absolute = performance_floor(heldout, vehicle=vehicle)
+    walk = walk_forward_report(heldout, base_heldout, vehicle=vehicle)
+    bound = gate["heldout_paired_baseline"].get("mean_delta_lcb")
+    gate["checks_without_family"].update({
+        "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
+        "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
+        "heldout_delta_lcb_positive": bool(bound is not None and float(bound) > 0),
+        "walk_forward_majority_positive": bool(walk["available"] and
+                                               walk["majority_positive"]),
+    })
+    gate["passes_without_family"] = bool(
+        all(gate["checks_without_family"].values()) and
+        gate["paired_baseline"].get("mean_delta") is not None and
+        float(gate["paired_baseline"]["mean_delta"]) > 0)
+    gate["heldout_performance"] = absolute
+    gate["walk_forward"] = walk
+    gate["heldout_delta_lcb"] = bound
+    return gate
 
 
 def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFAULT_DB_PATH,
@@ -153,10 +185,12 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         mode = modes[variant.variant_id]
         if mode == "skip":
             continue
-        gates[variant.variant_id] = _discover_gate(
-            eval_rows[variant.variant_id], baseline_eval,
-            vehicle=vehicle, min_trades=min_trades,
-            min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow"))
+        gates[variant.variant_id] = _strengthen_gate(
+            _discover_gate(
+                eval_rows[variant.variant_id], baseline_eval,
+                vehicle=vehicle, min_trades=min_trades,
+                min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow")),
+            baseline_eval, vehicle=vehicle)
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
 
@@ -183,11 +217,13 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         config=effective_configs[baseline_variant.variant_id], dataset=raw_rows,
         code=code_path, provenance={"lane": lane, "vehicle": vehicle, "role": "baseline"},
         overrides=baseline_variant.overrides)
-    baseline_gate = _discover_gate(
-        baseline_eval, baseline_zero, vehicle=vehicle,
-        min_trades=min_trades, min_sessions=min_sessions, alpha=alpha,
-        shadow=(baseline_mode == "shadow"), actual_control=False,
-        control_kind="synthetic_zero_reference")
+    baseline_gate = _strengthen_gate(
+        _discover_gate(
+            baseline_eval, baseline_zero, vehicle=vehicle,
+            min_trades=min_trades, min_sessions=min_sessions, alpha=alpha,
+            shadow=(baseline_mode == "shadow"), actual_control=False,
+            control_kind="synthetic_zero_reference"),
+        baseline_zero, vehicle=vehicle)
     _finalize_gate(
         baseline_gate, lane=baseline_mode,
         family={"p": baseline_gate["candidate_p_raw"],
