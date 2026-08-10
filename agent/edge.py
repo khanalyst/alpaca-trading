@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Mapping
 
+from .allocation import evidence_rank
 from .registry import baseline_variant_id, known_variant_ids
 from .variants import from_record, apply as apply_variant_config
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
@@ -106,20 +107,10 @@ def _family(record: Mapping) -> str:
                spec.get("family") or record.get("strategy_id") or "unknown")
 
 
-def _proof_score(record: Mapping) -> tuple:
-    proof = record.get("latest_proof") if isinstance(record.get("latest_proof"), Mapping) else {}
-    gate = proof.get("verified_gate") if isinstance(proof.get("verified_gate"), Mapping) else {}
-    performance = gate.get("performance") if isinstance(
-        gate.get("performance"), Mapping) else {}
-    counts = gate.get("counts") if isinstance(gate.get("counts"), Mapping) else {}
-    heldout = counts.get("heldout") if isinstance(counts.get("heldout"), Mapping) else {}
-    confidence = _proof_confidence(proof)
-    heldout_delta = float(performance.get("heldout_delta", -float("inf")))
-    drawdown = float(performance.get("max_drawdown", float("inf")))
-    trades = int(heldout.get("trades", 0) or 0)
-    return (confidence, heldout_delta, -drawdown, trades,
-            str(record.get("variant_id") or ""),
-            str(record.get("candidate_id") or ""))
+# One notion of "better evidence" for the whole runtime: the ledger's own
+# conservative champion ordering.  ``_eligible`` has already applied the
+# confidence floor, so ranking is purely on the strength of the held-out proof.
+_proof_score = evidence_rank
 
 
 def resolve_validated_variant(config: Mapping, vehicle: str | None = None,
@@ -160,7 +151,10 @@ def resolve_validated_variants(config: Mapping, vehicle: str | None = None,
 
     ``specific`` retains the single-record behavior.  ``all_proved`` selects
     the strongest latest passing proof in each independent hypothesis/family,
-    preventing every mutation of one idea from becoming concurrent risk.
+    preventing every mutation of one idea from becoming concurrent risk.  The
+    families are returned strongest-evidence first, not by family name: order
+    is what decides which candidate meets the shared risk caps first, so it
+    must be decided by evidence.
     """
     strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
     if str(strategy.get("selection_mode") or "specific") == "specific":
@@ -185,7 +179,7 @@ def resolve_validated_variants(config: Mapping, vehicle: str | None = None,
         current = grouped.get(family)
         if current is None or _proof_score(record) > _proof_score(current):
             grouped[family] = record
-    return [grouped[key] for key in sorted(grouped)]
+    return sorted(grouped.values(), key=evidence_rank, reverse=True)
 
 
 def apply_variant(config: Mapping, record: Mapping) -> dict:
