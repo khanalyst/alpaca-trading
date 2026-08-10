@@ -261,6 +261,39 @@ class StrategyFactoryTests(unittest.TestCase):
                            min_trades=1, min_sessions=1, alpha=1.0,
                            max_generations=2, **kwargs)
 
+    def test_false_discovery_correction_spans_every_family_in_the_cycle(self):
+        # Selection compares candidates across families, so the correction that
+        # authorizes a champion has to be corrected over the same set.  A
+        # per-family correction alone leaves the cross-family selection effect
+        # uncorrected no matter how strict each family's own batch looks.
+        scopes = []
+        real = factory_module.benjamini_hochberg
+
+        def recording(values, **kwargs):
+            scopes.append(tuple(sorted(values)))
+            return real(values, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker), \
+                patch.object(factory_module, "benjamini_hochberg", side_effect=recording):
+            db = Path(directory) / "edge.sqlite3"
+            run_factory(losing_breakouts(), db_path=db, strategies=2,
+                        variants_per_strategy=2, workers=2, min_trades=1,
+                        min_sessions=1, alpha=1.0, max_generations=2)
+
+        # Family-local batches are keyed by variant alone; the global batch is
+        # keyed "hypothesis:variant" and must carry every variant in the cycle.
+        globals_ = [keys for keys in scopes
+                    if keys and all(":" in key for key in keys)]
+        self.assertTrue(globals_, "no cycle-global correction was applied")
+        widest = max(globals_, key=len)
+        families = {key.split(":", 1)[0] for key in widest}
+        self.assertGreater(len(families), 1)
+        locals_ = [keys for keys in scopes if keys and keys not in globals_]
+        for keys in locals_:
+            self.assertLess(len(keys), len(widest))
+
     def test_generation_exhaustion_rotates_one_fresh_family_per_cycle(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
