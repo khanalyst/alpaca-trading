@@ -307,17 +307,22 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         if entry_ref <= 0:
             return None
         multiplier = snap.contract.multiplier
+    # The runtime derives both levels from the completed breakout bar's close,
+    # because the bracket legs are submitted with the entry and no fill price
+    # exists yet.  Anchoring here to the entry bar's open instead would give
+    # research a systematically different R than the deployed system.
+    anchor = float(signal.close)
     if cfg.range_stop:
         stop = low if direction == "long" else high
-        distance = abs(underlying_entry - stop)
+        distance = abs(anchor - stop)
         target_r = cfg.target_r if cfg.target_r is not None else (
             cfg.target_pct / cfg.stop_pct)
-        target = (underlying_entry + target_r * distance if direction == "long"
-                  else underlying_entry - target_r * distance)
+        target = (anchor + target_r * distance if direction == "long"
+                  else anchor - target_r * distance)
     else:
-        stop = underlying_entry * (
+        stop = anchor * (
             1 - cfg.stop_pct if direction == "long" else 1 + cfg.stop_pct)
-        target = underlying_entry * (
+        target = anchor * (
             1 + cfg.target_pct if direction == "long" else 1 - cfg.target_pct)
 
     def option_exit_reference(cutoff: datetime) -> float | None:

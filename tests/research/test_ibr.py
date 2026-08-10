@@ -88,6 +88,24 @@ class IBRReplayTests(unittest.TestCase):
         self.assertTrue(result.trades[0].gap_fill)
         self.assertEqual(result.trades[0].exit_price, 95)
 
+    def test_levels_are_anchored_to_the_signal_close_not_the_entry_gap(self):
+        # The runtime submits its bracket from the completed breakout bar's
+        # close (101), before the gapped entry bar (open 103) exists.
+        for gap in (False, True):
+            with self.subTest(gap=gap):
+                bars = bars_for_day(gap=gap)
+                percent = replay_ibr(bars, config=IBRConfig(
+                    stop_pct=.01, target_pct=.02, spread_bps=0,
+                    slippage_bps=0, fee_bps=0)).trades[0]
+                self.assertAlmostEqual(percent.stop_price, 99.99, places=9)
+                self.assertAlmostEqual(percent.target_price, 103.02, places=9)
+                ranged = replay_ibr(bars, config=IBRConfig(
+                    range_stop=True, target_r=2.0, stop_pct=.01, target_pct=.02,
+                    spread_bps=0, slippage_bps=0, fee_bps=0)).trades[0]
+                self.assertAlmostEqual(ranged.stop_price, 99.0, places=9)
+                self.assertAlmostEqual(ranged.target_price, 105.0, places=9)
+                self.assertEqual(percent.entry_reference, 103 if gap else 101)
+
     def test_equity_and_option_results_are_not_pooled(self):
         bars = bars_for_day()
         contract = {

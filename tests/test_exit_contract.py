@@ -23,7 +23,7 @@ from agent.contracts.rule import (BAR_SECONDS, RuleSpecError,
 from agent.engine import Engine
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
-from research.factory_core import _simulate_trade
+from research.factory_core import _simulate_trade, simulate_account
 from research.market_data import normalize_underlying_bar
 
 BASE = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
@@ -38,10 +38,14 @@ RISING = [100.2, 100.4, 100.6, 100.8]
 FLAT = [100.8] * 8
 
 
-def _payloads(closes):
+def _payloads(closes, opens=None):
+    """``opens`` overrides an index's open, i.e. gaps that bar away from the
+    previous close.  Without it every bar opens where the last one closed,
+    which is exactly the case that hides an anchor divergence."""
     rows = []
     opened = 100.0
     for index, close in enumerate(closes):
+        opened = float((opens or {}).get(index, opened))
         timestamp = BASE + timedelta(minutes=index)
         end = timestamp + timedelta(minutes=1)
         rows.append({
@@ -55,8 +59,8 @@ def _payloads(closes):
     return rows
 
 
-def _bars(closes):
-    return [normalize_underlying_bar(row) for row in _payloads(closes)]
+def _bars(closes, opens=None):
+    return [normalize_underlying_bar(row) for row in _payloads(closes, opens)]
 
 
 class ExitBroker:
@@ -291,8 +295,8 @@ class ExitContractDifferentialTests(unittest.TestCase):
                 return result["closed"][0]["reason"], bar.end
         return None, None
 
-    def _differential(self, closes, name, *, force_flat_from=None):
-        bars = _bars(closes)
+    def _differential(self, closes, name, *, force_flat_from=None, opens=None):
+        bars = _bars(closes, opens)
         simulated = _simulate_trade(bars, SPEC, [], "equity")
         self.assertIsNotNone(simulated)
         engine, plan = self._open_runtime_trade(bars, name)
@@ -303,6 +307,10 @@ class ExitContractDifferentialTests(unittest.TestCase):
         self.provider.positions_live = [self._position(bars[-1].close)]
         # The simulator evaluates protective exits from the bar after entry.
         reason, exit_at = self._drive(engine, bars, start_index=5)
+        # The protective levels themselves, not only their timing, are part of
+        # the shared contract: both engines anchor them to the signal close.
+        self.assertAlmostEqual(simulated["stop_price"], plan["stop_price"], places=9)
+        self.assertAlmostEqual(simulated["target_price"], plan["target_price"], places=9)
         return simulated, plan, reason, exit_at
 
     def test_time_exit_fires_at_the_simulated_exit_bar(self):
@@ -368,6 +376,46 @@ class ExitContractDifferentialTests(unittest.TestCase):
                                            [self._position(bars[5].close)])
         self.assertEqual([row["reason"] for row in result["closed"]], ["max_hold"])
 
+    def test_a_gap_up_entry_does_not_move_the_protective_levels(self):
+        simulated, plan, reason, exit_at = self._differential(
+            RISING + FLAT, "runtime-gap-up", opens={4: 101.0})
+        self.assertEqual(simulated["underlying_entry"], 101.0)
+        self.assertAlmostEqual(simulated["stop_price"], 100.5, places=9)
+        self.assertAlmostEqual(simulated["target_price"], 101.4, places=9)
+        self.assertEqual(simulated["exit_reason"], "time")
+        self.assertEqual(reason, "max_hold")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        # Nominal R is unchanged; the gap shows up as real risk per share.
+        self.assertAlmostEqual(simulated["stop_distance"], .3, places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], .5, places=9)
+
+    def test_a_gap_down_entry_does_not_move_the_protective_levels(self):
+        simulated, plan, reason, exit_at = self._differential(
+            RISING + FLAT, "runtime-gap-down", opens={4: 100.6})
+        self.assertEqual(simulated["underlying_entry"], 100.6)
+        self.assertAlmostEqual(simulated["stop_price"], 100.5, places=9)
+        self.assertAlmostEqual(simulated["target_price"], 101.4, places=9)
+        self.assertEqual(simulated["exit_reason"], "time")
+        self.assertEqual(reason, "max_hold")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+        self.assertAlmostEqual(simulated["risk_per_unit"], .1, places=9)
+
+    def test_a_gapped_entry_still_agrees_on_a_stop_exit(self):
+        closes = RISING + [100.8, 100.4] + FLAT[:5]
+        simulated, _, reason, exit_at = self._differential(
+            closes, "runtime-gap-stop", opens={4: 101.0})
+        self.assertEqual(simulated["exit_reason"], "stop")
+        self.assertEqual(reason, "stop")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+
+    def test_a_gapped_entry_still_agrees_on_a_target_exit(self):
+        closes = RISING + [100.8, 101.5] + FLAT[:5]
+        simulated, _, reason, exit_at = self._differential(
+            closes, "runtime-gap-target", opens={4: 100.6})
+        self.assertEqual(simulated["exit_reason"], "target")
+        self.assertEqual(reason, "target")
+        self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
+
     def test_a_legacy_trade_without_the_field_keeps_its_behaviour(self):
         bars = _bars(RISING + FLAT)
         engine, _ = self._open_runtime_trade(bars, "runtime-legacy")
@@ -380,6 +428,43 @@ class ExitContractDifferentialTests(unittest.TestCase):
         for bar in bars[5:]:
             result = engine._monitor_positions(bar.end, [self._position(bar.close)])
             self.assertEqual(result["closed"], [])
+
+
+class GappedEntrySizingTests(unittest.TestCase):
+    """Sizing must charge the real fill-to-stop distance, not the nominal one."""
+
+    def _row(self, opens=None):
+        book = simulate_account(_bars(RISING + FLAT, opens), [], SPEC,
+                                vehicle="equity", account_id="sizing",
+                                risk_pct=.05)
+        row = book["rows"][0]
+        self.assertIs(row.get("no_trade"), False)
+        return row
+
+    def test_a_gap_against_the_stop_shrinks_the_position(self):
+        flat, gapped = self._row(), self._row({4: 101.0})
+        # 100k * .05% = $50 of risk. Ungapped risk per share is the nominal
+        # .30 ATR stop; the gap widens it to 101.00 - 100.50 = .50.
+        self.assertEqual(flat["quantity"], 166)
+        self.assertEqual(gapped["quantity"], 100)
+        self.assertLess(gapped["quantity"], flat["quantity"])
+
+    def test_a_gap_toward_the_stop_is_a_smaller_risk_per_share(self):
+        row = self._row({4: 100.6})
+        # Real risk is .10/share, so $50 funds 500 shares; the 25%-of-cash
+        # notional cap binds first at floor(25_000 / 100.60) = 248.
+        self.assertEqual(row["quantity"], 248)
+        self.assertGreater(row["quantity"], self._row()["quantity"])
+
+    def test_an_entry_through_the_stop_is_not_booked(self):
+        book = simulate_account(_bars(RISING + FLAT, {4: 100.3}), [], SPEC,
+                                vehicle="equity", account_id="sizing",
+                                risk_pct=.05)
+        row = book["rows"][0]
+        self.assertIs(row["no_trade"], True)
+        self.assertEqual(row["reject_reason"],
+                         "entry gapped through the protective stop")
+        self.assertEqual(book["trades"], 0)
 
 
 if __name__ == "__main__":

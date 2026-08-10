@@ -139,8 +139,20 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         direction = signal["direction"]
         entry_underlying = float(entry_bar.open)
         distance = float(signal["stop_distance"])
-        stop = entry_underlying - distance if direction == "long" else entry_underlying + distance
-        target = entry_underlying + distance * float(spec["target_r"]) if direction == "long" else entry_underlying - distance * float(spec["target_r"])
+        # The runtime submits the bracket legs with the entry order, before any
+        # fill exists, so the only anchor it can use is the signal bar's close.
+        # Research must use the same levels and let the entry gap show up as
+        # real sizing/R error rather than silently re-anchoring them.
+        stop = float(signal["stop_price"])
+        target = float(signal["target_price"])
+        # Actual risk per share is the distance from the real fill to that stop.
+        real_risk = (entry_underlying - stop if direction == "long"
+                     else stop - entry_underlying)
+        if real_risk <= 0:
+            # The entry gapped to or through its own protective stop: the
+            # bracket is stopped out on arrival and the trade cannot be sized
+            # against a risk budget at all.
+            return {"reject_reason": "entry gapped through the protective stop"}
         deadline = hold_deadline(entry_bar.timestamp, spec)
         last_index = index + 1
         for probe in range(index + 2, len(session_bars)):
@@ -151,19 +163,27 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         exit_ref = float(exit_bar.close)
         reason = "time"
         tie = False
-        for bar in session_bars[index + 2:last_index + 1]:
-            if not _visible(bar, bar.end):
-                continue
-            if direction == "long":
-                hit_stop, hit_target = bar.low <= stop, bar.high >= target
-            else:
-                hit_stop, hit_target = bar.high >= stop, bar.low <= target
-            if hit_stop or hit_target:
-                tie = hit_stop and hit_target
-                reason = "stop" if hit_stop else "target"
-                exit_ref = stop if hit_stop else target
-                exit_bar = bar
-                break
+        if (entry_underlying >= target if direction == "long"
+                else entry_underlying <= target):
+            # The entry gapped past its own target; the broker-side leg fills
+            # at the entry, not at an impossible better price.
+            reason = "target"
+            exit_ref = entry_underlying
+            exit_bar = entry_bar
+        else:
+            for bar in session_bars[index + 2:last_index + 1]:
+                if not _visible(bar, bar.end):
+                    continue
+                if direction == "long":
+                    hit_stop, hit_target = bar.low <= stop, bar.high >= target
+                else:
+                    hit_stop, hit_target = bar.high >= stop, bar.low <= target
+                if hit_stop or hit_target:
+                    tie = hit_stop and hit_target
+                    reason = "stop" if hit_stop else "target"
+                    exit_ref = stop if hit_stop else target
+                    exit_bar = bar
+                    break
         day = signal_bar.session_date
         multiplier = 1
         contract = None
@@ -192,7 +212,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
             "contract": contract, "contract_multiplier": multiplier,
-            "risk_per_unit": (entry_ref * multiplier if vehicle == "option" else distance),
+            "stop_distance": distance, "risk_per_unit": (
+                entry_ref * multiplier if vehicle == "option" else real_risk),
         }
     return None
 
@@ -218,6 +239,12 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
                          "net_pnl": 0.0, "return_value": 0.0, "no_trade": True})
+            continue
+        if raw.get("reject_reason"):
+            rows.append({"vehicle": vehicle, "symbol": symbol,
+                         "session_date": day.isoformat(), "opportunity_id": opportunity,
+                         "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
+                         "reject_reason": raw["reject_reason"]})
             continue
         risk_budget = max(0.0, cash * float(risk_pct) / 100.0)
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
