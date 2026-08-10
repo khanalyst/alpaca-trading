@@ -48,23 +48,40 @@ def _gate_evidence(heldout, *, alpha=.05):
     return control, falsification, absolute, walk
 
 
-def _sessions(start: datetime, count: int) -> list[dict]:
+def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA")) -> list[dict]:
+    """Sessions with a real timing edge, not a session-long directional drift.
+
+    The breakout runs far enough to pay 1.5R but not 2R, and then gives the
+    whole move back over a long decline.  The give-back is what makes a
+    randomly timed entry lose: without it the randomized-entry null control
+    would score the same trade as the strategy, which is the point of having
+    the control at all.
+    """
     rows: list[dict] = []
     for offset in range(count):
         session = start + timedelta(days=offset)
-        values = (
-            (100, 101, 99, 100),    # one-minute opening range
-            (100, 102, 99, 102),    # confirmed breakout
-            (102, 103, 101, 102),   # next-bar entry
-            (102, 107, 101, 106),   # 1.5R target, but not 2R
-        )
-        for minute, (open_, high, low, close) in enumerate(values):
-            rows.append({
-                "symbol": "SPY",
-                "timestamp": (session + timedelta(minutes=minute)).isoformat(),
-                "open": open_, "high": high, "low": low, "close": close,
-                "volume": 1, "provider": "alpaca", "feed": "sip",
-            })
+        values = [
+            (100, 101, 99, 100),        # one-minute opening range
+            (100, 102, 99.5, 102),      # confirmed breakout
+            (102, 103, 101.5, 103),     # next-bar entry at 102
+            (103, 107, 102.5, 106.8),   # 1.5R (106.5) target, but not 2R (108)
+        ]
+        price = 106.8
+        for _ in range(20):            # the whole move handed back
+            values.append((price, price + .05, price - .4, price - .35))
+            price -= .35
+        for index, symbol in enumerate(symbols):
+            # A per-symbol offset keeps the sample from being one repeated
+            # observation while leaving every level on the same side of itself.
+            shift = index * .01
+            for minute, (open_, high, low, close) in enumerate(values):
+                rows.append({
+                    "symbol": symbol,
+                    "timestamp": (session + timedelta(minutes=minute)).isoformat(),
+                    "open": open_ + shift, "high": high + shift,
+                    "low": low + shift, "close": close + shift,
+                    "volume": 1, "provider": "alpaca", "feed": "sip",
+                })
     return rows
 
 
@@ -1021,6 +1038,128 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             trades = EdgeLedger(db).trades(candidate["candidate_id"], lane="shadow")
             self.assertTrue(trades)
             self.assertTrue(all(row["session_date"] >= "2024-02-01" for row in trades))
+
+
+def _drift_sessions(start: datetime, count: int,
+                    symbols=("SPY", "QQQ", "IWM", "DIA")) -> list[dict]:
+    """One session-long move and nothing else: pure directional drift.
+
+    The 1.5R variant still beats its 2R baseline here, so every control the
+    IBR lane had before this change is satisfied.  But the move is the whole
+    session, so an entry chosen at random catches the same move: none of the
+    P&L is bought by the timing, which is what the null control exists to say.
+    """
+    rows: list[dict] = []
+    for offset in range(count):
+        session = start + timedelta(days=offset)
+        values = [
+            (100, 101, 99, 100),     # one-minute opening range
+            (100, 102, 99, 102),     # confirmed breakout
+            (102, 103, 101, 102),    # next-bar entry
+            (102, 107, 101, 106),    # 1.5R target, but not 2R
+        ]
+        for index, symbol in enumerate(symbols):
+            shift = index * .01
+            for minute, (open_, high, low, close) in enumerate(values):
+                rows.append({
+                    "symbol": symbol,
+                    "timestamp": (session + timedelta(minutes=minute)).isoformat(),
+                    "open": open_ + shift, "high": high + shift,
+                    "low": low + shift, "close": close + shift,
+                    "volume": 1, "provider": "alpaca", "feed": "sip",
+                })
+    return rows
+
+
+class IbrLaneEvidenceParityTests(unittest.TestCase):
+    """The IBR lane carries the factory lane's null control and sealed window."""
+
+    REGISTRY = {"variants": [
+        {"variant_id": "ibr.baseline", "strategy_id": "ibr",
+         "base_version": "v1", "overrides": {}, "vehicles": ["equity"],
+         "hypothesis": "registered baseline"},
+        {"variant_id": "ibr.target.1_5r", "strategy_id": "ibr",
+         "base_version": "v1", "overrides": {"strategy.target_r": 1.5},
+         "vehicles": ["equity"], "hypothesis": "earlier target"},
+    ]}
+    CONFIG = {"strategy": {"range_minutes": 1, "range_stop": True, "target_r": 2}}
+
+    def _discover(self, rows, directory, **kwargs):
+        root = Path(directory)
+        data = root / "corpus.jsonl"
+        variants = root / "variants.yaml"
+        data.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        variants.write_text(json.dumps(self.REGISTRY), encoding="utf-8")
+        options = {"min_trades": 5, "min_sessions": 5, "lane": "auto", **kwargs}
+        return discover(data, db_path=root / "edge.sqlite3", variants_path=variants,
+                        config=self.CONFIG, **options)
+
+    def test_the_gate_reports_a_null_control_and_a_sealed_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._discover(
+                _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
+                directory)
+        gate = result["variants"][0]["gate"]
+        for name in ("null_control_available", "null_control_delta_positive",
+                     "qualification_net_positive", "qualification_delta_positive"):
+            self.assertIn(name, gate["checks_without_family"])
+            self.assertTrue(gate["checks_without_family"][name], name)
+        self.assertEqual(gate["null_control"]["kind"], "randomized_entry_null")
+        self.assertGreater(gate["null_control"]["matched"], 0)
+        self.assertTrue(gate["qualification"]["available"])
+        # The sealed window is the last fifth of the corpus and is scored, not
+        # split, so it appears in the persisted decision as its own evidence.
+        self.assertEqual(gate["qualification"]["sessions"],
+                         ["2024-01-18", "2024-01-19", "2024-01-20", "2024-01-21"])
+        envelope = gate["verified_gate"]
+        self.assertEqual(envelope["null_control"], gate["null_control"])
+        self.assertEqual(envelope["qualification"], gate["qualification"])
+        self.assertEqual(envelope["walk_forward"], gate["walk_forward"])
+
+    def test_the_sealed_window_never_reaches_selection_or_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._discover(
+                _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
+                directory)
+            candidate = result["variants"][0]
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            trades = ledger.trades(candidate["candidate_id"])
+        sealed = set(candidate["gate"]["qualification"]["sessions"])
+        self.assertTrue(trades)
+        self.assertFalse(sealed & {str(row["session_date"]) for row in trades})
+        counts = candidate["gate"]["verified_gate"]["counts"]
+        self.assertEqual(counts["total"]["trades"],
+                         counts["fit"]["trades"] + counts["heldout"]["trades"])
+
+    def test_a_drift_edge_beats_its_baseline_and_still_fails_the_null(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._discover(
+                _drift_sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
+                directory)
+        candidate = result["variants"][0]
+        checks = candidate["gate"]["checks_without_family"]
+        self.assertTrue(checks["heldout_delta_positive"])
+        self.assertTrue(checks["heldout_net_pnl_positive"])
+        self.assertTrue(checks["null_control_available"])
+        # Everything the lane could ask before this change is satisfied; only
+        # the chance-entry comparison is not.
+        self.assertFalse(checks["null_control_delta_positive"])
+        self.assertFalse(candidate["gate"]["passes"])
+        self.assertEqual(candidate["status"], "retired")
+
+    def test_a_corpus_too_thin_to_seal_a_window_is_underpowered_not_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._discover(
+                _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 1),
+                directory, min_trades=1, min_sessions=1)
+            candidate = result["variants"][0]
+            events = EdgeLedger(Path(directory) / "edge.sqlite3").history(
+                candidate["candidate_id"])
+        self.assertFalse(candidate["gate"]["qualification"]["available"])
+        # Structural inadequacy, never a failure: a thin corpus must not retire
+        # a hypothesis or otherwise churn the lifecycle.
+        self.assertEqual(candidate["status"], "candidate")
+        self.assertIn("insufficient_data", {event["event_type"] for event in events})
 
 
 if __name__ == "__main__":

@@ -18,8 +18,8 @@ from .edge_ledger import (
 from .gates import (
     chronological_split, deterministic_placebo_deltas, falsification_gate,
     heldout_separation, matched_cluster_test, max_drawdown_of, paired_delta,
-    performance_floor, sample_counts, structural_floor, verified_gate_envelope,
-    walk_forward_report,
+    performance_floor, qualification_report, sample_counts, seal_final_window,
+    structural_floor, verified_gate_envelope, walk_forward_report,
 )
 from .costs import CostModel
 from .ibr import IBRConfig, replay_ibr
@@ -31,9 +31,43 @@ from .stats import benjamini_hochberg
 
 
 from .edge_discovery_core import (
-    DiscoveryError, _read_discovery_rows, _effective_ibr_config,
-    _opportunity_rows, _discover_gate, _finalize_gate,
+    DiscoveryError, _bar_session, _read_discovery_rows, _effective_ibr_config,
+    _null_reference_rows, _opportunity_rows, _discover_gate, _finalize_gate,
+    null_control_account,
 )
+
+
+# One regular session of one-minute bars: the randomized-entry null holds to
+# the session boundary, which is where the IBR replay is force-flat.
+SESSION_BARS = 390
+
+
+def _null_spec(cfg) -> dict:
+    """The geometry the randomized-entry null replays this variant with.
+
+    The null needs one reward-to-risk ratio and one hold horizon.  The ratio
+    is the variant's own — explicit ``target_r``, or the percentage pair's
+    implied ratio, exactly as :mod:`research.ibr` resolves it.  The horizon is
+    a whole regular session because an IBR position is closed by the session
+    boundary rather than by a bounded rule's bar count.
+    """
+    ratio = (float(cfg.target_r) if cfg.target_r is not None
+             else float(cfg.target_pct) / float(cfg.stop_pct))
+    return {"target_r": ratio, "max_hold_bars": SESSION_BARS}
+
+
+def _adequate(gate: Mapping) -> bool:
+    """Whether this gate was decided on structurally sufficient evidence.
+
+    Floors, a usable rolling-origin walk-forward, and a released final
+    qualification window are all sample-size statements.  A corpus that cannot
+    supply one of them is underpowered, not failed, and must not retire a
+    hypothesis on evidence it never had.
+    """
+    return bool(gate.get("fit_floor", {}).get("adequate") and
+                gate.get("heldout_floor", {}).get("adequate") and
+                (gate.get("walk_forward") or {}).get("available") and
+                (gate.get("qualification") or {}).get("available"))
 
 
 def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -> dict:
@@ -101,15 +135,58 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     code_path = Path(__file__)
     data_hash = content_hash(raw_rows)
 
+    # The latest sessions are sealed before any variant is replayed, so no
+    # gate, correction or champion comparison can reach them; the window is
+    # opened once, below, after every variant has been scored.
+    development_bars, sealed_window = seal_final_window(
+        bars, session_of=_bar_session, fraction=.2)
+    sealed_sessions = set(sealed_window.session_dates)
+    sealed_snapshots = {key: snap for key, snap in snapshots.items()
+                        if snap.session_date.isoformat() in sealed_sessions}
+    sealed_quotes = [quote for quote in quotes
+                     if quote.session_date.isoformat() in sealed_sessions]
+    development_snapshots = {key: snap for key, snap in snapshots.items()
+                             if snap.session_date.isoformat() not in sealed_sessions}
+    development_quotes = [quote for quote in quotes
+                          if quote.session_date.isoformat() not in sealed_sessions]
+
+    def replay(variant_bars, variant_snapshots, variant_quotes, cfg):
+        return replay_ibr(
+            variant_bars, config=cfg, vehicle=vehicle,
+            option_snapshots=variant_snapshots if vehicle == "option" else None,
+            quotes=variant_quotes if vehicle == "equity" else None)
+
     base_results: dict[str, list[dict]] = {}
+    null_results: dict[str, list[dict]] = {}
     effective_configs: dict[str, dict] = {}
+    configs: dict[str, object] = {}
     for variant in selected:
         cfg, effective = _effective_ibr_config(config, variant.overrides)
-        result = replay_ibr(bars, config=cfg, vehicle=vehicle,
-                            option_snapshots=snapshots if vehicle == "option" else None,
-                            quotes=quotes if vehicle == "equity" else None)
-        base_results[variant.variant_id] = _opportunity_rows(result, bars, vehicle)
+        result = replay(development_bars, development_snapshots, development_quotes, cfg)
+        base_results[variant.variant_id] = _opportunity_rows(
+            result, development_bars, vehicle)
+        # Beating the config a variant was derived from is not beating chance.
+        # The null keeps this variant's own sessions, symbols, directions and
+        # stop distances, and moves only the entry bar.
+        null_results[variant.variant_id] = null_control_account(
+            development_bars, list(development_snapshots.values()),
+            _null_spec(cfg), vehicle=vehicle,
+            reference_rows=_null_reference_rows(result, development_bars, vehicle),
+            account_id=f"ibr:{vehicle}:{variant.variant_id}",
+            costs=cfg.costs, quotes=development_quotes,
+            fixed_quantity=cfg.quantity)["rows"]
         effective_configs[variant.variant_id] = effective
+        configs[variant.variant_id] = cfg
+
+    qualification_rows: dict[str, list[dict]] = {}
+    if sealed_sessions:
+        window_bars = sealed_window.release(
+            reason=f"final qualification {vehicle} {data_hash[:12]}")
+        for variant in selected:
+            qualification_rows[variant.variant_id] = _opportunity_rows(
+                replay(window_bars, sealed_snapshots, sealed_quotes,
+                       configs[variant.variant_id]),
+                window_bars, vehicle)
 
     def latest_boundary(record: Mapping | None) -> str | None:
         if not record:
@@ -119,6 +196,12 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             value = run.get("heldout_end") or run.get("fit_end")
             if value:
                 values.append(str(value))
+            # A sealed window that was scored was consumed: the forward-only
+            # boundary has to clear it, or the next cycle would develop on
+            # sessions this one already qualified against.
+            window = ((run.get("metrics") or {}).get("gate") or {}).get("qualification") or {}
+            for session in (window.get("sessions") or ()):
+                values.append(str(session))
         return max(values) if values else None
 
     existing = {variant.variant_id: ledger.candidate_by_variant(variant.variant_id, vehicle)
@@ -144,6 +227,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         lane == "shadow" or (lane == "auto" and baseline_boundary is not None)
     ) else "backtest"
 
+    def consumed_sessions(*groups: Sequence[Mapping]) -> int:
+        """Unseen sessions this lane consumed, development and sealed alike."""
+        return len({str(row.get("session_date") or "")
+                    for group in groups for row in group})
+
     def tail(rows: Sequence[Mapping], boundary: str | None) -> list[dict]:
         if boundary is None:
             return [dict(row) for row in rows]
@@ -151,11 +239,22 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 if str(row.get("session_date") or "") > str(boundary)]
 
     baseline_eval = tail(baseline_rows, baseline_boundary) if baseline_mode == "shadow" else baseline_rows
-    if lane == "shadow" and not baseline_eval:
+    baseline_window_rows = tail(
+        qualification_rows.get(baseline_variant.variant_id, []),
+        baseline_boundary if baseline_mode == "shadow" else None)
+    if lane == "shadow" and not baseline_eval and not baseline_window_rows:
         raise DiscoveryError("shadow corpus contains no unseen sessions after the persisted boundary")
+
+    def final_window(rows: Sequence[Mapping], control: Sequence[Mapping]) -> dict:
+        """Score one variant over the sealed sessions: go/no-go, never diagnosis."""
+        return qualification_report(
+            rows, control, vehicle=vehicle,
+            sessions=sorted({str(row.get("session_date") or "") for row in rows}))
 
     modes: dict[str, str] = {}
     eval_rows: dict[str, list[dict]] = {}
+    window_rows: dict[str, list[dict]] = {}
+    window_reports: dict[str, dict] = {}
     for variant in candidates:
         record = existing.get(variant.variant_id)
         if record is not None and record.get("status") in {"retired", "demoted"}:
@@ -176,7 +275,15 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 if mode == "shadow" else
                 ([] if mode == "skip" else base_results[variant.variant_id]))
         eval_rows[variant.variant_id] = rows
-        if lane == "shadow" and not rows:
+        window_rows[variant.variant_id] = (
+            [] if mode == "skip" else
+            tail(qualification_rows.get(variant.variant_id, []),
+                 boundary if mode == "shadow" else None))
+        window_reports[variant.variant_id] = final_window(
+            window_rows[variant.variant_id],
+            tail(qualification_rows.get(baseline_variant.variant_id, []),
+                 boundary if mode == "shadow" else None))
+        if lane == "shadow" and not rows and not window_rows[variant.variant_id]:
             raise DiscoveryError(
                 f"shadow corpus contains no unseen sessions for {variant.variant_id!r}")
 
@@ -191,7 +298,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             _discover_gate(
                 eval_rows[variant.variant_id], baseline_eval,
                 vehicle=vehicle, min_trades=min_trades,
-                min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow")),
+                min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow"),
+                null_rows=null_results[variant.variant_id],
+                qualification=window_reports[variant.variant_id]),
             baseline_eval, vehicle=vehicle)
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
@@ -219,12 +328,19 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         config=effective_configs[baseline_variant.variant_id], dataset=raw_rows,
         code=code_path, provenance={"lane": lane, "vehicle": vehicle, "role": "baseline"},
         overrides=baseline_variant.overrides)
+    # The baseline's own control is the synthetic zero reference, in the final
+    # window exactly as in the development one.
+    baseline_window = final_window(
+        baseline_window_rows,
+        [{**row, "net_pnl": 0.0, "return_value": 0.0} for row in baseline_window_rows])
     baseline_gate = _strengthen_gate(
         _discover_gate(
             baseline_eval, baseline_zero, vehicle=vehicle,
             min_trades=min_trades, min_sessions=min_sessions, alpha=alpha,
             shadow=(baseline_mode == "shadow"), actual_control=False,
-            control_kind="synthetic_zero_reference"),
+            control_kind="synthetic_zero_reference",
+            null_rows=null_results[baseline_variant.variant_id],
+            qualification=baseline_window),
         baseline_zero, vehicle=vehicle)
     _finalize_gate(
         baseline_gate, lane=baseline_mode,
@@ -233,9 +349,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 "significant": baseline_gate["candidate_p_raw"] <= alpha,
                 "family_size": 1})
     baseline_run = None
-    baseline_adequate = bool(
-        baseline_gate.get("fit_floor", {}).get("adequate") and
-        baseline_gate.get("heldout_floor", {}).get("adequate"))
+    baseline_adequate = _adequate(baseline_gate)
     if baseline_eval and not baseline_adequate:
         ledger.append_event(
             candidate_id=baseline_record["candidate_id"],
@@ -282,8 +396,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             continue
         gate = gates[variant.variant_id]
         family = gate["multiple_tests"]["candidate"]
-        adequate = bool(gate.get("fit_floor", {}).get("adequate") and
-                        gate.get("heldout_floor", {}).get("adequate"))
+        adequate = _adequate(gate)
         run = None
         shadow_run = None
         status = record.get("status", "candidate")
@@ -352,14 +465,19 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                         "shadow_gate": gate if mode == "shadow" else None,
                         "run_id": run["run_id"] if run else None,
                         "shadow_run_id": shadow_run["run_id"] if shadow_run else None,
-                        "mode": mode, "unseen_sessions": len(rows) if mode == "shadow" else None})
+                        "mode": mode,
+                        "unseen_sessions": (
+                            consumed_sessions(rows, window_rows[variant.variant_id])
+                            if mode == "shadow" else None)})
     champion = ledger.select_champion(vehicle=vehicle) if lane in {"auto", "shadow"} else None
     return {"vehicle": vehicle, "lane": lane, "dataset_hash": data_hash,
             "variants": results, "family_correction": corrected,
             "baseline": {"candidate_id": baseline_record["candidate_id"],
                          "run_id": baseline_run["run_id"] if baseline_run else None,
                          "gate": baseline_gate, "mode": baseline_mode,
-                         "unseen_sessions": len(baseline_eval) if baseline_mode == "shadow" else None},
+                         "unseen_sessions": (
+                             consumed_sessions(baseline_eval, baseline_window_rows)
+                             if baseline_mode == "shadow" else None)},
             "champion": champion}
 
 

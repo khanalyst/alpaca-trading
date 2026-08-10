@@ -24,6 +24,9 @@ from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
+# One randomized-entry null control serves both research lanes; it lives in
+# the shared discovery helpers and is re-exported here for its callers.
+from .edge_discovery_core import corpus_slice, null_control_account
 from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
     FactoryLedger,
@@ -31,7 +34,9 @@ from .factory_ledger import (
 from .gates import (chronological_split, heldout_separation,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
                     performance_floor, placebo_null_distribution,
-                    falsification_gate, sample_counts, seal_final_window,
+                    falsification_gate,
+                    qualification_report as _qualification_report,
+                    sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
 from .llm_strategy import ProposalResult, RuleProposalAdapter
@@ -151,175 +156,6 @@ def _llm_lineage_evidence(factory: FactoryLedger,
     return None
 
 
-def _null_row(symbol: str, day: str, opportunity: str, vehicle: str,
-              reason: str | None = None) -> dict:
-    row = {"vehicle": vehicle, "symbol": symbol, "session_date": day,
-           "opportunity_id": opportunity, "net_pnl": 0.0, "return_value": 0.0,
-           "no_trade": True}
-    if reason:
-        row["reject_reason"] = reason
-    return row
-
-
-def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
-                         spec: Mapping[str, Any], *, vehicle: str,
-                         reference_rows: Sequence[Mapping], account_id: str,
-                         starting_cash: float = 100_000.0, risk_pct: float = .5,
-                         costs: CostModel | None = None,
-                         quotes: Sequence[Any] | None = None) -> dict:
-    """Replay a chance-entry null with the strategy's own exit and cost rules.
-
-    The null keeps the candidate's session/symbol/direction distribution and
-    its stop geometry, but chooses the entry bar at random.  A candidate that
-    cannot beat this is timing nothing: comparing only against the parent
-    specification measures relative improvement, not edge against chance.
-    """
-    model = costs or CostModel()
-    quote_index = index_quotes(quotes)
-    grouped: dict[tuple[str, str], list] = {}
-    for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
-        grouped.setdefault((bar.symbol, bar.session_date.isoformat()), []).append(bar)
-    references = {(str(row.get("symbol")), str(row.get("session_date"))): row
-                  for row in reference_rows}
-    rng = random.Random(stable_seed({"account": str(account_id),
-                                     "spec": dict(spec),
-                                     "sessions": sorted(references)}))
-    cash = float(starting_cash)
-    peak = cash
-    drawdown = 0.0
-    rows: list[dict] = []
-    for key in sorted(references):
-        symbol, day = key
-        opportunity = f"null:{account_id}:{symbol}:{day}"
-        reference = references[key]
-        session_bars = grouped.get(key, [])
-        if reference.get("no_trade") is True or len(session_bars) < 3:
-            rows.append(_null_row(symbol, day, opportunity, vehicle))
-            continue
-        try:
-            entry_underlying_ref = float(reference["underlying_entry"])
-            distance = abs(entry_underlying_ref - float(reference["stop_price"]))
-            direction = str(reference["direction"])
-        except (KeyError, TypeError, ValueError):
-            rows.append(_null_row(symbol, day, opportunity, vehicle,
-                                  "reference trade lacks null-control geometry"))
-            continue
-        if not math.isfinite(distance) or distance <= 0 or direction not in {"long", "short"}:
-            rows.append(_null_row(symbol, day, opportunity, vehicle,
-                                  "reference trade lacks null-control geometry"))
-            continue
-        entry_index = rng.randrange(1, len(session_bars) - 1)
-        entry_bar = session_bars[entry_index]
-        if not _visible(entry_bar, entry_bar.end):
-            rows.append(_null_row(symbol, day, opportunity, vehicle))
-            continue
-        entry_underlying = float(entry_bar.open)
-        stop = (entry_underlying - distance if direction == "long" else
-                entry_underlying + distance)
-        target = (entry_underlying + distance * float(spec["target_r"])
-                  if direction == "long" else
-                  entry_underlying - distance * float(spec["target_r"]))
-        deadline = hold_deadline(entry_bar.timestamp, spec)
-        last_index = entry_index
-        for probe in range(entry_index + 1, len(session_bars)):
-            if session_bars[probe].end.timestamp() > deadline:
-                break
-            last_index = probe
-        exit_bar = session_bars[last_index]
-        exit_ref = float(exit_bar.close)
-        exit_at = exit_bar.end
-        boundary_exit = True
-        for bar in session_bars[entry_index + 1:last_index + 1]:
-            if not _visible(bar, bar.end):
-                continue
-            if direction == "long":
-                gap_stop, gap_target = bar.open <= stop, bar.open >= target
-                hit_stop, hit_target = bar.low <= stop, bar.high >= target
-            else:
-                gap_stop, gap_target = bar.open >= stop, bar.open <= target
-                hit_stop, hit_target = bar.high >= stop, bar.low <= target
-            # The null shares the candidate's exit rules, gap-through included.
-            # Giving chance entries an exit realism the candidate does not have
-            # would bias every delta measured against them.
-            if gap_stop or gap_target:
-                exit_ref, exit_bar, exit_at = float(bar.open), bar, bar.timestamp
-                break
-            if hit_stop or hit_target:
-                exit_ref = stop if hit_stop else target
-                exit_bar, exit_at, boundary_exit = bar, bar.end, False
-                break
-        entry_ref = entry_underlying
-        entry_source = exit_source = BAR
-        multiplier = 1
-        risk_per_unit = distance
-        if vehicle == "equity":
-            side = "buy" if direction == "long" else "sell"
-            quoted = quote_fill(quote_index, symbol=symbol,
-                                at=entry_bar.timestamp, side=side)
-            if quoted is not None:
-                entry_ref, entry_source = quoted, QUOTE
-            quoted_exit = (quote_fill(quote_index, symbol=symbol, at=exit_at,
-                                      side="sell" if direction == "long" else "buy")
-                           if boundary_exit else None)
-            if quoted_exit is not None:
-                exit_ref, exit_source = quoted_exit, QUOTE
-        if vehicle == "option":
-            entry_snap = _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
-                                    direction=direction, cutoff=entry_bar.end)
-            exit_snap = (None if entry_snap is None else
-                         _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
-                                    direction=direction, cutoff=exit_bar.end,
-                                    contract_symbol=entry_snap.contract.symbol))
-            if entry_snap is None or exit_snap is None:
-                rows.append(_null_row(symbol, day, opportunity, vehicle))
-                continue
-            entry_ref = entry_snap.ask
-            exit_ref = exit_snap.bid
-            multiplier = entry_snap.contract.multiplier
-            risk_per_unit = entry_ref * multiplier
-        quantity = math.floor(max(0.0, cash * float(risk_pct) / 100.0) /
-                              max(float(risk_per_unit), 1e-9))
-        if vehicle == "equity":
-            # A chance entry derives its own stop from its own fill, so the
-            # plan anchor and the fill are the same price here.
-            quantity = min(quantity, math.floor(
-                max(0.0, cash * NOTIONAL_CAP_PCT / 100.0) /
-                max(float(entry_underlying), 1e-9)))
-        if quantity <= 0:
-            rows.append(_null_row(symbol, day, opportunity, vehicle,
-                                  "isolated account risk budget cannot fund one unit"))
-            continue
-        execution_direction = "long" if vehicle == "option" else direction
-        executable = vehicle == "option"
-        entry = model.execution_price(
-            entry_ref, execution_direction, entry=True,
-            executable_quote=executable or entry_source == QUOTE)
-        exit_price = model.execution_price(
-            exit_ref, execution_direction, entry=False,
-            executable_quote=executable or exit_source == QUOTE)
-        gross = ((exit_price - entry) if execution_direction == "long" else
-                 (entry - exit_price)) * quantity * multiplier
-        fees = model.fees(entry, exit_price, quantity, multiplier)
-        net = gross - fees
-        before = cash
-        cash += net
-        peak = max(peak, cash)
-        drawdown = max(drawdown, peak - cash)
-        rows.append({"vehicle": vehicle, "symbol": symbol, "session_date": day,
-                     "opportunity_id": opportunity, "direction": direction,
-                     "entry_timestamp": entry_bar.timestamp.isoformat(),
-                     "exit_timestamp": exit_bar.end.isoformat(),
-                     "quantity": quantity, "entry_price": entry,
-                     "exit_price": exit_price, "gross_pnl": gross, "costs": fees,
-                     "net_pnl": net,
-                     "return_value": net / before if before > 0 else 0.0,
-                     "no_trade": False})
-    executed = [row for row in rows if row.get("no_trade") is not True]
-    return {"account_id": account_id, "starting_cash": float(starting_cash),
-            "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
-            "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
-
-
 def _worker(payload: Mapping[str, Any]) -> dict:
     hypothesis = dict(payload["hypothesis"])
     bars = list(payload["bars"])
@@ -375,23 +211,6 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             "variants": sorted(variants, key=lambda item: item["variant_id"]),
             "control_rows": control_account["rows"], "null_rows": null_rows,
             "expected_variants": len(specs), "worker_pid": os.getpid()}
-
-
-def _qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
-                          vehicle: str, sessions: Sequence[str]) -> dict:
-    """Score the sealed final window: go/no-go only, never diagnosis."""
-    if not rows or not sessions:
-        return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
-                "matched": 0, "mean_delta": None, "trades": 0,
-                "net_positive": False, "delta_positive": False}
-    pairs = matched_pairs(rows, baseline, vehicle=vehicle)
-    absolute = performance_floor(rows, vehicle=vehicle)
-    delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
-    return {"available": True, "sessions": list(sessions),
-            "net_pnl": absolute["net_pnl"], "trades": absolute["trades"],
-            "matched": pairs["matched"], "mean_delta": delta,
-            "net_positive": bool(absolute["net_pnl_positive"]),
-            "delta_positive": bool(delta is not None and delta > 0)}
 
 
 def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
