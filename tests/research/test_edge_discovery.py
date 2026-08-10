@@ -20,8 +20,31 @@ from research.edge_ledger import (
     hash_provenance, init_db, init_ledger,
 )
 from research.gates import (
-    heldout_separation, structural_floor, verified_gate_envelope,
+    falsification_gate, heldout_separation, matched_cluster_test,
+    performance_floor, placebo_null_distribution, structural_floor,
+    verified_gate_envelope, walk_forward_report,
 )
+
+
+def _gate_evidence(heldout, *, alpha=.05):
+    """Build the statistical evidence a persisted proof must now reproduce.
+
+    The zero baseline makes the matched deltas equal to the held-out P&L, so
+    every recorded statistic is recomputable from the envelope itself.
+    """
+    baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
+                for index, row in enumerate(heldout)]
+    control = matched_cluster_test(heldout, baseline, vehicle="equity")
+    placebo = placebo_null_distribution(heldout, baseline, vehicle="equity")
+    falsification = {
+        **falsification_gate(placebo["observed"], placebo["placebo"], alpha=alpha),
+        "method": placebo["method"], "assignments_hash": placebo["assignments_hash"],
+        "observations": len(placebo["observed"]),
+        "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
+    }
+    absolute = performance_floor(heldout, vehicle="equity")
+    walk = walk_forward_report(heldout, baseline, vehicle="equity")
+    return control, falsification, absolute, walk
 
 
 def _sessions(start: datetime, count: int) -> list[dict]:
@@ -52,11 +75,15 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         {"vehicle": "equity", "session_date": "2024-01-02",
          "opportunity_id": f"{prefix}-fit", "net_pnl": 1.0},
     ]
+    # Eight held-out sessions: a sign-flip null over two clusters cannot
+    # reach any useful significance level, so the old two-session fixture
+    # could never have supported a passing falsification.
     heldout = [
-        {"vehicle": "equity", "session_date": f"2024-01-0{day}",
+        {"vehicle": "equity", "symbol": "SPY",
+         "session_date": f"2024-01-{day:02d}",
          "opportunity_id": f"{prefix}-held-{day}",
          "net_pnl": score if passes else -1.0}
-        for day in (3, 4)
+        for day in range(3, 11)
     ]
     fit_floor = structural_floor(
         fit, vehicle="equity", min_trades=1, min_sessions=1,
@@ -66,18 +93,28 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": True, "mode": "new_data"})
-    checks = {"edge_positive": passes, "family_fdr_significant": True}
+    control, falsification, absolute, walk = _gate_evidence(heldout)
+    checks = {"edge_positive": passes, "family_fdr_significant": True,
+              "falsification": bool(passes and falsification["passes"]),
+              "heldout_net_pnl_positive": bool(passes and absolute["net_pnl_positive"]),
+              "heldout_expectancy_positive": bool(passes and absolute["expectancy_positive"]),
+              "heldout_delta_lcb_positive": bool(
+                  passes and control["mean_delta_lcb"] is not None and
+                  control["mean_delta_lcb"] > 0),
+              "walk_forward_majority_positive": bool(passes and walk["majority_positive"])}
     envelope = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_floor=fit_floor, heldout_floor=held_floor,
-        control={"kind": "matched_actual_baseline", "actual_control": True,
-                 "available": True, "matched": len(heldout),
-                 "mean_delta": score if passes else -1.0},
-        p_value=.01, q_value=.02, alpha=.05,
-        falsification={"passes": passes, "method": "test_placebo"},
+        control={**control, "kind": "matched_actual_baseline"},
+        p_value=control["p_value"], q_value=.02, alpha=.05,
+        falsification=falsification,
         separation=separation, checks=checks, passes=passes,
-        performance={"heldout_delta": score if passes else -1.0,
-                     "max_drawdown": 0.0 if passes else 2.0})
+        walk_forward=walk,
+        performance={"heldout_delta": control["mean_delta"],
+                     "heldout_delta_lcb": control["mean_delta_lcb"],
+                     "heldout_net_pnl": absolute["net_pnl"],
+                     "heldout_expectancy": absolute["expectancy"],
+                     "max_drawdown": 0.0 if passes else 8.0})
     run = ledger.append_run(
         candidate_id, lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         metrics={"gate": {"passes": not passes}, "confidence": 0.0})
@@ -423,11 +460,17 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             run, envelope = _persist_gate(
                 ledger, candidate["candidate_id"], "backtest", passes=False,
                 record=False)
+            # A genuinely unmatched control carries no deltas at all, so the
+            # recomputed statistics must be empty rather than merely relabelled.
             envelope["control"].update({
                 "matched": 0, "available": False, "mean_delta": None,
+                "mean_delta_lcb": None, "deltas": [], "delta_clusters": [],
             })
             envelope["checks"]["heldout_delta_positive"] = False
+            envelope["checks"]["heldout_delta_lcb_positive"] = False
+            envelope["statistics"]["p_value"] = 1.0
             envelope["performance"]["heldout_delta"] = None
+            envelope["performance"]["heldout_delta_lcb"] = None
             envelope["content_hash"] = content_hash({
                 key: item for key, item in envelope.items()
                 if key != "content_hash"})

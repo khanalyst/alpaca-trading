@@ -13,7 +13,11 @@ from agent.contracts.rule import (
 )
 from agent.edge import apply_variant, resolve_validated_variant
 from research.edge_lab import EdgeLedger
-from research.gates import heldout_separation, structural_floor, verified_gate_envelope
+from research.gates import (
+    falsification_gate, heldout_separation, matched_cluster_test,
+    performance_floor, placebo_null_distribution, structural_floor,
+    verified_gate_envelope,
+)
 from research.llm_strategy import PROPOSAL_SCHEMA, ProposalResult
 import research.factory_core as core_module
 import research.strategy_factory as factory_module
@@ -56,7 +60,10 @@ def fake_adequate_worker(payload):
     specs = mutate_from_diagnosis(
         hypothesis["rule_spec"], {"primary_failure": "negative_expectancy"},
         int(payload["variants_per_strategy"]))
-    sessions = [f"2026-01-{day:02d}" for day in range(5, 11)]
+    # Twenty sessions: the held-out partition must be large enough to support
+    # rolling-origin folds, otherwise the variant is under-powered rather than
+    # adequately failed and the family is never eligible for replacement.
+    sessions = [f"2026-01-{day:02d}" for day in range(5, 25)]
     control_rows = [
         {"vehicle": payload["vehicle"], "symbol": "SPY", "session_date": session,
          "opportunity_id": f"control:{session}", "net_pnl": 0.0,
@@ -92,10 +99,14 @@ def persist_rule_gate(ledger, candidate_id, lane):
     fit = [] if lane == "shadow" else [
         {"vehicle": "equity", "session_date": "2026-01-05",
          "opportunity_id": f"{lane}-fit", "net_pnl": 1.0}]
+    # Eight held-out sessions are the minimum that can carry a sign-flip
+    # falsification below alpha; two never could.
     heldout = [
-        {"vehicle": "equity", "session_date": f"2026-01-0{day}",
+        {"vehicle": "equity", "symbol": "SPY", "session_date": f"2026-01-{day:02d}",
          "opportunity_id": f"{lane}-held-{day}", "net_pnl": 1.0}
-        for day in (6, 7)]
+        for day in range(6, 14)]
+    baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
+                for index, row in enumerate(heldout)]
     fit_floor = structural_floor(
         fit, vehicle="equity", min_trades=1, min_sessions=1,
         required=lane != "shadow")
@@ -103,15 +114,29 @@ def persist_rule_gate(ledger, candidate_id, lane):
         heldout, vehicle="equity", min_trades=1, min_sessions=1)
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"passes": True, "mode": "new_data"})
+    control = matched_cluster_test(heldout, baseline, vehicle="equity")
+    placebo = placebo_null_distribution(heldout, baseline, vehicle="equity")
+    falsification = {
+        **falsification_gate(placebo["observed"], placebo["placebo"]),
+        "draws": int(placebo["draws"]), "seed": int(placebo["seed"])}
+    absolute = performance_floor(heldout, vehicle="equity")
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_floor=fit_floor, heldout_floor=held_floor,
-        control={"actual_control": True, "available": True, "matched": 2,
-                 "mean_delta": 1.0},
-        p_value=.01, q_value=.01, alpha=.05,
-        falsification={"passes": True}, separation=separation,
-        checks={"family_fdr_significant": True}, passes=True,
-        performance={"heldout_delta": 1.0, "max_drawdown": 0.0})
+        control={**control, "kind": "matched_root_baseline"},
+        p_value=control["p_value"], q_value=.01, alpha=.05,
+        falsification=falsification, separation=separation,
+        checks={"family_fdr_significant": True, "global_fdr_significant": True,
+                "falsification": bool(falsification["passes"]),
+                "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
+                "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
+                "heldout_delta_lcb_positive": bool(control["mean_delta_lcb"] > 0)},
+        passes=True,
+        performance={"heldout_delta": control["mean_delta"],
+                     "heldout_delta_lcb": control["mean_delta_lcb"],
+                     "heldout_net_pnl": absolute["net_pnl"],
+                     "heldout_expectancy": absolute["expectancy"],
+                     "max_drawdown": 0.0})
     run = ledger.append_run(candidate_id, lane=lane, fit=fit, heldout=heldout,
                             config=candidate_config,
                             metrics={"gate": {"passes": True}, "confidence": .99,
@@ -210,7 +235,7 @@ class StrategyFactoryTests(unittest.TestCase):
                 sorted((row["hypothesis_id"], row["variant_id"])
                        for row in result["results"]))
             self.assertEqual(len(result["replacements"]), 2)
-            self.assertTrue(all(item["not_before"] == "2026-01-10"
+            self.assertTrue(all(item["not_before"] == "2026-01-24"
                                 for item in result["replacements"]))
 
         with tempfile.TemporaryDirectory() as directory, \

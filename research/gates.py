@@ -2,11 +2,16 @@
 
 The checks operate on already normalized, vehicle-local rows.  They do not
 know how a signal was generated and never combine equity and option returns.
+
+Every statistic persisted by :func:`verified_gate_envelope` is recomputable
+from the evidence the envelope itself carries: matched deltas, their cluster
+labels, the draw counts, and the seeds.  Re-verification therefore repeats the
+analysis instead of re-hashing a recorded conclusion.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -14,8 +19,19 @@ from statistics import mean
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
+from .stats import (
+    DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS, cluster_bootstrap_lower_bound,
+    paired_cluster_sign_flip, sign_flip_null_statistics, stable_seed,
+)
 
-GATE_ENVELOPE_SCHEMA = "verified-research-gate.v1"
+
+GATE_ENVELOPE_SCHEMA = "verified-research-gate.v2"
+CLUSTER_SECONDS = 86_400
+LOWER_BOUND_CONFIDENCE = .95
+
+
+class SealedWindowError(RuntimeError):
+    """Raised when sealed final-qualification data is used more than once."""
 
 
 @dataclass(frozen=True)
@@ -94,7 +110,12 @@ def _session_key(row: Mapping) -> str:
 def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
                      min_trades: int, min_sessions: int,
                      min_clusters: int = 0, required: bool = True) -> dict:
-    """Report structural adequacy without treating profitability as sample size."""
+    """Report structural adequacy without treating profitability as sample size.
+
+    Profitability is deliberately absent here.  ``AcceptanceFloor.min_net_pnl``
+    is exercised by :func:`performance_floor`, which is a separate, mandatory
+    gate check rather than a sample-size statement.
+    """
     report = AcceptanceFloor(
         min_trades=min_trades, min_sessions=min_sessions,
         min_clusters=min_clusters,
@@ -105,6 +126,30 @@ def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
     report["required"] = bool(required)
     report["adequate"] = bool(report["structural_passes"] if required else True)
     return report
+
+
+def performance_floor(rows: Iterable[Mapping], *, vehicle: str,
+                      min_net_pnl: float = 0.0,
+                      min_expectancy: float = 0.0) -> dict:
+    """Require absolute, after-cost profitability rather than only a delta.
+
+    A variant that loses money on unseen data has no edge to validate, however
+    favourably it compares with the parent specification it was mutated from.
+    """
+    report = AcceptanceFloor(min_trades=0, min_sessions=0,
+                             min_net_pnl=float(min_net_pnl)).check(rows, vehicle=vehicle)
+    trades = int(report["trades"])
+    net = float(report["net_pnl"])
+    expectancy = net / trades if trades else None
+    return {
+        "vehicle": vehicle, "net_pnl": net, "trades": trades,
+        "expectancy": expectancy,
+        "min_net_pnl": float(min_net_pnl),
+        "min_expectancy": float(min_expectancy),
+        "net_pnl_positive": bool(trades > 0 and net > float(min_net_pnl)),
+        "expectancy_positive": bool(expectancy is not None and
+                                    expectancy > float(min_expectancy)),
+    }
 
 
 def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *, vehicle: str) -> dict:
@@ -136,85 +181,106 @@ def paired_delta(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *, v
             "deltas": deltas}
 
 
-def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
-                         vehicle: str, seed: int = 20260728) -> dict:
-    """Test matched opportunity deltas with deterministic session clustering."""
-    from .stats import paired_cluster_sign_flip
+def _unique_by_match_key(rows: Iterable[Mapping], vehicle: str) -> dict[str, Mapping]:
+    """Index vehicle-local rows by comparison key, dropping ambiguous keys."""
+    values: dict[str, Mapping] = {}
+    duplicates: set[str] = set()
+    for row in rows:
+        if row.get("vehicle", vehicle) != vehicle:
+            continue
+        key = _match_key(row, vehicle)
+        if not key or key in values:
+            duplicates.add(key)
+        else:
+            values[key] = row
+    for key in duplicates:
+        values.pop(key, None)
+    return values
 
-    def unique(rows: Iterable[Mapping]) -> dict[str, Mapping]:
-        values: dict[str, Mapping] = {}
-        duplicates: set[str] = set()
-        for row in rows:
-            if row.get("vehicle", vehicle) != vehicle:
-                continue
-            key = _match_key(row, vehicle)
-            if not key or key in values:
-                duplicates.add(key)
-            else:
-                values[key] = row
-        for key in duplicates:
-            values.pop(key, None)
-        return values
 
-    left = unique(candidate)
-    right = unique(baseline)
-    pairs: list[tuple[float, float, float]] = []
-    matched_ids: list[str] = []
+def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
+                  vehicle: str) -> dict:
+    """Return the matched candidate-minus-baseline deltas and their clusters."""
+    left = _unique_by_match_key(candidate, vehicle)
+    right = _unique_by_match_key(baseline, vehicle)
+    keys: list[str] = []
+    deltas: list[float] = []
+    clusters: list[int] = []
+    stamps: list[float] = []
     for index, key in enumerate(sorted(left)):
         other = right.get(key)
         if other is None:
             continue
-        stamp = left[key].get("entry_timestamp") or left[key].get("session_date")
+        row = left[key]
+        stamp = row.get("entry_timestamp") or row.get("session_date")
         try:
-            timestamp = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+            timestamp = datetime.fromisoformat(
+                str(stamp).replace("Z", "+00:00")).timestamp()
         except (TypeError, ValueError):
-            timestamp = float(index * 86_400)
-        pairs.append((timestamp, float(left[key].get("net_pnl", 0.0)),
-                      float(other.get("net_pnl", 0.0))))
-        matched_ids.append(key)
-    result = paired_cluster_sign_flip(pairs, cluster_seconds=86_400, seed=seed)
-    result["matched"] = len(pairs)
-    result["matched_ids_hash"] = _content_hash(matched_ids)
-    result["mean_delta"] = (sum(left - right for _, left, right in pairs) / len(pairs)
-                            if pairs else None)
+            timestamp = float(index * CLUSTER_SECONDS)
+        keys.append(key)
+        stamps.append(timestamp)
+        clusters.append(int(timestamp // CLUSTER_SECONDS))
+        deltas.append(float(row.get("net_pnl", 0.0)) -
+                      float(other.get("net_pnl", 0.0)))
+    return {"vehicle": vehicle, "keys": keys, "deltas": deltas,
+            "clusters": clusters, "timestamps": stamps,
+            "matched": len(deltas)}
+
+
+def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
+                         vehicle: str, seed: int = 20260728,
+                         confidence: float = LOWER_BOUND_CONFIDENCE) -> dict:
+    """Test matched opportunity deltas with deterministic session clustering."""
+    pairs = matched_pairs(candidate, baseline, vehicle=vehicle)
+    triples = [(stamp, delta, 0.0) for stamp, delta
+               in zip(pairs["timestamps"], pairs["deltas"])]
+    result = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS,
+                                       seed=seed)
+    bound = cluster_bootstrap_lower_bound(
+        pairs["deltas"], pairs["clusters"], confidence=confidence)
+    result["matched"] = pairs["matched"]
+    result["matched_ids_hash"] = _content_hash(pairs["keys"])
+    result["deltas"] = list(pairs["deltas"])
+    result["delta_clusters"] = list(pairs["clusters"])
+    result["mean_delta"] = (sum(pairs["deltas"]) / pairs["matched"]
+                            if pairs["matched"] else None)
+    result["mean_delta_lcb"] = bound["lower_bound"]
+    result["lower_bound"] = {key: bound[key] for key in
+                             ("method", "available", "confidence", "draws", "seed")}
     result["actual_control"] = True
-    result["available"] = bool(pairs)
+    result["available"] = bool(pairs["matched"])
     return result
 
 
-def deterministic_placebo_deltas(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
-                                  vehicle: str) -> dict:
-    """Apply a deterministic mixed-sign session-label falsification to matched deltas."""
-    def unique(rows: Iterable[Mapping]) -> dict[str, Mapping]:
-        values: dict[str, Mapping] = {}
-        duplicates: set[str] = set()
-        for row in rows:
-            if row.get("vehicle", vehicle) != vehicle:
-                continue
-            key = _match_key(row, vehicle)
-            if not key or key in values:
-                duplicates.add(key)
-            else:
-                values[key] = row
-        for key in duplicates:
-            values.pop(key, None)
-        return values
+def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
+                              vehicle: str, draws: int = DEFAULT_NULL_DRAWS) -> dict:
+    """Draw a seeded cluster sign-flip null distribution for matched deltas.
 
-    left = unique(candidate)
-    right = unique(baseline)
-    keys = sorted(key for key in left if key and key in right)
-    observed = [float(left[key].get("net_pnl", 0.0)) -
-                float(right[key].get("net_pnl", 0.0)) for key in keys]
-    if len(observed) < 2:
-        return {"method": "deterministic_mixed_sign_session_labels",
-                "available": False, "observed": observed, "placebo": [],
-                "assignments_hash": _content_hash(keys)}
-    phase = int(hashlib.sha256("|".join(keys).encode("utf-8")).hexdigest(), 16) % 2
-    placebo = [value if (index + phase) % 2 == 0 else -value
-               for index, value in enumerate(observed)]
-    return {"method": "deterministic_mixed_sign_session_labels",
-            "available": True, "observed": observed, "placebo": placebo,
-            "assignments_hash": _content_hash({"keys": keys, "phase": phase})}
+    ``placebo`` is the null *distribution* of the mean delta, not a single
+    reflection of the observations.  The seed is derived from the matched
+    content itself, so the same evidence always reproduces the same draws.
+    """
+    pairs = matched_pairs(candidate, baseline, vehicle=vehicle)
+    null = sign_flip_null_statistics(pairs["deltas"], pairs["clusters"],
+                                     draws=draws)
+    return {"method": "seeded_cluster_sign_flip_null",
+            "available": bool(null["available"]) and len(pairs["deltas"]) >= 2,
+            "observed": list(pairs["deltas"]),
+            "clusters": list(pairs["clusters"]),
+            "placebo": list(null["statistics"]),
+            "draws": int(null["draws"]), "seed": int(null["seed"]),
+            "cluster_count": int(null["clusters"]),
+            "p_value": float(null["p_value"]),
+            "assignments_hash": _content_hash({"keys": pairs["keys"],
+                                               "clusters": pairs["clusters"],
+                                               "draws": int(null["draws"]),
+                                               "seed": int(null["seed"])})}
+
+
+# Historical name retained for the discovery facades; the semantics are the
+# seeded null distribution above, not a single deterministic sign pattern.
+deterministic_placebo_deltas = placebo_null_distribution
 
 
 def _match_key(row: Mapping, vehicle: str) -> str:
@@ -229,7 +295,7 @@ def _match_key(row: Mapping, vehicle: str) -> str:
 
 
 def placebo_ratio(observed: Sequence[float], placebo: Sequence[float]) -> float | None:
-    """Return the observed/placebo mean ratio, or ``None`` for no placebo."""
+    """Return the observed mean over the mean absolute null draw."""
     if not placebo:
         return None
     baseline = mean(abs(float(value)) for value in placebo)
@@ -268,20 +334,30 @@ def heldout_separation(fit: Sequence[Mapping], heldout: Sequence[Mapping]) -> di
 
 
 def falsification_gate(observed: Sequence[float], placebo: Sequence[float], *,
-                       minimum_ratio: float = 1.0) -> dict:
-    ratio = placebo_ratio(observed, placebo)
-    observed_mean = mean([float(x) for x in observed]) if observed else 0.0
-    placebo_mean = mean([float(x) for x in placebo]) if placebo else 0.0
-    zero_placebo = bool(placebo and all(abs(float(x)) <= 1e-15 for x in placebo))
-    distinct = bool(placebo and (len(observed) != len(placebo) or
-                    any(abs(float(left) - float(right)) > 1e-15
-                        for left, right in zip(observed, placebo))))
+                       alpha: float = .05, minimum_ratio: float = 1.0) -> dict:
+    """Place the observed mean delta inside a genuine null distribution.
+
+    ``placebo`` is a sample of null mean deltas.  The decision is an empirical
+    one-sided p-value against that distribution; the ratio is reported for
+    scale but cannot on its own authorize a pass.
+    """
+    draws = [float(value) for value in placebo]
+    observed_values = [float(value) for value in observed]
+    observed_mean = mean(observed_values) if observed_values else 0.0
+    placebo_mean = mean(draws) if draws else 0.0
+    ratio = placebo_ratio(observed_values, draws)
+    zero_placebo = bool(draws and all(abs(value) <= 1e-15 for value in draws))
+    degenerate = bool(draws and max(draws) - min(draws) <= 1e-15)
+    tolerance = 1e-15 * max(1.0, abs(observed_mean))
+    extreme = sum(1 for value in draws if value >= observed_mean - tolerance)
+    p_value = (extreme + 1) / (len(draws) + 1) if draws else 1.0
     return {"observed_mean": observed_mean, "placebo_mean": placebo_mean,
-            "ratio": ratio, "available": bool(placebo),
+            "ratio": ratio, "available": bool(draws),
+            "draws": len(draws), "p_value": p_value, "alpha": float(alpha),
             "zero_placebo": zero_placebo,
-            "distinct": distinct,
-            "passes": bool(placebo) and not zero_placebo and distinct and
-            observed_mean > 0 and observed_mean > placebo_mean and
+            "distinct": not degenerate,
+            "passes": bool(draws) and not zero_placebo and not degenerate and
+            observed_mean > 0 and p_value <= float(alpha) and
             ratio is not None and ratio >= minimum_ratio}
 
 
@@ -296,6 +372,108 @@ def sample_counts(rows: Iterable[Mapping], *, vehicle: str) -> dict:
     }
 
 
+def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
+                        vehicle: str, folds: int = 3) -> dict:
+    """Roll the origin forward and require a majority of positive test folds.
+
+    Each fold trains on every session before its test block, so no fold ever
+    scores a period that precedes its own fit window.  A single chronological
+    cut can be survived by one lucky regime; a majority requirement cannot.
+    """
+    if int(folds) < 2:
+        raise ValueError("walk-forward requires at least two folds")
+    ordered = sorted(candidate, key=lambda row: (_session_key(row),
+                                                 str(row.get("entry_timestamp", ""))))
+    sessions = sorted({_session_key(row) for row in ordered if _session_key(row)})
+    count = int(folds)
+    # One fit block plus ``folds`` test blocks must each hold a whole session.
+    if len(sessions) < count + 1:
+        return {"available": False, "folds": count, "tested_folds": 0,
+                "positive_folds": 0, "majority_positive": False,
+                "sessions": len(sessions), "results": []}
+    start = len(sessions) - count
+    results = []
+    for index in range(count):
+        test_sessions = {sessions[start + index]}
+        fit_sessions = set(sessions[:start + index])
+        test_rows = [row for row in ordered if _session_key(row) in test_sessions]
+        base_rows = [row for row in baseline if _session_key(row) in test_sessions]
+        pairs = matched_pairs(test_rows, base_rows, vehicle=vehicle)
+        delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
+        net = sum(float(row.get("net_pnl", 0.0)) for row in test_rows)
+        results.append({"fold": index, "fit_sessions": len(fit_sessions),
+                        "test_sessions": sorted(test_sessions),
+                        "matched": pairs["matched"], "mean_delta": delta,
+                        "net_pnl": net,
+                        "positive": bool(delta is not None and delta > 0 and net > 0)})
+    positive = sum(1 for item in results if item["positive"])
+    return {"available": True, "folds": count, "tested_folds": len(results),
+            "positive_folds": positive,
+            "majority_positive": bool(positive * 2 > len(results)),
+            "sessions": len(sessions), "results": results}
+
+
+@dataclass
+class SealedQualificationWindow:
+    """Final-qualification data that may be released exactly once.
+
+    Selection, mutation and diagnosis are given the development payload only.
+    This object owns the remaining sessions and refuses to be copied,
+    serialized, or shipped to a worker process, so the qualification window
+    cannot be consumed by accident even if a caller forgets the convention.
+    """
+
+    session_dates: tuple[str, ...]
+    digest: str
+    reason: str = ""
+    released: bool = False
+    _payload: Any = field(default=None, repr=False)
+
+    def release(self, *, reason: str) -> Any:
+        if self.released:
+            raise SealedWindowError(
+                "the final qualification window has already been consumed")
+        if not str(reason).strip():
+            raise SealedWindowError("releasing a sealed window requires a reason")
+        self.released = True
+        self.reason = str(reason)
+        payload, self._payload = self._payload, None
+        return payload
+
+    def __getstate__(self):
+        raise SealedWindowError(
+            "a sealed qualification window cannot be serialized or sent to a worker")
+
+    def __deepcopy__(self, memo):
+        raise SealedWindowError("a sealed qualification window cannot be copied")
+
+    def __repr__(self) -> str:
+        return (f"SealedQualificationWindow(sessions={len(self.session_dates)}, "
+                f"digest={self.digest[:12]!r}, released={self.released})")
+
+
+def seal_final_window(items: Sequence[Any], *, session_of, fraction: float = .2,
+                      min_sessions: int = 1) -> tuple[list, SealedQualificationWindow]:
+    """Split off the latest sessions into a sealed final-qualification window."""
+    if not 0 < float(fraction) < 1:
+        raise ValueError("fraction must be between zero and one")
+    ordered = list(items)
+    sessions = sorted({str(session_of(item)) for item in ordered})
+    reserved = max(int(min_sessions), int(len(sessions) * float(fraction)))
+    if len(sessions) <= reserved:
+        # Not enough history to seal anything without emptying development.
+        return ordered, SealedQualificationWindow((), _content_hash([]))
+    sealed_sessions = set(sessions[len(sessions) - reserved:])
+    development = [item for item in ordered
+                   if str(session_of(item)) not in sealed_sessions]
+    qualification = [item for item in ordered
+                     if str(session_of(item)) in sealed_sessions]
+    return development, SealedQualificationWindow(
+        tuple(sorted(sealed_sessions)),
+        _content_hash(sorted(sealed_sessions)),
+        _payload=qualification)
+
+
 def verified_gate_envelope(*, lane: str, vehicle: str,
                            fit: Sequence[Mapping], heldout: Sequence[Mapping],
                            fit_floor: Mapping, heldout_floor: Mapping,
@@ -303,8 +481,21 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            alpha: float,
                            falsification: Mapping, separation: Mapping,
                            checks: Mapping[str, bool], passes: bool,
-                           performance: Mapping | None = None) -> dict:
-    """Build the immutable, content-addressed gate decision persisted per run."""
+                           performance: Mapping | None = None,
+                           family_q_value: float | None = None,
+                           walk_forward: Mapping | None = None,
+                           qualification: Mapping | None = None,
+                           null_control: Mapping | None = None) -> dict:
+    """Build the immutable, content-addressed gate decision persisted per run.
+
+    ``q_value`` is the cycle-global false-discovery q; ``family_q_value`` is
+    the family-local one.  Both are persisted so a proof states exactly which
+    correction authorized it.
+    """
+    reported = dict(performance or {})
+    reported.setdefault("heldout_delta", control.get("mean_delta"))
+    reported.setdefault("heldout_delta_lcb", control.get("mean_delta_lcb"))
+    reported.setdefault("max_drawdown", 0.0)
     body: dict[str, Any] = {
         "schema": GATE_ENVELOPE_SCHEMA,
         "lane": str(lane),
@@ -317,10 +508,15 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "floors": {"fit": dict(fit_floor), "heldout": dict(heldout_floor)},
         "control": dict(control),
         "statistics": {"p_value": float(p_value), "q_value": float(q_value),
+                       "family_q_value": float(q_value if family_q_value is None
+                                                else family_q_value),
                        "alpha": float(alpha)},
-        "performance": dict(performance or {}),
+        "performance": reported,
         "falsification": dict(falsification),
         "separation": dict(separation),
+        "walk_forward": dict(walk_forward or {}),
+        "qualification": dict(qualification or {}),
+        "null_control": dict(null_control or {}),
         "checks": {str(key): bool(value) for key, value in checks.items()},
         "passes": bool(passes),
     }
@@ -339,9 +535,87 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             isinstance(envelope.get("floors"), Mapping) and
             isinstance(envelope.get("control"), Mapping) and
             isinstance(envelope.get("statistics"), Mapping) and
+            isinstance(envelope.get("walk_forward"), Mapping) and
+            isinstance(envelope.get("qualification"), Mapping) and
+            isinstance(envelope.get("null_control"), Mapping) and
             envelope.get("content_hash") == _content_hash(body))
     except (TypeError, ValueError, OverflowError):
         return False
+
+
+def recompute_gate_statistics(envelope: Mapping) -> dict:
+    """Recompute the envelope's statistics from its own source observations.
+
+    The persisted matched deltas, cluster labels, draw counts and seeds are
+    sufficient to reproduce the control p-value, the lower confidence bound
+    and the falsification decision.  Re-verification compares these against
+    the recorded conclusions rather than trusting them.
+    """
+    control = envelope.get("control")
+    if not isinstance(control, Mapping):
+        return {"available": False, "reason": "control evidence is missing"}
+    deltas = control.get("deltas")
+    clusters = control.get("delta_clusters")
+    if not isinstance(deltas, Sequence) or not isinstance(clusters, Sequence) or \
+            isinstance(deltas, (str, bytes)) or isinstance(clusters, (str, bytes)):
+        return {"available": False, "reason": "matched delta evidence is missing"}
+    if len(deltas) != len(clusters):
+        return {"available": False, "reason": "matched delta evidence is inconsistent"}
+    values: list[float] = []
+    for item in deltas:
+        if isinstance(item, bool):
+            return {"available": False, "reason": "matched delta evidence is invalid"}
+        try:
+            value = float(item)
+        except (TypeError, ValueError):
+            return {"available": False, "reason": "matched delta evidence is invalid"}
+        if not math.isfinite(value):
+            return {"available": False, "reason": "matched delta evidence is invalid"}
+        values.append(value)
+    triples = [(float(cluster) * CLUSTER_SECONDS, value, 0.0)
+               for cluster, value in zip(clusters, values)]
+    sign_flip = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS)
+    falsification = envelope.get("falsification")
+    draws = None
+    seed = None
+    if isinstance(falsification, Mapping):
+        draws = falsification.get("draws")
+        seed = falsification.get("seed")
+    null = sign_flip_null_statistics(
+        values, [str(cluster) for cluster in clusters],
+        draws=int(draws) if isinstance(draws, int) and draws > 0 else DEFAULT_NULL_DRAWS,
+        seed=int(seed) if isinstance(seed, int) and not isinstance(seed, bool) else None)
+    lower = control.get("lower_bound")
+    confidence = LOWER_BOUND_CONFIDENCE
+    bootstrap_draws = DEFAULT_BOOTSTRAP_DRAWS
+    bootstrap_seed = None
+    if isinstance(lower, Mapping):
+        if isinstance(lower.get("confidence"), (int, float)) and \
+                not isinstance(lower.get("confidence"), bool):
+            confidence = float(lower["confidence"])
+        if isinstance(lower.get("draws"), int) and not isinstance(lower.get("draws"), bool) \
+                and lower["draws"] > 0:
+            bootstrap_draws = int(lower["draws"])
+        if isinstance(lower.get("seed"), int) and not isinstance(lower.get("seed"), bool):
+            bootstrap_seed = int(lower["seed"])
+    bound = cluster_bootstrap_lower_bound(
+        values, [str(cluster) for cluster in clusters], confidence=confidence,
+        draws=bootstrap_draws, seed=bootstrap_seed)
+    decision = falsification_gate(
+        values, null["statistics"],
+        alpha=float(falsification.get("alpha", .05))
+        if isinstance(falsification, Mapping) and
+        isinstance(falsification.get("alpha"), (int, float)) and
+        not isinstance(falsification.get("alpha"), bool) else .05)
+    return {
+        "available": True,
+        "matched": len(values),
+        "mean_delta": (sum(values) / len(values)) if values else None,
+        "p_value": float(sign_flip["p_value"]),
+        "mean_delta_lcb": bound["lower_bound"],
+        "falsification_p_value": float(decision["p_value"]),
+        "falsification_passes": bool(decision["passes"]),
+    }
 
 
 def _content_hash(value: Any) -> str:
@@ -350,8 +624,13 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-__all__ = ["AcceptanceFloor", "GATE_ENVELOPE_SCHEMA", "chronological_split",
+__all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
+           "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
+           "SealedWindowError", "chronological_split",
            "deterministic_placebo_deltas", "falsification_gate",
-           "heldout_separation", "matched_cluster_test", "max_drawdown_of",
-           "paired_delta", "placebo_ratio", "sample_counts", "structural_floor",
-           "verified_gate_envelope", "verify_gate_envelope"]
+           "heldout_separation", "matched_cluster_test", "matched_pairs",
+           "max_drawdown_of", "paired_delta", "performance_floor",
+           "placebo_null_distribution", "placebo_ratio",
+           "recompute_gate_statistics", "sample_counts", "seal_final_window",
+           "structural_floor", "verified_gate_envelope", "verify_gate_envelope",
+           "walk_forward_report"]

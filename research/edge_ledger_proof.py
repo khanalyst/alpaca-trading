@@ -50,6 +50,18 @@ def _nonnegative_integer(*args, **kwargs):
     return _facade_helper("_nonnegative_integer")(*args, **kwargs)
 
 
+def recompute_gate_statistics(envelope):
+    from .gates import recompute_gate_statistics as _recompute
+    return _recompute(envelope)
+
+
+def _close(left, right, *, tolerance: float = 1e-9) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return abs(float(left) - float(right)) <= tolerance * max(
+        1.0, abs(float(left)), abs(float(right)))
+
+
 class EdgeLedgerProofMixin:
     """Mixin containing durable gate-proof and eligibility operations."""
 
@@ -270,6 +282,53 @@ class EdgeLedgerProofMixin:
         if (max_drawdown is None or
                 max_drawdown < 0):
             return "verified gate performance evidence is invalid"
+        # Re-verification repeats the analysis from the persisted source rows
+        # and matched deltas.  A recorded decision the evidence no longer
+        # reproduces is not a proof, however well formed its hashes are.
+        from .gates import performance_floor
+        absolute = performance_floor(heldout_rows, vehicle=run["vehicle"])
+        if "heldout_net_pnl" in performance and not _close(
+                _finite_number(performance.get("heldout_net_pnl")), absolute["net_pnl"]):
+            return "verified gate held-out net P&L does not match persisted trades"
+        if "heldout_expectancy" in performance and not _close(
+                _finite_number(performance.get("heldout_expectancy")), absolute["expectancy"]):
+            return "verified gate held-out expectancy does not match persisted trades"
+        for key, expected in (("heldout_net_pnl_positive", absolute["net_pnl_positive"]),
+                              ("heldout_expectancy_positive", absolute["expectancy_positive"])):
+            if key in checks and bool(checks[key]) != bool(expected):
+                return "verified gate absolute performance decision is inconsistent"
+        recomputed = recompute_gate_statistics(envelope)
+        if envelope.get("passes") and not recomputed.get("available"):
+            return "passing verified gate cannot be recomputed from its own observations"
+        if recomputed.get("available"):
+            if not _close(recomputed["mean_delta"], delta):
+                return "verified gate control delta does not survive recomputation"
+            if not _close(recomputed["p_value"], p_value):
+                return "verified gate p-value does not survive recomputation"
+            if "heldout_delta_lcb" in performance and not _close(
+                    recomputed["mean_delta_lcb"],
+                    _finite_number(performance.get("heldout_delta_lcb"))):
+                return "verified gate lower confidence bound does not survive recomputation"
+            bound = _finite_number(performance.get("heldout_delta_lcb"))
+            if "heldout_delta_lcb_positive" in checks and bool(
+                    checks["heldout_delta_lcb_positive"]) != bool(
+                        bound is not None and bound > 0):
+                return "verified gate lower-bound decision is inconsistent"
+            # The null draws are reproducible from the matched deltas alone:
+            # an absent seed is re-derived from the same content hash the
+            # original draw used, so only the draw count must be recorded.
+            seeded = (isinstance(falsification.get("draws"), int) and
+                      not isinstance(falsification.get("draws"), bool) and
+                      int(falsification["draws"]) > 0)
+            if envelope.get("passes") and not seeded:
+                return "passing verified gate lacks a reproducible falsification draw"
+            if seeded and bool(falsification.get("passes")) != bool(
+                    recomputed["falsification_passes"]):
+                return "verified gate falsification does not survive recomputation"
+            if seeded and "p_value" in falsification and not _close(
+                    _finite_number(falsification.get("p_value")),
+                    recomputed["falsification_p_value"]):
+                return "verified gate falsification p-value does not survive recomputation"
         return None
 
     def _latest_verified_gate(self, candidate_id: str) -> tuple[dict, dict]:

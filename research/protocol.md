@@ -71,9 +71,34 @@ cause autonomous hypothesis churn.
 
 Each transition requires a chronological fit/held-out boundary, fit and
 held-out structural floors for trades/sessions/clusters, matched baseline
-deltas, cluster-level sign randomisation, family-level false-discovery
-correction, and a placebo/falsification comparison. The complete gate is
-durably persisted and re-verified before validation or champion selection.
+deltas, cluster-level sign randomisation, and both family-local and
+cycle-global false-discovery correction. Selection compares candidates across
+families, so the q-value that authorizes a champion is the global one.
+
+Beating a control is necessary but never sufficient. A variant must also show
+absolute after-cost profitability on unseen data (positive net P&L and
+positive per-trade expectancy), a positive lower confidence bound on the mean
+held-out delta, a positive delta against a randomized-entry null control that
+shares the candidate's session/symbol/direction distribution and exit rules,
+and a majority of positive rolling-origin walk-forward folds.
+
+The falsification check is a seeded permutation test: at least ten thousand
+cluster-level sign-flip draws form an explicit null distribution, and the
+decision is the empirical one-sided p-value against it. The draw count and
+seed are derived from the matched evidence and persisted, so the distribution
+is reproducible.
+
+The last sessions of every evaluation corpus are sealed into a final
+qualification window before any worker is scheduled. Selection, mutation and
+diagnosis never receive them; the window is opened exactly once, by the
+orchestrator, for the last go/no-go, and refuses to be copied or serialized.
+
+The complete gate is durably persisted and re-verified before validation or
+champion selection. Re-verification recomputes the analysis — matched deltas,
+p-value, lower bound, falsification, absolute profitability — from the stored
+source rows and compares it against the recorded decision, rather than only
+re-checking hashes. Champions are ranked by the lower confidence bound, not
+the raw held-out delta.
 Underpowered data is not failure. Retirement is permitted only after every
 intended variant is adequately tested and fails; an enabled LLM lane must first
 register a valid bounded replacement. Drawdown is persisted and used to rank
