@@ -125,17 +125,33 @@ def _add_cost_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force-flat", type=_time, default=_time("15:55"))
 
 
+def _quotes(args: argparse.Namespace):
+    """Load the optional executable-quote view replay prices boundaries from."""
+    path = getattr(args, "quotes", None)
+    if not path:
+        return None
+    quotes = []
+    for number, row in enumerate(_json_rows(path), 1):
+        try:
+            quotes.append(normalize_quote(
+                row, provider=args.provider, feed=args.feed))
+        except (NormalizationError, ValueError) as exc:
+            raise SystemExit(f"quote row {number}: {exc}") from exc
+    return quotes or None
+
+
 def cmd_backtest_ibr(args: argparse.Namespace) -> int:
     bars = _bars(args)
+    quotes = _quotes(args)
     cfg = _config(args)
     if args.vehicle == "both":
-        result = replay_ibr_vehicles(bars, config=cfg,
+        result = replay_ibr_vehicles(bars, config=cfg, quotes=quotes,
                                      vehicles=("equity", "option"))
         print(json.dumps({key: value.summary() for key, value in result.items()},
                          sort_keys=True))
     else:
         result = replay_ibr(bars, config=cfg, vehicle=args.vehicle,
-                            symbol=args.symbol)
+                            symbol=args.symbol, quotes=quotes)
         print(json.dumps(result.summary(), sort_keys=True))
     return 0
 
@@ -429,6 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     ibr = sub.add_parser("backtest-ibr", help="replay IBR on normalized bars JSONL")
     ibr.add_argument("bars", help="underlying bars JSONL, or - for stdin")
     ibr.add_argument("--symbol", default=None)
+    ibr.add_argument("--quotes", default=None,
+                     help="normalized quote JSONL used for boundary fills")
     ibr.add_argument("--provider", default=None)
     ibr.add_argument("--feed", default=None)
     ibr.add_argument("--vehicle", choices=("equity", "option", "both"), default="equity")

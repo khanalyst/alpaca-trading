@@ -76,6 +76,9 @@ class LifecycleProvider:
         self.close_requests.append(request)
         return self.submit_order(request)
 
+    def cancel_order(self, order_id):
+        self.set_order(str(order_id), status="canceled")
+
     def set_order(self, order_id, *, status, filled_qty=0, filled_avg_price=None):
         self.orders_by_id[order_id] = replace(
             self.orders_by_id[order_id], status=status,
@@ -479,8 +482,11 @@ class ExecutionLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(len(self.provider.close_requests), 1)
 
-        close_id = next(item.id for item in self.provider.orders_by_id.values()
-                        if item.id != accepted.id)
+        # The option profile also rests a take-profit order, so identify the
+        # close by the client id the monitor actually submitted it under.
+        close_id = next(
+            item.id for item in self.provider.orders_by_id.values()
+            if item.client_order_id == self.provider.close_requests[0].client_order_id)
         self.provider.set_order(close_id, status="filled", filled_qty=quantity,
                                 filled_avg_price=exit_price)
         self.provider.positions_live = []

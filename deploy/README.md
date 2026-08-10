@@ -14,6 +14,7 @@ is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 | `recorder` | Alpaca bars, quotes, and session observations (paper by default) | `runtime-data` |
 | `trader` | Exactly one intraday loop in one configured execution profile and broker reconciliation | `runtime-data`, `research-cache` |
 | `research` (profile `research`) | Scheduled seven-strategy parallel factory, validation, and replay; no broker authority | `runtime-data`, research volumes |
+| `watchdog` | Independent stale-trader flatten; cancel and close only, never entries | `runtime-data` |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
 All services run as UID/GID 10001, drop Linux capabilities, use a read-only
@@ -21,6 +22,14 @@ root filesystem, and receive only the secret/config mounts they need. The
 dashboard receives no credentials. Health checks monitor recorder freshness,
 trader state, research progress, and dashboard availability. Recorder health is
 reported independently and does not gate trader startup.
+
+The `watchdog` service exists because Alpaca provides no broker-resident stop
+for options: it reads the trader heartbeat from the shared runtime volume and,
+when that heartbeat is stale beyond `ALPACA_WATCHDOG_MAX_HEARTBEAT_AGE` (300s)
+and the broker still reports positions, it cancels resting protective legs and
+flattens through its own broker session. It first takes the mode-scoped run
+lock, so a running trader keeps it inert; it can never submit an entry. It
+cannot help when the broker or the network is unreachable.
 
 The research profile is disabled by default. When the recorder has produced
 the mixed bars/quotes/options dataset at

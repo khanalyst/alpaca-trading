@@ -86,7 +86,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 def validate_config(raw: Mapping[str, Any]) -> dict:
     cfg = deepcopy(_map(raw, "config"))
-    allowed = {"mode", "broker", "data", "session", "universe", "strategy", "risk", "execution", "llm", "research", "cycle"}
+    allowed = {"mode", "broker", "data", "session", "universe", "strategy", "risk", "execution", "costs", "llm", "research", "cycle"}
     _unknown(cfg, allowed, "config")
     mode = str(cfg.get("mode", "paper")).strip().lower()
     if mode not in {"paper", "live"}:
@@ -240,6 +240,21 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     execution["max_spread_bps"] = _num(execution, "max_spread_bps", "execution", 0, 10_000, 100)
     out["execution"] = execution
 
+    costs = out.get("costs")
+    if costs is not None:
+        # The shared research cost model owns the field set and the caps; this
+        # only makes the block reachable from the checked-in configuration
+        # instead of a --config JSON override, and fails closed on its errors.
+        from research.costs import CostError, CostModel
+        try:
+            model = CostModel.from_config({"costs": _map(costs, "costs"),
+                                           "execution": execution})
+        except CostError as exc:
+            raise ConfigError(f"costs: {exc}") from exc
+        out["costs"] = {"spread_bps": model.spread_bps,
+                        "slippage_bps": model.slippage_bps,
+                        "fee_bps": model.fee_bps}
+
     llm = _map(out.get("llm"), "llm")
     _unknown(llm, {"enabled", "provider", "model", "temperature", "max_tokens", "base_url"}, "llm")
     llm["enabled"] = _bool(llm, "enabled", "llm", False)
@@ -309,6 +324,13 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
             raise ConfigError("live mode requires the validated research edge gate")
         if strategy.get("selection_mode") != "specific":
             raise ConfigError("live mode requires strategy.selection_mode=specific")
+        if strategy.get("execution_mode") == "options":
+            raise ConfigError(
+                "live mode rejects strategy.execution_mode=options: Alpaca offers no bracket, "
+                "OCO, or stop order of any kind on options, so an option position's protective "
+                "stop can only be the local 60-second poller, which dies with the process. The "
+                "live canary is equities-only until the deploy/watchdog.py flatten path has soak "
+                "evidence; run the options profile on paper")
         if llm["enabled"]:
             raise ConfigError(
                 "live mode requires llm.enabled=false: the validated edge was proven with the "

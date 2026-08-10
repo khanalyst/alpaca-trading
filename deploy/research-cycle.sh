@@ -125,22 +125,27 @@ if [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; t
 fi
 bars_input="$tmp_dir/bars.jsonl"
 options_input="$tmp_dir/options.jsonl"
+# Quotes are the executable price at a boundary fill instant. Routing them
+# into their own view keeps the bars-only replay input valid while letting the
+# shared cost/fill model use recorded quotes instead of bar prices.
+quotes_input="$tmp_dir/quotes.jsonl"
 
 if [[ "$validated_input" == *.csv ]]; then
   validated_input="$tmp_dir/market.jsonl"
-  "$python_bin" - "$dataset" "$validated_input" "$bars_input" "$options_input" <<'PY'
+  "$python_bin" - "$dataset" "$validated_input" "$bars_input" "$options_input" "$quotes_input" <<'PY'
 import csv
 import json
 import sys
 
-source, target, bars_target, options_target = sys.argv[1:]
+source, target, bars_target, options_target, quotes_target = sys.argv[1:]
 def clean(value):
     return None if value in (None, "") else value
 
 with open(source, newline="", encoding="utf-8") as handle, open(
         target, "w", encoding="utf-8") as output, open(
         bars_target, "w", encoding="utf-8") as bars_output, open(
-        options_target, "w", encoding="utf-8") as options_output:
+        options_target, "w", encoding="utf-8") as options_output, open(
+        quotes_target, "w", encoding="utf-8") as quotes_output:
     for row in csv.DictReader(handle):
         event = str(row.get("event_type") or "").lower()
         common = {
@@ -161,7 +166,9 @@ with open(source, newline="", encoding="utf-8") as handle, open(
             payload = {"kind": "quote", **common, "bid": clean(row.get("bid")),
                        "ask": clean(row.get("ask")), "bid_size": clean(row.get("bid_size")),
                        "ask_size": clean(row.get("ask_size"))}
-            output.write(json.dumps(payload, sort_keys=True) + "\n")
+            serialized = json.dumps(payload, sort_keys=True) + "\n"
+            output.write(serialized)
+            quotes_output.write(serialized)
         elif event in {"option", "option_snapshot"}:
             payload = {"kind": "option_snapshot", **common,
                        "contract": clean(row.get("contract")),
@@ -181,14 +188,15 @@ PY
 else
   # Validate the complete mixed JSONL input but derive bars/options-only views
   # for local replay and presence checks. Invalid JSON remains a hard failure.
-  "$python_bin" - "$validated_input" "$bars_input" "$options_input" <<'PY'
+  "$python_bin" - "$validated_input" "$bars_input" "$options_input" "$quotes_input" <<'PY'
 import json
 import sys
 
-source, bars_target, options_target = sys.argv[1:]
+source, bars_target, options_target, quotes_target = sys.argv[1:]
 with open(source, encoding="utf-8") as source_handle, open(
         bars_target, "w", encoding="utf-8") as bars_output, open(
-        options_target, "w", encoding="utf-8") as options_output:
+        options_target, "w", encoding="utf-8") as options_output, open(
+        quotes_target, "w", encoding="utf-8") as quotes_output:
     for line in source_handle:
         if not line.strip():
             continue
@@ -199,6 +207,8 @@ with open(source, encoding="utf-8") as source_handle, open(
             bars_output.write(serialized)
         elif kind in {"option", "option_snapshot"}:
             options_output.write(serialized)
+        elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
+            quotes_output.write(serialized)
 PY
 fi
 
@@ -220,8 +230,12 @@ fi
 
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   set +e
+  quote_flags=()
+  if [ -s "$quotes_input" ]; then
+    quote_flags=(--quotes "$quotes_input")
+  fi
   "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
-    --provider alpaca --feed "$feed" --vehicle equity
+    --provider alpaca --feed "$feed" --vehicle equity "${quote_flags[@]}"
   backtest_status=$?
   set -e
   if [ "$backtest_status" -ne 0 ]; then

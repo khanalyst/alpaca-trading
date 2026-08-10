@@ -99,6 +99,19 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
     }
 
 
+def watchdog(path: Path, max_age: float, *, now: float | None = None) -> dict:
+    status_payload = _read_json(path)
+    status = str(status_payload.get("status") or "missing")
+    fresh = _fresh(status_payload.get("updated_ts"), max_age, now)
+    return {
+        "ok": fresh and status in {"watching", "acted"},
+        "component": "watchdog",
+        "status": status,
+        "fresh": fresh,
+        "reason": status_payload.get("reason"),
+    }
+
+
 def dashboard(url: str, timeout: float = 3.0) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -139,6 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--path", default="runtime/health/research.json")
     item.add_argument("--max-age", type=float, default=180)
 
+    item = sub.add_parser("watchdog")
+    item.add_argument("--path", default="runtime/health/watchdog.json")
+    item.add_argument("--max-age", type=float, default=180)
+
     item = sub.add_parser("dashboard")
     item.add_argument("--url", default="http://127.0.0.1:8080/healthz")
     item.add_argument("--timeout", type=float, default=3)
@@ -154,6 +171,8 @@ def main() -> int:
             result = recorder(Path(args.path), args.max_age)
         elif args.component == "research":
             result = research(Path(args.path), args.max_age)
+        elif args.component == "watchdog":
+            result = watchdog(Path(args.path), args.max_age)
         else:
             result = dashboard(args.url, args.timeout)
     except Exception as exc:                               # noqa: BLE001

@@ -6,7 +6,7 @@ import time
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import Any, Mapping
 
 from . import state
@@ -98,6 +98,18 @@ def _broker_protected(legs: list[dict]) -> bool:
     return {"stop", "target"} <= {str(leg.get("role")) for leg in legs if _leg_live(leg)}
 
 
+def _option_trade(trade: Any) -> bool:
+    """An option position can never carry a broker-resident stop leg.
+
+    Alpaca supports market and limit day orders on options only: no bracket,
+    no OCO/OTO, and no stop or stop-limit at all.  A resting take-profit is
+    therefore the whole of the broker-side protection, and its absence is not
+    the lost-protection condition that a half-dead equity bracket is.
+    """
+    return (isinstance(trade, Mapping) and
+            str(trade.get("execution_profile", "")).lower() == "options")
+
+
 def _value(obj: Any, name: str, default=None):
     if isinstance(obj, Mapping):
         return obj.get(name, default)
@@ -152,6 +164,9 @@ class ExecutionLifecycleMixin:
                                          "status": status, "filled_qty": filled_qty,
                                          "client_order_id": request.client_order_id,
                                          "risk": risk_plan})
+        # The option profile's take-profit can only rest after its entry
+        # fills, so it is submitted here, outside the transaction above.
+        self._sync_option_take_profit()
 
     def _activate_filled_trade(self, current: dict, order_state: dict,
                                filled_qty: float, fill_price: float | None) -> dict:
@@ -233,6 +248,123 @@ class ExecutionLifecycleMixin:
             order_state["fill_logged"] = True
             order_state["logged_filled_qty"] = filled_qty
         return trade
+
+    def _option_take_profit_price(self, trade: Mapping) -> float | None:
+        """Price the resting sell in the option's own risk unit.
+
+        The plan's stop and target are underlying prices and a premium is not
+        a linear function of them, so they cannot be used as a limit price.  A
+        long option's risk is its whole debit, so the plan's reward-to-risk
+        ratio is applied to that debit: the leg fills only once the position
+        has made the validated variant's target multiple of the risk it really
+        took.  Rounding up to the cent keeps a resting order from ever exiting
+        cheaper than that.
+        """
+        debit = self._number(trade.get("entry_price"))
+        underlying = self._number(trade.get("underlying_entry_price"))
+        stop = self._number(trade.get("stop_price"))
+        target = self._number(trade.get("target_price"))
+        if debit is None or underlying is None or stop is None or target is None:
+            return None
+        if debit <= 0:
+            return None
+        distance = abs(underlying - stop)
+        reward = abs(target - underlying)
+        if distance <= 0 or reward <= 0:
+            return None
+        price = Decimal(str(debit)) * (Decimal(1) + Decimal(str(reward / distance)))
+        return float(price.quantize(Decimal("0.01"), rounding=ROUND_CEILING))
+
+    def _sync_option_take_profit(self) -> None:
+        """Rest a broker-side sell_to_close limit against every filled option.
+
+        This is the only protection Alpaca lets an option position keep when
+        this process dies; the stop stays with the local poller.  The order is
+        submitted after the fill is already durable and never from inside a
+        state transaction, because a retried update callback must not be able
+        to replay a broker mutation.  The leg is stored in the same
+        ``protective_legs`` structure the equity bracket uses, so cancellation,
+        the poller backstop, and the filled-leg close path need no new case.
+        """
+        runtime = state.load_state()
+        active = runtime.get("active_trades", {}) if isinstance(runtime, Mapping) else {}
+        if not isinstance(active, Mapping):
+            return
+        for symbol, trade in list(active.items()):
+            if not _option_trade(trade) or trade.get("closing_order_id"):
+                continue
+            if str(trade.get("status", "open")).lower() != "open":
+                continue
+            qty = self._number(trade.get("qty")) or 0.0
+            legs = _leg_rows(trade)
+            if qty <= 0 or any(str(leg.get("status", "")).lower() == "filled"
+                               for leg in legs):
+                continue
+            targets = [leg for leg in legs if str(leg.get("role")) == "target"]
+            live = [leg for leg in targets if _leg_live(leg)]
+            if live and all(self._number(leg.get("qty")) == qty for leg in live):
+                continue
+            price = self._option_take_profit_price(trade)
+            if price is None:
+                self._event("option_take_profit_skipped", {
+                    "symbol": symbol, "reason": "target premium is underivable"})
+                continue
+            # A resting leg reserves the contracts it was sized for.  An
+            # amended quantity replaces it only once the old one is provably
+            # cancelled, never alongside it.
+            if live and not self._cancel_protective_legs(str(symbol), live):
+                continue
+            request = OrderRequest(
+                str(symbol), Decimal(str(int(qty))), "sell", type="limit",
+                time_in_force="day", limit_price=Decimal(str(price)),
+                client_order_id=self._client_id(
+                    "tp", {"symbol": symbol, "setup_id": trade.get("setup_id")},
+                    len(targets)),
+                position_intent="sell_to_close")
+            try:
+                order = self.provider.submit_order(request)
+            except Exception as exc:  # noqa: BLE001
+                # Nothing was mutated, so this is not a durability failure: the
+                # poller remains the whole protection until the next attempt.
+                self._event("option_take_profit_failed", {"symbol": symbol,
+                                                           "error": str(exc)})
+                continue
+            leg = {"order_id": str(getattr(order, "id", None) or
+                                   request.client_order_id),
+                   "role": "target",
+                   "status": str(getattr(order, "status", "accepted") or
+                                 "accepted").lower(),
+                   "price": float(price), "qty": qty}
+
+            def attach(current: dict, symbol=symbol, leg=leg) -> dict:
+                for bucket in ("active_trades", "protection"):
+                    row = current.get(bucket, {}).get(symbol)
+                    if not isinstance(row, dict):
+                        continue
+                    rows = [item for item in _leg_rows(row)
+                            if str(item.get("order_id")) != leg["order_id"]]
+                    rows.append(dict(leg))
+                    row["protective_legs"] = rows
+                return current
+
+            try:
+                state.update_state(attach)
+            except Exception as exc:  # noqa: BLE001
+                self._reconciled = False
+                self._preflight_error = (
+                    "post-submit protection durability failure; reconciliation required")
+                try:
+                    state.commit({"operator_pause": True},
+                                 transition=(state.RUNNING, state.PAUSED))
+                except Exception:  # noqa: BLE001
+                    pass
+                raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
+            state.log_order(order, request, action="protect", run_id=self.run_id,
+                            runtime_mode=self.mode,
+                            setup_id=trade.get("setup_id"))
+            self._event("option_take_profit_resting", {
+                "symbol": symbol, "order_id": leg["order_id"], "qty": qty,
+                "limit_price": float(price)})
 
     def _close_position(self, position: Any, reason: str, *, attempt: int = 0) -> Any:
         symbol = str(_value(position, "symbol", "")).upper()
@@ -396,7 +528,7 @@ class ExecutionLifecycleMixin:
                 reason = "before_close"
             elif not trade or stop is None or target is None:
                 reason = "protection_missing"
-            elif legs and not protected:
+            elif legs and not protected and not _option_trade(trade):
                 # Recorded legs that are no longer live at the broker leave an
                 # open position unprotected; close it fail-closed.
                 self._event("unprotected_position", {"symbol": symbol,
@@ -555,6 +687,7 @@ class ExecutionLifecycleMixin:
                     "action": "close", "reason": str(leg.get("role")),
                     "updated_ts": time.time()})
             if (not trade.get("closing_order_id") and not _broker_protected(legs) and
+                    not _option_trade(trade) and
                     str(trade.get("status", "")).lower() == "open"):
                 self._event("unprotected_position", {
                     "symbol": symbol, "reason": "protective_legs_terminal"})
@@ -756,6 +889,9 @@ class ExecutionLifecycleMixin:
         self._reconciled = True
         self._drain_edge_outbox()
         self._event("rest_reconcile", {"positions": len(result.get("positions", [])) if isinstance(result, Mapping) else 0})
+        # After the atomic replacement above, so a broker submission can never
+        # be replayed by a retried state callback and never delays the outbox.
+        self._sync_option_take_profit()
         return result
 
     def _record_edge_outcome(self, trade: Mapping, realized: float | None,

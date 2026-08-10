@@ -31,6 +31,11 @@ are force-closed before the close.
   exact named validated/champion `strategy.variant_id`. Live mode pins that
   edge and does not auto-switch. Keep live configuration, credentials, and
   `ALPACA_AGENT_RUNTIME_ROOT` in a separate runtime scope from paper.
+- `strategy.execution_mode: options` is paper-only. Alpaca offers no bracket,
+  OCO, or stop order on options, so an option position's protective stop is
+  software (the 60-second poller, bounded by the separate `watchdog` process)
+  and `mode: live` rejects the options profile. If the broker or network is
+  unreachable, nothing local protects an open option position.
 - Keep API keys in `.env` or a host secret; never commit them. Use trading
   permissions only and disable withdrawals.
 - Research, recorder, trader, and dashboard state is isolated in named

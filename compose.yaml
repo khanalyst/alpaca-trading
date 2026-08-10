@@ -98,6 +98,53 @@ services:
     deploy:
       replicas: 1
 
+  watchdog:
+    <<: *app
+    container_name: alpaca-watchdog
+    # A separate container with its own broker session, so it cannot die with
+    # the trader it watches.  It can only cancel and flatten; the mode-scoped
+    # run lock on the shared runtime volume keeps it inert while the trader
+    # lives.
+    command:
+      - python
+      - deploy/watchdog.py
+      - --config
+      - config.yaml
+      - --interval
+      - ${ALPACA_WATCHDOG_INTERVAL_SECONDS:-30}
+      - --max-heartbeat-age
+      - ${ALPACA_WATCHDOG_MAX_HEARTBEAT_AGE:-300}
+    environment:
+      ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
+      ALPACA_PAPER: "true"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+    secrets:
+      - source: agent_credentials
+        target: agent_credentials
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    configs:
+      - source: agent_config
+        target: /app/config.yaml
+        mode: 0444
+    volumes:
+      - runtime-data:/app/runtime
+    healthcheck:
+      test: ["CMD", "python", "deploy/health.py", "watchdog", "--max-age", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 1m
+    cpus: "0.25"
+    mem_limit: 512m
+    pids_limit: 64
+    stop_grace_period: 45s
+    deploy:
+      replicas: 1
+
   research:
     <<: *app
     profiles: [research]

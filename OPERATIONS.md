@@ -16,6 +16,7 @@ cd /opt/alpaca-agent-trading
 docker compose ps
 docker compose logs --tail=100 trader
 docker compose logs --tail=100 recorder
+docker compose logs --tail=100 watchdog
 docker compose exec -T trader python main.py check
 docker compose exec -T trader python main.py status
 docker compose --profile research ps research
@@ -55,6 +56,23 @@ closes. The trader must:
 If the process is restarted during a session, reconcile first. Never infer a
 flat account from a local journal alone. A long option contract is one risk
 unit: close or cancel it and confirm no residual contract remains.
+
+### Option protection is not equity protection
+
+Alpaca supports market and limit day orders on options only: no bracket, no
+OCO/OTO, and no stop or stop-limit. The runtime rests a `sell_to_close` limit
+take-profit once an option entry fills, and that order survives the trader
+dying; the stop does not — it is the 60-second poller. The `watchdog` service
+bounds that gap by flattening a stale trader's open positions from a separate
+process and broker session, and stays inert while the trader holds the
+mode-scoped run lock. Two cases remain uncovered and must be handled by a
+human: a trader that is alive but wedged (it keeps the lock, so the watchdog
+will not act), and an unreachable broker or network (no local process can
+close anything). `mode: live` therefore rejects `execution_mode: options`;
+run the options profile on paper only.
+
+Check the watchdog with `python deploy/health.py watchdog`; a `watching`
+status is the normal steady state and `acted` means it flattened.
 
 ## Mode guard and live preflight
 

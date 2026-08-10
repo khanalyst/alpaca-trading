@@ -8,13 +8,14 @@ multi-leg options, naked options, and short-option exposure are rejected.
 
 ## System boundaries
 
-The repository contains four cooperating processes:
+The repository contains five cooperating processes:
 
 | Process | Authority | Durable output |
 | --- | --- | --- |
 | Recorder | Read-only Alpaca market-data collection | Mixed bars, quotes, and option snapshots under `runtime/research/recorded` |
 | Research | Offline simulation, evidence gates, and candidate lifecycle | Edge/factory SQLite ledgers and content-addressed proof artifacts |
 | Trader | Authenticated account reads and order/position mutation | Mode-scoped runtime state, operational journal, events, and heartbeat |
+| Watchdog | Cancel and flatten only, never entries | Its own health status file |
 | Dashboard | Read-only observation | No authoritative writes |
 
 Research cannot submit orders or mutate broker state. The trader cannot create
@@ -112,6 +113,29 @@ A normal cycle follows these gates:
 The runtime never silently substitutes stale data, malformed numeric values,
 an unrelated idempotency lookup, an incompatible OCC contract, or an unknown
 broker status.
+
+### Option protection and its residual
+
+A `buy_to_open` entry cannot ship a protective leg with it, so after the fill
+is durable — outside every state transaction, so no retried callback can
+replay a broker mutation — the runtime rests one `sell_to_close` limit order
+sized to the filled quantity and amended whenever more of the entry fills. Its
+limit price is the entry debit grown by the plan's reward-to-risk ratio: the
+plan's stop and target are underlying prices, a premium is not a linear
+function of them, and the long option's real risk is its whole debit. The leg
+is stored in the same `protective_legs` structure as an equity bracket child,
+so cancellation, the poller backstop, and the filled-leg close path are shared
+code. A lone resting take-profit is not a half-dead bracket and never triggers
+the lost-protection close.
+
+The stop stays software. `deploy/watchdog.py` bounds it: a separate process
+with its own broker session that flattens when the trader heartbeat is stale
+and the broker reports exposure. It takes the mode-scoped run lock first, so a
+living trader — even a hung one — keeps it inert rather than racing it into a
+double close, and it has no entry path at all. What no local process can cover
+is the broker or the network being unreachable; in that window an option
+position has no stop of any kind. That is the residual, and it is why live
+mode is equities-only.
 
 ### Provider boundary
 
@@ -271,6 +295,11 @@ slot and `ROTATION_BUDGET` times per cycle, each rotation granting one further
 - An equity entry is submitted as a bracket or not at all. The local poller is
   a backstop for exits the legs cannot express (session force-flat, bounded
   hold, and lost protection) and must cancel the legs before any close.
+- Alpaca accepts market and limit day orders on options only: no bracket, no
+  OCO/OTO, and no stop or stop-limit at all. The option profile therefore gets
+  a broker-resident take-profit and no broker-resident stop. Its stop is the
+  local poller, bounded from outside by `deploy/watchdog.py`, and `mode: live`
+  rejects `strategy.execution_mode: options` for exactly that reason.
 - Startup and shutdown are reconciled; exposure or ambiguous broker state
   blocks entries and pauses safely.
 - A durable operator pause survives restart until authenticated flat-only
