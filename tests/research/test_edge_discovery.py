@@ -70,7 +70,8 @@ def _sessions(start: datetime, count: int) -> list[dict]:
 def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   passes: bool = True, record: bool = True,
                   score: float = 1.0,
-                  scores: list[float] | None = None) -> tuple[dict, dict]:
+                  scores: list[float] | None = None,
+                  r_multiples: list[float] | None = None) -> tuple[dict, dict]:
     prefix = f"{lane}-{'pass' if passes else 'fail'}"
     fit = [] if lane == "shadow" else [
         {"vehicle": "equity", "session_date": "2024-01-02",
@@ -124,8 +125,14 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     run = ledger.append_run(
         candidate_id, lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         metrics={"gate": {"passes": not passes}, "confidence": 0.0})
+    # ``r_multiples`` attaches the risk-normalized outcome the drift reference
+    # is read from; the gate statistics themselves never consume it.
+    per_trade = dict(zip((row["opportunity_id"] for row in heldout),
+                         r_multiples or ()))
     for row in [*fit, *heldout]:
-        ledger.append_trade(run["run_id"], row)
+        value = per_trade.get(row["opportunity_id"])
+        ledger.append_trade(run["run_id"],
+                            row if value is None else {**row, "r_multiple": value})
     if record:
         ledger.record_verified_gate(run["run_id"], envelope)
     return run, envelope
@@ -606,6 +613,104 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                     "net_pnl": -1, "risk_usd": 10, "r_multiple": 999,
                 })
             self.assertEqual(outcome["status"], "demoted")
+
+    def _deployed_candidate(self, ledger, *, r_multiples=None):
+        candidate = ledger.register_candidate(
+            "ibr.target.1_5r", vehicle="equity", hypothesis="deployed guard",
+            config={"strategy": {"target_r": 1.5}})
+        candidate_id = candidate["candidate_id"]
+        _persist_gate(ledger, candidate_id, "backtest")
+        ledger.transition(candidate_id, "backtest_passed", reason="backtest gates passed")
+        _persist_gate(ledger, candidate_id, "shadow", scores=[1.0] * 20,
+                      r_multiples=r_multiples)
+        ledger.transition(candidate_id, "shadow", reason="shadow evidence started")
+        ledger.transition(candidate_id, "validated", reason="shadow gates passed")
+        return candidate_id
+
+    def _ingest(self, ledger, candidate_id, values, *, prefix="paper"):
+        result = {}
+        for index, r_multiple in enumerate(values):
+            result = ledger.ingest_paper_outcome(candidate_id, {
+                "vehicle": "equity", "opportunity_id": f"{prefix}-{index}",
+                "session_date": f"2024-02-{index + 1:02d}",
+                "net_pnl": r_multiple * 10, "risk_usd": 10,
+            })
+        return result
+
+    def test_rolling_guard_demotes_a_losing_validated_non_champion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate_id = self._deployed_candidate(ledger)
+            result = self._ingest(ledger, candidate_id, [-0.1] * 20)
+            self.assertEqual(result["status"], "demoted")
+            transitions = [(row["from_status"], row["to_status"])
+                           for row in ledger.history(candidate_id)
+                           if row["event_type"] == "safety_demotion"]
+            self.assertEqual(transitions, [("validated", "demoted")])
+
+    def test_repeated_ingestion_of_one_opportunity_is_a_single_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity", hypothesis="idempotent",
+                config={})
+            candidate_id = candidate["candidate_id"]
+            outcome = {"vehicle": "equity", "opportunity_id": "paper-1",
+                       "net_pnl": -1, "risk_usd": 10}
+            first = ledger.ingest_paper_outcome(candidate_id, outcome)
+            repeats = [ledger.ingest_paper_outcome(candidate_id, outcome)
+                       for _ in range(3)]
+            self.assertFalse(first["duplicate"])
+            self.assertTrue(all(row["duplicate"] for row in repeats))
+            self.assertEqual({row["outcome_id"] for row in repeats},
+                             {first["outcome_id"]})
+            self.assertEqual([row["rolling_r"] for row in repeats], [-.1] * 3)
+            with closing(sqlite3.connect(ledger.path)) as db:
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM paper_outcomes").fetchone()[0], 1)
+
+    def test_drift_demotes_a_deployed_candidate_whose_paper_r_collapses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate_id = self._deployed_candidate(
+                ledger, r_multiples=[.5, 1.5] * 10)
+            # The rolling floor cannot see this: twenty outcomes summing to
+            # -1R stay above the -2R floor.  Only the sequential test against
+            # the validated held-out distribution proves the edge is gone.
+            result = self._ingest(ledger, candidate_id, [-0.05] * 20)
+            self.assertGreater(result["rolling_r"], -2.0)
+            self.assertTrue(result["drift"]["degraded"])
+            self.assertGreaterEqual(result["drift"]["statistic"], 4.0)
+            self.assertEqual(result["status"], "demoted")
+
+    def test_drift_stays_quiet_while_paper_r_wobbles_around_the_validated_mean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate_id = self._deployed_candidate(
+                ledger, r_multiples=[.5, 1.5] * 10)
+            result = self._ingest(ledger, candidate_id, [.8, 1.2] * 15)
+            self.assertTrue(result["drift"]["applicable"])
+            self.assertFalse(result["drift"]["degraded"])
+            self.assertLess(result["drift"]["statistic"], 0.0)
+            self.assertEqual(result["status"], "validated")
+
+    def test_drift_tolerates_a_single_severe_loss_inside_the_validated_spread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate_id = self._deployed_candidate(
+                ledger, r_multiples=[.5, 1.5] * 10)
+            result = self._ingest(ledger, candidate_id, [1.0] * 19 + [-3.0])
+            self.assertFalse(result["drift"]["degraded"])
+            self.assertEqual(result["status"], "validated")
+
+    def test_drift_is_inapplicable_without_a_risk_normalized_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate_id = self._deployed_candidate(ledger)
+            self.assertIsNone(ledger.heldout_reference(candidate_id))
+            result = self._ingest(ledger, candidate_id, [.5] * 20)
+            self.assertFalse(result["drift"]["applicable"])
+            self.assertEqual(result["status"], "validated")
 
     def test_paper_outcomes_recompute_r_and_reject_manual_demotion(self):
         with tempfile.TemporaryDirectory() as directory:

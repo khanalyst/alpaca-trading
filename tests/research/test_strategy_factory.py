@@ -251,6 +251,65 @@ class StrategyFactoryTests(unittest.TestCase):
             self.assertEqual(FactoryLedger(db).active("equity")[0]["status"],
                              "pending_generation_limit")
 
+    def _exhausted_slots(self, db, **kwargs):
+        """Run one cycle that mutates, then one that hits the generation cap."""
+        run_factory(losing_breakouts(), db_path=db, strategies=2,
+                    variants_per_strategy=2, workers=2, min_trades=1,
+                    min_sessions=1, alpha=1.0, max_generations=2)
+        return run_factory(losing_breakouts(sessions=30), db_path=db,
+                           strategies=2, variants_per_strategy=2, workers=2,
+                           min_trades=1, min_sessions=1, alpha=1.0,
+                           max_generations=2, **kwargs)
+
+    def test_generation_exhaustion_rotates_one_fresh_family_per_cycle(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker):
+            db = Path(directory) / "edge.sqlite3"
+            result = self._exhausted_slots(db)
+            # Both slots are exhausted; the per-cycle budget rotates one and
+            # leaves the other pending until the next cycle.
+            self.assertEqual(len(result["rotations"]), 1)
+            self.assertEqual([row["reason"] for row in result["pending"]],
+                             ["generation_limit"])
+            seed = result["rotations"][0]
+            ledger = FactoryLedger(db)
+            parent = ledger.hypothesis(seed["parent_hypothesis_id"])
+            self.assertEqual(parent["status"], "retired")
+            self.assertEqual(seed["slot"], parent["slot"])
+            self.assertEqual(seed["generation"], parent["generation"] + 1)
+            self.assertNotEqual(seed["family"], parent["family"])
+            self.assertEqual(ledger.hypothesis(seed["hypothesis_id"])["status"],
+                             "queued")
+            self.assertIn(seed["hypothesis_id"],
+                          {item["hypothesis_id"] for item in ledger.active("equity")})
+            rotation = [event for event in ledger.events(parent["hypothesis_id"])
+                        if event["payload"].get("rotation") is True]
+            self.assertEqual(len(rotation), 1)
+            self.assertEqual(rotation[0]["status"], "retired")
+            self.assertEqual(rotation[0]["payload"]["rotation_index"], 0)
+
+    def test_rotation_can_be_disabled_and_keeps_the_pending_slot_behavior(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
+                patch.object(factory_module, "_worker", side_effect=fake_adequate_worker):
+            db = Path(directory) / "edge.sqlite3"
+            result = self._exhausted_slots(db, max_rotations=0)
+            self.assertEqual(result["rotations"], [])
+            self.assertEqual(result["status"], "pending_replacement_capacity")
+            self.assertEqual(
+                {item["status"] for item in FactoryLedger(db).active("equity")},
+                {"pending_generation_limit"})
+
+    def test_rotation_bounds_are_not_configurable_upwards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "edge.sqlite3"
+            for kwargs in ({"rotation_budget": 5}, {"max_rotations": 9},
+                           {"max_rotations": -1}):
+                with self.subTest(**kwargs), self.assertRaises(FactoryError):
+                    run_factory(losing_breakouts(), db_path=db, strategies=1,
+                                variants_per_strategy=2, workers=1, **kwargs)
+
     def test_worker_failure_requeues_and_does_not_freeze_the_cycle(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \

@@ -153,7 +153,16 @@ owns path-parameterized SQLite schema, migration, readiness, and inserts.
 The authoritative JSON state contains the runtime state machine, account
 fingerprint, active trades, protective orders, opened timestamps, durable
 orders, daily-risk baseline, reconciliation timestamp, preflight record, kill
-reason, and operator pause. Writes are lock-protected and atomically replaced.
+reason, operator pause, and the durable edge outbox. Writes are lock-protected
+and atomically replaced.
+
+The edge outbox makes closed-trade learning durable. A close's paper outcome is
+written in the same atomic replacement that removes the trade from
+`active_trades`, then drained into the research ledger on that or a later
+cycle. A crash before the replacement leaves the trade active and its close is
+re-derived; a crash after it leaves the outcome queued. Ingestion is keyed on
+`opportunity_id`, so a replayed drain is a no-op rather than a second
+observation.
 A present but malformed state file is corruption; it is never treated as a
 fresh default.
 
@@ -233,6 +242,20 @@ Every accepted proof retains content hashes for data, configuration, code, and
 provenance. Gate envelopes are re-verified before use. Malformed legacy proof
 rows are skipped rather than crashing champion selection. Paper outcomes are
 append-only and can demote an edge; they cannot manufacture a proof.
+
+Retirement guards every deployed candidate, not only the champion, because
+`all_proved` selection trades one validated candidate per family. Two
+independent signals demote: the registered rolling-R floor, and a one-sided
+sequential likelihood test of live paper R against the held-out R distribution
+the candidate's re-verified shadow proof was computed over. The sequential
+boundary bounds the probability of retiring an undegraded candidate at
+`exp(-4)`, about 1.8% per deployment.
+
+Generation exhaustion in the strategy factory is recoverable but still
+bounded. A slot whose family has spent its mutation budget may be reseeded
+with an untried family at template defaults, at most `MAX_ROTATIONS` times per
+slot and `ROTATION_BUDGET` times per cycle, each rotation granting one further
+`max_generations` budget. Neither bound can be raised by configuration.
 
 ## Safety invariants
 

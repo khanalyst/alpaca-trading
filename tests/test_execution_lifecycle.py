@@ -14,6 +14,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from agent import engine as engine_module
 from agent import state
@@ -24,6 +25,7 @@ from agent.execution_lifecycle import (ExecutionLifecycleMixin,
                                        _FILLED_ORDER_STATUSES,
                                        _TERMINAL_ORDER_STATUSES, _plain, _value)
 from agent.market import MarketData
+from research.edge_ledger import EdgeLedger
 
 
 class LifecycleProvider:
@@ -510,6 +512,129 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self._bind_engine(profile="options", market_data=MarketData(self.provider),
                           runtime_name="runtime-options")
         self._run_lifecycle(option=True)
+
+
+class EdgeOutboxTests(unittest.TestCase):
+    """A booked close must never lose its learning event."""
+
+    VARIANT = "ibr.target.1_5r"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="alpaca-outbox-")
+        root = Path(self.tmp.name)
+        self.edge_db = root / "edge.sqlite3"
+        self.provider = LifecycleProvider()
+        self.engine = None
+        self.original_runtime_base = state.RUNTIME_BASE
+        self.addCleanup(self._cleanup_runtime)
+
+    def _cleanup_runtime(self):
+        try:
+            if self.engine is not None:
+                self.engine.close()
+        finally:
+            state.RUNTIME_BASE = self.original_runtime_base
+            state.configure_runtime("paper")
+            self.tmp.cleanup()
+
+    def _bind_engine(self, runtime_name="runtime"):
+        state.RUNTIME_BASE = Path(self.tmp.name) / runtime_name
+        self.engine = Engine(_config(self.edge_db), light=True,
+                             provider=self.provider)
+        state.ensure_ready()
+
+    def _register_candidate(self):
+        EdgeLedger(self.edge_db).register_candidate(
+            self.VARIANT, vehicle="equity", hypothesis="durable outbox",
+            config={"strategy": {"target_r": 1.5}})
+
+    def _close_one_trade(self, client_order_id="entry-outbox"):
+        request = OrderRequest("SPY", Decimal("10"), "buy",
+                               client_order_id=client_order_id)
+        order = self.provider.submit_order(request)
+        self.engine._record_open_order(request, order, {
+            "execution_profile": "shares", "direction": "long",
+            "entry_price": 101.5, "stop_price": 99, "target_price": 105,
+            "underlying_stop_price": 99, "underlying_target_price": 105,
+            "underlying_symbol": "SPY", "contract_multiplier": Decimal("1"),
+            "setup_id": client_order_id, "setup_type": "ibr",
+            "variant_id": self.VARIANT, "risk_usd": 100, "notional": 1000,
+        })
+        self.provider.set_order(order.id, status="filled", filled_qty=10,
+                                filled_avg_price=101.5)
+        self.provider.positions_live = [
+            Position("SPY", Decimal("10"), "long",
+                     avg_entry_price=Decimal("101.5"),
+                     current_price=Decimal("101.5"))]
+        self.engine.reconcile()
+        self.provider.positions_live = []
+        state.update_state(lambda latest: {
+            **latest, "active_trades": {
+                symbol: {**trade, "closing_price": 99, "closing_reason": "stop"}
+                for symbol, trade in latest["active_trades"].items()}})
+        self.engine._runtime_state = state.load_state()
+        self.engine.reconcile()
+
+    def _outcomes(self):
+        with closing(sqlite3.connect(self.edge_db)) as db:
+            return db.execute(
+                "SELECT opportunity_id FROM paper_outcomes ORDER BY created_at"
+            ).fetchall()
+
+    def test_outcome_survives_a_ledger_failure_and_drains_on_a_later_cycle(self):
+        self._bind_engine(runtime_name="runtime-outbox-retry")
+        self._register_candidate()
+        with mock.patch("agent.edge.record_paper_outcome",
+                        side_effect=sqlite3.OperationalError("database is locked")):
+            self._close_one_trade()
+        queued = state.load_state()["edge_outbox"]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["attempts"], 1)
+        self.assertEqual(queued[0]["outcome"]["opportunity_id"], "entry-outbox")
+        self.assertEqual(self._outcomes(), [])
+
+        self.engine.reconcile()
+        self.assertEqual(state.load_state()["edge_outbox"], [])
+        self.assertEqual([row[0] for row in self._outcomes()], ["entry-outbox"])
+
+    def test_draining_is_idempotent_across_retries_and_a_process_restart(self):
+        self._bind_engine(runtime_name="runtime-outbox-idempotent")
+        self._register_candidate()
+        self._close_one_trade()
+        self.assertEqual([row[0] for row in self._outcomes()], ["entry-outbox"])
+        durable = state.load_state()
+        self.assertEqual(durable["edge_outbox"], [])
+
+        # A crash between the ledger write and the outbox pruning leaves the
+        # entry queued; a restarted process must not book it a second time.
+        replayed = {"entry_id": f"{self.VARIANT}\0equity\0entry-outbox",
+                    "queued_ts": 1.0, "attempts": 1,
+                    "outcome": {"variant_id": self.VARIANT, "vehicle": "equity",
+                                "opportunity_id": "entry-outbox",
+                                "session_date": "2026-01-05", "net_pnl": -25.0,
+                                "risk_usd": 100.0, "paper": True}}
+        state.update_state(lambda latest: {**latest, "edge_outbox": [replayed]})
+        restarted = Engine(_config(self.edge_db), light=True, provider=self.provider)
+        self.addCleanup(restarted.close)
+        restarted._runtime_state = state.load_state()
+        for _ in range(3):
+            restarted._drain_edge_outbox()
+        self.assertEqual([row[0] for row in self._outcomes()], ["entry-outbox"])
+        self.assertEqual(state.load_state()["edge_outbox"], [])
+
+    def test_unusable_outcome_is_journaled_rather_than_retried_forever(self):
+        self._bind_engine(runtime_name="runtime-outbox-rejected")
+        state.update_state(lambda latest: {**latest, "edge_outbox": [
+            {"entry_id": "missing", "queued_ts": 1.0, "attempts": 0,
+             "outcome": {"variant_id": "ibr.unknown", "vehicle": "equity",
+                         "opportunity_id": "gone", "net_pnl": 1.0,
+                         "risk_usd": 100.0}}]})
+        self.engine._runtime_state = state.load_state()
+        self.assertEqual(self.engine._drain_edge_outbox(), 0)
+        self.assertEqual(state.load_state()["edge_outbox"], [])
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            kinds = [row[0] for row in db.execute("SELECT kind FROM events")]
+        self.assertIn("edge_outcome_rejected", kinds)
 
 
 if __name__ == "__main__":
