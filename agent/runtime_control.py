@@ -13,6 +13,8 @@ from .alpaca_domain import OrderRequest
 from .alpaca_provider import AlpacaError
 from .execution_lifecycle import (
     _TERMINAL_ORDER_STATUSES,
+    _leg_live,
+    _leg_rows,
     _plain,
     _value,
 )
@@ -52,16 +54,41 @@ class RuntimeControlMixin:
             if temporary:
                 self._release_lock()
 
+    def _protected_legs_by_symbol(self) -> dict[str, list[dict]]:
+        """Durable live protective legs, keyed by the symbol they protect."""
+        try:
+            active = state.load_state().get("active_trades", {})
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(active, Mapping):
+            return {}
+        found = {}
+        for symbol, trade in active.items():
+            live = [leg for leg in _leg_rows(trade) if _leg_live(leg)]
+            if live:
+                found[str(symbol).upper()] = live
+        return found
+
     def _flatten_all_impl(self, reason: str = "operator") -> bool:
         def order_status(order: Any) -> str:
             value = _value(order, "status", "")
             return str(getattr(value, "value", value)).split(".")[-1].lower()
 
-        try:
-            self.provider.cancel_all_orders()
-        except Exception as exc:  # noqa: BLE001
-            self._event("flatten_cancel_error", {"reason": str(exc)})
-            return False
+        # Cancelling a bracket parent cancels its protective legs, so a bulk
+        # cancel run before the flatten completes strips protection from every
+        # position at once and keeps it stripped for the whole retry budget.
+        # While protected positions exist, each symbol's legs are cancelled
+        # immediately before that symbol's close, and the bulk sweep is
+        # deferred until the book is flat.
+        protected = self._protected_legs_by_symbol()
+        swept = False
+        if not protected:
+            try:
+                self.provider.cancel_all_orders()
+            except Exception as exc:  # noqa: BLE001
+                self._event("flatten_cancel_error", {"reason": str(exc)})
+                return False
+            swept = True
         submitted: dict[str, dict[str, Any]] = {}
         retryable = {"canceled", "cancelled", "expired", "rejected",
                      "failed", "not_found"}
@@ -83,6 +110,18 @@ class RuntimeControlMixin:
                 order for order in (broker_orders or [])
                 if order_status(order) not in _TERMINAL_ORDER_STATUSES
             ]
+            if not positions and not swept:
+                try:
+                    self.provider.cancel_all_orders()
+                    broker_orders = self.provider.orders()
+                except Exception as exc:  # noqa: BLE001
+                    self._event("flatten_cancel_error", {"reason": str(exc)})
+                    return False
+                swept = True
+                working_orders = [
+                    order for order in (broker_orders or [])
+                    if order_status(order) not in _TERMINAL_ORDER_STATUSES
+                ]
             if not positions and not working_orders:
                 try:
                     self.reconcile()
@@ -109,6 +148,12 @@ class RuntimeControlMixin:
                     close_attempt = int(prior.get("attempt", 0)) + 1
                 else:
                     close_attempt = 0
+                legs = protected.get(symbol) or []
+                if legs and not self._cancel_protective_legs(symbol, legs):
+                    # A resting leg reserves the quantity; never submit a close
+                    # that the broker would bounce.
+                    return False
+                protected.pop(symbol, None)
                 close = getattr(self.provider, "close_position", None)
                 if callable(close):
                     client_order_id = self._client_id(

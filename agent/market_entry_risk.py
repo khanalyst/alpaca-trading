@@ -470,9 +470,26 @@ class MarketEntryRiskMixin:
         except ValueError as exc:
             self._event("execution_reject", {"symbol": symbol, "reason": str(exc)})
             return None
-        return OrderRequest(symbol, qty, side, type=order_type,
-                            time_in_force=tif, limit_price=limit,
-                            client_order_id=self._client_id("open", signal)), plan
+        # A shares order's instrument is the underlying, so the instrument-level
+        # stop/target are the same prices the bracket legs must carry.  The
+        # separate underlying_* fields only diverge for the option profile,
+        # which cannot be bracketed at all.
+        stop_loss = self._number(plan.get("stop_price"))
+        take_profit = self._number(plan.get("target_price"))
+        try:
+            if stop_loss is None or take_profit is None:
+                raise ValueError("equity entry requires a stop and target for broker protection")
+            request = OrderRequest(
+                symbol, qty, side, type=order_type, time_in_force=tif,
+                limit_price=limit, client_order_id=self._client_id("open", signal),
+                order_class="bracket", take_profit=Decimal(str(take_profit)),
+                stop_loss=Decimal(str(stop_loss)))
+        except (ValueError, ArithmeticError) as exc:
+            # A bracket the broker would reject must never be downgraded to an
+            # unprotected entry; report it and take no position.
+            self._event("execution_reject", {"symbol": symbol, "reason": str(exc)})
+            return None
+        return request, plan
 
     def _client_id(self, action: str, signal: Mapping, attempt: int = 0) -> str:
         execution = self.cfg.get("execution", {})

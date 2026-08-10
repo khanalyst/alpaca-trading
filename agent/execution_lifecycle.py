@@ -56,6 +56,39 @@ def _hold_expired(trade: Any, now: datetime) -> bool:
     return now.timestamp() >= deadline
 
 
+def _protective_legs(legs: Any) -> list[dict]:
+    """Reduce normalized broker legs to the durable protection record."""
+    rows = []
+    for leg in legs or ():
+        if not isinstance(leg, Mapping):
+            continue
+        leg_id = str(leg.get("id") or leg.get("order_id") or "").strip()
+        if not leg_id:
+            continue
+        price = leg.get("stop_price") if leg.get("role") == "stop" else leg.get("limit_price")
+        rows.append({"order_id": leg_id,
+                     "role": str(leg.get("role") or "target"),
+                     "status": str(leg.get("status") or "").lower(),
+                     "price": float(price) if price is not None else None})
+    return rows
+
+
+def _leg_rows(trade: Any) -> list[dict]:
+    if not isinstance(trade, Mapping):
+        return []
+    return [leg for leg in (trade.get("protective_legs") or [])
+            if isinstance(leg, dict) and leg.get("order_id")]
+
+
+def _leg_live(leg: Mapping) -> bool:
+    return str(leg.get("status", "")).lower() not in _TERMINAL_ORDER_STATUSES
+
+
+def _broker_protected(legs: list[dict]) -> bool:
+    """Only a complete live pair is protection; a half-bracket is not."""
+    return {"stop", "target"} <= {str(leg.get("role")) for leg in legs if _leg_live(leg)}
+
+
 def _value(obj: Any, name: str, default=None):
     if isinstance(obj, Mapping):
         return obj.get(name, default)
@@ -90,6 +123,8 @@ class ExecutionLifecycleMixin:
             "side": request.side, "type": request.type,
             "time_in_force": request.time_in_force,
             "position_intent": request.position_intent,
+            "order_class": request.order_class,
+            "protective_legs": _protective_legs(getattr(order, "legs", ())),
             "risk_plan": _plain(risk_plan), "fill_logged": False,
             "logged_filled_qty": 0.0,
             "updated_ts": time.time(),
@@ -148,6 +183,12 @@ class ExecutionLifecycleMixin:
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
             "contract_multiplier": plan.get("contract_multiplier", 1),
         }
+        # The broker-resident bracket legs are the position's real protection.
+        # Keep the ids observed at submission; a later reconciliation refreshes
+        # their status but must not lose the association.
+        legs = _leg_rows(order_state) or _leg_rows(existing)
+        if legs:
+            trade["protective_legs"] = [dict(leg) for leg in legs]
         # A newly observed fill may precede the broker position endpoint.  An
         # explicit false marker lets reconciliation retain that exposure over
         # repeated empty-position snapshots; legacy trades without this field
@@ -161,7 +202,7 @@ class ExecutionLifecycleMixin:
         current.setdefault("protection", {})[symbol] = {
             key: trade.get(key) for key in (
                 "underlying_symbol", "stop_price", "target_price", "force_flat_at",
-                "max_hold_bars", "hold_deadline_ts")
+                "max_hold_bars", "hold_deadline_ts", "protective_legs")
         }
         logged_qty = self._number(order_state.get("logged_filled_qty")) or 0.0
         if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
@@ -236,6 +277,49 @@ class ExecutionLifecycleMixin:
             raise AlpacaError(f"{self._preflight_error}: {exc}") from exc
         return result
 
+    def _cancel_protective_legs(self, symbol: str, legs: list[dict]) -> bool:
+        """Cancel resting bracket legs before any close, or refuse to close.
+
+        A live leg reserves the position quantity at the broker, so a close
+        submitted underneath it is rejected for insufficient quantity.  A
+        cancel that cannot be proven leaves the close unsafe to send.
+        """
+        live = [leg for leg in legs if _leg_live(leg)]
+        if not live:
+            return True
+        cancel = getattr(self.provider, "cancel_order", None)
+        if not callable(cancel):
+            self._event("protection_cancel_failed", {
+                "symbol": symbol, "reason": "provider cannot cancel one order"})
+            return False
+        cancelled = []
+        for leg in live:
+            leg_id = str(leg.get("order_id"))
+            try:
+                cancel(leg_id)
+            except Exception as exc:  # noqa: BLE001
+                self._event("protection_cancel_failed", {
+                    "symbol": symbol, "order_id": leg_id, "error": str(exc)})
+                return False
+            cancelled.append(leg_id)
+            leg["status"] = "canceled"
+        def mark(current: dict) -> dict:
+            for bucket in ("active_trades", "protection"):
+                row = current.get(bucket, {}).get(symbol)
+                for leg in _leg_rows(row):
+                    if str(leg.get("order_id")) in cancelled:
+                        leg["status"] = "canceled"
+            return current
+        try:
+            state.update_state(mark)
+        except Exception as exc:  # noqa: BLE001
+            self._event("protection_cancel_failed", {
+                "symbol": symbol, "reason": f"cancel not durable: {exc}"})
+            return False
+        self._event("protection_cancelled", {"symbol": symbol,
+                                              "order_ids": cancelled})
+        return True
+
     def _protection_price(self, trade: Mapping, position: Any,
                           now: datetime) -> float | None:
         """Return the underlying price used by both stock and option exits."""
@@ -288,6 +372,12 @@ class ExecutionLifecycleMixin:
                 # retried if the broker still reports residual quantity.
                 if saved_status and saved_status not in _TERMINAL_ORDER_STATUSES:
                     continue
+            legs = _leg_rows(trade)
+            if any(str(leg.get("status", "")).lower() == "filled" for leg in legs):
+                # A filled child leg is the close itself; reconciliation books
+                # it.  Sending anything here would double-close.
+                continue
+            protected = _broker_protected(legs)
             price = self._protection_price(trade, position, now) if isinstance(trade, Mapping) else None
             direction = str(trade.get("direction", _value(position, "side", "long"))).lower()
             stop = self._number(trade.get("stop_price"))
@@ -297,6 +387,16 @@ class ExecutionLifecycleMixin:
                 reason = "before_close"
             elif not trade or stop is None or target is None:
                 reason = "protection_missing"
+            elif legs and not protected:
+                # Recorded legs that are no longer live at the broker leave an
+                # open position unprotected; close it fail-closed.
+                self._event("unprotected_position", {"symbol": symbol,
+                                                      "reason": "protective_legs_terminal"})
+                reason = "protection_missing"
+            elif protected:
+                # The broker owns the stop and target exits.  A local price
+                # crossing must not race its own resting legs.
+                reason = None
             elif price is not None and direction in {"long", "buy"}:
                 if stop is not None and price <= stop:
                     reason = "stop"
@@ -312,10 +412,16 @@ class ExecutionLifecycleMixin:
                 # fire without a tradable price rather than be reported as a
                 # market-data outage.
                 reason = "max_hold"
-            if reason is None and price is None:
+            if reason is None and price is None and not protected:
+                # Missing local prices are only an emergency while the local
+                # poller is the protection.
                 reason = "protection_data_unavailable"
             if reason:
                 try:
+                    if not self._cancel_protective_legs(symbol, legs):
+                        failed.append({"symbol": symbol, "reason": reason,
+                                       "error": "protective legs could not be cancelled"})
+                        continue
                     prior_attempt = self._number(trade.get("closing_attempt")) \
                         if isinstance(trade, Mapping) else None
                     attempt = int(prior_attempt) + 1 if prior_attempt is not None else 0
@@ -404,6 +510,46 @@ class ExecutionLifecycleMixin:
                  if getattr(order, "id", None)}
         by_client = {str(getattr(order, "client_order_id", "")): order
                      for order in broker_orders if getattr(order, "client_order_id", None)}
+        # Bracket child legs arrive as broker orders with no local ``orders``
+        # row, so the loop below never sees them.  They are associated to
+        # their parent trade only through the leg ids persisted at activation,
+        # and they still pass the instrument/day-TIF assertions above because
+        # the broker creates them on the same equity symbol with the parent's
+        # day time-in-force.
+        for symbol, trade in previous.items():
+            legs = _leg_rows(trade)
+            if not legs:
+                continue
+            for leg in legs:
+                broker_leg = by_id.get(str(leg.get("order_id")))
+                if broker_leg is None:
+                    leg["status"] = "not_found"
+                    continue
+                leg["status"] = str(getattr(broker_leg, "status", "") or "").lower()
+                filled_qty = self._number(getattr(broker_leg, "filled_qty", None)) or 0.0
+                if leg["status"] != "filled" and filled_qty <= 0:
+                    continue
+                if trade.get("closing_order_id"):
+                    # An exit is already booked against this trade; a leg can
+                    # never add a second close for the same position.
+                    continue
+                leg_id = str(leg.get("order_id"))
+                trade.update({
+                    "status": "closing", "closing_reason": str(leg.get("role")),
+                    "closing_price": self._number(
+                        getattr(broker_leg, "filled_avg_price", None)),
+                    "closing_order_id": leg_id, "updated_ts": time.time()})
+                order_state.setdefault(leg_id, {
+                    "order_id": leg_id, "symbol": symbol,
+                    "status": leg["status"], "qty": str(getattr(broker_leg, "qty", "")),
+                    "side": str(getattr(broker_leg, "side", "")),
+                    "action": "close", "reason": str(leg.get("role")),
+                    "updated_ts": time.time()})
+            if (not trade.get("closing_order_id") and not _broker_protected(legs) and
+                    str(trade.get("status", "")).lower() == "open"):
+                self._event("unprotected_position", {
+                    "symbol": symbol, "reason": "protective_legs_terminal"})
+
         for key, saved in list(order_state.items()):
             if not isinstance(saved, dict):
                 continue

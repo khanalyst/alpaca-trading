@@ -90,6 +90,11 @@ def _option_row_contract(row: Any, symbol: str) -> OptionContract:
     return OptionContract.from_sdk(merged)
 
 
+_PROTECTIVE_LEG_TYPES = {"limit", "stop", "stop_limit"}
+# Submission still rejects stop orders (see OrderRequest); these are the types
+# a broker reports back for the child legs of a bracket the broker owns.
+_BROKER_ORDER_TYPES = {"market", "limit", "stop", "stop_limit"}
+
 _TERMINAL_ORDER_STATUSES = {
     "filled", "canceled", "cancelled", "expired", "rejected", "done", "closed",
     "done_for_day", "replaced", "stopped", "suspended", "failed", "not_found",
@@ -373,21 +378,57 @@ class AlpacaProvider(AlpacaMarketDataMixin):
         if side not in {"buy", "sell"}:
             raise AlpacaError("broker order side must be buy or sell")
         order_type = _text(_value(row, "type", None)).strip()
-        if order_type not in {"market", "limit"}:
-            raise AlpacaError("broker order type must be market or limit")
+        if order_type not in _BROKER_ORDER_TYPES:
+            raise AlpacaError("broker order type must be market, limit, stop or stop_limit")
         tif = _text(_value(row, "time_in_force", None)).strip()
         if not tif:
             raise AlpacaError("broker order time_in_force is required")
         if tif != "day":
             raise AlpacaError("broker order time_in_force must be day")
         filled_avg_price = _optional_decimal(_value(row, "filled_avg_price"), "broker order filled_avg_price")
+        raw_legs = _value(row, "legs", None) or ()
+        if isinstance(raw_legs, Mapping):
+            raw_legs = [raw_legs]
         return Order(id=order_id, symbol=symbol, qty=qty, side=side,
                      status=status, type=order_type, time_in_force=tif,
                      client_order_id=_value(row, "client_order_id"),
                      filled_qty=filled_qty, filled_avg_price=filled_avg_price,
                      submitted_at=_dt(_value(row, "submitted_at")),
                      updated_at=_dt(_value(row, "updated_at")),
+                     legs=tuple(self._order_leg(leg) for leg in raw_legs),
                      raw=_mapping(row))
+
+    def _order_leg(self, row: Any) -> dict[str, Any]:
+        """Normalize one bracket child leg; no SDK object crosses upward."""
+        leg_id = str(_value(row, "id", "") or "").strip()
+        if not leg_id:
+            raise AlpacaError("broker order leg id is required")
+        status = _text(_value(row, "status", None)).strip()
+        if not status:
+            raise AlpacaError("broker order leg status is required")
+        leg_type = _text(_value(row, "type", None)).strip()
+        if leg_type not in _PROTECTIVE_LEG_TYPES:
+            raise AlpacaError("broker order leg type must be limit, stop or stop_limit")
+        side = _text(_value(row, "side", None)).strip()
+        if side not in {"buy", "sell"}:
+            raise AlpacaError("broker order leg side must be buy or sell")
+        # A stop-priced leg is the protective stop; the remaining limit leg is
+        # the take-profit target.  The role is what execution reasons about.
+        stop_price = _optional_decimal(_value(row, "stop_price"), "broker order leg stop_price")
+        return {
+            "id": leg_id,
+            "symbol": validate_instrument(_value(row, "symbol", "")),
+            "side": side, "type": leg_type, "status": status,
+            "role": "stop" if leg_type in {"stop", "stop_limit"} or stop_price is not None else "target",
+            "qty": _optional_decimal(_value(row, "qty"), "broker order leg qty"),
+            "filled_qty": _optional_decimal(_value(row, "filled_qty"),
+                                            "broker order leg filled_qty"),
+            "filled_avg_price": _optional_decimal(
+                _value(row, "filled_avg_price"), "broker order leg filled_avg_price"),
+            "limit_price": _optional_decimal(_value(row, "limit_price"),
+                                             "broker order leg limit_price"),
+            "stop_price": stop_price,
+        }
 
     def _verify_existing_order(self, request: OrderRequest, existing: Order) -> None:
         """Ensure an idempotency hit is the same economic order request."""

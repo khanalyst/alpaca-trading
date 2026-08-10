@@ -240,7 +240,12 @@ append-only and can demote an edge; they cannot manufacture a proof.
   fingerprint must agree.
 - The Alpaca clock/calendar controls session eligibility; no local weekday
   approximation can authorize an entry.
-- Only day orders are supported. Extended-hours and stop orders are rejected.
+- Only day orders are supported. Extended-hours orders and locally submitted
+  stop orders are rejected; the equity profile's protection is a broker-side
+  bracket whose stop/target child legs the broker itself creates and owns.
+- An equity entry is submitted as a bracket or not at all. The local poller is
+  a backstop for exits the legs cannot express (session force-flat, bounded
+  hold, and lost protection) and must cancel the legs before any close.
 - Startup and shutdown are reconciled; exposure or ambiguous broker state
   blocks entries and pauses safely.
 - A durable operator pause survives restart until authenticated flat-only

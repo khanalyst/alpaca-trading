@@ -517,6 +517,8 @@ class Order:
     filled_avg_price: Decimal | None = None
     submitted_at: datetime | None = None
     updated_at: datetime | None = None
+    # Bracket child legs, provider-neutral and already normalized.
+    legs: tuple[Mapping[str, Any], ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
