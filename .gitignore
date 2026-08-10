@@ -1,5 +1,8 @@
 .env
 runtime/
+
+# Agent tooling scratch: throwaway git worktrees, not project content.
+.claude/worktrees/
 __pycache__/
 *.pyc
 .DS_Store
