@@ -91,6 +91,28 @@ if [[ "$recorded_root" != /* ]]; then
   recorded_root="$repo_root/$recorded_root"
 fi
 
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/alpaca-research.XXXXXX")"
+
+# The recorder partitions its corpus by session date. Concatenate the requested
+# window of partitions once, in order, instead of keeping an unbounded file.
+merge_partitions() {
+  local root="$1"
+  local window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
+  local merged="$tmp_dir/market.csv"
+  local -a files
+  mapfile -t files < <(ls -1 "$root"/market-*.csv 2>/dev/null | sort)
+  [ "${#files[@]}" -gt 0 ] || return 1
+  if [ "$window" -gt 0 ] && [ "${#files[@]}" -gt "$window" ]; then
+    files=("${files[@]: -$window}")
+  fi
+  head -n 1 "${files[0]}" > "$merged"
+  local file
+  for file in "${files[@]}"; do
+    tail -n +2 "$file" >> "$merged"
+  done
+  printf '%s' "$merged"
+}
+
 if [ -z "$dataset" ]; then
   for candidate in "$recorded_root/market.jsonl" "$recorded_root/market.csv"; do
     if [ -s "$candidate" ]; then
@@ -98,6 +120,12 @@ if [ -z "$dataset" ]; then
       break
     fi
   done
+fi
+if [ -z "$dataset" ] && [ -d "$recorded_root/sessions" ]; then
+  dataset="$(merge_partitions "$recorded_root/sessions" || true)"
+fi
+if [ -n "$dataset" ] && [ -d "$dataset/sessions" ]; then
+  dataset="$(merge_partitions "$dataset/sessions" || true)"
 fi
 if [ -n "$dataset" ] && [ "$dataset" != "-" ] && [[ "$dataset" != /* ]]; then
   dataset="$repo_root/$dataset"
@@ -114,7 +142,6 @@ if [ -z "$dataset" ] || { [ "$dataset" != "-" ] && { [ -d "$dataset" ] || [ ! -s
   finish "no_data" "recorded dataset unavailable" 2
 fi
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/alpaca-research.XXXXXX")"
 validated_input="$dataset"
 if [ "$dataset" = "-" ]; then
   validated_input="$tmp_dir/input.jsonl"
@@ -211,6 +238,18 @@ with open(source, encoding="utf-8") as source_handle, open(
             quotes_output.write(serialized)
 PY
 fi
+
+# Report what each view actually received. Routing quotes into their own view
+# is only useful if rows arrive there, and that is otherwise invisible.
+"$python_bin" - "$bars_input" "$quotes_input" "$options_input" <<'PY' >&2
+import json
+import sys
+
+print(json.dumps({"schema": "research-cycle-views.v1", **{
+    name: sum(1 for line in open(path, encoding="utf-8") if line.strip())
+    for name, path in zip(("bars", "quotes", "options"), sys.argv[1:])}},
+    sort_keys=True))
+PY
 
 # A CSV containing only its header is not a usable research dataset even
 # though the source file itself is non-empty.

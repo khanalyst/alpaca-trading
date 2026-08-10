@@ -108,6 +108,106 @@ class _MismatchedOptionFake(_OptionFake):
         return [{**row, "underlying": "BTC"} for row in rows]
 
 
+class _CalendarFake:
+    """Two regular sessions, one 13:00 early close and one missing holiday."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def calendar(self, start=None, end=None):
+        self.calls += 1
+        return [{"date": "2026-08-04", "open": "09:30", "close": "16:00"},
+                {"date": "2026-08-06", "open": "09:30", "close": "16:00"},
+                {"date": "2026-08-07", "open": "09:30", "close": "13:00"}]
+
+
+def _corpus_rows(*, sessions: int, per_session: int, minute: int = 0) -> list[dict]:
+    """Synthesize a durable corpus ending the session before the fakes' rows."""
+    from deploy.recorder_market import _event_key
+    rows = []
+    for index in range(sessions):
+        day = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc) - timedelta(
+            days=sessions - index)
+        for step in range(per_session):
+            stamp = (day + timedelta(minutes=minute + step)).isoformat()
+            rows.append({"event_key": _event_key("bar_1m", "SPY", stamp),
+                         "observed_at": stamp, "provider": "alpaca", "feed": "iex",
+                         "event_type": "bar_1m", "symbol": "SPY",
+                         "timestamp": stamp, "as_of": stamp, "open": 100,
+                         "high": 101, "low": 99, "close": 100.5, "volume": 10})
+    return rows
+
+
+def _write_flat_corpus(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=recorder.FIELDS)
+        writer.writeheader()
+        writer.writerows({field: row.get(field, "") for field in recorder.FIELDS}
+                         for row in rows)
+
+
+def _replay_corpus_csv(*, quotes: bool = True, sessions: int = 1) -> str:
+    """One tradable IBR session per day, with quotes priced away from the bar."""
+    from deploy.recorder_market import _event_key
+    from zoneinfo import ZoneInfo
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=recorder.FIELDS)
+    writer.writeheader()
+    open_bell = datetime(2026, 8, 3, 9, 30, tzinfo=ZoneInfo("America/New_York"))
+    for session in range(sessions):
+        day = open_bell + timedelta(days=session)
+        for minute in range(60):
+            stamp = (day + timedelta(minutes=minute)).astimezone(timezone.utc).isoformat()
+            if minute < 15:
+                values = (100.0, 100.5, 99.8, 100.2)
+            elif minute == 15:
+                values = (100.2, 101.5, 100.2, 101.4)
+            else:
+                base = 101.4 + minute * 0.02
+                values = (base, base + 0.3, base - 0.1, base + 0.2)
+            writer.writerow({
+                "event_key": _event_key("bar_1m", "SPY", stamp), "observed_at": stamp,
+                "provider": "alpaca", "feed": "iex", "event_type": "bar_1m",
+                "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
+                "open": values[0], "high": values[1], "low": values[2],
+                "close": values[3], "volume": 1000})
+            if quotes:
+                writer.writerow({
+                    "event_key": _event_key("quote", "SPY", stamp), "observed_at": stamp,
+                    "provider": "alpaca", "feed": "iex", "event_type": "quote",
+                    "symbol": "SPY", "timestamp": stamp, "as_of": stamp,
+                    "bid": values[0] - 0.5, "ask": values[0] + 0.5,
+                    "bid_size": 10, "ask_size": 10})
+    return buffer.getvalue()
+
+
+def _run_research_cycle(dataset: Path | str, root: Path, **env):
+    return subprocess.run(
+        ["deploy/research-cycle.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=dict(os.environ, PYTHON=sys.executable,
+                 ALPACA_RESEARCH_DATASET=str(dataset),
+                 ALPACA_FACTORY_ENABLED="0",
+                 ALPACA_EDGE_DB=str(root / "edge.sqlite3"), **env),
+        capture_output=True, text=True, check=False)
+
+
+def _cycle_payloads(text: str, key: str) -> list[dict]:
+    payloads = []
+    for line in text.splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and key in payload:
+            payloads.append(payload)
+    return payloads
+
+
+_corpus_iterator = recorder.iter_corpus_rows
+
+
 class _StockDataFake:
     def __init__(self):
         self.bar_request = None
@@ -256,9 +356,13 @@ class DeployTests(unittest.TestCase):
                 "bar_1m,SPY,2026-08-08T13:30:00+00:00\n",
                 encoding="utf-8")
             self.assertEqual(recorder.record_once(fake, ["SPY"], path), 1)
-            with path.open(newline="", encoding="utf-8") as handle:
+            partitions = recorder.corpus_partitions(path)
+            self.assertEqual([item.name for item in partitions],
+                             ["market-2026-08-08.csv"])
+            with partitions[0].open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(list(rows[0]), list(recorder.FIELDS))
+            self.assertFalse(path.exists())
             self.assertEqual(recorder.record_once(fake, ["SPY"], path), 0)
 
     def test_research_cycle_uses_recorded_csv_and_initializes_edge_ledger(self):
@@ -285,6 +389,44 @@ class DeployTests(unittest.TestCase):
             with closing(sqlite3.connect(edge_db)) as db:
                 self.assertGreater(db.execute(
                     "SELECT COUNT(*) FROM candidates").fetchone()[0], 0)
+
+    def test_research_cycle_routes_recorded_quotes_into_the_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summaries = {}
+            for label in ("quotes", "bars_only"):
+                dataset = root / f"{label}.csv"
+                dataset.write_text(_replay_corpus_csv(quotes=label == "quotes"),
+                                   encoding="utf-8")
+                result = _run_research_cycle(dataset, root / label)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                views = _cycle_payloads(result.stderr, "schema")
+                views = [item for item in views
+                         if item["schema"] == "research-cycle-views.v1"][0]
+                self.assertEqual(views["quotes"], 60 if label == "quotes" else 0)
+                self.assertEqual(views["bars"], 60)
+                summaries[label] = _cycle_payloads(result.stdout, "vehicle")[0]
+            # The routed quotes are the executable price at the fill instant,
+            # so a corpus carrying them must not replay like the bars alone.
+            self.assertEqual(summaries["quotes"]["trades"], 1)
+            self.assertEqual(summaries["bars_only"]["trades"], 1)
+            self.assertNotEqual(summaries["quotes"]["net_pnl"],
+                                summaries["bars_only"]["net_pnl"])
+
+    def test_research_cycle_reads_a_partitioned_corpus_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "recorded"
+            path = corpus / "market.csv"
+            _write_flat_corpus(path, _corpus_rows(sessions=4, per_session=3))
+            recorder.migrate_corpus(path)
+            result = _run_research_cycle(
+                "", root, ALPACA_RECORDED_DATASET_ROOT=str(corpus),
+                ALPACA_RESEARCH_SESSION_WINDOW="2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            views = [item for item in _cycle_payloads(result.stderr, "schema")
+                     if item["schema"] == "research-cycle-views.v1"][0]
+            self.assertEqual(views["bars"], 6)  # two sessions, not twelve
 
     def test_research_cycle_reports_no_data_as_structured_nonzero_outcome(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -406,11 +548,12 @@ class DeployTests(unittest.TestCase):
                                                   feed="sip"), 2)
             self.assertEqual(recorder.record_once(fake, ["SPY"], path,
                                                   feed="sip"), 0)
-            rows = path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(rows), 3)  # header plus one bar and quote
+            rows = list(recorder.iter_corpus_rows(path))
+            self.assertEqual(len(rows), 2)  # one bar and one quote
             self.assertEqual(fake.seen, [("bars", "sip"), ("quotes", "sip"),
                                          ("bars", "sip"), ("quotes", "sip")])
-            self.assertEqual(len({row.split(",", 1)[0] for row in rows[1:]}), 2)
+            self.assertEqual(len({row["event_key"] for row in rows}), 2)
+            self.assertTrue(all(row["feed"] == "sip" for row in rows))
 
     def test_recorder_resumes_from_durable_watermark_after_long_outage(self):
         fake = _WindowFake()
@@ -429,8 +572,7 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "market.csv"
             self.assertEqual(recorder.record_once(fake, ["SPY"], path), 1)
-            with path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
+            rows = list(recorder.iter_corpus_rows(path))
             self.assertEqual([row["event_type"] for row in rows], ["bar_1m"])
 
     def test_recorder_fails_closed_on_corrupt_existing_csv(self):
@@ -477,8 +619,7 @@ class DeployTests(unittest.TestCase):
             path = Path(directory) / "market.csv"
             self.assertEqual(recorder.record_once(
                 fake, ["SPY"], path, include_options=True), 2)
-            with path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
+            rows = list(recorder.iter_corpus_rows(path))
             self.assertEqual({row["event_type"] for row in rows},
                              {"bar_1m", "quote"})
 
@@ -510,6 +651,149 @@ class DeployTests(unittest.TestCase):
               "timestamp": (previous + timedelta(minutes=1)).isoformat()}],
             {"SPY": previous}, previous + timedelta(minutes=1), ["SPY"])
 
+    def test_recorder_partitions_by_session_and_migrates_a_legacy_corpus(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            legacy = _corpus_rows(sessions=3, per_session=4)
+            _write_flat_corpus(path, legacy)
+            self.assertEqual(recorder.migrate_corpus(path), len(legacy))
+            self.assertEqual(
+                [item.name for item in recorder.corpus_partitions(path)],
+                ["market-2026-08-05.csv", "market-2026-08-06.csv",
+                 "market-2026-08-07.csv"])
+            self.assertFalse(path.exists())
+            self.assertTrue(path.with_name("market.csv.migrated").is_file())
+            migrated = list(recorder.iter_corpus_rows(path))
+            self.assertEqual([row["event_key"] for row in migrated],
+                             [row["event_key"] for row in legacy])
+            # The first cycle after the upgrade resumes from the migrated
+            # watermark instead of rewriting anything.
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 2)
+            self.assertEqual(len(recorder.corpus_partitions(path)), 4)
+
+    def test_recorder_rejects_duplicate_keys_and_rebuilds_a_stale_index(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=4)
+            recorder._append_partitions(path, rows)
+            recorder._save_index(path, recorder._scan_corpus(path))
+            index = Path(directory) / recorder.INDEX_NAME
+            self.assertTrue(index.is_file())
+            # A cycle that appended rows and died before rewriting the index
+            # leaves partition sizes disagreeing with it; that must rebuild.
+            recorder._append_partitions(path, _corpus_rows(
+                sessions=1, per_session=2, minute=90))
+            self.assertIsNone(recorder._load_index(path))
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 2)
+            keys = [row["event_key"] for row in recorder.iter_corpus_rows(path)]
+            self.assertEqual(len(keys), len(set(keys)))
+            recorder._append_partitions(path, rows[:1])
+            with self.assertRaisesRegex(RuntimeError, "repeats event_key"):
+                recorder._scan_corpus(path)
+
+    def test_recorder_refuses_rows_older_than_the_dedup_window(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            self.assertEqual(recorder.record_once(fake, ["SPY"], path), 2)
+            state = recorder._load_index(path)
+            state["watermark"] = (
+                datetime(2026, 8, 8, 13, 30, tzinfo=timezone.utc) +
+                recorder.DEDUP_HORIZON + timedelta(minutes=5)).isoformat()
+            recorder._save_index(path, state)
+            with self.assertRaisesRegex(RuntimeError, "older than the dedup window"):
+                recorder.record_once(fake, ["SPY"], path)
+
+    def test_recorder_cycle_cost_stays_flat_as_the_corpus_grows(self):
+        counts = []
+
+        def counting(output):
+            rows = 0
+            for row in _corpus_iterator(output):
+                rows += 1
+                yield row
+            counts.append(rows)
+
+        with tempfile.TemporaryDirectory() as directory:
+            measured = {}
+            for label, sessions in (("small", 3), ("large", 30)):
+                root = Path(directory) / label
+                path = root / "market.csv"
+                rows = _corpus_rows(sessions=sessions, per_session=200)
+                recorder._append_partitions(path, rows)
+                recorder._save_index(path, recorder._scan_corpus(path))
+                self.assertEqual(len(recorder.corpus_partitions(path)), sessions)
+                with patch.object(recorder, "iter_corpus_rows", counting):
+                    counts.clear()
+                    recorder.record_once(_MarketFake(), ["SPY"], path)
+                    steady = sum(counts)
+                    counts.clear()
+                    recorder._scan_corpus(path)
+                    measured[label] = (steady, sum(counts), len(rows))
+            # A steady cycle reads no durable rows at either size, while the
+            # recovery scan it replaced still grows with the corpus.
+            self.assertEqual(measured["small"][0], 0)
+            self.assertEqual(measured["large"][0], 0)
+            self.assertGreaterEqual(
+                measured["large"][1] / measured["small"][1],
+                0.9 * measured["large"][2] / measured["small"][2])
+
+    def test_recorder_keeps_calendar_holidays_and_early_closes_quiet(self):
+        calendar = recorder.CalendarCache(_CalendarFake())
+        zone = recorder.NEW_YORK
+        gap = timedelta(hours=2)
+        trading = datetime(2026, 8, 6, 10, 0, tzinfo=zone)
+        self.assertTrue(recorder._regular_session_gap(
+            trading, trading + gap, calendar))
+        holiday = datetime(2026, 8, 5, 10, 0, tzinfo=zone)  # weekday, shut
+        self.assertFalse(recorder._regular_session_gap(
+            holiday, holiday + gap, calendar))
+        self.assertTrue(recorder._regular_session_gap(
+            holiday, holiday + gap))  # no calendar: heuristic still fails closed
+        early = datetime(2026, 8, 7, 12, 55, tzinfo=zone)  # closes 13:00
+        self.assertFalse(recorder._regular_session_gap(
+            early, early + gap, calendar))
+        self.assertEqual(calendar.provider.calls, 1)
+
+    def test_recorder_keeps_pinned_option_contracts_in_the_sample(self):
+        from deploy import recorder_market
+        fake = _OptionFake()
+        quotes = fake.quotes(["SPY"], start=None, end=None, feed="iex")
+        now = datetime(2026, 8, 8, 13, 31, tzinfo=timezone.utc)
+        expiry = datetime.now(timezone.utc).date() + timedelta(days=30)
+        drifted = f"SPY{expiry:%y%m%d}C00105000"
+
+        def sample(pinned=frozenset()):
+            return [row["contract"] for row in recorder_market._option_rows(
+                fake, ["SPY"], quotes, now, feed="iex", config=None, limit=2,
+                pinned=pinned)]
+
+        self.assertNotIn(drifted, sample())
+        self.assertIn(drifted, sample(frozenset({drifted})))
+        self.assertEqual(len(sample(frozenset({drifted}))), len(sample()) + 1)
+
+    def test_recorder_pins_sampled_contracts_until_the_hold_expires(self):
+        fake = _OptionFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            recorder.record_once(fake, ["SPY"], path, include_options=True,
+                                 option_limit=1)
+            pins = recorder._load_index(path)["option_pins"]
+            self.assertEqual(len(pins), 2)
+            self.assertTrue(all(value > datetime.now(timezone.utc).isoformat()
+                                for value in pins.values()))
+            recorder.record_once(fake, ["SPY"], path, include_options=True,
+                                 option_limit=1,
+                                 option_hold=timedelta(seconds=-1))
+            expired = recorder._load_index(path)["option_pins"]
+            self.assertEqual(set(expired), set(pins))
+            self.assertTrue(all(value < datetime.now(timezone.utc).isoformat()
+                                for value in expired.values()))
+            self.assertEqual(recorder.record_once(
+                fake, ["SPY"], path, include_options=True, option_limit=1), 0)
+
     def test_recorder_records_bounded_lossless_option_snapshots(self):
         from research.market_data import normalize_option_snapshot
         fake = _OptionFake()
@@ -526,8 +810,7 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(fake.option_calls,
                              [("SPY", 100.5, "indicative", 7, 60),
                               ("SPY", 100.5, "indicative", 7, 60)])
-            with path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
+            rows = list(recorder.iter_corpus_rows(path))
             options = [row for row in rows if row["event_type"] == "option_snapshot"]
             self.assertEqual(len(options), 10)
             self.assertEqual({row["right"] for row in options}, {"call", "put"})
@@ -554,8 +837,8 @@ class DeployTests(unittest.TestCase):
             path = Path(directory) / "market.csv"
             self.assertEqual(recorder.record_once(fake, ["SPY"], path), 2)
             self.assertEqual(fake.seen, [("bars", "sip"), ("quotes", "sip")])
-            self.assertTrue(all(",sip," in row for row in path.read_text(
-                encoding="utf-8").splitlines()[1:]))
+            self.assertTrue(all(row["feed"] == "sip"
+                                for row in recorder.iter_corpus_rows(path)))
 
     def test_provider_env_feed_wins_over_iex_config_and_is_recorded(self):
         sdk = _StockDataFake()
@@ -574,8 +857,8 @@ class DeployTests(unittest.TestCase):
                 if value is None and isinstance(request, dict):
                     value = request.get("feed")
                 self.assertIn("sip", str(value).lower())
-            self.assertTrue(all(",sip," in row for row in path.read_text(
-                encoding="utf-8").splitlines()[1:]))
+            self.assertTrue(all(row["feed"] == "sip"
+                                for row in recorder.iter_corpus_rows(path)))
 
     def test_health_uses_running_paper_heartbeat_contract(self):
         with tempfile.TemporaryDirectory() as directory:

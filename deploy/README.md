@@ -31,11 +31,27 @@ flattens through its own broker session. It first takes the mode-scoped run
 lock, so a running trader keeps it inert; it can never submit an entry. It
 cannot help when the broker or the network is unreachable.
 
-The research profile is disabled by default. When the recorder has produced
-the mixed bars/quotes/options dataset at
-`runtime/research/recorded/market.csv`, `deploy/research-cycle.sh` discovers
-and routes it automatically; `ALPACA_RESEARCH_DATASET` can override that
-source with normalized JSONL. Start it with
+The recorder writes its mixed bars/quotes/options corpus partitioned by New
+York session date under `runtime/research/recorded/sessions/market-<date>.csv`,
+with a sidecar `.recorder-index.json` holding the watermark, the per-symbol last
+bar, a fifteen-minute dedup window and the option contracts held open for
+continued sampling. A cycle costs O(new rows); the index is verified against
+partition sizes on load and rebuilt from the partitions when they disagree. A
+legacy single-file `market.csv` is partitioned in place on the first run after
+upgrade and kept beside the corpus as `market.csv.migrated`.
+
+Option sampling takes `ALPACA_RECORDER_OPTION_LIMIT` contracts per side per
+sample (default 10, capped at 25) and keeps every contract it has sampled in
+the sample for `ALPACA_RECORDER_OPTION_HOLD_MINUTES` (default 180) so a trade
+opened on a contract still has quotes at its exit. Continuity gaps are judged
+against the Alpaca calendar, cached per fetch window, so holidays and early
+closes are quiet and a genuine intraday hole still fails closed.
+
+The research profile is disabled by default. `deploy/research-cycle.sh`
+discovers and routes the corpus automatically, concatenating partitions in
+session order; `ALPACA_RESEARCH_SESSION_WINDOW` limits that to the most recent
+N sessions, and `ALPACA_RESEARCH_DATASET` can override the source with
+normalized JSONL. Start it with
 `docker compose --profile research up -d research`. The edge ledger is stored
 at `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate broker
