@@ -24,6 +24,7 @@ from agent.contracts.rule import (rule_spec_hash, rule_variant_id,
 
 
 PROPOSAL_SCHEMA = "llm-rule-proposal.v1"
+DISCOVERY_SCHEMA = "llm-edge-discovery.v1"
 DEFAULT_RESPONSE_BYTES = 16_384
 DEFAULT_ATTEMPTS = 2
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -38,6 +39,27 @@ markdown, Python/source code, executable instructions, credentials, market
 rows, or fields outside schema and rule_spec.
 """
 
+# Discovery is the other half of the loop: seeding a free research slot with a
+# genuinely new hypothesis rather than repairing a family that just failed.
+# The grammar is the same audited one, so a discovered edge is validated by
+# exactly the gates every other candidate faces.
+DISCOVERY_SYSTEM_PROMPT = """You propose new bounded intraday edge hypotheses for
+an audited research process.  Return one JSON object and nothing else, exactly:
+{"schema":"llm-edge-discovery.v1","rule_spec":{...},"thesis":"..."}
+The rule_spec must use only the finite rule-strategy grammar.  Set
+"schema":"rule-strategy.v2" inside rule_spec to use the wider grammar, which
+adds: "confirmations" (a list of extra filters from trend/volume/volatility,
+all of which must hold), "entry_after_minutes" and "entry_before_minutes"
+(the minutes-from-09:30-New-York window in which a signal may fire), and
+"min_atr_bps"/"max_atr_bps" (the volatility regime the rule is allowed to
+trade).  Use them to express a conditional edge, not just retuned numbers.
+Propose something structurally different from the already-tried and
+already-proved rules you are shown; a near-duplicate is rejected.  "thesis" is
+one plain sentence, at most 240 characters, saying why the edge should exist.
+Never return markdown, Python/source code, executable instructions,
+credentials, market rows, or fields outside schema, rule_spec and thesis.
+"""
+
 _FORBIDDEN_KEYS = {
     "source", "code", "python", "javascript", "typescript", "shell",
     "exec", "execute", "eval", "command", "raw", "raw_rows", "rows",
@@ -45,6 +67,8 @@ _FORBIDDEN_KEYS = {
     "secret", "password", "credential", "credentials",
 }
 _RESPONSE_KEYS = frozenset(("schema", "rule_spec"))
+_DISCOVERY_RESPONSE_KEYS = frozenset(("schema", "rule_spec", "thesis"))
+MAX_THESIS_CHARS = 240
 
 
 def canonical_json(value: Any) -> str:
@@ -99,15 +123,31 @@ def _finite(value: Any, *, path: str = "value") -> Any:
     raise ValueError(f"{path} must contain JSON-compatible values")
 
 
-def _safe_diagnosis(value: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_diagnosis(value: Mapping[str, Any], *,
+                    label: str = "diagnosis") -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise TypeError("diagnosis must be an aggregate mapping")
-    result = _finite(value, path="diagnosis")
+        raise TypeError(f"{label} must be an aggregate mapping")
+    result = _finite(value, path=label)
     # A bounded aggregate diagnosis should not become an unbounded prompt.
     encoded = canonical_json(result).encode("utf-8")
     if len(encoded) > 8_192:
-        raise ValueError("diagnosis exceeds the 8192-byte aggregate bound")
+        raise ValueError(f"{label} exceeds the 8192-byte aggregate bound")
     return result
+
+
+def _safe_thesis(value: Any) -> str:
+    """Accept one short plain-text rationale; it is evidence, never a command."""
+
+    if not isinstance(value, str):
+        raise ValueError("thesis must be a string")
+    text = " ".join(value.split())
+    if not text:
+        raise ValueError("thesis must not be empty")
+    if len(text) > MAX_THESIS_CHARS:
+        raise ValueError(f"thesis exceeds {MAX_THESIS_CHARS} characters")
+    if "```" in text:
+        raise ValueError("thesis must not contain markdown")
+    return text
 
 
 def _raw_text(value: Any) -> str:
@@ -157,7 +197,10 @@ def _raw_text(value: Any) -> str:
     raise ValueError("provider response did not contain text")
 
 
-def _parse_response(value: Any, *, max_bytes: int) -> tuple[dict[str, Any], str]:
+def _parse_response(value: Any, *, max_bytes: int,
+                    schema: str = PROPOSAL_SCHEMA,
+                    keys: frozenset[str] = _RESPONSE_KEYS
+                    ) -> tuple[dict[str, Any], str]:
     raw = _raw_text(value)
     raw_bytes = raw.encode("utf-8")
     if len(raw_bytes) > max_bytes:
@@ -173,14 +216,14 @@ def _parse_response(value: Any, *, max_bytes: int) -> tuple[dict[str, Any], str]
         raise ValueError("provider response is not strict JSON") from exc
     if not isinstance(parsed, Mapping):
         raise ValueError("provider response must be a JSON object")
-    unknown = set(parsed) - _RESPONSE_KEYS
-    missing = _RESPONSE_KEYS - set(parsed)
+    unknown = set(parsed) - keys
+    missing = keys - set(parsed)
     if unknown:
         raise ValueError(f"proposal response has unknown field(s): {', '.join(sorted(unknown))}")
     if missing:
         raise ValueError(f"proposal response is missing field(s): {', '.join(sorted(missing))}")
-    if parsed.get("schema") != PROPOSAL_SCHEMA:
-        raise ValueError(f"proposal schema must be {PROPOSAL_SCHEMA!r}")
+    if parsed.get("schema") != schema:
+        raise ValueError(f"proposal schema must be {schema!r}")
     if not isinstance(parsed.get("rule_spec"), Mapping):
         raise ValueError("proposal rule_spec must be an object")
     # Catch source/code keys before the rule validator's more general unknown
@@ -276,6 +319,9 @@ class ProposalResult:
     variant_id: str | None = None
     spec_id: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
+    # Discovery proposals carry a one-sentence rationale.  It is recorded as
+    # evidence and shown to operators; nothing reads it as an instruction.
+    thesis: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -288,6 +334,7 @@ class RuleProposalAdapter:
     def __init__(self, provider: str = "openai", *, model: str = "",
                  caller: Callable[..., Any] | None = None,
                  system_prompt: str | None = None,
+                 discovery_prompt: str | None = None,
                  max_attempts: int = DEFAULT_ATTEMPTS,
                  timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                  max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
@@ -307,6 +354,7 @@ class RuleProposalAdapter:
         self.caller = caller
         self.client = client
         self.system_prompt = str(system_prompt or SYSTEM_PROMPT)
+        self.discovery_prompt = str(discovery_prompt or DISCOVERY_SYSTEM_PROMPT)
         self.max_attempts = int(max_attempts)
         self.timeout_seconds = float(timeout_seconds)
         self.max_response_bytes = int(max_response_bytes)
@@ -335,21 +383,24 @@ class RuleProposalAdapter:
         return self.client
 
     @staticmethod
-    def _schema() -> dict[str, Any]:
+    def _schema(name: str = PROPOSAL_SCHEMA) -> dict[str, Any]:
         # OpenAI Responses API JSON schema; Anthropic accepts the same schema
         # under ``output_config.format`` on versions supporting structured
         # outputs.  additionalProperties is deliberately false.
-        return {
-            "type": "object", "additionalProperties": False,
-            "required": ["schema", "rule_spec"],
-            "properties": {
-                "schema": {"type": "string", "const": PROPOSAL_SCHEMA},
-                "rule_spec": {"type": "object", "additionalProperties": True},
-            },
+        properties: dict[str, Any] = {
+            "schema": {"type": "string", "const": name},
+            "rule_spec": {"type": "object", "additionalProperties": True},
         }
+        required = ["schema", "rule_spec"]
+        if name == DISCOVERY_SCHEMA:
+            properties["thesis"] = {"type": "string", "maxLength": MAX_THESIS_CHARS}
+            required.append("thesis")
+        return {"type": "object", "additionalProperties": False,
+                "required": required, "properties": properties}
 
     def _provider_call(self, system_prompt: str,
-                       request: Mapping[str, Any], timeout: float) -> Any:
+                       request: Mapping[str, Any], timeout: float,
+                       schema_name: str = PROPOSAL_SCHEMA) -> Any:
         if self.caller is not None:
             # The outer proposal loop applies the hard timeout. Keeping this
             # seam direct also makes fake callers easy to inspect in tests.
@@ -367,7 +418,8 @@ class RuleProposalAdapter:
                     {"role": "user", "content": [{"type": "input_text", "text": request_text}]},
                 ],
                 text={"format": {"type": "json_schema", "name": "llm_rule_proposal",
-                                  "strict": True, "schema": self._schema()}},
+                                  "strict": True,
+                                  "schema": self._schema(schema_name)}},
                 timeout=timeout,
             )
             return _raw_text(response)
@@ -375,7 +427,8 @@ class RuleProposalAdapter:
             model=self.model, max_tokens=1200, temperature=0,
             system=system_prompt,
             messages=[{"role": "user", "content": request_text}],
-            output_config={"format": {"type": "json_schema", "schema": self._schema()}},
+            output_config={"format": {"type": "json_schema",
+                                      "schema": self._schema(schema_name)}},
             timeout=timeout,
         )
         return _raw_text(response)
@@ -445,6 +498,85 @@ class RuleProposalAdapter:
             evidence["raw_response_hash"] = raw_hash
         return ProposalResult(False, error="; ".join(errors), evidence=evidence)
 
+    def discover(self, vehicle: str, slot: int,
+                 context: Mapping[str, Any]) -> ProposalResult:
+        """Request one bounded *new* edge hypothesis for a free research slot.
+
+        Discovery differs from :meth:`propose` only in what it is given and
+        what it is asked for: no prior rule to repair, and an explicit brief to
+        avoid what has already been tried or proved.  The output is validated
+        by the same grammar and, once registered, faces the same gates as every
+        other candidate, so a discovered edge is never trusted more than a
+        deterministic one.
+        """
+
+        prompt = self.discovery_prompt
+        try:
+            if vehicle not in {"equity", "option"}:
+                raise ValueError("vehicle must be equity or option")
+            if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+                raise ValueError("slot must be a non-negative integer")
+            safe_context = _safe_diagnosis(context, label="context")
+            request = {"vehicle": vehicle, "slot": slot, "context": safe_context}
+            request_hash = content_hash(request)
+            system_hash = content_hash(prompt)
+        except Exception as exc:
+            return ProposalResult(False, error=str(exc),
+                                  schema=DISCOVERY_SCHEMA,
+                                  evidence={"provider": self.provider,
+                                            "model": self.model,
+                                            "kind": "discovery",
+                                            "system_prompt_hash": content_hash(prompt)})
+
+        errors: list[str] = []
+        raw_hash: str | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                raw_value = _call_with_timeout(
+                    self._discovery_call, self.timeout_seconds, prompt, request)
+                raw_hash = content_hash(_raw_text(raw_value))
+                parsed, raw = _parse_response(
+                    raw_value, max_bytes=self.max_response_bytes,
+                    schema=DISCOVERY_SCHEMA, keys=_DISCOVERY_RESPONSE_KEYS)
+                normalized = validate_rule_spec(parsed["rule_spec"])
+                thesis = _safe_thesis(parsed["thesis"])
+                spec_hash = rule_spec_hash(normalized)
+                variant = rule_variant_id(normalized)
+                raw_hash = content_hash(raw)
+                evidence = {
+                    "provider": self.provider,
+                    "model": self.model,
+                    "kind": "discovery",
+                    "system_prompt_hash": system_hash,
+                    "request_hash": request_hash,
+                    "raw_response_hash": raw_hash,
+                    "normalized_spec_hash": spec_hash,
+                    "spec_id": spec_hash,
+                    "variant_id": variant,
+                    "rule_schema": normalized["schema"],
+                    "attempts": attempt,
+                }
+                return ProposalResult(True, schema=DISCOVERY_SCHEMA,
+                                      rule_spec=normalized, variant_id=variant,
+                                      spec_id=spec_hash, evidence=evidence,
+                                      thesis=thesis)
+            except Exception as exc:
+                errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+        evidence = {"provider": self.provider, "model": self.model,
+                    "kind": "discovery", "system_prompt_hash": system_hash,
+                    "request_hash": request_hash, "attempts": self.max_attempts}
+        if raw_hash is not None:
+            evidence["raw_response_hash"] = raw_hash
+        return ProposalResult(False, error="; ".join(errors),
+                              schema=DISCOVERY_SCHEMA, evidence=evidence)
+
+    def _discovery_call(self, system_prompt: str, request: Mapping[str, Any],
+                        timeout: float) -> Any:
+        # Keeps the three-argument seam ``_call_with_timeout`` introspects while
+        # binding the discovery structured-output schema.
+        return self._provider_call(system_prompt, request, timeout,
+                                   DISCOVERY_SCHEMA)
+
 
 # Friendly aliases for callers that prefer proposal-oriented naming.
 LLMRuleProposalAdapter = RuleProposalAdapter
@@ -460,8 +592,17 @@ def propose_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
     return selected.propose(*args, **kwargs)
 
 
+def discover_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
+                  **kwargs: Any) -> ProposalResult:
+    """Functional seam for one-shot discovery proposals."""
+
+    selected = adapter or RuleProposalAdapter()
+    return selected.discover(*args, **kwargs)
+
+
 __all__ = [
+    "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "MAX_THESIS_CHARS",
     "PROPOSAL_SCHEMA", "SYSTEM_PROMPT", "ProposalResult", "RuleProposalResult",
     "RuleProposalAdapter", "LLMRuleProposalAdapter", "LLMStrategy", "canonical_json",
-    "content_hash", "propose_rule",
+    "content_hash", "discover_rule", "propose_rule",
 ]

@@ -157,6 +157,38 @@ breakout/fade, momentum continuation, mean reversion, trend pullback,
 volatility breakout, and volume breakout, with bounded confirmations and exit
 parameters. It never generates or imports source code.
 
+The grammar has two versions. `rule-strategy.v1` is the original field set and
+is unchanged, so every candidate already in a ledger keeps its exact
+`variant_id`. `rule-strategy.v2` is a strict superset reached only by naming it
+explicitly, and adds four *entry-side* predicates: `confirmations` (a list of
+additional trend/volume/volatility filters, all of which must hold),
+`entry_after_minutes`/`entry_before_minutes` (the minutes-from-09:30-New-York
+window a signal may fire in), and `min_atr_bps`/`max_atr_bps` (the volatility
+regime the rule may trade). Together they let a hypothesis express a
+*conditional* edge rather than only retuned numbers. Every extension is a pure
+function of the same completed-bar prefix the v1 grammar already sees, so
+research and runtime remain one evaluator and no extension can reach sizing,
+exits, or order placement; a v2 spec that admits a signal produces exactly the
+v1 plan.
+
+### Slots are capacity, not licences
+
+The factory runs a fixed number of parallel slots. A slot's hypothesis leaves
+the active set permanently once it proves an edge — the deployed variant is
+frozen and must never be re-tuned — so the slot is immediately reseeded with a
+*new* hypothesis in the same cycle. Without that reseed the factory would lose
+one worker per success and eventually have nothing left to search. Reseeding
+prefers a family the slot has not tried, at that family's own template, and
+then continues into the conditional v2 ladder: a slot that has run out of
+families has not run out of hypotheses. Each reseed grants one further
+`max_generations` mutation budget and never consumes the separate
+failure-recovery rotation budget.
+
+`run_factory` also repairs slots at the start of every cycle: a slot with no
+active hypothesis — a ledger written before reseeding existed, or a raised
+`--strategies` — is revived. The cycle result reports `reseeds`, `revived`, and
+`active_slots` so idle capacity is visible rather than silent.
+
 On a fresh corpus, each worker diagnoses its baseline only from the
 chronological fit partition, creates bounded variants based on the observed
 failure mode, and evaluates those variants on untouched held-out sessions.
@@ -173,11 +205,36 @@ the orchestrator's own, so the trades, statistics and content hashes are the
 same either way; an in-memory corpus has nothing to re-read and still travels
 with the task.
 
-The checked config enables the bounded strategy-replacement adapter with
-OpenAI `gpt-5`. It is optional and reads provider keys only from
-`ALPACA_RESEARCH_LLM_SECRETS_FILE`, never from the broker secret file. Missing,
-invalid, or rejected model output records a pending replacement; it cannot
-retire a family prematurely. Successful proof produces a deterministic,
+### What the LLM does, and what it cannot do
+
+`research.llm_strategy` serves two distinct requests, both bounded by the same
+output contract:
+
+- `llm-rule-proposal.v1` — **repair.** Asked for a replacement `rule_spec` only
+  after every intended variant of a family has failed with an adequate sample.
+- `llm-edge-discovery.v1` — **discovery.** Asked for a genuinely new hypothesis
+  whenever a slot comes free, either because it proved an edge or because its
+  generation budget ran out. The request carries a small aggregate brief — the
+  families this slot has tried, the families already carrying a deployed edge,
+  and the last diagnosis — and the reply must include a one-sentence `thesis`
+  of at most 240 characters, which is recorded as evidence and displayed but
+  never interpreted as an instruction.
+
+Both replies are strict JSON, size-capped, fence-rejecting, and validated
+against the rule grammar before anything is stored; keys that look like source,
+credentials, or market rows are refused outright. A discovered hypothesis is
+registered `queued` with no run, no gate, and no candidate — it must earn
+`backtest_passed` and then a strictly later forward shadow pass through exactly
+the same gates as a deterministic one. **The LLM chooses what to try next; it
+can never shorten the evidence path or authorize trading.** Every seeding path
+falls back to a deterministic ladder, so the factory keeps discovering with no
+provider configured at all.
+
+The checked config enables these adapters with OpenAI `gpt-5`. They are
+optional and read provider keys only from `ALPACA_RESEARCH_LLM_SECRETS_FILE`,
+never from the broker secret file. Missing, invalid, or rejected model output
+records a pending replacement or falls back to deterministic discovery; it
+cannot retire a family prematurely. Successful proof produces a deterministic,
 content-addressed finding. `research.proof.webhook_url` may send that finding
 to an HTTPS webhook without changing the durable artifact.
 
@@ -196,4 +253,13 @@ python research.py edge init
 python research.py edge discover --data market.jsonl --vehicle equity --lane auto
 python research.py edge status --vehicle equity
 python research.py edge ingest CANDIDATE_ID paper-outcome.json
+python research.py edge paper --vehicle equity --deployed
 ```
+
+`edge status` reports lifecycle state; `edge paper` reports how each edge is
+actually doing on live paper outcomes — trade and session counts, total and
+mean R, win rate, net P&L, the registered rolling-R guard with its floor, and
+the sequential drift statistic against the held-out distribution the edge was
+validated on. Both matter: the first is the evidence an edge was promoted with,
+the second is what it has done since. Neither can change a lifecycle state;
+they are read-only views of append-only data.

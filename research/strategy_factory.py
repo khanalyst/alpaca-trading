@@ -44,8 +44,9 @@ from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
-    _session, _simulate_trade, _thesis, _visible, diagnose, initial_hypotheses,
-    mutate_from_diagnosis, replacement_hypothesis, simulate_account,
+    _session, _simulate_trade, _thesis, _visible, diagnose, discovery_hypothesis,
+    initial_hypotheses, mutate_from_diagnosis, replacement_hypothesis,
+    simulate_account, template_hypothesis,
 )
 
 
@@ -63,48 +64,100 @@ MAX_ROTATIONS = 2
 
 def _slot_rotations(factory: FactoryLedger, vehicle: str, slot: int) -> int:
     """Count the bounded family rotations a slot has already spent."""
-    total = 0
-    for item in factory.hypotheses(vehicle=vehicle):
-        if int(item["slot"]) != int(slot):
-            continue
-        for event in factory.events(str(item["hypothesis_id"])):
-            payload = event.get("payload")
-            if (event.get("status") == "retired" and isinstance(payload, Mapping)
-                    and payload.get("rotation") is True):
-                total += 1
-    return total
+    return factory.slot_event_count(vehicle, slot, status="retired",
+                                    flag="rotation")
+
+
+def _slot_reseeds(factory: FactoryLedger, vehicle: str, slot: int) -> int:
+    """Count the successful reseeds a slot has already been granted.
+
+    A reseed follows a *proved* edge, not a failure, so it is counted apart
+    from the failure-recovery rotation budget and never consumes it.
+    """
+    return factory.slot_event_count(vehicle, slot, status="validated",
+                                    flag="reseed")
 
 
 def _slot_families(factory: FactoryLedger, vehicle: str, slot: int) -> set[str]:
-    return {str(item["family"]) for item in factory.hypotheses(vehicle=vehicle)
-            if int(item["slot"]) == int(slot)}
+    return factory.slot_families(vehicle, slot)
 
 
-def _rotation_hypothesis(previous: Mapping[str, Any], *, generation: int,
-                         not_before: str | None, existing_variant_ids: set[str],
-                         tried_families: set[str]) -> StrategyHypothesis | None:
-    """Reseed an exhausted slot with an untried family at template defaults.
+def _proved_families(edge: EdgeLedger, vehicle: str) -> list[str]:
+    """Families already carrying a deployed edge in this vehicle."""
+    families: set[str] = set()
+    for candidate in edge.status(vehicle=vehicle):
+        if candidate.get("status") not in {"validated", "champion"}:
+            continue
+        try:
+            config = json.loads(candidate.get("config_json") or "{}")
+        except json.JSONDecodeError:
+            continue
+        spec = (config.get("strategy") or {}).get("rule_spec")
+        if isinstance(spec, Mapping) and spec.get("family"):
+            families.add(str(spec["family"]))
+    return sorted(families)
 
-    Rotation is not a mutation: it deliberately discards the exhausted
-    lineage's tuned parameters instead of carrying a failed family's shape
-    into the fresh hypothesis.
+
+def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
+                       tried_families: set[str], proved_families: Sequence[str],
+                       diagnostic: Mapping[str, Any] | None = None) -> dict:
+    """Build the small aggregate brief a discovery proposal is given."""
+    context: dict[str, Any] = {
+        "slot": int(slot),
+        "reason": str(reason),
+        "previous_family": str(previous.get("family") or ""),
+        "tried_families": sorted(tried_families),
+        "proved_families": sorted(proved_families),
+        "available_families": list(RULE_FAMILIES),
+    }
+    if diagnostic:
+        context["last_diagnosis"] = dict(diagnostic)
+    return context
+
+
+def _seed_slot(previous: Mapping[str, Any], *, generation: int,
+               not_before: str | None, existing_variant_ids: set[str],
+               tried_families: set[str], context: Mapping[str, Any],
+               llm_enabled: bool, config: Mapping[str, Any],
+               adapter: RuleProposalAdapter | None = None
+               ) -> tuple[StrategyHypothesis | None, ProposalResult | None, str]:
+    """Seed a free slot: LLM discovery first, deterministic ladder second.
+
+    The proposal is only ever a *seed*.  Whatever produced it, the resulting
+    hypothesis is registered as ``queued`` and has to earn ``backtest_passed``
+    and then a strictly later forward shadow pass through exactly the same
+    gates as a deterministic one, so an LLM cannot shorten the evidence path.
     """
     vehicle = str(previous["vehicle"])
     slot = int(previous["slot"])
-    current = str(previous["family"])
-    start = RULE_FAMILIES.index(current) if current in RULE_FAMILIES else 0
-    for offset in range(1, len(RULE_FAMILIES) + 1):
-        family = RULE_FAMILIES[(start + offset) % len(RULE_FAMILIES)]
-        if family in tried_families:
-            continue
-        spec = validate_rule_spec({"family": family})
-        if rule_variant_id(spec) in existing_variant_ids:
-            continue
-        return StrategyHypothesis(
-            _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
-            vehicle, family, _thesis(spec), _falsification(spec), spec,
-            str(previous["hypothesis_id"]), not_before)
-    return None
+    proposal: ProposalResult | None = None
+    if llm_enabled:
+        selected = adapter or RuleProposalAdapter(
+            provider=str(config.get("provider") or "openai"),
+            model=str(config.get("model") or ""),
+            max_attempts=int(config.get("max_attempts", 1)),
+            timeout_seconds=float(config.get("timeout_seconds", 30)),
+            max_response_bytes=int(config.get("max_response_bytes", 16_384)),
+        )
+        proposal = selected.discover(vehicle=vehicle, slot=slot, context=dict(context))
+        if (proposal.success and proposal.rule_spec is not None and
+                proposal.variant_id and
+                proposal.variant_id not in existing_variant_ids):
+            spec = validate_rule_spec(proposal.rule_spec)
+            return StrategyHypothesis(
+                _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
+                vehicle, str(spec["family"]),
+                # The model's own one-sentence rationale is recorded as the
+                # thesis when it supplied one; it is displayed text, never an
+                # instruction, and the falsification stays machine-generated.
+                proposal.thesis or _thesis(spec), _falsification(spec), spec,
+                str(previous["hypothesis_id"]), not_before), proposal, "llm_discovery"
+    seeded = discovery_hypothesis(
+        previous, generation=generation, not_before=not_before,
+        existing_variant_ids=existing_variant_ids, tried_families=tried_families)
+    if seeded is None:
+        return None, proposal, "exhausted"
+    return seeded, proposal, "deterministic_discovery"
 
 
 def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any], *,
@@ -154,6 +207,57 @@ def _llm_lineage_evidence(factory: FactoryLedger,
                     "evidence": dict(payload["llm_evidence"]),
                     "replacement_hypothesis_id": hypothesis.get("hypothesis_id")}
     return None
+
+
+def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
+                  strategies: int, existing_variant_ids: set[str],
+                  llm_enabled: bool, llm_config: Mapping[str, Any],
+                  adapter: RuleProposalAdapter | None) -> list[dict]:
+    """Give every configured slot an active hypothesis before scheduling.
+
+    Two situations need this.  A ledger written before slots were reseeded on
+    success has proved slots with no successor, and raising ``strategies``
+    leaves the new slots empty because template seeding only runs on a
+    completely empty ledger.  Both are silent losses of research capacity, and
+    both are recoverable without touching a single deployed edge.
+    """
+    latest = factory.slot_latest(vehicle)
+    active_slots = {int(item["slot"]) for item in factory.active(vehicle)}
+    revived: list[dict] = []
+    for slot in range(int(strategies)):
+        if slot in active_slots:
+            continue
+        previous = latest.get(slot)
+        if previous is None:
+            seed = template_hypothesis(slot, vehicle=vehicle)
+            source = "template"
+            if rule_variant_id(seed.rule_spec) in existing_variant_ids:
+                continue
+        else:
+            tried = factory.slot_families(vehicle, slot)
+            seed, _proposal, source = _seed_slot(
+                previous, generation=factory.next_generation(vehicle, slot),
+                not_before=previous.get("not_before"),
+                existing_variant_ids=existing_variant_ids,
+                tried_families=tried,
+                context=_discovery_context(
+                    slot=slot, reason="slot_had_no_active_hypothesis",
+                    previous=previous, tried_families=tried,
+                    proved_families=_proved_families(edge, vehicle)),
+                llm_enabled=llm_enabled, config=llm_config, adapter=adapter)
+            if seed is None:
+                continue
+        factory.register(seed)
+        existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+        if previous is not None:
+            factory.event(
+                previous["hypothesis_id"], str(previous.get("status") or "validated"),
+                "idle slot revived with a new hypothesis",
+                {"reseed": True, "source": source,
+                 "successor_hypothesis_id": seed.hypothesis_id,
+                 "successor_variant_id": rule_variant_id(seed.rule_spec)})
+        revived.append(asdict(seed))
+    return revived
 
 
 def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
@@ -399,6 +503,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     duplicate = factory.existing_cycle(dataset_hash, vehicle)
     if duplicate is not None:
         return {**duplicate, "duplicate": True}
+    edge = EdgeLedger(db_path)
     if not factory.hypotheses(vehicle=vehicle):
         for hypothesis in initial_hypotheses(strategies, vehicle=vehicle):
             factory.register(hypothesis)
@@ -406,11 +511,15 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         rule_variant_id(item["rule_spec"])
         for item in factory.hypotheses(vehicle=vehicle)
     }
+    revived = _ensure_slots(
+        factory, edge, vehicle=vehicle, strategies=strategies,
+        existing_variant_ids=existing_variant_ids, llm_enabled=llm_enabled,
+        llm_config=llm_config, adapter=proposal_adapter)
     active = factory.active(vehicle)[:int(strategies)]
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
-                "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0}
-    edge = EdgeLedger(db_path)
+                "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0,
+                "revived": revived}
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
@@ -608,6 +717,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     summaries = []
     replacements = []
     rotations: list[dict] = []
+    reseeds: list[dict] = []
     pending = []
     for worker in worker_results:
         hypothesis = worker["hypothesis"]
@@ -702,16 +812,71 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             factory.event(hypothesis["hypothesis_id"], new_state,
                           f"{len(passing)} autonomous variant(s) passed {worker['mode']}",
                           {"passing": [item[0]["variant_id"] for item in passing]})
+            if worker["mode"] == "shadow":
+                # A proved hypothesis leaves the active set for good: its
+                # variant is deployed and must never be re-tuned.  The *slot*
+                # is a unit of parallel research capacity, not a one-shot
+                # licence, so it is immediately reseeded with a new hypothesis.
+                # Without this the factory loses a worker on every success and
+                # eventually reports ``exhausted`` with nothing left to search.
+                slot = int(hypothesis["slot"])
+                tried = _slot_families(factory, vehicle, slot)
+                seed, proposal, source = _seed_slot(
+                    hypothesis,
+                    generation=factory.next_generation(vehicle, slot),
+                    not_before=worker["evaluation_end"],
+                    existing_variant_ids=existing_variant_ids,
+                    tried_families=tried,
+                    context=_discovery_context(
+                        slot=slot, reason="slot_proved_an_edge",
+                        previous=hypothesis, tried_families=tried,
+                        proved_families=_proved_families(edge, vehicle)),
+                    llm_enabled=llm_enabled, config=llm_config,
+                    adapter=proposal_adapter)
+                reseed_payload: dict[str, Any] = {
+                    "reseed": True, "source": source,
+                    "proved_variants": [item[0]["variant_id"] for item in passing],
+                }
+                if seed is None:
+                    reseed_payload["reseed"] = False
+                    factory.event(
+                        hypothesis["hypothesis_id"], new_state,
+                        "slot proved an edge but no unused successor hypothesis remains",
+                        reseed_payload)
+                else:
+                    factory.register(seed)
+                    existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+                    reseed_payload.update({
+                        "successor_hypothesis_id": seed.hypothesis_id,
+                        "successor_variant_id": rule_variant_id(seed.rule_spec),
+                        "successor_family": seed.family,
+                        "successor_rule_schema": seed.rule_spec["schema"],
+                    })
+                    if proposal is not None:
+                        reseed_payload.update({
+                            "proposal_schema": proposal.schema,
+                            "llm_evidence": proposal.evidence,
+                        })
+                        if not proposal.success:
+                            reseed_payload["llm_error"] = proposal.error
+                    factory.event(
+                        hypothesis["hypothesis_id"], new_state,
+                        "slot proved an edge and was reseeded with a new hypothesis",
+                        reseed_payload)
+                    reseeds.append(asdict(seed))
         elif all_intended_adequate:
             aggregate = max((item[0]["diagnostic"] for item in local),
                             key=lambda value: abs(float(value.get("net_pnl", 0.0))))
             proposal = None
             replacement_error = None
-            # Each rotation grants the slot one further mutation budget, so a
-            # freshly seeded family is not born at the generation cap.
+            # Each rotation and each reseed grants the slot one further
+            # mutation budget, so a freshly seeded family is not born at the
+            # generation cap.
             slot = int(hypothesis["slot"])
             rotations_used = _slot_rotations(factory, vehicle, slot)
-            generation_cap = int(max_generations) * (rotations_used + 1)
+            reseeds_used = _slot_reseeds(factory, vehicle, slot)
+            generation_cap = int(max_generations) * (
+                rotations_used + reseeds_used + 1)
             if llm_enabled:
                 replacement, proposal, replacement_error = _llm_replacement(
                     hypothesis, aggregate, config=llm_config,
@@ -763,17 +928,28 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                                 "reason": detail["failure"]})
             else:
                 seed = None
+                rotation_proposal: ProposalResult | None = None
+                rotation_source = "deterministic_discovery"
                 # Only a family that actually spent a mutation budget may be
                 # rotated away; reseeding one that was never mutated would be
                 # family churn rather than bounded exploration.
                 if (int(hypothesis["generation"]) >= 1 and
                         rotations_used < int(max_rotations) and
                         len(rotations) < int(rotation_budget)):
-                    seed = _rotation_hypothesis(
-                        hypothesis, generation=int(hypothesis["generation"]) + 1,
+                    tried = _slot_families(factory, vehicle, slot)
+                    seed, rotation_proposal, rotation_source = _seed_slot(
+                        hypothesis,
+                        generation=factory.next_generation(vehicle, slot),
                         not_before=worker["evaluation_end"],
                         existing_variant_ids=existing_variant_ids,
-                        tried_families=_slot_families(factory, vehicle, slot))
+                        tried_families=tried,
+                        context=_discovery_context(
+                            slot=slot, reason="generation_budget_exhausted",
+                            previous=hypothesis, tried_families=tried,
+                            proved_families=_proved_families(edge, vehicle),
+                            diagnostic=aggregate),
+                        llm_enabled=llm_enabled, config=llm_config,
+                        adapter=proposal_adapter)
                 if seed is None:
                     factory.event(
                         hypothesis["hypothesis_id"], "pending_generation_limit",
@@ -792,9 +968,18 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                         "rotation": True, "rotation_index": rotations_used,
                         "max_rotations": int(max_rotations),
                         "generation_cap": generation_cap,
+                        "source": rotation_source,
                         "replacement_hypothesis_id": seed.hypothesis_id,
                         "replacement_variant_id": rule_variant_id(seed.rule_spec),
+                        "replacement_rule_schema": seed.rule_spec["schema"],
                     }
+                    if rotation_proposal is not None:
+                        rotation_payload.update({
+                            "proposal_schema": rotation_proposal.schema,
+                            "llm_evidence": rotation_proposal.evidence,
+                        })
+                        if not rotation_proposal.success:
+                            rotation_payload["llm_error"] = rotation_proposal.error
                     factory.retire_hypothesis(
                         hypothesis["hypothesis_id"], cycle_id=cycle_id,
                         expected_variants=int(worker.get("expected_variants", 0)),
@@ -824,6 +1009,11 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,
         "replacements": replacements, "rotations": rotations,
+        # Slots reseeded after proving an edge, and slots revived because they
+        # had no active hypothesis at all.  Both keep parallel research
+        # capacity constant instead of letting it decay toward ``exhausted``.
+        "reseeds": reseeds, "revived": revived,
+        "active_slots": len(factory.active(vehicle)),
         "rotation_budget": int(rotation_budget), "max_rotations": int(max_rotations),
         "pending": pending, "worker_failures": worker_failures,
         "strategy_llm": {"enabled": llm_enabled,
@@ -845,7 +1035,8 @@ def factory_status(db_path: str | Path = DEFAULT_DB_PATH) -> dict:
 
 __all__ = [
     "DEFAULT_STRATEGIES", "DEFAULT_VARIANTS", "DEFAULT_WORKERS", "FactoryError",
-    "FactoryLedger", "StrategyHypothesis", "diagnose", "factory_status",
-    "initial_hypotheses", "mutate_from_diagnosis", "replacement_hypothesis",
-    "run_factory", "simulate_account",
+    "FactoryLedger", "StrategyHypothesis", "diagnose", "discovery_hypothesis",
+    "factory_status", "initial_hypotheses", "mutate_from_diagnosis",
+    "replacement_hypothesis", "run_factory", "simulate_account",
+    "template_hypothesis",
 ]

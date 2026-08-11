@@ -252,6 +252,46 @@ class FactoryLedger:
                 latest[int(item["slot"])] = item
         return [latest[key] for key in sorted(latest)]
 
+    def slot_latest(self, vehicle: str) -> dict[int, dict]:
+        """Return the highest-generation hypothesis in each occupied slot."""
+        latest: dict[int, dict] = {}
+        for item in self.hypotheses(vehicle=vehicle):
+            slot = int(item["slot"])
+            current = latest.get(slot)
+            if current is None or int(item["generation"]) >= int(current["generation"]):
+                latest[slot] = item
+        return latest
+
+    def next_generation(self, vehicle: str, slot: int) -> int:
+        """Return the next free generation number in a slot.
+
+        ``factory_hypotheses`` is unique on ``(vehicle, slot, generation)``, so
+        a successor registered into an occupied slot has to continue that
+        slot's numbering rather than restart it.
+        """
+        generations = [int(item["generation"])
+                       for item in self.hypotheses(vehicle=vehicle)
+                       if int(item["slot"]) == int(slot)]
+        return max(generations) + 1 if generations else 0
+
+    def slot_families(self, vehicle: str, slot: int) -> set[str]:
+        return {str(item["family"]) for item in self.hypotheses(vehicle=vehicle)
+                if int(item["slot"]) == int(slot)}
+
+    def slot_event_count(self, vehicle: str, slot: int, *, status: str,
+                         flag: str) -> int:
+        """Count a slot's events carrying ``payload[flag] is True``."""
+        total = 0
+        for item in self.hypotheses(vehicle=vehicle):
+            if int(item["slot"]) != int(slot):
+                continue
+            for event in self.events(str(item["hypothesis_id"])):
+                payload = event.get("payload")
+                if (event.get("status") == status and
+                        isinstance(payload, Mapping) and payload.get(flag) is True):
+                    total += 1
+        return total
+
     def add_account(self, cycle_id: str, hypothesis_id: str, result: Mapping) -> None:
         account = result["account"]
         with closing(_connect(self.path)) as db, db:

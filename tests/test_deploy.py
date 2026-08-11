@@ -895,6 +895,8 @@ class DeployTests(unittest.TestCase):
         self.assertIn("d.research.entry_gate_required", dashboard.HTML)
         self.assertIn("d.research.service_optional", dashboard.HTML)
         self.assertIn("d.edge.proved_edges", dashboard.HTML)
+        self.assertIn("d.edge.live_paper", dashboard.HTML)
+        self.assertIn("Live paper results by edge", dashboard.HTML)
         self.assertIn("cycle outcome", dashboard.HTML)
         self.assertIn("Execution journal", dashboard.HTML)
         self.assertNotIn("d.research_feed_version", dashboard.HTML)
@@ -929,6 +931,45 @@ class DeployTests(unittest.TestCase):
             _persist_gate(ledger, candidate["candidate_id"], "shadow",
                           passes=False)
             self.assertEqual(dashboard._edge_status(ledger_path)["proved_edges"], [])
+
+    def test_dashboard_reports_live_paper_results_for_each_edge(self):
+        """Proof confidence is what the evidence was; this is how it is doing."""
+        from research.edge_lab import EdgeLedger, init_ledger
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "edge_lab.sqlite3"
+            init_ledger(ledger_path)
+            ledger = EdgeLedger(ledger_path)
+            # No outcomes yet: the key exists so the card can render empty.
+            self.assertEqual(dashboard._edge_status(ledger_path)["live_paper"], [])
+            for variant, values in (("rule.mean-reversion.win", [1.0, 1.0, .5]),
+                                    ("rule.trend-pullback.lose", [-1.0, -.5])):
+                record = ledger.register_candidate(
+                    variant, strategy_id="rule", vehicle="equity",
+                    hypothesis="live paper visibility",
+                    config={"strategy": {"rule_spec": {"family": "mean_reversion"}}})
+                for index, value in enumerate(values):
+                    ledger.ingest_paper_outcome(record["candidate_id"], {
+                        "opportunity_id": f"{variant}:{index}",
+                        "session_date": f"2026-06-{index + 1:02d}",
+                        "net_pnl": value * 100.0, "risk_usd": 100.0})
+            live = dashboard._edge_status(ledger_path)["live_paper"]
+            self.assertEqual([row["variant_id"] for row in live],
+                             ["rule.mean-reversion.win", "rule.trend-pullback.lose"])
+            winner = live[0]
+            self.assertEqual(winner["outcomes"], 3)
+            self.assertEqual(winner["sessions"], 3)
+            self.assertEqual(winner["last_session"], "2026-06-03")
+            self.assertAlmostEqual(winner["total_r"], 2.5)
+            self.assertAlmostEqual(winner["net_pnl"], 250.0)
+            self.assertEqual(winner["guard"], "3/20")
+
+    def test_dashboard_paper_guard_thresholds_track_the_ledger(self):
+        """The dashboard restates the guard rather than importing it."""
+        from research.edge_ledger import (PAPER_DEMOTION_MIN_OUTCOMES,
+                                          PAPER_DEMOTION_R_FLOOR)
+        self.assertEqual(dashboard.PAPER_ROLLING_WINDOW,
+                         PAPER_DEMOTION_MIN_OUTCOMES)
+        self.assertEqual(dashboard.PAPER_ROLLING_FLOOR, PAPER_DEMOTION_R_FLOOR)
 
     def test_report_is_a_small_usd_paper_summary(self):
         with closing(sqlite3.connect(":memory:")) as db:

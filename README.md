@@ -13,7 +13,16 @@ The research factory starts with seven independent rule families and four
 isolated simulated-account variants per family. It evaluates independent
 families in parallel, diagnoses failures from chronological fit data, mutates
 bounded data-only rule specifications, and judges them on untouched held-out
-data. A rule specification carries `max_hold_bars`, so every strategy has a
+data. A slot that proves an edge is reseeded with a new hypothesis in the same
+cycle: the proved variant is frozen and never re-tuned, but the *slot* is
+parallel research capacity, so discovery continues at full width instead of
+shrinking with every success. An optional LLM proposes what to try next — both
+new hypotheses for free slots and replacements for exhausted families — inside
+the same audited grammar, and every such proposal must earn `backtest_passed`
+and a strictly later forward shadow pass through the identical gates a
+deterministic one faces. Every seeding path falls back to a deterministic
+ladder, so research works with no provider configured. A rule specification
+carries `max_hold_bars`, so every strategy has a
 bounded time exit as well as a stop and a target; research and runtime compute
 that deadline from one shared helper. Paper
 `strategy.selection_mode: all_proved` selects one best proven variant per
@@ -69,7 +78,12 @@ normalizes account, asset, quote/bar, calendar, option-chain, order, and trade
 update data for the rest of the application. `agent/alpaca_session.py` owns
 the NYSE calendar and session policy. `agent/contracts/rule.py` is the safe
 strategy grammar shared by research and runtime; generated specifications can
-never contain executable code. `agent/contracts/ibr.py` remains the explicit
+never contain executable code. It has two versions: `rule-strategy.v1` is
+unchanged and keeps every existing variant id, and `rule-strategy.v2` is a
+strict superset adding entry-side predicates only — a multi-filter confirmation
+list, a session-time entry window, and an ATR volatility band — so a hypothesis
+can express a conditional edge without any extension reaching sizing, exits, or
+order placement. `agent/contracts/ibr.py` remains the explicit
 IBR replay/baseline. Risk and execution
 profiles enforce sizing, single-leg long-option checks, idempotent client
 order IDs, and end-of-day flattening.
@@ -94,8 +108,17 @@ concatenates those partitions in session order.
 four isolated accounts per strategy, and up to seven worker processes. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
-status, latest re-verified passing edges, edge proof reports, and the execution
-journal.
+status, latest re-verified passing edges, per-edge live paper results, edge
+proof reports, and the execution journal.
+
+Two views answer two different questions about a deployed edge. `research.py
+edge status` and the dashboard's "Proved edges" table report the evidence an
+edge was promoted with. `research.py edge paper` and the dashboard's "Live
+paper results by edge" table report what it has done since — trades, sessions,
+total and mean R, win rate, net P&L, the rolling-R demotion guard, and the
+sequential drift statistic against its validated held-out distribution. Both
+are read-only views of append-only data and neither can change a lifecycle
+state.
 
 ## Quick start
 
@@ -116,9 +139,11 @@ selected `ALPACA_DATA_FEED`/`ALPACA_OPTIONS_FEED` in `.env`. `check` is the
 authenticated preflight by default; `check --offline` validates local
 configuration only and is not a trading preflight. Unit tests use fakes and do
 not need credentials. The checked config enables the bounded research
-replacement adapter with model `gpt-5`; it reads optional provider credentials
-only from the separate `ALPACA_RESEARCH_LLM_SECRETS_FILE`. Missing or invalid
-LLM output leaves a pending replacement and does not retire a family. Runtime
+discovery and replacement adapters with model `gpt-5`; they read optional
+provider credentials only from the separate
+`ALPACA_RESEARCH_LLM_SECRETS_FILE`. Missing or invalid LLM output leaves a
+pending replacement or falls back to deterministic discovery; it never retires
+a family or authorizes trading. Runtime
 decision LLM use remains disabled (`llm.enabled: false`). The default stock
 feed is IEX. Long options remain subject to liquidity and contract checks. On a
 fresh ledger, `run` starts safely but will not submit entries: first collect an

@@ -15,8 +15,8 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    RULE_FAMILIES, evaluate_rule_signal, hold_deadline, rule_variant_id,
-    validate_rule_spec,
+    RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, evaluate_rule_signal,
+    hold_deadline, rule_variant_id, validate_rule_spec,
 )
 from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
 from .edge_ledger import content_hash
@@ -77,35 +77,53 @@ def _falsification(spec: Mapping[str, Any]) -> str:
     )
 
 
+# One template per family, in ``RULE_FAMILIES`` order.  Initial seeding and
+# every later reseed start a fresh family from its own template rather than
+# from an exhausted lineage's tuned parameters.
+FAMILY_TEMPLATES: tuple[dict[str, Any], ...] = (
+    {"family": "opening_range_breakout", "range_minutes": 15,
+     "threshold_bps": 5.0, "confirmation": "volume"},
+    {"family": "opening_range_fade", "range_minutes": 20,
+     "threshold_bps": 8.0, "target_r": 1.5, "confirmation": "none"},
+    {"family": "momentum_continuation", "lookback": 12,
+     "threshold_bps": 18.0, "confirmation": "volume"},
+    {"family": "mean_reversion", "lookback": 20,
+     "zscore": 1.5, "target_r": 1.5, "confirmation": "volatility"},
+    {"family": "trend_pullback", "lookback": 10,
+     "slow_lookback": 35, "threshold_bps": 15.0, "confirmation": "trend"},
+    {"family": "volatility_breakout", "lookback": 12,
+     "compression_bps": 55.0, "threshold_bps": 5.0, "confirmation": "volume"},
+    {"family": "volume_breakout", "lookback": 15,
+     "volume_multiplier": 1.5, "threshold_bps": 5.0, "confirmation": "trend"},
+)
+
+
+def family_template(family: str) -> dict[str, Any]:
+    for template in FAMILY_TEMPLATES:
+        if template["family"] == family:
+            return dict(template)
+    raise FactoryError(f"unknown rule family: {family!r}")
+
+
+def template_hypothesis(slot: int, *, vehicle: str = "equity",
+                        generation: int = 0) -> StrategyHypothesis:
+    """Return the generation-zero hypothesis a slot starts from."""
+    if not 0 <= int(slot) < MAX_STRATEGIES:
+        raise FactoryError(f"slot must be between 0 and {MAX_STRATEGIES - 1}")
+    spec = validate_rule_spec(dict(FAMILY_TEMPLATES[int(slot)]))
+    return StrategyHypothesis(
+        _hypothesis_id(vehicle, int(slot), int(generation), spec), int(slot),
+        int(generation), vehicle, spec["family"], _thesis(spec),
+        _falsification(spec), spec, None, None,
+    )
+
+
 def initial_hypotheses(count: int = DEFAULT_STRATEGIES, *,
                        vehicle: str = "equity") -> list[StrategyHypothesis]:
     if not 1 <= int(count) <= MAX_STRATEGIES:
         raise FactoryError(f"strategies must be between 1 and {MAX_STRATEGIES}")
-    templates = [
-        {"family": "opening_range_breakout", "range_minutes": 15,
-         "threshold_bps": 5.0, "confirmation": "volume"},
-        {"family": "opening_range_fade", "range_minutes": 20,
-         "threshold_bps": 8.0, "target_r": 1.5, "confirmation": "none"},
-        {"family": "momentum_continuation", "lookback": 12,
-         "threshold_bps": 18.0, "confirmation": "volume"},
-        {"family": "mean_reversion", "lookback": 20,
-         "zscore": 1.5, "target_r": 1.5, "confirmation": "volatility"},
-        {"family": "trend_pullback", "lookback": 10,
-         "slow_lookback": 35, "threshold_bps": 15.0, "confirmation": "trend"},
-        {"family": "volatility_breakout", "lookback": 12,
-         "compression_bps": 55.0, "threshold_bps": 5.0, "confirmation": "volume"},
-        {"family": "volume_breakout", "lookback": 15,
-         "volume_multiplier": 1.5, "threshold_bps": 5.0, "confirmation": "trend"},
-    ]
-    output = []
-    for slot in range(int(count)):
-        raw = templates[slot]
-        spec = validate_rule_spec(raw)
-        output.append(StrategyHypothesis(
-            _hypothesis_id(vehicle, slot, 0, spec), slot, 0, vehicle, spec["family"],
-            _thesis(spec), _falsification(spec), spec, None, None,
-        ))
-    return output
+    return [template_hypothesis(slot, vehicle=vehicle)
+            for slot in range(int(count))]
 
 
 def _session(row: UnderlyingBar) -> str:
@@ -533,6 +551,93 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
     if len(variants) != int(count):
         raise FactoryError("could not form the requested number of unique variants")
     return variants
+
+
+# Deterministic discovery ladders.  These are the offline fallback for seeding
+# a free slot, and they deliberately reach into the v2 grammar: without them
+# the only structure a slot could ever explore is "another family at template
+# defaults", which is what made the search terminate in the first place.
+_DISCOVERY_WINDOWS: tuple[tuple[int, int], ...] = (
+    (0, SESSION_MINUTES), (0, 120), (30, 210), (120, 330), (240, SESSION_MINUTES))
+_DISCOVERY_CONFIRMATIONS: tuple[tuple[str, ...], ...] = (
+    (), ("trend",), ("volume",), ("volatility",), ("trend", "volume"))
+_DISCOVERY_BANDS: tuple[tuple[float, float], ...] = (
+    (0.0, 5_000.0), (0.0, 60.0), (25.0, 120.0), (60.0, 5_000.0))
+# (side, target_r, stop_atr, max_hold_bars) — the payoff shape the conditional
+# entry is expressed with.
+_DISCOVERY_SHAPES: tuple[tuple[str, float, float, int], ...] = (
+    ("both", 2.0, 1.0, 90), ("both", 1.25, 0.75, 30), ("both", 3.0, 1.5, 180),
+    ("long", 2.0, 1.0, 60), ("short", 2.0, 1.0, 60), ("both", 1.5, 2.0, 45),
+    ("both", 4.0, 1.0, 240),
+)
+MAX_DISCOVERY_ATTEMPTS = 512
+
+
+def discovery_spec(index: int, *, family: str) -> dict[str, Any]:
+    """Return the deterministic *index*-th conditional variant of a family.
+
+    The ladder dimensions have pairwise-coprime lengths (5, 5, 4, 7 against a
+    7-family rotation) so consecutive indices vary several axes at once rather
+    than sweeping one and repeating.
+    """
+
+    spec = family_template(family)
+    if index <= 0:
+        return validate_rule_spec(spec)
+    windows, confirms = len(_DISCOVERY_WINDOWS), len(_DISCOVERY_CONFIRMATIONS)
+    bands, shapes = len(_DISCOVERY_BANDS), len(_DISCOVERY_SHAPES)
+    after, before = _DISCOVERY_WINDOWS[index % windows]
+    confirmations = _DISCOVERY_CONFIRMATIONS[(index // windows) % confirms]
+    low, high = _DISCOVERY_BANDS[(index // (windows * confirms)) % bands]
+    side, target_r, stop_atr, max_hold = _DISCOVERY_SHAPES[
+        (index // (windows * confirms * bands)) % shapes]
+    spec.update({"schema": RULE_SCHEMA_V2, "entry_after_minutes": after,
+                 "entry_before_minutes": before,
+                 "confirmations": list(confirmations),
+                 "min_atr_bps": low, "max_atr_bps": high,
+                 "side": side, "target_r": target_r, "stop_atr": stop_atr,
+                 "max_hold_bars": max_hold})
+    return validate_rule_spec(spec)
+
+
+def discovery_hypothesis(previous: Mapping[str, Any], *, generation: int,
+                         not_before: str | None,
+                         existing_variant_ids: set[str],
+                         tried_families: set[str]) -> StrategyHypothesis | None:
+    """Seed a free slot with a new hypothesis the ledger has not tried.
+
+    An untried family at its own template comes first, because that is the
+    cheapest genuinely new shape.  Once a slot has seen every family, discovery
+    continues into the conditional v2 grammar instead of stopping: a slot that
+    has run out of families has not run out of hypotheses.
+    """
+
+    vehicle = str(previous["vehicle"])
+    slot = int(previous["slot"])
+    current = str(previous["family"])
+    start = RULE_FAMILIES.index(current) if current in RULE_FAMILIES else 0
+
+    def build(spec: Mapping[str, Any]) -> StrategyHypothesis | None:
+        if rule_variant_id(spec) in existing_variant_ids:
+            return None
+        return StrategyHypothesis(
+            _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
+            vehicle, str(spec["family"]), _thesis(spec), _falsification(spec),
+            dict(spec), str(previous["hypothesis_id"]), not_before)
+
+    for offset in range(1, len(RULE_FAMILIES) + 1):
+        family = RULE_FAMILIES[(start + offset) % len(RULE_FAMILIES)]
+        if family in tried_families:
+            continue
+        seeded = build(validate_rule_spec(family_template(family)))
+        if seeded is not None:
+            return seeded
+    for index in range(1, MAX_DISCOVERY_ATTEMPTS + 1):
+        family = RULE_FAMILIES[(start + index) % len(RULE_FAMILIES)]
+        seeded = build(discovery_spec(index, family=family))
+        if seeded is not None:
+            return seeded
+    return None
 
 
 def replacement_hypothesis(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],

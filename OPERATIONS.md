@@ -237,10 +237,32 @@ content-addressed edge proof reports and may send an optional HTTPS webhook. Kee
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
 
+A slot whose hypothesis proves an edge is reseeded with a new hypothesis in the
+same cycle, so parallel research capacity stays constant instead of shrinking
+with every success. Each cycle result reports `reseeds`, `revived`, and
+`active_slots`; `active_slots` below the configured `--strategies` for more
+than one cycle is the signal that the factory has run out of unused hypotheses
+and needs attention. Slots left idle by an older ledger, or added by raising
+`--strategies`, are revived automatically at the start of the next cycle.
+
 Inspect autonomous lineage and isolated-account counts with
 `python research.py factory status`. Tune bounded capacity with
 `ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`, and
 `ALPACA_FACTORY_WORKERS`; hard validation caps these at 16, 8, and 16.
+
+See how each deployed edge is performing on live paper outcomes:
+
+```bash
+python research.py edge paper --vehicle equity --deployed
+```
+
+This reports per-edge trade and session counts, total and mean R, win rate, net
+P&L, the rolling-R demotion guard with its floor, and the sequential drift
+statistic against the held-out distribution the edge was validated on. It is
+the forward counterpart to `edge status`, which reports only lifecycle state
+and the confidence an edge was promoted with. The command is read-only and
+cannot change a lifecycle state. The same table is on the dashboard as
+"Live paper results by edge".
 
 Score the shared cost model against what the account actually paid:
 

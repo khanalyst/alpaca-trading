@@ -18,7 +18,13 @@ from zoneinfo import ZoneInfo
 from . import register
 
 
-RULE_SCHEMA = "rule-strategy.v1"
+RULE_SCHEMA_V1 = "rule-strategy.v1"
+RULE_SCHEMA_V2 = "rule-strategy.v2"
+RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2)
+# ``RULE_SCHEMA`` remains the v1 name so existing callers, stored specs, and
+# content hashes are untouched.  v2 is a strict superset reached only by
+# writing its schema string explicitly.
+RULE_SCHEMA = RULE_SCHEMA_V1
 RULE_FAMILIES = (
     "opening_range_breakout",
     "opening_range_fade",
@@ -64,21 +70,81 @@ _BOUNDS = {
     "max_hold_bars": (1, 390, int),
 }
 
+# v2 widens what a hypothesis can *express* without widening what it can *do*.
+# Every extension is an entry-side predicate over the same completed-bar prefix
+# the v1 grammar already sees, so research and runtime remain one evaluator and
+# the broker-side bracket that protects a position is unchanged.  Nothing here
+# can alter sizing, exits, or order placement.
+SESSION_MINUTES = 390
+V2_DEFAULT_EXTENSIONS: dict[str, Any] = {
+    # Additional confirmation filters; every listed filter must also pass.
+    "confirmations": [],
+    # Minutes after the 09:30 New York open during which entries may signal.
+    "entry_after_minutes": 0,
+    "entry_before_minutes": SESSION_MINUTES,
+    # Volatility regime band, as ATR expressed in basis points of price.
+    "min_atr_bps": 0.0,
+    "max_atr_bps": 5_000.0,
+}
+_V2_BOUNDS = {
+    "entry_after_minutes": (0, SESSION_MINUTES - 1, int),
+    "entry_before_minutes": (1, SESSION_MINUTES, int),
+    "min_atr_bps": (0.0, 2_000.0, float),
+    "max_atr_bps": (1.0, 5_000.0, float),
+}
+_EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
+MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
+
 
 class RuleSpecError(ValueError):
     """Raised when an autonomous rule leaves the audited grammar."""
 
 
+def _validate_confirmations(value: Any) -> list[str]:
+    """Normalize the v2 confirmation list to a deterministic, bounded set."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise RuleSpecError("rule_spec.confirmations must be a list of filter names")
+    if len(value) > MAX_CONFIRMATIONS:
+        raise RuleSpecError(
+            f"rule_spec.confirmations accepts at most {MAX_CONFIRMATIONS} filters")
+    selected: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or item not in _EXTRA_CONFIRMATIONS:
+            raise RuleSpecError(
+                "rule_spec.confirmations entries must be "
+                f"{', '.join(_EXTRA_CONFIRMATIONS)}")
+        selected.add(item)
+    # Order carries no meaning — every listed filter must pass — so the
+    # canonical form is sorted and duplicate-free.  That keeps one logical
+    # rule from hashing to several distinct variant ids.
+    return sorted(selected)
+
+
 def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise RuleSpecError("rule_spec must be a mapping")
-    unknown = sorted(set(value) - set(DEFAULT_RULE_SPEC))
+    schema = value.get("schema", RULE_SCHEMA_V1)
+    if schema not in RULE_SCHEMAS:
+        raise RuleSpecError(
+            f"rule_spec.schema must be one of {', '.join(map(repr, RULE_SCHEMAS))}")
+    permitted = set(DEFAULT_RULE_SPEC)
+    if schema == RULE_SCHEMA_V2:
+        permitted |= set(V2_DEFAULT_EXTENSIONS)
+    unknown = sorted(set(value) - permitted)
     if unknown:
+        # A v1 spec naming a v2 field is a version error, not a typo: say so.
+        extensions = [name for name in unknown if name in V2_DEFAULT_EXTENSIONS]
+        if extensions:
+            raise RuleSpecError(
+                f"rule_spec field(s) {', '.join(extensions)} require "
+                f"schema {RULE_SCHEMA_V2!r}")
         raise RuleSpecError(f"rule_spec has unknown field(s): {', '.join(unknown)}")
     spec = dict(DEFAULT_RULE_SPEC)
+    if schema == RULE_SCHEMA_V2:
+        spec.update(V2_DEFAULT_EXTENSIONS)
     spec.update(value)
-    if spec.get("schema") != RULE_SCHEMA:
-        raise RuleSpecError(f"rule_spec.schema must be {RULE_SCHEMA!r}")
+    spec["schema"] = schema
     if spec.get("family") not in RULE_FAMILIES:
         raise RuleSpecError(f"unsupported rule family: {spec.get('family')!r}")
     if spec.get("side") not in SIDES:
@@ -102,6 +168,28 @@ def validate_rule_spec(value: Mapping[str, Any]) -> dict[str, Any]:
         spec[name] = number
     if spec["slow_lookback"] <= spec["lookback"]:
         raise RuleSpecError("rule_spec.slow_lookback must exceed lookback")
+    if schema != RULE_SCHEMA_V2:
+        return spec
+    spec["confirmations"] = _validate_confirmations(spec["confirmations"])
+    for name, (lower, upper, cast) in _V2_BOUNDS.items():
+        raw = spec.get(name)
+        if isinstance(raw, bool):
+            raise RuleSpecError(f"rule_spec.{name} has an invalid type")
+        if cast is int and not isinstance(raw, int):
+            raise RuleSpecError(f"rule_spec.{name} must be an integer")
+        try:
+            number = cast(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuleSpecError(f"rule_spec.{name} must be numeric") from exc
+        if not math.isfinite(float(number)) or not lower <= number <= upper:
+            raise RuleSpecError(
+                f"rule_spec.{name} must be between {lower:g} and {upper:g}")
+        spec[name] = number
+    if spec["entry_before_minutes"] <= spec["entry_after_minutes"]:
+        raise RuleSpecError(
+            "rule_spec.entry_before_minutes must exceed entry_after_minutes")
+    if spec["max_atr_bps"] <= spec["min_atr_bps"]:
+        raise RuleSpecError("rule_spec.max_atr_bps must exceed min_atr_bps")
     return spec
 
 
@@ -206,8 +294,48 @@ def _allowed(direction: str, spec: Mapping[str, Any]) -> bool:
     return spec["side"] == "both" or spec["side"] == direction
 
 
-def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any]) -> bool:
-    kind = spec["confirmation"]
+def _session_minutes(stamp: datetime) -> float:
+    """Minutes from the 09:30 New York open to *stamp*, on its own local day."""
+
+    zone = ZoneInfo("America/New_York")
+    local = stamp.astimezone(zone)
+    opened = datetime.combine(local.date(), time(9, 30), tzinfo=zone)
+    return (local.timestamp() - opened.timestamp()) / 60.0
+
+
+def _within_entry_window(spec: Mapping[str, Any], stamp: datetime) -> bool:
+    if spec.get("schema") != RULE_SCHEMA_V2:
+        return True
+    elapsed = _session_minutes(stamp)
+    return (float(spec["entry_after_minutes"]) <= elapsed <
+            float(spec["entry_before_minutes"]))
+
+
+def _within_volatility_band(spec: Mapping[str, Any], atr: float,
+                            close: float) -> bool:
+    if spec.get("schema") != RULE_SCHEMA_V2:
+        return True
+    if close <= 0:
+        return False
+    bps = atr / close * 10_000
+    return float(spec["min_atr_bps"]) <= bps <= float(spec["max_atr_bps"])
+
+
+def _confirmations_pass(direction: str, rows: Sequence[Any],
+                        spec: Mapping[str, Any]) -> bool:
+    """Every confirmation the spec names must hold, v1 single or v2 list."""
+
+    if not _confirmation(direction, rows, spec, spec["confirmation"]):
+        return False
+    for kind in spec.get("confirmations") or ():
+        if not _confirmation(direction, rows, spec, kind):
+            return False
+    return True
+
+
+def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any],
+                  kind: str | None = None) -> bool:
+    kind = spec["confirmation"] if kind is None else kind
     if kind == "none":
         return True
     closes = [_number(row, "close") for row in rows]
@@ -317,16 +445,24 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         elif volume_ok and close < low * (1 - threshold):
             direction = "short"
 
-    if direction is None or not _allowed(direction, spec) or not _confirmation(direction, bars, spec):
+    if direction is None or not _allowed(direction, spec) or not _confirmations_pass(
+            direction, bars, spec):
         return None
     atr = _atr(bars, spec["atr_period"])
     if atr is None:
+        return None
+    # The v2 entry window and volatility band are the last entry-side gates.
+    # They are evaluated from the same completed-bar prefix as the signal, so a
+    # spec that passes here in research passes here at runtime.
+    if not _within_volatility_band(spec, atr, close):
         return None
     distance = max(atr * spec["stop_atr"], close * .0005)
     stop = close - distance if direction == "long" else close + distance
     target = close + distance * spec["target_r"] if direction == "long" else close - distance * spec["target_r"]
     stamp = _timestamp(current)
     if stamp is None:
+        return None
+    if not _within_entry_window(spec, stamp):
         return None
     return {
         "direction": direction,
@@ -368,7 +504,7 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
     strategy = config.get("strategy", config) if isinstance(config, Mapping) else {}
     spec = validate_rule_spec(strategy.get("rule_spec") or {})
     return {
-        "schema": RULE_SCHEMA,
+        "schema": spec["schema"],
         "family": spec["family"],
         "rule_spec_hash": rule_spec_hash(spec),
         "signal_ts": snapshot.get("signal_ts"),
@@ -379,8 +515,10 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
 
 
 __all__ = [
-    "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "RULE_FAMILIES",
-    "RULE_SCHEMA", "RuleSpecError", "evaluate_rule_signal",
+    "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
+    "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
+    "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
+    "RuleSpecError", "evaluate_rule_signal",
     "generate_rule_signal", "hold_deadline", "rule_spec_hash",
     "rule_variant_id", "setup_evidence", "validate_rule_spec",
 ]

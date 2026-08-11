@@ -107,6 +107,74 @@ def _performance(path: Path) -> dict:
         return {"available": False, "reason": type(exc).__name__}
 
 
+# Mirrors research.edge_ledger.PAPER_DEMOTION_* .  The dashboard deliberately
+# does not import the research package, so the guard thresholds it displays are
+# restated here and pinned to the ledger's constants by test_deploy.
+PAPER_ROLLING_WINDOW = 20
+PAPER_ROLLING_FLOOR = -2.0
+
+
+def _live_paper(connection: sqlite3.Connection) -> list[dict]:
+    """Per-edge live paper results, strongest realized R first.
+
+    Proof confidence says how strong the evidence *was*; this says how the
+    deployed edge is *doing*.  Both are needed to answer "which of my edges is
+    working", and only the first was visible before.
+    """
+    rows = connection.execute(
+        """SELECT p.candidate_id, c.variant_id, c.strategy_id, c.vehicle,
+                  s.status, p.session_date, p.net_pnl, p.outcome_json
+           FROM paper_outcomes p
+             JOIN candidates c ON c.candidate_id=p.candidate_id
+             JOIN candidate_state s ON s.candidate_id=p.candidate_id
+           ORDER BY p.candidate_id, p.created_at, p.outcome_id""").fetchall()
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        item = grouped.setdefault(str(row["candidate_id"]), {
+            "candidate_id": str(row["candidate_id"]),
+            "variant_id": row["variant_id"], "strategy_id": row["strategy_id"],
+            "vehicle": row["vehicle"], "status": row["status"],
+            "outcomes": 0, "net_pnl": 0.0, "_r": [], "_sessions": set()})
+        item["outcomes"] += 1
+        try:
+            item["net_pnl"] += float(row["net_pnl"])
+        except (TypeError, ValueError):
+            pass
+        if row["session_date"]:
+            item["_sessions"].add(str(row["session_date"]))
+        try:
+            payload = json.loads(row["outcome_json"])
+            value = float(payload["r_multiple"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if value == value and value not in (float("inf"), float("-inf")):
+            item["_r"].append(value)
+    report = []
+    for item in grouped.values():
+        r_values = item.pop("_r")
+        sessions = item.pop("_sessions")
+        recent = r_values[-PAPER_ROLLING_WINDOW:]
+        wins = [value for value in r_values if value > 0]
+        report.append({
+            **item,
+            "sessions": len(sessions),
+            "last_session": max(sessions) if sessions else None,
+            "net_pnl": round(item["net_pnl"], 2),
+            "total_r": round(sum(r_values), 4) if r_values else None,
+            "mean_r": round(sum(r_values) / len(r_values), 4) if r_values else None,
+            "win_rate": round(len(wins) / len(r_values), 4) if r_values else None,
+            "rolling_r": round(sum(recent), 4) if recent else None,
+            "rolling_floor": PAPER_ROLLING_FLOOR,
+            "guard": ("breached" if len(recent) >= PAPER_ROLLING_WINDOW and
+                      sum(recent) <= PAPER_ROLLING_FLOOR else
+                      "armed" if len(recent) >= PAPER_ROLLING_WINDOW else
+                      f"{len(recent)}/{PAPER_ROLLING_WINDOW}"),
+        })
+    return sorted(report, key=lambda item: (
+        item["total_r"] is not None,
+        item["total_r"] if item["total_r"] is not None else 0.0), reverse=True)
+
+
 def _edge_status(path: Path) -> dict:
     """Expose the append-only edge-lab lifecycle without promoting anything.
 
@@ -118,15 +186,16 @@ def _edge_status(path: Path) -> dict:
     if not path.is_file():
         return {"available": False, "status": "not_initialized",
                 "candidates": 0, "by_status": {}, "by_vehicle": {},
-                "proved_edges": []}
+                "proved_edges": [], "live_paper": []}
     try:
         factory = {"hypotheses": 0, "accounts": 0, "cycles": 0}
+        live_paper: list[dict] = []
         with closing(_ro_connect(path)) as connection:
             tables = _tables(connection)
             if not {"candidates", "candidate_state"}.issubset(tables):
                 return {"available": False, "status": "invalid_ledger",
                         "candidates": 0, "by_status": {}, "by_vehicle": {},
-                        "proved_edges": []}
+                        "proved_edges": [], "live_paper": []}
             rows = connection.execute(
                 """SELECT c.vehicle, s.status, COUNT(*) AS count
                    FROM candidates c JOIN candidate_state s
@@ -180,6 +249,8 @@ def _edge_status(path: Path) -> dict:
                     proved.append({**dict(candidate), "run_id": run["run_id"],
                                    "gate_hash": gate["content_hash"],
                                    "confidence": round(confidence, 6)})
+            if "paper_outcomes" in tables:
+                live_paper = _live_paper(connection)
             if {"factory_hypotheses", "factory_accounts", "factory_cycles"}.issubset(tables):
                 factory = {
                     "hypotheses": int(connection.execute(
@@ -201,11 +272,12 @@ def _edge_status(path: Path) -> dict:
                 "candidates": sum(by_status.values()),
                 "by_status": by_status, "by_vehicle": by_vehicle,
                 "proved_edges": [dict(row) for row in proved],
+                "live_paper": live_paper,
                 "factory": factory}
     except (OSError, sqlite3.Error, ValueError):
         return {"available": False, "status": "unreadable",
                 "candidates": 0, "by_status": {}, "by_vehicle": {},
-                "proved_edges": []}
+                "proved_edges": [], "live_paper": []}
 
 
 def _reports(root: Path) -> list[dict]:
@@ -339,7 +411,8 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
  c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
  c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);c.append(el('p',d.research.note||'No research status.','muted'));
- c=card('Proved edges',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
+ c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
+ c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard'])};
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}

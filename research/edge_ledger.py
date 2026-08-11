@@ -629,6 +629,99 @@ class EdgeLedger(EdgeLedgerProofMixin):
                             ("applicable", "degraded", "outcomes", "statistic", "threshold")}
         return summary
 
+    def paper_performance(self, candidate_id: str) -> dict:
+        """Summarize one candidate's live paper record.
+
+        The demotion guards already consume these outcomes; this is the same
+        append-only data made readable, so an operator can see how a deployed
+        edge is actually doing rather than only how strong its proof was.
+        Every field is derived, never stored, so it cannot drift from the
+        outcomes it summarizes.
+        """
+        candidate = self.candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(candidate_id)
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                "WHERE candidate_id=? ORDER BY created_at,outcome_id",
+                (candidate_id,)).fetchall()
+        r_values: list[float] = []
+        net_values: list[float] = []
+        sessions: set[str] = set()
+        for row in rows:
+            number = _finite_number(row["net_pnl"])
+            if number is not None:
+                net_values.append(number)
+            if row["session_date"]:
+                sessions.add(str(row["session_date"]))
+            try:
+                payload = json.loads(row["outcome_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            value = _finite_number(payload.get("r_multiple"))
+            if value is not None:
+                r_values.append(value)
+        recent = r_values[-PAPER_DEMOTION_MIN_OUTCOMES:]
+        wins = [value for value in r_values if value > 0]
+        drift = self.paper_drift(candidate_id)
+        reference = drift.get("reference") or {}
+        return {
+            "candidate_id": candidate_id,
+            "variant_id": candidate.get("variant_id"),
+            "strategy_id": candidate.get("strategy_id"),
+            "vehicle": candidate.get("vehicle"),
+            "status": candidate.get("status"),
+            "deployed": candidate.get("status") in DEPLOYED_STATUSES,
+            "outcomes": len(rows),
+            "sessions": len(sessions),
+            "first_session": min(sessions) if sessions else None,
+            "last_session": max(sessions) if sessions else None,
+            "net_pnl": sum(net_values) if net_values else 0.0,
+            "total_r": sum(r_values) if r_values else None,
+            "mean_r": (sum(r_values) / len(r_values)) if r_values else None,
+            "win_rate": (len(wins) / len(r_values)) if r_values else None,
+            # The registered rolling-R guard, exactly as the demotion path
+            # evaluates it, so a live edge's distance from retirement is visible
+            # before it retires rather than only in the event log afterwards.
+            "rolling": {
+                "outcomes": len(recent),
+                "required": PAPER_DEMOTION_MIN_OUTCOMES,
+                "r": sum(recent) if recent else None,
+                "floor": PAPER_DEMOTION_R_FLOOR,
+                "armed": len(recent) >= PAPER_DEMOTION_MIN_OUTCOMES,
+                "breached": bool(len(recent) >= PAPER_DEMOTION_MIN_OUTCOMES and
+                                 sum(recent) <= PAPER_DEMOTION_R_FLOOR),
+            },
+            "drift": {
+                "applicable": bool(drift.get("applicable")),
+                "degraded": bool(drift.get("degraded")),
+                "outcomes": drift.get("outcomes"),
+                "required": PAPER_DRIFT_MIN_OUTCOMES,
+                "statistic": drift.get("statistic"),
+                "threshold": drift.get("threshold"),
+                "reference_mean_r": reference.get("mean_r"),
+                "reference_trades": reference.get("trades"),
+            },
+        }
+
+    def paper_report(self, *, vehicle: str | None = None,
+                     deployed_only: bool = False) -> list[dict]:
+        """Return the live paper record of every candidate, strongest first."""
+        rows = self.status(vehicle=vehicle)
+        report = []
+        for candidate in rows:
+            if deployed_only and candidate["status"] not in DEPLOYED_STATUSES:
+                continue
+            report.append(self.paper_performance(candidate["candidate_id"]))
+        # No live outcomes yet sorts last: an unobserved edge is not a good one.
+        return sorted(report, key=lambda item: (
+            item["total_r"] is not None,
+            item["total_r"] if item["total_r"] is not None else 0.0,
+            item["outcomes"]), reverse=True)
+
     def _runs(self, candidate_id: str, *, lane: str | None = None) -> list[sqlite3.Row]:
         query = "SELECT * FROM runs WHERE candidate_id=?"; params: list = [candidate_id]
         if lane: query += " AND lane=?"; params.append(lane)

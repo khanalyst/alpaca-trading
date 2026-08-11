@@ -308,6 +308,18 @@ def cmd_edge_promote(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edge_paper(args: argparse.Namespace) -> int:
+    """Report how each edge is actually doing on live paper outcomes."""
+    ledger = EdgeLedger(_db(args))
+    if getattr(args, "candidate", None):
+        report = [ledger.paper_performance(args.candidate)]
+    else:
+        report = ledger.paper_report(vehicle=args.vehicle,
+                                     deployed_only=bool(args.deployed))
+    print(json.dumps(report, sort_keys=True, default=str))
+    return 0
+
+
 def cmd_edge_ingest(args: argparse.Namespace) -> int:
     ledger = EdgeLedger(_db(args))
     outcome = _read_json(args.outcome, {})
@@ -418,6 +430,13 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("candidate")
         parser.add_argument("outcome")
         parser.set_defaults(func=cmd_edge_ingest)
+    elif command == "paper":
+        parser.add_argument("candidate", nargs="?", default=None,
+                            help="one candidate id (default: every candidate)")
+        parser.add_argument("--vehicle", choices=("equity", "option"), default=None)
+        parser.add_argument("--deployed", action="store_true",
+                            help="only validated/champion edges")
+        parser.set_defaults(func=cmd_edge_paper)
     elif command == "discover":
         parser.add_argument("--data", required=True,
                             help="normalized market JSONL corpus")
@@ -456,9 +475,10 @@ def build_parser() -> argparse.ArgumentParser:
     # jobs can stay terse while operators retain a discoverable command tree.
     edge = sub.add_parser("edge", help="auditable edge discovery ledger")
     edge_sub = edge.add_subparsers(dest="edge_command", required=True)
-    for name in ("init", "status", "promote", "ingest", "discover"):
+    for name in ("init", "status", "promote", "ingest", "paper", "discover"):
         _edge_parser(edge_sub, name, name)
-    for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest", "edge-discover"):
+    for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest",
+                 "edge-paper", "edge-discover"):
         _edge_parser(sub, name, name.split("-", 1)[1])
     calibrate = sub.add_parser(
         "calibrate", help="compare modelled fill costs against journaled fills")

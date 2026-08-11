@@ -304,9 +304,46 @@ Generated strategies are data in the finite grammar defined by
 `agent.contracts.rule`; research never generates or executes Python source.
 Diagnosis uses chronological fit data. Variants are judged on untouched
 held-out data, and a backtest winner still needs a strictly later forward
-shadow sample before runtime eligibility. Optional LLM replacement can only
-propose another schema-validated bounded rule; invalid output cannot retire a
-family or authorize trading.
+shadow sample before runtime eligibility.
+
+The grammar is versioned. `rule-strategy.v1` is unchanged and keeps every
+existing `variant_id` byte-identical, so ledgers written before v2 stay
+resolvable. `rule-strategy.v2` is a strict superset, reached only by naming it,
+that adds four entry-side predicates — a multi-filter `confirmations` list, a
+session-time entry window, and an ATR volatility band. Each is a pure function
+of the same completed-bar prefix, so `evaluate_rule_signal` remains the single
+evaluator shared by research and runtime and no extension can reach sizing,
+exits, or order placement. A v2 spec that admits a signal emits exactly the v1
+plan.
+
+### Slot lifecycle
+
+A slot is a unit of parallel research capacity. Its hypothesis leaves
+`ACTIVE_HYPOTHESIS_STATES` permanently on a shadow pass, because the proved
+variant is deployed and must never be re-tuned; the slot is therefore reseeded
+with a new hypothesis in the same cycle. Reseeding prefers an untried family at
+that family's template and then continues into a deterministic conditional-v2
+ladder. Each reseed grants one further `max_generations` budget and is counted
+separately from the failure-recovery rotation budget, which it never consumes.
+`run_factory` additionally revives any slot holding no active hypothesis before
+scheduling, so an older ledger or a raised `strategies` count recovers without
+touching a deployed edge. Without this, capacity fell by one slot per success
+and the factory eventually returned `exhausted` permanently.
+
+### The LLM's authority
+
+`research.llm_strategy` answers two bounded requests. `llm-rule-proposal.v1`
+repairs a family whose intended variants all failed. `llm-edge-discovery.v1`
+seeds a free slot with a new hypothesis, given an aggregate brief of what the
+slot has tried and what is already proved, and must return a short plain-text
+thesis alongside the spec. Both replies are strict, size-capped, fence- and
+unsafe-key-rejecting JSON validated against the rule grammar before storage. A
+proposal is only ever a *seed*: the resulting hypothesis is registered `queued`
+and must earn `backtest_passed` and a strictly later shadow pass through the
+same gates as a deterministic one. The LLM decides what to try next; it cannot
+shorten the evidence path, retire a family on invalid output, or authorize
+trading. Every seeding path has a deterministic fallback, so the factory keeps
+discovering with no provider configured.
 
 ### Statistical gates and lifecycle
 
@@ -344,7 +381,23 @@ Generation exhaustion in the strategy factory is recoverable but still
 bounded. A slot whose family has spent its mutation budget may be reseeded
 with an untried family at template defaults, at most `MAX_ROTATIONS` times per
 slot and `ROTATION_BUDGET` times per cycle, each rotation granting one further
-`max_generations` budget. Neither bound can be raised by configuration.
+`max_generations` budget. Neither bound can be raised by configuration. A
+reseed after a *proved* edge is a separate, unbounded path: it follows success
+rather than failure, so bounding it would only shrink the search.
+
+### Deployed-edge observability
+
+`EdgeLedger.paper_performance` and `paper_report` read back the append-only
+`paper_outcomes` the demotion guards already consume: per-edge trade and
+session counts, total and mean R, win rate, net P&L, the rolling-R guard with
+its floor and armed/breached state, and the sequential drift statistic against
+the validated held-out distribution. `research.py edge paper` and the
+dashboard's "Live paper results by edge" card are the two read surfaces. They
+are derived on every read, never stored, so they cannot drift from the
+outcomes they summarize or from the guard that acts on them; the dashboard
+restates the two guard thresholds rather than importing the research package,
+and a test pins them to the ledger's constants. Neither surface can change a
+lifecycle state.
 
 ## Safety invariants
 
