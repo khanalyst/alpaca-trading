@@ -145,6 +145,18 @@ class AlpacaRuntimeTests(unittest.TestCase):
         self.assertTrue(equity.called)
         self.assertTrue(option.called)
 
+    def test_a_trading_client_without_option_contracts_is_a_capability_gap(self):
+        # option_candidates tolerates exactly one error text when it falls back
+        # to the chain alone.  Whether alpaca-py is importable decides which
+        # branch of option_contracts runs, so both have to spell the missing
+        # endpoint the same way or the fallback silently stops working.
+        provider = AlpacaProvider(
+            {"mode": "paper"},
+            session=AlpacaSession(paper=True, trading_client=object()))
+        with self.assertRaises(AlpacaError) as raised:
+            provider.option_contracts("SPY")
+        self.assertIn("request support is unavailable", str(raised.exception).lower())
+
     def test_early_close_and_session_policy(self):
         day = normalize_calendar_day({"date": "2026-07-03", "open": "09:30", "close": "13:00"})
         policy = SessionPolicy(force_flat_minutes_before_close=10)

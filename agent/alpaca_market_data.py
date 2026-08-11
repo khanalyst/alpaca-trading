@@ -114,7 +114,14 @@ class AlpacaMarketDataMixin:
             if ExerciseStyle is not None and request_kwargs.get("style") is not None:
                 request_kwargs["style"] = getattr(ExerciseStyle, str(request_kwargs["style"]).upper(), request_kwargs["style"])
             request = GetOptionContractsRequest(**request_kwargs)
-            getter = getattr(self.session.trading, "get_option_contracts")
+            # A trading client that simply lacks this endpoint is a capability
+            # gap, not a request failure.  Report it exactly as the ImportError
+            # path below does, so option_candidates' documented chain-only
+            # fallback recognizes both spellings of the same condition.
+            getter = getattr(self.session.trading, "get_option_contracts", None)
+            if getter is None:
+                raise AlpacaError(
+                    "alpaca-py option-contract request support is unavailable")
             rows = getter(request)
             # API response is a paginated object in alpaca-py 0.43.x.
             if hasattr(rows, "option_contracts"):
