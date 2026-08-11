@@ -102,6 +102,8 @@ For an existing non-Compose host, install these units as the restricted
 
 - `alpaca-recorder.service` — recorder;
 - `alpaca-trader.service` — one paper trader process and one execution profile;
+- `alpaca-watchdog.service` — flatten-only watchdog; enable it with the
+  trader, since it is the only bound on the option profile's software stop;
 - `alpaca-research.service` and `alpaca-research.timer` — scheduled research.
 
 The units are alternatives to Compose. Do not enable both lanes on one host or

@@ -1,0 +1,29 @@
+[Unit]
+Description=Alpaca flatten-only watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpaca
+Group=alpaca
+WorkingDirectory=/opt/alpaca-agent-trading
+EnvironmentFile=-/etc/alpaca-agent-trading/agent.env
+Environment=ALPACA_PAPER=true
+Environment=ALPACA_AGENT_SECRETS_FILE=/etc/alpaca-agent-trading/agent.env
+ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/watchdog.py \
+  --config config.yaml --interval 30 --max-heartbeat-age 300
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alpaca-agent-trading/runtime
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=2m
+
+[Install]
+WantedBy=multi-user.target

@@ -32,8 +32,10 @@ fresh, the dashboard is healthy, and the trader has exactly one replica.
 For systemd hosts:
 
 ```bash
-sudo systemctl status alpaca-recorder alpaca-trader alpaca-research.timer
+sudo systemctl status alpaca-recorder alpaca-trader alpaca-watchdog \
+  alpaca-research.timer
 sudo journalctl -u alpaca-trader -n 100 --no-pager
+sudo journalctl -u alpaca-watchdog -n 100 --no-pager
 sudo journalctl -u alpaca-recorder -n 100 --no-pager
 sudo journalctl -u alpaca-research -n 100 --no-pager
 ```
