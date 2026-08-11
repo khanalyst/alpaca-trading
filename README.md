@@ -13,8 +13,13 @@ The research factory starts with seven independent rule families and four
 isolated simulated-account variants per family. It evaluates independent
 families in parallel, diagnoses failures from chronological fit data, mutates
 bounded data-only rule specifications, and judges them on untouched held-out
-data. Paper `strategy.selection_mode: all_proved` selects one best proven
-variant per independent family under one global risk book. A trader process
+data. A rule specification carries `max_hold_bars`, so every strategy has a
+bounded time exit as well as a stop and a target; research and runtime compute
+that deadline from one shared helper. Paper
+`strategy.selection_mode: all_proved` selects one best proven variant per
+independent family under one global risk book, ranked by held-out evidence
+rather than by family name and bounded by a correlation cap so several
+expressions of one bet do not become concurrent risk. A trader process
 uses one execution profile (`shares` or `options`) at a time; do not mix
 profiles in one process. The market calendar is America/New_York (NYSE regular
 session). New entries are rejected outside the regular session, orders are
@@ -36,6 +41,11 @@ are force-closed before the close.
   software (the 60-second poller, bounded by the separate `watchdog` process)
   and `mode: live` rejects the options profile. If the broker or network is
   unreachable, nothing local protects an open option position.
+- `mode: live` rejects `llm.enabled: true`. The validated edge was proven with
+  the deterministic rule and no LLM in the loop, so enabling the runtime LLM
+  veto in live would deploy a strategy that is not the one that passed the
+  gates. Runtime decision LLM use stays off; the bounded research replacement
+  adapter is a separate, offline setting.
 - Keep API keys in `.env` or a host secret; never commit them. Use trading
   permissions only and disable withdrawals.
 - Research, recorder, trader, and dashboard state is isolated in named
@@ -75,10 +85,12 @@ The lean deployment topology is:
 
 The research service is an opt-in Compose profile, but a fresh deployment must
 run it long enough to produce a champion before the trader can open risk. It
-consumes the recorder's append-only mixed
-`runtime/research/recorded/market.csv` by default (bars, quotes, and option
-snapshots), or an explicit normalized JSONL path from
-`ALPACA_RESEARCH_DATASET`. By default each cycle schedules seven strategies,
+consumes the recorder's mixed corpus (bars, quotes, and option snapshots),
+which is written one append-only partition per New York session date under
+`runtime/research/recorded/sessions/` with a sidecar index; the cycle script
+concatenates those partitions in session order.
+`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the most recent N sessions and
+`ALPACA_RESEARCH_DATASET` overrides the source with normalized JSONL. By default each cycle schedules seven strategies,
 four isolated accounts per strategy, and up to seven worker processes. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger

@@ -81,7 +81,12 @@ Paper is the default and the shipped Compose/systemd lanes set
 `broker.paper: false`, `broker.allow_live: true`, and
 `ALPACA_LIVE_ENABLE=true`; `ALPACA_PAPER=true` must not be set. It must use
 `strategy.selection_mode: specific` and one exact named validated/champion
-`strategy.variant_id`. The runtime pins that candidate/configuration and does
+`strategy.variant_id`, and it must keep `llm.enabled: false` — validation
+rejects a live configuration with the runtime decision LLM on, because the
+pinned edge was proven with the deterministic rule and no LLM in the loop and a
+runtime veto would deploy a strategy that never passed the gates. The bounded
+research strategy-replacement adapter is a separate offline setting and is
+unaffected. The runtime pins that candidate/configuration and does
 not auto-switch. Keep live credentials, config, and
 `ALPACA_AGENT_RUNTIME_ROOT` separate from paper; never run both against shared
 state or a shared account.
@@ -234,6 +239,23 @@ Inspect autonomous lineage and isolated-account counts with
 `python research.py factory status`. Tune bounded capacity with
 `ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`, and
 `ALPACA_FACTORY_WORKERS`; hard validation caps these at 16, 8, and 16.
+
+Score the shared cost model against what the account actually paid:
+
+```bash
+python research.py calibrate runtime/paper/journal.db
+```
+
+The command is read-only. It reconstructs each entry fill's plan price from the
+plan's notional and submitted quantity and reports the observed adverse cost in
+basis points, the model's bias against it, the share of fills inside the model,
+how many fills landed past the runtime's own slippage cap, and a verdict of
+`conservative`, `optimistic`, or `insufficient_data`. Under 20 referenced fills
+it issues no verdict at all, and an `optimistic` verdict exits non-zero so it
+cannot be missed in a scheduled run. It never adjusts the model; widening a
+cost assumption is a human decision. There is no exit-side calibration: the
+journal records no exit reference price, so an exit number would be invented
+rather than measured.
 
 The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this

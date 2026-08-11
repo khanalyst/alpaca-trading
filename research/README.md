@@ -19,9 +19,12 @@ identity and multiplier separately from the quote. Use
 `normalize_option_snapshot` at provider boundaries; replay code does not
 accept raw provider dictionaries.
 
-The deployment recorder appends bars, quotes, and option snapshots to one
-mixed market dataset. `deploy/research-cycle.sh` validates that dataset and
-routes the available bar/option events to the vehicle-local discovery lanes.
+The deployment recorder writes bars, quotes, and option snapshots to one mixed
+corpus, appended into one partition per New York session date under
+`sessions/` with a sidecar index. `deploy/research-cycle.sh` concatenates those
+partitions in session order (`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the
+most recent N), validates the result, and routes the vehicle-local discovery
+lanes from it.
 It also invokes `research.strategy_factory`, which evaluates seven distinct
 rule families concurrently by default. Each generated variant owns an
 isolated simulated account; no capital or P&L is shared between arms.
@@ -84,10 +87,12 @@ than simulating fills that could never happen. Sourcing an expected slippage
 from the cap is as wrong as ignoring the cap.
 
 Quote-driven fills need the quote rows to reach the lane. `research.edge_lab`
-and `research.strategy_factory` accept them from a mixed corpus, but
-`deploy/research-cycle.sh` currently splits the recorded dataset into
-bar-only and option-only files, so a scheduled cycle still prices every
-equity fill from the bar and reports `bar` as the source.
+and `research.strategy_factory` are handed the complete mixed corpus by
+`deploy/research-cycle.sh`, so a scheduled cycle prices a boundary fill from a
+recorded quote where one exists and records the source on the trade. The
+bar-only, quote-only and option-only views the script derives alongside it are
+used to decide which vehicle lanes to run and to feed the standalone
+`backtest-ibr` invocation, which receives the quotes explicitly.
 
 ```bash
 python research.py calibrate runtime/paper/journal.db
@@ -98,8 +103,15 @@ recorded entry fill against the plan price that priced it, recovered from the
 plan's notional and submitted quantity. It reports the observed adverse cost
 in basis points, the model's bias against it, how many fills landed past the
 runtime's own slippage cap, and a verdict of `conservative`, `optimistic`, or
-`insufficient_data`. It never adjusts the model; an optimistic model is a
-finding, and the command exits non-zero so it cannot be missed.
+`insufficient_data`. Under 20 referenced fills it issues no verdict at all: the
+sample cannot separate the model from noise. A fill whose reference cannot be
+reconstructed is counted as unreferenced rather than scored against a guess. It
+never adjusts the model; an optimistic model is a finding, and the command
+exits non-zero so it cannot be missed.
+
+There is deliberately no exit-side calibration. The journal records no exit
+reference price, so an exit cost could only be inferred, and an inferred number
+in a calibration report is indistinguishable from a measured one.
 
 ## Evidence and provenance
 

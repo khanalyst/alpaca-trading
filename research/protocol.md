@@ -20,7 +20,14 @@ Every replay must establish the following invariants:
 - a fill landing on a bar boundary uses a recorded quote at that instant when
   one exists, and otherwise records that it fell back to the bar;
 - spread, slippage, and both-side fees are charged from one shared model;
+- an option leg is priced only from a quote no older than the staleness bound
+  (300s) at the instant being priced; a signal whose contract has no such quote
+  is recorded as an explicit unpriced row, never dropped and never filled from
+  the contract's last quote of the morning;
 - positions are force-flat before the session close;
+- a bounded rule position also carries a `max_hold_bars` time exit, computed by
+  the one helper the runtime uses (`agent/contracts/rule.py::hold_deadline`)
+  and clamped to the force-flat time;
 - equity and single-leg long-option books have separate samples, costs, and
   P&L; multi-leg and short option structures are outside the protocol.
 

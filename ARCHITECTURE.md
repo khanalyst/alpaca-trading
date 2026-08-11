@@ -12,7 +12,7 @@ The repository contains five cooperating processes:
 
 | Process | Authority | Durable output |
 | --- | --- | --- |
-| Recorder | Read-only Alpaca market-data collection | Mixed bars, quotes, and option snapshots under `runtime/research/recorded` |
+| Recorder | Read-only Alpaca market-data collection | Mixed bars, quotes, and option snapshots, one partition per session date under `runtime/research/recorded/sessions` |
 | Research | Offline simulation, evidence gates, and candidate lifecycle | Edge/factory SQLite ledgers and content-addressed proof artifacts |
 | Trader | Authenticated account reads and order/position mutation | Mode-scoped runtime state, operational journal, events, and heartbeat |
 | Watchdog | Cancel and flatten only, never entries | Its own health status file |
@@ -25,7 +25,10 @@ record from the research ledger. The dashboard is not an execution console.
 Paper and live runtimes use separate directories and account fingerprints.
 Paper is the documented default. Live mode requires an explicit live
 configuration, environment guard, authenticated preflight, pattern-day-trader
-status, and one specifically pinned proved variant.
+status, one specifically pinned proved variant, and `llm.enabled: false`: the
+pinned edge was proven with the deterministic rule and no LLM in the loop, so a
+runtime LLM veto would deploy a different strategy from the one the gates
+passed.
 
 ## Deployment and data flow
 
@@ -36,7 +39,7 @@ Alpaca market-data APIs
 deploy/recorder.py + deploy/recorder_market.py
         |
         v
-append-only normalized market corpus
+normalized market corpus, append-only, partitioned by session date
         |
         +------------------------------+
         |                              |
@@ -113,6 +116,59 @@ A normal cycle follows these gates:
 The runtime never silently substitutes stale data, malformed numeric values,
 an unrelated idempotency lookup, an incompatible OCC contract, or an unknown
 broker status.
+
+### The bounded-hold exit contract
+
+The bounded rule grammar carries `max_hold_bars`, so a validated strategy has a
+time exit as well as a stop and a target. `agent.contracts.rule.hold_deadline`
+is the single definition of that exit: given the entry bar's opening timestamp
+(the bar after the signal bar) it returns the close of the last permitted bar,
+clamped to the session force-flat time. Both the research simulator
+(`research.edge_discovery_core`, `research.factory_core`) and the live runtime
+(`agent.strategy` when building the setup plan) call it, so a strategy
+validated with an N-bar time exit runs with that same time exit rather than an
+approximation of it.
+
+The runtime persists the resulting `hold_deadline_ts` on the trade, so the exit
+survives a restart. `agent.execution_lifecycle` fires the `max_hold` close from
+durable state and the clock alone, without needing a market price: a data
+outage must not silently extend a hold past the validated horizon. A trade
+persisted before the field existed, or an IBR trade, has no deadline and keeps
+its historical stop/target/close-only behaviour; a present but unusable
+deadline is treated as expired. `tests/test_exit_contract.py` is the
+differential test that pins the two engines to one another.
+
+### Concurrent proved edges
+
+`all_proved` paper selection can resolve several independently proved
+candidates in one cycle, and the order in which they are offered decides which
+one meets the shared risk caps first. `agent.allocation` makes that order
+evidence, not alphabet. Candidates are ranked by `evidence_rank`, the identical
+ordering `EdgeLedger.select_champion` uses — held-out delta lower confidence
+bound, then smaller max drawdown, then held-out trade count, then the point
+estimate, with ids only to break ties — and a missing or non-finite metric
+collapses to its worst admissible value.
+
+Ranked candidates are then admitted greedily under a correlation cap: a
+candidate is refused while a free concurrent position slot is unavailable, or
+when it is already represented by an admitted candidate it correlates with at
+or above the threshold, so one directional bet expressed several ways does not
+become several risks. Correlation is Pearson on held-out per-session R, matched
+by session date, taken from the persisted trades of the candidate's latest
+re-verified shadow run — the same evidence that authorized deployment. Fewer
+than ten shared sessions, a zero-variance series, or an unreadable run all
+yield correlation 1.0: absence of evidence is maximal correlation, never
+independence. A negative estimate is floored at zero, so no extra slot is
+granted on the strength of a claimed hedge. Every input appears exactly once in
+the admitted or rejected list and every rejection carries a durable reason,
+journalled as an `allocation_reject` event; an allocation failure falls back to
+the single best-ranked edge.
+
+Allocation only narrows and reorders. Every per-order risk check in the cycle
+still runs unchanged, so it reallocates within the existing risk caps and
+cannot admit a set the previous sequential path would have refused.
+`selection_mode: specific` — the only mode live may use — resolves one record
+and bypasses the allocator entirely.
 
 ### Option protection and its residual
 
@@ -307,6 +363,11 @@ slot and `ROTATION_BUDGET` times per cycle, each rotation granting one further
   a broker-resident take-profit and no broker-resident stop. Its stop is the
   local poller, bounded from outside by `deploy/watchdog.py`, and `mode: live`
   rejects `strategy.execution_mode: options` for exactly that reason.
+- `mode: live` rejects `llm.enabled: true`; the deployed strategy must be the
+  deterministic rule the gates passed.
+- A bounded-hold deadline is computed by one shared helper for research and
+  runtime, is clamped to the session force-flat time, and closes from durable
+  state and the clock without requiring a market price.
 - Startup and shutdown are reconciled; exposure or ambiguous broker state
   blocks entries and pauses safely.
 - A durable operator pause survives restart until authenticated flat-only
