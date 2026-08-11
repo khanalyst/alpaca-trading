@@ -308,6 +308,33 @@ def cmd_edge_promote(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_vehicles(args: argparse.Namespace) -> int:
+    """Print the vehicles this deployment should research, one per line.
+
+    The research cycle asks this rather than studying both vehicles
+    unconditionally: a trader runs one execution profile, so evidence in the
+    other vehicle can never be deployed and only accumulates unusable proofs.
+    """
+    from agent.edge import research_vehicles, runtime_vehicle
+
+    config = _agent_config(args)
+    override = (args.vehicles if getattr(args, "vehicles", None) is not None
+                else os.getenv("ALPACA_RESEARCH_VEHICLES"))
+    try:
+        selected = research_vehicles(config, override)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if getattr(args, "json", False):
+        print(json.dumps({"schema": "research-vehicles.v1",
+                          "vehicles": selected,
+                          "runtime_vehicle": runtime_vehicle(config),
+                          "override": override or None}, sort_keys=True))
+    else:
+        for vehicle in selected:
+            print(vehicle)
+    return 0 if selected else 2
+
+
 def cmd_edge_paper(args: argparse.Namespace) -> int:
     """Report how each edge is actually doing on live paper outcomes."""
     ledger = EdgeLedger(_db(args))
@@ -480,6 +507,16 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest",
                  "edge-paper", "edge-discover"):
         _edge_parser(sub, name, name.split("-", 1)[1])
+    vehicles = sub.add_parser(
+        "vehicles", help="print the vehicles this deployment should research")
+    vehicles.add_argument("--agent-config", default=None,
+                          help="validated agent config (default: config.yaml)")
+    vehicles.add_argument("--vehicles", default=None,
+                          help="override: 'all' or a comma-separated subset "
+                               "(default: ALPACA_RESEARCH_VEHICLES, else the "
+                               "configured execution profile)")
+    vehicles.add_argument("--json", action="store_true")
+    vehicles.set_defaults(func=cmd_vehicles)
     calibrate = sub.add_parser(
         "calibrate", help="compare modelled fill costs against journaled fills")
     calibrate.add_argument("journal")

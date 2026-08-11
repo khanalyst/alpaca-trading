@@ -9,8 +9,9 @@ Options are single-leg long calls or puts
 (buy-to-open, sell-to-close); multi-leg and naked/short option structures are
 unsupported. No performance claim is made.
 
-The research factory starts with seven independent rule families and four
-isolated simulated-account variants per family. It evaluates independent
+The research factory runs seven independent slots, each holding one rule
+hypothesis with four isolated simulated-account variants, drawn from a catalog
+of eleven rule families. It evaluates independent
 families in parallel, diagnoses failures from chronological fit data, mutates
 bounded data-only rule specifications, and judges them on untouched held-out
 data. A slot that proves an edge is reseeded with a new hypothesis in the same
@@ -146,6 +147,20 @@ pending replacement or falls back to deterministic discovery; it never retires
 a family or authorizes trading. Runtime
 decision LLM use remains disabled (`llm.enabled: false`). The default stock
 feed is IEX. Long options remain subject to liquidity and contract checks. On a
+Research studies only the vehicle the configured execution profile can trade
+(`python research.py vehicles`); `ALPACA_RESEARCH_VEHICLES=all` runs both lanes
+deliberately. Seed months of history in one command instead of waiting for the
+recorder to accumulate it:
+
+```bash
+./.venv/bin/python deploy/backfill.py --days 180
+```
+
+Backfill writes the same partitions, `as_of` semantics, and index the recorder
+writes, so no gate is weakened; options are not backfilled and still need
+recorded sessions. Clearing the 100-trade held-out floor depends on universe
+width as much as history — four symbols over 120 sessions yields roughly 84
+held-out trades — so widen `universe.symbols` too. On a
 fresh ledger, `run` starts safely but will not submit entries: first collect an
 initial corpus, let the strategy factory pass its backtest, and then collect a
 strictly later unseen tail for shadow validation and automatic champion

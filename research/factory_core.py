@@ -95,6 +95,14 @@ FAMILY_TEMPLATES: tuple[dict[str, Any], ...] = (
      "compression_bps": 55.0, "threshold_bps": 5.0, "confirmation": "volume"},
     {"family": "volume_breakout", "lookback": 15,
      "volume_multiplier": 1.5, "threshold_bps": 5.0, "confirmation": "trend"},
+    {"family": "vwap_reversion", "lookback": 20,
+     "threshold_bps": 25.0, "target_r": 1.5, "confirmation": "none"},
+    {"family": "vwap_trend", "lookback": 15,
+     "threshold_bps": 8.0, "confirmation": "volume"},
+    {"family": "range_expansion", "lookback": 20,
+     "volume_multiplier": 2.0, "threshold_bps": 5.0, "confirmation": "none"},
+    {"family": "opening_drive", "range_minutes": 30,
+     "threshold_bps": 30.0, "confirmation": "volume"},
 )
 
 

@@ -39,7 +39,7 @@ from .gates import (chronological_split, heldout_separation,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
-from .llm_strategy import ProposalResult, RuleProposalAdapter
+from .llm_strategy import DISCOVERY_SCHEMA, ProposalResult, RuleProposalAdapter
 from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
@@ -139,9 +139,20 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
             timeout_seconds=float(config.get("timeout_seconds", 30)),
             max_response_bytes=int(config.get("max_response_bytes", 16_384)),
         )
-        proposal = selected.discover(vehicle=vehicle, slot=slot, context=dict(context))
-        if (proposal.success and proposal.rule_spec is not None and
-                proposal.variant_id and
+        discover = getattr(selected, "discover", None)
+        try:
+            # An injected seam without ``discover``, or one that raises, means
+            # no proposal — not a failed research cycle. Seeding must always
+            # produce a hypothesis, so any provider trouble degrades to the
+            # deterministic ladder rather than stopping the night's work.
+            proposal = (discover(vehicle=vehicle, slot=slot,
+                                 context=dict(context))
+                        if callable(discover) else None)
+        except Exception as exc:  # noqa: BLE001 - degraded, never fatal
+            proposal = ProposalResult(False, schema=DISCOVERY_SCHEMA,
+                                      error=f"{type(exc).__name__}: {exc}")
+        if (proposal is not None and proposal.success and
+                proposal.rule_spec is not None and proposal.variant_id and
                 proposal.variant_id not in existing_variant_ids):
             spec = validate_rule_spec(proposal.rule_spec)
             return StrategyHypothesis(
@@ -212,25 +223,51 @@ def _llm_lineage_evidence(factory: FactoryLedger,
 def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                   strategies: int, existing_variant_ids: set[str],
                   llm_enabled: bool, llm_config: Mapping[str, Any],
-                  adapter: RuleProposalAdapter | None) -> list[dict]:
+                  adapter: RuleProposalAdapter | None
+                  ) -> tuple[list[dict], list[dict]]:
     """Give every configured slot an active hypothesis before scheduling.
 
-    Two situations need this.  A ledger written before slots were reseeded on
-    success has proved slots with no successor, and raising ``strategies``
-    leaves the new slots empty because template seeding only runs on a
-    completely empty ledger.  Both are silent losses of research capacity, and
-    both are recoverable without touching a single deployed edge.
+    Returns ``(seeded, revived)``.  A *seeded* slot never held a hypothesis —
+    a fresh ledger, or a slot added by raising ``strategies``.  A *revived*
+    slot held one and lost it, which is the interesting case: a ledger written
+    before slots were reseeded on success, or a reseed that could not be built.
+    Both are losses of research capacity and both are recoverable without
+    touching a single deployed edge, but only the second says something went
+    wrong, so they are reported apart.
     """
     latest = factory.slot_latest(vehicle)
     active_slots = {int(item["slot"]) for item in factory.active(vehicle)}
+    seeded_slots: list[dict] = []
     revived: list[dict] = []
     for slot in range(int(strategies)):
         if slot in active_slots:
             continue
         previous = latest.get(slot)
         if previous is None:
+            # Genesis. The template is the fallback, not the only option: an
+            # empty slot is exactly where a discovery proposal is most useful,
+            # and seeding every deployment from the same seven templates would
+            # make "the LLM discovers edges" false on the very first cycle.
             seed = template_hypothesis(slot, vehicle=vehicle)
             source = "template"
+            if llm_enabled:
+                proposed, _proposal, proposed_source = _seed_slot(
+                    {"vehicle": vehicle, "slot": slot,
+                     "family": seed.family, "rule_spec": seed.rule_spec,
+                     "hypothesis_id": seed.hypothesis_id},
+                    generation=0, not_before=None,
+                    existing_variant_ids=existing_variant_ids,
+                    tried_families=set(),
+                    context=_discovery_context(
+                        slot=slot, reason="fresh_slot", previous={
+                            "family": seed.family},
+                        tried_families={
+                            str(item["family"]) for item in latest.values()},
+                        proved_families=_proved_families(edge, vehicle)),
+                    llm_enabled=True, config=llm_config, adapter=adapter)
+                if (proposed is not None and
+                        proposed_source == "llm_discovery"):
+                    seed, source = proposed, proposed_source
             if rule_variant_id(seed.rule_spec) in existing_variant_ids:
                 continue
         else:
@@ -249,15 +286,17 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                 continue
         factory.register(seed)
         existing_variant_ids.add(rule_variant_id(seed.rule_spec))
-        if previous is not None:
-            factory.event(
-                previous["hypothesis_id"], str(previous.get("status") or "validated"),
-                "idle slot revived with a new hypothesis",
-                {"reseed": True, "source": source,
-                 "successor_hypothesis_id": seed.hypothesis_id,
-                 "successor_variant_id": rule_variant_id(seed.rule_spec)})
-        revived.append(asdict(seed))
-    return revived
+        if previous is None:
+            seeded_slots.append({**asdict(seed), "source": source})
+            continue
+        factory.event(
+            previous["hypothesis_id"], str(previous.get("status") or "validated"),
+            "idle slot revived with a new hypothesis",
+            {"reseed": True, "source": source,
+             "successor_hypothesis_id": seed.hypothesis_id,
+             "successor_variant_id": rule_variant_id(seed.rule_spec)})
+        revived.append({**asdict(seed), "source": source})
+    return seeded_slots, revived
 
 
 def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
@@ -504,14 +543,14 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     if duplicate is not None:
         return {**duplicate, "duplicate": True}
     edge = EdgeLedger(db_path)
-    if not factory.hypotheses(vehicle=vehicle):
-        for hypothesis in initial_hypotheses(strategies, vehicle=vehicle):
-            factory.register(hypothesis)
+    # Seeding a fresh ledger and reviving an idle slot are the same operation:
+    # give every configured slot an active hypothesis. Keeping one path means
+    # genesis gets discovery too, instead of always starting from templates.
     existing_variant_ids = {
         rule_variant_id(item["rule_spec"])
         for item in factory.hypotheses(vehicle=vehicle)
     }
-    revived = _ensure_slots(
+    seeded, revived = _ensure_slots(
         factory, edge, vehicle=vehicle, strategies=strategies,
         existing_variant_ids=existing_variant_ids, llm_enabled=llm_enabled,
         llm_config=llm_config, adapter=proposal_adapter)
@@ -519,7 +558,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
                 "vehicle": vehicle, "strategies": 0, "variants": 0, "accounts": 0,
-                "revived": revived}
+                "seeded": seeded, "revived": revived}
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
@@ -1009,10 +1048,11 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,
         "replacements": replacements, "rotations": rotations,
-        # Slots reseeded after proving an edge, and slots revived because they
-        # had no active hypothesis at all.  Both keep parallel research
-        # capacity constant instead of letting it decay toward ``exhausted``.
-        "reseeds": reseeds, "revived": revived,
+        # Slots reseeded after proving an edge, slots seeded for the first
+        # time, and slots revived because they had lost their hypothesis.
+        # Together these keep parallel research capacity constant instead of
+        # letting it decay toward ``exhausted``.
+        "reseeds": reseeds, "seeded": seeded, "revived": revived,
         "active_slots": len(factory.active(vehicle)),
         "rotation_budget": int(rotation_budget), "max_rotations": int(max_rotations),
         "pending": pending, "worker_failures": worker_failures,

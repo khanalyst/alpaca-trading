@@ -17,6 +17,9 @@ from .variants import from_record, apply as apply_variant_config
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
 
 
+VEHICLES = ("equity", "option")
+
+
 def _vehicle(config: Mapping, vehicle: str | None) -> str | None:
     if vehicle is not None:
         return str(vehicle)
@@ -31,6 +34,37 @@ def _vehicle(config: Mapping, vehicle: str | None) -> str | None:
             not any(str(item).lower() in {"us_equity", "equity", "stock"} for item in classes):
         return "option"
     return "equity"
+
+
+def runtime_vehicle(config: Mapping) -> str | None:
+    """The one vehicle this deployment's execution profile can trade.
+
+    A trader process runs a single execution profile, so proving an edge in the
+    other vehicle produces evidence it can never act on.  Research uses this to
+    scope what it studies to what the deployment could actually deploy.
+    """
+    return _vehicle(config, None)
+
+
+def research_vehicles(config: Mapping, override: str | None = None) -> list[str]:
+    """Vehicles worth researching, defaulting to what the trader can trade.
+
+    ``override`` accepts ``all`` or a comma-separated subset, so a deployment
+    that intends to switch profiles — or one recording options for later — can
+    keep both lanes running deliberately rather than by accident.
+    """
+    raw = str(override or "").strip().lower()
+    if raw in {"all", "both"}:
+        return list(VEHICLES)
+    if raw:
+        selected = [item.strip() for item in raw.split(",") if item.strip()]
+        unknown = sorted({item for item in selected if item not in VEHICLES})
+        if unknown:
+            raise ValueError(
+                f"unknown research vehicle(s): {', '.join(unknown)}")
+        return [item for item in VEHICLES if item in set(selected)]
+    vehicle = runtime_vehicle(config)
+    return [vehicle] if vehicle in VEHICLES else []
 
 
 def _decoded(record: Mapping) -> dict | None:
@@ -255,5 +289,6 @@ def record_paper_outcome(outcome: Mapping, *, candidate_id: str | None = None,
     return ledger.ingest_paper_outcome(str(cid), outcome)
 
 
-__all__ = ["apply_variant", "record_paper_outcome", "resolve_validated_variant",
-           "resolve_validated_variants"]
+__all__ = ["VEHICLES", "apply_variant", "record_paper_outcome",
+           "research_vehicles", "resolve_validated_variant",
+           "resolve_validated_variants", "runtime_vehicle"]

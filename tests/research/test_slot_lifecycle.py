@@ -12,7 +12,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from agent.contracts.rule import RULE_SCHEMA_V2, rule_variant_id
+from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V2,
+                                  rule_variant_id)
 from research.edge_lab import EdgeLedger
 from research.factory_core import (
     MAX_DISCOVERY_ATTEMPTS, discovery_hypothesis, discovery_spec,
@@ -81,10 +82,11 @@ class ReseedTests(unittest.TestCase):
             factory, edge = _ledgers(directory)
             _seed(factory)
             proved = _prove_every_active_slot(factory)
-            revived = _ensure_slots(
+            seeded, revived = _ensure_slots(
                 factory, edge, vehicle="equity", strategies=STRATEGIES,
                 existing_variant_ids=_variant_ids(factory), llm_enabled=False,
                 llm_config={}, adapter=None)
+            self.assertEqual(seeded, [])
             self.assertEqual(len(revived), STRATEGIES)
             self.assertEqual(len(factory.active("equity")), STRATEGIES)
             # The proved hypotheses keep their state and their spec.
@@ -98,12 +100,27 @@ class ReseedTests(unittest.TestCase):
             factory, edge = _ledgers(directory)
             _seed(factory, count=3)
             self.assertEqual(len(factory.active("equity")), 3)
-            revived = _ensure_slots(
+            seeded, revived = _ensure_slots(
                 factory, edge, vehicle="equity", strategies=STRATEGIES,
                 existing_variant_ids=_variant_ids(factory), llm_enabled=False,
                 llm_config={}, adapter=None)
-            self.assertEqual(len(revived), STRATEGIES - 3)
+            # New slots were never occupied, so they are seeded, not revived.
+            self.assertEqual(len(seeded), STRATEGIES - 3)
+            self.assertEqual(revived, [])
             self.assertEqual(len(factory.active("equity")), STRATEGIES)
+
+    def test_ensure_slots_seeds_a_completely_empty_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, edge = _ledgers(directory)
+            seeded, revived = _ensure_slots(
+                factory, edge, vehicle="equity", strategies=STRATEGIES,
+                existing_variant_ids=set(), llm_enabled=False,
+                llm_config={}, adapter=None)
+            self.assertEqual(len(seeded), STRATEGIES)
+            self.assertEqual(revived, [])
+            self.assertEqual({item["source"] for item in seeded}, {"template"})
+            self.assertEqual([item["rule_spec"] for item in seeded],
+                             [h.rule_spec for h in initial_hypotheses(STRATEGIES)])
 
     def test_ensure_slots_is_idempotent_while_slots_are_active(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -114,7 +131,7 @@ class ReseedTests(unittest.TestCase):
                 self.assertEqual(_ensure_slots(
                     factory, edge, vehicle="equity", strategies=STRATEGIES,
                     existing_variant_ids=_variant_ids(factory),
-                    llm_enabled=False, llm_config={}, adapter=None), [])
+                    llm_enabled=False, llm_config={}, adapter=None), ([], []))
             self.assertEqual(len(factory.hypotheses(vehicle="equity")), before)
 
     def test_capacity_survives_many_consecutive_all_success_cycles(self):
@@ -174,8 +191,7 @@ class DeterministicDiscoveryTests(unittest.TestCase):
             seeded = discovery_hypothesis(
                 previous, generation=1, not_before=None,
                 existing_variant_ids=_variant_ids(factory),
-                tried_families=set(f["family"] for f in factory.hypotheses(
-                    vehicle="equity")))
+                tried_families=set(RULE_FAMILIES))
             self.assertIsNotNone(seeded)
             self.assertEqual(seeded.rule_spec["schema"], RULE_SCHEMA_V2)
 
@@ -190,7 +206,6 @@ class DeterministicDiscoveryTests(unittest.TestCase):
             factory, _edge = _ledgers(directory)
             _seed(factory, count=1)
             previous = factory.active("equity")[0]
-            from agent.contracts.rule import RULE_FAMILIES
             everything = {rule_variant_id(discovery_spec(index, family=family))
                           for family in RULE_FAMILIES
                           for index in range(0, MAX_DISCOVERY_ATTEMPTS + 1)}
@@ -306,6 +321,79 @@ class LLMDiscoveryTests(unittest.TestCase):
                         config={"model": "gpt-5"}, adapter=adapter)
                     self.assertEqual(source, "deterministic_discovery")
                     self.assertIsNotNone(seeded)
+
+    def test_genesis_slots_are_discovered_not_only_templated(self):
+        """A fresh ledger is where discovery matters most."""
+        with tempfile.TemporaryDirectory() as directory:
+            factory, edge = _ledgers(directory)
+            briefs = []
+
+            class Adapter:
+                def discover(inner, *, vehicle, slot, context):
+                    briefs.append(context)
+                    spec = {"schema": RULE_SCHEMA_V2, "family": "vwap_reversion",
+                            "entry_after_minutes": 30 + slot,
+                            "entry_before_minutes": 300}
+                    from agent.contracts.rule import validate_rule_spec
+                    normalized = validate_rule_spec(spec)
+                    return ProposalResult(
+                        True, schema=DISCOVERY_SCHEMA, rule_spec=normalized,
+                        variant_id=rule_variant_id(normalized),
+                        thesis=f"Slot {slot} fades the session average.",
+                        evidence={"kind": "discovery"})
+
+            seeded, revived = _ensure_slots(
+                factory, edge, vehicle="equity", strategies=3,
+                existing_variant_ids=set(), llm_enabled=True,
+                llm_config={"model": "gpt-5"}, adapter=Adapter())
+            self.assertEqual(revived, [])
+            self.assertEqual(len(seeded), 3)
+            self.assertEqual({item["source"] for item in seeded},
+                             {"llm_discovery"})
+            self.assertEqual({item["family"] for item in seeded},
+                             {"vwap_reversion"})
+            self.assertEqual([brief["reason"] for brief in briefs],
+                             ["fresh_slot"] * 3)
+            self.assertEqual(len(factory.active("equity")), 3)
+
+    def test_genesis_falls_back_to_templates_when_discovery_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, edge = _ledgers(directory)
+
+            class Failing:
+                def discover(inner, **_):
+                    return ProposalResult(False, schema=DISCOVERY_SCHEMA,
+                                          error="provider unavailable")
+
+            seeded, _revived = _ensure_slots(
+                factory, edge, vehicle="equity", strategies=STRATEGIES,
+                existing_variant_ids=set(), llm_enabled=True,
+                llm_config={"model": "gpt-5"}, adapter=Failing())
+            self.assertEqual({item["source"] for item in seeded}, {"template"})
+            self.assertEqual([item["rule_spec"] for item in seeded],
+                             [h.rule_spec for h in initial_hypotheses(STRATEGIES)])
+
+    def test_a_broken_adapter_degrades_instead_of_failing_the_cycle(self):
+        """A nightly job must not die because a provider seam misbehaves."""
+        with tempfile.TemporaryDirectory() as directory:
+            factory, edge = _ledgers(directory)
+
+            class Exploding:
+                def discover(inner, **_):
+                    raise RuntimeError("provider exploded")
+
+            class NoDiscovery:
+                def propose(inner, **_):
+                    raise AssertionError("propose is not the discovery seam")
+
+            for adapter in (Exploding(), NoDiscovery()):
+                with self.subTest(adapter=type(adapter).__name__):
+                    seeded, _revived = _ensure_slots(
+                        factory, edge, vehicle="equity", strategies=STRATEGIES,
+                        existing_variant_ids=_variant_ids(factory),
+                        llm_enabled=True, llm_config={"model": "gpt-5"},
+                        adapter=adapter)
+                    self.assertEqual(len(factory.active("equity")), STRATEGIES)
 
     def test_discovery_is_never_called_when_the_llm_is_disabled(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -208,17 +208,50 @@ Rollback means restoring the prior reviewed Git revision and image, then
 re-running the mode-appropriate check and reconciliation. Record the revision,
 operator, mode, time, and check output in the deployment log.
 
+## Bootstrapping the corpus
+
+The recorder samples forward in real time, so a new deployment has no history
+and cannot clear the research floors — a hundred held-out trades across ten
+sessions, then a strictly later forward window — for a long time. Seed the
+corpus from Alpaca's historical bars instead:
+
+```bash
+python deploy/backfill.py --days 180
+```
+
+It writes the same normalized rows, the same one-partition-per-session layout,
+and the same sidecar index the recorder writes, so research cannot distinguish
+a backfilled session from a recorded one and no gate is weakened. Only
+*completed* sessions are written, `as_of` is the bar's own open exactly as the
+recorder records it, and the run is resumable: sessions that already have a
+partition are skipped, so re-running is a no-op and an interrupted run
+continues. `--overwrite` replaces existing partitions, `--quotes` also
+backfills quotes (far larger, and rarely needed because replay prices boundary
+fills from bars and charges the modelled half-spread when a quote is absent).
+
+Two limits are worth planning around. **Options are not backfilled** — the
+recorder's option rows are sampled chain snapshots with quote-age semantics no
+historical endpoint reconstructs, so the option lane still needs recorded
+sessions. And **history alone is not enough**: `_simulate_trade` takes at most
+one trade per symbol-session, so the 100-trade held-out floor is as much a
+universe-width requirement as a history-length one. Four symbols over 120
+sessions yields roughly 84 held-out trades and will not clear it; widen
+`universe.symbols` as well as the backfill window.
+
+Run the backfill before starting the trader, or outside market hours, so the
+recorder's first live cycle resumes from a completed session boundary.
+
 ## Research and evidence
 
 Research is read-only with respect to broker authority. It discovers the
 recorder's mixed bars/quotes/options corpus under
 `runtime/research/recorded/sessions/` by default (or uses
 `ALPACA_RESEARCH_DATASET`; `ALPACA_RESEARCH_SESSION_WINDOW` loads only the most
-recent N session partitions), runs the seven-family autonomous strategy factory
+recent N session partitions), runs the autonomous strategy factory
 plus the explicit IBR baseline, scores shares and single-leg long-option
 vehicles separately, and writes evidence. Each variant has its own simulated
 cash/equity account; default capacity is seven parallel strategy workers and
-four variants per strategy. Paper `selection_mode: all_proved` keeps one best
+four variants per strategy, drawn from a catalog of eleven rule families. Paper `selection_mode: all_proved` keeps one best
 proven variant per independent family under one global risk book. The edge
 ledger is
 initialized at `runtime/research/edge_lab.sqlite3`; inspect it with
@@ -236,6 +269,15 @@ the operator safety action. Good edges emit deterministic,
 content-addressed edge proof reports and may send an optional HTTPS webhook. Keep data
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
+
+Research studies only the vehicle this deployment can trade. A trader runs one
+execution profile, so proving an option edge in a `shares` deployment produces
+evidence it can never act on. `python research.py vehicles` prints what will be
+studied; set `ALPACA_RESEARCH_VEHICLES=all` (or a comma-separated subset) to
+run both lanes deliberately — for example while recording options ahead of a
+profile switch. The dashboard's Research card reports the tradeable vehicle and
+counts any proved edges in the other one, so evidence accumulated under a
+previous profile is visible rather than silently unusable.
 
 A slot whose hypothesis proves an edge is reseeded with a new hypothesis in the
 same cycle, so parallel research capacity stays constant instead of shrinking

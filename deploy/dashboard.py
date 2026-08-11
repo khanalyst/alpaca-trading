@@ -175,6 +175,17 @@ def _live_paper(connection: sqlite3.Connection) -> list[dict]:
         item["total_r"] if item["total_r"] is not None else 0.0), reverse=True)
 
 
+def _tradeable_vehicle(config: dict) -> str:
+    """The vehicle this deployment's execution profile can trade.
+
+    Mirrors ``agent.edge.runtime_vehicle`` without importing the runtime edge
+    resolver into a read-only view; ``test_deploy`` pins the two together.
+    """
+    strategy = config.get("strategy") if isinstance(config, dict) else {}
+    mode = str((strategy or {}).get("execution_mode", "")).strip().lower()
+    return "option" if mode in {"options", "option"} else "equity"
+
+
 def _edge_status(path: Path) -> dict:
     """Expose the append-only edge-lab lifecycle without promoting anything.
 
@@ -326,6 +337,10 @@ def snapshot(root: Path) -> dict:
     edge_path = edge_configured if edge_configured.is_absolute() else root / edge_configured
     cycle_seconds = float(config.get("cycle", {}).get("interval_seconds") or 60)
     trader_max_age = max(90.0, cycle_seconds * 4)
+    edge = _cached(f"edge:{edge_path}", 30, lambda: _edge_status(edge_path))
+    tradeable = _tradeable_vehicle(config)
+    untradeable = sum(1 for row in edge.get("proved_edges") or ()
+                      if str(row.get("vehicle")) != tradeable)
     return {
         "schema": 1,
         "generated_ts": time.time(),
@@ -356,14 +371,18 @@ def snapshot(root: Path) -> dict:
         },
         "performance": _cached(
             f"performance:{journal}", 30, lambda: _performance(journal)),
-        "edge": _cached(
-            f"edge:{edge_path}", 30, lambda: _edge_status(edge_path)),
+        "edge": edge,
         "research": {
             "available": edge_path.is_file(),
             "service_optional": True,
             "entry_gate_required": bool(
                 config.get("research", {}).get("enabled", True) and
                 config.get("research", {}).get("require_validated_variant", True)),
+            "tradeable_vehicle": tradeable,
+            # Proved edges in the vehicle this profile cannot trade. They are
+            # real evidence, but this trader will never act on them, so they
+            # are reported rather than counted among the deployable edges.
+            "untradeable_proved_edges": untradeable,
             "note": "the service is optional to run continuously; entries require a validated edge record",
         },
         "reports": _cached(
@@ -410,7 +429,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  let c=card('Trader');row(c,'mode',d.mode);row(c,'strategy',d.strategy.id+' / '+d.strategy.version);row(c,'execution profile',d.strategy.execution_mode);row(c,'configured variant',d.strategy.variant_id);row(c,'health',d.trader.health.status,good(d.trader.health.ok));row(c,'state',d.trader.state.state);row(c,'last heartbeat',when(d.trader.heartbeat.updated_ts));row(c,'edge entry gate',d.research.entry_gate_required?'required':'disabled',d.research.entry_gate_required?'warn':'ok');
  c=card('Recorder & scheduler');row(c,'recorder',d.recorder.status,good(d.recorder.ok));row(c,'latest market write',when(d.recorder.latest_write_ts));row(c,'research scheduler',d.research_service.health.status,good(d.research_service.health.ok));row(c,'cycle outcome',d.research_service.heartbeat.cycle_status);row(c,'job id',d.research_service.health.job_id);row(c,'job started',when(d.research_service.health.started_ts));row(c,'job completed',when(d.research_service.health.completed_ts));row(c,'hung',d.research_service.health.hung,good(!d.research_service.health.hung));row(c,'next UTC run',when(d.research_service.health.next_run_ts));row(c,'last exit',d.research_service.health.last_exit_code);row(c,'structured failures',(d.research_service.health.structured_failures||[]).length,good(!(d.research_service.health.structured_failures||[]).length));
  c=card('Execution journal');row(c,'available',d.performance.available,good(d.performance.available));row(c,'events',d.performance.events);row(c,'closed trades',d.performance.closed_trades);row(c,'realized P&L USD',d.performance.realized_pnl_usd);row(c,'win rate',d.performance.win_rate);
- c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);c.append(el('p',d.research.note||'No research status.','muted'));
+ c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);row(c,'tradeable vehicle',d.research.tradeable_vehicle);row(c,'proved but untradeable',d.research.untradeable_proved_edges,d.research.untradeable_proved_edges?'warn':'ok');c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
  c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard'])};
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);

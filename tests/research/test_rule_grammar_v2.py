@@ -171,6 +171,114 @@ class V2ValidationTests(unittest.TestCase):
         self.assertEqual(evidence["schema"], RULE_SCHEMA_V2)
 
 
+def ohlc_bars(count, step, *, start_minute=0, volume=lambda index: 3_000,
+              last_body=None):
+    """One-minute bars with real bodies, offset from the 09:30 open."""
+    base = datetime(2026, 3, 10, 9, 30, tzinfo=NEW_YORK) + timedelta(
+        minutes=start_minute)
+    rows, price = [], 100.0
+    for index in range(count):
+        opened = price
+        move = last_body if (last_body is not None and index == count - 1) else step(index)
+        price *= (1 + move)
+        high, low = max(opened, price) * 1.0005, min(opened, price) * .9995
+        rows.append({"timestamp": base + timedelta(minutes=index), "symbol": "SPY",
+                     "open": opened, "high": high, "low": low, "close": price,
+                     "volume": volume(index)})
+    return rows
+
+
+SURGE = lambda index: 20_000 if index >= 75 else 3_000  # noqa: E731
+
+
+class SessionAnchoredFamilyTests(unittest.TestCase):
+    """The families added so discovery is not confined to seven primitives."""
+
+    CASES = {
+        # family: (rising-market bars, expected direction when rising)
+        "vwap_trend": (
+            lambda: ohlc_bars(80, lambda i: .0006, volume=SURGE), "long"),
+        "opening_drive": (
+            lambda: ohlc_bars(80, lambda i: .0008 if i < 30 else .0004,
+                              volume=SURGE), "long"),
+        "range_expansion": (
+            lambda: ohlc_bars(60, lambda i: .0002, last_body=.004), "long"),
+        # A fade: stretched above the session average, so it sells.
+        "vwap_reversion": (
+            lambda: ohlc_bars(80, lambda i: .0012 if i > 55 else 0.0), "short"),
+    }
+
+    @staticmethod
+    def _template(family):
+        from research.factory_core import family_template
+        return validate_rule_spec(family_template(family))
+
+    def test_every_new_family_is_in_the_catalog_with_a_template(self):
+        from research.factory_core import FAMILY_TEMPLATES
+        self.assertEqual([item["family"] for item in FAMILY_TEMPLATES],
+                         list(RULE_FAMILIES))
+        for family in self.CASES:
+            self.assertIn(family, RULE_FAMILIES)
+
+    def test_each_new_family_fires_on_its_own_shape(self):
+        for family, (build, expected) in self.CASES.items():
+            with self.subTest(family=family):
+                signal = evaluate_rule_signal(build(), self._template(family))
+                self.assertIsNotNone(signal, f"{family} never signalled")
+                self.assertEqual(signal["direction"], expected)
+                self.assertEqual(signal["setup_type"], f"rule_{family}")
+                self.assertEqual(signal["family"], family)
+
+    def test_each_new_family_is_symmetric(self):
+        """A mirrored market must produce the mirrored side."""
+        mirrored = {
+            "vwap_trend": (ohlc_bars(80, lambda i: -.0006, volume=SURGE), "short"),
+            "opening_drive": (ohlc_bars(
+                80, lambda i: -.0008 if i < 30 else -.0004, volume=SURGE), "short"),
+            "range_expansion": (ohlc_bars(
+                60, lambda i: -.0002, last_body=-.004), "short"),
+            "vwap_reversion": (ohlc_bars(
+                80, lambda i: -.0012 if i > 55 else 0.0), "long"),
+        }
+        for family, (rows, expected) in mirrored.items():
+            with self.subTest(family=family):
+                signal = evaluate_rule_signal(rows, self._template(family))
+                self.assertIsNotNone(signal, f"{family} never signalled")
+                self.assertEqual(signal["direction"], expected)
+
+    def test_a_flat_session_signals_nothing(self):
+        flat = ohlc_bars(80, lambda index: 0.0)
+        for family in self.CASES:
+            with self.subTest(family=family):
+                self.assertIsNone(
+                    evaluate_rule_signal(flat, self._template(family)))
+
+    def test_session_statistics_cannot_leak_across_days(self):
+        """A longer history must not change today's VWAP or opening drive."""
+        today = ohlc_bars(80, lambda index: .0006, volume=SURGE)
+        yesterday = [{**row, "timestamp": row["timestamp"] - timedelta(days=1),
+                      "open": row["open"] * 3, "high": row["high"] * 3,
+                      "low": row["low"] * 3, "close": row["close"] * 3}
+                     for row in ohlc_bars(80, lambda index: -.002)]
+        for family in ("vwap_trend", "vwap_reversion", "opening_drive"):
+            with self.subTest(family=family):
+                spec = self._template(family)
+                self.assertEqual(
+                    evaluate_rule_signal(today, spec),
+                    evaluate_rule_signal(yesterday + today, spec))
+
+    def test_every_family_evaluates_cleanly_under_both_schemas(self):
+        rows = ohlc_bars(80, lambda index: .0006, volume=SURGE)
+        for family in RULE_FAMILIES:
+            with self.subTest(family=family):
+                evaluate_rule_signal(rows, self._template(family))
+                widened = validate_rule_spec({
+                    **self._template(family), "schema": RULE_SCHEMA_V2,
+                    "entry_after_minutes": 15, "entry_before_minutes": 300,
+                    "confirmations": ["trend"], "max_atr_bps": 900.0})
+                evaluate_rule_signal(rows, widened)
+
+
 class V2EvaluationTests(unittest.TestCase):
     """Each extension must actually gate, and only on the entry side."""
 

@@ -524,9 +524,12 @@ class DeployTests(unittest.TestCase):
             dataset = root / "market.csv"
             edge_db = root / "edge.sqlite3"
             dataset.write_text(csv_buffer.getvalue(), encoding="utf-8")
+            # The checked config trades shares, so the option lane runs only
+            # when it is asked for; a trader cannot deploy option evidence.
             env = dict(os.environ, PYTHON=sys.executable,
                        ALPACA_RESEARCH_DATASET=str(dataset),
-                       ALPACA_EDGE_DB=str(edge_db))
+                       ALPACA_EDGE_DB=str(edge_db),
+                       ALPACA_RESEARCH_VEHICLES="all")
             result = subprocess.run(
                 ["deploy/research-cycle.sh"],
                 cwd=Path(__file__).resolve().parents[1], env=env,
@@ -539,6 +542,83 @@ class DeployTests(unittest.TestCase):
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
             self.assertEqual(vehicles, {"equity": 7, "option": 7})
+
+    def test_research_cycle_studies_only_the_tradeable_vehicle_by_default(self):
+        """Option evidence a shares trader can never deploy is not produced."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.jsonl"
+            edge_db = root / "edge.sqlite3"
+            dataset.write_text("\n".join(json.dumps(row) for row in (
+                {"kind": "bar", "provider": "alpaca", "feed": "iex",
+                 "symbol": "SPY", "timestamp": "2026-08-08T13:30:00+00:00",
+                 "as_of": "2026-08-08T13:30:00+00:00",
+                 "observed_at": "2026-08-08T13:31:00+00:00",
+                 "open": 100, "high": 101, "low": 99, "close": 100.5,
+                 "volume": 10},
+                {"kind": "option_snapshot", "provider": "alpaca",
+                 "feed": "indicative", "symbol": "SPY260918C00100000",
+                 "contract": "SPY260918C00100000",
+                 "timestamp": "2026-08-08T13:30:02+00:00",
+                 "as_of": "2026-08-08T13:30:02+00:00",
+                 "observed_at": "2026-08-08T13:31:00+00:00",
+                 "underlying": "SPY", "expiration": "2026-09-18", "strike": 100,
+                 "right": "call", "multiplier": 100, "bid": 1, "ask": 1.1,
+                 "bid_size": 10, "ask_size": 11, "volume": 100,
+                 "open_interest": 200, "underlying_price": 100},
+            )) + "\n", encoding="utf-8")
+            env = dict(os.environ, PYTHON=sys.executable,
+                       ALPACA_RESEARCH_DATASET=str(dataset),
+                       ALPACA_EDGE_DB=str(edge_db))
+            env.pop("ALPACA_RESEARCH_VEHICLES", None)
+            result = subprocess.run(
+                ["deploy/research-cycle.sh"],
+                cwd=Path(__file__).resolve().parents[1], env=env,
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            with closing(sqlite3.connect(edge_db)) as db:
+                vehicles = dict(db.execute(
+                    "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
+                ).fetchall())
+            self.assertEqual(vehicles, {"equity": 7})
+
+    def test_dashboard_tradeable_vehicle_matches_the_runtime_resolver(self):
+        from agent.edge import runtime_vehicle
+        for mode, expected in (("shares", "equity"), ("options", "option"),
+                               ("option", "option"), ("", "equity")):
+            config = {"strategy": {"execution_mode": mode},
+                      "universe": {"asset_classes": ["us_equity", "us_option"]}}
+            with self.subTest(mode=mode):
+                self.assertEqual(dashboard._tradeable_vehicle(config), expected)
+                self.assertEqual(runtime_vehicle(config), expected)
+
+    def test_dashboard_counts_proved_edges_this_profile_cannot_trade(self):
+        from research.edge_lab import EdgeLedger, init_ledger
+        from tests.research.test_edge_discovery import _persist_gate
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runtime" / "research").mkdir(parents=True)
+            # An options profile holding a proved *equity* edge: real evidence
+            # this trader can never act on, so it is reported, not counted as
+            # deployable.
+            (root / "config.yaml").write_text(
+                "mode: paper\nstrategy:\n  id: ibr\n  version: v1\n"
+                "  execution_mode: options\n", encoding="utf-8")
+            ledger_path = root / "runtime" / "research" / "edge_lab.sqlite3"
+            init_ledger(ledger_path)
+            ledger = EdgeLedger(ledger_path)
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="an equity edge an options trader cannot deploy",
+                config={"strategy": {"target_r": 1.5}})
+            _persist_gate(ledger, candidate["candidate_id"], "shadow")
+            with closing(sqlite3.connect(ledger_path)) as db, db:
+                db.execute("UPDATE candidate_state SET status='validated' WHERE candidate_id=?",
+                           (candidate["candidate_id"],))
+            snapshot = dashboard.snapshot(root)
+            self.assertEqual(snapshot["research"]["tradeable_vehicle"], "option")
+            self.assertEqual(snapshot["edge"]["proved_edges"][0]["vehicle"], "equity")
+            self.assertEqual(snapshot["research"]["untradeable_proved_edges"], 1)
 
     def test_recorder_passes_feed_and_deduplicates_overlapping_windows(self):
         fake = _MarketFake()
@@ -897,6 +977,8 @@ class DeployTests(unittest.TestCase):
         self.assertIn("d.edge.proved_edges", dashboard.HTML)
         self.assertIn("d.edge.live_paper", dashboard.HTML)
         self.assertIn("Live paper results by edge", dashboard.HTML)
+        self.assertIn("d.research.tradeable_vehicle", dashboard.HTML)
+        self.assertIn("d.research.untradeable_proved_edges", dashboard.HTML)
         self.assertIn("cycle outcome", dashboard.HTML)
         self.assertIn("Execution journal", dashboard.HTML)
         self.assertNotIn("d.research_feed_version", dashboard.HTML)

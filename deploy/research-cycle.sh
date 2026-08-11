@@ -337,18 +337,41 @@ run_factory() {
   fi
 }
 
-if [ -s "$bars_input" ]; then
-  run_discovery equity
-  if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
-    run_factory equity
-  fi
+# A trader process runs one execution profile, so proving an edge in the other
+# vehicle produces evidence it can never deploy. Study what this deployment can
+# actually trade; ALPACA_RESEARCH_VEHICLES=all restores both lanes deliberately.
+set +e
+vehicles="$("$python_bin" "$repo_root/research.py" vehicles \
+  --agent-config "$agent_config")"
+vehicle_status=$?
+set -e
+if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
+  finish "failed" "no research vehicle resolved from the agent config" 3
 fi
-if [ -s "$options_input" ]; then
-  run_discovery option
+
+for vehicle in $vehicles; do
+  case "$vehicle" in
+    equity)
+      if [ ! -s "$bars_input" ]; then
+        cycle_outcomes+=("equity:skipped:no_bars")
+        continue
+      fi
+      ;;
+    option)
+      if [ ! -s "$options_input" ]; then
+        cycle_outcomes+=("option:skipped:no_option_snapshots")
+        continue
+      fi
+      ;;
+    *)
+      finish "failed" "unsupported research vehicle: $vehicle" 3
+      ;;
+  esac
+  run_discovery "$vehicle"
   if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
-    run_factory option
+    run_factory "$vehicle"
   fi
-fi
+done
 
 if [ "$cycle_success" -eq 1 ]; then
   finish "completed" "research cycle completed with proof" 0

@@ -25,7 +25,7 @@ corpus, appended into one partition per New York session date under
 partitions in session order (`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the
 most recent N), validates the result, and routes the vehicle-local discovery
 lanes from it.
-It also invokes `research.strategy_factory`, which evaluates seven distinct
+It also invokes `research.strategy_factory`, which evaluates seven concurrent
 rule families concurrently by default. Each generated variant owns an
 isolated simulated account; no capital or P&L is shared between arms.
 Paper runtime selection can then use `selection_mode: all_proved`, which keeps
@@ -152,10 +152,16 @@ demotion is the operator safety action.
 ## Autonomous strategy factory
 
 `research.strategy_factory` owns safe hypothesis generation. Its proposal
-language is the finite grammar in `agent.contracts.rule`: opening-range
-breakout/fade, momentum continuation, mean reversion, trend pullback,
-volatility breakout, and volume breakout, with bounded confirmations and exit
-parameters. It never generates or imports source code.
+language is the finite grammar in `agent.contracts.rule`: eleven signal
+primitives — opening-range breakout/fade, momentum continuation, mean
+reversion, trend pullback, volatility breakout, volume breakout, VWAP
+reversion, VWAP trend, range expansion, and opening drive — with bounded
+confirmations and exit parameters. It never generates or imports source code.
+
+The last four are session-anchored: they re-derive the current session from the
+bars' own New York dates, so a longer history can never contaminate a session
+statistic. Research replays one session at a time and the runtime fetches from
+the session open, so the two see the same window either way.
 
 The grammar has two versions. `rule-strategy.v1` is the original field set and
 is unchanged, so every candidate already in a ledger keeps its exact
@@ -184,10 +190,20 @@ families has not run out of hypotheses. Each reseed grants one further
 `max_generations` mutation budget and never consumes the separate
 failure-recovery rotation budget.
 
-`run_factory` also repairs slots at the start of every cycle: a slot with no
-active hypothesis — a ledger written before reseeding existed, or a raised
-`--strategies` — is revived. The cycle result reports `reseeds`, `revived`, and
-`active_slots` so idle capacity is visible rather than silent.
+`run_factory` gives every configured slot an active hypothesis at the start of
+every cycle, which is one code path for three situations: genesis on a fresh
+ledger, a slot added by raising `--strategies`, and a slot that lost its
+hypothesis (a ledger written before reseeding existed). The cycle result
+reports `seeded`, `revived`, `reseeds`, and `active_slots` separately —
+`revived` is the one that says something had gone wrong — so idle capacity is
+visible rather than silent.
+
+Research is also scoped to what the deployment can trade. `research.py
+vehicles` resolves the trader's execution profile to a vehicle, and the nightly
+cycle studies only that; `ALPACA_RESEARCH_VEHICLES` (`all`, or a comma-separated
+subset) overrides it. Proving an option edge in a `shares` deployment produces
+evidence the trader can never act on, so the dashboard reports any such
+proved-but-untradeable edges rather than letting them accumulate silently.
 
 On a fresh corpus, each worker diagnoses its baseline only from the
 chronological fit partition, creates bounded variants based on the observed
@@ -213,8 +229,9 @@ output contract:
 - `llm-rule-proposal.v1` — **repair.** Asked for a replacement `rule_spec` only
   after every intended variant of a family has failed with an adequate sample.
 - `llm-edge-discovery.v1` — **discovery.** Asked for a genuinely new hypothesis
-  whenever a slot comes free, either because it proved an edge or because its
-  generation budget ran out. The request carries a small aggregate brief — the
+  whenever a slot needs one: at genesis on a fresh ledger, when a slot proves
+  an edge and is reseeded, when a generation budget runs out, and when an idle
+  slot is revived. The request carries a small aggregate brief — the
   families this slot has tried, the families already carrying a deployed edge,
   and the last diagnosis — and the reply must include a one-sentence `thesis`
   of at most 240 characters, which is recorded as evidence and displayed but

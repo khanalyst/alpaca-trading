@@ -13,6 +13,7 @@ The repository contains five cooperating processes:
 | Process | Authority | Durable output |
 | --- | --- | --- |
 | Recorder | Read-only Alpaca market-data collection | Mixed bars, quotes, and option snapshots, one partition per session date under `runtime/research/recorded/sessions` |
+| Backfill | Read-only historical bar acquisition, run on demand | The same partitions and sidecar index the recorder writes |
 | Research | Offline simulation, evidence gates, and candidate lifecycle | Edge/factory SQLite ledgers and content-addressed proof artifacts |
 | Trader | Authenticated account reads and order/position mutation | Mode-scoped runtime state, operational journal, events, and heartbeat |
 | Watchdog | Cancel and flatten only, never entries | Its own health status file |
@@ -315,6 +316,34 @@ of the same completed-bar prefix, so `evaluate_rule_signal` remains the single
 evaluator shared by research and runtime and no extension can reach sizing,
 exits, or order placement. A v2 spec that admits a signal emits exactly the v1
 plan.
+
+### Corpus acquisition
+
+`deploy/recorder.py` samples forward in real time. `deploy/backfill.py` fills
+the same corpus from Alpaca's historical bars so a new deployment is not months
+away from its first proof. It writes the recorder's exact normalized fields,
+`event_key`, session-partition layout, and sidecar index, and rebuilds that
+index with the recorder's own scan — which is also the validator, so a repeated
+key or malformed row fails at write time rather than downstream. Three
+boundaries keep the result trustworthy: only completed sessions are written, so
+the recorder's continuity check never meets a mid-session hole; `as_of` is the
+bar's own open, so the completed-bar visibility rule applies unchanged; and
+options are never fabricated, because their quote-age semantics cannot be
+reconstructed from a historical endpoint. Backfill is resumable — a session
+with an existing partition is skipped — so re-running is a no-op.
+
+Corpus length is not the only cold-start constraint. `_simulate_trade` takes at
+most one trade per symbol-session, so the held-out trade floor is a function of
+universe width as well as history depth.
+
+### Research scope
+
+A trader process runs one execution profile, so an edge proved in the other
+vehicle is evidence it can never deploy. `agent.edge.research_vehicles` resolves
+the profile to a vehicle and the nightly cycle studies only that, with
+`ALPACA_RESEARCH_VEHICLES` as an explicit override. The dashboard counts proved
+edges outside the tradeable vehicle so evidence stranded by a profile change is
+reported rather than silently unusable.
 
 ### Slot lifecycle
 

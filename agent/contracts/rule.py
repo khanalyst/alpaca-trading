@@ -25,6 +25,9 @@ RULE_SCHEMAS = (RULE_SCHEMA_V1, RULE_SCHEMA_V2)
 # content hashes are untouched.  v2 is a strict superset reached only by
 # writing its schema string explicitly.
 RULE_SCHEMA = RULE_SCHEMA_V1
+# The signal primitives autonomous research may compose. Families are appended,
+# never reordered or removed: a stored spec names its family by string, so the
+# order affects only which family a deterministic rotation reaches next.
 RULE_FAMILIES = (
     "opening_range_breakout",
     "opening_range_fade",
@@ -33,6 +36,13 @@ RULE_FAMILIES = (
     "trend_pullback",
     "volatility_breakout",
     "volume_breakout",
+    # Session-anchored primitives. Both research and runtime supply one
+    # session's completed bars, and each of these re-derives its session from
+    # the bars' own local dates, so a mixed history cannot leak across days.
+    "vwap_reversion",
+    "vwap_trend",
+    "range_expansion",
+    "opening_drive",
 )
 CONFIRMATIONS = ("none", "trend", "volume", "volatility")
 SIDES = ("both", "long", "short")
@@ -355,6 +365,45 @@ def _confirmation(direction: str, rows: Sequence[Any], spec: Mapping[str, Any],
     return bool(atr and close > 0 and atr / close * 10_000 >= spec["compression_bps"])
 
 
+def _session_prefix(bars: Sequence[Any], current: Any) -> list[Any]:
+    """The completed bars of *current*'s own New York session, in order.
+
+    Session statistics reset daily. Research replays one session at a time and
+    the runtime fetches from the session open, so this is normally the whole
+    input — but deriving it from the bars' own dates means a longer history can
+    never contaminate a session-anchored family.
+    """
+    stamp = _timestamp(current)
+    if stamp is None:
+        return []
+    zone = ZoneInfo("America/New_York")
+    day = stamp.astimezone(zone).date()
+    prefix = []
+    for row in bars:
+        row_stamp = _timestamp(row)
+        if row_stamp is not None and row_stamp.astimezone(zone).date() == day:
+            prefix.append(row)
+    return prefix
+
+
+def _vwap(bars: Sequence[Any]) -> float | None:
+    """Volume-weighted average typical price over *bars*, or ``None``."""
+    weighted = 0.0
+    volume = 0.0
+    for row in bars:
+        size = _number(row, "volume")
+        if size <= 0:
+            continue
+        typical = (_number(row, "high") + _number(row, "low") +
+                   _number(row, "close")) / 3.0
+        weighted += typical * size
+        volume += size
+    if volume <= 0:
+        return None
+    result = weighted / volume
+    return result if result > 0 and math.isfinite(result) else None
+
+
 def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict | None:
     """Evaluate one completed-bar prefix and return a deterministic signal."""
     spec = validate_rule_spec(value)
@@ -443,6 +492,70 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
         if volume_ok and close > high * (1 + threshold):
             direction = "long"
         elif volume_ok and close < low * (1 - threshold):
+            direction = "short"
+    elif family in {"vwap_reversion", "vwap_trend"}:
+        session = _session_prefix(bars, current)
+        if len(session) < spec["lookback"] + 1:
+            return None
+        vwap = _vwap(session)
+        if vwap is None:
+            return None
+        deviation = close / vwap - 1
+        if family == "vwap_reversion":
+            # Stretched away from the session's own average price, expected to
+            # revert toward it.
+            if deviation <= -max(threshold, 1e-9):
+                direction = "long"
+            elif deviation >= max(threshold, 1e-9):
+                direction = "short"
+        else:
+            # Trading with a session average that is itself advancing: the
+            # trend statistic is the session's fair value, not a moving average
+            # of price, so this is not `trend_pullback` under another name.
+            earlier = _vwap(session[:-spec["lookback"]])
+            if earlier is None:
+                return None
+            if close > vwap and vwap > earlier * (1 + threshold):
+                direction = "long"
+            elif close < vwap and vwap < earlier * (1 - threshold):
+                direction = "short"
+    elif family == "range_expansion":
+        previous = bars[-spec["lookback"] - 1:-1]
+        ranges = [_number(row, "high") - _number(row, "low") for row in previous]
+        average_range = mean(ranges) if ranges else 0.0
+        current_range = _number(current, "high") - _number(current, "low")
+        # `volume_multiplier` is the bounded expansion factor here: the same
+        # "multiple of a rolling average" parameter, applied to range.
+        if (average_range > 0 and
+                current_range >= average_range * spec["volume_multiplier"]):
+            if close > opened * (1 + threshold):
+                direction = "long"
+            elif close < opened * (1 - threshold):
+                direction = "short"
+    elif family == "opening_drive":
+        zone = ZoneInfo("America/New_York")
+        stamp = _timestamp(current)
+        if stamp is None:
+            return None
+        session = _session_prefix(bars, current)
+        start = datetime.combine(stamp.astimezone(zone).date(), time(9, 30),
+                                 tzinfo=zone)
+        end = start.timestamp() + spec["range_minutes"] * 60
+        opening = [row for row in session
+                   if (ts := _timestamp(row)) is not None and
+                   start.timestamp() <= ts.timestamp() < end]
+        if (stamp.timestamp() < end or
+                len(opening) < max(2, spec["range_minutes"] // 2)):
+            return None
+        first = _number(opening[0], "open", _number(opening[0], "close"))
+        last = _number(opening[-1], "close")
+        # Net displacement over the opening window, continued rather than
+        # faded. Unlike the opening-range families this needs no level break:
+        # a session can drive without ever printing a clean range.
+        drive = last / first - 1 if first > 0 else 0.0
+        if drive > threshold and close > opened:
+            direction = "long"
+        elif drive < -threshold and close < opened:
             direction = "short"
 
     if direction is None or not _allowed(direction, spec) or not _confirmations_pass(
