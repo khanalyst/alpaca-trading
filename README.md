@@ -112,14 +112,20 @@ at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
 status, latest re-verified passing edges, per-edge live paper results, edge
 proof reports, and the execution journal.
 
-Two views answer two different questions about a deployed edge. `research.py
-edge status` and the dashboard's "Proved edges" table report the evidence an
-edge was promoted with. `research.py edge paper` and the dashboard's "Live
-paper results by edge" table report what it has done since — trades, sessions,
-total and mean R, win rate, net P&L, the rolling-R demotion guard, and the
-sequential drift statistic against its validated held-out distribution. Both
-are read-only views of append-only data and neither can change a lifecycle
-state.
+Three read-only views answer three different questions, and none can change a
+lifecycle state:
+
+- **What is research doing?** `research.py factory report` renders the full
+  discovery narrative — every slot, every hypothesis it has held, who proposed
+  each one and on what rationale, every variant with its performance and the
+  named gates it missed, and why anything was retired and after how many
+  variants. `--format markdown` produces a shareable document.
+- **What evidence was an edge promoted on?** `research.py edge status` and the
+  dashboard's "Proved edges" table.
+- **What has it done since?** `research.py edge paper` and the dashboard's
+  "Live paper results by edge" table — trades, sessions, total and mean R, win
+  rate, net P&L, the rolling-R demotion guard, and the sequential drift
+  statistic against its validated held-out distribution.
 
 ## Quick start
 

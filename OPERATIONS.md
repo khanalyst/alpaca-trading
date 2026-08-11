@@ -287,7 +287,28 @@ than one cycle is the signal that the factory has run out of unused hypotheses
 and needs attention. Slots left idle by an older ledger, or added by raising
 `--strategies`, are revived automatically at the start of the next cycle.
 
-Inspect autonomous lineage and isolated-account counts with
+To see what research actually did — every slot, every hypothesis it has held,
+who proposed each one, every variant with its performance, and exactly why
+anything was retired and after how many variants:
+
+```bash
+python research.py factory report                      # readable narrative
+python research.py factory report --slot 3             # one slot
+python research.py factory report --format markdown    # shareable document
+python research.py factory report --format json        # for your own tooling
+```
+
+Each variant line carries its trade counts split fit/held-out, net P&L, max
+drawdown, the held-out edge over baseline and its lower confidence bound, the
+multiple-testing-corrected q-value, and a plain-English list of which of the
+gates it missed. Each retirement carries the reason, the number of variants
+tested, the dominant failure mode, and the hypothesis that replaced it. An
+LLM-proposed hypothesis carries its model, attempt count, and the prompt,
+request and response content hashes — the audit trail without storing raw model
+output. The report is strictly derived and read-only; it cannot change a
+lifecycle state.
+
+Inspect raw lineage rows and isolated-account counts with
 `python research.py factory status`. Tune bounded capacity with
 `ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`, and
 `ALPACA_FACTORY_WORKERS`; hard validation caps these at 16, 8, and 16.

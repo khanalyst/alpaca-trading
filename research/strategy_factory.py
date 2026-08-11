@@ -9,7 +9,7 @@ partition and judged on untouched held-out or later forward data.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import math
 import os
@@ -210,7 +210,13 @@ def _llm_lineage_evidence(factory: FactoryLedger,
     parent = hypothesis.get("parent_hypothesis_id")
     if not parent:
         return None
-    for event in reversed(factory.events(str(parent))):
+    try:
+        parent_events = factory.events(str(parent))
+    except KeyError:
+        # Lineage evidence is a nice-to-have annotation. An unresolvable
+        # ancestor must not abort a research cycle that is otherwise valid.
+        return None
+    for event in reversed(parent_events):
         payload = event.get("payload") or {}
         if (payload.get("replacement_hypothesis_id") == hypothesis.get("hypothesis_id") and
                 isinstance(payload.get("llm_evidence"), Mapping)):
@@ -250,8 +256,9 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
             # make "the LLM discovers edges" false on the very first cycle.
             seed = template_hypothesis(slot, vehicle=vehicle)
             source = "template"
+            genesis_proposal: ProposalResult | None = None
             if llm_enabled:
-                proposed, _proposal, proposed_source = _seed_slot(
+                proposed, genesis_proposal, proposed_source = _seed_slot(
                     {"vehicle": vehicle, "slot": slot,
                      "family": seed.family, "rule_spec": seed.rule_spec,
                      "hypothesis_id": seed.hypothesis_id},
@@ -267,7 +274,12 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                     llm_enabled=True, config=llm_config, adapter=adapter)
                 if (proposed is not None and
                         proposed_source == "llm_discovery"):
-                    seed, source = proposed, proposed_source
+                    # The template only supplied the brief; it was never
+                    # registered, so it is not an ancestor.  Leaving it as the
+                    # parent would dangle a foreign key at a hypothesis that
+                    # does not exist and break every lineage read afterwards.
+                    seed = replace(proposed, parent_hypothesis_id=None)
+                    source = proposed_source
             if rule_variant_id(seed.rule_spec) in existing_variant_ids:
                 continue
         else:
@@ -287,6 +299,18 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
         factory.register(seed)
         existing_variant_ids.add(rule_variant_id(seed.rule_spec))
         if previous is None:
+            # A genesis slot has no ancestor to carry its provenance, so the
+            # seeding decision is recorded on the hypothesis itself. Without
+            # this an LLM-discovered first hypothesis is indistinguishable
+            # from a template in every later lineage read.
+            payload: dict[str, Any] = {"seeded": True, "source": source}
+            if genesis_proposal is not None:
+                payload["proposal_schema"] = genesis_proposal.schema
+                payload["llm_evidence"] = genesis_proposal.evidence
+                if not genesis_proposal.success:
+                    payload["llm_error"] = genesis_proposal.error
+            factory.event(seed.hypothesis_id, "queued",
+                          f"slot seeded via {source}", payload)
             seeded_slots.append({**asdict(seed), "source": source})
             continue
         factory.event(

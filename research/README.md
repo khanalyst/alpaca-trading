@@ -263,7 +263,20 @@ permits bypassing the runtime edge gate.
 ```bash
 python research.py factory run --data market.jsonl --strategies 7 --variants 4 --workers 7
 python research.py factory status
+python research.py factory report [--slot N] [--format text|markdown|json]
 ```
+
+`research.factory_report` is the reader for everything the two ledgers already
+record but nothing previously opened: per slot, the lineage of hypotheses it
+has held; per hypothesis, its origin (template, deterministic mutation,
+rotation, LLM discovery, LLM replacement) with the model and the prompt,
+request and response content hashes where one applies, plus its thesis and its
+falsification condition; per variant, trade counts split fit/held-out, net P&L,
+drawdown, held-out delta and lower bound, q-value, and the named gates it
+missed; and per outcome, why a hypothesis was retired, after how many of its
+intended variants, the dominant failure mode, and what replaced it. It opens
+both ledgers read-only, derives every number on read, and reports the gate hash
+beside anything a gate produced.
 
 ```bash
 python research.py edge init

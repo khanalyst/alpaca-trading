@@ -412,11 +412,31 @@ def cmd_factory_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_factory_report(args: argparse.Namespace) -> int:
+    """Explain what research did: lineage, variants, verdicts, and reasons."""
+    from research.factory_report import build_report, render_markdown, render_text
+
+    report = build_report(_db(args), vehicle=args.vehicle, slot=args.slot)
+    if args.format == "json":
+        print(json.dumps(report, sort_keys=True, default=str))
+    elif args.format == "markdown":
+        print(render_markdown(report), end="")
+    else:
+        print(render_text(report), end="")
+    return 0 if report.get("available") else 2
+
+
 def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
     parser = sub.add_parser(name, help=f"autonomous strategy factory {command}")
     parser.add_argument("--db", default=None)
     if command == "status":
         parser.set_defaults(func=cmd_factory_status)
+    elif command == "report":
+        parser.add_argument("--vehicle", choices=("equity", "option"), default=None)
+        parser.add_argument("--slot", type=int, default=None)
+        parser.add_argument("--format", choices=("text", "markdown", "json"),
+                            default="text")
+        parser.set_defaults(func=cmd_factory_report)
     else:
         parser.add_argument("--data", required=True, help="normalized mixed market JSONL")
         parser.add_argument("--agent-config", default=None,
@@ -524,9 +544,9 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.set_defaults(func=cmd_calibrate)
     factory = sub.add_parser("factory", help="parallel autonomous strategy factory")
     factory_sub = factory.add_subparsers(dest="factory_command", required=True)
-    for name in ("run", "status"):
+    for name in ("run", "status", "report"):
         _factory_parser(factory_sub, name, name)
-    for name in ("factory-run", "factory-status"):
+    for name in ("factory-run", "factory-status", "factory-report"):
         _factory_parser(sub, name, name.split("-", 1)[1])
     return parser
 

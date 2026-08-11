@@ -414,6 +414,20 @@ slot and `ROTATION_BUDGET` times per cycle, each rotation granting one further
 reseed after a *proved* edge is a separate, unbounded path: it follows success
 rather than failure, so bounding it would only shrink the search.
 
+### Discovery observability
+
+`research.factory_report` reads the factory and edge ledgers and renders what
+research did as text, Markdown, or JSON. Both ledgers already recorded every
+hypothesis, every variant's full gate, the diagnosis behind each mutation, the
+retirement reason and variant count, and the provider/prompt hashes behind an
+LLM proposal; none of it was readable, because `factory status` returned rows
+and three counts. The report is strictly derived — it opens both ledgers
+read-only, computes on read, drops the stored trade rows, and reports the gate
+hash beside anything a gate produced, so a claim in the report traces back to
+the immutable row it came from. Genesis slots have no ancestor to carry their
+provenance, so the seeding decision is recorded on the hypothesis itself; every
+other origin is recorded on the ancestor it replaced.
+
 ### Deployed-edge observability
 
 `EdgeLedger.paper_performance` and `paper_report` read back the append-only
