@@ -17,12 +17,17 @@ bounded data-only rule specifications, and judges them on untouched held-out
 data. A slot that proves an edge is reseeded with a new hypothesis in the same
 cycle: the proved variant is frozen and never re-tuned, but the *slot* is
 parallel research capacity, so discovery continues at full width instead of
-shrinking with every success. An optional LLM proposes what to try next — both
-new hypotheses for free slots and replacements for exhausted families — inside
-the same audited grammar, and every such proposal must earn `backtest_passed`
-and a strictly later forward shadow pass through the identical gates a
-deterministic one faces. Every seeding path falls back to a deterministic
-ladder, so research works with no provider configured. A rule specification
+shrinking with every success. An optional LLM proposes what to try next — new
+hypotheses for free slots, replacements for exhausted families, and the
+parameter variants inside a hypothesis — inside the same audited grammar, and
+every such proposal must earn `backtest_passed` and a strictly later forward
+shadow pass through the identical gates a deterministic one faces. Every
+proposal records the reason it was made *before* the gate that judges it
+exists, that reason is graded against the gate afterwards, and the graded pairs
+are fed back into later proposals, so parameter search is driven by what
+earlier attempts taught rather than by a fixed table alone. Every seeding and
+tuning path falls back to a deterministic ladder, so research works with no
+provider configured. A rule specification
 carries `max_hold_bars`, so every strategy has a
 bounded time exit as well as a stop and a target; research and runtime compute
 that deadline from one shared helper. Paper
@@ -117,9 +122,12 @@ lifecycle state:
 
 - **What is research doing?** `research.py factory report` renders the full
   discovery narrative — every slot, every hypothesis it has held, who proposed
-  each one and on what rationale, every variant with its performance and the
-  named gates it missed, and why anything was retired and after how many
-  variants. `--format markdown` produces a shareable document.
+  each one and on what rationale, every variant with the reason it was tried,
+  its performance and the named gates it missed, why anything was retired and
+  after how many variants, and the graded reason history: what was tried, why,
+  and what the gates then said. `--format markdown` produces a shareable
+  document. Each cycle archives it under `research/results/factory/`, so the
+  dashboard lists it without anyone running a command.
 - **What evidence was an edge promoted on?** `research.py edge status` and the
   dashboard's "Proved edges" table.
 - **What has it done since?** `research.py edge paper` and the dashboard's

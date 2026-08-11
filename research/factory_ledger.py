@@ -20,10 +20,25 @@ ACTIVE_HYPOTHESIS_STATES = {
     "pending_llm_replacement",
 }
 FACTORY_STATUSES = ACTIVE_HYPOTHESIS_STATES | {"validated", "retired"}
+# What a recorded reason was given for.  ``tuning`` changes the numbers of one
+# hypothesis; the rest change which hypothesis a slot holds.
+LESSON_KINDS = {"tuning", "discovery", "replacement", "rotation", "reseed"}
+LESSON_SOURCES = {"llm", "deterministic"}
 
 
 class FactoryError(ValueError):
     """Raised when a factory operation cannot preserve research boundaries."""
+
+
+def _real(value: Any) -> float | None:
+    """Coerce a metric to a finite float, or ``None`` rather than a guess."""
+    if isinstance(value, (bool, str, bytes, bytearray)) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -91,6 +106,58 @@ class FactoryLedger:
                     created_at REAL NOT NULL,
                     UNIQUE(dataset_hash,vehicle)
                 );
+                -- Why something was tried, and what happened when it was.
+                -- Split in two because the two facts are learned at different
+                -- times: the reason exists when the variant is proposed, the
+                -- grade only after its gate is computed.  Keeping them as two
+                -- append-only rows preserves the ledger's no-update rule
+                -- instead of carving an exception into it.
+                CREATE TABLE IF NOT EXISTS factory_lessons (
+                    lesson_id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL REFERENCES factory_hypotheses(hypothesis_id),
+                    vehicle TEXT NOT NULL CHECK(vehicle IN ('equity','option')),
+                    family TEXT NOT NULL,
+                    variant_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    changed_json TEXT NOT NULL,
+                    diagnosis_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(hypothesis_id,variant_id,kind)
+                );
+                CREATE TABLE IF NOT EXISTS factory_lesson_outcomes (
+                    outcome_id TEXT PRIMARY KEY,
+                    lesson_id TEXT NOT NULL REFERENCES factory_lessons(lesson_id),
+                    passed INTEGER NOT NULL,
+                    underpowered INTEGER NOT NULL,
+                    heldout_delta REAL,
+                    heldout_net_pnl REAL,
+                    q_value REAL,
+                    failed_checks_json TEXT NOT NULL,
+                    gate_hash TEXT,
+                    created_at REAL NOT NULL,
+                    UNIQUE(lesson_id)
+                );
+                CREATE INDEX IF NOT EXISTS factory_lessons_family
+                    ON factory_lessons(vehicle,family,created_at);
+                CREATE TRIGGER IF NOT EXISTS factory_lessons_no_update
+                    BEFORE UPDATE ON factory_lessons BEGIN
+                    SELECT RAISE(ABORT, 'factory lessons are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_lessons_no_delete
+                    BEFORE DELETE ON factory_lessons BEGIN
+                    SELECT RAISE(ABORT, 'factory lessons are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_lesson_outcomes_no_update
+                    BEFORE UPDATE ON factory_lesson_outcomes BEGIN
+                    SELECT RAISE(ABORT, 'factory lesson outcomes are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS factory_lesson_outcomes_no_delete
+                    BEFORE DELETE ON factory_lesson_outcomes BEGIN
+                    SELECT RAISE(ABORT, 'factory lesson outcomes are immutable');
+                END;
                 CREATE TRIGGER IF NOT EXISTS factory_hypotheses_no_update
                     BEFORE UPDATE ON factory_hypotheses BEGIN
                     SELECT RAISE(ABORT, 'factory hypotheses are immutable');
@@ -292,6 +359,124 @@ class FactoryLedger:
                     total += 1
         return total
 
+    def record_lesson(self, hypothesis_id: str, *, vehicle: str, family: str,
+                      variant_id: str, kind: str, source: str, reason: str,
+                      changed: Mapping | None = None,
+                      diagnosis: Mapping | None = None,
+                      evidence: Mapping | None = None) -> str:
+        """Record why something was tried, before anyone knows if it worked.
+
+        Writing the reason at proposal time is what makes it evidence rather
+        than a story told afterwards: it is fixed before the gate that will
+        judge it has been computed.
+        """
+        if kind not in LESSON_KINDS:
+            raise FactoryError(f"unknown lesson kind: {kind}")
+        if source not in LESSON_SOURCES:
+            raise FactoryError(f"unknown lesson source: {source}")
+        if not str(reason).strip():
+            raise FactoryError("a lesson requires a stated reason")
+        if vehicle not in {"equity", "option"}:
+            raise FactoryError("vehicle must be equity or option")
+        if self.hypothesis(hypothesis_id) is None:
+            raise KeyError(hypothesis_id)
+        with closing(_connect(self.path)) as db, db:
+            existing = db.execute(
+                """SELECT lesson_id FROM factory_lessons
+                   WHERE hypothesis_id=? AND variant_id=? AND kind=?""",
+                (hypothesis_id, str(variant_id), kind)).fetchone()
+            if existing is not None:
+                return str(existing["lesson_id"])
+            lesson_id = uuid.uuid4().hex
+            db.execute("INSERT INTO factory_lessons VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+                lesson_id, hypothesis_id, vehicle, str(family), str(variant_id),
+                kind, source, " ".join(str(reason).split()),
+                canonical_json(dict(changed or {})),
+                canonical_json(dict(diagnosis or {})),
+                canonical_json(dict(evidence or {})),
+                datetime.now().timestamp(),
+            ))
+            return lesson_id
+
+    def grade_lesson(self, hypothesis_id: str, variant_id: str, *, kind: str,
+                     outcome: Mapping) -> str | None:
+        """Attach the gate's verdict to the reason that predicted it.
+
+        Returns ``None`` when nothing proposed this variant with a reason, so
+        grading a deterministic path that predates lessons is a no-op rather
+        than an error.
+        """
+        with closing(_connect(self.path)) as db, db:
+            lesson = db.execute(
+                """SELECT lesson_id FROM factory_lessons
+                   WHERE hypothesis_id=? AND variant_id=? AND kind=?""",
+                (hypothesis_id, str(variant_id), kind)).fetchone()
+            if lesson is None:
+                return None
+            lesson_id = str(lesson["lesson_id"])
+            if db.execute("SELECT 1 FROM factory_lesson_outcomes WHERE lesson_id=?",
+                          (lesson_id,)).fetchone() is not None:
+                return lesson_id
+            db.execute("INSERT INTO factory_lesson_outcomes VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                uuid.uuid4().hex, lesson_id,
+                1 if outcome.get("passed") else 0,
+                1 if outcome.get("underpowered") else 0,
+                _real(outcome.get("heldout_delta")),
+                _real(outcome.get("heldout_net_pnl")),
+                _real(outcome.get("q_value")),
+                canonical_json(list(outcome.get("failed_checks") or [])),
+                str(outcome["gate_hash"]) if outcome.get("gate_hash") else None,
+                datetime.now().timestamp(),
+            ))
+            return lesson_id
+
+    def lessons(self, *, vehicle: str | None = None, family: str | None = None,
+                hypothesis_id: str | None = None, graded_only: bool = False,
+                limit: int = 50) -> list[dict]:
+        """Return graded proposal reasons, most recent first."""
+        where = []
+        parameters: list[Any] = []
+        for column, value in (("l.vehicle", vehicle), ("l.family", family),
+                              ("l.hypothesis_id", hypothesis_id)):
+            if value is not None:
+                where.append(f"{column}=?")
+                parameters.append(value)
+        if graded_only:
+            where.append("o.outcome_id IS NOT NULL")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        parameters.append(max(1, int(limit)))
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                """SELECT l.*, o.passed, o.underpowered, o.heldout_delta,
+                          o.heldout_net_pnl, o.q_value, o.failed_checks_json,
+                          o.gate_hash, o.outcome_id
+                   FROM factory_lessons l
+                   LEFT JOIN factory_lesson_outcomes o ON o.lesson_id=l.lesson_id"""
+                + clause + " ORDER BY l.created_at DESC, l.lesson_id DESC LIMIT ?",
+                parameters).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["changed"] = json.loads(item.pop("changed_json"))
+            item["diagnosis"] = json.loads(item.pop("diagnosis_json"))
+            item["evidence"] = json.loads(item.pop("evidence_json"))
+            failed = item.pop("failed_checks_json")
+            graded = item.pop("outcome_id") is not None
+            item["outcome"] = ({
+                "passed": bool(item["passed"]),
+                "underpowered": bool(item["underpowered"]),
+                "heldout_delta": item["heldout_delta"],
+                "heldout_net_pnl": item["heldout_net_pnl"],
+                "q_value": item["q_value"],
+                "failed_checks": json.loads(failed) if failed else [],
+                "gate_hash": item["gate_hash"],
+            } if graded else None)
+            for key in ("passed", "underpowered", "heldout_delta",
+                        "heldout_net_pnl", "q_value", "gate_hash"):
+                item.pop(key, None)
+            output.append(item)
+        return output
+
     def add_account(self, cycle_id: str, hypothesis_id: str, result: Mapping) -> None:
         account = result["account"]
         with closing(_connect(self.path)) as db, db:
@@ -347,5 +532,5 @@ class FactoryLedger:
 
 __all__ = [
     "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_STATUSES",
-    "FactoryError", "FactoryLedger",
+    "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
 ]

@@ -12,6 +12,8 @@ venv/
 # Generated research caches: binary, large, and rebuildable from the journal.
 research/cache/
 research/results/edges/
+# The discovery narrative is a view over the ledgers, rewritten every cycle.
+research/results/factory/
 
 # Imported VM databases/results are audit fixtures only; production and test
 # code must use explicit temporary stores or configured runtime paths.

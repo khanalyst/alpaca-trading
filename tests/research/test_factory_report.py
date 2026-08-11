@@ -19,8 +19,9 @@ from unittest.mock import patch
 
 from agent.contracts.rule import (rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
-from research.factory_report import (REPORT_SCHEMA, build_report,
-                                     render_markdown, render_text)
+from research.factory_report import (DEFAULT_REPORT_ROOT, REPORT_SCHEMA,
+                                     build_report, render_markdown,
+                                     render_text, write_report)
 import research.strategy_factory as factory_module
 from research.llm_strategy import (DISCOVERY_SCHEMA, PROPOSAL_SCHEMA,
                                    ProposalResult)
@@ -126,8 +127,40 @@ class ReportContentTests(unittest.TestCase):
 
             summary = vehicle["summary"]
             self.assertEqual(summary["llm_seeded_hypotheses"], 2)
+            self.assertEqual(summary["llm_proposals_rejected"], 0)
             self.assertEqual(summary["retired_hypotheses"], 1)
             self.assertEqual(summary["variants_tested"], 2)
+
+    def test_a_refused_proposal_is_not_counted_as_an_llm_hypothesis(self):
+        """A provider that was asked and said no leaves a deterministic run."""
+        class Refusing:
+            def discover(self, **_):
+                return ProposalResult(False, schema=DISCOVERY_SCHEMA,
+                                      error="provider unavailable",
+                                      evidence={"provider": "openai",
+                                                "model": "gpt-5",
+                                                "kind": "discovery"})
+
+            def propose(self, **_):
+                return ProposalResult(False, error="provider unavailable",
+                                      evidence={"provider": "openai",
+                                                "model": "gpt-5"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "edge.sqlite3"
+            with patch.object(factory_module, "ProcessPoolExecutor",
+                              side_effect=OSError), \
+                    patch.object(factory_module, "_worker",
+                                 side_effect=fake_adequate_worker):
+                run_factory(losing_breakouts(), db_path=db, strategies=1,
+                            variants_per_strategy=2, workers=1, min_trades=1,
+                            min_sessions=1, alpha=1.0, max_generations=2,
+                            strategy_llm={"enabled": True, "provider": "openai",
+                                          "model": "gpt-5"},
+                            proposal_adapter=Refusing())
+            summary = build_report(db)["vehicles"][0]["summary"]
+        self.assertEqual(summary["llm_seeded_hypotheses"], 0)
+        self.assertGreaterEqual(summary["llm_proposals_rejected"], 1)
 
     def test_a_deterministic_run_reports_no_llm_involvement(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -232,6 +265,78 @@ class ReportCommandTests(unittest.TestCase):
             result = self._run_cli(Path(directory) / "absent.sqlite3")
             self.assertEqual(result.returncode, 2)
             self.assertNotIn("Traceback", result.stderr)
+
+
+class ArchivedReportTests(unittest.TestCase):
+    """The narrative is only useful where somebody will actually see it.
+
+    ``factory report`` printed to stdout and was never invoked by the
+    scheduled cycle, so on the documented headless topology the one artifact
+    explaining what research had been doing was written and never read.  It is
+    now archived under ``research/results``, which is exactly the tree the
+    read-only dashboard already lists.
+    """
+
+    def test_it_writes_markdown_the_dashboard_will_list(self):
+        from deploy.dashboard import _reports, report_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = _run(directory)
+            root = Path(directory) / "site"
+            target = write_report(db, vehicle="equity",
+                                  output_root=root / "research" / "results" / "factory")
+            self.assertIsNotNone(target)
+            self.assertTrue(target.is_file())
+            body = target.read_text(encoding="utf-8")
+            self.assertIn("Autonomous research report", body)
+            self.assertIn("vwap_reversion", body)
+
+            listed = [row["path"] for row in _reports(root)]
+            self.assertIn("research/results/factory/equity.md", listed)
+            text, _kind = report_file(root, "research/results/factory/equity.md")
+            self.assertEqual(text, body)
+            # No stray staging file is left behind for the dashboard to serve.
+            self.assertEqual(
+                sorted(item.name for item in target.parent.iterdir()),
+                ["equity.md"])
+
+    def test_rewriting_replaces_rather_than_accumulates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = _run(directory)
+            root = Path(directory) / "out"
+            first = write_report(db, vehicle="equity", output_root=root)
+            second = write_report(db, vehicle="equity", output_root=root)
+            self.assertEqual(first, second)
+            self.assertEqual(len(list(root.iterdir())), 1)
+
+    def test_an_empty_ledger_archives_nothing_instead_of_an_empty_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "out"
+            self.assertIsNone(write_report(Path(directory) / "absent.sqlite3",
+                                           output_root=root))
+            self.assertFalse(root.exists())
+
+    def test_the_default_root_is_inside_the_dashboards_report_tree(self):
+        self.assertEqual(DEFAULT_REPORT_ROOT.parts[:2],
+                         ("research", "results"))
+
+    def test_a_cycle_archives_the_narrative_even_when_nothing_proved(self):
+        """The cycle that found nothing is the one an operator needs to read."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = _run(directory)
+            completed = subprocess.run(
+                [sys.executable, str(REPO / "research.py"), "factory", "report",
+                 "--db", str(db), "--vehicle", "equity", "--write",
+                 "--format", "json"],
+                capture_output=True, text=True,
+                env={"PATH": "/usr/bin:/bin", "HOME": str(root),
+                     "ALPACA_RESEARCH_REPORT_DIR": str(root / "archive")})
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            artifact = json.loads(completed.stderr.strip().splitlines()[-1])
+            self.assertTrue(Path(artifact["artifact"]).is_file())
+            self.assertEqual(Path(artifact["artifact"]).parent,
+                             root / "archive")
 
 
 if __name__ == "__main__":

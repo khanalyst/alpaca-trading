@@ -539,6 +539,16 @@ class CorpusDescriptorTests(unittest.TestCase):
                            if quote.session_date.isoformat() not in set(sealed)]},
                 {**common, "corpus": {"source": str(source), "after": None,
                                       "until": end, "exclude": sealed}})
+            # Both phases must agree across both task shapes: the diagnosis the
+            # orchestrator tunes from, and the evaluation it schedules after.
+            diagnoses = [factory_module._diagnose_worker(task)["diagnostic"]
+                         for task in (copied, reread)]
+            self.assertEqual(diagnoses[0], diagnoses[1])
+            specs = factory_module.mutate_from_diagnosis(
+                hypothesis["rule_spec"], diagnoses[0], 2)
+            for task, diagnostic in zip((copied, reread), diagnoses):
+                task["diagnostic"] = diagnostic
+                task["specs"] = specs
             # The account ids carry a random suffix; pin it so the comparison is
             # of the computed evidence, not of two fresh uuids.
             with patch.object(factory_module.uuid, "uuid4",

@@ -361,18 +361,54 @@ and the factory eventually returned `exhausted` permanently.
 
 ### The LLM's authority
 
-`research.llm_strategy` answers two bounded requests. `llm-rule-proposal.v1`
+`research.llm_strategy` answers three bounded requests. `llm-rule-proposal.v1`
 repairs a family whose intended variants all failed. `llm-edge-discovery.v1`
 seeds a free slot with a new hypothesis, given an aggregate brief of what the
-slot has tried and what is already proved, and must return a short plain-text
-thesis alongside the spec. Both replies are strict, size-capped, fence- and
-unsafe-key-rejecting JSON validated against the rule grammar before storage. A
-proposal is only ever a *seed*: the resulting hypothesis is registered `queued`
-and must earn `backtest_passed` and a strictly later shadow pass through the
-same gates as a deterministic one. The LLM decides what to try next; it cannot
-shorten the evidence path, retire a family on invalid output, or authorize
-trading. Every seeding path has a deterministic fallback, so the factory keeps
-discovering with no provider configured.
+slot has tried, what is already proved, *what the other slots took earlier in
+this same cycle*, and how earlier reasons were graded; it must return a short
+plain-text thesis alongside the spec. `llm-variant-tuning.v1` proposes the
+parameter variants of one hypothesis, each with a one-sentence reason naming
+the parameter it changed and the diagnosed problem it should fix. All three
+replies are strict, size-capped, fence- and unsafe-key-rejecting JSON validated
+against the rule grammar before storage. A proposal is only ever a *seed*: the
+resulting hypothesis is registered `queued` and must earn `backtest_passed` and
+a strictly later shadow pass through the same gates as a deterministic one. The
+LLM decides what to try next; it cannot shorten the evidence path, retire a
+family on invalid output, or authorize trading. Every seeding and tuning path
+has a deterministic fallback, so the factory keeps discovering with no provider
+configured.
+
+Tuning may change numbers, never structure: a tuned spec keeps its root's
+`family`, so replacing the idea stays discovery's job. The unmutated root is
+always variant zero and is never proposed away — its own matched control is
+itself, so it cannot pass and serves as the hypothesis's null calibration.
+Anything the model does not supply, supplies as a duplicate, or supplies
+invalidly is topped up from the same deterministic mutation table, so the
+variant count is unchanged whether a provider answered or not.
+
+The cycle therefore runs in two scheduled phases. `_diagnose_worker` replays
+each hypothesis's root on its fit partition only; the orchestrator then chooses
+that hypothesis's variants; `_worker` replays them. Splitting the passes is
+what keeps every provider call in the parent process — no adapter is ever
+pickled into a worker — while the expensive replay stays parallel.
+
+### Reasons, and grading them
+
+`factory_lessons` records why something was tried; `factory_lesson_outcomes`
+records what the gates then said. They are two append-only tables rather than
+one updated row because the two facts are learned at different times: the
+reason exists when a variant is proposed, the grade only after its gate is
+computed. Fixing the reason first is what makes it a prediction rather than a
+story told afterwards. Deterministic mutations record reasons in the same
+shape, including an explicit "no diagnosis behind it" for the arithmetic sweep
+that fills variants past the diagnosed changes, so the feedback loop can
+compare a tuned reason against the fixed table instead of only against itself.
+
+`_lesson_brief` reads the graded pairs back into the next tuning and discovery
+request, trimming oldest-first to stay inside the adapter's aggregate bound. A
+ledger written before lessons existed degrades to "no history", never to a
+failed cycle. Hypothesis-level reasons — why a slot was given an idea at all —
+are graded by the best variant that idea produced, never by the root.
 
 ### Statistical gates and lifecycle
 
@@ -426,7 +462,17 @@ read-only, computes on read, drops the stored trade rows, and reports the gate
 hash beside anything a gate produced, so a claim in the report traces back to
 the immutable row it came from. Genesis slots have no ancestor to carry their
 provenance, so the seeding decision is recorded on the hypothesis itself; every
-other origin is recorded on the ancestor it replaced.
+other origin is recorded on the ancestor it replaced. Every variant carries the
+reason it was tried and who proposed it, and each vehicle carries the graded
+reason history: what was tried, why, and what the gates said.
+
+`write_report` archives the Markdown narrative under `research/results/`, which
+is the tree the read-only dashboard already lists, and `research.py factory
+run` calls it on every cycle — including a cycle that proved nothing, which is
+exactly the one an operator needs to read. Previously the report existed only
+as a command whose output went to stdout, and the scheduled cycle never invoked
+it, so on the documented headless topology nobody ever saw it. The path is
+stable per vehicle: the ledgers are the durable record, this file is a view.
 
 ### Deployed-edge observability
 

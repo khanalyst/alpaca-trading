@@ -373,6 +373,23 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
     return 0 if promoted else 2
 
 
+def _write_factory_report(args: argparse.Namespace) -> str | None:
+    """Archive the discovery narrative where the dashboard will list it."""
+    from research.factory_report import DEFAULT_REPORT_ROOT, write_report
+
+    root = Path(os.getenv("ALPACA_RESEARCH_REPORT_DIR") or DEFAULT_REPORT_ROOT)
+    if not root.is_absolute():
+        root = REPO / root
+    try:
+        target = write_report(_db(args), vehicle=getattr(args, "vehicle", None),
+                              output_root=root)
+    except (OSError, ValueError):
+        # The narrative is a convenience view over ledgers that are already
+        # durable.  Failing to archive it must not fail the research cycle.
+        return None
+    return str(target) if target is not None else None
+
+
 def cmd_factory_run(args: argparse.Namespace) -> int:
     agent_config = _agent_config(args)
     config = _read_json(getattr(args, "config", None), {})
@@ -387,6 +404,11 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         costs=CostModel.from_config(config),
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"))
     proofs = _emit_proofs(args, result, agent_config)
+    # Archive the narrative every cycle, not only when an edge proves out. A
+    # cycle that found nothing is exactly the one an operator needs to read,
+    # and on a headless deployment the dashboard's report list is the only
+    # place they will see it.
+    result["report"] = _write_factory_report(args)
     print(json.dumps(result, sort_keys=True, default=str))
     return 0 if proofs else 2
 
@@ -417,6 +439,10 @@ def cmd_factory_report(args: argparse.Namespace) -> int:
     from research.factory_report import build_report, render_markdown, render_text
 
     report = build_report(_db(args), vehicle=args.vehicle, slot=args.slot)
+    if getattr(args, "write", False):
+        target = _write_factory_report(args)
+        print(json.dumps({"schema": "factory-report-artifact.v1",
+                          "artifact": target}, sort_keys=True), file=sys.stderr)
     if args.format == "json":
         print(json.dumps(report, sort_keys=True, default=str))
     elif args.format == "markdown":
@@ -436,6 +462,8 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--slot", type=int, default=None)
         parser.add_argument("--format", choices=("text", "markdown", "json"),
                             default="text")
+        parser.add_argument("--write", action="store_true",
+                            help="also archive Markdown under research/results")
         parser.set_defaults(func=cmd_factory_report)
     else:
         parser.add_argument("--data", required=True, help="normalized mixed market JSONL")

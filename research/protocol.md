@@ -81,7 +81,21 @@ explicit demotion is the operator safety action.
 
 Factory mutations may inspect only the chronological fit partition. Held-out
 and later-forward sessions must not influence hypothesis or parameter
-generation. Each variant is evaluated in an isolated simulated account.
+generation. This binds the bounded LLM tuning lane exactly as it binds the
+deterministic mutation table: a tuning request is given the fit-partition
+diagnosis and the graded outcomes of *already completed* proposals, never a
+held-out, sealed, or later-forward observation. A tuned variant may change
+parameters only, never its root's family, and is evaluated under the identical
+gates. Each variant is evaluated in an isolated simulated account.
+
+Every proposal — deterministic or model-authored — records a stated reason
+before the gate that judges it is computed, and that reason is graded against
+the resulting gate afterwards. Both records are append-only and the grade is
+written once. The graded pairs may be fed back into later proposals; because
+they describe only completed, already-corrected evaluations, doing so adds no
+information about unseen data. Multiple-test correction is what prices the
+search, so a tuned variant counts against the same family-local and
+cycle-global false-discovery budget as a mutated one.
 Multiple-test correction covers every variant evaluated in the cycle. A
 replacement hypothesis may be generated only after the root family has an
 adequate trade/session sample and no variant passes; underpowered data must not

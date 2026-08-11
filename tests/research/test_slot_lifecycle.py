@@ -356,6 +356,73 @@ class LLMDiscoveryTests(unittest.TestCase):
                              ["fresh_slot"] * 3)
             self.assertEqual(len(factory.active("equity")), 3)
 
+    def test_each_genesis_slot_is_told_what_its_siblings_just_took(self):
+        """Slots are seeded in sequence inside one cycle.
+
+        Without this the brief is identical for every slot of a fresh ledger —
+        empty tried/proved families — so a model that answers consistently
+        returns the same hypothesis N times, N-1 are dropped as duplicates, and
+        the deployment pays for N proposals to fill one slot.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            factory, edge = _ledgers(directory)
+            briefs = []
+
+            class Steady:
+                """A realistic model: same brief in, same answer out."""
+
+                def discover(inner, *, vehicle, slot, context):
+                    briefs.append(context)
+                    from agent.contracts.rule import validate_rule_spec
+                    taken = {item["family"] for item in
+                             context.get("already_seeded_this_cycle") or ()}
+                    family = next(name for name in RULE_FAMILIES
+                                  if name not in taken)
+                    spec = validate_rule_spec({"family": family})
+                    return ProposalResult(
+                        True, schema=DISCOVERY_SCHEMA, rule_spec=spec,
+                        variant_id=rule_variant_id(spec),
+                        thesis=f"{family} should carry an edge.",
+                        evidence={"kind": "discovery"})
+
+            seeded, _revived = _ensure_slots(
+                factory, edge, vehicle="equity", strategies=4,
+                existing_variant_ids=set(), llm_enabled=True,
+                llm_config={"model": "gpt-5"}, adapter=Steady())
+
+            self.assertEqual([item["source"] for item in seeded],
+                             ["llm_discovery"] * 4)
+            self.assertEqual(len({item["family"] for item in seeded}), 4)
+            # The first slot has no siblings yet; each later one is told about
+            # every slot already seeded in this same cycle.
+            self.assertEqual(briefs[0].get("already_seeded_this_cycle"), None)
+            for index, brief in enumerate(briefs[1:], start=1):
+                self.assertEqual(len(brief["already_seeded_this_cycle"]), index)
+                self.assertEqual(
+                    [row["slot"] for row in brief["already_seeded_this_cycle"]],
+                    list(range(index)))
+
+    def test_a_revived_slot_is_told_about_the_slots_still_running(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, edge = _ledgers(directory)
+            _seed(factory, count=3)
+            briefs = []
+
+            class Recorder:
+                def discover(inner, *, vehicle, slot, context):
+                    briefs.append(context)
+                    return ProposalResult(False, error="deterministic please")
+
+            _prove_every_active_slot(factory)
+            _ensure_slots(factory, edge, vehicle="equity", strategies=3,
+                          existing_variant_ids=_variant_ids(factory),
+                          llm_enabled=True, llm_config={"model": "gpt-5"},
+                          adapter=Recorder())
+            self.assertEqual(len(briefs), 3)
+            for index, brief in enumerate(briefs):
+                seen = brief.get("already_seeded_this_cycle") or []
+                self.assertEqual(len(seen), index)
+
     def test_genesis_falls_back_to_templates_when_discovery_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             factory, edge = _ledgers(directory)

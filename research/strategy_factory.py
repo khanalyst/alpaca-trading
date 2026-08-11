@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import random
+import sqlite3
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -39,14 +40,16 @@ from .gates import (chronological_split, heldout_separation,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
-from .llm_strategy import DISCOVERY_SCHEMA, ProposalResult, RuleProposalAdapter
+from .llm_strategy import (DISCOVERY_SCHEMA, TUNING_SCHEMA, ProposalResult,
+                           RuleProposalAdapter)
 from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
     _session, _simulate_trade, _thesis, _visible, diagnose, discovery_hypothesis,
-    initial_hypotheses, mutate_from_diagnosis, replacement_hypothesis,
-    simulate_account, template_hypothesis,
+    initial_hypotheses, mutate_from_diagnosis, mutate_with_reasons,
+    mutation_reason, replacement_hypothesis, simulate_account, spec_delta,
+    template_hypothesis,
 )
 
 
@@ -60,6 +63,14 @@ MAX_WORKERS = 16
 # ``max_generations * (MAX_ROTATIONS + 1)`` for the life of the ledger.
 ROTATION_BUDGET = 1
 MAX_ROTATIONS = 2
+# How much graded history a tuning prompt carries.  The adapter bounds the
+# payload at 8 KiB anyway; this keeps the brief recent and readable rather
+# than letting it drift toward that ceiling.
+LESSON_BRIEF_LIMIT = 8
+LESSON_BRIEF_BYTES = 6_000
+# Hypothesis-level lessons are graded by the best variant the hypothesis
+# produced, not by the root, which by construction cannot beat itself.
+HYPOTHESIS_LESSON_KINDS = ("discovery", "reseed", "replacement", "rotation")
 
 
 def _slot_rotations(factory: FactoryLedger, vehicle: str, slot: int) -> int:
@@ -100,7 +111,9 @@ def _proved_families(edge: EdgeLedger, vehicle: str) -> list[str]:
 
 def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
                        tried_families: set[str], proved_families: Sequence[str],
-                       diagnostic: Mapping[str, Any] | None = None) -> dict:
+                       diagnostic: Mapping[str, Any] | None = None,
+                       seeded_this_cycle: Sequence[Mapping[str, Any]] = (),
+                       lessons: Sequence[Mapping[str, Any]] = ()) -> dict:
     """Build the small aggregate brief a discovery proposal is given."""
     context: dict[str, Any] = {
         "slot": int(slot),
@@ -112,7 +125,57 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
     }
     if diagnostic:
         context["last_diagnosis"] = dict(diagnostic)
+    # Slots are seeded one after another inside a single cycle.  Without this
+    # every slot of a fresh ledger receives an identical brief, so a model that
+    # answers consistently returns the same hypothesis every time and all but
+    # the first are discarded as duplicates — paying for N proposals and using
+    # one.  Telling each slot what its siblings just took is what makes the
+    # parallel width real rather than nominal.
+    if seeded_this_cycle:
+        context["already_seeded_this_cycle"] = [
+            {"slot": int(item["slot"]), "family": str(item["family"])}
+            for item in seeded_this_cycle]
+    if lessons:
+        context["lessons"] = list(lessons)
     return context
+
+
+def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Compact graded lessons into the aggregate brief a prompt may carry."""
+    brief: list[dict] = []
+    for row in rows:
+        outcome = row.get("outcome") or {}
+        brief.append({
+            "family": row.get("family"),
+            "tried": row.get("changed") or {},
+            "reason": row.get("reason"),
+            "proposed_by": row.get("source"),
+            "verdict": ("passed" if outcome.get("passed") else
+                        "underpowered" if outcome.get("underpowered") else
+                        "failed"),
+            "heldout_delta": outcome.get("heldout_delta"),
+            "failed_checks": list(outcome.get("failed_checks") or [])[:4],
+        })
+        # Trim from the oldest end rather than failing the request: a brief
+        # that outgrew its bound should lose history, not become no history.
+        while brief and len(json.dumps(brief, default=str).encode(
+                "utf-8")) > LESSON_BRIEF_BYTES:
+            brief.pop(0)
+    return brief
+
+
+def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
+                  family: str | None = None,
+                  limit: int = LESSON_BRIEF_LIMIT) -> list[dict]:
+    """The graded reason history a proposal is allowed to learn from."""
+    try:
+        rows = factory.lessons(vehicle=vehicle, family=family,
+                               graded_only=True, limit=int(limit))
+    except (sqlite3.Error, ValueError, KeyError):
+        # The brief is an enrichment.  A ledger written before lessons existed
+        # must degrade to "no history", never to a failed research cycle.
+        return []
+    return _trim_lessons(rows)
 
 
 def _seed_slot(previous: Mapping[str, Any], *, generation: int,
@@ -171,6 +234,77 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
     return seeded, proposal, "deterministic_discovery"
 
 
+def _adapter(config: Mapping[str, Any],
+             adapter: RuleProposalAdapter | None) -> RuleProposalAdapter:
+    return adapter or RuleProposalAdapter(
+        provider=str(config.get("provider") or "openai"),
+        model=str(config.get("model") or ""),
+        max_attempts=int(config.get("max_attempts", 1)),
+        timeout_seconds=float(config.get("timeout_seconds", 30)),
+        max_response_bytes=int(config.get("max_response_bytes", 16_384)),
+    )
+
+
+def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any],
+                    *, count: int, vehicle: str, llm_enabled: bool,
+                    config: Mapping[str, Any],
+                    adapter: RuleProposalAdapter | None,
+                    lessons: Sequence[Mapping[str, Any]] = ()
+                    ) -> tuple[list[tuple[dict, str, str]], ProposalResult | None]:
+    """Choose this hypothesis's variants, each with the reason it was chosen.
+
+    The root is always variant zero and is never replaced: its matched control
+    is itself, so it cannot pass, and it is the null calibration the rest of
+    the hypothesis is measured against.
+
+    With the LLM lane off this is exactly the previous deterministic mutation,
+    unchanged spec-for-spec.  With it on, the model may propose the remaining
+    variants from the diagnosis *and the graded outcomes of earlier reasons*,
+    and anything it does not supply — or supplies as a duplicate — is topped up
+    from the same deterministic table.  A tuned variant is not trusted more
+    than a mutated one: both are content-addressed and both face every gate.
+    """
+    root = validate_rule_spec(hypothesis["rule_spec"])
+    if not llm_enabled:
+        return ([(spec, reason, "deterministic")
+                 for spec, reason in mutate_with_reasons(root, diagnostic, count)],
+                None)
+    # A wider deterministic pool than ``count`` so that topping up still has
+    # unused candidates left after the model's proposals claim some ids.
+    pool = mutate_with_reasons(root, diagnostic, MAX_VARIANTS)
+    selected = _adapter(config, adapter)
+    tune = getattr(selected, "tune", None)
+    proposal: ProposalResult | None = None
+    try:
+        # An injected seam without ``tune``, or one that raises, means no
+        # proposal — never a failed cycle.
+        proposal = (tune(vehicle=vehicle, slot=int(hypothesis["slot"]),
+                         rule_spec=root, diagnosis=dict(diagnostic),
+                         count=max(1, int(count) - 1), lessons=list(lessons))
+                    if callable(tune) else None)
+    except Exception as exc:  # noqa: BLE001 - degraded, never fatal
+        proposal = ProposalResult(False, schema=TUNING_SCHEMA,
+                                  error=f"{type(exc).__name__}: {exc}")
+    chosen: list[tuple[dict, str, str]] = [(root, pool[0][1], "deterministic")]
+    seen = {rule_variant_id(root)}
+    if proposal is not None and proposal.success:
+        for entry in proposal.variants:
+            if len(chosen) >= int(count):
+                break
+            if entry["variant_id"] in seen:
+                continue
+            seen.add(entry["variant_id"])
+            chosen.append((entry["rule_spec"], entry["reason"], "llm"))
+    for spec, reason in pool[1:]:
+        if len(chosen) >= int(count):
+            break
+        if rule_variant_id(spec) in seen:
+            continue
+        seen.add(rule_variant_id(spec))
+        chosen.append((spec, reason, "deterministic"))
+    return chosen, proposal
+
+
 def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any], *,
                      config: Mapping[str, Any], max_generations: int,
                      not_before: str | None,
@@ -226,6 +360,37 @@ def _llm_lineage_evidence(factory: FactoryLedger,
     return None
 
 
+def _seed_reason(source: str, seed: Any, proposal: ProposalResult | None) -> str:
+    """The recorded rationale for putting this hypothesis in this slot."""
+    if source == "llm_discovery" and proposal is not None and proposal.thesis:
+        return str(proposal.thesis)
+    if source == "template":
+        return (f"Genesis template for slot {int(seed.slot)}: the "
+                f"{str(seed.family).replace('_', ' ')} family at its own defaults.")
+    return (f"Deterministic discovery: {str(seed.family).replace('_', ' ')} is "
+            "the next structure this slot has not tried.")
+
+
+def _record_seed_lesson(factory: FactoryLedger, seed: Any, *, vehicle: str,
+                        kind: str, source: str, proposal: ProposalResult | None,
+                        diagnostic: Mapping[str, Any] | None = None) -> None:
+    """Record why a slot was given this hypothesis, before it is evaluated."""
+    try:
+        factory.record_lesson(
+            seed.hypothesis_id, vehicle=vehicle, family=seed.family,
+            variant_id=rule_variant_id(seed.rule_spec), kind=kind,
+            source="llm" if source.startswith("llm") else "deterministic",
+            reason=_seed_reason(source, seed, proposal),
+            changed={"family": seed.family,
+                     "rule_schema": seed.rule_spec["schema"]},
+            diagnosis=dict(diagnostic or {}),
+            evidence=dict(proposal.evidence) if proposal is not None else {})
+    except (FactoryError, KeyError, sqlite3.Error):
+        # A lesson is an annotation on work that already happened.  Failing to
+        # write one must never cost the research cycle its actual result.
+        pass
+
+
 def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                   strategies: int, existing_variant_ids: set[str],
                   llm_enabled: bool, llm_config: Mapping[str, Any],
@@ -245,6 +410,13 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
     active_slots = {int(item["slot"]) for item in factory.active(vehicle)}
     seeded_slots: list[dict] = []
     revived: list[dict] = []
+    # Slots are seeded sequentially, so each proposal can be told what the
+    # earlier ones in this same cycle already took.  Without it every slot of a
+    # fresh ledger gets an identical brief.
+    cycle_seeds: list[dict] = [
+        {"slot": int(item["slot"]), "family": str(item["family"])}
+        for item in factory.active(vehicle)]
+    lessons = _lesson_brief(factory, vehicle=vehicle)
     for slot in range(int(strategies)):
         if slot in active_slots:
             continue
@@ -270,7 +442,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                             "family": seed.family},
                         tried_families={
                             str(item["family"]) for item in latest.values()},
-                        proved_families=_proved_families(edge, vehicle)),
+                        proved_families=_proved_families(edge, vehicle),
+                        seeded_this_cycle=cycle_seeds, lessons=lessons),
                     llm_enabled=True, config=llm_config, adapter=adapter)
                 if (proposed is not None and
                         proposed_source == "llm_discovery"):
@@ -284,7 +457,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                 continue
         else:
             tried = factory.slot_families(vehicle, slot)
-            seed, _proposal, source = _seed_slot(
+            seed, genesis_proposal, source = _seed_slot(
                 previous, generation=factory.next_generation(vehicle, slot),
                 not_before=previous.get("not_before"),
                 existing_variant_ids=existing_variant_ids,
@@ -292,12 +465,16 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                 context=_discovery_context(
                     slot=slot, reason="slot_had_no_active_hypothesis",
                     previous=previous, tried_families=tried,
-                    proved_families=_proved_families(edge, vehicle)),
+                    proved_families=_proved_families(edge, vehicle),
+                    seeded_this_cycle=cycle_seeds, lessons=lessons),
                 llm_enabled=llm_enabled, config=llm_config, adapter=adapter)
             if seed is None:
                 continue
         factory.register(seed)
         existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+        cycle_seeds.append({"slot": int(seed.slot), "family": str(seed.family)})
+        _record_seed_lesson(factory, seed, vehicle=vehicle, kind="discovery",
+                            source=source, proposal=genesis_proposal)
         if previous is None:
             # A genesis slot has no ancestor to carry its provenance, so the
             # seeding decision is recorded on the hypothesis itself. Without
@@ -340,6 +517,35 @@ def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
                         until=corpus["until"], exclude=corpus["exclude"])
 
 
+def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
+    """Diagnose a hypothesis's root on its fit partition only.
+
+    Split out of :func:`_worker` so the orchestrator holds a diagnosis *before*
+    variants are chosen.  That ordering is what lets the parameter proposal be
+    made centrally — every provider call stays in the parent process, so no
+    adapter ever has to cross a process boundary — while the expensive replay
+    stays parallel.  The fit cut is computed exactly as it was inside the
+    worker, so the diagnosis is the same one the previous single pass produced.
+    """
+    hypothesis = dict(payload["hypothesis"])
+    bars, snapshots, quotes = _task_corpus(payload)
+    vehicle = str(payload["vehicle"])
+    starting_cash = float(payload["starting_cash"])
+    sessions = sorted({_session(bar) for bar in bars})
+    cut = max(1, min(len(sessions) - 1, int(len(sessions) * .7))) if len(sessions) > 1 else len(sessions)
+    fit_sessions = set(sessions[:cut])
+    fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
+    root_account = simulate_account(
+        fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
+        account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
+        starting_cash=starting_cash, costs=payload["costs"], quotes=quotes,
+    )
+    return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
+            "diagnostic": diagnose(root_account["rows"],
+                                   starting_cash=starting_cash),
+            "worker_pid": os.getpid()}
+
+
 def _worker(payload: Mapping[str, Any]) -> dict:
     hypothesis = dict(payload["hypothesis"])
     bars, snapshots, quotes = _task_corpus(payload)
@@ -347,22 +553,11 @@ def _worker(payload: Mapping[str, Any]) -> dict:
     mode = str(payload["mode"])
     starting_cash = float(payload["starting_cash"])
     costs = payload["costs"]
-    if mode == "backtest":
-        sessions = sorted({_session(bar) for bar in bars})
-        cut = max(1, min(len(sessions) - 1, int(len(sessions) * .7))) if len(sessions) > 1 else len(sessions)
-        fit_sessions = set(sessions[:cut])
-        fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
-        root_account = simulate_account(
-            fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
-            account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
-            starting_cash=starting_cash, costs=costs, quotes=quotes,
-        )
-        diagnostic = diagnose(root_account["rows"], starting_cash=starting_cash)
-        specs = mutate_from_diagnosis(
-            hypothesis["rule_spec"], diagnostic, int(payload["variants_per_strategy"]))
-    else:
-        diagnostic = {"primary_failure": "forward_validation"}
-        specs = [validate_rule_spec(item) for item in payload["existing_specs"]]
+    diagnostic = dict(payload["diagnostic"])
+    # The orchestrator decided which specs to evaluate — deterministically
+    # mutated, model-tuned, or carried forward for forward validation — so the
+    # worker only replays them.
+    specs = [validate_rule_spec(item) for item in payload["specs"]]
     control_account = simulate_account(
         bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
         account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
@@ -656,7 +851,24 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     max_workers = min(int(workers), len(tasks))
     worker_results = []
     worker_failures = []
+    tuning_proposals: list[dict] = []
+    # variant_id -> (reason, source), per hypothesis: what the orchestrator
+    # decided and why, ready to be graded once the gates are known.
+    proposals: dict[str, dict[str, tuple[str, str]]] = {}
     backend = "process"
+
+    def _requeue(task: Mapping[str, Any], exc: BaseException, stage: str) -> None:
+        hypothesis = task["hypothesis"]
+        resume_status = ("backtest_passed" if task["mode"] == "shadow" else "queued")
+        factory.event(
+            hypothesis["hypothesis_id"], resume_status,
+            f"{stage} failed; hypothesis requeued without a failure conclusion",
+            {"error_type": type(exc).__name__, "error": str(exc)[:500],
+             "stage": stage})
+        worker_failures.append({"hypothesis_id": hypothesis["hypothesis_id"],
+                                "error_type": type(exc).__name__,
+                                "stage": stage})
+
     try:
         pool = ProcessPoolExecutor(max_workers=max_workers)
     except (OSError, PermissionError):
@@ -665,21 +877,102 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         pool = ThreadPoolExecutor(max_workers=max_workers)
         backend = "thread_fallback"
     with pool:
-        futures = {pool.submit(_worker, task): task for task in tasks}
+        # Phase one: diagnose each backtest hypothesis's root on fit data only.
+        # Forward validation carries its variants forward and has nothing to
+        # diagnose, so it skips straight to evaluation.
+        diagnostics: dict[str, dict] = {}
+        pending_diagnosis = [task for task in tasks if task["mode"] == "backtest"]
+        failed_hypotheses: set[str] = set()
+        if pending_diagnosis:
+            futures = {pool.submit(_diagnose_worker, task): task
+                       for task in pending_diagnosis}
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    _requeue(task, exc, "diagnosis")
+                    failed_hypotheses.add(str(task["hypothesis"]["hypothesis_id"]))
+                    continue
+                diagnostics[str(result["hypothesis_id"])] = dict(
+                    result["diagnostic"])
+
+        # Between the phases, and only in this process, the variants are
+        # chosen.  Every provider call the factory makes lives here, so no
+        # adapter is ever pickled into a worker.
+        scheduled = []
+        for task in tasks:
+            hypothesis = task["hypothesis"]
+            hypothesis_id = str(hypothesis["hypothesis_id"])
+            if hypothesis_id in failed_hypotheses:
+                continue
+            if task["mode"] == "shadow":
+                chosen = [(spec, "Carried forward unchanged for forward "
+                                 "validation; a proved variant is never re-tuned.",
+                           "carried_forward")
+                          for spec in task["existing_specs"]]
+                task["diagnostic"] = {"primary_failure": "forward_validation"}
+            else:
+                diagnostic = diagnostics.get(hypothesis_id)
+                if diagnostic is None:
+                    continue
+                task["diagnostic"] = diagnostic
+                chosen, tuning = _tuned_variants(
+                    hypothesis, diagnostic,
+                    count=int(variants_per_strategy), vehicle=vehicle,
+                    llm_enabled=llm_enabled, config=llm_config,
+                    adapter=proposal_adapter,
+                    lessons=_lesson_brief(factory, vehicle=vehicle,
+                                          family=str(hypothesis["family"])))
+                if tuning is not None:
+                    entry = {"hypothesis_id": hypothesis_id,
+                             "slot": int(hypothesis["slot"]),
+                             "family": str(hypothesis["family"]),
+                             "schema": tuning.schema,
+                             "success": bool(tuning.success),
+                             "evidence": dict(tuning.evidence),
+                             "tuned_variants": sum(
+                                 1 for _s, _r, origin in chosen if origin == "llm")}
+                    if not tuning.success:
+                        entry["error"] = tuning.error
+                    tuning_proposals.append(entry)
+                    factory.event(
+                        hypothesis_id, "testing",
+                        ("model-tuned variants accepted for this hypothesis"
+                         if entry["tuned_variants"] else
+                         "no model-tuned variant was usable; deterministic "
+                         "mutation supplied every variant"),
+                        {key: value for key, value in entry.items()
+                         if key not in {"hypothesis_id", "slot", "family"}})
+            task["specs"] = [spec for spec, _reason, _origin in chosen]
+            slot_proposals = proposals.setdefault(hypothesis_id, {})
+            for spec, reason, origin in chosen:
+                variant_id = rule_variant_id(spec)
+                slot_proposals[variant_id] = (reason, origin)
+                if origin == "carried_forward":
+                    continue
+                try:
+                    factory.record_lesson(
+                        hypothesis_id, vehicle=vehicle,
+                        family=str(hypothesis["family"]), variant_id=variant_id,
+                        kind="tuning",
+                        source="llm" if origin == "llm" else "deterministic",
+                        reason=reason,
+                        changed=spec_delta(hypothesis["rule_spec"], spec),
+                        diagnosis=task["diagnostic"])
+                except (FactoryError, KeyError, sqlite3.Error):
+                    # Losing an annotation must not lose the evaluation.
+                    pass
+            scheduled.append(task)
+
+        # Phase two: replay every chosen variant in its own isolated account.
+        futures = {pool.submit(_worker, task): task for task in scheduled}
         for future in as_completed(futures):
             task = futures[future]
             try:
                 worker_results.append(future.result())
             except Exception as exc:
-                hypothesis = task["hypothesis"]
-                resume_status = ("backtest_passed" if task["mode"] == "shadow" else "queued")
-                factory.event(
-                    hypothesis["hypothesis_id"], resume_status,
-                    "worker failed; hypothesis requeued without a failure conclusion",
-                    {"error_type": type(exc).__name__, "error": str(exc)[:500]},
-                )
-                worker_failures.append({"hypothesis_id": hypothesis["hypothesis_id"],
-                                        "error_type": type(exc).__name__})
+                _requeue(task, exc, "worker")
     worker_results.sort(key=lambda item: (int(item["hypothesis"]["slot"]),
                                           str(item["hypothesis"]["hypothesis_id"])))
     for worker in worker_results:
@@ -774,7 +1067,32 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                              "max_drawdown": gate["max_drawdown"]})
             gate["verified_gate"] = envelope
             gate["gate_hash"] = envelope["content_hash"]
+            gate["failed_checks"] = sorted(
+                name for name, ok in checks.items() if ok is False)
             partitions[variant["account"]["account_id"]] = (fit, heldout)
+
+    def _lesson_outcome(gate: Mapping[str, Any]) -> dict:
+        """Grade one reason against the gate its variant actually earned."""
+        statistics = gate.get("global_multiple_tests")
+        return {
+            "passed": bool(gate.get("passes")),
+            "underpowered": not (gate.get("sample_adequate") and
+                                 gate.get("heldout_sample_adequate")),
+            "heldout_delta": (gate.get("test") or {}).get("mean_delta"),
+            "heldout_net_pnl": gate.get("heldout_net_pnl"),
+            "q_value": (statistics.get("p_adjusted")
+                        if isinstance(statistics, Mapping) else None),
+            "failed_checks": list(gate.get("failed_checks") or []),
+            "gate_hash": gate.get("gate_hash"),
+        }
+
+    def _grade(hypothesis_id: str, variant_id: str, kind: str,
+               gate: Mapping[str, Any]) -> None:
+        try:
+            factory.grade_lesson(hypothesis_id, variant_id, kind=kind,
+                                 outcome=_lesson_outcome(gate))
+        except (FactoryError, KeyError, sqlite3.Error):
+            pass
 
     cycle_id = uuid.uuid4().hex
     summaries = []
@@ -795,10 +1113,17 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             len(adequate) == len(local))
         passing = [item for item in local if item[1]["passes"]]
         for variant, gate in local:
+            reason, origin = proposals.get(
+                str(hypothesis["hypothesis_id"]), {}).get(
+                    variant["variant_id"], (None, None))
             result = {**variant, "evaluation_start": worker["evaluation_start"],
                       "evaluation_end": worker["evaluation_end"], "mode": worker["mode"],
-                      "gate": gate}
+                      "gate": gate, "reason": reason, "proposed_by": origin}
             factory.add_account(cycle_id, hypothesis["hypothesis_id"], result)
+            # The reason was fixed before this gate existed; now it is graded
+            # against it.  That pairing is what later prompts read back.
+            _grade(str(hypothesis["hypothesis_id"]), variant["variant_id"],
+                   "tuning", gate)
             config = {"strategy": {"id": "rule", "version": "v1",
                                      "variant_id": variant["variant_id"],
                                      "rule_spec": variant["rule_spec"]}}
@@ -870,6 +1195,16 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 "status": (edge.candidate(candidate["candidate_id"]) or {}).get("status"),
                 "run_id": run.get("run_id") if run else None,
             })
+        # A hypothesis-level reason — why this slot was given this idea at all
+        # — is answered by the best variant the idea produced, never by the
+        # root, whose own control is itself and which therefore cannot pass.
+        if local:
+            best = max(local, key=lambda item: (
+                bool(item[1]["passes"]),
+                float(item[1].get("heldout_delta_lcb") or float("-inf"))))[1]
+            for kind in HYPOTHESIS_LESSON_KINDS:
+                _grade(str(hypothesis["hypothesis_id"]),
+                       rule_variant_id(hypothesis["rule_spec"]), kind, best)
         if passing:
             new_state = "validated" if worker["mode"] == "shadow" else "backtest_passed"
             factory.event(hypothesis["hypothesis_id"], new_state,
@@ -909,6 +1244,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 else:
                     factory.register(seed)
                     existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+                    _record_seed_lesson(factory, seed, vehicle=vehicle,
+                                        kind="reseed", source=source,
+                                        proposal=proposal)
                     reseed_payload.update({
                         "successor_hypothesis_id": seed.hypothesis_id,
                         "successor_variant_id": rule_variant_id(seed.rule_spec),
@@ -954,6 +1292,26 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             if replacement is not None:
                 factory.register(replacement)
                 existing_variant_ids.add(rule_variant_id(replacement.rule_spec))
+                try:
+                    factory.record_lesson(
+                        replacement.hypothesis_id, vehicle=vehicle,
+                        family=replacement.family,
+                        variant_id=rule_variant_id(replacement.rule_spec),
+                        kind="replacement",
+                        source="llm" if proposal is not None else "deterministic",
+                        reason=(
+                            f"Replacement after every intended variant of "
+                            f"{str(hypothesis['family']).replace('_', ' ')} "
+                            f"failed with "
+                            f"{aggregate.get('primary_failure') or 'no edge'}; "
+                            f"moved to "
+                            f"{str(replacement.family).replace('_', ' ')}."),
+                        changed={"from_family": hypothesis["family"],
+                                 "to_family": replacement.family},
+                        diagnosis=aggregate,
+                        evidence=dict(proposal.evidence) if proposal else {})
+                except (FactoryError, KeyError, sqlite3.Error):
+                    pass
                 retirement_payload = {
                     "diagnostic": aggregate, "tested_variants": len(local),
                     "replacement_hypothesis_id": replacement.hypothesis_id,
@@ -1026,6 +1384,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 else:
                     factory.register(seed)
                     existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+                    _record_seed_lesson(factory, seed, vehicle=vehicle,
+                                        kind="rotation", source=rotation_source,
+                                        proposal=rotation_proposal,
+                                        diagnostic=aggregate)
                     rotation_payload = {
                         "diagnostic": aggregate, "tested_variants": len(local),
                         "rotation": True, "rotation_index": rotations_used,
@@ -1083,6 +1445,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         "strategy_llm": {"enabled": llm_enabled,
                          "provider": llm_config.get("provider") if llm_enabled else None,
                          "model": llm_config.get("model") if llm_enabled else None},
+        # What the model was asked to tune, and how much of it survived
+        # validation and de-duplication into an actual isolated account.
+        "tuning": tuning_proposals,
         "champion": ({key: champion.get(key) for key in
                       ("candidate_id", "variant_id", "strategy_id", "vehicle", "status")}
                      if champion else None),

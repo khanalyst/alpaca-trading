@@ -223,7 +223,7 @@ with the task.
 
 ### What the LLM does, and what it cannot do
 
-`research.llm_strategy` serves two distinct requests, both bounded by the same
+`research.llm_strategy` serves three distinct requests, all bounded by the same
 output contract:
 
 - `llm-rule-proposal.v1` — **repair.** Asked for a replacement `rule_spec` only
@@ -231,21 +231,59 @@ output contract:
 - `llm-edge-discovery.v1` — **discovery.** Asked for a genuinely new hypothesis
   whenever a slot needs one: at genesis on a fresh ledger, when a slot proves
   an edge and is reseeded, when a generation budget runs out, and when an idle
-  slot is revived. The request carries a small aggregate brief — the
-  families this slot has tried, the families already carrying a deployed edge,
-  and the last diagnosis — and the reply must include a one-sentence `thesis`
-  of at most 240 characters, which is recorded as evidence and displayed but
-  never interpreted as an instruction.
+  slot is revived. The request carries a small aggregate brief — the families
+  this slot has tried, the families already carrying a deployed edge, the last
+  diagnosis, the slots already seeded earlier *in this same cycle*, and the
+  graded history of earlier reasons — and the reply must include a
+  one-sentence `thesis` of at most 240 characters, which is recorded as
+  evidence and displayed but never interpreted as an instruction.
+- `llm-variant-tuning.v1` — **tuning.** Asked for the parameter variants of one
+  hypothesis, given its root spec, the fit-partition diagnosis, and the graded
+  lessons. Each returned variant must carry a `reason` of at most 240
+  characters naming the parameter it changed and the diagnosed problem it
+  should fix. A tuned spec must keep its root's `family`: tuning changes the
+  numbers of an idea, never which idea it is.
 
-Both replies are strict JSON, size-capped, fence-rejecting, and validated
+All three replies are strict JSON, size-capped, fence-rejecting, and validated
 against the rule grammar before anything is stored; keys that look like source,
 credentials, or market rows are refused outright. A discovered hypothesis is
 registered `queued` with no run, no gate, and no candidate — it must earn
 `backtest_passed` and then a strictly later forward shadow pass through exactly
-the same gates as a deterministic one. **The LLM chooses what to try next; it
-can never shorten the evidence path or authorize trading.** Every seeding path
-falls back to a deterministic ladder, so the factory keeps discovering with no
-provider configured at all.
+the same gates as a deterministic one. A tuned variant gets its own isolated
+simulated account and faces every gate a mutated variant faces. **The LLM
+chooses what to try next; it can never shorten the evidence path or authorize
+trading.** Every seeding and tuning path falls back to the deterministic
+ladder and mutation table, so the factory keeps discovering with no provider
+configured at all.
+
+### Why something was tried, and how that turned out
+
+Parameter search used to be a fixed table: three hand-written responses per
+diagnosed failure mode, with an arithmetic sweep filling anything past that.
+It worked, but nothing it learned in one cycle reached the next one.
+
+Every proposal now records a **reason** before the gate that will judge it
+exists, and that reason is **graded** against the gate afterwards. The pair
+lives in two append-only tables — `factory_lessons` for the reason,
+`factory_lesson_outcomes` for the verdict — because the two facts are known at
+different times, and writing the reason first is what makes it a prediction
+rather than a summary. Deterministic mutations record reasons in the same
+shape, including an explicit "no diagnosis behind it" marker on the sweep fill,
+so a tuned reason can be compared against the fixed table rather than only
+against other tuned reasons.
+
+The graded pairs are read back into the next tuning and discovery request,
+oldest-first-trimmed to stay inside the prompt's aggregate bound. That is the
+whole loop: propose with a reason, evaluate under unchanged gates, grade the
+reason, and hand the grade forward.
+
+```bash
+python research.py factory report --format markdown   # includes the graded reasons
+```
+
+The unmutated root is always variant zero and is never proposed away. Its
+matched control is itself, so it cannot pass; it is the null calibration the
+hypothesis's real variants are measured against.
 
 The checked config enables these adapters with OpenAI `gpt-5`. They are
 optional and read provider keys only from `ALPACA_RESEARCH_LLM_SECRETS_FILE`,
@@ -263,8 +301,13 @@ permits bypassing the runtime edge gate.
 ```bash
 python research.py factory run --data market.jsonl --strategies 7 --variants 4 --workers 7
 python research.py factory status
-python research.py factory report [--slot N] [--format text|markdown|json]
+python research.py factory report [--slot N] [--format text|markdown|json] [--write]
 ```
+
+`factory run` archives the Markdown narrative under `research/results/factory/`
+on every cycle, including a cycle that proved nothing, so the read-only
+dashboard lists it without anyone running a command. `--write` does the same
+on demand; `ALPACA_RESEARCH_REPORT_DIR` overrides the destination.
 
 `research.factory_report` is the reader for everything the two ledgers already
 record but nothing previously opened: per slot, the lineage of hypotheses it

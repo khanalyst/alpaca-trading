@@ -480,9 +480,61 @@ def _safe_variant(spec: Mapping[str, Any], **changes) -> dict:
     return validate_rule_spec(candidate)
 
 
+def spec_delta(root: Mapping[str, Any], spec: Mapping[str, Any]) -> dict[str, Any]:
+    """The fields a variant changed relative to its root, and to what."""
+    delta: dict[str, Any] = {}
+    for key in sorted(set(root) | set(spec)):
+        before, after = root.get(key), spec.get(key)
+        if before != after:
+            delta[key] = {"from": before, "to": after}
+    return delta
+
+
+def _change_phrase(delta: Mapping[str, Any]) -> str:
+    if not delta:
+        return "no parameter changed"
+    return "; ".join(
+        f"{key} {value['from']}→{value['to']}" for key, value in delta.items())
+
+
+def mutation_reason(root: Mapping[str, Any], spec: Mapping[str, Any],
+                    diagnostic: Mapping[str, Any], *, swept: bool = False) -> str:
+    """State why a deterministic mutation was made, in the same shape as an
+    LLM-authored reason.
+
+    Recording this for the deterministic path too is what makes the lesson
+    ledger comparable: the feedback loop can then show that a tuned reason
+    outperformed (or failed to outperform) the fixed mutation table, instead of
+    only ever grading the model against itself.
+    """
+    delta = spec_delta(root, spec)
+    if not delta:
+        return ("Unmutated root, kept as the null calibration its own variants "
+                "are measured against.")
+    failure = str(diagnostic.get("primary_failure") or "none")
+    if swept:
+        return (f"Deterministic sweep fill with no diagnosis behind it: "
+                f"{_change_phrase(delta)}.")[:_REASON_LIMIT]
+    return (f"Deterministic response to {failure}: "
+            f"{_change_phrase(delta)}.")[:_REASON_LIMIT]
+
+
+# Mirrors ``research.llm_strategy.MAX_REASON_CHARS`` without importing the
+# optional adapter module into the deterministic core; ``test_llm_tuning``
+# pins the two together.
+_REASON_LIMIT = 240
+
+
 def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any],
                           count: int = DEFAULT_VARIANTS) -> list[dict]:
     """Create bounded variants from an explicit failure diagnosis."""
+    return [item[0] for item in mutate_with_reasons(spec, diagnostic, count)]
+
+
+def mutate_with_reasons(spec: Mapping[str, Any], diagnostic: Mapping[str, Any],
+                        count: int = DEFAULT_VARIANTS
+                        ) -> list[tuple[dict, str]]:
+    """Bounded variants from an explicit failure diagnosis, each with its reason."""
     if not 2 <= int(count) <= MAX_VARIANTS:
         raise FactoryError(f"variants must be between 2 and {MAX_VARIANTS}")
     root = validate_rule_spec(spec)
@@ -531,7 +583,9 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
              "slow_lookback": min(240, max(root["slow_lookback"] + 8,
                                              root["lookback"] + 6))},
         ]
-    variants = [root]
+    variants: list[tuple[dict, str]] = [
+        (root, mutation_reason(root, root, diagnostic))]
+    seen = {rule_variant_id(root)}
     for change in changes:
         if len(variants) >= int(count):
             break
@@ -539,8 +593,9 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
             candidate = _safe_variant(root, **change)
         except ValueError:
             continue
-        if rule_variant_id(candidate) not in {rule_variant_id(item) for item in variants}:
-            variants.append(candidate)
+        if rule_variant_id(candidate) not in seen:
+            seen.add(rule_variant_id(candidate))
+            variants.append((candidate, mutation_reason(root, candidate, diagnostic)))
     attempt = 0
     while len(variants) < int(count) and attempt < 64:
         attempt += 1
@@ -553,9 +608,11 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
             threshold_bps=(float(root["threshold_bps"]) + attempt * 7.0) % 500.0,
             target_r=.25 + ((float(root["target_r"]) - .25 + attempt * .25) % 9.75),
         )
-        if rule_variant_id(candidate) not in {
-                rule_variant_id(item) for item in variants}:
-            variants.append(candidate)
+        if rule_variant_id(candidate) not in seen:
+            seen.add(rule_variant_id(candidate))
+            variants.append((candidate,
+                             mutation_reason(root, candidate, diagnostic,
+                                             swept=True)))
     if len(variants) != int(count):
         raise FactoryError("could not form the requested number of unique variants")
     return variants

@@ -26,6 +26,10 @@ from .edge_ledger_store import DEFAULT_DB_PATH, VEHICLES
 
 REPORT_SCHEMA = "factory-report.v1"
 
+# Origins where the model actually authored the hypothesis.  Everything else
+# is deterministic, even when a provider was asked first and refused.
+_LLM_ORIGINS = frozenset(("llm_discovery", "llm_replacement"))
+
 # Ordered so the narrative reads as a lifecycle rather than an alphabet.
 _CHECK_LABELS = {
     "fit_structurally_adequate": "fit sample big enough",
@@ -124,6 +128,11 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         "win_rate": _number(diagnosis.get("win_rate")),
         "profit_factor": _number(diagnosis.get("profit_factor")),
         "gate_hash": gate.get("gate_hash"),
+        # Why this variant was tried, and who decided to try it.  Fixed before
+        # the gate beside it was computed, so the pair reads as a prediction
+        # and its result rather than as a summary written afterwards.
+        "reason": record.get("reason"),
+        "proposed_by": record.get("proposed_by"),
     }
 
 
@@ -276,6 +285,37 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         cycles = int(db.execute(
             "SELECT COUNT(*) FROM factory_cycles").fetchone()[0]) \
             if "factory_cycles" in tables else 0
+        # The graded reason history: what was tried, why, and what the gates
+        # then said.  Read here so the narrative can show the learning loop
+        # rather than only the current state.
+        lessons: dict[str, list[dict]] = {}
+        if {"factory_lessons", "factory_lesson_outcomes"}.issubset(tables):
+            for row in db.execute(
+                    """SELECT l.vehicle, l.family, l.kind, l.source, l.reason,
+                              l.changed_json, l.variant_id, l.created_at,
+                              o.passed, o.underpowered, o.heldout_delta,
+                              o.q_value, o.failed_checks_json, o.outcome_id
+                       FROM factory_lessons l
+                       LEFT JOIN factory_lesson_outcomes o
+                         ON o.lesson_id=l.lesson_id
+                       ORDER BY l.created_at DESC, l.lesson_id DESC"""):
+                graded = row["outcome_id"] is not None
+                lessons.setdefault(str(row["vehicle"]), []).append({
+                    "family": row["family"], "kind": row["kind"],
+                    "proposed_by": row["source"], "reason": row["reason"],
+                    "variant_id": row["variant_id"],
+                    "changed": _loads(row["changed_json"]) or {},
+                    "graded": graded,
+                    "verdict": (None if not graded else
+                                "passed" if row["passed"] else
+                                "underpowered" if row["underpowered"] else
+                                "failed"),
+                    "heldout_delta": _number(row["heldout_delta"]),
+                    "q_value": _number(row["q_value"]),
+                    "failed_checks": [
+                        _CHECK_LABELS.get(name, name) for name in
+                        (_loads(row["failed_checks_json"]) or [])],
+                })
 
     report_vehicles = []
     for name in VEHICLES:
@@ -320,6 +360,12 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         proved = [row for rows in slots.values() for item in rows
                   for row in item["variants"]
                   if row["ledger_status"] in {"validated", "champion"}]
+        local_lessons = [item for item in lessons.get(name, [])
+                         if slot is None or any(
+                             item["variant_id"] == row["variant_id"]
+                             for rows in slots.values() for entry in rows
+                             for row in entry["variants"])]
+        graded = [item for item in local_lessons if item["graded"]]
         report_vehicles.append({
             "vehicle": name,
             "summary": {
@@ -335,15 +381,47 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "retired_hypotheses": sum(
                     1 for rows in slots.values() for item in rows
                     if item["outcome"]["kind"] in {"retired", "rotated"}),
+                # Authored by the model, not merely asked of it.  A rejected
+                # proposal still records provider evidence, so counting the
+                # presence of that evidence reported a deterministic template
+                # as an LLM-seeded hypothesis.
                 "llm_seeded_hypotheses": sum(
                     1 for rows in slots.values() for item in rows
-                    if item["origin"].get("llm")),
+                    if item["origin"]["kind"] in _LLM_ORIGINS),
+                "llm_proposals_rejected": sum(
+                    1 for rows in slots.values() for item in rows
+                    if item["origin"].get("llm_error")),
+                "reasons_recorded": len(local_lessons),
+                "reasons_graded": len(graded),
+                "llm_reasons_that_passed": sum(
+                    1 for item in graded
+                    if item["proposed_by"] == "llm" and item["verdict"] == "passed"),
+                "llm_tuned_variants": sum(
+                    1 for item in local_lessons
+                    if item["proposed_by"] == "llm" and item["kind"] == "tuning"),
             },
+            "lessons": local_lessons,
             "slots": [{"slot": key, "generations": slots[key]}
                       for key in sorted(slots)],
         })
     return {"schema": REPORT_SCHEMA, "available": True, "db_path": str(path),
             "cycles": cycles, "vehicles": report_vehicles}
+
+
+# How many graded reasons the rendered narrative shows before it becomes a log
+# rather than a report.  ``build_report`` returns all of them either way.
+_LESSON_ROWS = 25
+
+
+def _changed_phrase(changed: Mapping[str, Any]) -> str:
+    """Render a recorded parameter delta the way the ledger stored it."""
+    parts = []
+    for key, value in sorted(changed.items()):
+        if isinstance(value, Mapping) and {"from", "to"} <= set(value):
+            parts.append(f"{key} {value['from']}→{value['to']}")
+        else:
+            parts.append(f"{key}={value}")
+    return "; ".join(parts)
 
 
 def _fmt(value: Any, digits: int = 4) -> str:
@@ -372,10 +450,29 @@ def render_text(report: Mapping[str, Any]) -> str:
             f" | hypotheses {summary['hypotheses']}"
             f" | variants tested {summary['variants_tested']}")
         add(f"  families explored: {', '.join(summary['families_explored'])}")
-        add(f"  hypotheses proposed by the LLM: {summary['llm_seeded_hypotheses']}")
+        add(f"  hypotheses proposed by the LLM: {summary['llm_seeded_hypotheses']}"
+            f" ({summary['llm_proposals_rejected']} proposal(s) refused)")
         add(f"  hypotheses retired/rotated: {summary['retired_hypotheses']}")
+        add(f"  variants the model tuned: {summary['llm_tuned_variants']}"
+            f" | reasons recorded {summary['reasons_recorded']}"
+            f" ({summary['reasons_graded']} graded)")
         proved = summary["proved_variants"]
         add(f"  PROVED EDGES: {', '.join(proved) if proved else 'none yet'}")
+        if vehicle.get("lessons"):
+            add("")
+            add("  WHAT IT TRIED, WHY, AND WHAT HAPPENED")
+            for item in vehicle["lessons"][:_LESSON_ROWS]:
+                verdict = item["verdict"] or "not yet graded"
+                add(f"    [{verdict}] {item['kind']} by {item['proposed_by']}"
+                    f" ({item['family']})")
+                add(f"      reason: {item['reason']}")
+                if item["changed"]:
+                    add(f"      changed: {_changed_phrase(item['changed'])}")
+                if item["verdict"] is not None:
+                    add(f"      held-out delta {_fmt(item['heldout_delta'])}"
+                        f"  q {_fmt(item['q_value'])}")
+                if item["failed_checks"]:
+                    add("      failed: " + "; ".join(item["failed_checks"][:4]))
         for entry in vehicle["slots"]:
             add("")
             add(f"  {'-' * 74}")
@@ -414,6 +511,9 @@ def render_text(report: Mapping[str, Any]) -> str:
                         f"  lcb {_fmt(variant['heldout_delta_lcb'])}"
                         f"  q {_fmt(variant['q_value'])}"
                         f"  win {_fmt(variant['win_rate'])}")
+                    if variant["reason"]:
+                        add(f"            tried because ({variant['proposed_by']}):"
+                            f" {variant['reason']}")
                     if variant["ledger_status"]:
                         add(f"            ledger status: {variant['ledger_status']}")
                     if variant["primary_failure"] and variant["primary_failure"] != "none":
@@ -455,9 +555,23 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"- Slots: {summary['slots']} ({summary['active_slots']} still searching)",
                 f"- Hypotheses: {summary['hypotheses']}, variants tested: {summary['variants_tested']}",
                 f"- Families explored: {', '.join(summary['families_explored'])}",
-                f"- Proposed by the LLM: {summary['llm_seeded_hypotheses']}",
+                f"- Proposed by the LLM: {summary['llm_seeded_hypotheses']}"
+                f" ({summary['llm_proposals_rejected']} refused)",
                 f"- Retired or rotated: {summary['retired_hypotheses']}",
+                f"- Variants the model tuned: {summary['llm_tuned_variants']}",
+                f"- Reasons recorded: {summary['reasons_recorded']}"
+                f" ({summary['reasons_graded']} graded)",
                 f"- Proved edges: {', '.join(summary['proved_variants']) or 'none yet'}"]
+        if vehicle.get("lessons"):
+            out += ["", "#### What it tried, why, and what happened", "",
+                    "| verdict | kind | by | reason | changed | held-out Δ |",
+                    "| --- | --- | --- | --- | --- | --- |"]
+            for item in vehicle["lessons"][:_LESSON_ROWS]:
+                out.append(
+                    f"| {item['verdict'] or 'ungraded'} | {item['kind']} |"
+                    f" {item['proposed_by']} | {item['reason']} |"
+                    f" {_changed_phrase(item['changed'])} |"
+                    f" {_fmt(item['heldout_delta'])} |")
         for entry in vehicle["slots"]:
             out += ["", f"### Slot {entry['slot']}"]
             for item in entry["generations"]:
@@ -483,4 +597,36 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(out) + "\n"
 
 
-__all__ = ["REPORT_SCHEMA", "build_report", "render_markdown", "render_text"]
+DEFAULT_REPORT_ROOT = Path("research/results/factory")
+
+
+def write_report(db_path: str | Path = DEFAULT_DB_PATH, *,
+                 vehicle: str | None = None,
+                 output_root: str | Path = DEFAULT_REPORT_ROOT) -> Path | None:
+    """Archive the narrative as Markdown, and return where it landed.
+
+    The report was previously reachable only by running a command by hand.  On
+    the documented headless topology nobody ever does, so the discovery
+    narrative — the one artifact that explains what research has been doing —
+    was written and never read.  Writing it under ``research/results`` puts it
+    exactly where the read-only dashboard already lists Markdown reports.
+
+    The path is stable per vehicle so a cycle overwrites its own predecessor
+    rather than accumulating one file per night; the ledger, not this file, is
+    the durable record.
+    """
+    report = build_report(db_path, vehicle=vehicle)
+    if not report.get("available"):
+        return None
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{vehicle or 'all'}.md"
+    # Write-then-rename so the dashboard never serves a half-written report.
+    staging = target.with_suffix(".md.tmp")
+    staging.write_text(render_markdown(report), encoding="utf-8")
+    staging.replace(target)
+    return target
+
+
+__all__ = ["DEFAULT_REPORT_ROOT", "REPORT_SCHEMA", "build_report",
+           "render_markdown", "render_text", "write_report"]

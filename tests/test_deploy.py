@@ -26,6 +26,28 @@ except ModuleNotFoundError as exc:  # dependency-independent local test runs
 import report
 from agent.alpaca_provider import AlpacaProvider, AlpacaSession
 
+# Several tests run the real ``deploy/research-cycle.sh`` with the repository
+# as its working directory, and a real cycle archives its narrative and edge
+# proofs under ``research/results``.  Redirecting both for the whole module
+# keeps generated artifacts out of the working copy no matter which invocation
+# a later test adds; every call site builds its environment from ``os.environ``.
+_ARTIFACTS: tempfile.TemporaryDirectory | None = None
+
+
+def setUpModule() -> None:                                     # noqa: N802
+    global _ARTIFACTS
+    _ARTIFACTS = tempfile.TemporaryDirectory(prefix="alpaca-test-artifacts.")
+    root = Path(_ARTIFACTS.name)
+    os.environ["ALPACA_RESEARCH_REPORT_DIR"] = str(root / "reports")
+    os.environ["ALPACA_RESEARCH_PROOF_DIR"] = str(root / "proofs")
+
+
+def tearDownModule() -> None:                                  # noqa: N802
+    for name in ("ALPACA_RESEARCH_REPORT_DIR", "ALPACA_RESEARCH_PROOF_DIR"):
+        os.environ.pop(name, None)
+    if _ARTIFACTS is not None:
+        _ARTIFACTS.cleanup()
+
 
 class _MarketFake:
     def __init__(self, feed=None):
