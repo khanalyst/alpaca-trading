@@ -626,6 +626,155 @@ class FeedbackLoopTests(unittest.TestCase):
             self.assertEqual(_lesson_brief(factory, vehicle="equity"), [])
 
 
+class SharedLearningTests(unittest.TestCase):
+    """One slot's search should benefit from the other six.
+
+    A per-family brief can only say what happened to one idea. Some of what
+    research learns is not about one idea at all, and sharing that is what
+    stops seven slots rediscovering the same thing seven times.
+    """
+
+    def _graded(self, factory, hypothesis, *, family, changes, passed,
+                kind="tuning", source="llm"):
+        for index, change in enumerate(changes):
+            spec = validate_rule_spec({**hypothesis.rule_spec, **change})
+            variant = rule_variant_id(spec) + f".{family}.{index}"
+            factory.record_lesson(
+                hypothesis.hypothesis_id, vehicle="equity", family=family,
+                variant_id=variant, kind=kind, source=source,
+                reason=f"Attempt {index} on {family}.",
+                changed=spec_delta(hypothesis.rule_spec, spec))
+            factory.grade_lesson(hypothesis.hypothesis_id, variant, kind=kind,
+                                 outcome={"passed": passed,
+                                          "underpowered": False,
+                                          "failed_checks": []})
+
+    def test_it_aggregates_parameter_directions_across_families(self):
+        from research.strategy_factory import shared_learning
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            raised = [{"threshold_bps": 20.0 + index} for index in range(4)]
+            self._graded(factory, hypothesis, family="alpha",
+                         changes=raised, passed=True)
+            self._graded(factory, hypothesis, family="beta",
+                         changes=[{"threshold_bps": 40.0 + index}
+                                  for index in range(3)], passed=False)
+            digest = shared_learning(factory, vehicle="equity")
+
+        self.assertEqual(digest["graded_attempts"], 7)
+        by_parameter = {(item["parameter"], item["direction"]): item
+                        for item in digest["parameters"]}
+        entry = by_parameter[("threshold_bps", "raised")]
+        self.assertEqual(entry["attempts"], 7)
+        self.assertEqual(entry["passed"], 4)
+        families = {item["family"] for item in digest["families"]}
+        self.assertEqual(families, {"alpha", "beta"})
+
+    def test_underpowered_attempts_do_not_manufacture_a_trend(self):
+        from research.strategy_factory import shared_learning
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            for index in range(5):
+                spec = validate_rule_spec(
+                    {**hypothesis.rule_spec, "threshold_bps": 30.0 + index})
+                variant = rule_variant_id(spec)
+                factory.record_lesson(
+                    hypothesis.hypothesis_id, vehicle="equity",
+                    family="alpha", variant_id=variant, kind="tuning",
+                    source="llm", reason="Thin sample.",
+                    changed=spec_delta(hypothesis.rule_spec, spec))
+                factory.grade_lesson(hypothesis.hypothesis_id, variant,
+                                     kind="tuning",
+                                     outcome={"passed": False,
+                                              "underpowered": True})
+            digest = shared_learning(factory, vehicle="equity")
+        self.assertEqual(digest["parameters"], [])
+
+    def test_a_single_attempt_is_not_reported_as_a_pattern(self):
+        from research.strategy_factory import (SHARED_LEARNING_MIN_ATTEMPTS,
+                                               shared_learning)
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            self._graded(factory, hypothesis, family="alpha",
+                         changes=[{"threshold_bps": 42.0}], passed=True)
+            digest = shared_learning(factory, vehicle="equity")
+        self.assertGreater(SHARED_LEARNING_MIN_ATTEMPTS, 1)
+        self.assertEqual(digest["parameters"], [])
+        self.assertEqual(digest["graded_attempts"], 1)
+
+    def test_live_trials_are_counted_apart_from_replays(self):
+        from research.strategy_factory import shared_learning
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            self._graded(factory, hypothesis, family="alpha",
+                         changes=[{"threshold_bps": 20.0}], passed=False,
+                         kind="trial", source="live_paper")
+            digest = shared_learning(factory, vehicle="equity")
+        self.assertEqual(digest["live_trials"], {"run": 1, "failed": 1})
+
+    def test_an_empty_or_missing_ledger_degrades_to_no_digest(self):
+        from research.strategy_factory import shared_learning
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            self.assertEqual(shared_learning(factory, vehicle="equity"),
+                             {"graded_attempts": 0, "parameters": [],
+                              "families": [],
+                              "live_trials": {"run": 0, "failed": 0}})
+            import sqlite3
+
+            with sqlite3.connect(factory.path) as db:
+                db.execute("DROP TABLE factory_lesson_outcomes")
+                db.execute("DROP TABLE factory_lessons")
+            self.assertEqual(
+                shared_learning(factory, vehicle="equity")["graded_attempts"], 0)
+
+    def test_the_digest_reaches_a_tuning_request(self):
+        """Aggregated learning is only useful if a proposal actually sees it."""
+        seen = []
+
+        class Recorder:
+            def tune(inner, *, diagnosis, **_):
+                seen.append(diagnosis)
+                return ProposalResult(False, error="recording only")
+
+        digest = {"graded_attempts": 9,
+                  "parameters": [{"parameter": "target_r", "direction": "lowered",
+                                  "attempts": 5, "passed": 4}],
+                  "families": [], "live_trials": {"run": 0, "failed": 0}}
+        _tuned_variants({"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=3,
+                        vehicle="equity", llm_enabled=True,
+                        config={"model": "test"}, adapter=Recorder(),
+                        shared=digest)
+        self.assertEqual(seen[0]["shared_learning"], digest)
+
+    def test_an_empty_digest_is_not_attached(self):
+        seen = []
+
+        class Recorder:
+            def tune(inner, *, diagnosis, **_):
+                seen.append(diagnosis)
+                return ProposalResult(False, error="recording only")
+
+        _tuned_variants({"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=3,
+                        vehicle="equity", llm_enabled=True,
+                        config={"model": "test"}, adapter=Recorder(),
+                        shared={"graded_attempts": 0, "parameters": []})
+        self.assertNotIn("shared_learning", seen[0])
+
+
 class FrozenEdgeTests(unittest.TestCase):
     """Tuning is a pre-promotion activity, and only a pre-promotion activity."""
 

@@ -548,7 +548,17 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 "rolling_r": sum(recent_r) if recent_r else None,
                 "duplicate": duplicate}
 
-    def ingest_paper_outcome(self, candidate_id: str, outcome: Mapping) -> dict:
+    def ingest_paper_outcome(self, candidate_id: str, outcome: Mapping, *,
+                             frozen: bool = False) -> dict:
+        """Append one observed paper outcome and return the resulting status.
+
+        ``frozen`` marks a candidate the operator pinned in configuration.  A
+        pinned edge is theirs: the guards still run and still say what they
+        found, but they raise a durable alert instead of changing the
+        lifecycle, because an automatic demotion would be exactly the silent
+        change pinning exists to prevent.  Runtime risk limits are unaffected —
+        they are safety, not lifecycle.
+        """
         candidate = self.candidate(candidate_id)
         if candidate is None:
             raise KeyError(candidate_id)
@@ -609,22 +619,34 @@ class EdgeLedger(EdgeLedgerProofMixin):
         # Every deployed candidate is guarded, not only the champion: paper
         # ``all_proved`` selection trades one validated candidate per family,
         # and an unguarded validated loser would trade indefinitely.
-        if candidate["status"] in DEPLOYED_STATUSES:
-            if automatic_guard:
-                self.transition(
-                    candidate_id, "demoted",
-                    reason="paper outcomes failed the registered rolling R guard",
-                    payload={"outcomes": len(recent_r), "rolling_r": sum(recent_r),
-                             "from_status": candidate["status"]})
-            elif drift.get("degraded"):
-                self.transition(
-                    candidate_id, "demoted",
-                    reason="paper R degraded against the validated held-out distribution",
-                    payload={"outcomes": drift.get("outcomes"),
-                             "statistic": drift.get("statistic"),
-                             "threshold": drift.get("threshold"),
-                             "from_status": candidate["status"]})
+        breach = None
+        if automatic_guard:
+            breach = ("rolling_r_guard",
+                      "paper outcomes failed the registered rolling R guard",
+                      {"outcomes": len(recent_r), "rolling_r": sum(recent_r)})
+        elif drift.get("degraded"):
+            breach = ("heldout_drift",
+                      "paper R degraded against the validated held-out distribution",
+                      {"outcomes": drift.get("outcomes"),
+                       "statistic": drift.get("statistic"),
+                       "threshold": drift.get("threshold")})
+        if candidate["status"] in DEPLOYED_STATUSES and breach is not None:
+            kind, reason, detail = breach
+            payload = {**detail, "from_status": candidate["status"], "guard": kind}
+            if frozen:
+                # The operator pinned this edge; say so loudly and leave it
+                # exactly where they put it.
+                self.append_event(
+                    candidate_id=candidate_id, event_type="guard_alert",
+                    actor="paper",
+                    reason=f"{reason}; pinned edge left unchanged for the operator",
+                    payload={**payload, "pinned": True, "action": "notify_only"})
+            else:
+                self.transition(candidate_id, "demoted", reason=reason,
+                                payload=payload)
         summary = self._paper_summary(candidate_id, oid)
+        summary["guard_breach"] = breach[0] if breach else None
+        summary["frozen"] = bool(frozen)
         summary["drift"] = {key: drift[key] for key in
                             ("applicable", "degraded", "outcomes", "statistic", "threshold")}
         return summary

@@ -349,6 +349,24 @@ if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
   finish "failed" "no research vehicle resolved from the agent config" 3
 fi
 
+# Judge the demo-account trials before proposing anything new, so a trial that
+# just finished below its floor is already a recorded lesson by the time this
+# cycle's tuning reads its history. A parked edge exits 3, which is an
+# operator-visible outcome, not a failure.
+review_trials() {
+  local vehicle="$1"
+  set +e
+  "$python_bin" "$repo_root/research.py" edge trials \
+    --vehicle "$vehicle" --db "$edge_db" --agent-config "$agent_config"
+  local status=$?
+  set -e
+  case "$status" in
+    0) cycle_outcomes+=("$vehicle:trial:running") ;;
+    3) cycle_outcomes+=("$vehicle:trial:parked") ;;
+    *) finish "failed" "$vehicle trial review failed" "$status" ;;
+  esac
+}
+
 for vehicle in $vehicles; do
   case "$vehicle" in
     equity)
@@ -367,6 +385,9 @@ for vehicle in $vehicles; do
       finish "failed" "unsupported research vehicle: $vehicle" 3
       ;;
   esac
+  if [ "${ALPACA_TRIAL_REVIEW_ENABLED:-1}" = "1" ]; then
+    review_trials "$vehicle"
+  fi
   run_discovery "$vehicle"
   if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
     run_factory "$vehicle"

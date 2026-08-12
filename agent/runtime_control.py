@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from decimal import Decimal
 from typing import Any, Mapping
@@ -499,6 +500,42 @@ class RuntimeControlMixin:
             self._heartbeat_owner = False
             self._release_lock()
 
+    def _record_config_version(self) -> None:
+        """Stamp the configuration this run is operating under.
+
+        The id is content-addressed, so restarting under unchanged settings
+        records nothing new and a single changed value produces a new version
+        with a diff naming the field.  That is what makes "which settings were
+        in force, and who changed what" answerable after the fact.  Secrets are
+        redacted before hashing, so the trail records that a key changed and
+        never what it changed to.
+        """
+        try:
+            from .governance import record_config_version
+
+            result = record_config_version(
+                state.JOURNAL_FILE, self.cfg,
+                source=str(os.getenv("ALPACA_AGENT_CONFIG") or "config.yaml"))
+            self.config_version_id = str(result.get("config_version_id") or "")
+            if result.get("recorded"):
+                self._journal_event("config_version_recorded", {
+                    "config_version_id": self.config_version_id,
+                    "previous_version_id": result.get("previous_version_id"),
+                    "changed_paths": [item["path"] for item in result.get("diff", [])],
+                })
+        except Exception as exc:  # noqa: BLE001
+            # The audit trail is a record of work that is happening anyway.
+            # Failing to write it must never stop a runtime from starting.
+            print(f"config audit unavailable: {type(exc).__name__}: {exc}")
+
+    def _journal_event(self, kind: str, payload: Mapping) -> None:
+        try:
+            state.log_event(kind, json.dumps(dict(payload), sort_keys=True,
+                                             default=str),
+                            run_id=self.run_id, runtime_mode=self.mode)
+        except Exception:  # noqa: BLE001
+            pass
+
     def run(self, *, max_cycles: int | None = None) -> None:
         if not self._acquire_lock(persistent=True):
             raise AlpacaError(f"another {self.mode} runtime process already holds the run lock")
@@ -514,6 +551,7 @@ class RuntimeControlMixin:
             self.running = False
             self.close()
             raise
+        self._record_config_version()
         try:
             ready = self._ensure_order_ready()
         except BaseException:

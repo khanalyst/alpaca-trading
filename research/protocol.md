@@ -55,6 +55,43 @@ gate. Walk-forward and held-out checks must be chronological. Paired baseline,
 placebo, and acceptance-floor checks are evaluated independently for each
 vehicle and may not pool option and underlying returns.
 
+## Deployment states
+
+Four states, one of which no automatic process may enter.
+
+*Research* and *proved* are the lanes above: gates decide, and they may move a
+candidate in either direction on evidence.
+
+*Trial* is a proved, unpinned edge trading the paper account. Its live outcomes
+are append-only evidence. After a configured window of sessions and trades it
+is judged against an explicit floor. An edge below the floor is demoted and the
+result is recorded as a graded lesson sourced from live paper, which later
+proposals may read. An edge above it keeps trading and is reported as
+promotable. Underpowered windows and outcomes without a usable risk reference
+are never treated as failure.
+
+*Pinned* is an operator-declared promotion: an entry in `strategy.pinned`
+carrying an operator-assigned id, an exact `variant_id`, and a vehicle.
+Pinning is a selection, not an authorization — a pinned entry still resolves
+through the same evidence gate and a pin that does not resolve trades nothing
+rather than being substituted. Pinning is the only route into live. A pinned
+candidate is exempt from every automatic lifecycle change: the rolling-R guard,
+the sequential drift test, and the trial review all still evaluate and still
+record what they found, but they raise a durable alert instead of transitioning
+it. Runtime risk limits are unaffected; they are safety, not lifecycle.
+
+No automatic process may move a candidate into the pinned state, and none may
+move one out of it.
+
+## Configuration provenance
+
+Every distinct configuration a runtime operates under is content-addressed and
+recorded append-only with a version id, the previous version, and a diff naming
+each field that changed. Secret-bearing fields are redacted before hashing, so
+the trail records that such a field changed and never what it changed to, and a
+change confined to redacted values is therefore not distinguishable as a new
+version. Records are immutable.
+
 ## Autonomous edge lane
 
 The bounded registry in `research/variants.yaml` remains the complete proposal

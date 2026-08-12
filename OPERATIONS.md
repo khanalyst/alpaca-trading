@@ -9,6 +9,13 @@ order path is intraday: day-only orders, regular NYSE session entries, startup
 cleanup, and force-flat before the close. Overnight positions are an incident,
 not a supported state.
 
+The read-only dashboard on `http://127.0.0.1:8080` is the fastest way to see
+all of this at once: demo trials and what has earned a promotion, pinned
+promotions and any pin that cannot trade, every fill attributed to the strategy
+and variant that placed it, what research learned and what each proposal built
+on, and the configuration audit trail. It cannot change anything — `POST`
+returns 405.
+
 ## Daily checks
 
 ```bash
@@ -240,6 +247,119 @@ sessions yields roughly 84 held-out trades and will not clear it; widen
 
 Run the backfill before starting the trader, or outside market hours, so the
 recorder's first live cycle resumes from a completed session boundary.
+
+## Promoting an edge
+
+Promotion is the one step nothing automatic performs. The system runs proved
+edges on the demo account, judges them on their real fills, and hands you a
+shortlist; deciding is yours.
+
+**1. See what has earned it.**
+
+```bash
+./.venv/bin/python research.py edge promotable
+```
+
+Each entry names the variant, its edge/family, what it returned on the book —
+trades, sessions, total and mean R, win rate, net P&L — and prints the exact
+configuration block. Empty output means nothing has cleared its trial floor
+yet; that is the normal state early on.
+
+**2. Paste the block into `config.yaml`.** Copy it verbatim. Retyping a
+content-addressed variant id is how a promotion silently points at a different
+edge. Give the entry an `id` that means something to you (`pin-orb-2026-08`);
+it is the handle used by the audit trail, the dashboard, and every notification
+about that edge.
+
+```json
+"strategy": {
+  "selection_mode": "pinned",
+  "pinned": [
+    { "id": "pin-orb-2026-08",
+      "variant_id": "rule.opening-range-breakout.abc12345…",
+      "vehicle": "equity", "strategy_id": "rule",
+      "promoted_at": "2026-08-12",
+      "note": "live paper: 34 trades over 21 sessions, total R 6.40" }
+  ]
+}
+```
+
+**3. Verify before restarting.**
+
+```bash
+./.venv/bin/python main.py check --offline    # the promotion must validate
+./.venv/bin/python main.py check              # authenticated preflight
+```
+
+A malformed promotion fails `check --offline`. Restart the trader, then confirm
+on the dashboard that "Pinned promotions" lists your entry and that "Pinned but
+NOT trading" is absent — a pin that cannot resolve trades nothing rather than
+substituting something else.
+
+**What changes once an edge is pinned.** It is frozen. The rolling-R guard, the
+sequential drift test, and the trial review all still run and still record what
+they find, but they raise a `guard_alert` and leave the edge in place instead of
+demoting it. You are told; nothing acts. Removing a pinned edge is an edit to
+`config.yaml` and a restart — the same route in and out. Runtime risk limits
+(daily loss limit, open risk, position caps) are unaffected: those are safety,
+not lifecycle, and they still stop trading.
+
+**Live.** `mode: live` accepts `selection_mode: pinned` with exactly one entry,
+or the older `selection_mode: specific`. Everything in
+"Mode guard and live preflight" still applies.
+
+## Trials on the demo account
+
+An edge that is proved but not pinned trades the demo account so its evidence
+stops being a replay. `research.trial` in `config.yaml` sets the window and the
+floor:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | run the lane at all |
+| `min_sessions` | `20` | sessions before a verdict |
+| `min_trades` | `20` | trades before a verdict |
+| `min_total_r` | `0.0` | total R the window must beat |
+| `min_mean_r` | `0.0` | mean R per trade it must beat |
+
+The scheduled cycle reviews trials before it proposes anything new. Check what
+a review would do without letting it act:
+
+```bash
+./.venv/bin/python research.py edge trials --dry-run
+```
+
+An edge below its floor is parked (demoted) and the reason is written into the
+lesson ledger as live evidence, so the next tuning cycle proposes parameters
+against what actually happened rather than only against the backtest. Parking
+promotes nothing in its place: the replacement still has to earn a backtest
+pass, a strictly later shadow pass, and every gate. `ALPACA_TRIAL_REVIEW_ENABLED=0`
+disables the review in a cycle.
+
+Exit code 3 from `edge trials` means something was parked. That is an
+operator-visible outcome, not a failure.
+
+## Configuration audit trail
+
+Every distinct configuration the trader loads is recorded with a
+content-addressed `config_version_id`, the version it replaced, and a diff
+naming each field that changed. Restarting under unchanged settings records
+nothing new; one changed value produces one new version.
+
+Read it on the dashboard's "Configuration audit trail" card, or directly:
+
+```bash
+./.venv/bin/python - <<'PY'
+from agent.governance import config_history
+for item in config_history("runtime/paper/journal.db", limit=10):
+    print(item["config_version_id"], item["created_at"], item["changed_paths"])
+PY
+```
+
+Secret-bearing fields (`api_key`, `secret_key`, tokens, webhook URLs) are
+redacted before hashing. The trail records that such a field changed, never
+what it changed to — and the honest consequence is that a change confined to
+those fields alone does not appear as a separate version.
 
 ## Research and evidence
 

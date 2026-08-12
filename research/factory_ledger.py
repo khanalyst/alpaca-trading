@@ -22,8 +22,11 @@ ACTIVE_HYPOTHESIS_STATES = {
 FACTORY_STATUSES = ACTIVE_HYPOTHESIS_STATES | {"validated", "retired"}
 # What a recorded reason was given for.  ``tuning`` changes the numbers of one
 # hypothesis; the rest change which hypothesis a slot holds.
-LESSON_KINDS = {"tuning", "discovery", "replacement", "rotation", "reseed"}
-LESSON_SOURCES = {"llm", "deterministic"}
+LESSON_KINDS = {"tuning", "discovery", "replacement", "rotation", "reseed",
+                # What a live paper trial taught, which is the only lesson kind
+                # produced by real fills rather than a replay.
+                "trial"}
+LESSON_SOURCES = {"llm", "deterministic", "live_paper"}
 
 
 class FactoryError(ValueError):

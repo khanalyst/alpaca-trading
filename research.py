@@ -347,6 +347,68 @@ def cmd_edge_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pinned(config: dict) -> list[tuple[str, str]]:
+    from agent.governance import pinned_variant_ids
+
+    return sorted(pinned_variant_ids(config))
+
+
+def cmd_edge_trials(args: argparse.Namespace) -> int:
+    """Judge each demo-account trial, and park the ones below their floor.
+
+    ``--dry-run`` reports the same verdicts without changing a lifecycle, so an
+    operator can see what a review would do before letting it do it.
+    """
+    from research.trial import review_trials
+
+    config = _agent_config(args)
+    result = review_trials(_db(args), config=config, vehicle=args.vehicle,
+                           pinned=_pinned(config), apply=not args.dry_run)
+    print(json.dumps(result, sort_keys=True, default=str))
+    # Parking an edge is a real change worth noticing in a scheduled log; it
+    # is not an error, so the non-zero code is reserved for the operator's
+    # attention rather than for failure.
+    return 3 if result.get("parked") else 0
+
+
+def cmd_edge_promotable(args: argparse.Namespace) -> int:
+    """List edges whose live paper record clears the trial floor.
+
+    This is the hand-off point: it names the variant and its edge, shows what
+    it actually returned, and prints the exact configuration block to paste.
+    Promotion itself stays a human action.
+    """
+    from research.trial import promotable_report
+
+    config = _agent_config(args)
+    rows = promotable_report(_db(args), config=config, vehicle=args.vehicle,
+                             pinned=_pinned(config))
+    if getattr(args, "format", "json") == "text":
+        if not rows:
+            print("No edge has cleared its live paper trial floor yet.")
+        for row in rows:
+            print(f"\n{'=' * 70}")
+            print(f"Variant ID : {row['variant_id']}")
+            print(f"Edge/family: {row['family']}  ({row['vehicle']},"
+                  f" {row['status']})")
+            print(f"Candidate  : {row['candidate_id']}")
+            print(f"Live paper : {row['trades']} trades over {row['sessions']}"
+                  f" sessions")
+            print(f"             total R {row['total_r']:.2f},"
+                  f" mean R {row['mean_r']:.3f},"
+                  f" win rate {row['win_rate']}")
+            print(f"             net P&L {row['net_pnl']},"
+                  f" mean return per trade {row['return_pct']}% of risk")
+            if row["already_pinned"]:
+                print("Already pinned in config.")
+            else:
+                print("\nTo promote, add to config.yaml:")
+                print(row["config_snippet"])
+    else:
+        print(json.dumps(rows, sort_keys=True, default=str))
+    return 0
+
+
 def cmd_edge_ingest(args: argparse.Namespace) -> int:
     ledger = EdgeLedger(_db(args))
     outcome = _read_json(args.outcome, {})
@@ -512,6 +574,19 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--deployed", action="store_true",
                             help="only validated/champion edges")
         parser.set_defaults(func=cmd_edge_paper)
+    elif command == "trials":
+        parser.add_argument("--vehicle", choices=("equity", "option"), default=None)
+        parser.add_argument("--agent-config", default=None,
+                            help="validated agent config (default: config.yaml)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="report verdicts without parking anything")
+        parser.set_defaults(func=cmd_edge_trials)
+    elif command == "promotable":
+        parser.add_argument("--vehicle", choices=("equity", "option"), default=None)
+        parser.add_argument("--agent-config", default=None,
+                            help="validated agent config (default: config.yaml)")
+        parser.add_argument("--format", choices=("text", "json"), default="text")
+        parser.set_defaults(func=cmd_edge_promotable)
     elif command == "discover":
         parser.add_argument("--data", required=True,
                             help="normalized market JSONL corpus")
@@ -550,10 +625,12 @@ def build_parser() -> argparse.ArgumentParser:
     # jobs can stay terse while operators retain a discoverable command tree.
     edge = sub.add_parser("edge", help="auditable edge discovery ledger")
     edge_sub = edge.add_subparsers(dest="edge_command", required=True)
-    for name in ("init", "status", "promote", "ingest", "paper", "discover"):
+    for name in ("init", "status", "promote", "ingest", "paper", "discover",
+                 "trials", "promotable"):
         _edge_parser(edge_sub, name, name)
     for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest",
-                 "edge-paper", "edge-discover"):
+                 "edge-paper", "edge-discover", "edge-trials",
+                 "edge-promotable"):
         _edge_parser(sub, name, name.split("-", 1)[1])
     vehicles = sub.add_parser(
         "vehicles", help="print the vehicles this deployment should research")

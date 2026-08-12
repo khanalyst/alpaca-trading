@@ -45,6 +45,48 @@ session). New entries are rejected outside the regular session, orders are
 day-only, startup cancels working orders and flattens residuals, and positions
 are force-closed before the close.
 
+## How an edge reaches money
+
+Four states, and only one transition a machine cannot make.
+
+| State | Who decides | Can it change on its own? |
+| --- | --- | --- |
+| **Research** — hypotheses, variants, gates | the factory | yes, continuously |
+| **Proved** — `validated`/`champion` in the ledger | the gates | yes, on evidence |
+| **Trial** — trading the demo account, live results collected | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
+| **Pinned** — an id you wrote into `config.yaml` | **you only** | **no.** Guards still run and still report; they raise an alert and leave it in place |
+
+Promotion is the one step that is never automatic. When an edge clears its
+trial, `research.py edge promotable` names the variant, shows what it actually
+returned on the book, and prints the exact configuration block:
+
+```bash
+./.venv/bin/python research.py edge promotable
+```
+
+```json
+{ "strategy": { "selection_mode": "pinned", "pinned": [
+    { "id": "pin-equity-abc12345",
+      "variant_id": "rule.opening-range-breakout.abc12345…",
+      "vehicle": "equity", "strategy_id": "rule",
+      "promoted_at": "2026-08-12",
+      "note": "live paper: 34 trades over 21 sessions, total R 6.40" } ] } }
+```
+
+Paste it, restart the trader, and that edge is frozen: pinning exempts it from
+automatic demotion, from trial parking, and from every other lane that would
+otherwise move it. Pinning selects, it never authorizes — a pinned entry still
+has to resolve to a proved ledger record with a re-verified passing proof, so
+an id in a file cannot put an unproved variant on the book. A pin that cannot
+resolve is reported rather than silently substituted.
+
+Every `id` is yours and must be unique; it is the handle the audit trail, the
+dashboard, and the notifications all use. Separately, every distinct
+configuration the runtime loads is recorded with a content-addressed
+`config_version_id` and a diff naming each field that moved, so any changed
+value is traceable to a version, a time, and an actor. Secrets are recorded as
+having changed, never as values.
+
 ## Safety boundary
 
 - Paper mode (`mode: paper`, `broker.paper: true`, `ALPACA_PAPER=true`) and
@@ -120,6 +162,24 @@ edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
 status, latest re-verified passing edges, per-edge live paper results, edge
 proof reports, and the execution journal.
+
+The read-only dashboard (`http://127.0.0.1:8080`) is the detailed reporting
+surface. Beyond trader health it shows: demo trials with each edge's live
+record against its floor; promotable edges with the config block to paste;
+pinned promotions and any pin that cannot currently trade; every recorded fill
+attributed to the strategy and variant that placed it, plus a per-variant
+roll-up of what the broker actually did; the graded reason history with what
+each proposal built on; and the configuration audit trail. It is read-only —
+`POST` returns 405 — and nothing on it can change a lifecycle.
+
+The CLI answers the same questions without a browser:
+
+```bash
+python research.py edge promotable          # what has earned a promotion
+python research.py edge trials --dry-run    # what a trial review would do
+python research.py edge paper --deployed    # how each deployed edge is doing
+python research.py factory report           # the full discovery narrative
+```
 
 Three read-only views answer three different questions, and none can change a
 lifecycle state:

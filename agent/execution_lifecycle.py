@@ -974,7 +974,9 @@ class ExecutionLifecycleMixin:
                 settled.add(entry_id)
                 continue
             try:
-                record_paper_outcome(dict(outcome), db_path=self._edge_db_path or None)
+                record_paper_outcome(dict(outcome),
+                                     db_path=self._edge_db_path or None,
+                                     config=self.cfg)
             except (ValueError, KeyError) as exc:
                 self._event("edge_outcome_rejected",
                             {"error": str(exc), "entry_id": entry_id,

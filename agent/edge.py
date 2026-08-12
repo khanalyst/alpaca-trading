@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .allocation import evidence_rank
+from .governance import pinned_variant_ids
 from .registry import baseline_variant_id, known_variant_ids
 from .variants import from_record, apply as apply_variant_config
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
@@ -191,9 +192,12 @@ def resolve_validated_variants(config: Mapping, vehicle: str | None = None,
     must be decided by evidence.
     """
     strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
-    if str(strategy.get("selection_mode") or "specific") == "specific":
+    mode = str(strategy.get("selection_mode") or "specific")
+    if mode == "specific":
         record = resolve_validated_variant(config, vehicle=vehicle, db_path=db_path)
         return [record] if record is not None else []
+    if mode == "pinned":
+        return resolve_pinned_variants(config, vehicle=vehicle, db_path=db_path)
     selected_vehicle = _vehicle(config, vehicle)
     if selected_vehicle not in {"equity", "option"}:
         return []
@@ -214,6 +218,97 @@ def resolve_validated_variants(config: Mapping, vehicle: str | None = None,
         if current is None or _proof_score(record) > _proof_score(current):
             grouped[family] = record
     return sorted(grouped.values(), key=evidence_rank, reverse=True)
+
+
+def resolve_pinned_variants(config: Mapping, vehicle: str | None = None,
+                            db_path: str | Path | None = None) -> list[dict]:
+    """Resolve exactly the edges the operator pinned, and nothing else.
+
+    Pinning is a selection, not an authorization.  Each entry still has to
+    resolve to a ``validated``/``champion`` record whose latest shadow proof
+    re-verifies and passes, so an id written into a file can never put an
+    unproved variant on the book.  What it does guarantee is the converse: no
+    automatic process chose this, and none will change it.
+
+    An entry that does not resolve is skipped rather than substituted.  Quietly
+    trading a different edge than the one named would be the worst possible
+    reading of a promotion.
+    """
+    strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
+    entries = strategy.get("pinned") or []
+    if not entries:
+        return []
+    selected_vehicle = _vehicle(config, vehicle)
+    research = config.get("research", {}) if isinstance(config, Mapping) else {}
+    min_confidence = float(research.get("champion_min_confidence", .95) or .95) \
+        if isinstance(research, Mapping) else .95
+    ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
+    resolved: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        entry_vehicle = str(entry.get("vehicle") or selected_vehicle)
+        # A trader runs one execution profile; a promotion for the other
+        # vehicle is a real record this process simply cannot act on.
+        if entry_vehicle != selected_vehicle:
+            continue
+        record = _eligible(
+            ledger,
+            ledger.candidate_by_variant(str(entry.get("variant_id")), entry_vehicle),
+            strategy_id=str(entry.get("strategy_id") or "rule"),
+            vehicle=entry_vehicle, min_confidence=min_confidence)
+        if record is None:
+            continue
+        # Carry the promotion through so every downstream record — journal
+        # rows, notifications, the dashboard — can name the decision that put
+        # this edge on the book.
+        record["promotion"] = {"id": str(entry.get("id") or ""),
+                               "note": str(entry.get("note") or ""),
+                               "promoted_at": str(entry.get("promoted_at") or "")}
+        record["pinned"] = True
+        resolved.append(record)
+    return sorted(resolved, key=evidence_rank, reverse=True)
+
+
+def unresolved_promotions(config: Mapping, vehicle: str | None = None,
+                          db_path: str | Path | None = None) -> list[dict]:
+    """Pinned entries that cannot currently trade, and why.
+
+    A promotion that silently resolves to nothing is the failure mode worth
+    surfacing: the operator believes an edge is deployed and it is not.
+    """
+    strategy = config.get("strategy", {}) if isinstance(config, Mapping) else {}
+    entries = strategy.get("pinned") or []
+    if not entries:
+        return []
+    selected_vehicle = _vehicle(config, vehicle)
+    ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
+    research = config.get("research", {}) if isinstance(config, Mapping) else {}
+    min_confidence = float(research.get("champion_min_confidence", .95) or .95) \
+        if isinstance(research, Mapping) else .95
+    problems = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        variant_id = str(entry.get("variant_id") or "")
+        entry_vehicle = str(entry.get("vehicle") or selected_vehicle)
+        record = ledger.candidate_by_variant(variant_id, entry_vehicle)
+        if entry_vehicle != selected_vehicle:
+            reason = (f"pinned for {entry_vehicle}, but this trader runs "
+                      f"{selected_vehicle}")
+        elif record is None:
+            reason = "no candidate with this variant_id exists in the ledger"
+        elif record.get("status") not in {"validated", "champion"}:
+            reason = f"candidate status is {record.get('status')!r}"
+        elif _eligible(ledger, record, strategy_id=str(entry.get("strategy_id") or "rule"),
+                       vehicle=entry_vehicle, min_confidence=min_confidence) is None:
+            reason = "no re-verified passing shadow proof at the required confidence"
+        else:
+            continue
+        problems.append({"id": str(entry.get("id") or ""),
+                         "variant_id": variant_id, "vehicle": entry_vehicle,
+                         "reason": reason})
+    return problems
 
 
 def apply_variant(config: Mapping, record: Mapping) -> dict:
@@ -273,22 +368,36 @@ def apply_variant(config: Mapping, record: Mapping) -> dict:
 
 
 def record_paper_outcome(outcome: Mapping, *, candidate_id: str | None = None,
-                         db_path: str | Path | None = None) -> dict:
-    """Append an observed paper outcome and return the resulting status."""
+                         db_path: str | Path | None = None,
+                         config: Mapping | None = None) -> dict:
+    """Append an observed paper outcome and return the resulting status.
+
+    When ``config`` pins this variant, the outcome is ingested frozen: the
+    guards still evaluate and still record what they found, but they raise an
+    alert instead of demoting, because the operator owns that decision.
+    """
     ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
     cid = candidate_id or outcome.get("candidate_id")
+    variant_id = outcome.get("variant_id")
+    vehicle = outcome.get("vehicle")
     if not cid:
-        variant_id = outcome.get("variant_id")
-        vehicle = outcome.get("vehicle")
         if not variant_id or not vehicle:
             raise ValueError("candidate_id or variant_id+vehicle is required")
         record = ledger.candidate_by_variant(str(variant_id), str(vehicle))
         if record is None:
             raise KeyError(f"unknown candidate {variant_id!r}/{vehicle!r}")
         cid = record["candidate_id"]
-    return ledger.ingest_paper_outcome(str(cid), outcome)
+    frozen = False
+    if config is not None:
+        if not variant_id or not vehicle:
+            record = ledger.candidate(str(cid)) or {}
+            variant_id = variant_id or record.get("variant_id")
+            vehicle = vehicle or record.get("vehicle")
+        frozen = (str(variant_id), str(vehicle)) in pinned_variant_ids(config)
+    return ledger.ingest_paper_outcome(str(cid), outcome, frozen=frozen)
 
 
 __all__ = ["VEHICLES", "apply_variant", "record_paper_outcome",
-           "research_vehicles", "resolve_validated_variant",
-           "resolve_validated_variants", "runtime_vehicle"]
+           "research_vehicles", "resolve_pinned_variants",
+           "resolve_validated_variant", "resolve_validated_variants",
+           "runtime_vehicle", "unresolved_promotions"]

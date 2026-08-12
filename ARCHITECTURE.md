@@ -510,6 +510,59 @@ restates the two guard thresholds rather than importing the research package,
 and a test pins them to the ledger's constants. Neither surface can change a
 lifecycle state.
 
+### Trial, promotion, and the freeze
+
+`research.trial` is the lane between "proved" and "given money". A proved,
+unpinned edge trades the paper account; after a configured window of sessions
+and trades its live record is judged against an explicit floor. Clearing it
+makes the edge *promotable* — reported, never promoted. Missing it parks the
+edge and writes the reason into `factory_lessons` as a `trial` lesson sourced
+from `live_paper`, graded on the spot, which the next tuning request reads.
+That feedback path is the lane's purpose: without it the paper book drove the
+demotion guards and taught the search nothing.
+
+`agent.governance` owns the other half. `strategy.pinned` is a list of
+operator-declared promotions, each with an id the operator assigns, validated
+at config time so a malformed promotion fails the preflight rather than
+silently trading nothing. `agent.edge.resolve_pinned_variants` resolves them
+through the same `_eligible` gate every other path uses — pinning selects, it
+never authorizes — and `unresolved_promotions` reports any pin that cannot
+trade, because a promotion that quietly resolves to nothing is the failure
+worth surfacing. A pinned candidate is frozen: `ingest_paper_outcome(frozen=
+True)` evaluates the guards exactly as before and appends a `guard_alert`
+event instead of transitioning, and `review_trials` skips it entirely.
+
+The scheduled cycle reviews trials *before* discovery and tuning, so a trial
+that just closed below its floor is already a lesson by the time this cycle
+proposes anything.
+
+### Configuration provenance
+
+`record_config_version` writes each distinct configuration the runtime loads
+into `config_versions` in the mode-scoped journal: a content-addressed
+`config_version_id`, the version it replaced, and a diff naming every field
+that moved. Content addressing is what makes the id answer "which settings were
+in force" rather than "how many times did the process start" — restarting under
+unchanged settings records nothing. Secret-bearing fields are redacted before
+hashing, so the trail records that a key changed and never its value; the
+honest consequence, which a test pins, is that a change confined to redacted
+values does not produce a distinguishable version. Rows are immutable. The
+runtime records its version on start and journals the changed paths; failing to
+write the trail never stops a runtime from starting.
+
+### The reporting surface
+
+`deploy/dashboard.py` is the detailed read-only UI. Beyond trader health it
+answers, in order: which edge is earning a promotion (`_trial_view`), what is
+pinned and whether each pin can trade (`_promotions`), which strategy and
+variant placed every recorded fill and what each variant actually did
+(`_journal_view`, joining the `strategy_id`/`variant_id` the journal already
+stamped and nothing previously read back), why research tried what it tried
+(`_learning`, with the chain each proposal built on), and every configuration
+change by id (`_config_audit`). Each panel degrades to an empty state rather
+than failing the page, so a recovery image without the research package still
+gets a dashboard.
+
 ## Safety invariants
 
 - Paper/live mode, endpoint, credentials, runtime directory, and account

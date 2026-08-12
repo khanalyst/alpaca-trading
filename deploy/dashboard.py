@@ -16,6 +16,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Sequence
 from urllib.parse import parse_qs, urlparse
 
 REPO = Path(__file__).resolve().parents[1]
@@ -291,6 +292,237 @@ def _edge_status(path: Path) -> dict:
                 "proved_edges": [], "live_paper": []}
 
 
+def _trades(connection: sqlite3.Connection, limit: int = 200) -> list[dict]:
+    """Every recorded fill, and which edge decided to place it.
+
+    The journal already stamped ``strategy_id``/``variant_id`` on every row;
+    nothing read them back.  Without that join a trade list answers "what
+    happened" but not "which of my edges did this", which is the question that
+    decides whether an edge is worth promoting.
+    """
+    rows = connection.execute(
+        """SELECT ts, symbol, side, action, qty, price, notional,
+                  realized_pnl_usd, risk_usd, pnl_pct, fill_status, setup_type,
+                  strategy_id, strategy_version, variant_id, runtime_mode,
+                  exit_policy, close_trigger
+           FROM trades ORDER BY ts DESC, id DESC LIMIT ?""",
+        (max(1, int(limit)),)).fetchall()
+    trades = []
+    for row in rows:
+        item = dict(row)
+        risk = item.get("risk_usd")
+        realized = item.get("realized_pnl_usd")
+        try:
+            item["r_multiple"] = (round(float(realized) / float(risk), 4)
+                                  if risk and realized is not None else None)
+        except (TypeError, ValueError, ZeroDivisionError):
+            item["r_multiple"] = None
+        item["when"] = item.pop("ts", None)
+        trades.append(item)
+    return trades
+
+
+def _by_variant(trades: Sequence[dict]) -> list[dict]:
+    """Roll the journal's own fills up per deployed variant.
+
+    This is the runtime's view of an edge, independent of the research
+    ledger's: it counts what the broker actually did.  When the two disagree,
+    that disagreement is the finding.
+    """
+    grouped: dict[tuple[str, str], dict] = {}
+    for trade in trades:
+        key = (str(trade.get("strategy_id") or "unknown"),
+               str(trade.get("variant_id") or "unattributed"))
+        item = grouped.setdefault(key, {
+            "strategy_id": key[0], "variant_id": key[1], "trades": 0,
+            "symbols": set(), "realized_pnl_usd": 0.0, "_r": [],
+            "last_trade_ts": None})
+        item["trades"] += 1
+        if trade.get("symbol"):
+            item["symbols"].add(str(trade["symbol"]))
+        try:
+            item["realized_pnl_usd"] += float(trade.get("realized_pnl_usd") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        if trade.get("r_multiple") is not None:
+            item["_r"].append(float(trade["r_multiple"]))
+        when = trade.get("when")
+        if when is not None and (item["last_trade_ts"] is None or
+                                 when > item["last_trade_ts"]):
+            item["last_trade_ts"] = when
+    report = []
+    for item in grouped.values():
+        values = item.pop("_r")
+        wins = [value for value in values if value > 0]
+        report.append({
+            **item,
+            "symbols": ", ".join(sorted(item["symbols"])),
+            "realized_pnl_usd": round(item["realized_pnl_usd"], 2),
+            "total_r": round(sum(values), 4) if values else None,
+            "mean_r": round(sum(values) / len(values), 4) if values else None,
+            "win_rate": round(len(wins) / len(values), 4) if values else None,
+        })
+    return sorted(report, key=lambda item: item["trades"], reverse=True)
+
+
+def _journal_view(path: Path) -> dict:
+    """Per-trade attribution and its per-variant roll-up, read-only."""
+    if not path.is_file():
+        return {"available": False, "trades": [], "by_variant": []}
+    try:
+        with closing(_ro_connect(path)) as connection:
+            if "trades" not in _tables(connection):
+                return {"available": False, "trades": [], "by_variant": []}
+            trades = _trades(connection)
+    except (OSError, sqlite3.Error, ValueError):
+        return {"available": False, "trades": [], "by_variant": []}
+    return {"available": True, "trades": trades,
+            "by_variant": _by_variant(trades)}
+
+
+def _learning(path: Path, limit: int = 60) -> dict:
+    """The graded reason history, and the chain each proposal built on."""
+    empty = {"available": False, "lessons": [], "summary": {}}
+    if not path.is_file():
+        return empty
+    try:
+        with closing(_ro_connect(path)) as connection:
+            tables = _tables(connection)
+            if not {"factory_lessons", "factory_lesson_outcomes"}.issubset(tables):
+                return empty
+            columns = {str(row["name"]) for row in
+                       connection.execute("PRAGMA table_info(factory_lessons)")}
+            parent = ("l.parent_lesson_id" if "parent_lesson_id" in columns
+                      else "NULL AS parent_lesson_id")
+            rows = connection.execute(
+                f"""SELECT l.lesson_id, {parent}, l.vehicle, l.family, l.kind,
+                           l.source, l.reason, l.variant_id, l.changed_json,
+                           l.created_at, o.passed, o.underpowered,
+                           o.heldout_delta, o.q_value, o.outcome_id
+                    FROM factory_lessons l
+                    LEFT JOIN factory_lesson_outcomes o
+                      ON o.lesson_id=l.lesson_id
+                    ORDER BY l.created_at DESC, l.lesson_id DESC LIMIT ?""",
+                (max(1, int(limit)),)).fetchall()
+            reasons = {str(row[0]): str(row[1]) for row in connection.execute(
+                "SELECT lesson_id, reason FROM factory_lessons")}
+    except (OSError, sqlite3.Error, ValueError):
+        return empty
+    lessons = []
+    for row in rows:
+        item = dict(row)
+        graded = item.pop("outcome_id") is not None
+        changed = json.loads(item.pop("changed_json") or "{}")
+        lessons.append({
+            "lesson_id": item["lesson_id"], "vehicle": item["vehicle"],
+            "family": item["family"], "kind": item["kind"],
+            "proposed_by": item["source"], "reason": item["reason"],
+            "variant_id": item["variant_id"],
+            "changed": "; ".join(
+                f"{key} {value.get('from')}→{value.get('to')}"
+                if isinstance(value, dict) and "from" in value else f"{key}={value}"
+                for key, value in sorted(changed.items())),
+            "verdict": (None if not graded else
+                        "passed" if item["passed"] else
+                        "underpowered" if item["underpowered"] else "failed"),
+            "heldout_delta": item["heldout_delta"],
+            "built_on": reasons.get(str(item["parent_lesson_id"] or "")),
+            "when": item["created_at"],
+        })
+    graded_rows = [item for item in lessons if item["verdict"]]
+    return {
+        "available": True, "lessons": lessons,
+        "summary": {
+            "recorded": len(lessons),
+            "graded": len(graded_rows),
+            "built_on_a_prior_lesson": sum(
+                1 for item in lessons if item["built_on"]),
+            "from_live_trials": sum(
+                1 for item in lessons if item["kind"] == "trial"),
+            "llm_authored": sum(
+                1 for item in lessons if item["proposed_by"] == "llm"),
+        },
+    }
+
+
+def _trial_view(config: dict, edge_path: Path) -> dict:
+    """Demo-account trials: what is still running, and what has earned a pin.
+
+    The promotable list is the hand-off: it names the variant and its edge,
+    shows what it actually returned on the book, and carries the exact config
+    block to paste. Nothing here promotes anything.
+    """
+    empty = {"available": False, "policy": {}, "reviews": [], "promotable": []}
+    if not edge_path.is_file():
+        return empty
+    try:
+        from agent.governance import pinned_variant_ids
+        from research.trial import promotable_report, review_trials
+
+        pinned = sorted(pinned_variant_ids(config))
+        review = review_trials(edge_path, config=config, pinned=pinned,
+                               apply=False)
+        promotable = promotable_report(edge_path, config=config, pinned=pinned)
+    except Exception:                                      # noqa: BLE001
+        # A recovery image without the research package still gets a
+        # dashboard; it simply does not get this panel.
+        return empty
+    return {"available": True, "policy": review.get("policy") or {},
+            "reviews": [{
+                "variant_id": item["variant_id"], "vehicle": item["vehicle"],
+                "family": item["family"], "status": item["status"],
+                "pinned": item["pinned"], "action": item.get("action"),
+                "state": item["verdict"]["state"],
+                "sessions": item["verdict"].get("sessions"),
+                "trades": item["verdict"].get("trades"),
+                "total_r": item["verdict"].get("total_r"),
+                "mean_r": item["verdict"].get("mean_r"),
+            } for item in review.get("reviews") or []],
+            "promotable": promotable}
+
+
+def _promotions(config: dict, edge_path: Path) -> dict:
+    """What the operator pinned, and whether each pin can actually trade."""
+    strategy = config.get("strategy") if isinstance(config, dict) else {}
+    entries = (strategy or {}).get("pinned") or []
+    mode = str((strategy or {}).get("selection_mode") or "all_proved")
+    unresolved: list[dict] = []
+    if entries:
+        try:
+            from agent.edge import unresolved_promotions
+
+            unresolved = unresolved_promotions(config, db_path=edge_path)
+        except Exception:                                  # noqa: BLE001
+            # The dashboard is a view. A research package it cannot import
+            # must cost it this panel, never the whole page.
+            unresolved = []
+    return {"selection_mode": mode, "pinned": [dict(item) for item in entries],
+            "unresolved": unresolved,
+            "frozen": bool(entries),
+            "note": ("pinned edges are never changed automatically; guard "
+                     "breaches raise an alert and leave them in place")}
+
+
+def _config_audit(journal: Path) -> dict:
+    """The configuration versions this runtime has operated under."""
+    try:
+        from agent.governance import config_history
+
+        history = config_history(journal, limit=25)
+    except Exception:                                      # noqa: BLE001
+        return {"available": False, "versions": []}
+    return {"available": bool(history),
+            "current": history[0]["config_version_id"] if history else None,
+            "versions": [{
+                "config_version_id": item["config_version_id"],
+                "previous_version_id": item["previous_version_id"],
+                "mode": item["mode"], "source": item["source"],
+                "actor": item["actor"], "when": item["created_at"],
+                "changes": len(item["diff"]),
+                "changed_paths": ", ".join(item["changed_paths"][:8]),
+            } for item in history]}
+
+
 def _reports(root: Path) -> list[dict]:
     candidates = set((root / "research" / "results").glob("**/*.md"))
     rows = []
@@ -338,6 +570,8 @@ def snapshot(root: Path) -> dict:
     cycle_seconds = float(config.get("cycle", {}).get("interval_seconds") or 60)
     trader_max_age = max(90.0, cycle_seconds * 4)
     edge = _cached(f"edge:{edge_path}", 30, lambda: _edge_status(edge_path))
+    trial = _cached(f"trial:{edge_path}", 60,
+                    lambda: _trial_view(config, edge_path))
     tradeable = _tradeable_vehicle(config)
     untradeable = sum(1 for row in edge.get("proved_edges") or ()
                       if str(row.get("vehicle")) != tradeable)
@@ -371,7 +605,22 @@ def snapshot(root: Path) -> dict:
         },
         "performance": _cached(
             f"performance:{journal}", 30, lambda: _performance(journal)),
+        # What the broker actually did, attributed to the edge that decided it.
+        "journal": _cached(
+            f"journal:{journal}", 30, lambda: _journal_view(journal)),
+        # Why research tried what it tried, and what the gates said about it.
+        "learning": _cached(
+            f"learning:{edge_path}", 30, lambda: _learning(edge_path)),
+        # Operator-declared promotions: what is pinned, and what is pinned but
+        # cannot currently trade, which is the failure worth surfacing.
+        "promotions": _cached(
+            f"promotions:{config_path}:{edge_path}", 30,
+            lambda: _promotions(config, edge_path)),
+        # Configuration changes, each with the version id that identifies it.
+        "config_audit": _cached(
+            f"config_audit:{journal}", 30, lambda: _config_audit(journal)),
         "edge": edge,
+        "trial": trial,
         "research": {
             "available": edge_path.is_file(),
             "service_optional": True,
@@ -415,6 +664,10 @@ body{margin:0 auto;max-width:1440px;padding:24px}h1{margin:0 0 4px}.muted{color:
 .ok{color:#65d98a}.bad{color:#ff7b86}.warn{color:#f4c95d}table{border-collapse:collapse;width:100%}
 th,td{text-align:left;padding:6px;border-bottom:1px solid #28334b}button{background:#263652;color:#e7ecf7;border:0;border-radius:6px;padding:6px 9px;cursor:pointer}
 pre{white-space:pre-wrap;max-height:70vh;overflow:auto;background:#090d18;padding:12px;border-radius:8px}
+h2{font-size:15px;margin:0 0 8px}h3{font-size:13px;margin:12px 0 4px}
+details{margin:8px 0}summary{cursor:pointer;color:#9aa7bd;padding:4px 0}
+td,th{white-space:nowrap;font-variant-numeric:tabular-nums}
+.card>table{display:block;overflow-x:auto}
 </style></head><body>
 <h1>Alpaca agent</h1><div class="muted">Read-only operational view. Auto-refreshes every 30 seconds.</div>
 <div id="error" class="bad"></div><main class="grid" id="cards"></main>
@@ -433,6 +686,45 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
  c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard'])};
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
+
+ const tr=d.trial||{};
+ c=card('Demo trials — which edge is earning a promotion',true);
+ if(!tr.available){c.append(el('p','No trial data yet. Trials appear once a proved edge starts trading the demo account.','muted'))}
+ else{const p=tr.policy||{};c.append(el('p','Trial window: '+p.min_sessions+' sessions and '+p.min_trades+' trades, then judged against total R > '+p.min_total_r+' and mean R > '+p.min_mean_r+'.','muted'));
+  table(c,tr.reviews||[],['state','action','family','vehicle','variant_id','sessions','trades','total_r','mean_r','pinned'])}
+ c=card('Promotable — positive on the demo account',true);
+ const pr=(tr.promotable)||[];
+ if(!pr.length){c.append(el('p','Nothing has cleared its trial floor yet. Promotion is never automatic.','muted'))}
+ else{table(c,pr,['variant_id','family','vehicle','sessions','trades','total_r','mean_r','win_rate','net_pnl','return_pct','already_pinned']);
+  pr.filter(x=>x.config_snippet).forEach(x=>{const b=el('details');b.append(el('summary','Config to promote '+x.variant_id));b.append(el('pre',x.config_snippet));c.append(b)})}
+
+ const pm=d.promotions||{};
+ c=card('Pinned promotions (operator-declared)',true);
+ row(c,'selection mode',pm.selection_mode,pm.selection_mode==='pinned'?'ok':'muted');
+ row(c,'automatic changes',pm.frozen?'disabled — notify only':'enabled (auto lane)',pm.frozen?'ok':'warn');
+ table(c,pm.pinned||[],['id','variant_id','vehicle','strategy_id','promoted_at','note']);
+ if((pm.unresolved||[]).length){const w=el('h3','Pinned but NOT trading');w.className='bad';c.append(w);table(c,pm.unresolved,['id','variant_id','vehicle','reason'])}
+ c.append(el('p',pm.note||'','muted'));
+
+ const jr=d.journal||{};
+ c=card('Trades by edge — what the broker actually did',true);
+ if(!(jr.by_variant||[]).length){c.append(el('p','No fills recorded yet.','muted'))}
+ else{table(c,jr.by_variant,['strategy_id','variant_id','trades','symbols','total_r','mean_r','win_rate','realized_pnl_usd'])}
+ c=card('Recent trades, attributed',true);
+ table(c,(jr.trades||[]).slice(0,60),['when','symbol','side','action','qty','price','realized_pnl_usd','r_multiple','strategy_id','variant_id','setup_type','close_trigger']);
+
+ const lr=d.learning||{};
+ c=card('What research learned',true);
+ if(!lr.available){c.append(el('p','No recorded reasons yet.','muted'))}
+ else{const s=lr.summary||{};row(c,'reasons recorded',s.recorded);row(c,'graded against a gate',s.graded);row(c,'built on an earlier lesson',s.built_on_a_prior_lesson);row(c,'from live demo trials',s.from_live_trials);row(c,'authored by the model',s.llm_authored);
+  table(c,(lr.lessons||[]).slice(0,40),['verdict','kind','proposed_by','family','reason','built_on','changed','heldout_delta'])}
+
+ const ca=d.config_audit||{};
+ c=card('Configuration audit trail',true);
+ row(c,'current version',ca.current);
+ if(!(ca.versions||[]).length){c.append(el('p','No configuration versions recorded yet. One is written the first time the trader starts.','muted'))}
+ else{table(c,ca.versions,['config_version_id','when','mode','actor','source','changes','changed_paths','previous_version_id'])}
+
  c=card('Latest reports',true);(d.reports||[]).forEach(x=>{const n=el('div',undefined,'row');n.append(el('span',x.path),el('button','view'));n.lastChild.onclick=()=>showReport(x.path);c.append(n)});
  error.textContent='';}catch(e){error.textContent='Dashboard refresh failed: '+e.name}}
 refresh();setInterval(refresh,30000);

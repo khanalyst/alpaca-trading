@@ -11,6 +11,7 @@ from typing import Any, Mapping
 import os
 from urllib.parse import urlparse
 
+from .governance import GovernanceError, validate_promotions
 from .instruments import validate_asset_class, validate_equity_symbol
 
 class ConfigError(ValueError):
@@ -65,7 +66,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
     "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
-    "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
+    "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
     "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0},
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100},
     # Runtime rule execution stays deterministic.  The separate decision-LLM
@@ -79,6 +80,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                          "max_response_bytes": 16_384},
         "proof": {"directory": "research/results/edges", "webhook_url": "",
                   "webhook_timeout_seconds": 10},
+        # The demo-account trial window.  An auto-lane edge trades paper for
+        # this long before its live record is judged; a pinned edge is never
+        # judged here at all.
+        "trial": {"enabled": True, "min_sessions": 20, "min_trades": 20,
+                  "min_mean_r": 0.0, "min_total_r": 0.0},
     },
     "cycle": {"interval_seconds": 60},
 }
@@ -178,13 +184,29 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     out["universe"] = universe
 
     strategy = _map(out.get("strategy"), "strategy")
-    _unknown(strategy, {"id", "version", "variant_id", "selection_mode", "execution_mode", "rule_spec", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "atr_period", "max_ibr_width_pct", "max_spread_bps", "stale_minutes", "latest_entry_time", "force_flat_minutes_before_close"}, "strategy")
+    _unknown(strategy, {"id", "version", "variant_id", "selection_mode", "execution_mode", "rule_spec", "pinned", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "atr_period", "max_ibr_width_pct", "max_spread_bps", "stale_minutes", "latest_entry_time", "force_flat_minutes_before_close"}, "strategy")
     if not isinstance(strategy.get("id"), str) or not strategy["id"].strip():
         raise ConfigError("strategy.id must be a non-empty string")
     if strategy.get("execution_mode", "shares") not in {"shares", "options"}:
         raise ConfigError("strategy.execution_mode must be shares or options")
-    if strategy.get("selection_mode", "all_proved") not in {"specific", "all_proved"}:
-        raise ConfigError("strategy.selection_mode must be specific or all_proved")
+    if strategy.get("selection_mode", "all_proved") not in {
+            "specific", "all_proved", "pinned"}:
+        raise ConfigError(
+            "strategy.selection_mode must be specific, all_proved, or pinned")
+    # Operator-declared promotions.  Validated here so a malformed promotion
+    # fails the preflight rather than silently trading nothing.
+    try:
+        strategy["pinned"] = validate_promotions(strategy.get("pinned"))
+    except GovernanceError as exc:
+        raise ConfigError(str(exc)) from exc
+    if strategy.get("selection_mode") == "pinned" and not strategy["pinned"]:
+        raise ConfigError(
+            "strategy.selection_mode=pinned requires at least one "
+            "strategy.pinned entry naming a variant_id")
+    if strategy["pinned"] and strategy.get("selection_mode") != "pinned":
+        raise ConfigError(
+            "strategy.pinned entries are only used by "
+            "strategy.selection_mode=pinned; set it or remove them")
     strategy["range_minutes"] = _int(strategy, "range_minutes", "strategy", 1, 240, 15)
     strategy["breakout_buffer_bps"] = _num(strategy, "breakout_buffer_bps", "strategy", 0, 500, 5)
     strategy["min_relative_volume"] = _num(strategy, "min_relative_volume", "strategy", 0, 100, 1)
@@ -268,7 +290,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     llm["max_tokens"] = _int(llm, "max_tokens", "llm", 128, 32_000, 2_000)
     out["llm"] = llm
     research = _map(out.get("research"), "research")
-    _unknown(research, {"enabled", "require_validated_variant", "champion_min_confidence", "db_path", "strategy_llm", "proof"}, "research")
+    _unknown(research, {"enabled", "require_validated_variant", "champion_min_confidence", "db_path", "strategy_llm", "proof", "trial"}, "research")
     research["enabled"] = _bool(research, "enabled", "research", True)
     research["require_validated_variant"] = _bool(
         research, "require_validated_variant", "research", True)
@@ -311,19 +333,43 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         if parsed.scheme.lower() != "https" or not parsed.netloc:
             raise ConfigError("research.proof.webhook_url must use HTTPS")
     proof["webhook_url"] = webhook
+    trial_defaults = DEFAULT_CONFIG["research"]["trial"]
+    trial = dict(trial_defaults)
+    trial.update(_map(research.get("trial", {}), "research.trial"))
+    _unknown(trial, {"enabled", "min_sessions", "min_trades", "min_mean_r",
+                     "min_total_r"}, "research.trial")
+    trial["enabled"] = _bool(trial, "enabled", "research.trial", True)
+    # A trial that concludes from a handful of fills is measuring noise, and
+    # parking an edge on noise costs more search than it saves.
+    trial["min_sessions"] = _int(trial, "min_sessions", "research.trial", 5, 500, 20)
+    trial["min_trades"] = _int(trial, "min_trades", "research.trial", 5, 5_000, 20)
+    trial["min_mean_r"] = _num(trial, "min_mean_r", "research.trial", -10, 10, 0.0)
+    trial["min_total_r"] = _num(trial, "min_total_r", "research.trial", -1_000, 1_000, 0.0)
+    research["trial"] = trial
     proof["webhook_timeout_seconds"] = _num(
         proof, "webhook_timeout_seconds", "research.proof", 1, 30, 10)
     research["strategy_llm"] = strategy_llm
     research["proof"] = proof
     out["research"] = research
     if mode == "live":
-        variant_id = str(strategy.get("variant_id") or "").strip()
-        if not variant_id or variant_id.lower() == "auto":
-            raise ConfigError("live mode requires a named strategy.variant_id")
+        selection = strategy.get("selection_mode")
+        # Live pins exactly one edge, by either route.  ``pinned`` carries an
+        # operator-assigned promotion id, so the audit trail can answer "who
+        # put this in production and when"; ``specific`` remains supported
+        # unchanged for configurations written before promotions existed.
+        if selection == "pinned":
+            if len(strategy["pinned"]) != 1:
+                raise ConfigError(
+                    "live mode requires exactly one strategy.pinned entry")
+        elif selection == "specific":
+            variant_id = str(strategy.get("variant_id") or "").strip()
+            if not variant_id or variant_id.lower() == "auto":
+                raise ConfigError("live mode requires a named strategy.variant_id")
+        else:
+            raise ConfigError(
+                "live mode requires strategy.selection_mode=specific or pinned")
         if not research["enabled"] or not research["require_validated_variant"]:
             raise ConfigError("live mode requires the validated research edge gate")
-        if strategy.get("selection_mode") != "specific":
-            raise ConfigError("live mode requires strategy.selection_mode=specific")
         if strategy.get("execution_mode") == "options":
             raise ConfigError(
                 "live mode rejects strategy.execution_mode=options: Alpaca offers no bracket, "

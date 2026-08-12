@@ -1007,6 +1007,101 @@ class DeployTests(unittest.TestCase):
         self.assertNotIn("d.research.optional", dashboard.HTML)
         self.assertNotIn("d.trader.heartbeat.research_available", dashboard.HTML)
 
+    def test_dashboard_renders_the_detailed_reporting_panels(self):
+        """Every question the operator asked has a surface that answers it."""
+        for marker in (
+                # Which edge is earning a promotion, and what to paste.
+                "d.trial", "Demo trials", "Promotable", "config_snippet",
+                # What was pinned, and whether it can actually trade.
+                "d.promotions", "Pinned promotions", "Pinned but NOT trading",
+                "notify only",
+                # Which strategy and variant each real fill came from.
+                "d.journal", "Trades by edge", "Recent trades, attributed",
+                "variant_id",
+                # Why research tried what it tried.
+                "d.learning", "What research learned", "built_on",
+                # Every configuration change, by id.
+                "d.config_audit", "Configuration audit trail",
+                "config_version_id"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, dashboard.HTML)
+
+    def test_dashboard_attributes_each_trade_to_its_edge(self):
+        import sqlite3 as sqlite
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.db"
+            with closing(sqlite.connect(journal)) as db, db:
+                db.execute("""CREATE TABLE trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT,
+                    side TEXT, action TEXT, qty REAL, price REAL, notional REAL,
+                    realized_pnl_usd REAL, risk_usd REAL, pnl_pct REAL,
+                    fill_status TEXT, setup_type TEXT, strategy_id TEXT,
+                    strategy_version TEXT, variant_id TEXT, runtime_mode TEXT,
+                    exit_policy TEXT, close_trigger TEXT)""")
+                for index, (variant, pnl) in enumerate(
+                        [("rule.a.1", 200.0), ("rule.a.1", -100.0),
+                         ("rule.b.2", 50.0)]):
+                    db.execute(
+                        "INSERT INTO trades (ts,symbol,side,action,qty,price,"
+                        "realized_pnl_usd,risk_usd,strategy_id,variant_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (1000.0 + index, "SPY", "buy", "close", 10, 100.0,
+                         pnl, 100.0, "rule", variant))
+            view = dashboard._journal_view(journal)
+        self.assertTrue(view["available"])
+        self.assertEqual(len(view["trades"]), 3)
+        by_variant = {row["variant_id"]: row for row in view["by_variant"]}
+        self.assertEqual(by_variant["rule.a.1"]["trades"], 2)
+        self.assertEqual(by_variant["rule.a.1"]["total_r"], 1.0)
+        self.assertEqual(by_variant["rule.a.1"]["win_rate"], 0.5)
+        self.assertEqual(by_variant["rule.b.2"]["realized_pnl_usd"], 50.0)
+
+    def test_dashboard_journal_view_degrades_without_a_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            view = dashboard._journal_view(Path(directory) / "absent.db")
+        self.assertFalse(view["available"])
+        self.assertEqual(view["trades"], [])
+
+    def test_dashboard_surfaces_the_config_audit_trail(self):
+        import copy as copier
+        from agent.config import DEFAULT_CONFIG
+        from agent.governance import record_config_version
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.db"
+            base = copier.deepcopy(DEFAULT_CONFIG)
+            record_config_version(journal, base)
+            base["risk"]["daily_loss_limit_pct"] = 3.0
+            record_config_version(journal, base)
+            audit = dashboard._config_audit(journal)
+        self.assertTrue(audit["available"])
+        self.assertEqual(len(audit["versions"]), 2)
+        self.assertEqual(audit["current"], audit["versions"][0]["config_version_id"])
+        self.assertIn("risk.daily_loss_limit_pct",
+                      audit["versions"][0]["changed_paths"])
+
+    def test_dashboard_reports_a_pin_that_cannot_trade(self):
+        from research.edge_lab import init_ledger
+
+        with tempfile.TemporaryDirectory() as directory:
+            edge_db = Path(directory) / "edge.sqlite3"
+            init_ledger(edge_db)
+            from agent.config import DEFAULT_CONFIG as _DEFAULTS
+
+            config = {**_DEFAULTS}
+            config["strategy"] = {**config["strategy"],
+                                  "selection_mode": "pinned",
+                                  "pinned": [{"id": "pin-ghost",
+                                              "variant_id": "rule.ghost.1",
+                                              "vehicle": "equity",
+                                              "strategy_id": "rule",
+                                              "note": "", "promoted_at": ""}]}
+            view = dashboard._promotions(config, edge_db)
+        self.assertEqual(view["selection_mode"], "pinned")
+        self.assertTrue(view["frozen"])
+        self.assertEqual(len(view["pinned"]), 1)
+        self.assertEqual(view["unresolved"][0]["id"], "pin-ghost")
+
     def test_dashboard_exposes_edge_ledger_status(self):
         from research.edge_lab import EdgeLedger, init_ledger
         from tests.research.test_edge_discovery import _persist_gate

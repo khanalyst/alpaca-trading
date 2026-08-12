@@ -322,6 +322,57 @@ property of the system instead:
 That is the whole loop: propose with a reason and a citation, evaluate under
 unchanged gates, grade the reason, and hand the grade forward.
 
+### Learning shared across every strategy
+
+A per-family brief can only say what happened to one idea. Some of what
+research learns is not about one idea at all — that lowering a target tends to
+help across families, that live trials keep disagreeing with replays, that one
+direction of change fails everywhere it is tried. `shared_learning` aggregates
+exactly that and attaches it to every tuning and discovery request, so a fresh
+slot with no history of its own still has evidence to reason from.
+
+It is an aggregate of *outcomes*, never of market data: each entry is a
+parameter name, a direction, how many graded attempts changed it that way, and
+how many passed. Underpowered attempts are excluded — they say something about
+the sample, not the parameter — and a direction needs at least three graded
+attempts before it is reported, because a "trend" drawn from one is worse than
+no trend. Nothing in the digest is derived from a held-out, sealed, or
+later-forward observation, so sharing it adds no information about unseen data.
+
+## The demo-account trial lane
+
+`research.trial` closes the loop between the book and the search.
+
+A proved edge that is not pinned trades the demo account, and its real fills
+accumulate as `paper_outcomes`. After the trial window — `research.trial`
+config, default 20 sessions and 20 trades — the record is judged against an
+explicit floor (total R and mean R both positive by default):
+
+- **Clears it** → the edge keeps trading and becomes *promotable*. Nothing is
+  promoted; `edge promotable` hands the operator the config block.
+- **Misses it** → the edge is parked, and the reason is written into the lesson
+  ledger as a `trial` lesson from `live_paper`, graded immediately. The next
+  tuning request reads it, so the parameters proposed next are answering the
+  book rather than only the replay. This is the point of the lane.
+- **Window still open, or outcomes carry no usable R** → nothing happens.
+  Underpowered is not failure here either.
+
+A pinned edge is never judged: it is reported with its verdict and left exactly
+where the operator put it.
+
+```bash
+python research.py edge trials --dry-run   # verdicts, changing nothing
+python research.py edge trials             # park the failures (exit 3)
+python research.py edge promotable         # what has earned a promotion
+```
+
+The scheduled cycle runs the review *before* discovery and tuning, so a trial
+that just finished below its floor is already a recorded lesson by the time
+this cycle proposes anything. `ALPACA_TRIAL_REVIEW_ENABLED=0` turns it off.
+
+Parking an edge never promotes anything in its place. The replacement still has
+to earn `backtest_passed`, a strictly later shadow pass, and every gate.
+
 ```bash
 python research.py factory report --format markdown   # includes the graded reasons
 ```

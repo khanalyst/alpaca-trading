@@ -68,6 +68,14 @@ MAX_ROTATIONS = 2
 # than letting it drift toward that ceiling.
 LESSON_BRIEF_LIMIT = 8
 LESSON_BRIEF_BYTES = 6_000
+# The cross-family digest is an aggregate over many more rows than the brief,
+# because its whole value is that one family's eight attempts are not the only
+# evidence a slot has.
+SHARED_LEARNING_SAMPLE = 400
+SHARED_LEARNING_ROWS = 12
+# Below this, a "trend" is one or two attempts and reporting it as a pattern
+# would be worse than reporting nothing.
+SHARED_LEARNING_MIN_ATTEMPTS = 3
 # Hypothesis-level lessons are graded by the best variant the hypothesis
 # produced, not by the root, which by construction cannot beat itself.
 HYPOTHESIS_LESSON_KINDS = ("discovery", "reseed", "replacement", "rotation")
@@ -113,7 +121,8 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
                        tried_families: set[str], proved_families: Sequence[str],
                        diagnostic: Mapping[str, Any] | None = None,
                        seeded_this_cycle: Sequence[Mapping[str, Any]] = (),
-                       lessons: Sequence[Mapping[str, Any]] = ()) -> dict:
+                       lessons: Sequence[Mapping[str, Any]] = (),
+                       shared: Mapping[str, Any] | None = None) -> dict:
     """Build the small aggregate brief a discovery proposal is given."""
     context: dict[str, Any] = {
         "slot": int(slot),
@@ -137,6 +146,10 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
             for item in seeded_this_cycle]
     if lessons:
         context["lessons"] = list(lessons)
+    # What every slot has learned, not only this one.  A fresh slot has no
+    # history of its own and this is the only evidence it can reason from.
+    if shared and shared.get("graded_attempts"):
+        context["shared_learning"] = dict(shared)
     return context
 
 
@@ -181,7 +194,12 @@ def _failed_variants(factory: FactoryLedger, *, vehicle: str,
 def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
                   family: str | None = None,
                   limit: int = LESSON_BRIEF_LIMIT) -> list[dict]:
-    """The graded reason history a proposal is allowed to learn from."""
+    """The graded reason history a proposal is allowed to learn from.
+
+    Scoped to one family when tuning it, because the specific attempts on that
+    idea are what a parameter change should answer.  The cross-family view is
+    a separate, aggregated digest — see :func:`shared_learning`.
+    """
     try:
         rows = factory.lessons(vehicle=vehicle, family=family,
                                graded_only=True, limit=int(limit))
@@ -190,6 +208,88 @@ def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
         # must degrade to "no history", never to a failed research cycle.
         return []
     return _trim_lessons(rows)
+
+
+def shared_learning(factory: FactoryLedger, *, vehicle: str,
+                    limit: int = SHARED_LEARNING_SAMPLE) -> dict:
+    """What every strategy has learned, aggregated across all of them.
+
+    A per-family brief can only say what happened to *this* idea.  Some of what
+    research learns is not about one idea at all — that widening a stop tends
+    to help across families, that a live paper trial has never yet agreed with
+    a replay, that one direction of change keeps failing everywhere.  Sharing
+    that is what lets a slot benefit from the other six.
+
+    It is deliberately an aggregate of *outcomes*, never of market data: each
+    entry is a parameter name, how often changing it in a given direction
+    passed, and over how many graded attempts.  Nothing here can carry a
+    held-out or sealed observation into a proposal, because nothing here is
+    derived from one.
+    """
+    try:
+        rows = factory.lessons(vehicle=vehicle, graded_only=True,
+                               limit=int(limit))
+    except (sqlite3.Error, ValueError, KeyError):
+        return {"graded_attempts": 0, "parameters": [], "families": [],
+                "live_trials": {"run": 0, "failed": 0}}
+    parameters: dict[tuple[str, str], dict[str, int]] = {}
+    families: dict[str, dict[str, int]] = {}
+    trials = {"run": 0, "failed": 0}
+    for row in rows:
+        outcome = row.get("outcome") or {}
+        passed = bool(outcome.get("passed"))
+        underpowered = bool(outcome.get("underpowered"))
+        if row.get("kind") == "trial":
+            trials["run"] += 1
+            trials["failed"] += 0 if passed else 1
+        family = str(row.get("family") or "unknown")
+        bucket = families.setdefault(family, {"attempts": 0, "passed": 0})
+        bucket["attempts"] += 1
+        bucket["passed"] += 1 if passed else 0
+        if underpowered:
+            # An underpowered attempt says nothing about the parameter; only
+            # about the sample.  Counting it would manufacture a trend.
+            continue
+        for name, change in (row.get("changed") or {}).items():
+            direction = _direction(change)
+            if direction is None:
+                continue
+            entry = parameters.setdefault((str(name), direction),
+                                          {"attempts": 0, "passed": 0})
+            entry["attempts"] += 1
+            entry["passed"] += 1 if passed else 0
+    ranked = [
+        {"parameter": name, "direction": direction,
+         "attempts": stats["attempts"], "passed": stats["passed"]}
+        for (name, direction), stats in parameters.items()
+        if stats["attempts"] >= SHARED_LEARNING_MIN_ATTEMPTS
+    ]
+    ranked.sort(key=lambda item: (-item["attempts"], item["parameter"]))
+    return {
+        "graded_attempts": len(rows),
+        "parameters": ranked[:SHARED_LEARNING_ROWS],
+        "families": sorted(
+            ({"family": name, **stats} for name, stats in families.items()),
+            key=lambda item: (-item["passed"], -item["attempts"], item["family"])
+        )[:SHARED_LEARNING_ROWS],
+        "live_trials": trials,
+    }
+
+
+def _direction(change: Any) -> str | None:
+    """Whether a recorded delta raised, lowered, or switched a value."""
+    if not isinstance(change, Mapping) or {"from", "to"} - set(change):
+        return None
+    before, after = change.get("from"), change.get("to")
+    if isinstance(before, bool) or isinstance(after, bool):
+        return None
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        if after > before:
+            return "raised"
+        if after < before:
+            return "lowered"
+        return None
+    return "switched" if before != after else None
 
 
 def _seed_slot(previous: Mapping[str, Any], *, generation: int,
@@ -280,7 +380,8 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     config: Mapping[str, Any],
                     adapter: RuleProposalAdapter | None,
                     lessons: Sequence[Mapping[str, Any]] = (),
-                    already_failed: frozenset[str] = frozenset()
+                    already_failed: frozenset[str] = frozenset(),
+                    shared: Mapping[str, Any] | None = None
                     ) -> tuple[list[TunedVariant], ProposalResult | None]:
     """Choose this hypothesis's variants, each with the reason it was chosen.
 
@@ -310,8 +411,13 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     try:
         # An injected seam without ``tune``, or one that raises, means no
         # proposal — never a failed cycle.
+        # The diagnosis says how this hypothesis failed; the shared digest says
+        # what every other slot has found out about the same parameters.
+        diagnosis = dict(diagnostic)
+        if shared and shared.get("graded_attempts"):
+            diagnosis["shared_learning"] = dict(shared)
         proposal = (tune(vehicle=vehicle, slot=int(hypothesis["slot"]),
-                         rule_spec=root, diagnosis=dict(diagnostic),
+                         rule_spec=root, diagnosis=diagnosis,
                          count=max(1, int(count) - 1), lessons=list(lessons))
                     if callable(tune) else None)
     except Exception as exc:  # noqa: BLE001 - degraded, never fatal
@@ -456,6 +562,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
         {"slot": int(item["slot"]), "family": str(item["family"])}
         for item in factory.active(vehicle)]
     lessons = _lesson_brief(factory, vehicle=vehicle)
+    shared = shared_learning(factory, vehicle=vehicle)
     for slot in range(int(strategies)):
         if slot in active_slots:
             continue
@@ -482,7 +589,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                         tried_families={
                             str(item["family"]) for item in latest.values()},
                         proved_families=_proved_families(edge, vehicle),
-                        seeded_this_cycle=cycle_seeds, lessons=lessons),
+                        seeded_this_cycle=cycle_seeds, lessons=lessons,
+                        shared=shared),
                     llm_enabled=True, config=llm_config, adapter=adapter)
                 if (proposed is not None and
                         proposed_source == "llm_discovery"):
@@ -505,7 +613,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                     slot=slot, reason="slot_had_no_active_hypothesis",
                     previous=previous, tried_families=tried,
                     proved_families=_proved_families(edge, vehicle),
-                    seeded_this_cycle=cycle_seeds, lessons=lessons),
+                    seeded_this_cycle=cycle_seeds, lessons=lessons,
+                    shared=shared),
                 llm_enabled=llm_enabled, config=llm_config, adapter=adapter)
             if seed is None:
                 continue
@@ -939,6 +1048,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         # Between the phases, and only in this process, the variants are
         # chosen.  Every provider call the factory makes lives here, so no
         # adapter is ever pickled into a worker.
+        shared = shared_learning(factory, vehicle=vehicle)
         scheduled = []
         for task in tasks:
             hypothesis = task["hypothesis"]
@@ -966,7 +1076,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     lessons=_lesson_brief(factory, vehicle=vehicle,
                                           family=family),
                     already_failed=_failed_variants(factory, vehicle=vehicle,
-                                                    family=family))
+                                                    family=family),
+                    shared=shared)
                 if tuning is not None:
                     entry = {"hypothesis_id": hypothesis_id,
                              "slot": int(hypothesis["slot"]),
@@ -1275,7 +1386,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     context=_discovery_context(
                         slot=slot, reason="slot_proved_an_edge",
                         previous=hypothesis, tried_families=tried,
-                        proved_families=_proved_families(edge, vehicle)),
+                        proved_families=_proved_families(edge, vehicle),
+                        lessons=_lesson_brief(factory, vehicle=vehicle),
+                        shared=shared),
                     llm_enabled=llm_enabled, config=llm_config,
                     adapter=proposal_adapter)
                 reseed_payload: dict[str, Any] = {
@@ -1415,7 +1528,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                             slot=slot, reason="generation_budget_exhausted",
                             previous=hypothesis, tried_families=tried,
                             proved_families=_proved_families(edge, vehicle),
-                            diagnostic=aggregate),
+                            diagnostic=aggregate,
+                            lessons=_lesson_brief(factory, vehicle=vehicle),
+                            shared=shared),
                         llm_enabled=llm_enabled, config=llm_config,
                         adapter=proposal_adapter)
                 if seed is None:
