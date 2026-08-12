@@ -354,6 +354,22 @@ class EngineCycleMixin:
                 if sized is None:
                     continue
                 request, risk_plan = sized
+                # Bind the exact immutable edge proof that authorized this
+                # entry.  The ledger may advance to a newer verified run
+                # before the position closes; deriving this later from the
+                # candidate would silently attribute the outcome to the wrong
+                # proof epoch.  Persist the snapshot alongside the order
+                # before any broker submission can be recorded.
+                if isinstance(edge_record, Mapping):
+                    risk_plan = dict(risk_plan)
+                    candidate_id = edge_record.get("candidate_id")
+                    if candidate_id is not None:
+                        risk_plan["candidate_id"] = str(candidate_id)
+                    latest_proof = edge_record.get("latest_proof")
+                    if isinstance(latest_proof, Mapping):
+                        proof_run_id = latest_proof.get("run_id")
+                        if proof_run_id is not None:
+                            risk_plan["proof_run_id"] = str(proof_run_id)
                 try:
                     candidate_risk = self._required_number(
                         risk_plan.get("risk_usd"), "planned risk_usd")

@@ -14,6 +14,9 @@ import unittest
 from unittest.mock import patch
 
 from agent.config import DEFAULT_CONFIG, validate_config
+from agent.alpaca_provider import AlpacaError
+from agent.contracts.rule import rule_variant_id
+from agent.engine import Engine
 from agent.edge import (resolve_pinned_variants, resolve_validated_variants,
                         unresolved_promotions)
 from research.edge_lab import EdgeLedger
@@ -177,6 +180,138 @@ class UnresolvedPromotionTests(unittest.TestCase):
     def test_no_promotions_means_nothing_to_report(self):
         base = copy.deepcopy(DEFAULT_CONFIG)
         self.assertEqual(unresolved_promotions(validate_config(base)), [])
+
+
+class LivePinnedRuntimeTests(unittest.TestCase):
+    """A validated promotion stays exact across live startup refreshes."""
+
+    class _LiveProvider:
+        paper = False
+        endpoint = "https://api.alpaca.markets"
+
+        class Session:
+            api_key = "key"
+            secret_key = "secret"
+
+        session = Session()
+
+    def test_live_pinned_startup_ignores_competing_champion_and_fails_closed(self):
+        from agent import state
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_base = state.RUNTIME_BASE
+            state.RUNTIME_BASE = Path(directory) / "runtime"
+            state.configure_runtime("live")
+            state.ensure_ready()
+            self.addCleanup(lambda: self._restore_runtime(state, runtime_base))
+
+            db_path = Path(directory) / "edge.sqlite3"
+            ledger = EdgeLedger(db_path)
+
+            def deploy(variant_id, status, family):
+                record = ledger.register_candidate(
+                    variant_id, strategy_id="rule", vehicle="equity",
+                    hypothesis=variant_id,
+                    config={"strategy": {"rule_spec": {"family": family}}})
+                with closing(sqlite3.connect(ledger.path)) as db, db:
+                    db.execute("UPDATE candidate_state SET status=? WHERE candidate_id=?",
+                               (status, record["candidate_id"]))
+                return ledger.candidate(record["candidate_id"])
+
+            pinned_variant = rule_variant_id({"family": "opening_range_breakout"})
+            competing_variant = rule_variant_id({"family": "mean_reversion"})
+            pinned = deploy(pinned_variant, "validated", "opening_range_breakout")
+            competing = deploy(competing_variant, "champion", "mean_reversion")
+
+            def proof_for(candidate_id, *, lane=None):
+                record = ledger.candidate(candidate_id)
+                if record is None:
+                    return None
+                return {"lane": lane or "shadow",
+                        "config_hash": record["config_hash"],
+                        "metrics": {"confidence": 1.0},
+                        "verified_gate": {"passes": True}}
+
+            with patch.dict("os.environ", {"ALPACA_LIVE_ENABLE": "true"}, clear=False):
+                cfg = validate_config({
+                    "mode": "live",
+                    "broker": {"paper": False, "allow_live": True},
+                    "strategy": {
+                        "selection_mode": "pinned", "execution_mode": "shares",
+                        "pinned": [{"id": "promote-baseline",
+                                    "variant_id": pinned_variant,
+                                    "vehicle": "equity"}],
+                    },
+                    "research": {"enabled": True,
+                                 "require_validated_variant": True,
+                                 "db_path": str(db_path)},
+                })
+            with patch.dict("os.environ", {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
+                    patch.object(EdgeLedger, "latest_verified_run",
+                                 side_effect=proof_for):
+                engine = Engine(cfg, light=True, provider=self._LiveProvider())
+            self.addCleanup(engine.close)
+
+            self.assertEqual(engine._edge_record["candidate_id"],
+                             pinned["candidate_id"])
+            self.assertNotEqual(engine._edge_record["candidate_id"],
+                                competing["candidate_id"])
+            # Startup refresh re-resolves the pin, rather than selecting the
+            # stronger champion that an automatic resolver would prefer.
+            with patch.object(EdgeLedger, "latest_verified_run",
+                              side_effect=proof_for):
+                self.assertTrue(engine._refresh_edge(), engine._edge_error)
+            self.assertEqual(engine._edge_record["candidate_id"],
+                             pinned["candidate_id"])
+
+            # A missing proof blocks the exact pin and cannot fall through to
+            # the competing champion.
+            with patch.object(EdgeLedger, "latest_verified_run",
+                              return_value=None):
+                self.assertFalse(engine._refresh_edge())
+            self.assertIsNone(engine._edge_record)
+
+    def test_engine_rejects_direct_live_llm_but_preserves_paper_injection(self):
+        live_cfg = {
+            "mode": "live",
+            "broker": {"paper": False, "allow_live": True},
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "selection_mode": "specific"},
+            "research": {"enabled": True,
+                         "require_validated_variant": True},
+        }
+        with patch.dict("os.environ", {"ALPACA_LIVE_ENABLE": "true"}, clear=False):
+            with self.assertRaisesRegex(AlpacaError, "runtime LLM"):
+                Engine({**live_cfg, "llm": {"enabled": True}},
+                       light=True, provider=self._LiveProvider())
+            with self.assertRaisesRegex(AlpacaError, "runtime LLM"):
+                Engine(live_cfg, light=True, provider=self._LiveProvider(),
+                       brain=object())
+
+        class PaperProvider:
+            paper = True
+            endpoint = "https://paper-api.alpaca.markets"
+
+            class Session:
+                api_key = "key"
+                secret_key = "secret"
+
+            session = Session()
+
+        brain = object()
+        engine = Engine({
+            "mode": "paper", "broker": {"paper": True, "allow_live": False},
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "selection_mode": "specific"},
+            "llm": {"enabled": False},
+        }, light=True, provider=PaperProvider(), brain=brain)
+        self.addCleanup(engine.close)
+        self.assertIs(engine.brain, brain)
+
+    @staticmethod
+    def _restore_runtime(state, runtime_base):
+        state.RUNTIME_BASE = runtime_base
+        state.configure_runtime("paper")
 
 
 if __name__ == "__main__":

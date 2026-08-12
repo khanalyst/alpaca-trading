@@ -909,6 +909,14 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertIsNone(ledger.select_champion(
                 vehicle="equity", min_confidence=.9))
             self.assertFalse(ledger.eligibility(candidate_id)["eligible"])
+            with self.assertRaisesRegex(
+                    ValueError, "passing verified shadow proof"):
+                ledger.ingest_paper_outcome(candidate_id, {
+                    "opportunity_id": "post-failed-proof",
+                    "session_date": "2026-01-01",
+                    "net_pnl": 1.0,
+                    "risk_usd": 1.0,
+                })
 
     def _validated_candidate(self, ledger, variant, hypothesis, scores):
         candidate = ledger.register_candidate(
@@ -1124,6 +1132,15 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         options = {"min_trades": 5, "min_sessions": 5, "lane": "auto", **kwargs}
         return discover(data, db_path=root / "edge.sqlite3", variants_path=variants,
                         config=self.CONFIG, **options)
+
+    def test_edge_lab_rejects_invalid_statistical_policy_inputs_before_replay(self):
+        rows = _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 2)
+        for kwargs in ({"alpha": 0.0}, {"alpha": float("nan")},
+                       {"min_trades": 0}, {"min_sessions": 1.5},
+                       {"min_trades": True}):
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(DiscoveryError):
+                    self._discover(rows, directory, **kwargs)
 
     def test_the_gate_reports_a_null_control_and_a_sealed_window(self):
         with tempfile.TemporaryDirectory() as directory:

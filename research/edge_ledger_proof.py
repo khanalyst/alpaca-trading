@@ -203,9 +203,19 @@ class EdgeLedgerProofMixin:
             return "verified gate p/q evidence is invalid"
         if not (0.0 <= p_value <= 1.0 and 0.0 <= q_value <= 1.0 and 0.0 < alpha <= 1.0):
             return "verified gate p/q evidence is invalid"
+        family_q_value = _finite_number(statistics.get("family_q_value"))
+        if family_q_value is None or not 0.0 <= family_q_value <= 1.0:
+            return "verified gate family FDR evidence is invalid"
+        # Family correction and cycle-global correction authorize different
+        # decisions.  Never compare the family flag with the global q (or the
+        # global flag with the family q): a candidate may pass its local family
+        # while correctly failing the cross-family gate.
         if "family_fdr_significant" in checks and \
-                bool(checks["family_fdr_significant"]) != (q_value <= alpha):
-            return "verified gate FDR decision is inconsistent"
+                bool(checks["family_fdr_significant"]) != (family_q_value <= alpha):
+            return "verified gate family FDR decision is inconsistent"
+        if "global_fdr_significant" in checks and \
+                bool(checks["global_fdr_significant"]) != (q_value <= alpha):
+            return "verified gate global FDR decision is inconsistent"
         control = envelope.get("control")
         if not isinstance(control, Mapping):
             return "verified gate control decision is inconsistent"
@@ -331,16 +341,21 @@ class EdgeLedgerProofMixin:
                 return "verified gate falsification p-value does not survive recomputation"
         return None
 
-    def _latest_verified_gate(self, candidate_id: str) -> tuple[dict, dict]:
-        runs = self._runs(candidate_id)
+    def _latest_verified_gate(self, candidate_id: str, *, lane: str | None = None) -> tuple[dict, dict]:
+        runs = self._runs(candidate_id, lane=lane)
         if not runs:
             raise ValueError("lifecycle transition requires persisted verified gate evidence")
-        run = dict(runs[-1])
+        return self._verified_gate_for_run(str(runs[-1]["run_id"]))
+
+    def _verified_gate_for_run(self, run_id: str) -> tuple[dict, dict]:
+        run = self.run(run_id)
+        if run is None:
+            raise ValueError("persisted run is missing")
         with closing(_connect(self.path)) as db:
             row = db.execute("""SELECT * FROM evidence
                 WHERE candidate_id=? AND run_id=? AND kind='verified_gate'
                 ORDER BY created_at DESC,evidence_id DESC LIMIT 1""",
-                (candidate_id, run["run_id"])).fetchone()
+                (run["candidate_id"], run["run_id"])).fetchone()
         if row is None:
             raise ValueError("latest persisted run lacks verified gate evidence")
         try:
@@ -356,17 +371,23 @@ class EdgeLedgerProofMixin:
             raise ValueError("latest persisted verified gate envelope is invalid")
         return run, dict(envelope)
 
+    def verified_run(self, run_id: str) -> tuple[dict, dict] | None:
+        """Return one run and its gate only when the durable proof re-verifies."""
+        try:
+            return self._verified_gate_for_run(str(run_id))
+        except ValueError:
+            return None
+
     def latest_verified_run(self, candidate_id: str, *,
                             lane: str | None = None) -> dict | None:
         """Return the latest run only when its durable gate proof re-verifies."""
         try:
-            run, gate = self._latest_verified_gate(candidate_id)
+            run, gate = self._latest_verified_gate(candidate_id, lane=lane)
         except ValueError:
             return None
         if lane is not None and run.get("lane") != lane:
             return None
         result = dict(run)
-        result["metrics"] = json.loads(result.pop("metrics_json"))
         result["verified_gate"] = gate
         result["gate_hash"] = gate["content_hash"]
         return result

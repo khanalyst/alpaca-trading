@@ -205,14 +205,29 @@ class StartupEdgePolicyMixin:
         if not isinstance(research, Mapping) or not research.get("enabled", False):
             return True
         try:
-            from .edge import (apply_variant, resolve_validated_variant,
+            from .edge import (apply_variant, resolve_pinned_variants,
+                               resolve_validated_variant,
                                resolve_validated_variants)
             lookup = deepcopy(self._edge_base_cfg)
             if self._edge_requested_variant:
                 lookup.setdefault("strategy", {})["variant_id"] = self._edge_requested_variant
             else:
                 lookup.setdefault("strategy", {}).pop("variant_id", None)
-            if self.mode == "live":
+            if self.mode == "live" and self._edge_selection_mode == "pinned":
+                # Re-resolve the operator's promotion, then insist that both
+                # immutable identities are unchanged.  A pin that goes stale
+                # must stop trading; it must never fall through to a
+                # competing champion or a newly selected record.
+                pinned_records = resolve_pinned_variants(
+                    lookup, db_path=self._edge_db_path or None)
+                record = (pinned_records[0]
+                          if len(pinned_records) == 1 and
+                          str(pinned_records[0].get("candidate_id") or "") ==
+                          self._edge_pinned_candidate_id and
+                          str(pinned_records[0].get("config_hash") or "") ==
+                          self._edge_pinned_config_hash else None)
+                records = [record] if record is not None else []
+            elif self.mode == "live":
                 record = resolve_validated_variant(
                     lookup, db_path=self._edge_db_path or None,
                     candidate_id=self._edge_pinned_candidate_id)

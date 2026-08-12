@@ -18,6 +18,8 @@ from research.edge_ledger import (
     PAPER_DRIFT_MIN_OUTCOMES,
 )
 from research.edge_lab import EdgeLedger
+from research.trial import review_trials
+from .test_strategy_factory import persist_rule_gate
 
 
 def _ledger(directory):
@@ -124,6 +126,36 @@ class PaperPerformanceTests(unittest.TestCase):
                 ledger.ingest_paper_outcome(candidate, {
                     "opportunity_id": "same", "session_date": "2026-05-01",
                     "net_pnl": 100.0, "risk_usd": 100.0})
+            self.assertEqual(ledger.paper_performance(candidate)["outcomes"], 1)
+
+    def test_retrial_uses_only_the_new_shadow_proof_epoch(self):
+        policy = {"research": {"trial": {"enabled": True,
+                                            "min_sessions": 5,
+                                            "min_trades": 10,
+                                            "min_mean_r": 0.0,
+                                            "min_total_r": 0.0}}}
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = _ledger(directory)
+            candidate = _candidate(ledger, status=None)
+            persist_rule_gate(ledger, candidate, "backtest")
+            ledger.transition(candidate, "backtest_passed", reason="backtest proof")
+            persist_rule_gate(ledger, candidate, "shadow")
+            ledger.transition(candidate, "shadow", reason="shadow proof started")
+            ledger.transition(candidate, "validated", reason="shadow proof passed")
+            _outcomes(ledger, candidate, [-1.0] * 12, prefix="old")
+            review = review_trials(ledger.path, config=policy)
+            self.assertEqual(review["parked"][0]["candidate_id"], candidate)
+
+            # Re-proof the same immutable candidate identity.  The new trial
+            # must not inherit the old losses from the demoted epoch.
+            persist_rule_gate(ledger, candidate, "shadow")
+            ledger.transition(candidate, "shadow", reason="new shadow proof")
+            ledger.transition(candidate, "validated", reason="new shadow proof passed")
+            report = ledger.paper_performance(candidate)
+            self.assertEqual(report["outcomes"], 0)
+            # Reuse the same opportunity id to exercise the legacy unique-key
+            # migration path; storage keys are epoch-qualified internally.
+            _outcomes(ledger, candidate, [1.0], prefix="old")
             self.assertEqual(ledger.paper_performance(candidate)["outcomes"], 1)
 
 

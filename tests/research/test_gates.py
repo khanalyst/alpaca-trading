@@ -6,7 +6,7 @@ from research.gates import (
     AcceptanceFloor, SealedWindowError, chronological_split,
     deterministic_placebo_deltas, falsification_gate, matched_cluster_test,
     paired_delta, performance_floor, placebo_null_distribution,
-    recompute_gate_statistics, seal_final_window, structural_floor,
+    qualification_report, recompute_gate_statistics, seal_final_window, structural_floor,
     verified_gate_envelope, verify_gate_envelope, walk_forward_report,
 )
 
@@ -197,6 +197,48 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertTrue(verify_gate_envelope(envelope))
         envelope["passes"] = False
         self.assertFalse(verify_gate_envelope(envelope))
+
+    def test_qualification_source_digests_are_recomputed_and_tampering_fails(self):
+        candidate = _rows(3, net=2.0)
+        baseline = _rows(3, net=0.0, prefix="baseline")
+        qualification = qualification_report(
+            candidate, baseline, vehicle="equity",
+            sessions=sorted({row["session_date"] for row in candidate}))
+        self.assertTrue(qualification["candidate_observation_digest"])
+        control = matched_cluster_test(candidate, baseline, vehicle="equity")
+        envelope = verified_gate_envelope(
+            lane="shadow", vehicle="equity", fit=[], heldout=candidate,
+            fit_floor=structural_floor([], vehicle="equity", min_trades=0,
+                                        min_sessions=0, required=False),
+            heldout_floor=structural_floor(
+                candidate, vehicle="equity", min_trades=1, min_sessions=1),
+            control={**control, "actual_control": True},
+            p_value=control["p_value"], q_value=.5, alpha=.05,
+            falsification={"passes": False},
+            separation={"passes": True},
+            checks={"global_fdr_significant": False,
+                    "heldout_delta_positive": True},
+            passes=False, qualification=qualification)
+        self.assertTrue(verify_gate_envelope(envelope))
+        tampered = copy.deepcopy(envelope)
+        tampered["qualification"]["candidate_observations"][0]["net_pnl"] = 99.0
+        # Re-signing the outer envelope does not make source evidence valid.
+        from research.gates import _content_hash
+        tampered["content_hash"] = _content_hash(
+            {key: value for key, value in tampered.items()
+             if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(tampered))
+
+    def test_family_fdr_can_pass_while_global_fdr_fails(self):
+        # This is the ordinary BH case: one p=.01 among six tests has global
+        # q=.06, while its two-test family has q=.02.
+        from research.stats import benjamini_hochberg
+        family = benjamini_hochberg({"target": .01, "sibling": .9}, alpha=.05)
+        global_ = benjamini_hochberg(
+            {"target": .01, "sibling": .9, "other-a": .9,
+             "other-b": .9, "other-c": .9, "other-d": .9}, alpha=.05)
+        self.assertTrue(family["target"]["significant"])
+        self.assertFalse(global_["target"]["significant"])
 
 
 if __name__ == "__main__":

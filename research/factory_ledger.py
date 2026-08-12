@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any, Mapping
 import uuid
 
-from .edge_lab import DEFAULT_DB_PATH, EdgeLedger, canonical_json
+from .edge_lab import DEFAULT_DB_PATH, EdgeLedger, canonical_json, content_hash
 from .gates import verify_gate_envelope
 
 
@@ -550,16 +550,55 @@ class FactoryLedger:
             ))
 
     def last_boundary(self, hypothesis_id: str, vehicle: str) -> str | None:
+        # A factory account is diagnostic evidence, not a consumed forward
+        # boundary: it is written before the gate knows whether all intended
+        # shadow variants were adequately powered.  Read boundaries only from
+        # durable EdgeLedger proof runs, so an underpowered sibling cannot make
+        # the next cycle skip unseen observations.
         with closing(_connect(self.path)) as db:
-            rows = db.execute("""SELECT result_json FROM factory_accounts
-                WHERE hypothesis_id=? AND vehicle=? ORDER BY created_at DESC""",
-                (hypothesis_id, vehicle)).fetchall()
+            try:
+                rows = db.execute("""SELECT r.run_id, r.candidate_id,
+                        r.heldout_end, r.fit_end, r.metrics_json, c.axes_json,
+                        e.payload_json,
+                        e.evidence_hash
+                    FROM runs r JOIN candidates c ON c.candidate_id=r.candidate_id
+                    JOIN evidence e ON e.run_id=r.run_id AND e.kind='verified_gate'
+                    WHERE r.vehicle=? AND r.lane='shadow'""",
+                    (vehicle,)).fetchall()
+            except sqlite3.Error:
+                return None
+        proof_ledger = EdgeLedger(self.path)
         values = []
         for row in rows:
             try:
-                value = json.loads(row["result_json"]).get("evaluation_end")
-                if value:
-                    values.append(str(value))
+                axes = json.loads(row["axes_json"] or "{}")
+                if axes.get("hypothesis_id") != hypothesis_id:
+                    continue
+                verified = proof_ledger.verified_run(str(row["run_id"]))
+                if (verified is None or verified[0].get("candidate_id") !=
+                        row["candidate_id"] or verified[0].get("lane") != "shadow" or
+                        verified[0].get("vehicle") != vehicle or
+                        verified[1].get("passes") is not True):
+                    continue
+                payload = json.loads(row["payload_json"] or "{}")
+                if (row["evidence_hash"] != content_hash(payload) or
+                        not isinstance(payload, Mapping)):
+                    continue
+                gate = payload.get("gate")
+                if (not isinstance(gate, Mapping) or
+                        payload.get("gate_hash") != gate.get("content_hash") or
+                        not verify_gate_envelope(gate)):
+                    continue
+                for value in (row["heldout_end"], row["fit_end"]):
+                    if value:
+                        values.append(str(value))
+                metrics = json.loads(row["metrics_json"] or "{}")
+                run_gate = metrics.get("gate") if isinstance(metrics, Mapping) else None
+                qualification = (run_gate.get("qualification")
+                                 if isinstance(run_gate, Mapping) else None)
+                if isinstance(qualification, Mapping):
+                    values.extend(str(item) for item in
+                                   (qualification.get("sessions") or ()) if item)
             except json.JSONDecodeError:
                 continue
         return max(values) if values else None

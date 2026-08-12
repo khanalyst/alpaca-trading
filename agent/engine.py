@@ -64,11 +64,27 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         self._edge_selection_mode = str(
             strategy_cfg.get("selection_mode") or
             ("specific" if self.mode == "live" else "all_proved"))
+        llm_cfg = cfg.get("llm", {})
+        llm_enabled = bool(llm_cfg.get("enabled", False)) if isinstance(llm_cfg, Mapping) else False
         if self.mode == "live":
             requested = str(strategy_cfg.get("variant_id") or "").strip()
-            if (not requested or requested.lower() == "auto" or
-                    self._edge_selection_mode != "specific"):
-                raise AlpacaError("live mode requires one named specific strategy variant")
+            if self._edge_selection_mode == "specific":
+                if not requested or requested.lower() == "auto":
+                    raise AlpacaError("live mode requires a named specific strategy variant")
+            elif self._edge_selection_mode == "pinned":
+                pinned_entries = strategy_cfg.get("pinned")
+                if (not isinstance(pinned_entries, (list, tuple)) or
+                        len(pinned_entries) != 1):
+                    raise AlpacaError("live mode requires exactly one strategy.pinned entry")
+            else:
+                raise AlpacaError(
+                    "live mode requires strategy.selection_mode=specific or pinned")
+            # Configuration validation rejects this too, but Engine is also a
+            # public construction boundary.  A caller must not be able to
+            # inject an LLM brain into a live run by skipping validation.
+            if llm_enabled or brain is not None:
+                raise AlpacaError(
+                    "live mode forbids runtime LLM decisions; use the deterministic validated edge")
         research_cfg = cfg.get("research", {}) if isinstance(cfg, Mapping) else {}
         if self.mode == "live" and (
                 not isinstance(research_cfg, Mapping) or
@@ -92,8 +108,16 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         if isinstance(research_cfg, Mapping) and research_cfg.get("enabled", False):
             try:
                 from .edge import (apply_variant, resolve_validated_variant,
-                                   resolve_validated_variants)
-                if self.mode == "live" or self._edge_selection_mode == "specific":
+                                   resolve_validated_variants,
+                                   resolve_pinned_variants)
+                if self.mode == "live" and self._edge_selection_mode == "pinned":
+                    records = resolve_pinned_variants(
+                        cfg, db_path=self._edge_db_path or None)
+                    # A malformed/directly-constructed config must not make a
+                    # pinned live process trade more than its one promotion.
+                    if len(records) != 1:
+                        records = []
+                elif self.mode == "live" or self._edge_selection_mode == "specific":
                     record = resolve_validated_variant(
                         cfg, db_path=self._edge_db_path or None)
                     records = [record] if record is not None else []
@@ -126,8 +150,6 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
             raise AlpacaError(f"provider is not {self.mode} scoped")
         session_cfg = cfg.get("session", {})
         self.market = market_data or MarketData(self.provider, SessionPolicy(**session_cfg))
-        llm_cfg = cfg.get("llm", {})
-        llm_enabled = bool(llm_cfg.get("enabled", False)) if isinstance(llm_cfg, Mapping) else False
         self.brain = brain or (DecisionBrain(llm_cfg) if llm_enabled and not light else None)
         self.risk = RiskEngine(self._edge_base_cfg)
         self.light = light

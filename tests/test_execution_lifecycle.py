@@ -417,6 +417,84 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual(sum(row[4] or 0 for row in self._journal_trades()),
                          Decimal("-25"))
 
+    def test_protective_cancel_requires_broker_terminal_confirmation(self):
+        self._bind_engine(runtime_name="runtime-protection-confirmation")
+
+        class StaleCancelProvider(LifecycleProvider):
+            def orders(self, **_):
+                return [Order("protect-leg", "SPY", Decimal("10"), "sell",
+                               "accepted", "limit", "day")]
+
+        provider = StaleCancelProvider()
+        provider.orders_by_id["protect-leg"] = Order(
+            "protect-leg", "SPY", Decimal("10"), "sell", "accepted",
+            "limit", "day")
+        self.engine.provider = provider
+        leg = {"order_id": "protect-leg", "role": "target", "status": "accepted"}
+        self.assertFalse(self.engine._cancel_protective_legs("SPY", [leg]))
+        self.assertEqual(leg["status"], "accepted")
+
+    def test_close_journal_replay_is_idempotent_after_state_removal_crash(self):
+        self._bind_engine(runtime_name="runtime-close-replay")
+        _, entry = self._submit_stock_entry(client_order_id="entry-close-replay")
+        self.provider.set_order(entry.id, status="filled", filled_qty=10,
+                                filled_avg_price=101.5)
+        position = Position("SPY", Decimal("10"), "long",
+                            avg_entry_price=Decimal("101.5"),
+                            current_price=Decimal("98"))
+        self.provider.positions_live = [position]
+        self.engine.reconcile()
+        self.engine._monitor_positions(
+            datetime(2026, 8, 7, 14, tzinfo=timezone.utc), [position])
+        close = self.provider.close_requests[-1]
+        close_order = next(item for item in self.provider.orders_by_id.values()
+                           if item.client_order_id == close.client_order_id)
+        self.provider.set_order(close_order.id, status="filled", filled_qty=10,
+                                filled_avg_price=99)
+        self.provider.positions_live = []
+        with mock.patch.object(state, "update_state",
+                               side_effect=OSError("crash after journal commit")):
+            with self.assertRaises(OSError):
+                self.engine.reconcile()
+        self.assertEqual([row[1] for row in self._journal_trades()],
+                         ["open", "close"])
+
+        self.engine.reconcile()
+        self.assertEqual([row[1] for row in self._journal_trades()],
+                         ["open", "close"])
+        self.assertEqual(state.load_state()["active_trades"], {})
+
+    def test_edge_proof_identity_survives_fill_and_close_outbox(self):
+        self._bind_engine(runtime_name="runtime-proof-epoch")
+        request = OrderRequest("SPY", Decimal("10"), "buy",
+                               client_order_id="entry-proof-epoch")
+        order = self.provider.submit_order(request)
+        plan = {
+            "execution_profile": "shares", "direction": "long",
+            "entry_price": 101.5, "stop_price": 99, "target_price": 105,
+            "underlying_stop_price": 99, "underlying_target_price": 105,
+            "underlying_symbol": "SPY", "contract_multiplier": Decimal("1"),
+            "setup_id": "proof-epoch-setup", "setup_type": "ibr",
+            "variant_id": "ibr.target.1_5r", "candidate_id": "candidate-old",
+            "proof_run_id": "shadow-run-old", "risk_usd": 100, "notional": 1000,
+        }
+        self.engine._record_open_order(request, order, plan)
+        self.provider.set_order(order.id, status="filled", filled_qty=10,
+                                filled_avg_price=101.5)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("10"), "long", avg_entry_price=Decimal("101.5"),
+            current_price=Decimal("101"))]
+        self.engine.reconcile()
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["candidate_id"], "candidate-old")
+        self.assertEqual(trade["proof_run_id"], "shadow-run-old")
+
+        self.engine._record_edge_outcome(trade, -25.0, -2.5, 99.0)
+        queued = self.engine._pending_edge_outcomes[-1]
+        self.assertEqual(queued["outcome"]["candidate_id"], "candidate-old")
+        self.assertEqual(queued["outcome"]["proof_run_id"], "shadow-run-old")
+        self.assertTrue(queued["entry_id"].endswith("\0shadow-run-old"))
+
     def _run_lifecycle(self, *, option=False):
         symbol = "SPY260821C00600000" if option else "SPY"
         quantity = Decimal("1") if option else Decimal("246")

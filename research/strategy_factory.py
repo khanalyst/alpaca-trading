@@ -1270,6 +1270,11 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             len(local) == int(worker.get("expected_variants", 0)) and
             len(adequate) == len(local))
         passing = [item for item in local if item[1]["passes"]]
+        if worker["mode"] == "shadow" and not all_intended_adequate:
+            # A passing subset is not a passing shadow cycle.  Keep the gate
+            # verdicts in the account report for diagnosis, but do not advance
+            # the hypothesis lifecycle or reseed its slot.
+            passing = []
         for variant, gate in local:
             reason, origin = proposals.get(
                 str(hypothesis["hypothesis_id"]), {}).get(
@@ -1303,7 +1308,15 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     edge.append_evidence(
                         candidate["candidate_id"], "llm_strategy_proposal", lineage)
             run = None
-            if gate["sample_adequate"] and gate["heldout_sample_adequate"]:
+            # Shadow variants share one forward boundary.  Do not persist a
+            # proof run for an adequately-powered sibling while another
+            # intended variant is underpowered: that would advance the
+            # hypothesis boundary and make the underpowered variant skip the
+            # same unseen observations on the next cycle.
+            persist_run = (gate["sample_adequate"] and
+                           gate["heldout_sample_adequate"] and
+                           (worker["mode"] != "shadow" or all_intended_adequate))
+            if persist_run:
                 fit, held = partitions[variant["account"]["account_id"]]
                 run = edge.append_run(
                     candidate["candidate_id"], lane=worker["mode"], vehicle=vehicle,

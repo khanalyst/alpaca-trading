@@ -20,7 +20,7 @@ CANDIDATE, BACKTEST_PASSED, SHADOW, VALIDATED, CHAMPION, RETIRED, DEMOTED = LIFE
 DEFAULT_DB_PATH = Path(os.getenv(
     "ALPACA_EDGE_DB",
     str(Path(__file__).resolve().parents[1] / "runtime" / "research" / "edge_lab.sqlite3")))
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 
@@ -155,6 +155,7 @@ def init_ledger(path: str | Path = DEFAULT_DB_PATH) -> dict:
                 opportunity_id TEXT NOT NULL,
                 session_date TEXT,
                 net_pnl REAL NOT NULL,
+                proof_run_id TEXT REFERENCES runs(run_id),
                 outcome_json TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 UNIQUE(candidate_id, opportunity_id)
@@ -207,6 +208,14 @@ def init_ledger(path: str | Path = DEFAULT_DB_PATH) -> dict:
                 SELECT RAISE(ABORT, 'paper outcomes are immutable');
             END;
         """)
+        # ``proof_run_id`` scopes live paper observations to the shadow proof
+        # epoch that authorized the deployment.  Existing ledgers predate the
+        # column; nullable migration preserves their historical rows while a
+        # newly proved epoch can no longer inherit them.
+        paper_columns = {row[1] for row in db.execute(
+            "PRAGMA table_info(paper_outcomes)").fetchall()}
+        if "proof_run_id" not in paper_columns:
+            db.execute("ALTER TABLE paper_outcomes ADD COLUMN proof_run_id TEXT")
         db.execute("INSERT OR REPLACE INTO ledger_meta(key,value) VALUES('schema',?)",
                    (str(SCHEMA_VERSION),))
     return {"db_path": str(target), "schema": SCHEMA_VERSION}

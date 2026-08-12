@@ -19,6 +19,11 @@ _TERMINAL_ORDER_STATUSES = {
     "filled", "canceled", "cancelled", "expired", "rejected", "replaced", "stopped",
     "suspended", "failed", "not_found",
 }
+# Alpaca may use these terminal aliases on the order endpoint even though the
+# normalized lifecycle rows generally use the shorter forms above.
+_PROTECTIVE_TERMINAL_STATUSES = _TERMINAL_ORDER_STATUSES | {
+    "done", "closed", "done_for_day",
+}
 
 
 _EDGE_OUTBOX_WARN = 500
@@ -26,8 +31,10 @@ _EDGE_OUTBOX_WARN = 500
 
 def _outbox_entry_id(outcome: Mapping) -> str:
     """Identify a learning event by the opportunity the ledger keys on."""
+    proof_run_id = outcome.get("proof_run_id")
+    suffix = f"\0{proof_run_id}" if proof_run_id else ""
     return (f"{outcome.get('variant_id')}\0{outcome.get('vehicle')}"
-            f"\0{outcome.get('opportunity_id')}")
+            f"\0{outcome.get('opportunity_id')}{suffix}")
 
 
 def _plain(value):
@@ -203,6 +210,8 @@ class ExecutionLifecycleMixin:
                                          existing.get("hold_deadline_ts")),
             "risk_usd": plan.get("risk_usd"),
             "notional": plan.get("notional"), "variant_id": plan.get("variant_id"),
+            "candidate_id": plan.get("candidate_id"),
+            "proof_run_id": plan.get("proof_run_id"),
             "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
             "contract_multiplier": plan.get("contract_multiplier", 1),
@@ -422,40 +431,147 @@ class ExecutionLifecycleMixin:
         """Cancel resting bracket legs before any close, or refuse to close.
 
         A live leg reserves the position quantity at the broker, so a close
-        submitted underneath it is rejected for insufficient quantity.  A
-        cancel that cannot be proven leaves the close unsafe to send.
+        submitted underneath it is rejected for insufficient quantity.  The
+        cancel endpoint's acceptance response is not proof: a stop/target can
+        fill in the race window, so the broker's terminal order snapshot must
+        confirm every leg before a close is sent.
         """
         live = [leg for leg in legs if _leg_live(leg)]
         if not live:
             return True
         cancel = getattr(self.provider, "cancel_order", None)
-        if not callable(cancel):
+        orders = getattr(self.provider, "orders", None)
+        if not callable(orders):
+            # Lightweight/test providers may expose only their existing
+            # reconciliation snapshot.  It is still a broker boundary and
+            # therefore sufficient for terminal-status proof; an absent
+            # snapshot remains fail-closed below.
+            reconcile = getattr(self.provider, "reconcile", None)
+            if callable(reconcile):
+                def orders(**_kwargs):
+                    snapshot = reconcile()
+                    return snapshot.get("orders") if isinstance(snapshot, Mapping) else None
+        if not callable(cancel) or not callable(orders):
             self._event("protection_cancel_failed", {
-                "symbol": symbol, "reason": "provider cannot cancel one order"})
+                "symbol": symbol,
+                "reason": "provider cannot cancel and confirm one order"})
             return False
-        cancelled = []
+
+        cancel_errors: dict[str, str] = {}
         for leg in live:
             leg_id = str(leg.get("order_id"))
             try:
                 cancel(leg_id)
             except Exception as exc:  # noqa: BLE001
+                # A cancel race often reports a provider error after the
+                # broker has already filled the child.  Continue to the
+                # authoritative snapshot before deciding whether it is safe.
+                cancel_errors[leg_id] = str(exc)
+
+        by_id: dict[str, Any] = {}
+        # The order endpoint can lag the cancel request by one short poll. A
+        # bounded retry proves terminal state without turning a close into an
+        # unbounded wait. Missing/working rows remain unsafe.
+        for poll in range(3):
+            try:
+                try:
+                    snapshot = orders(status="all")
+                except TypeError:
+                    snapshot = orders()
+            except Exception as exc:  # noqa: BLE001
                 self._event("protection_cancel_failed", {
-                    "symbol": symbol, "order_id": leg_id, "error": str(exc)})
+                    "symbol": symbol, "reason": f"status confirmation unavailable: {exc}"})
                 return False
-            cancelled.append(leg_id)
-            leg["status"] = "canceled"
+            if not isinstance(snapshot, (list, tuple)):
+                self._event("protection_cancel_failed", {
+                    "symbol": symbol, "reason": "status confirmation malformed"})
+                return False
+            by_id = {
+                str(_value(order, "id", "")): order
+                for order in snapshot
+                if _value(order, "id", None) is not None
+            }
+            unresolved = False
+            for leg in live:
+                broker_leg = by_id.get(str(leg.get("order_id")))
+                if broker_leg is None:
+                    unresolved = True
+                    continue
+                status_value = _value(broker_leg, "status", "")
+                status = str(getattr(status_value, "value", status_value) or "")
+                status = status.split(".")[-1].strip().lower()
+                filled_qty = self._number(_value(broker_leg, "filled_qty", 0)) or 0.0
+                if filled_qty > 0 or status == "filled":
+                    # A filled child is the close.  Mark it as such so the
+                    # monitor cannot submit a second market close while the
+                    # next reconciliation catches its terminal evidence.
+                    leg["status"] = "filled"
+                    leg["filled_qty"] = filled_qty
+                    leg["filled_avg_price"] = self._number(
+                        _value(broker_leg, "filled_avg_price", None))
+                    leg["cancel_race"] = True
+                    self._event("protection_fill_race", {
+                        "symbol": symbol, "order_id": str(leg.get("order_id")),
+                        "status": status, "filled_qty": filled_qty})
+                    unresolved = True
+                    continue
+                if status not in _PROTECTIVE_TERMINAL_STATUSES:
+                    unresolved = True
+                    continue
+                leg["status"] = status
+                if str(leg.get("order_id")) in cancel_errors:
+                    # The error is acceptable only because the broker now
+                    # proves a terminal non-fill state.
+                    self._event("protection_cancel_confirmed_after_error", {
+                        "symbol": symbol, "order_id": str(leg.get("order_id")),
+                        "status": status, "error": cancel_errors[str(leg.get("order_id"))]})
+            if not unresolved:
+                break
+            if poll < 2:
+                time.sleep(0.05)
+
+        cancelled = [str(leg.get("order_id")) for leg in live
+                     if str(leg.get("status", "")).lower() in _PROTECTIVE_TERMINAL_STATUSES
+                     and str(leg.get("status", "")).lower() not in _FILLED_ORDER_STATUSES]
+        unsafe = [str(leg.get("order_id")) for leg in live
+                  if str(leg.get("status", "")).lower() not in _PROTECTIVE_TERMINAL_STATUSES]
+        filled = [str(leg.get("order_id")) for leg in live
+                  if str(leg.get("status", "")).lower() in _FILLED_ORDER_STATUSES]
+
         def mark(current: dict) -> dict:
             for bucket in ("active_trades", "protection"):
                 row = current.get(bucket, {}).get(symbol)
+                if not isinstance(row, dict):
+                    continue
                 for leg in _leg_rows(row):
-                    if str(leg.get("order_id")) in cancelled:
-                        leg["status"] = "canceled"
+                    leg_id = str(leg.get("order_id"))
+                    if leg_id in cancelled or leg_id in filled:
+                        source = next((item for item in live
+                                       if str(item.get("order_id")) == leg_id), None)
+                        if source is not None:
+                            leg.update({key: value for key, value in source.items()
+                                        if key in {"status", "filled_qty",
+                                                   "filled_avg_price", "cancel_race"}})
+                        if leg_id in filled:
+                            row["status"] = "closing"
+                            row.setdefault("closing_reason", "protection_fill")
+                            row.setdefault("closing_order_id", leg_id)
             return current
         try:
             state.update_state(mark)
         except Exception as exc:  # noqa: BLE001
             self._event("protection_cancel_failed", {
                 "symbol": symbol, "reason": f"cancel not durable: {exc}"})
+            return False
+        if filled:
+            # A child fill is terminal broker evidence, but not proof that the
+            # whole position is flat.  Refuse the parent close and let
+            # reconciliation attribute any residual quantity.
+            return False
+        if unsafe:
+            self._event("protection_cancel_failed", {
+                "symbol": symbol, "order_ids": unsafe,
+                "reason": "broker status is not terminal"})
             return False
         self._event("protection_cancelled", {"symbol": symbol,
                                               "order_ids": cancelled})
@@ -847,9 +963,23 @@ class ExecutionLifecycleMixin:
                 realized = (exit_price - entry) * qty * multiplier * sign
             pnl_pct = ((exit_price - entry) / entry * 100.0 * sign
                        if entry and exit_price is not None else None)
+            # The broker's terminal close and durable active-trade removal are
+            # separate writes (SQLite and JSON respectively).  A crash in
+            # between must replay the close journal as a no-op, not book a
+            # second realized P&L row.  Entry/close order ids are stable across
+            # process restarts; the fallback includes the original open time
+            # for a broker-only position with no local entry order.
+            entry_order_id = str(trade.get("order_id") or "")
+            close_order_id = str(trade.get("closing_order_id") or "")
+            close_trade_id = (
+                f"close:{entry_order_id}:{close_order_id}"
+                if entry_order_id or close_order_id else
+                f"close:{symbol}:{trade.get('opened_at')}"
+            )
             state.log_trade(
                 symbol, "sell" if str(trade.get("position_side", "long")) == "long" else "buy",
                 "close", qty, price=exit_price, reason=trade.get("closing_reason", "broker_reconcile"),
+                trade_id=close_trade_id,
                 realized_pnl_usd=realized, pnl_pct=pnl_pct,
                 close_trigger=trade.get("closing_reason", "broker_reconcile"),
                 setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
@@ -858,7 +988,6 @@ class ExecutionLifecycleMixin:
                 variant_id=trade.get("variant_id"), runtime_mode=self.mode,
                 account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
             self._record_edge_outcome(trade, realized, pnl_pct, exit_price)
-            entry_order_id = str(trade.get("order_id") or "")
             entry_order = order_state.get(entry_order_id)
             if isinstance(entry_order, dict):
                 closing_attempt = self._number(trade.get("closing_attempt"))
@@ -907,6 +1036,8 @@ class ExecutionLifecycleMixin:
         opened = self._number(trade.get("opened_at")) or time.time()
         outcome = {
             "variant_id": variant_id, "vehicle": vehicle,
+            "candidate_id": trade.get("candidate_id"),
+            "proof_run_id": trade.get("proof_run_id"),
             "opportunity_id": trade.get("setup_id") or
                               f"{trade.get('symbol')}:{opened:.6f}",
             "session_date": datetime.fromtimestamp(opened, timezone.utc).date().isoformat(),

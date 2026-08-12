@@ -10,6 +10,7 @@ the gate that will judge it exists, and that reason is graded afterwards and
 handed back to the next proposal.
 """
 
+from contextlib import closing
 import json
 from pathlib import Path
 import tempfile
@@ -506,7 +507,7 @@ class LessonLedgerTests(unittest.TestCase):
                                       family="x", variant_id=variant,
                                       kind="tuning", source="llm", reason="Why.")
             import sqlite3
-            with sqlite3.connect(factory.path) as db:
+            with closing(sqlite3.connect(factory.path)) as db, db:
                 with self.assertRaises(sqlite3.IntegrityError):
                     db.execute("UPDATE factory_lessons SET reason='rewritten'")
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -620,7 +621,7 @@ class FeedbackLoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             factory, _edge = _ledgers(directory)
             import sqlite3
-            with sqlite3.connect(factory.path) as db:
+            with closing(sqlite3.connect(factory.path)) as db, db:
                 db.execute("DROP TABLE factory_lesson_outcomes")
                 db.execute("DROP TABLE factory_lessons")
             self.assertEqual(_lesson_brief(factory, vehicle="equity"), [])
@@ -735,7 +736,7 @@ class SharedLearningTests(unittest.TestCase):
                               "live_trials": {"run": 0, "failed": 0}})
             import sqlite3
 
-            with sqlite3.connect(factory.path) as db:
+            with closing(sqlite3.connect(factory.path)) as db, db:
                 db.execute("DROP TABLE factory_lesson_outcomes")
                 db.execute("DROP TABLE factory_lessons")
             self.assertEqual(

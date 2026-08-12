@@ -30,6 +30,10 @@ HEARTBEAT_FILE = RUNTIME / "heartbeat.json"
 STATE_LOCK_FILE = RUNTIME / "state.lock"
 EVENTS_FILE = RUNTIME / "events.jsonl"
 JOURNAL_FILE = RUNTIME / "journal.db"
+# A process can discover an observability failure before the cycle writer
+# emits its normal ``running`` heartbeat.  Keep the degraded reason at the
+# mode-scoped state facade so later heartbeat calls cannot erase it.
+OBSERVABILITY_DEGRADED_REASON: str | None = None
 
 
 class RuntimeIdentityError(RuntimeError):
@@ -39,6 +43,10 @@ class RuntimeIdentityError(RuntimeError):
 def _set_paths(runtime: Path, scope: str) -> Path:
     global RUNTIME_SCOPE, RUNTIME, STATE_FILE, PID_FILE, HEARTBEAT_FILE
     global STATE_LOCK_FILE, EVENTS_FILE, JOURNAL_FILE
+    global OBSERVABILITY_DEGRADED_REASON
+    runtime = Path(runtime)
+    same_scope = RUNTIME_SCOPE == scope
+    same_runtime = Path(RUNTIME) == runtime
     RUNTIME_SCOPE = scope
     RUNTIME = runtime
     STATE_FILE = runtime / "state.json"
@@ -47,7 +55,25 @@ def _set_paths(runtime: Path, scope: str) -> Path:
     STATE_LOCK_FILE = runtime / "state.lock"
     EVENTS_FILE = runtime / "events.jsonl"
     JOURNAL_FILE = runtime / "journal.db"
+    # Rebinding the same mode/path is a normal startup/readiness operation;
+    # it must not erase a sticky observability fault before the next heartbeat
+    # is emitted.  A genuinely different runtime scope or directory starts a
+    # fresh observability epoch.
+    if not (same_scope and same_runtime):
+        OBSERVABILITY_DEGRADED_REASON = None
     return runtime
+
+
+def mark_observability_degraded(reason: str) -> None:
+    """Keep a runtime observability fault sticky across normal heartbeats."""
+    global OBSERVABILITY_DEGRADED_REASON
+    OBSERVABILITY_DEGRADED_REASON = str(reason or "runtime_observability_degraded")
+
+
+def clear_observability_degraded() -> None:
+    """Clear a recovered observability fault for the current runtime scope."""
+    global OBSERVABILITY_DEGRADED_REASON
+    OBSERVABILITY_DEGRADED_REASON = None
 
 
 def configure_runtime(mode: str, base: Path | None = None) -> Path:
@@ -140,7 +166,7 @@ def update_state(update: Mapping[str, Any] | Callable[[dict], Mapping[str, Any] 
 def initialize_journal() -> Path:
     """Create/migrate the current mode-scoped operational journal."""
     try:
-        return journal.initialize_journal(
+        path = journal.initialize_journal(
             JOURNAL_FILE,
             RUNTIME,
             RUNTIME_SCOPE,
@@ -149,6 +175,35 @@ def initialize_journal() -> Path:
             connect=sqlite3.connect,
             connection_factory=_ClosingConnection,
         )
+        # A close can be observed more than once when a process crashes after
+        # the SQLite journal commit but before the JSON active-trade removal.
+        # Give those rows a durable uniqueness boundary.  ``NULL`` remains
+        # allowed for legacy/open rows that predate close idempotency.
+        with sqlite3.connect(path, timeout=5,
+                             factory=_ClosingConnection) as db:
+            db.execute("PRAGMA busy_timeout=5000")
+            # Serialize this small migration with other initializers.  The
+            # base journal adapter is itself idempotent, but this optional
+            # column/index used to be added in a second transaction: two
+            # startups could both observe the missing column and one would
+            # fail on ``duplicate column name``.
+            db.execute("BEGIN IMMEDIATE")
+            if "trade_id" not in _journal_columns(db, "trades"):
+                try:
+                    db.execute("ALTER TABLE trades ADD COLUMN trade_id TEXT")
+                except sqlite3.OperationalError as exc:
+                    # A legacy process may have completed the ALTER between
+                    # the probe and statement.  Re-probe and continue only if
+                    # the required column is now present; all other migration
+                    # failures remain fail-closed.
+                    if "duplicate column name" not in str(exc).lower() or \
+                            "trade_id" not in _journal_columns(db, "trades"):
+                        raise
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS trades_trade_id_unique "
+                "ON trades(trade_id) WHERE trade_id IS NOT NULL")
+            db.commit()
+        return path
     except JournalNotReady:
         raise
     except (OSError, sqlite3.Error, RuntimeError) as exc:
@@ -258,6 +313,9 @@ def append_operational_history(path: str | Path, payload: dict) -> None:
 def write_heartbeat(status: str, **detail) -> dict:
     if status not in {"starting", "running", "degraded", "pausing", "paused", "killed", "stopped"}:
         raise ValueError(f"unsupported heartbeat status {status!r}")
+    if status == "running" and OBSERVABILITY_DEGRADED_REASON:
+        status = "degraded"
+        detail["reason"] = OBSERVABILITY_DEGRADED_REASON
     payload = {"schema": 1, "status": status, "updated_ts": time.time(),
                "pid": os.getpid(), "runtime_mode": RUNTIME_SCOPE if RUNTIME_SCOPE in {"paper", "live", "test"} else None,
                **detail}
@@ -309,13 +367,60 @@ def log_equity(equity: Any, state_name: str | None = None, **detail) -> None:
 
 
 def log_trade(symbol, side, action, qty, price=None, notional=None,
-              reason=None, **detail) -> None:
+              reason=None, trade_id: str | None = None, **detail) -> None:
+    """Append a trade row, suppressing a previously committed close replay.
+
+    ``trade_id`` is deliberately supplied by the close lifecycle, rather than
+    generated here: it must be stable across a restart while the broker's
+    terminal close order and the JSON active-trade removal settle separately.
+    The unique SQLite index is the final race boundary; the read avoids a
+    noisy integrity error on the normal replay path.
+    """
+    if trade_id is None:
+        candidate = detail.get("trade_id")
+        if candidate is not None:
+            trade_id = str(candidate)
+    if trade_id is not None:
+        trade_id = str(trade_id)
+        ensure_ready()
+        try:
+            with sqlite3.connect(JOURNAL_FILE, timeout=5,
+                                 factory=_ClosingConnection) as db:
+                db.execute("PRAGMA busy_timeout=5000")
+                row = db.execute(
+                    "SELECT 1 FROM trades WHERE trade_id=? LIMIT 1",
+                    (trade_id,),
+                ).fetchone()
+            if row is not None:
+                return
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            raise JournalNotReady(f"journal trade idempotency check failed: {exc}") from exc
     row = {"ts": time.time(), "symbol": symbol, "side": side,
            "action": action, "qty": float(qty) if qty is not None else None,
            "price": float(price) if price is not None else None,
            "notional": float(notional) if notional is not None else None,
-           "reason": reason, **detail}
-    _journal_insert("trades", row)
+           "reason": reason, "trade_id": trade_id, **detail}
+    try:
+        _journal_insert("trades", row)
+    except JournalNotReady:
+        # Two recovery workers can pass the read above concurrently.  The
+        # partial unique index turns the loser into a journal error; if the
+        # winning row is now visible, treat that race as the intended replay
+        # no-op rather than reporting a false durability failure.
+        if trade_id is not None:
+            try:
+                with sqlite3.connect(JOURNAL_FILE, timeout=5,
+                                     factory=_ClosingConnection) as db:
+                    db.execute("PRAGMA busy_timeout=5000")
+                    duplicate = db.execute(
+                        "SELECT 1 FROM trades WHERE trade_id=? LIMIT 1",
+                        (trade_id,),
+                    ).fetchone()
+                if duplicate is not None:
+                    return
+            except (OSError, sqlite3.Error, RuntimeError):
+                pass
+        raise
     try:
         _append(EVENTS_FILE, {"ts": row["ts"], "kind": "trade",
                               "payload": json.dumps(row, default=str)})

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import json
+import math
 from pathlib import Path
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -118,6 +119,15 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         raise DiscoveryError("vehicle must be equity or option")
     if lane not in {"auto", "backtest", "shadow"}:
         raise DiscoveryError("lane must be auto, backtest, or shadow")
+    # These values are policy inputs, not harmless replay hints.  Reject bools,
+    # fractional counts, non-finite values and out-of-range alpha before any
+    # corpus is sealed or a candidate is registered.
+    for name, value in (("min_trades", min_trades), ("min_sessions", min_sessions)):
+        if (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise DiscoveryError(f"{name} must be a positive integer")
+    if (isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or
+            not math.isfinite(float(alpha)) or not 0.0 < float(alpha) <= 1.0):
+        raise DiscoveryError("alpha must be finite and in (0,1]")
     raw_rows, bars, snapshots, quotes = _read_discovery_rows(data)
     from agent.variants import load_registry
     registry_path = variants_path or Path(__file__).with_name("variants.yaml")

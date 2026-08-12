@@ -13,8 +13,10 @@ double close is the mode-scoped run lock: a running trader holds it for its
 whole life, so a watchdog that cannot take that lock stays inert no matter how
 stale the heartbeat looks, and the flatten it eventually performs runs under
 the same lock and the same deterministic client-order-id scheme the trader
-uses.  A hung-but-alive trader still owns the lock and is deliberately left
-alone; no action beats an unsynchronized second closer.
+uses.  Before any close, the watchdog authenticates the broker account and
+binds the returned account id to the mode-scoped runtime fingerprint.  A
+hung-but-alive trader still owns the lock and is deliberately left alone; no
+action beats an unsynchronized second closer.
 
 Nothing local helps when the broker or the network is unreachable.  That
 residual is real and is documented rather than papered over.
@@ -103,35 +105,120 @@ def _engine(cfg: Mapping[str, Any], provider):
     return Engine(dict(cfg), light=True, provider=provider)
 
 
+def _lock_handle_open(handle: Any) -> bool:
+    """Return whether a transferred run-lock descriptor can still be used."""
+    if handle is None or bool(getattr(handle, "closed", False)):
+        return False
+    try:
+        handle.fileno()
+    except (OSError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def _bind_verified_identity(cfg: Mapping[str, Any], provider) -> str:
+    """Authenticate and bind the broker account before any destructive call."""
+    mode = str(cfg.get("mode", "paper")).lower()
+    if mode not in {"paper", "live"}:
+        raise WatchdogError("watchdog mode is invalid")
+    try:
+        account = provider.account()
+    except Exception as exc:  # noqa: BLE001
+        raise WatchdogError(f"cannot verify broker account identity: {exc}") from exc
+    account_id = getattr(account, "id", None)
+    if account_id is None and isinstance(account, Mapping):
+        account_id = account.get("id")
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        raise WatchdogError("broker account identity is unavailable")
+    session = getattr(provider, "session", None)
+    api_key = getattr(session, "api_key", None)
+    if not api_key:
+        broker = cfg.get("broker") if isinstance(cfg.get("broker"), Mapping) else {}
+        api_key = broker.get("api_key")
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise WatchdogError("authenticated API key is unavailable")
+    fingerprint = agent_state.account_fingerprint(
+        mode, f"{api_key}\0{account_id}")
+    try:
+        agent_state.bind_account_identity(fingerprint)
+    except Exception as exc:  # noqa: BLE001
+        raise WatchdogError(f"runtime account identity verification failed: {exc}") from exc
+    return fingerprint
+
+
 def run_once(cfg: Mapping[str, Any], provider, *, max_age: float,
              now: float | None = None) -> dict:
     mode = str(cfg.get("mode", "paper")).lower()
     agent_state.configure_runtime(mode)
-    heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
     handle = agent_state.acquire_run_lock()
-    trader_alive = handle is None
-    if handle is not None:
-        agent_state.release_run_lock(handle)
-    positions = [] if trader_alive else provider.positions()
-    verdict = decide(heartbeat, positions, trader_alive=trader_alive,
-                     max_age=max_age, now=now)
-    verdict["heartbeat_status"] = str(heartbeat.get("status") or "missing")
-    if not verdict["act"]:
-        return verdict
-    fingerprint = agent_state.load_state().get("account_fingerprint")
-    if fingerprint:
-        session = getattr(provider, "session", None)
-        expected = agent_state.account_fingerprint(
-            mode, str(getattr(session, "api_key", "") or ""))
-        if expected != fingerprint:
-            raise WatchdogError(
-                "runtime state belongs to a different account; refusing to flatten")
-    engine = _engine(cfg, provider)
     try:
-        verdict["flattened"] = bool(engine.flatten_all("watchdog_stale_heartbeat"))
+        if handle is None:
+            # A running trader legitimately owns the mode-scoped lock.  The
+            # watchdog remains inert, including when that trader is hung.
+            heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
+            return {
+                "act": False, "reason": INERT_TRADER,
+                "heartbeat_status": str(heartbeat.get("status") or "missing"),
+                "status": "watching",
+            }
+
+        # Keep the lock from this point through every snapshot and the action.
+        # Re-read the heartbeat immediately before flattening so a trader that
+        # refreshed while the watchdog was obtaining its snapshot wins safely.
+        heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
+        positions = provider.positions()
+        verdict = decide(heartbeat, positions, trader_alive=False,
+                         max_age=max_age, now=now)
+        verdict["heartbeat_status"] = str(heartbeat.get("status") or "missing")
+        if not verdict["act"]:
+            verdict["status"] = "watching"
+            return verdict
+
+        heartbeat = _read_json(agent_state.HEARTBEAT_FILE)
+        positions = provider.positions()
+        verdict = decide(heartbeat, positions, trader_alive=False,
+                         max_age=max_age, now=now)
+        verdict["heartbeat_status"] = str(heartbeat.get("status") or "missing")
+        if not verdict["act"]:
+            verdict["status"] = "watching"
+            return verdict
+
+        # Identity is checked after the final read-only snapshot and before
+        # constructing the flatten engine.  Missing identity is bound only
+        # from this authenticated account response; an existing mismatch is
+        # rejected by bind_account_identity and no order is submitted.
+        verdict["account_fingerprint"] = _bind_verified_identity(cfg, provider)
+        engine = _engine(cfg, provider)
+        # Engine.flatten_all normally acquires a temporary lock.  Transfer the
+        # watchdog's already-held descriptor so it cannot release/reacquire
+        # around the destructive action and introduce a race.
+        engine._lock_handle = handle
+        owned_handle = handle
+        handle = None
+        try:
+            verdict["flattened"] = bool(
+                engine.flatten_all("watchdog_stale_heartbeat"))
+            verdict["residual_risk"] = not verdict["flattened"]
+            verdict["status"] = "acted" if verdict["flattened"] else "degraded"
+        finally:
+            # Let the engine own release when it still has a usable descriptor.
+            # A current/future flatten implementation may release the
+            # transferred handle itself; clear a closed descriptor before
+            # close() so that method cannot attempt a second release.
+            if not _lock_handle_open(owned_handle):
+                engine._lock_handle = None
+            try:
+                engine.close()
+            finally:
+                # A lightweight/injected engine may not release its handle at
+                # all.  Fall back only while the descriptor is still open.
+                if _lock_handle_open(owned_handle):
+                    agent_state.release_run_lock(owned_handle)
+        return verdict
     finally:
-        engine.close()
-    return verdict
+        if handle is not None:
+            agent_state.release_run_lock(handle)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,9 +260,12 @@ def main(argv=None) -> int:
         try:
             verdict = run_once(cfg, provider, max_age=args.max_heartbeat_age)
             failures = 0
-            write_status(status_path, "acted" if verdict["act"] else "watching",
+            status = str(verdict.get("status") or (
+                "watching" if not verdict["act"] else
+                "acted" if verdict.get("flattened") is True else "degraded"))
+            write_status(status_path, status,
                          **{key: value for key, value in verdict.items()
-                            if key != "act"})
+                            if key not in {"act", "status"}})
         except Exception as exc:                           # noqa: BLE001
             # The watchdog can only act on a state it has proved.  An error
             # here means it has not, so it reports and takes no action.
@@ -185,7 +275,9 @@ def main(argv=None) -> int:
                          consecutive_failures=failures)
             if args.once:
                 return 1
-        if args.once or not _running:
+        if args.once:
+            return 1 if verdict.get("act") and verdict.get("flattened") is not True else 0
+        if not _running:
             return 0
         time.sleep(args.interval)
 

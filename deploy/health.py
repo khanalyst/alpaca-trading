@@ -45,7 +45,27 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         heartbeat.get("research_expected") is True
         and (heartbeat.get("research_available") is not True
              or heartbeat.get("research_status") not in {"healthy", "disabled"}))
-    ok = fresh and status in {"starting", "running", "paused"} and research_ok
+    reason = str(heartbeat.get("reason") or "").strip()
+    # ``paused`` is a safe operator gate unless the payload explicitly
+    # describes residual exposure or a failed/degraded operation.  Degraded
+    # is never healthy: it is the runtime's assertion that safety could not
+    # be proven (most importantly, an incomplete flatten).
+    residual_risk = status == "degraded" or status == "failed" or any(
+        marker in reason.lower()
+        for marker in ("flatten", "residual", "incomplete", "failed", "error", "unavailable")
+    )
+    operator_pause = status in {"paused", "pausing"} and not residual_risk
+    classification = (
+        "degraded_residual_risk" if residual_risk else
+        "operator_pause" if operator_pause else
+        "healthy"
+    )
+    alert_kind = (
+        "residual_risk" if residual_risk else
+        "operator_pause" if operator_pause else
+        None
+    )
+    ok = fresh and status in {"starting", "running", "paused", "pausing"} and research_ok and not residual_risk
     return {
         "ok": ok,
         "component": "trader",
@@ -53,6 +73,13 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "fresh": fresh,
         "research_available": heartbeat.get("research_available"),
         "research_status": heartbeat.get("research_status"),
+        "reason": reason or None,
+        "classification": classification,
+        "pause_class": classification,
+        "operator_pause": operator_pause,
+        "residual_risk": residual_risk,
+        "alert": residual_risk,
+        "alert_kind": alert_kind,
     }
 
 
@@ -103,12 +130,25 @@ def watchdog(path: Path, max_age: float, *, now: float | None = None) -> dict:
     status_payload = _read_json(path)
     status = str(status_payload.get("status") or "missing")
     fresh = _fresh(status_payload.get("updated_ts"), max_age, now)
+    flattened = status_payload.get("flattened")
+    # An ``acted`` record is healthy only when flatten completion was
+    # explicitly confirmed.  Older/malformed records and degraded/failed
+    # records remain visible but are residual-risk alerts.
+    incomplete = status == "acted" and flattened is not True
+    residual_risk = status in {"degraded", "failed"} or incomplete
+    alert_kind = "residual_risk" if residual_risk else None
     return {
-        "ok": fresh and status in {"watching", "acted"},
+        "ok": fresh and status in {"watching", "acted"} and not incomplete,
         "component": "watchdog",
         "status": status,
         "fresh": fresh,
         "reason": status_payload.get("reason"),
+        "flattened": flattened,
+        "classification": "degraded_residual_risk" if residual_risk else "healthy",
+        "pause_class": "degraded_residual_risk" if residual_risk else "healthy",
+        "residual_risk": residual_risk,
+        "alert": residual_risk,
+        "alert_kind": alert_kind,
     }
 
 

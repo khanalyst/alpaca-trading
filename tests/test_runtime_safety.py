@@ -1022,6 +1022,45 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(any(call.args and call.args[0] == "flatten_orders_error"
                             for call in event.call_args_list))
 
+    def test_flatten_does_not_bulk_cancel_when_active_state_is_malformed(self):
+        provider = FakeProvider()
+        engine = Engine(_cfg(), light=True, provider=provider)
+        with patch("agent.runtime_control.state.load_state",
+                   return_value={"active_trades": []}), \
+                patch.object(engine, "_event") as event:
+            self.assertFalse(engine.flatten_all("malformed-state"))
+        self.assertEqual(provider.cancel_calls, 0)
+        self.assertTrue(any(call.args and call.args[0] == "flatten_state_error"
+                            for call in event.call_args_list))
+
+    def test_config_audit_failure_marks_runtime_observability_degraded(self):
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        with patch("agent.governance.record_config_version",
+                   side_effect=OSError("audit disk full")), \
+                patch("agent.runtime_control.state.write_heartbeat") as heartbeat:
+            engine._record_config_version()
+        self.assertTrue(engine._observability_degraded)
+        heartbeat.assert_called_once()
+        self.assertEqual(heartbeat.call_args.args[0], "degraded")
+        self.assertEqual(heartbeat.call_args.kwargs["reason"],
+                         "config_audit_unavailable")
+
+    def test_config_audit_degraded_heartbeat_survives_normal_cycle_write(self):
+        from agent import state
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        with patch("agent.governance.record_config_version",
+                   side_effect=OSError("audit disk full")):
+            engine._record_config_version()
+        # The cycle writer uses the ordinary running status; the state facade
+        # must retain the sticky degraded reason discovered at startup.
+        with patch.object(engine, "_run_once_impl",
+                          side_effect=lambda *_args: state.write_heartbeat(
+                              "running", run_id=engine.run_id)):
+            engine.run_once({})
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "degraded")
+        self.assertEqual(heartbeat["reason"], "config_audit_unavailable")
+
     def test_flatten_fails_closed_when_final_position_poll_errors(self):
         class FinalPositionErrorProvider(FakeProvider):
             def __init__(self):

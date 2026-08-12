@@ -459,6 +459,8 @@ class EdgeLedger(EdgeLedgerProofMixin):
         run = self.latest_verified_run(candidate_id, lane="shadow")
         if not isinstance(run, Mapping):
             return None
+        if (run.get("verified_gate") or {}).get("passes") is not True:
+            return None
         start, end = run.get("heldout_start"), run.get("heldout_end")
         if not isinstance(start, str) or not isinstance(end, str) or not start or not end:
             return None
@@ -520,10 +522,20 @@ class EdgeLedger(EdgeLedgerProofMixin):
         return report
 
     def _paper_r_history(self, candidate_id: str) -> list[tuple[float, float]]:
+        epoch, has_shadow = self._trial_epoch_state(candidate_id)
         with closing(_connect(self.path)) as db:
-            rows = db.execute(
-                "SELECT created_at,outcome_json FROM paper_outcomes WHERE candidate_id=? "
-                "ORDER BY created_at,outcome_id", (candidate_id,)).fetchall()
+            if has_shadow and epoch is None:
+                rows = []
+            elif epoch is None:
+                rows = db.execute(
+                    "SELECT created_at,outcome_json FROM paper_outcomes "
+                    "WHERE candidate_id=? AND proof_run_id IS NULL "
+                    "ORDER BY created_at,outcome_id", (candidate_id,)).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT created_at,outcome_json FROM paper_outcomes "
+                    "WHERE candidate_id=? AND proof_run_id=? "
+                    "ORDER BY created_at,outcome_id", (candidate_id, epoch)).fetchall()
         history: list[tuple[float, float]] = []
         for row in rows:
             try:
@@ -537,6 +549,49 @@ class EdgeLedger(EdgeLedgerProofMixin):
             if number is not None and created_at is not None:
                 history.append((created_at, number))
         return history
+
+    def _trial_epoch(self, candidate_id: str) -> str | None:
+        """Return the latest verified shadow run authorizing paper outcomes.
+
+        A candidate may be demoted and later re-proved under the same variant
+        identity.  The proof run, rather than the candidate id, is therefore
+        the deployment epoch; observations from an older epoch must never
+        influence a new trial verdict.
+        """
+        return self._trial_epoch_state(candidate_id)[0]
+
+    def _trial_epoch_state(self, candidate_id: str) -> tuple[str | None, bool]:
+        """Return the authorizing epoch and whether shadow history exists.
+
+        A failed or invalid latest shadow proof quarantines paper history; only
+        candidates with no shadow run at all retain legacy NULL behavior.
+        """
+        runs = self._runs(candidate_id, lane="shadow")
+        if not runs:
+            return None, False
+        try:
+            run, gate = self._latest_verified_gate(candidate_id, lane="shadow")
+        except ValueError:
+            return None, True
+        if gate.get("passes") is not True:
+            return None, True
+        return str(run["run_id"]), True
+
+    def _authorize_proof_run(self, candidate_id: str, proof_run_id: Any) -> str:
+        if (isinstance(proof_run_id, (bool, bytes, bytearray)) or
+                not str(proof_run_id).strip()):
+            raise ValueError("paper outcome proof_run_id is invalid")
+        verified = self.verified_run(str(proof_run_id))
+        if verified is None:
+            raise ValueError("paper outcome proof_run_id has no valid durable proof")
+        run, gate = verified
+        candidate = self.candidate(candidate_id)
+        if (run.get("candidate_id") != candidate_id or
+                run.get("lane") != "shadow" or
+                (candidate is not None and run.get("vehicle") != candidate.get("vehicle")) or
+                gate.get("passes") is not True):
+            raise ValueError("paper outcome proof_run_id does not authorize this candidate")
+        return str(run["run_id"])
 
     def _paper_summary(self, candidate_id: str, outcome_id: str,
                        *, duplicate: bool = False) -> dict:
@@ -565,6 +620,16 @@ class EdgeLedger(EdgeLedgerProofMixin):
         error = "paper outcome requires finite net_pnl and positive risk_usd"
         if not isinstance(outcome, Mapping):
             raise ValueError(error)
+        explicit_proof = outcome.get("proof_run_id") if "proof_run_id" in outcome else None
+        has_explicit_proof = ("proof_run_id" in outcome and
+                              explicit_proof not in (None, ""))
+        if has_explicit_proof:
+            proof_run_id = self._authorize_proof_run(candidate_id, explicit_proof)
+        else:
+            proof_run_id, has_shadow = self._trial_epoch_state(candidate_id)
+            if has_shadow and proof_run_id is None:
+                raise ValueError(
+                    "paper outcome requires a passing verified shadow proof")
         vehicle = str(outcome.get("vehicle") or candidate["vehicle"])
         if vehicle != candidate["vehicle"]:
             raise ValueError("paper outcome vehicle differs from candidate")
@@ -592,19 +657,35 @@ class EdgeLedger(EdgeLedgerProofMixin):
         # An outcome is identified by its opportunity, so a retried delivery
         # from the runtime's durable outbox is a no-op rather than a second
         # observation of the same closed trade.
+        normalized["proof_run_id"] = proof_run_id
+        epoch_opportunity = (f"{opportunity}@epoch:{proof_run_id}"
+                             if proof_run_id is not None else opportunity)
         with closing(_connect(self.path)) as db:
             prior = db.execute(
-                "SELECT outcome_id FROM paper_outcomes WHERE candidate_id=? AND opportunity_id=?",
-                (candidate_id, opportunity)).fetchone()
+                "SELECT outcome_id,proof_run_id FROM paper_outcomes "
+                "WHERE candidate_id=? AND opportunity_id IN (?,?) "
+                "ORDER BY CASE WHEN opportunity_id=? THEN 0 ELSE 1 END, created_at "
+                "LIMIT 1",
+                (candidate_id, opportunity, epoch_opportunity,
+                 epoch_opportunity)).fetchone()
         if prior is not None:
-            return self._paper_summary(candidate_id, prior["outcome_id"], duplicate=True)
+            # The legacy uniqueness key predates proof epochs.  If a runtime
+            # legitimately reuses an opportunity id after re-proofing, retain
+            # both immutable observations under epoch-scoped internal keys;
+            # retries within the same epoch remain idempotent.
+            if prior["proof_run_id"] == proof_run_id:
+                return self._paper_summary(candidate_id, prior["outcome_id"], duplicate=True)
+            if proof_run_id is None:
+                return self._paper_summary(candidate_id, prior["outcome_id"], duplicate=True)
+            opportunity = epoch_opportunity
         oid = uuid.uuid4().hex
         with closing(_connect(self.path)) as db, db:
             db.execute("""INSERT INTO paper_outcomes
-                (outcome_id,candidate_id,vehicle,opportunity_id,session_date,net_pnl,outcome_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
+                (outcome_id,candidate_id,vehicle,opportunity_id,session_date,net_pnl,
+                 proof_run_id,outcome_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
                 (oid, candidate_id, vehicle, opportunity, outcome.get("session_date"),
-                 net, _json(normalized), _utc()))
+                 net, proof_run_id, _json(normalized), _utc()))
             db.execute("""INSERT INTO events
                 (event_id,candidate_id,event_type,from_status,to_status,actor,reason,payload_json,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?)""",
@@ -664,10 +745,19 @@ class EdgeLedger(EdgeLedgerProofMixin):
         if candidate is None:
             raise KeyError(candidate_id)
         with closing(_connect(self.path)) as db:
-            rows = db.execute(
-                "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
-                "WHERE candidate_id=? ORDER BY created_at,outcome_id",
-                (candidate_id,)).fetchall()
+            epoch, has_shadow = self._trial_epoch_state(candidate_id)
+            if has_shadow and epoch is None:
+                rows = []
+            elif epoch is None:
+                rows = db.execute(
+                    "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                    "WHERE candidate_id=? AND proof_run_id IS NULL "
+                    "ORDER BY created_at,outcome_id", (candidate_id,)).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT session_date,net_pnl,outcome_json FROM paper_outcomes "
+                    "WHERE candidate_id=? AND proof_run_id=? "
+                    "ORDER BY created_at,outcome_id", (candidate_id, epoch)).fetchall()
         r_values: list[float] = []
         net_values: list[float] = []
         sessions: set[str] = set()

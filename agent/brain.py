@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -36,7 +37,15 @@ def build_system(cfg: Mapping[str, Any] | None = None) -> str:
 def _extract_json(value: Any) -> dict:
     if isinstance(value, Mapping):
         return dict(value)
+    if value is None:
+        return {}
     text = str(value).strip()
+    # A provider may successfully return no content (for example when its
+    # safety layer declines to make a recommendation).  Runtime LLM policy
+    # is subtractive: no recommendation is not a veto.  Malformed non-empty
+    # content remains an error and therefore fails closed in the caller.
+    if not text:
+        return {}
     if text.startswith("```"):
         text = text.strip("`")
         if text.startswith("json"):
@@ -56,6 +65,52 @@ class DecisionBrain:
         self.system = system or build_system(cfg)
         self.prompt_version = prompt_version(self.system)
         self.client = client
+        try:
+            self.timeout_seconds = float(self.cfg.get("timeout_seconds", 10.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("llm.timeout_seconds must be a positive number") from exc
+        if not 0 < self.timeout_seconds < float("inf"):
+            raise ValueError("llm.timeout_seconds must be a positive number")
+        self._timed_out = False
+
+    def _call_with_timeout(self, call, *, operation: str = "LLM request"):
+        """Run one provider call behind a strict, process-safe time boundary.
+
+        Provider SDK calls are synchronous and a broken transport can ignore
+        its own socket timeout.  A daemon worker lets the engine return a
+        deterministic veto when the deadline expires; the worker cannot keep
+        the process alive or delay shutdown.  There is intentionally no
+        attempt to reuse a timed-out client/thread.
+        """
+        if self._timed_out:
+            raise TimeoutError("LLM provider quarantined after a previous timeout")
+        result: list[Any] = []
+        failure: list[BaseException] = []
+        done = threading.Event()
+
+        def invoke() -> None:
+            try:
+                result.append(call())
+            except BaseException as exc:  # noqa: BLE001
+                failure.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=invoke,
+            name="alpaca-llm-call",
+            daemon=True,
+        )
+        worker.start()
+        if not done.wait(self.timeout_seconds):
+            # Do not reuse a client while an uninterruptible provider call is
+            # still running in its daemon worker.
+            self._timed_out = True
+            raise TimeoutError(
+                f"{operation} exceeded timeout_seconds={self.timeout_seconds:g}")
+        if failure:
+            raise failure[0]
+        return result[0] if result else None
 
     def _client(self):
         if self.client is not None:
@@ -89,13 +144,25 @@ class DecisionBrain:
         provider = str(self.cfg.get("provider", "openai")).lower()
         client = self._client()
         if hasattr(client, "complete"):
-            result = client.complete(system=self.system, prompt=prompt)
+            result = self._call_with_timeout(
+                lambda: client.complete(system=self.system, prompt=prompt))
         elif provider == "openai":
-            response = client.chat.completions.create(model=self.cfg["model"], temperature=self.cfg.get("temperature", .2), max_tokens=self.cfg.get("max_tokens", 2000), messages=[{"role": "system", "content": self.system}, {"role": "user", "content": prompt}])
-            result = response.choices[0].message.content
+            response = self._call_with_timeout(lambda: client.chat.completions.create(
+                model=self.cfg["model"], temperature=self.cfg.get("temperature", .2),
+                max_tokens=self.cfg.get("max_tokens", 2000), messages=[
+                    {"role": "system", "content": self.system},
+                    {"role": "user", "content": prompt},
+                ]))
+            choices = getattr(response, "choices", None) or []
+            result = (getattr(getattr(choices[0], "message", None), "content", None)
+                      if choices else "")
         else:
-            response = client.messages.create(model=self.cfg["model"], max_tokens=self.cfg.get("max_tokens", 2000), temperature=self.cfg.get("temperature", .2), system=self.system, messages=[{"role": "user", "content": prompt}])
-            result = response.content[0].text
+            response = self._call_with_timeout(lambda: client.messages.create(
+                model=self.cfg["model"], max_tokens=self.cfg.get("max_tokens", 2000),
+                temperature=self.cfg.get("temperature", .2), system=self.system,
+                messages=[{"role": "user", "content": prompt}]))
+            content = getattr(response, "content", None) or []
+            result = getattr(content[0], "text", None) if content else ""
         parsed = _extract_json(result)
         decisions = parsed.get("decisions", [])
         if not isinstance(decisions, list):

@@ -57,14 +57,33 @@ class RuntimeControlMixin:
 
     def _protected_legs_by_symbol(self) -> dict[str, list[dict]]:
         """Durable live protective legs, keyed by the symbol they protect."""
-        try:
-            active = state.load_state().get("active_trades", {})
-        except Exception:  # noqa: BLE001
-            return {}
+        # An empty fallback is unsafe here: flattening would bulk-cancel every
+        # broker protection while believing there are no local brackets.  The
+        # caller must fail closed and leave broker state untouched whenever the
+        # durable active-trade record cannot be trusted.
+        runtime = state.load_state()
+        if not isinstance(runtime, Mapping):
+            raise ValueError("runtime state is not an object")
+        active = runtime.get("active_trades")
         if not isinstance(active, Mapping):
-            return {}
+            raise ValueError("active_trades is not an object")
         found = {}
         for symbol, trade in active.items():
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise ValueError("active trade symbol is invalid")
+            if not isinstance(trade, Mapping):
+                raise ValueError(f"active trade {symbol!r} is malformed")
+            if not trade:
+                raise ValueError(f"active trade {symbol!r} is empty")
+            if "protective_legs" in trade:
+                legs = trade.get("protective_legs")
+                if not isinstance(legs, list):
+                    raise ValueError(f"active trade {symbol!r} protective_legs is malformed")
+                for leg in legs:
+                    if not isinstance(leg, Mapping) or not str(
+                            leg.get("order_id") or "").strip():
+                        raise ValueError(
+                            f"active trade {symbol!r} protective leg is malformed")
             live = [leg for leg in _leg_rows(trade) if _leg_live(leg)]
             if live:
                 found[str(symbol).upper()] = live
@@ -81,7 +100,14 @@ class RuntimeControlMixin:
         # While protected positions exist, each symbol's legs are cancelled
         # immediately before that symbol's close, and the bulk sweep is
         # deferred until the book is flat.
-        protected = self._protected_legs_by_symbol()
+        try:
+            protected = self._protected_legs_by_symbol()
+        except Exception as exc:  # noqa: BLE001
+            self._event("flatten_state_error", {
+                "reason": "active_trade_state_unreadable_or_malformed",
+                "error": str(exc),
+            })
+            return False
         swept = False
         if not protected:
             try:
@@ -490,8 +516,13 @@ class RuntimeControlMixin:
                 except Exception:
                     pass
                 try:
-                    state.write_heartbeat("stopped", run_id=self.run_id,
-                                          reason=self.shutdown_reason or "closed")
+                    if getattr(self, "_observability_degraded", False):
+                        state.write_heartbeat(
+                            "degraded", run_id=self.run_id,
+                            reason="config_audit_unavailable")
+                    else:
+                        state.write_heartbeat("stopped", run_id=self.run_id,
+                                              reason=self.shutdown_reason or "closed")
                 except Exception:
                     pass
         finally:
@@ -516,6 +547,11 @@ class RuntimeControlMixin:
             result = record_config_version(
                 state.JOURNAL_FILE, self.cfg,
                 source=str(os.getenv("ALPACA_AGENT_CONFIG") or "config.yaml"))
+            self._observability_degraded = False
+            try:
+                state.clear_observability_degraded()
+            except Exception:  # noqa: BLE001
+                pass
             self.config_version_id = str(result.get("config_version_id") or "")
             if result.get("recorded"):
                 self._journal_event("config_version_recorded", {
@@ -526,7 +562,23 @@ class RuntimeControlMixin:
         except Exception as exc:  # noqa: BLE001
             # The audit trail is a record of work that is happening anyway.
             # Failing to write it must never stop a runtime from starting.
-            print(f"config audit unavailable: {type(exc).__name__}: {exc}")
+            self._observability_degraded = True
+            try:
+                state.mark_observability_degraded("config_audit_unavailable")
+            except Exception:  # noqa: BLE001
+                pass
+            detail = f"{type(exc).__name__}: {exc}"
+            # Configuration provenance is part of runtime observability.  It
+            # is intentionally non-blocking for trading, but a watchdog must
+            # not see a healthy heartbeat after the audit write failed.
+            try:
+                state.write_heartbeat(
+                    "degraded", run_id=self.run_id,
+                    reason="config_audit_unavailable", error=detail)
+            except Exception as heartbeat_exc:  # noqa: BLE001
+                log.warning("config audit heartbeat unavailable: %s",
+                            heartbeat_exc)
+            print(f"config audit unavailable: {detail}")
 
     def _journal_event(self, kind: str, payload: Mapping) -> None:
         try:

@@ -688,6 +688,34 @@ class WatchdogTests(ProtectionHarness):
         self.assertEqual(self.provider.close_requests, [])
         self.assertEqual(self.provider.cancelled, [])
 
+    def test_watchdog_tolerates_engine_releasing_transferred_lock(self):
+        self._bind_engine(profile="options", runtime_name="runtime-dog-release")
+        self._open_option_position()
+        self._heartbeat(3600)
+
+        class ReleasingEngine:
+            _lock_handle = None
+
+            def flatten_all(self, _reason):
+                # Simulate an injected/current implementation that takes
+                # ownership and releases the transferred descriptor itself,
+                # but leaves the attribute pointing at the now-closed handle.
+                state.release_run_lock(self._lock_handle)
+                return True
+
+            def close(self):
+                pass
+
+        with mock.patch.object(watchdog, "_engine",
+                               return_value=ReleasingEngine()):
+            verdict = self._run_watchdog("runtime-dog-release")
+        self.assertTrue(verdict["flattened"])
+        # A closed descriptor must not be released a second time, and the
+        # watchdog must leave the mode lock available for the next owner.
+        handle = state.acquire_run_lock()
+        self.assertIsNotNone(handle)
+        state.release_run_lock(handle)
+
     def test_watchdog_is_inert_when_the_broker_reports_no_exposure(self):
         self._bind_engine(profile="options", runtime_name="runtime-dog-flat")
         self._heartbeat(3600)

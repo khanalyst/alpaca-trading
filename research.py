@@ -457,13 +457,26 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
     config = _read_json(getattr(args, "config", None), {})
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
+    # Scheduled jobs pass the validated agent config, not a second ad-hoc
+    # research config.  Use its execution caps and cost assumptions as the
+    # factory model; an explicit --config may override only those two blocks
+    # for an intentional offline experiment.
+    cost_config = dict(agent_config)
+    for block in ("costs", "execution"):
+        if block in config:
+            base = cost_config.get(block)
+            override = config.get(block)
+            if isinstance(base, dict) and isinstance(override, dict):
+                cost_config[block] = {**base, **override}
+            else:
+                cost_config[block] = override
     result = run_factory(
         args.data, db_path=_db(args), vehicle=args.vehicle,
         strategies=args.strategies, variants_per_strategy=args.variants,
         workers=args.workers, starting_cash=args.starting_cash,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha, max_generations=args.max_generations,
-        costs=CostModel.from_config(config),
+        costs=CostModel.from_config(cost_config),
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"))
     proofs = _emit_proofs(args, result, agent_config)
     # Archive the narrative every cycle, not only when an edge proves out. A

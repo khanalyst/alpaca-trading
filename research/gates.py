@@ -28,6 +28,11 @@ from .stats import (
 GATE_ENVELOPE_SCHEMA = "verified-research-gate.v2"
 CLUSTER_SECONDS = 86_400
 LOWER_BOUND_CONFIDENCE = .95
+# Qualification observations are source evidence carried outside the run's
+# fit/held-out rows.  Keep both storage and verification bounded so a malformed
+# recorder row cannot inflate a proof envelope without limit.
+QUALIFICATION_MAX_ROWS = 10_000
+QUALIFICATION_MAX_BYTES = 2_000_000
 
 
 class SealedWindowError(RuntimeError):
@@ -420,14 +425,53 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
         return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
                 "matched": 0, "mean_delta": None, "trades": 0,
                 "net_positive": False, "delta_positive": False}
+    declared = tuple(str(item) for item in sessions)
+    declared_set = set(declared)
+    if (len(declared_set) != len(declared) or
+            any(not item for item in declared_set)):
+        raise ValueError("qualification sessions must be unique, non-empty strings")
     pairs = matched_pairs(rows, baseline, vehicle=vehicle)
     absolute = performance_floor(rows, vehicle=vehicle)
     delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
-    return {"available": True, "sessions": list(sessions),
+    # The final window is intentionally outside the run's fit/held-out trades.
+    # Carry the source observations and their independent digests in the
+    # signed envelope so a proof can be re-verified after it leaves memory.
+    # This also makes tampering detectable even when the summary numbers are
+    # changed consistently with one another.
+    candidate_observations = [dict(row) for row in rows]
+    baseline_observations = [dict(row) for row in baseline]
+    if len(candidate_observations) + len(baseline_observations) > QUALIFICATION_MAX_ROWS:
+        raise ValueError("qualification observations exceed row limit")
+    candidate_sessions = {
+        str(row.get("session_date") or "") for row in candidate_observations}
+    baseline_sessions = {
+        str(row.get("session_date") or "") for row in baseline_observations}
+    if (candidate_sessions != declared_set or baseline_sessions != declared_set or
+            "" in candidate_sessions or "" in baseline_sessions):
+        raise ValueError(
+            "qualification observation sessions do not match declared sessions")
+    serialized = json.dumps(
+        {"candidate": candidate_observations, "baseline": baseline_observations},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False, default=str).encode("utf-8")
+    if len(serialized) > QUALIFICATION_MAX_BYTES:
+        raise ValueError("qualification observations exceed serialized byte limit")
+    candidate_digest = _content_hash(candidate_observations)
+    baseline_digest = _content_hash(baseline_observations)
+    return {"available": True, "sessions": list(declared),
             "net_pnl": absolute["net_pnl"], "trades": absolute["trades"],
             "matched": pairs["matched"], "mean_delta": delta,
             "net_positive": bool(absolute["net_pnl_positive"]),
-            "delta_positive": bool(delta is not None and delta > 0)}
+            "delta_positive": bool(delta is not None and delta > 0),
+            "candidate_observations": candidate_observations,
+            "baseline_observations": baseline_observations,
+            "candidate_observation_digest": candidate_digest,
+            "baseline_observation_digest": baseline_digest,
+            # Short aliases make the binding explicit to downstream proof
+            # consumers while retaining the descriptive field names above.
+            "candidate_digest": candidate_digest,
+            "baseline_digest": baseline_digest,
+            "observation_schema": "qualification-observations.v1"}
 
 
 @dataclass
@@ -542,7 +586,55 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
 
 def verify_gate_envelope(envelope: Mapping) -> bool:
     try:
+        qualification = envelope.get("qualification")
+        if not isinstance(qualification, Mapping):
+            return False
+        if qualification.get("available"):
+            candidate = qualification.get("candidate_observations")
+            baseline = qualification.get("baseline_observations")
+            if (not isinstance(candidate, Sequence) or isinstance(candidate, (str, bytes)) or
+                    not isinstance(baseline, Sequence) or isinstance(baseline, (str, bytes)) or
+                    not all(isinstance(row, Mapping) for row in candidate) or
+                    not all(isinstance(row, Mapping) for row in baseline) or
+                    qualification.get("observation_schema") != "qualification-observations.v1" or
+                    qualification.get("candidate_observation_digest") != _content_hash(candidate) or
+                    qualification.get("baseline_observation_digest") != _content_hash(baseline) or
+                    qualification.get("candidate_digest") != qualification.get(
+                        "candidate_observation_digest") or
+                    qualification.get("baseline_digest") != qualification.get(
+                        "baseline_observation_digest")):
+                return False
+            if (len(candidate) + len(baseline) > QUALIFICATION_MAX_ROWS or
+                    len(json.dumps(
+                        {"candidate": candidate, "baseline": baseline},
+                        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                        allow_nan=False, default=str).encode("utf-8")) >
+                    QUALIFICATION_MAX_BYTES):
+                return False
+            expected = qualification_report(
+                candidate, baseline, vehicle=str(envelope.get("vehicle")),
+                sessions=qualification.get("sessions") or ())
+            for key in ("sessions", "net_pnl", "trades", "matched", "mean_delta",
+                        "net_positive", "delta_positive"):
+                if expected.get(key) != qualification.get(key):
+                    return False
         body = {key: value for key, value in envelope.items() if key != "content_hash"}
+        statistics = envelope.get("statistics")
+        checks = envelope.get("checks")
+        if isinstance(statistics, Mapping) and isinstance(checks, Mapping):
+            alpha = float(statistics.get("alpha"))
+            global_q = float(statistics.get("q_value"))
+            family_q = float(statistics.get("family_q_value"))
+            if not (math.isfinite(alpha) and 0.0 < alpha <= 1.0 and
+                    math.isfinite(global_q) and 0.0 <= global_q <= 1.0 and
+                    math.isfinite(family_q) and 0.0 <= family_q <= 1.0):
+                return False
+            if ("family_fdr_significant" in checks and
+                    bool(checks["family_fdr_significant"]) != (family_q <= alpha)):
+                return False
+            if ("global_fdr_significant" in checks and
+                    bool(checks["global_fdr_significant"]) != (global_q <= alpha)):
+                return False
         return bool(
             envelope.get("schema") == GATE_ENVELOPE_SCHEMA and
             envelope.get("lane") in {"backtest", "shadow"} and
@@ -642,7 +734,8 @@ def _content_hash(value: Any) -> str:
 
 
 __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
-           "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
+    "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
+           "QUALIFICATION_MAX_BYTES", "QUALIFICATION_MAX_ROWS",
            "SealedWindowError", "chronological_split",
            "deterministic_placebo_deltas", "falsification_gate",
            "heldout_separation", "matched_cluster_test", "matched_pairs",

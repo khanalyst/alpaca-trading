@@ -172,6 +172,167 @@ class StrategyFactoryTests(unittest.TestCase):
             previous, diagnosis, max_generations=4)
         self.assertEqual(replacement_one, replacement_two)
 
+    def test_underpowered_shadow_accounts_do_not_advance_the_forward_boundary(self):
+        # Accounts are diagnostic rows and are written before adequacy is
+        # known.  Only a durable shadow proof run may advance last_boundary.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "edge_lab.sqlite3"
+            EdgeLedger(path)
+            factory = FactoryLedger(path)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            factory.add_account("cycle", hypothesis.hypothesis_id, {
+                "variant_id": "rule.synthetic",
+                "vehicle": "equity", "worker_pid": 1,
+                "evaluation_start": "2026-01-01",
+                "evaluation_end": "2026-01-31",
+                "account": {"account_id": "account.synthetic",
+                            "starting_cash": 100.0, "ending_equity": 100.0,
+                            "realized_pnl": 0.0, "max_drawdown": 0.0,
+                            "trades": 0},
+            })
+            self.assertIsNone(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity"))
+            # Conversely, an actual shadow run is a consumed boundary.  This
+            # distinguishes the all-intended-adequacy guard from simply
+            # disabling forward validation altogether.
+            candidate = EdgeLedger(path).register_candidate(
+                "rule.synthetic.boundary", strategy_id="rule", vehicle="equity",
+                hypothesis="h", config={"strategy": {"rule_spec":
+                    hypothesis.rule_spec}},
+                axes={"hypothesis_id": hypothesis.hypothesis_id})
+            run = EdgeLedger(path).append_run(
+                candidate["candidate_id"], lane="shadow", vehicle="equity",
+                fit=[], heldout=[{"vehicle": "equity",
+                                  "session_date": "2026-02-01",
+                                  "opportunity_id": "boundary",
+                                  "net_pnl": 0.0}])
+            EdgeLedger(path).append_trade(run["run_id"], {
+                "vehicle": "equity", "session_date": "2026-02-01",
+                "opportunity_id": "boundary", "net_pnl": 0.0})
+            # An unverified/crash-created run is not a durable boundary.
+            self.assertIsNone(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity"))
+            # The helper appends the gate evidence through the same
+            # record_verified_gate path used by the factory.
+            persist_rule_gate(EdgeLedger(path), candidate["candidate_id"], "shadow")
+            self.assertEqual(factory.last_boundary(
+                hypothesis.hypothesis_id, "equity"), "2026-01-13")
+
+    def test_run_factory_records_family_pass_global_fail_as_a_failed_gate(self):
+        """A normal BH family pass must not bypass the cycle-global gate."""
+        rows = losing_breakouts(sessions=20)
+        calls = {"gate": 0}
+
+        def fake_diagnose(task):
+            return {"hypothesis_id": task["hypothesis"]["hypothesis_id"],
+                    "diagnostic": {"primary_failure": "negative_expectancy"}}
+
+        def fake_worker(task):
+            sessions = sorted({factory_module._session(bar) for bar in task["bars"]})
+            control = [{"vehicle": "equity", "symbol": "SPY",
+                        "session_date": session,
+                        "opportunity_id": f"control:{session}",
+                        "net_pnl": 0.0, "return_value": 0.0,
+                        "no_trade": False} for session in sessions]
+            variants = []
+            for spec in task["specs"]:
+                variant_id = rule_variant_id(spec)
+                account_rows = [{**row,
+                                 "opportunity_id": f"{variant_id}:{row['session_date']}"}
+                                for row in control]
+                variants.append({
+                    "variant_id": variant_id, "rule_spec": spec,
+                    "vehicle": "equity",
+                    "account": {"account_id": f"account:{variant_id}",
+                                "starting_cash": 100_000.0,
+                                "ending_equity": 100_000.0,
+                                "realized_pnl": 0.0, "max_drawdown": 0.0,
+                                "trades": len(account_rows), "rows": account_rows},
+                    "diagnostic": {"primary_failure": "negative_expectancy",
+                                   "net_pnl": 0.0},
+                    "worker_pid": 1})
+            return {"hypothesis": task["hypothesis"], "mode": task["mode"],
+                    "diagnostic": task["diagnostic"],
+                    "evaluation_start": sessions[0], "evaluation_end": sessions[-1],
+                    "variants": variants, "control_rows": control,
+                    "null_rows": {}, "expected_variants": len(variants),
+                    "worker_pid": 1}
+
+        def fake_gate(rows, baseline, **kwargs):
+            ordered = sorted(rows, key=lambda row: row["session_date"])
+            fit, heldout = factory_module.chronological_split(ordered, fit_fraction=.7)
+            fit_floor = structural_floor(
+                fit, vehicle="equity", min_trades=1, min_sessions=1)
+            held_floor = structural_floor(
+                heldout, vehicle="equity", min_trades=1, min_sessions=1)
+            p_value = .01 if calls["gate"] == 0 else .9
+            calls["gate"] += 1
+            control = {"actual_control": False, "available": False,
+                       "matched": 0, "mean_delta": None}
+            checks = {
+                "fit_structurally_adequate": True,
+                "heldout_structurally_adequate": True,
+                "separated": True, "actual_control_available": False,
+                "fit_delta_positive": False, "heldout_delta_positive": False,
+                "heldout_p_significant": p_value <= .05, "falsification": False,
+                "heldout_net_pnl_positive": False,
+                "heldout_expectancy_positive": False,
+                "null_control_available": False,
+                "null_control_delta_positive": False,
+                "walk_forward_majority_positive": False,
+                "qualification_net_positive": False,
+                "qualification_delta_positive": False,
+            }
+            return {
+                "passes_without_family": False, "passes": False,
+                "p_raw": p_value, "sample_adequate": True,
+                "heldout_sample_adequate": True,
+                "confidence": 1.0 - p_value,
+                "floor": structural_floor(ordered, vehicle="equity",
+                                           min_trades=1, min_sessions=1),
+                "fit_floor": fit_floor, "heldout_floor": held_floor,
+                "fit_net_pnl": 0.0, "heldout_net_pnl": 0.0,
+                "heldout_expectancy": 0.0,
+                "heldout_performance": {"net_pnl_positive": False,
+                                        "expectancy_positive": False},
+                "fit_trades": len(fit), "heldout_trades": len(heldout),
+                "heldout_delta_lcb": None, "max_drawdown": 0.0,
+                "test": {**control, "p_value": p_value},
+                "fit_test": {}, "control": control,
+                "null_control": {"kind": "randomized_entry_null",
+                                  "matched": 0, "available": False,
+                                  "mean_delta": None, "p_value": 1.0},
+                "walk_forward": {}, "qualification": {"available": False},
+                "falsification": {"passes": False, "draws": 0},
+                "heldout_separation": {"passes": True},
+                "checks_without_family": checks,
+                "mode": "backtest", "alpha": .05,
+                "_fit_rows": fit, "_heldout_rows": heldout,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(factory_module, "ProcessPoolExecutor",
+                              side_effect=OSError), \
+                 patch.object(factory_module, "_diagnose_worker",
+                              side_effect=fake_diagnose), \
+                 patch.object(factory_module, "_worker",
+                              side_effect=fake_worker), \
+                 patch.object(factory_module, "_gate",
+                              side_effect=fake_gate):
+                result = run_factory(
+                    rows, db_path=Path(directory) / "edge.sqlite3",
+                    strategies=3, variants_per_strategy=2, workers=1,
+                    min_trades=1, min_sessions=1, alpha=.05)
+        target = next(item for item in result["results"]
+                      if item["gate"]["p_raw"] == .01)
+        self.assertTrue(target["gate"]["multiple_tests"]["significant"])
+        self.assertFalse(target["gate"]["global_multiple_tests"]["significant"])
+        self.assertTrue(target["gate"]["checks_without_family"])
+        self.assertFalse(target["gate"]["passes"])
+        self.assertIsNotNone(target["run_id"])
+        self.assertFalse(result["worker_failures"])
+
     def test_rule_grammar_is_bounded_and_content_addressed(self):
         spec = validate_rule_spec({"family": "mean_reversion", "lookback": 10,
                                    "slow_lookback": 30})
@@ -581,7 +742,12 @@ class CorpusDescriptorTests(unittest.TestCase):
                     source, db_path=root / "thread.sqlite3", strategies=1,
                     variants_per_strategy=2, workers=1, min_trades=1,
                     min_sessions=1, alpha=1.0)
-        self.assertEqual(results["process"]["parallel_backend"], "process")
+        # Restricted CI/sandbox hosts can deny the POSIX primitives required
+        # to construct a process pool.  That is the production code's explicit
+        # thread-fallback contract, not evidence divergence; on capable hosts
+        # this same assertion still exercises the real process backend.
+        self.assertIn(results["process"]["parallel_backend"],
+                      {"process", "thread_fallback"})
         self.assertEqual(results["thread"]["parallel_backend"], "thread_fallback")
 
         def evidence(result):

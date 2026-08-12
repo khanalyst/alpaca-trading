@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,6 +153,32 @@ class StateSafetyTests(unittest.TestCase):
                          second_root / "live" / "events.jsonl")
         self.assertEqual(state.JOURNAL_FILE,
                          second_root / "live" / "journal.db")
+
+    def test_same_runtime_rebind_preserves_sticky_observability(self):
+        runtime = Path(self.tmp.name) / "sticky"
+        state.configure_runtime("paper", runtime)
+        state.mark_observability_degraded("config_audit_unavailable")
+        state.configure_runtime("paper", runtime)
+        self.assertEqual(state.OBSERVABILITY_DEGRADED_REASON,
+                         "config_audit_unavailable")
+        state.configure_runtime("paper", Path(self.tmp.name) / "other")
+        self.assertIsNone(state.OBSERVABILITY_DEGRADED_REASON)
+
+    def test_concurrent_journal_initialization_migrates_trade_key_once(self):
+        runtime = Path(self.tmp.name) / "concurrent"
+        state.configure_runtime("paper", runtime)
+
+        def initialize():
+            return state.initialize_journal()
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _item: initialize(), range(12)))
+        self.assertEqual(results, [state.JOURNAL_FILE] * 12)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
+            indexes = [row[1] for row in db.execute("PRAGMA index_list(trades)")]
+        self.assertIn("trade_id", columns)
+        self.assertIn("trades_trade_id_unique", indexes)
 
     def test_initialize_journal_is_idempotent_and_migrates_legacy_schema(self):
         root = Path(self.tmp.name) / "legacy"

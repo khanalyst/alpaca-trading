@@ -71,7 +71,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100},
     # Runtime rule execution stays deterministic.  The separate decision-LLM
     # boundary remains disabled unless explicitly enabled.
-    "llm": {"enabled": False, "provider": "openai", "model": "", "temperature": 0.2, "max_tokens": 2000},
+    "llm": {"enabled": False, "provider": "openai", "model": "", "temperature": 0.2, "max_tokens": 2000, "timeout_seconds": 10.0},
     "research": {
         "enabled": True, "require_validated_variant": True,
         "champion_min_confidence": 0.95,
@@ -278,7 +278,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
                         "fee_bps": model.fee_bps}
 
     llm = _map(out.get("llm"), "llm")
-    _unknown(llm, {"enabled", "provider", "model", "temperature", "max_tokens", "base_url"}, "llm")
+    _unknown(llm, {"enabled", "provider", "model", "temperature", "max_tokens", "timeout_seconds", "base_url"}, "llm")
     llm["enabled"] = _bool(llm, "enabled", "llm", False)
     if llm.get("provider") not in {"openai", "anthropic"}:
         raise ConfigError("llm.provider must be openai or anthropic")
@@ -288,6 +288,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         raise ConfigError("llm.model is required when llm.enabled=true")
     llm["temperature"] = _num(llm, "temperature", "llm", 0, 2, .2)
     llm["max_tokens"] = _int(llm, "max_tokens", "llm", 128, 32_000, 2_000)
+    llm["timeout_seconds"] = _num(llm, "timeout_seconds", "llm", .1, 120, 10)
     out["llm"] = llm
     research = _map(out.get("research"), "research")
     _unknown(research, {"enabled", "require_validated_variant", "champion_min_confidence", "db_path", "strategy_llm", "proof", "trial"}, "research")

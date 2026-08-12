@@ -100,7 +100,13 @@ merge_partitions() {
   local window="${ALPACA_RESEARCH_SESSION_WINDOW:-0}"
   local merged="$tmp_dir/market.csv"
   local -a files
-  mapfile -t files < <(ls -1 "$root"/market-*.csv 2>/dev/null | sort)
+  files=()
+  # macOS ships Bash 3.2, which has no mapfile/readarray.  Read the sorted
+  # partition list with the POSIX-compatible read loop instead.
+  local listed_file
+  while IFS= read -r listed_file; do
+    [ -n "$listed_file" ] && files[${#files[@]}]="$listed_file"
+  done < <(ls -1 "$root"/market-*.csv 2>/dev/null | sort)
   [ "${#files[@]}" -gt 0 ] || return 1
   if [ "$window" -gt 0 ] && [ "${#files[@]}" -gt "$window" ]; then
     files=("${files[@]: -$window}")
@@ -269,12 +275,16 @@ fi
 
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   set +e
-  quote_flags=()
   if [ -s "$quotes_input" ]; then
-    quote_flags=(--quotes "$quotes_input")
+    "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
+      --provider alpaca --feed "$feed" --vehicle equity \
+      --quotes "$quotes_input"
+  else
+    # Avoid expanding an empty array under ``set -u``; Bash 3.2 treats that
+    # expansion as an unbound variable.
+    "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
+      --provider alpaca --feed "$feed" --vehicle equity
   fi
-  "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
-    --provider alpaca --feed "$feed" --vehicle equity "${quote_flags[@]}"
   backtest_status=$?
   set -e
   if [ "$backtest_status" -ne 0 ]; then
