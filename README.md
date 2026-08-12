@@ -93,9 +93,12 @@ having changed, never as values.
   Alpaca's paper endpoint are the documented defaults.
 - Live mode is an explicit, separately reviewed configuration only: set
   `mode: live`, `broker.paper: false`, `broker.allow_live: true`, and
-  `ALPACA_LIVE_ENABLE=true`; use `strategy.selection_mode: specific` with one
-  exact named validated/champion `strategy.variant_id`. Live mode pins that
-  edge and does not auto-switch. Keep live configuration, credentials, and
+  `ALPACA_LIVE_ENABLE=true`; then either `strategy.selection_mode: pinned`
+  with exactly one `strategy.pinned` entry, or `strategy.selection_mode:
+  specific` with one exact named validated/champion `strategy.variant_id`.
+  Prefer `pinned`: it carries an operator-assigned promotion id, so the audit
+  trail can name who deployed the edge and when. Live mode pins that edge and
+  does not auto-switch. Keep live configuration, credentials, and
   `ALPACA_AGENT_RUNTIME_ROOT` in a separate runtime scope from paper.
 - `strategy.execution_mode: options` is paper-only. Alpaca offers no bracket,
   OCO, or stop order on options, so an option position's protective stop is
