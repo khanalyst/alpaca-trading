@@ -9,41 +9,115 @@ Options are single-leg long calls or puts
 (buy-to-open, sell-to-close); multi-leg and naked/short option structures are
 unsupported. No performance claim is made.
 
-The research factory runs seven independent slots, each holding one rule
-hypothesis with four isolated simulated-account variants, drawn from a catalog
-of eleven rule families. It evaluates independent
-families in parallel, diagnoses failures from chronological fit data, mutates
-bounded data-only rule specifications, and judges them on untouched held-out
-data. A slot that proves an edge is reseeded with a new hypothesis in the same
-cycle: the proved variant is frozen and never re-tuned, but the *slot* is
-parallel research capacity, so discovery continues at full width instead of
-shrinking with every success. An optional LLM proposes what to try next — new
-hypotheses for free slots, replacements for exhausted families, and the
-parameter variants inside a hypothesis — inside the same audited grammar, and
-every such proposal must earn `backtest_passed` and a strictly later forward
-shadow pass through the identical gates a deterministic one faces. The signal
-primitives themselves are closed: an unknown family, filter, indicator field or
-data source is rejected at the boundary, and tuning must preserve both its
-root's family and its grammar version, so the model parameterizes signals and
-never invents one. Every proposal records the reason it was made *before* the
-gate that judges it exists, that reason is graded against the gate afterwards,
-and a proposal made against a non-empty history must cite the graded lesson it
-reasoned from — an uncited proposal is refused, a parameter set already proved
-to fail may not be re-proposed, and the citation is stored so the chain of
-learning is durable. Every seeding and tuning path falls back to a
-deterministic ladder, so research works with no provider configured. A rule specification
-carries `max_hold_bars`, so every strategy has a
-bounded time exit as well as a stop and a target; research and runtime compute
-that deadline from one shared helper. Paper
-`strategy.selection_mode: all_proved` selects one best proven variant per
-independent family under one global risk book, ranked by held-out evidence
-rather than by family name and bounded by a correlation cap so several
-expressions of one bet do not become concurrent risk. A trader process
-uses one execution profile (`shares` or `options`) at a time; do not mix
-profiles in one process. The market calendar is America/New_York (NYSE regular
-session). New entries are rejected outside the regular session, orders are
-day-only, startup cancels working orders and flattens residuals, and positions
-are force-closed before the close.
+## What this repository does
+
+This is not an LLM that watches prices and improvises orders. It is a set of
+separate, deliberately limited systems:
+
+1. **Recorder and backfill** collect point-in-time market observations into an
+   append-only, session-partitioned corpus.
+2. **Research** searches a closed strategy grammar, simulates candidates, and
+   applies chronological statistical gates.
+3. **The edge ledger** stores candidate state, source evidence, proof hashes,
+   and the exact verified shadow run that authorizes deployment.
+4. **The trader** resolves only proved ledger records, recomputes their
+   deterministic signals, applies account-wide risk limits, and submits orders.
+5. **State, journal, watchdog, and health services** reconcile broker truth,
+   make retries idempotent, expose degraded conditions, and flatten when that
+   can be done safely.
+
+```mermaid
+flowchart LR
+    A["Alpaca market data"] --> B["Recorder / backfill"]
+    B --> C["Session-partitioned corpus"]
+    C --> D["Research factory + IBR baseline"]
+    L["Optional research LLM"] -.->|bounded rule proposals only| D
+    D --> E["Chronological gates + later shadow validation"]
+    E --> F["Edge ledger + verified proof"]
+    F --> G["Edge resolver"]
+    P["Operator pin for live (preferred)"] --> G
+    G --> H["Deterministic trader + risk engine"]
+    H --> I["Alpaca account / orders"]
+    I --> J["Fills and paper outcomes"]
+    J --> K["Runtime journal"]
+    J --> F
+    W["Watchdog: flatten only"] --> I
+    R["Read-only dashboard"] -.-> F
+    R -.-> K
+```
+
+### How edge discovery works
+
+The strategy factory normally runs seven research slots. Each slot holds one
+hypothesis and evaluates four isolated-account variants drawn from a finite
+catalog of rule families. It diagnoses only chronological fit data, then judges
+the variants on untouched held-out data. A candidate must clear structural
+trade/session floors, matched controls, absolute after-cost profitability,
+falsification, walk-forward checks, and both family-local and cycle-global
+false-discovery correction. A family can legitimately pass its local test but
+fail the global one; only the global result can authorize cross-family
+selection.
+
+The final qualification sessions are sealed before the workers run. Their
+candidate and baseline observations, declared sessions, and content digests are
+bound into the verified gate so the qualification decision can be recomputed.
+A backtest pass is still not deployable: the candidate must later pass a
+strictly newer shadow window. An underpowered shadow cycle advances no durable
+boundary, so those sessions are reconsidered when enough data exists instead
+of being silently consumed.
+
+When a slot proves an edge, the proved rule is frozen and the slot is reseeded
+with a new hypothesis so research capacity does not shrink. Paper
+`selection_mode: all_proved` can then select one strongest proved variant per
+independent family under one global risk book and correlation cap. Live paper
+outcomes are scoped to the exact shadow proof that authorized the trade; if the
+same candidate is later demoted, re-proved, and re-trialled, old outcomes do not
+decide the new trial.
+
+### How trading works
+
+Every cycle begins with broker reconciliation and fresh clock, calendar, quote,
+account, and position checks. The selected proved rule produces a deterministic
+setup. The risk engine then decides whether it fits daily loss, open-risk,
+gross-exposure, position, liquidity, spread, and buying-power limits. Only after
+those checks does the provider submit an idempotently named day order.
+
+Equities use broker-side brackets. Long options are paper-only because Alpaca
+does not provide an option stop order: the runtime rests a broker-side
+take-profit, keeps the stop locally, and relies on the separate watchdog as a
+stale-process backstop. Protective orders must be broker-confirmed canceled
+before a local close is submitted. Startup, shutdown, force-flat, and crash
+recovery all reconcile against broker state; an unreadable state file is a
+blocking safety fault, never an empty book.
+
+A trader process uses one execution profile (`shares` or `options`) at a time.
+The market calendar is America/New_York (NYSE regular session). Entries outside
+the session are rejected, orders are day-only, and positions are force-closed
+before the close.
+
+### Where the LLM is used
+
+| Lane | What the model may do | What it cannot do |
+| --- | --- | --- |
+| Research | Propose a new bounded hypothesis, a replacement, or parameter values inside the validated rule grammar | Write executable strategy code, add data sources or indicators, skip a gate, validate a candidate, promote it, size it, or place an order |
+| Optional paper runtime | Return a subtractive veto after the deterministic setup and risk prerequisites already exist | Create a setup, change side/quantity/price, bypass risk, or submit an order |
+| Live runtime | Nothing; `llm.enabled: true` and injected decision brains are rejected | Participate in any live trading decision |
+
+Research works without an LLM because every proposal path has a deterministic
+fallback. Model requests are bounded and their prompt/request/response hashes
+are recorded. The optional paper-runtime call has a strict timeout. Empty or
+irrelevant output means “no veto,” returning control to the already-audited
+deterministic path; provider errors or malformed non-empty output veto that
+cycle. The LLM never has broker authority.
+
+Custom provider endpoints are a trust boundary. `llm.base_url`,
+`OPENAI_BASE_URL`, and `ANTHROPIC_BASE_URL` can receive the provider key and the
+prompt, so configure only a trusted HTTPS service; the application does not
+currently enforce a host allowlist for LLM endpoints. Recorded hashes prove
+which prompt/request/response was used, not that a provider will reproduce the
+same answer later. Attempts, time, and response size are bounded, but there is
+no aggregate daily spend budget, so enforce provider-side quotas for unattended
+research.
 
 ## How an edge reaches money
 
@@ -53,7 +127,7 @@ Four states, and only one transition a machine cannot make.
 | --- | --- | --- |
 | **Research** — hypotheses, variants, gates | the factory | yes, continuously |
 | **Proved** — `validated`/`champion` in the ledger | the gates | yes, on evidence |
-| **Trial** — trading the demo account, live results collected | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
+| **Trial** — trading the demo account, outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
 | **Pinned** — an id you wrote into `config.yaml` | **you only** | **no.** Guards still run and still report; they raise an alert and leave it in place |
 
 Promotion is the one step that is never automatic. When an edge clears its
@@ -85,7 +159,10 @@ dashboard, and the notifications all use. Separately, every distinct
 configuration the runtime loads is recorded with a content-addressed
 `config_version_id` and a diff naming each field that moved, so any changed
 value is traceable to a version, a time, and an actor. Secrets are recorded as
-having changed, never as values.
+having changed, never as values. A configuration-audit write failure does not
+halt a trader that may already own exposure; instead, the runtime keeps a
+sticky degraded heartbeat with reason `config_audit_unavailable` until a later
+successful audit clears it.
 
 ## Safety boundary
 
@@ -227,7 +304,7 @@ provider credentials only from the separate
 pending replacement or falls back to deterministic discovery; it never retires
 a family or authorizes trading. Runtime
 decision LLM use remains disabled (`llm.enabled: false`). The default stock
-feed is IEX. Long options remain subject to liquidity and contract checks. On a
+feed is IEX. Long options remain subject to liquidity and contract checks.
 Research studies only the vehicle the configured execution profile can trade
 (`python research.py vehicles`); `ALPACA_RESEARCH_VEHICLES=all` runs both lanes
 deliberately. Seed months of history in one command instead of waiting for the

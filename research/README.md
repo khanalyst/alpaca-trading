@@ -121,9 +121,11 @@ label must be computed from events at or before its as-of timestamp.  A
 completed-bar fixture and a no-look-ahead test are required for every new
 replay path.  Walk-forward, paired-baseline, placebo/falsification, and
 acceptance-floor checks are mandatory gates, with fit/held-out structural
-floors, family-level false-discovery correction, and a durable verified gate.
-They are applied per vehicle and per session rather than to a pooled
-equity/options series.
+floors, family-local and cycle-global false-discovery correction, sealed
+qualification source binding, and a durable verified gate. A family-local pass
+with a cycle-global failure is a normal marginal result; only the global result
+can authorize cross-family selection. The gates are applied per vehicle and per
+session rather than to a pooled equity/options series.
 
 ## Edge laboratory
 
@@ -136,18 +138,23 @@ SHA-256 hashes. The default database is `runtime/research/edge_lab.sqlite3`
 The lifecycle is forward-only: an initial corpus backtest moves a candidate to
 `backtest_passed`; a later corpus must contain sessions strictly after the
 persisted boundary, and passing unseen shadow gates moves it through `shadow`
-to `validated` and automatic champion selection. Paper outcomes are append-only
-evidence and may demote a champion. Candidates are scored separately for
-`equity` and `option` vehicles. Gates require chronological held-out data,
-fit/held-out trade and session structural floors, matched controls,
-cluster-aware randomisation, family-level FDR, and placebo/falsification.
-Underpowered data is not failure. Retirement is allowed only after all intended
-variants are adequately tested and fail; a valid bounded LLM replacement must
-be registered first when that lane is enabled. Drawdown is measured and used
-in conservative champion ranking. Normal operation needs no manual promotion;
-the `edge promote` CLI is only for explicit, audited controls and remains
-subject to lifecycle/evidence rules. Backward rollback is rejected; explicit
-demotion is the operator safety action.
+to `validated` and automatic champion selection. A shadow boundary advances
+only from a durable re-verifying passing proof; an underpowered worker persists
+no shadow result, so the same tail can be reconsidered later. Paper outcomes
+are append-only evidence scoped to the exact shadow proof that authorized the
+entry and may demote a deployed edge. Re-proving a candidate begins a new trial
+epoch instead of aggregating lifetime outcomes. Candidates are scored
+separately for `equity` and `option` vehicles. Gates require chronological
+held-out data, fit/held-out trade and session structural floors, matched
+controls, cluster-aware randomisation, family-local and cycle-global FDR,
+sealed qualification observations/digests, and placebo/falsification.
+Underpowered data is not failure. Retirement is allowed only after all
+intended variants are adequately tested and fail; a valid bounded LLM
+replacement must be registered first when that lane is enabled. Drawdown is
+measured and used in conservative champion ranking. Normal operation needs no
+manual promotion; the `edge promote` CLI is only for explicit, audited controls
+and remains subject to lifecycle/evidence rules. Backward rollback is rejected;
+explicit demotion is the operator safety action.
 
 ## Autonomous strategy factory
 
@@ -344,9 +351,11 @@ later-forward observation, so sharing it adds no information about unseen data.
 `research.trial` closes the loop between the book and the search.
 
 A proved edge that is not pinned trades the demo account, and its real fills
-accumulate as `paper_outcomes`. After the trial window — `research.trial`
-config, default 20 sessions and 20 trades — the record is judged against an
-explicit floor (total R and mean R both positive by default):
+accumulate as `paper_outcomes`, each carrying the exact passing shadow
+`proof_run_id` that authorized entry. After the trial window —
+`research.trial` config, default 20 sessions and 20 trades — that proof epoch
+is judged against an explicit floor (total R and mean R both positive by
+default):
 
 - **Clears it** → the edge keeps trading and becomes *promotable*. Nothing is
   promoted; `edge promotable` hands the operator the config block.
@@ -370,6 +379,12 @@ The scheduled cycle runs the review *before* discovery and tuning, so a trial
 that just finished below its floor is already a recorded lesson by the time
 this cycle proposes anything. `ALPACA_TRIAL_REVIEW_ENABLED=0` turns it off.
 
+If the same immutable candidate is later re-proved, the newer passing shadow
+run starts a fresh trial epoch. Earlier outcomes remain in the append-only
+ledger but are excluded from `paper_performance`, drift, and the new verdict.
+A failed or unverifiable latest shadow proof quarantines history rather than
+falling back to lifetime aggregation.
+
 Parking an edge never promotes anything in its place. The replacement still has
 to earn `backtest_passed`, a strictly later shadow pass, and every gate.
 
@@ -388,6 +403,14 @@ records a pending replacement or falls back to deterministic discovery; it
 cannot retire a family prematurely. Successful proof produces a deterministic,
 content-addressed finding. `research.proof.webhook_url` may send that finding
 to an HTTPS webhook without changing the durable artifact.
+
+`OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are trust boundaries: a configured
+endpoint receives the provider key and the bounded aggregate prompt. Use only a
+trusted HTTPS service; there is no application host allowlist. Prompt,
+request, and raw-response hashes prove what the cycle consumed, but they do not
+make a mutable model/provider response reproducible. The adapter caps attempts,
+timeout, and response bytes; provider-side quotas must supply any aggregate
+spend/rate budget.
 
 The scheduled cycle reports `completed`, `completed_no_edge`, `no_data`, or
 `failed`. `completed_no_edge` means the input was valid but no candidate passed
@@ -429,6 +452,8 @@ python research.py edge paper --vehicle equity --deployed
 actually doing on live paper outcomes — trade and session counts, total and
 mean R, win rate, net P&L, the registered rolling-R guard with its floor, and
 the sequential drift statistic against the held-out distribution the edge was
-validated on. Both matter: the first is the evidence an edge was promoted with,
-the second is what it has done since. Neither can change a lifecycle state;
-they are read-only views of append-only data.
+validated on. The live view is limited to the latest passing shadow proof epoch,
+so “what it has done since” means since the proof currently authorizing it, not
+the candidate's lifetime. Both matter: the first is the evidence an edge was
+promoted with, the second is what it has done since. Neither can change a
+lifecycle state; they are read-only views of append-only data.

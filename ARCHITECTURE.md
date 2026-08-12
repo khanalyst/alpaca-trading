@@ -8,7 +8,7 @@ multi-leg options, naked options, and short-option exposure are rejected.
 
 ## System boundaries
 
-The repository contains five cooperating processes:
+The repository contains six cooperating processes:
 
 | Process | Authority | Durable output |
 | --- | --- | --- |
@@ -26,9 +26,11 @@ record from the research ledger. The dashboard is not an execution console.
 Paper and live runtimes use separate directories and account fingerprints.
 Paper is the documented default. Live mode requires an explicit live
 configuration, environment guard, authenticated preflight, pattern-day-trader
-status, one specifically pinned proved variant, and `llm.enabled: false`: the
-pinned edge was proven with the deterministic rule and no LLM in the loop, so a
-runtime LLM veto would deploy a different strategy from the one the gates
+status, one exact proved variant, and `llm.enabled: false`. The preferred route
+is `selection_mode: pinned` with exactly one operator-named promotion; the
+legacy `selection_mode: specific` route remains supported for one exact
+validated/champion variant. Neither route may auto-switch, and a runtime LLM
+veto would deploy a different strategy from the deterministic one the gates
 passed.
 
 ## Deployment and data flow
@@ -168,8 +170,11 @@ the single best-ranked edge.
 Allocation only narrows and reorders. Every per-order risk check in the cycle
 still runs unchanged, so it reallocates within the existing risk caps and
 cannot admit a set the previous sequential path would have refused.
-`selection_mode: specific` — the only mode live may use — resolves one record
-and bypasses the allocator entirely.
+Live `selection_mode: pinned` (preferred) and `selection_mode: specific`
+resolve exactly one record and bypass the allocator entirely. A pin is resolved
+again at startup refresh and must retain the exact candidate id and config hash
+captured at construction; otherwise the runtime pauses without substituting a
+different champion.
 
 ### Option protection and its residual
 
@@ -189,10 +194,13 @@ The stop stays software. `deploy/watchdog.py` bounds it: a separate process
 with its own broker session that flattens when the trader heartbeat is stale
 and the broker reports exposure. It takes the mode-scoped run lock first, so a
 living trader — even a hung one — keeps it inert rather than racing it into a
-double close, and it has no entry path at all. What no local process can cover
-is the broker or the network being unreachable; in that window an option
-position has no stop of any kind. That is the residual, and it is why live
-mode is equities-only.
+double close, and it has no entry path at all. While holding that lock it takes
+the final broker snapshots, authenticates and binds the account fingerprint,
+and transfers the same lock into the flatten engine. `acted` means flattening
+was confirmed; an attempted but incomplete flatten is `degraded` with residual
+risk and is unhealthy. What no local process can cover is the broker or the
+network being unreachable; in that window an option position has no stop of
+any kind. That is the residual, and it is why live mode is equities-only.
 
 ### Provider boundary
 
@@ -241,11 +249,20 @@ The edge outbox makes closed-trade learning durable. A close's paper outcome is
 written in the same atomic replacement that removes the trade from
 `active_trades`, then drained into the research ledger on that or a later
 cycle. A crash before the replacement leaves the trade active and its close is
-re-derived; a crash after it leaves the outcome queued. Ingestion is keyed on
-`opportunity_id`, so a replayed drain is a no-op rather than a second
-observation.
+re-derived; a crash after it leaves the outcome queued. The operational trade
+journal also carries a stable `trade_id` protected by a unique index, so a
+re-derived close is idempotent. Paper ingestion is keyed by opportunity and
+the entry-time shadow `proof_run_id`, so a replayed drain is a no-op while a
+later re-proved trial remains a distinct evidence epoch.
 A present but malformed state file is corruption; it is never treated as a
 fresh default.
+
+Flattening is fail-closed around that state. If `active_trades` cannot be read
+and validated, the runtime refuses to bulk-cancel broker orders because doing
+so could remove bracket protection without proving that every residual
+position can be closed. Likewise, a protective cancel request is not treated
+as completion: the runtime polls broker order state for a terminal cancel and
+refuses the parent close when a child fill races the cancellation.
 
 The SQLite journal uses WAL plus `synchronous=FULL`, validates required base
 columns before migration, and records events, orders, trades, equity, runs,
@@ -378,6 +395,15 @@ family on invalid output, or authorize trading. Every seeding and tuning path
 has a deterministic fallback, so the factory keeps discovering with no provider
 configured.
 
+`agent.brain.DecisionBrain` is a separate optional paper-runtime adapter. It is
+consulted only after a deterministic strategy has produced a setup; it can
+subtract that opportunity with a matching veto but cannot author a setup,
+quantity, side, price, order type, or broker call. A strict timeout quarantines
+the client for the rest of the process after a hung request. Provider errors or
+malformed non-empty responses veto the cycle; an empty or irrelevant response
+means no veto and returns to the deterministic path. Live mode rejects both
+`llm.enabled: true` and a directly injected brain at the Engine boundary.
+
 No lane can extend the signal vocabulary. `RULE_FAMILIES`, `CONFIRMATIONS`,
 `SIDES`, the permitted field set and the numeric bounds in
 `agent.contracts.rule` are closed, and `evaluate_rule_signal` — how each signal
@@ -436,8 +462,12 @@ edge the report renders and counts.
 
 `research.gates` provides chronological splits, structural floors, paired and
 cluster-aware controls, placebo/falsification tests, held-out separation,
-drawdown, sample counts, family false-discovery correction inputs, and the
-verified-gate envelope.
+drawdown, sample counts, family-local and cycle-global false-discovery
+correction inputs, and the verified-gate envelope. The family and global
+decisions are separate: global q is always at least as conservative as the
+family q, so a marginal candidate commonly passes its family test while
+failing the cycle-global test. Proof verification compares each flag with its
+own q-value; only the global decision can authorize cross-family selection.
 
 `research.edge_ledger_store` owns the SQLite schema and hashing primitives.
 `research.edge_ledger_proof` owns verified-gate persistence and re-verification.
@@ -453,8 +483,18 @@ candidate -> backtest_passed -> shadow -> validated -> champion
 
 Every accepted proof retains content hashes for data, configuration, code, and
 provenance. Gate envelopes are re-verified before use. Malformed legacy proof
-rows are skipped rather than crashing champion selection. Paper outcomes are
-append-only and can demote an edge; they cannot manufacture a proof.
+rows are skipped rather than crashing champion selection. The final sealed
+qualification decision retains bounded candidate/baseline source observations,
+their declared session set, and content digests in the envelope; verification
+recomputes the qualification report and rejects missing, extra, or tampered
+sessions. Paper outcomes are append-only and can demote an edge; they cannot
+manufacture a proof.
+
+Forward-shadow boundaries advance only from a durable, re-verifying passing
+shadow proof. Diagnostic account rows do not move the boundary, and a worker
+whose intended variants are not all adequately powered persists no shadow
+proof or lifecycle result. Its tail is therefore reconsidered instead of being
+lost to a prematurely advanced boundary.
 
 Retirement guards every deployed candidate, not only the champion, because
 `all_proved` selection trades one validated candidate per family. Two
@@ -502,13 +542,16 @@ stable per vehicle: the ledgers are the durable record, this file is a view.
 `paper_outcomes` the demotion guards already consume: per-edge trade and
 session counts, total and mean R, win rate, net P&L, the rolling-R guard with
 its floor and armed/breached state, and the sequential drift statistic against
-the validated held-out distribution. `research.py edge paper` and the
+the validated held-out distribution. Each outcome is attributed to the exact
+passing shadow `proof_run_id` captured when the trade entered. Reads and trial
+verdicts use only the latest passing proof epoch; a demoted, re-proved candidate
+does not inherit losses or wins from the evidence epoch that preceded the new
+proof. A failed or unverifiable latest shadow proof quarantines the history
+instead of falling back to lifetime outcomes. `research.py edge paper` and the
 dashboard's "Live paper results by edge" card are the two read surfaces. They
 are derived on every read, never stored, so they cannot drift from the
-outcomes they summarize or from the guard that acts on them; the dashboard
-restates the two guard thresholds rather than importing the research package,
-and a test pins them to the ledger's constants. Neither surface can change a
-lifecycle state.
+outcomes they summarize or from the guard that acts on them. Neither surface
+can change a lifecycle state.
 
 ### Trial, promotion, and the freeze
 
@@ -547,8 +590,10 @@ unchanged settings records nothing. Secret-bearing fields are redacted before
 hashing, so the trail records that a key changed and never its value; the
 honest consequence, which a test pins, is that a change confined to redacted
 values does not produce a distinguishable version. Rows are immutable. The
-runtime records its version on start and journals the changed paths; failing to
-write the trail never stops a runtime from starting.
+runtime records its version on start and journals the changed paths. Failing to
+write the trail never stops a runtime that may already own exposure; instead it
+sets a sticky `degraded` heartbeat with reason `config_audit_unavailable` until
+a later successful audit clears the condition.
 
 ### The reporting surface
 

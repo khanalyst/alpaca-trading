@@ -29,7 +29,12 @@ when that heartbeat is stale beyond `ALPACA_WATCHDOG_MAX_HEARTBEAT_AGE` (300s)
 and the broker still reports positions, it cancels resting protective legs and
 flattens through its own broker session. It first takes the mode-scoped run
 lock, so a running trader keeps it inert; it can never submit an entry. It
-cannot help when the broker or the network is unreachable.
+keeps that lock through the final position snapshot and flatten action,
+authenticates and binds the broker account fingerprint before any mutation,
+and reports `acted` only after flattening is confirmed. An incomplete attempt
+is `degraded` with residual risk and fails health checks. It cannot help when
+the broker or the network is unreachable, or while a wedged trader still owns
+the lock.
 
 The recorder writes its mixed bars/quotes/options corpus partitioned by New
 York session date under `runtime/research/recorded/sessions/market-<date>.csv`,
@@ -86,14 +91,20 @@ into the research service.
 The shipped Compose and systemd lanes are paper-scoped. A live deployment is a
 separate reviewed config/runtime scope: `mode: live`, `broker.paper: false`,
 `broker.allow_live: true`, `ALPACA_LIVE_ENABLE=true`,
-`strategy.selection_mode: specific`, and one exact named validated/champion
-`strategy.variant_id`. The runtime pins that edge and does not auto-switch.
-The authenticated live preflight also requires `pattern_day_trader=true`.
+and either `strategy.selection_mode: pinned` with exactly one operator-named
+entry (preferred), or legacy `selection_mode: specific` with one exact named
+validated/champion `strategy.variant_id`. The runtime resolves only that edge,
+re-verifies its proof/configuration at startup refresh, and does not
+auto-switch. Runtime LLM decisions are rejected independently by configuration
+validation and the Engine constructor. The authenticated live preflight also
+requires `pattern_day_trader=true`.
 Research lifecycle gates include fit/held-out structural floors, matched
-controls, placebo/falsification, FDR, and durable verification; underpowered
-data is not failure. A valid bounded LLM replacement is registered before an
-adequately tested failed family can retire. Scheduler terminal statuses are
-`completed`, `completed_no_edge`, `no_data`, and `failed`.
+controls, placebo/falsification, family-local and cycle-global FDR, sealed
+qualification source binding, and durable verification. Underpowered shadow
+data advances no boundary and is reconsidered. A valid bounded LLM replacement
+is registered before an adequately tested failed family can retire. Scheduler
+terminal statuses are `completed`, `completed_no_edge`, `no_data`, and
+`failed`.
 
 ## Legacy systemd lane
 

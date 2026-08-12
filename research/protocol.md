@@ -63,22 +63,29 @@ Four states, one of which no automatic process may enter.
 candidate in either direction on evidence.
 
 *Trial* is a proved, unpinned edge trading the paper account. Its live outcomes
-are append-only evidence. After a configured window of sessions and trades it
-is judged against an explicit floor. An edge below the floor is demoted and the
+are append-only evidence attributed to the exact passing shadow proof that
+authorized entry. After a configured window of sessions and trades it is
+judged against an explicit floor. An edge below the floor is demoted and the
 result is recorded as a graded lesson sourced from live paper, which later
 proposals may read. An edge above it keeps trading and is reported as
-promotable. Underpowered windows and outcomes without a usable risk reference
-are never treated as failure.
+promotable. If the same candidate is later re-proved, the new trial begins a
+new proof epoch and cannot inherit the earlier epoch's wins or losses.
+Underpowered windows and outcomes without a usable risk reference are never
+treated as failure; a failed or unverifiable latest shadow proof quarantines
+history rather than falling back to lifetime aggregation.
 
 *Pinned* is an operator-declared promotion: an entry in `strategy.pinned`
 carrying an operator-assigned id, an exact `variant_id`, and a vehicle.
 Pinning is a selection, not an authorization — a pinned entry still resolves
 through the same evidence gate and a pin that does not resolve trades nothing
-rather than being substituted. Pinning is the only route into live. A pinned
-candidate is exempt from every automatic lifecycle change: the rolling-R guard,
-the sequential drift test, and the trial review all still evaluate and still
-record what they found, but they raise a durable alert instead of transitioning
-it. Runtime risk limits are unaffected; they are safety, not lifecycle.
+rather than being substituted. It is the preferred live route because the
+operator-assigned id makes the promotion explicit and auditable; the legacy
+`selection_mode: specific` route remains supported for one exact proved
+variant. A pinned candidate is exempt from every automatic lifecycle change:
+the rolling-R guard, the sequential drift test, and the trial review all still
+evaluate and still record what they found, but they raise a durable alert
+instead of transitioning it. Runtime risk limits are unaffected; they are
+safety, not lifecycle.
 
 No automatic process may move a candidate into the pinned state, and none may
 move one out of it.
@@ -90,7 +97,9 @@ recorded append-only with a version id, the previous version, and a diff naming
 each field that changed. Secret-bearing fields are redacted before hashing, so
 the trail records that such a field changed and never what it changed to, and a
 change confined to redacted values is therefore not distinguishable as a new
-version. Records are immutable.
+version. Records are immutable. Failure to write this audit row does not stop a
+runtime that may own exposure; it produces a sticky degraded heartbeat with
+reason `config_audit_unavailable` until a successful audit clears it.
 
 ## Autonomous edge lane
 
@@ -101,8 +110,10 @@ variant ids are content hashes of those specifications. Arbitrary source code
 or unbounded fields are rejected. `agent.edge` resolves only a SQLite candidate
 whose status is `validated` or `champion` for the configured strategy/vehicle.
 Paper `selection_mode: all_proved` may run one strongest passing variant per
-independent family under one global risk book; live mode must pin one named
-variant with `selection_mode: specific`.
+independent family under one global risk book. Live mode resolves exactly one
+proved record: preferably one `selection_mode: pinned` entry, or one legacy
+`selection_mode: specific` variant. It never substitutes a different
+candidate when the requested proof/configuration no longer re-verifies.
 
 Backtests and forward-shadow runs are persisted with immutable hashes and
 trade/evidence rows. The autonomous lane first evaluates the initial corpus as
@@ -111,10 +122,11 @@ evidence. Passing gates advance `candidate` -> `backtest_passed` -> `shadow` ->
 `validated`, after which champion selection is automatic; runtime entries stay
 blocked until a validated/champion record exists for the selected vehicle.
 A candidate cannot skip the lifecycle or silently move backwards. Paper
-outcomes are append-only and may demote a champion. Normal operation needs no
-manual promotion. Explicit `edge promote` is supported only as an audited
-control subject to lifecycle/evidence rules. Backward rollback is rejected;
-explicit demotion is the operator safety action.
+outcomes are append-only, proof-epoch scoped, and may demote a deployed edge.
+Normal operation needs no manual promotion. Explicit `edge promote` is
+supported only as an audited control subject to lifecycle/evidence rules.
+Backward rollback is rejected; explicit demotion is the operator safety
+action.
 
 Factory mutations may inspect only the chronological fit partition. Held-out
 and later-forward sessions must not influence hypothesis or parameter
@@ -156,7 +168,11 @@ Each transition requires a chronological fit/held-out boundary, fit and
 held-out structural floors for trades/sessions/clusters, matched baseline
 deltas, cluster-level sign randomisation, and both family-local and
 cycle-global false-discovery correction. Selection compares candidates across
-families, so the q-value that authorizes a champion is the global one.
+families, so the q-value that authorizes a champion is the global one. Because
+Benjamini-Hochberg is monotone in the number of tests, cycle-global q is never
+less conservative than family q; a family pass/global fail is therefore a
+normal result for a marginal candidate, and proof verification must compare
+each decision flag with its own q-value.
 
 Beating a control is necessary but never sufficient. A variant must also show
 absolute after-cost profitability on unseen data (positive net P&L and
@@ -174,9 +190,13 @@ is reproducible.
 The last sessions of every evaluation corpus are sealed into a final
 qualification window before any worker is scheduled. Selection, mutation and
 diagnosis never receive them; the window is opened exactly once, by the
-orchestrator, for the last go/no-go, and refuses to be copied or serialized.
-Sealed sessions are scored, never split, so they enter no run, trade row or
-family correction, and the forward-only boundary clears them afterwards.
+orchestrator, for the last go/no-go. Sealed sessions are scored, never split,
+so they enter no fit/held-out run, trade row, or family correction. The verified
+gate does retain a bounded copy of the candidate and baseline qualification
+observations, the exact declared session set, and content digests. Verification
+recomputes the qualification report and rejects a row from an undeclared
+session, a missing declared session, digest tampering, excessive row count, or
+an oversized envelope.
 
 Both research lanes are held to this standard. The explicit IBR lane and the
 autonomous factory lane share one randomized-entry null control and one sealed
@@ -193,6 +213,12 @@ Underpowered data is not failure. Retirement is permitted only after every
 intended variant is adequately tested and fails; an enabled LLM lane must first
 register a valid bounded replacement. Drawdown is persisted and used to rank
 otherwise qualified champions conservatively.
+
+The forward-shadow boundary advances only from a durable, re-verifying passing
+shadow proof. Diagnostic account rows never advance it. If even one intended
+variant in a worker lacks the required trade/session floors, that worker
+persists no shadow proof, transition, or reseed, and the complete tail remains
+eligible for reconsideration on the next cycle.
 
 The checked research config enables the bounded strategy LLM with model
 `gpt-5`. It reads only the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing

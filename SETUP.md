@@ -209,6 +209,13 @@ The model is set in `config.yaml` under `research.strategy_llm.model` and
 defaults to `gpt-5`. Set `research.strategy_llm.provider` to `anthropic` if you
 supplied an Anthropic key.
 
+Treat a custom provider base URL as a secret-bearing outbound destination.
+`OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` receives the provider key and bounded
+research prompt; use only a trusted HTTPS endpoint. The application does not
+currently enforce an LLM host allowlist. Provider-side spend/rate quotas are
+also required for unattended use because the application bounds attempts,
+timeouts, and response bytes but does not impose a daily currency budget.
+
 ## 7. Review the trading configuration
 
 Open `config.yaml`. For a first deployment, verify these and change nothing
@@ -418,7 +425,9 @@ disable `research.require_validated_variant` to force entries — that flag is
 the only thing standing between you and trading an unproven rule.
 
 The watchdog should report `watching`. That is the steady state; `acted` means
-it flattened something and requires reconciliation.
+it authenticated the scoped account and confirmed flattening. `degraded` or
+`residual_risk: true` means it attempted to act but could not prove the account
+flat and requires immediate broker reconciliation.
 
 **The watchdog is not optional for the `options` profile.** Alpaca offers no
 broker-resident stop on options, so an option position's stop is the trader's
@@ -427,7 +436,9 @@ process dies or hangs. It is a separate container with its own broker session
 that can cancel and flatten but never enter. It takes the mode-scoped run lock
 first, so a living trader keeps it inert; when the trader heartbeat is stale
 beyond `ALPACA_WATCHDOG_MAX_HEARTBEAT_AGE` (default 300s) and the broker still
-reports exposure, it cancels resting protective legs and flattens.
+reports exposure, it keeps the lock through the final snapshot and action,
+binds the authenticated account identity, cancels resting protective legs, and
+flattens.
 
 Two gaps it does **not** cover: a trader that is alive but wedged (it holds the
 lock, so the watchdog stays inert), and an unreachable broker or network — in
@@ -698,8 +709,12 @@ broker:
   paper: false
   allow_live: true
 strategy:
-  selection_mode: specific
-  variant_id: <exact-validated-or-champion-variant>
+  selection_mode: pinned
+  pinned:
+    - id: <operator-assigned-promotion-id>
+      variant_id: <exact-validated-or-champion-variant>
+      vehicle: equity
+      strategy_id: rule
 llm:
   enabled: false
 research:
@@ -717,7 +732,9 @@ export ALPACA_AGENT_RUNTIME_ROOT=/opt/alpaca-agent-live-runtime
 
 Note what live mode does **not** do: there is no automatic promotion from paper
 to live. You pin one exact validated variant by hand, and it never auto-switches
-for the process lifetime.
+for the process lifetime. The legacy `selection_mode: specific` form with one
+exact `variant_id` remains supported, but `pinned` is preferred because its
+operator-assigned id makes the promotion auditable.
 
 Configuration validation rejects `mode: live` with `llm.enabled: true`: the
 pinned edge was proven with the deterministic rule and no LLM in the loop, so a

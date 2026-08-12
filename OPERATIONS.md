@@ -80,8 +80,12 @@ will not act), and an unreachable broker or network (no local process can
 close anything). `mode: live` therefore rejects `execution_mode: options`;
 run the options profile on paper only.
 
-Check the watchdog with `python deploy/health.py watchdog`; a `watching`
-status is the normal steady state and `acted` means it flattened.
+Check the watchdog with `python deploy/health.py watchdog`. `watching` is the
+normal steady state. `acted` means the watchdog authenticated the scoped
+account and confirmed flattening. `degraded` or `residual_risk: true` means it
+attempted to act but could not prove the account flat; treat that as an
+incident, not a healthy watchdog result. The watchdog deliberately remains
+inert while a trader owns the run lock, even if that process is wedged.
 
 ## Mode guard and live preflight
 
@@ -89,14 +93,15 @@ Paper is the default and the shipped Compose/systemd lanes set
 `ALPACA_PAPER=true`. A live process is allowed only with `mode: live`,
 `broker.paper: false`, `broker.allow_live: true`, and
 `ALPACA_LIVE_ENABLE=true`; `ALPACA_PAPER=true` must not be set. It must use
-`strategy.selection_mode: specific` and one exact named validated/champion
-`strategy.variant_id`, and it must keep `llm.enabled: false` — validation
-rejects a live configuration with the runtime decision LLM on, because the
-pinned edge was proven with the deterministic rule and no LLM in the loop and a
-runtime veto would deploy a strategy that never passed the gates. The bounded
+either `strategy.selection_mode: pinned` with exactly one operator-named pin
+(preferred), or the legacy `selection_mode: specific` with one exact named
+validated/champion `strategy.variant_id`. It must keep `llm.enabled: false` —
+validation and the Engine constructor both reject a live runtime decision LLM,
+because a veto would deploy behavior that never passed the gates. The bounded
 research strategy-replacement adapter is a separate offline setting and is
-unaffected. The runtime pins that candidate/configuration and does
-not auto-switch. Keep live credentials, config, and
+unaffected. The runtime resolves exactly that candidate/configuration, checks
+it again during startup refresh, and never substitutes another champion. Keep
+live credentials, config, and
 `ALPACA_AGENT_RUNTIME_ROOT` separate from paper; never run both against shared
 state or a shared account.
 
@@ -336,6 +341,13 @@ promotes nothing in its place: the replacement still has to earn a backtest
 pass, a strictly later shadow pass, and every gate. `ALPACA_TRIAL_REVIEW_ENABLED=0`
 disables the review in a cycle.
 
+Paper outcomes are scoped to the exact passing shadow proof that authorized
+the entry. If a candidate is demoted, earns a newer shadow proof, and begins a
+new trial, `paper_performance` and `review_trials` use only the new proof epoch;
+old losses and wins remain durable history but cannot decide the new verdict.
+If the latest shadow proof is failed or cannot be re-verified, new unscoped
+outcomes are rejected and lifetime history is not used as a fallback.
+
 Exit code 3 from `edge trials` means something was parked. That is an
 operator-visible outcome, not a failure.
 
@@ -361,6 +373,14 @@ redacted before hashing. The trail records that such a field changed, never
 what it changed to — and the honest consequence is that a change confined to
 those fields alone does not appear as a separate version.
 
+An audit-write failure is deliberately non-blocking because halting a trader
+that may already own exposure is the more dangerous failure. It is not silent:
+the heartbeat becomes sticky `degraded` with reason
+`config_audit_unavailable`, health reports it as unhealthy, and a later
+successful audit is required to clear the condition. Investigate the journal
+path, permissions, free space, and SQLite readiness while continuing to
+monitor any open exposure.
+
 ## Research and evidence
 
 Research is read-only with respect to broker authority. It discovers the
@@ -378,11 +398,17 @@ initialized at `runtime/research/edge_lab.sqlite3`; inspect it with
 `python research.py edge status`. The autonomous lifecycle requires an initial
 corpus backtest followed by later unseen shadow evidence. Validation requires
 fit and held-out structural floors, matched controls, placebo/falsification,
-family-level FDR, and a durable verified gate. Underpowered data is not a
-failure. Retirement waits until all intended variants are adequately tested
-and fail, and a valid bounded LLM replacement is registered first when that
-lane is enabled. Paper outcomes are appended for forward monitoring and may
-demote a champion. Passing gates advance validated/champion state without
+family-local and cycle-global FDR, and a durable verified gate. A family pass
+with a global failure is a normal marginal result and cannot authorize
+selection. Final qualification evidence binds its declared sessions, bounded
+candidate/baseline observations, and content digests so it can be recomputed.
+Underpowered data is not a failure: a shadow worker advances no durable
+boundary until all intended variants are adequately powered, so the tail is
+reconsidered on a later cycle. Retirement waits until all intended variants
+are adequately tested and fail, and a valid bounded LLM replacement is
+registered first when that lane is enabled. Paper outcomes are appended for
+forward monitoring, scoped to their authorizing proof epoch, and may demote a
+deployed edge. Passing gates advance validated/champion state without
 manual promotion. Manual `edge promote` remains an audited control subject to
 lifecycle/evidence rules. Backward rollback is rejected; explicit demotion is
 the operator safety action. Good edges emit deterministic,
@@ -488,4 +514,6 @@ organization controls.
 | Option chain lacks a valid single-leg long contract | Skip the trade. Never substitute a multi-leg, uncovered, or short option. |
 | Position remains after close cutoff or startup cleanup | Stop new entries, cancel orders, flatten manually through the scoped Alpaca account, and keep the trader paused. |
 | Local/broker state differs | Broker state wins; preserve logs and reconcile before resuming. |
+| Watchdog reports `degraded` or residual risk | Treat the account as potentially exposed; inspect broker positions/orders directly, flatten through the scoped account, and do not mark the service healthy merely because it attempted to act. |
+| Trader reports `config_audit_unavailable` | Keep exposure monitoring active, repair journal storage/permissions/SQLite, and confirm a later successful audit clears the degraded heartbeat. |
 | Research reports disagree | Preserve both artifacts and compare feed/session/contract provenance; do not merge silently. |
