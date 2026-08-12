@@ -70,25 +70,35 @@ credentials, market rows, or fields outside schema, rule_spec and thesis.
 # must say *why* for every variant, and that reason is later graded against
 # the gate the variant earned.  It cannot widen the grammar, skip a gate, or
 # touch a variant that has already been proved.
-TUNING_SYSTEM_PROMPT = """You tune the parameters of one bounded intraday rule
-strategy for an audited research process.  Return one JSON object and nothing
-else, exactly:
-{"schema":"llm-variant-tuning.v1","variants":[{"rule_spec":{...},"reason":"..."}]}
-Each rule_spec must use only the finite rule-strategy grammar and must keep the
-same "family" as the root strategy you are given: you are tuning it, not
-replacing it.  Set "schema":"rule-strategy.v2" inside a rule_spec to also use
-the conditional fields (confirmations, entry_after_minutes,
-entry_before_minutes, min_atr_bps, max_atr_bps).
-You are given the root strategy, the diagnosis of how it failed on fit data
-only, and the graded lessons from earlier attempts: what was tried, the reason
-given for trying it, and what the gates then said.  Use the lessons.  Do not
-repeat a change whose recorded outcome was already a failure for the same
-reason.  "reason" is one plain sentence, at most 240 characters, naming the
-parameter you changed and the diagnosed problem it should fix, so it can be
-graded against the result later.
+TUNING_SYSTEM_PROMPT = """You tune the numeric parameters of one bounded
+intraday rule strategy for an audited research process.  Return one JSON object
+and nothing else, exactly:
+{"schema":"llm-variant-tuning.v1","variants":[
+  {"rule_spec":{...},"reason":"...","builds_on":"<lesson id>"}]}
+
+WHAT YOU MAY CHANGE.  You are given a root rule_spec.  Copy it and change the
+VALUES of its existing fields, within the grammar's bounds.  You may not add,
+remove or rename a field, you may not change "family", and you may not change
+"schema".  The signals themselves — the families, the confirmation filters, and
+how each is computed from the bars — are fixed code that you are tuning, not
+designing.  You cannot introduce a new signal, indicator or data source, and a
+reply that tries to is rejected outright.  Changing which idea is being tested
+is a different job, done elsewhere.
+
+WHAT YOU MUST LEARN FROM.  You are given the diagnosis of how the root failed
+on fit data only, and the graded lessons from earlier attempts: each lesson's
+id, what was tried, the reason given, and what the gates then said.  Every
+variant must set "builds_on" to the id of the lesson it is reasoning from, and
+its "reason" must say what that lesson showed and what you are changing as a
+result.  Do not re-propose parameter values a lesson already recorded as
+failed.  When no lessons are supplied, omit "builds_on".
+
+"reason" is one plain sentence, at most 240 characters, naming the parameter
+you changed and the diagnosed problem it should fix, so it can be graded
+against the result later.
 Never return markdown, Python/source code, executable instructions,
-credentials, market rows, or fields outside schema, variants, rule_spec and
-reason.
+credentials, market rows, or fields outside schema, variants, rule_spec,
+reason and builds_on.
 """
 
 _FORBIDDEN_KEYS = {
@@ -101,8 +111,13 @@ _RESPONSE_KEYS = frozenset(("schema", "rule_spec"))
 _DISCOVERY_RESPONSE_KEYS = frozenset(("schema", "rule_spec", "thesis"))
 _TUNING_RESPONSE_KEYS = frozenset(("schema", "variants"))
 _TUNED_VARIANT_KEYS = frozenset(("rule_spec", "reason"))
+_TUNED_VARIANT_OPTIONAL_KEYS = frozenset(("builds_on",))
 MAX_THESIS_CHARS = 240
 MAX_REASON_CHARS = 240
+# A lesson reference is the short prefix of its ledger id, which is what the
+# brief carries.  Anything else is a fabricated citation.
+LESSON_REF_CHARS = 12
+_LESSON_REF = re.compile(r"^[0-9a-f]{%d}$" % LESSON_REF_CHARS)
 
 
 def canonical_json(value: Any) -> str:
@@ -219,8 +234,17 @@ def _safe_reason(value: Any) -> str:
     return _safe_text(value, label="reason", limit=MAX_REASON_CHARS)
 
 
-def _safe_tuned_variants(value: Any, *, limit: int) -> list[dict[str, Any]]:
-    """Validate the ``variants`` list of a tuning reply, before any grammar."""
+def _safe_tuned_variants(value: Any, *, limit: int,
+                         known_lessons: frozenset[str] = frozenset()
+                         ) -> list[dict[str, Any]]:
+    """Validate the ``variants`` list of a tuning reply, before any grammar.
+
+    When the request supplied graded lessons, every variant must cite the one
+    it reasoned from.  An uncited proposal is indistinguishable from a guess,
+    and a citation naming a lesson that was never supplied is a fabricated
+    one, so both are refused rather than recorded as learning that did not
+    happen.
+    """
 
     if not isinstance(value, (list, tuple)):
         raise ValueError("variants must be a JSON array")
@@ -232,7 +256,7 @@ def _safe_tuned_variants(value: Any, *, limit: int) -> list[dict[str, Any]]:
     for index, entry in enumerate(value):
         if not isinstance(entry, Mapping):
             raise ValueError(f"variants[{index}] must be an object")
-        unknown = set(entry) - _TUNED_VARIANT_KEYS
+        unknown = set(entry) - _TUNED_VARIANT_KEYS - _TUNED_VARIANT_OPTIONAL_KEYS
         missing = _TUNED_VARIANT_KEYS - set(entry)
         if unknown:
             raise ValueError(
@@ -245,8 +269,23 @@ def _safe_tuned_variants(value: Any, *, limit: int) -> list[dict[str, Any]]:
         # Catch source/credential keys before the grammar's generic unknown
         # field error, preserving an explicit safety failure for callers.
         _finite(entry["rule_spec"], path=f"variants[{index}].rule_spec")
+        builds_on = entry.get("builds_on")
+        if known_lessons:
+            if not isinstance(builds_on, str) or not _LESSON_REF.match(builds_on):
+                raise ValueError(
+                    f"variants[{index}].builds_on must cite one of the "
+                    f"{len(known_lessons)} lesson id(s) supplied")
+            if builds_on not in known_lessons:
+                raise ValueError(
+                    f"variants[{index}].builds_on cites unknown lesson "
+                    f"{builds_on!r}")
+        elif builds_on is not None:
+            raise ValueError(
+                f"variants[{index}].builds_on cites a lesson, but none were "
+                "supplied")
         parsed.append({"rule_spec": dict(entry["rule_spec"]),
-                       "reason": _safe_reason(entry["reason"])})
+                       "reason": _safe_reason(entry["reason"]),
+                       "builds_on": builds_on if known_lessons else None})
     return parsed
 
 
@@ -508,12 +547,18 @@ class RuleProposalAdapter:
                         "maxItems": MAX_TUNED_VARIANTS,
                         "items": {
                             "type": "object", "additionalProperties": False,
-                            "required": ["rule_spec", "reason"],
+                            "required": ["rule_spec", "reason", "builds_on"],
                             "properties": {
                                 "rule_spec": {"type": "object",
                                               "additionalProperties": True},
                                 "reason": {"type": "string",
                                            "maxLength": MAX_REASON_CHARS},
+                                # Nullable: the first cycle has no lesson to
+                                # cite.  Structured-output modes require every
+                                # property to be listed, so it is required and
+                                # nullable rather than optional.
+                                "builds_on": {"type": ["string", "null"],
+                                              "maxLength": LESSON_REF_CHARS},
                             }}}}}
         properties: dict[str, Any] = {
             "schema": {"type": "string", "const": name},
@@ -735,11 +780,16 @@ class RuleProposalAdapter:
                 raise ValueError(
                     f"count must be between 1 and {MAX_TUNED_VARIANTS}")
             root = validate_rule_spec(_finite(rule_spec, path="rule_spec"))
+            safe_lessons = _safe_lessons(lessons)
+            known_lessons = frozenset(
+                str(item["id"]) for item in safe_lessons
+                if isinstance(item, Mapping) and item.get("id"))
             request = {"vehicle": vehicle, "slot": slot,
                        "variants_requested": int(count),
-                       "family": root["family"], "root_rule_spec": root,
+                       "family": root["family"], "rule_schema": root["schema"],
+                       "root_rule_spec": root,
                        "diagnosis": _safe_diagnosis(diagnosis),
-                       "lessons": _safe_lessons(lessons)}
+                       "lessons": safe_lessons}
             request_hash = content_hash(request)
             system_hash = content_hash(prompt)
         except Exception as exc:
@@ -760,15 +810,26 @@ class RuleProposalAdapter:
                     raw_value, max_bytes=self.max_response_bytes,
                     schema=TUNING_SCHEMA, keys=_TUNING_RESPONSE_KEYS,
                     spec_key=None)
-                entries = _safe_tuned_variants(parsed["variants"], limit=count)
+                entries = _safe_tuned_variants(parsed["variants"], limit=count,
+                                               known_lessons=known_lessons)
                 variants: list[dict[str, Any]] = []
                 seen: set[str] = set()
                 for index, entry in enumerate(entries):
                     normalized = validate_rule_spec(entry["rule_spec"])
+                    # The signal primitives are fixed code.  Tuning changes the
+                    # values inside one of them; it may not swap the family for
+                    # another, and it may not raise the grammar version, which
+                    # would unlock whole categories of predicate the root was
+                    # never expressed in.  Either is a new signal, not a tune.
                     if normalized["family"] != root["family"]:
                         raise ValueError(
                             f"variants[{index}] changed family; tuning may not "
-                            "replace the hypothesis")
+                            "replace the hypothesis's signal")
+                    if normalized["schema"] != root["schema"]:
+                        raise ValueError(
+                            f"variants[{index}] changed schema from "
+                            f"{root['schema']!r}; tuning may not widen the "
+                            "grammar")
                     variant = rule_variant_id(normalized)
                     # A repeated spec is a duplicate, not a contract breach:
                     # keep the first and let the caller top up the remainder.
@@ -777,7 +838,8 @@ class RuleProposalAdapter:
                     seen.add(variant)
                     variants.append({"rule_spec": normalized,
                                      "variant_id": variant,
-                                     "reason": entry["reason"]})
+                                     "reason": entry["reason"],
+                                     "builds_on": entry["builds_on"]})
                 if not variants:
                     raise ValueError("tuning reply contained no usable variant")
                 raw_hash = content_hash(raw)
@@ -790,9 +852,13 @@ class RuleProposalAdapter:
                     "raw_response_hash": raw_hash,
                     "root_variant_id": rule_variant_id(root),
                     "family": root["family"],
+                    "rule_schema": root["schema"],
                     "requested": int(count),
                     "returned": len(variants),
-                    "lessons_supplied": len(request["lessons"]),
+                    "lessons_supplied": len(safe_lessons),
+                    "lessons_cited": sorted(
+                        {entry["builds_on"] for entry in variants
+                         if entry["builds_on"]}),
                     "attempts": attempt,
                 }
                 return ProposalResult(True, schema=TUNING_SCHEMA,
@@ -804,7 +870,7 @@ class RuleProposalAdapter:
                     "kind": "tuning", "system_prompt_hash": system_hash,
                     "request_hash": request_hash,
                     "requested": int(count),
-                    "lessons_supplied": len(request["lessons"]),
+                    "lessons_supplied": len(safe_lessons),
                     "attempts": self.max_attempts}
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
@@ -848,8 +914,8 @@ def tune_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
 
 
 __all__ = [
-    "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "MAX_REASON_CHARS",
-    "MAX_THESIS_CHARS", "MAX_TUNED_VARIANTS",
+    "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
+    "MAX_REASON_CHARS", "MAX_THESIS_CHARS", "MAX_TUNED_VARIANTS",
     "PROPOSAL_SCHEMA", "SYSTEM_PROMPT", "TUNING_SCHEMA", "TUNING_SYSTEM_PROMPT",
     "ProposalResult", "RuleProposalResult",
     "RuleProposalAdapter", "LLMRuleProposalAdapter", "LLMStrategy", "canonical_json",

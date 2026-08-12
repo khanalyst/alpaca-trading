@@ -84,18 +84,32 @@ and later-forward sessions must not influence hypothesis or parameter
 generation. This binds the bounded LLM tuning lane exactly as it binds the
 deterministic mutation table: a tuning request is given the fit-partition
 diagnosis and the graded outcomes of *already completed* proposals, never a
-held-out, sealed, or later-forward observation. A tuned variant may change
-parameters only, never its root's family, and is evaluated under the identical
-gates. Each variant is evaluated in an isolated simulated account.
+held-out, sealed, or later-forward observation. Each variant is evaluated in an
+isolated simulated account.
+
+No lane may extend the signal vocabulary. The families, confirmation filters,
+sides, permitted fields, and numeric bounds in `agent/contracts/rule.py` are
+closed sets, and the feature computation itself is code that research never
+generates or rewrites. A proposal naming an unknown family, filter, field, or
+data source is rejected at the boundary. Tuning is bounded further: a tuned
+variant must preserve both its root's `family` and its root's grammar
+`schema`, so it may change only the values of fields the root already carries.
+Selecting a different family, or a wider grammar version, is a discovery
+decision and follows the discovery path with its own gates.
 
 Every proposal — deterministic or model-authored — records a stated reason
 before the gate that judges it is computed, and that reason is graded against
 the resulting gate afterwards. Both records are append-only and the grade is
-written once. The graded pairs may be fed back into later proposals; because
-they describe only completed, already-corrected evaluations, doing so adds no
-information about unseen data. Multiple-test correction is what prices the
-search, so a tuned variant counts against the same family-local and
-cycle-global false-discovery budget as a mutated one.
+written once. A model-authored proposal made against a non-empty history must
+additionally cite the graded lesson it reasoned from; the citation is resolved
+against the ledger and stored, and an unresolvable one is refused. A parameter
+set a graded lesson already recorded as an adequate failure may not be
+re-proposed; an underpowered result is not such a record. The graded pairs may
+be fed back into later proposals; because they describe only completed,
+already-corrected evaluations, doing so adds no information about unseen data.
+Multiple-test correction is what prices the search, so a tuned variant counts
+against the same family-local and cycle-global false-discovery budget as a
+mutated one.
 Multiple-test correction covers every variant evaluated in the cycle. A
 replacement hypothesis may be generated only after the root family has an
 adequate trade/session sample and no variant passes; underpowered data must not

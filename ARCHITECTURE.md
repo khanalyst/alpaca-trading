@@ -378,8 +378,19 @@ family on invalid output, or authorize trading. Every seeding and tuning path
 has a deterministic fallback, so the factory keeps discovering with no provider
 configured.
 
-Tuning may change numbers, never structure: a tuned spec keeps its root's
-`family`, so replacing the idea stays discovery's job. The unmutated root is
+No lane can extend the signal vocabulary. `RULE_FAMILIES`, `CONFIRMATIONS`,
+`SIDES`, the permitted field set and the numeric bounds in
+`agent.contracts.rule` are closed, and `evaluate_rule_signal` — how each signal
+is actually computed from bars — is code the research process never generates.
+An unknown family, filter, indicator field or data source is rejected at the
+boundary, so the model selects and parameterizes signals rather than inventing
+them.
+
+Tuning is narrower again: a tuned spec keeps its root's `family` *and* its
+root's `schema`. The family pin keeps "which idea is under test" a discovery
+decision; the schema pin stops a v1 root reaching v2's extra predicate
+categories, which would be adding structure rather than tuning values. What is
+left is the values of fields the root already carries. The unmutated root is
 always variant zero and is never proposed away — its own matched control is
 itself, so it cannot pass and serves as the hypothesis's null calibration.
 Anything the model does not supply, supplies as a duplicate, or supplies
@@ -409,6 +420,17 @@ request, trimming oldest-first to stay inside the adapter's aggregate bound. A
 ledger written before lessons existed degrades to "no history", never to a
 failed cycle. Hypothesis-level reasons — why a slot was given an idea at all —
 are graded by the best variant that idea produced, never by the root.
+
+Supplying history does not make a model use it, so three rules make the loop
+structural. Each brief entry carries a short id, and a tuned variant proposed
+against a non-empty brief must cite one in `builds_on`; an uncited proposal, or
+one citing an id never supplied, is refused. A variant whose parameters a
+graded lesson already recorded as an adequate failure is dropped and the slot
+topped up deterministically — `FactoryLedger.failed_variant_ids` deliberately
+excludes underpowered results, so a thin sample never closes a door. The
+citation is resolved through `resolve_lesson_ref` and stored as
+`parent_lesson_id`, making "B was tried because A failed this way" a durable
+edge the report renders and counts.
 
 ### Statistical gates and lifecycle
 

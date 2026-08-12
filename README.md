@@ -21,13 +21,17 @@ shrinking with every success. An optional LLM proposes what to try next — new
 hypotheses for free slots, replacements for exhausted families, and the
 parameter variants inside a hypothesis — inside the same audited grammar, and
 every such proposal must earn `backtest_passed` and a strictly later forward
-shadow pass through the identical gates a deterministic one faces. Every
-proposal records the reason it was made *before* the gate that judges it
-exists, that reason is graded against the gate afterwards, and the graded pairs
-are fed back into later proposals, so parameter search is driven by what
-earlier attempts taught rather than by a fixed table alone. Every seeding and
-tuning path falls back to a deterministic ladder, so research works with no
-provider configured. A rule specification
+shadow pass through the identical gates a deterministic one faces. The signal
+primitives themselves are closed: an unknown family, filter, indicator field or
+data source is rejected at the boundary, and tuning must preserve both its
+root's family and its grammar version, so the model parameterizes signals and
+never invents one. Every proposal records the reason it was made *before* the
+gate that judges it exists, that reason is graded against the gate afterwards,
+and a proposal made against a non-empty history must cite the graded lesson it
+reasoned from — an uncited proposal is refused, a parameter set already proved
+to fail may not be re-proposed, and the citation is stored so the chain of
+learning is durable. Every seeding and tuning path falls back to a
+deterministic ladder, so research works with no provider configured. A rule specification
 carries `max_hold_bars`, so every strategy has a
 bounded time exit as well as a stop and a target; research and runtime compute
 that deadline from one shared helper. Paper

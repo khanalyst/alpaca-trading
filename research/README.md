@@ -241,8 +241,38 @@ output contract:
   hypothesis, given its root spec, the fit-partition diagnosis, and the graded
   lessons. Each returned variant must carry a `reason` of at most 240
   characters naming the parameter it changed and the diagnosed problem it
-  should fix. A tuned spec must keep its root's `family`: tuning changes the
-  numbers of an idea, never which idea it is.
+  should fix, and a `builds_on` citing the lesson it reasoned from.
+
+### The model tunes values; it cannot invent a signal
+
+The signal primitives are fixed code. `RULE_FAMILIES` names eleven of them,
+`CONFIRMATIONS` and `SIDES` are closed enums, the permitted field set is fixed
+per grammar version, and every numeric field has hard bounds — so
+`validate_rule_spec` rejects an unknown family, an unknown filter, an invented
+indicator field, or a new data source before anything reaches an evaluator.
+How each signal is computed from the bars lives in
+`agent/contracts/rule.py::evaluate_rule_signal`, which is code the research
+process never generates, imports, or rewrites. That has always been true of
+every lane; tuning does not weaken it.
+
+Tuning is narrower still. A tuned spec must keep its root's `family` *and* its
+root's `schema`:
+
+- **family** — changing which idea is under test is discovery's job, not
+  tuning's.
+- **schema** — `rule-strategy.v2` unlocks whole categories of predicate
+  (`confirmations`, an entry-time window, an ATR regime band) that the root was
+  never expressed in. Reaching them is adding structure, not tuning values, so
+  a v1 root is tuned in v1 and a v2 root is tuned in v2.
+
+What is left is exactly what "tuning the parameters" means: the values of the
+fields the root already has, inside the bounds the grammar already enforces.
+
+### Why something was tried, and how that turned out
+
+Parameter search used to be a fixed table: three hand-written responses per
+diagnosed failure mode, with an arithmetic sweep filling anything past that.
+It worked, but nothing it learned in one cycle reached the next one.
 
 All three replies are strict JSON, size-capped, fence-rejecting, and validated
 against the rule grammar before anything is stored; keys that look like source,
@@ -256,15 +286,9 @@ trading.** Every seeding and tuning path falls back to the deterministic
 ladder and mutation table, so the factory keeps discovering with no provider
 configured at all.
 
-### Why something was tried, and how that turned out
-
-Parameter search used to be a fixed table: three hand-written responses per
-diagnosed failure mode, with an arithmetic sweep filling anything past that.
-It worked, but nothing it learned in one cycle reached the next one.
-
-Every proposal now records a **reason** before the gate that will judge it
-exists, and that reason is **graded** against the gate afterwards. The pair
-lives in two append-only tables — `factory_lessons` for the reason,
+Every proposal records a **reason** before the gate that will judge it exists,
+and that reason is **graded** against the gate afterwards. The pair lives in two
+append-only tables — `factory_lessons` for the reason,
 `factory_lesson_outcomes` for the verdict — because the two facts are known at
 different times, and writing the reason first is what makes it a prediction
 rather than a summary. Deterministic mutations record reasons in the same
@@ -273,9 +297,30 @@ so a tuned reason can be compared against the fixed table rather than only
 against other tuned reasons.
 
 The graded pairs are read back into the next tuning and discovery request,
-oldest-first-trimmed to stay inside the prompt's aggregate bound. That is the
-whole loop: propose with a reason, evaluate under unchanged gates, grade the
-reason, and hand the grade forward.
+oldest-first-trimmed to stay inside the prompt's aggregate bound.
+
+### A proposal has to build on a learning, not arrive from nowhere
+
+Handing the model its history is necessary but not sufficient — nothing in a
+prompt makes a model use what it was given. Three rules make the loop a
+property of the system instead:
+
+1. **Cite the lesson.** Each brief entry carries a short id. When any lesson is
+   supplied, every returned variant must set `builds_on` to one of those ids,
+   and its `reason` must say what that lesson showed. An uncited proposal is
+   refused; so is one citing an id that was never supplied, which would be a
+   fabricated citation.
+2. **Do not re-run a settled experiment.** A variant whose parameters a graded
+   lesson already recorded as an adequate failure is dropped, and the
+   deterministic table tops the slot back up. *Underpowered* is not a failure,
+   so a thin sample never closes a door.
+3. **Keep the chain.** The citation is resolved to a real lesson id and stored
+   as `parent_lesson_id`, so "B was tried because A failed this way" is a
+   durable edge in the ledger. `factory report` renders it as `built on:` and
+   counts how many proposals stood on an earlier result.
+
+That is the whole loop: propose with a reason and a citation, evaluate under
+unchanged gates, grade the reason, and hand the grade forward.
 
 ```bash
 python research.py factory report --format markdown   # includes the graded reasons

@@ -125,6 +125,10 @@ class FactoryLedger:
                     diagnosis_json TEXT NOT NULL,
                     evidence_json TEXT NOT NULL,
                     created_at REAL NOT NULL,
+                    -- The graded lesson this proposal reasoned from, so the
+                    -- chain of learning is a durable edge in the ledger rather
+                    -- than an assertion in a prompt.
+                    parent_lesson_id TEXT REFERENCES factory_lessons(lesson_id),
                     UNIQUE(hypothesis_id,variant_id,kind)
                 );
                 CREATE TABLE IF NOT EXISTS factory_lesson_outcomes (
@@ -158,6 +162,8 @@ class FactoryLedger:
                     BEFORE DELETE ON factory_lesson_outcomes BEGIN
                     SELECT RAISE(ABORT, 'factory lesson outcomes are immutable');
                 END;
+                CREATE INDEX IF NOT EXISTS factory_lessons_parent
+                    ON factory_lessons(parent_lesson_id);
                 CREATE TRIGGER IF NOT EXISTS factory_hypotheses_no_update
                     BEFORE UPDATE ON factory_hypotheses BEGIN
                     SELECT RAISE(ABORT, 'factory hypotheses are immutable');
@@ -191,6 +197,14 @@ class FactoryLedger:
                     SELECT RAISE(ABORT, 'factory cycles are immutable');
                 END;
             """)
+            # ``CREATE TABLE IF NOT EXISTS`` leaves an already-created table
+            # alone, so a ledger written before the learning chain existed
+            # needs the column added rather than assumed.
+            columns = {str(row["name"]) for row in
+                       db.execute("PRAGMA table_info(factory_lessons)")}
+            if columns and "parent_lesson_id" not in columns:
+                db.execute("ALTER TABLE factory_lessons "
+                           "ADD COLUMN parent_lesson_id TEXT")
 
     def register(self, hypothesis: Any) -> dict:
         now = datetime.now().timestamp()
@@ -363,7 +377,8 @@ class FactoryLedger:
                       variant_id: str, kind: str, source: str, reason: str,
                       changed: Mapping | None = None,
                       diagnosis: Mapping | None = None,
-                      evidence: Mapping | None = None) -> str:
+                      evidence: Mapping | None = None,
+                      parent_lesson_id: str | None = None) -> str:
         """Record why something was tried, before anyone knows if it worked.
 
         Writing the reason at proposal time is what makes it evidence rather
@@ -388,15 +403,59 @@ class FactoryLedger:
             if existing is not None:
                 return str(existing["lesson_id"])
             lesson_id = uuid.uuid4().hex
-            db.execute("INSERT INTO factory_lessons VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
-                lesson_id, hypothesis_id, vehicle, str(family), str(variant_id),
-                kind, source, " ".join(str(reason).split()),
-                canonical_json(dict(changed or {})),
-                canonical_json(dict(diagnosis or {})),
-                canonical_json(dict(evidence or {})),
-                datetime.now().timestamp(),
-            ))
+            db.execute(
+                """INSERT INTO factory_lessons
+                   (lesson_id,hypothesis_id,vehicle,family,variant_id,kind,
+                    source,reason,changed_json,diagnosis_json,evidence_json,
+                    created_at,parent_lesson_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    lesson_id, hypothesis_id, vehicle, str(family),
+                    str(variant_id), kind, source,
+                    " ".join(str(reason).split()),
+                    canonical_json(dict(changed or {})),
+                    canonical_json(dict(diagnosis or {})),
+                    canonical_json(dict(evidence or {})),
+                    datetime.now().timestamp(),
+                    str(parent_lesson_id) if parent_lesson_id else None,
+                ))
             return lesson_id
+
+    def resolve_lesson_ref(self, ref: str) -> str | None:
+        """Map a short citation back to the lesson it names, or ``None``.
+
+        Proposals cite the truncated id the brief carried, so the citation has
+        to be resolved before it can be stored as a foreign key.  An
+        unresolvable reference is dropped rather than stored, which keeps a
+        fabricated citation out of the chain.
+        """
+        text = str(ref or "").strip().lower()
+        if not text:
+            return None
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT lesson_id FROM factory_lessons WHERE lesson_id LIKE ? || '%'"
+                " LIMIT 2", (text,)).fetchall()
+        return str(rows[0]["lesson_id"]) if len(rows) == 1 else None
+
+    def failed_variant_ids(self, *, vehicle: str,
+                           family: str | None = None) -> set[str]:
+        """Variants a graded lesson already recorded as an adequate failure.
+
+        Re-proposing one is not a new experiment: it is the same experiment,
+        and its answer is already in the ledger.
+        """
+        parameters: list[Any] = [vehicle]
+        clause = ""
+        if family is not None:
+            clause = " AND l.family=?"
+            parameters.append(family)
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                """SELECT DISTINCT l.variant_id FROM factory_lessons l
+                   JOIN factory_lesson_outcomes o ON o.lesson_id=l.lesson_id
+                   WHERE l.vehicle=? AND o.passed=0 AND o.underpowered=0"""
+                + clause, parameters).fetchall()
+        return {str(row["variant_id"]) for row in rows}
 
     def grade_lesson(self, hypothesis_id: str, variant_id: str, *, kind: str,
                      outcome: Mapping) -> str | None:

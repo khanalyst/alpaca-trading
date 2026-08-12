@@ -88,6 +88,64 @@ class TuningContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("family", result.error)
 
+    def test_tuning_may_not_widen_the_grammar(self):
+        """v2 unlocks whole predicate categories the root never expressed.
+
+        Reaching them is inventing structure, not tuning values, so tuning is
+        pinned to the root's own grammar version.
+        """
+        wider = {**ROOT, "schema": "rule-strategy.v2",
+                 "confirmations": ["trend"], "entry_after_minutes": 45}
+        adapter = _adapter(_reply((wider, "Added a time window and a filter.")))
+        result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=1)
+        self.assertFalse(result.success)
+        self.assertIn("may not widen the grammar", result.error)
+
+    def test_a_v2_root_is_tuned_in_v2_and_still_cannot_change_family(self):
+        """Pinning is to the root's own version, not to v1 forever."""
+        root = validate_rule_spec({**ROOT, "schema": "rule-strategy.v2",
+                                   "entry_after_minutes": 30})
+        adapter = _adapter(_reply(({**root, "entry_after_minutes": 60},
+                                   "Pushed the entry window later.")))
+        result = adapter.tune("equity", 0, root, DIAGNOSIS, count=1)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.variants[0]["rule_spec"]["schema"],
+                         "rule-strategy.v2")
+        self.assertEqual(result.variants[0]["rule_spec"]["family"],
+                         root["family"])
+
+    def test_the_model_cannot_invent_a_signal(self):
+        """The signal primitives are fixed code, not a namespace to extend."""
+        cases = {
+            # A family that does not exist.
+            "unsupported rule family": {**ROOT, "family": "order_book_imbalance"},
+            # A confirmation filter that does not exist.
+            "confirmation must be": {**ROOT, "confirmation": "rsi_divergence"},
+            # A brand-new indicator field.
+            "unknown field(s)": {**ROOT, "rsi_period": 14},
+            # A new data source.
+            "unknown field(s)": {**ROOT, "sentiment_feed": "twitter"},
+        }
+        for expected, spec in cases.items():
+            with self.subTest(spec=sorted(set(spec) - set(ROOT)) or spec["family"]):
+                result = _adapter(_reply((spec, "A new idea I had."))).tune(
+                    "equity", 0, ROOT, DIAGNOSIS, count=1)
+                self.assertFalse(result.success)
+                self.assertIn(expected, result.error)
+
+    def test_discovery_cannot_invent_a_signal_either(self):
+        """Discovery picks from the fixed catalog; it does not extend it."""
+        for spec in ({"family": "order_book_imbalance"},
+                     {"family": "momentum_continuation", "rsi_period": 14},
+                     {"family": "momentum_continuation",
+                      "confirmation": "news_sentiment"}):
+            with self.subTest(spec=spec):
+                reply = json.dumps({"schema": "llm-edge-discovery.v1",
+                                    "rule_spec": spec,
+                                    "thesis": "A brand new kind of signal."})
+                result = _adapter(reply).discover("equity", 0, {})
+                self.assertFalse(result.success)
+
     def test_a_reason_is_required_bounded_and_plain(self):
         for reason, expected in ((None, "must be a string"),
                                  ("", "must not be empty"),
@@ -155,6 +213,139 @@ class TuningContractTests(unittest.TestCase):
         self.assertIn("8192-byte", result.error)
 
 
+class CitedLearningTests(unittest.TestCase):
+    """A proposal has to say what it learned from, or it is a guess."""
+
+    LESSONS = [
+        {"id": "a1b2c3d4e5f6", "reason": "Raising the threshold cut every "
+                                         "signal.", "verdict": "failed",
+         "tried": {"threshold_bps": {"from": 5.0, "to": 90.0}}},
+        {"id": "0f1e2d3c4b5a", "reason": "Shorter holds helped the payoff.",
+         "verdict": "passed", "tried": {"max_hold_bars": {"from": 90, "to": 45}}},
+    ]
+
+    def _reply_with(self, builds_on, threshold=40.0):
+        return json.dumps({"schema": TUNING_SCHEMA, "variants": [{
+            "rule_spec": {**ROOT, "threshold_bps": threshold},
+            "reason": "Backing off the threshold the cited lesson overshot.",
+            "builds_on": builds_on}]})
+
+    def test_a_cited_lesson_is_accepted_and_carried(self):
+        result = _adapter(self._reply_with("a1b2c3d4e5f6")).tune(
+            "equity", 0, ROOT, DIAGNOSIS, count=1, lessons=self.LESSONS)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.variants[0]["builds_on"], "a1b2c3d4e5f6")
+        self.assertEqual(result.evidence["lessons_supplied"], 2)
+        self.assertEqual(result.evidence["lessons_cited"], ["a1b2c3d4e5f6"])
+
+    def test_an_uncited_proposal_is_refused_when_lessons_exist(self):
+        """This is the whole point: no proposing into the void."""
+        reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [
+            {"rule_spec": {**ROOT, "threshold_bps": 40.0},
+             "reason": "Felt right."}]})
+        result = _adapter(reply).tune("equity", 0, ROOT, DIAGNOSIS, count=1,
+                                      lessons=self.LESSONS)
+        self.assertFalse(result.success)
+        self.assertIn("must cite one of the 2 lesson id(s)", result.error)
+
+    def test_a_fabricated_citation_is_refused(self):
+        for bogus in ("ffffffffffff", "not-a-lesson", ""):
+            with self.subTest(bogus=bogus):
+                result = _adapter(self._reply_with(bogus)).tune(
+                    "equity", 0, ROOT, DIAGNOSIS, count=1, lessons=self.LESSONS)
+                self.assertFalse(result.success)
+
+    def test_a_citation_without_any_lesson_supplied_is_refused(self):
+        result = _adapter(self._reply_with("a1b2c3d4e5f6")).tune(
+            "equity", 0, ROOT, DIAGNOSIS, count=1)
+        self.assertFalse(result.success)
+        self.assertIn("none were supplied", result.error)
+
+    def test_the_first_cycle_may_propose_without_a_citation(self):
+        reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [
+            {"rule_spec": {**ROOT, "threshold_bps": 40.0},
+             "reason": "Nothing has been tried yet; start wider."}]})
+        result = _adapter(reply).tune("equity", 0, ROOT, DIAGNOSIS, count=1)
+        self.assertTrue(result.success, result.error)
+        self.assertIsNone(result.variants[0]["builds_on"])
+
+    def test_a_repeat_of_a_graded_failure_is_dropped(self):
+        """The ledger already answered that experiment."""
+        repeat = validate_rule_spec({**ROOT, "threshold_bps": 40.0})
+        adapter = _adapter(self._reply_with("a1b2c3d4e5f6", threshold=40.0))
+        chosen, proposal = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=3,
+            vehicle="equity", llm_enabled=True, config={"model": "test"},
+            adapter=adapter, lessons=self.LESSONS,
+            already_failed=frozenset({rule_variant_id(repeat)}))
+        self.assertTrue(proposal.success)
+        self.assertEqual(len(chosen), 3)
+        self.assertNotIn(rule_variant_id(repeat),
+                         {rule_variant_id(item.rule_spec) for item in chosen})
+        self.assertEqual({item.source for item in chosen}, {"deterministic"})
+
+    def test_the_citation_becomes_a_durable_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            first = factory.record_lesson(
+                hypothesis.hypothesis_id, vehicle="equity",
+                family=hypothesis.family,
+                variant_id=rule_variant_id(hypothesis.rule_spec),
+                kind="tuning", source="deterministic",
+                reason="The root, unchanged.")
+            factory.grade_lesson(hypothesis.hypothesis_id,
+                                 rule_variant_id(hypothesis.rule_spec),
+                                 kind="tuning",
+                                 outcome={"passed": False,
+                                          "failed_checks": ["made money"]})
+            brief = _lesson_brief(factory, vehicle="equity")
+            self.assertEqual(brief[0]["id"], first[:12])
+
+            # A proposal citing that brief entry resolves back to the row.
+            self.assertEqual(factory.resolve_lesson_ref(brief[0]["id"]), first)
+            self.assertIsNone(factory.resolve_lesson_ref("ffffffffffff"))
+
+            child_spec = validate_rule_spec(
+                {**hypothesis.rule_spec, "threshold_bps": 33.0})
+            second = factory.record_lesson(
+                hypothesis.hypothesis_id, vehicle="equity",
+                family=hypothesis.family,
+                variant_id=rule_variant_id(child_spec), kind="tuning",
+                source="llm", reason="The cited attempt made no money; widen.",
+                parent_lesson_id=first)
+            chain = {row["lesson_id"]: row["parent_lesson_id"]
+                     for row in factory.lessons(vehicle="equity")}
+            self.assertEqual(chain[second], first)
+            self.assertIsNone(chain[first])
+
+    def test_failed_variant_ids_excludes_underpowered_and_passing(self):
+        """Underpowered is not an answer, so it is not a closed door."""
+        with tempfile.TemporaryDirectory() as directory:
+            factory, _edge = _ledgers(directory)
+            hypothesis = initial_hypotheses(1)[0]
+            factory.register(hypothesis)
+            outcomes = {
+                "failed": {"passed": False, "underpowered": False},
+                "thin": {"passed": False, "underpowered": True},
+                "won": {"passed": True, "underpowered": False},
+            }
+            ids = {}
+            for index, (name, outcome) in enumerate(outcomes.items()):
+                spec = validate_rule_spec(
+                    {**hypothesis.rule_spec, "threshold_bps": 20.0 + index})
+                ids[name] = rule_variant_id(spec)
+                factory.record_lesson(
+                    hypothesis.hypothesis_id, vehicle="equity",
+                    family=hypothesis.family, variant_id=ids[name],
+                    kind="tuning", source="llm", reason=f"The {name} attempt.")
+                factory.grade_lesson(hypothesis.hypothesis_id, ids[name],
+                                     kind="tuning", outcome=outcome)
+            closed = factory.failed_variant_ids(vehicle="equity")
+        self.assertEqual(closed, {ids["failed"]})
+
+
 class VariantSelectionTests(unittest.TestCase):
     """What actually reaches an isolated simulated account."""
 
@@ -163,10 +354,10 @@ class VariantSelectionTests(unittest.TestCase):
             {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
             vehicle="equity", llm_enabled=False, config={}, adapter=None)
         self.assertIsNone(proposal)
-        self.assertEqual([spec for spec, _r, _o in chosen],
+        self.assertEqual([item.rule_spec for item in chosen],
                          mutate_from_diagnosis(ROOT, DIAGNOSIS, 4))
-        self.assertEqual({origin for _s, _r, origin in chosen},
-                         {"deterministic"})
+        self.assertEqual({item.source for item in chosen}, {"deterministic"})
+        self.assertEqual({item.builds_on for item in chosen}, {None})
 
     def test_tuned_variants_are_adopted_and_topped_up_to_count(self):
         adapter = _adapter(_reply(_tuned({"threshold_bps": 41.0}),
@@ -177,13 +368,14 @@ class VariantSelectionTests(unittest.TestCase):
             adapter=adapter)
         self.assertTrue(proposal.success)
         self.assertEqual(len(chosen), 4)
-        origins = [origin for _s, _r, origin in chosen]
+        origins = [item.source for item in chosen]
         # Variant zero stays the unmutated root: its own matched control is
         # itself, so it is the null calibration, not a candidate.
-        self.assertEqual(chosen[0][0], ROOT)
+        self.assertEqual(chosen[0].rule_spec, ROOT)
         self.assertEqual(origins[0], "deterministic")
         self.assertEqual(origins.count("llm"), 2)
-        self.assertEqual(len({rule_variant_id(spec) for spec, _r, _o in chosen}), 4)
+        self.assertEqual(
+            len({rule_variant_id(item.rule_spec) for item in chosen}), 4)
 
     def test_a_failed_or_broken_adapter_still_fills_every_variant(self):
         class Exploding:
@@ -202,7 +394,8 @@ class VariantSelectionTests(unittest.TestCase):
                     vehicle="equity", llm_enabled=True,
                     config={"model": "test"}, adapter=adapter)
                 self.assertEqual(len(chosen), 4)
-                self.assertEqual({o for _s, _r, o in chosen}, {"deterministic"})
+                self.assertEqual({item.source for item in chosen},
+                                 {"deterministic"})
 
     def test_every_variant_carries_a_reason_whoever_proposed_it(self):
         adapter = _adapter(_reply(_tuned({"threshold_bps": 41.0})))
@@ -210,9 +403,9 @@ class VariantSelectionTests(unittest.TestCase):
             {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
             vehicle="equity", llm_enabled=True, config={"model": "test"},
             adapter=adapter)
-        for _spec, reason, _origin in chosen:
-            self.assertTrue(reason.strip())
-            self.assertLessEqual(len(reason), MAX_REASON_CHARS)
+        for item in chosen:
+            self.assertTrue(item.reason.strip())
+            self.assertLessEqual(len(item.reason), MAX_REASON_CHARS)
 
     def test_the_deterministic_reason_names_the_change_and_the_diagnosis(self):
         variants = mutate_with_reasons(ROOT, DIAGNOSIS, 4)
@@ -339,8 +532,14 @@ class FeedbackLoopTests(unittest.TestCase):
             def tune(inner, *, vehicle, slot, rule_spec, diagnosis, count,
                      lessons):
                 briefs.append(list(lessons))
+                # Cite the most recent lesson, exactly as the contract makes a
+                # real model do once any history exists.
+                cite = lessons[0]["id"] if lessons else None
+                # A model that learns proposes something it has not already
+                # been told the answer to, so the values move with the history.
+                base = 40.0 + 3.0 * len(lessons)
                 specs = [validate_rule_spec(
-                    {**rule_spec, "threshold_bps": 40.0 + 7 * index})
+                    {**rule_spec, "threshold_bps": base + 7 * index})
                     for index in range(count)]
                 return ProposalResult(
                     True, schema=TUNING_SCHEMA, rule_spec=rule_spec,
@@ -348,7 +547,8 @@ class FeedbackLoopTests(unittest.TestCase):
                     variants=tuple(
                         {"rule_spec": spec, "variant_id": rule_variant_id(spec),
                          "reason": f"Threshold to {spec['threshold_bps']} against "
-                                   f"{diagnosis.get('primary_failure')}."}
+                                   f"{diagnosis.get('primary_failure')}.",
+                         "builds_on": cite}
                         for spec in specs))
         return Model()
 
@@ -377,10 +577,21 @@ class FeedbackLoopTests(unittest.TestCase):
             self.assertIn(entry["verdict"], {"passed", "failed", "underpowered"})
             self.assertTrue(entry["reason"])
             self.assertIn("proposed_by", entry)
+            self.assertRegex(entry["id"], r"^[0-9a-f]{12}$")
         self.assertTrue(any(item["source"] == "llm" for item in recorded))
         self.assertTrue(all(item["outcome"] is not None for item in recorded
                             if item["kind"] == "tuning"))
         self.assertTrue(second["tuning"])
+
+        # The citation survives as a durable edge: at least one second-cycle
+        # lesson points back at a first-cycle one, and every parent resolves.
+        by_id = {item["lesson_id"]: item for item in recorded}
+        children = [item for item in recorded if item["parent_lesson_id"]]
+        self.assertTrue(children, "the second cycle must record what it built on")
+        for child in children:
+            self.assertIn(child["parent_lesson_id"], by_id)
+            self.assertLess(by_id[child["parent_lesson_id"]]["created_at"],
+                            child["created_at"])
 
     def test_the_brief_trims_oldest_history_rather_than_failing(self):
         with tempfile.TemporaryDirectory() as directory:

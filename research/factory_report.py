@@ -290,8 +290,14 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         # rather than only the current state.
         lessons: dict[str, list[dict]] = {}
         if {"factory_lessons", "factory_lesson_outcomes"}.issubset(tables):
+            parent_columns = {str(item["name"]) for item in
+                              db.execute("PRAGMA table_info(factory_lessons)")}
+            parent = ("l.parent_lesson_id" if "parent_lesson_id" in parent_columns
+                      else "NULL AS parent_lesson_id")
+            reasons: dict[str, str] = {}
             for row in db.execute(
-                    """SELECT l.vehicle, l.family, l.kind, l.source, l.reason,
+                    f"""SELECT l.lesson_id, {parent}, l.vehicle, l.family,
+                              l.kind, l.source, l.reason,
                               l.changed_json, l.variant_id, l.created_at,
                               o.passed, o.underpowered, o.heldout_delta,
                               o.q_value, o.failed_checks_json, o.outcome_id
@@ -300,7 +306,13 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                          ON o.lesson_id=l.lesson_id
                        ORDER BY l.created_at DESC, l.lesson_id DESC"""):
                 graded = row["outcome_id"] is not None
+                reasons[str(row["lesson_id"])] = str(row["reason"])
                 lessons.setdefault(str(row["vehicle"]), []).append({
+                    "lesson_id": row["lesson_id"],
+                    # The lesson this proposal reasoned from.  An unbroken
+                    # chain is the difference between a search that learns and
+                    # one that restarts every cycle.
+                    "parent_lesson_id": row["parent_lesson_id"],
                     "family": row["family"], "kind": row["kind"],
                     "proposed_by": row["source"], "reason": row["reason"],
                     "variant_id": row["variant_id"],
@@ -316,6 +328,11 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                         _CHECK_LABELS.get(name, name) for name in
                         (_loads(row["failed_checks_json"]) or [])],
                 })
+            # Resolved after the sweep so a parent recorded in the same cycle
+            # is available regardless of row order.
+            for rows in lessons.values():
+                for item in rows:
+                    item["built_on"] = reasons.get(str(item["parent_lesson_id"]))
 
     report_vehicles = []
     for name in VEHICLES:
@@ -399,6 +416,10 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "llm_tuned_variants": sum(
                     1 for item in local_lessons
                     if item["proposed_by"] == "llm" and item["kind"] == "tuning"),
+                # Proposals that named the earlier result they reasoned from,
+                # rather than starting from nothing.
+                "reasons_built_on_a_prior_lesson": sum(
+                    1 for item in local_lessons if item.get("parent_lesson_id")),
             },
             "lessons": local_lessons,
             "slots": [{"slot": key, "generations": slots[key]}
@@ -455,7 +476,9 @@ def render_text(report: Mapping[str, Any]) -> str:
         add(f"  hypotheses retired/rotated: {summary['retired_hypotheses']}")
         add(f"  variants the model tuned: {summary['llm_tuned_variants']}"
             f" | reasons recorded {summary['reasons_recorded']}"
-            f" ({summary['reasons_graded']} graded)")
+            f" ({summary['reasons_graded']} graded,"
+            f" {summary['reasons_built_on_a_prior_lesson']} built on an"
+            f" earlier lesson)")
         proved = summary["proved_variants"]
         add(f"  PROVED EDGES: {', '.join(proved) if proved else 'none yet'}")
         if vehicle.get("lessons"):
@@ -466,6 +489,8 @@ def render_text(report: Mapping[str, Any]) -> str:
                 add(f"    [{verdict}] {item['kind']} by {item['proposed_by']}"
                     f" ({item['family']})")
                 add(f"      reason: {item['reason']}")
+                if item.get("built_on"):
+                    add(f"      built on: {item['built_on']}")
                 if item["changed"]:
                     add(f"      changed: {_changed_phrase(item['changed'])}")
                 if item["verdict"] is not None:
@@ -564,12 +589,14 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"- Proved edges: {', '.join(summary['proved_variants']) or 'none yet'}"]
         if vehicle.get("lessons"):
             out += ["", "#### What it tried, why, and what happened", "",
-                    "| verdict | kind | by | reason | changed | held-out Δ |",
-                    "| --- | --- | --- | --- | --- | --- |"]
+                    "| verdict | kind | by | reason | built on | changed |"
+                    " held-out Δ |",
+                    "| --- | --- | --- | --- | --- | --- | --- |"]
             for item in vehicle["lessons"][:_LESSON_ROWS]:
                 out.append(
                     f"| {item['verdict'] or 'ungraded'} | {item['kind']} |"
                     f" {item['proposed_by']} | {item['reason']} |"
+                    f" {item.get('built_on') or '—'} |"
                     f" {_changed_phrase(item['changed'])} |"
                     f" {_fmt(item['heldout_delta'])} |")
         for entry in vehicle["slots"]:

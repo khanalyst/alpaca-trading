@@ -9,7 +9,7 @@ partition and judged on untouched held-out or later forward data.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
@@ -40,8 +40,8 @@ from .gates import (chronological_split, heldout_separation,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
-from .llm_strategy import (DISCOVERY_SCHEMA, TUNING_SCHEMA, ProposalResult,
-                           RuleProposalAdapter)
+from .llm_strategy import (DISCOVERY_SCHEMA, LESSON_REF_CHARS, TUNING_SCHEMA,
+                           ProposalResult, RuleProposalAdapter)
 from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
@@ -146,6 +146,10 @@ def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     for row in rows:
         outcome = row.get("outcome") or {}
         brief.append({
+            # The short handle a proposal must cite to say what it learned
+            # from.  Truncated because the brief is a prompt, and resolvable
+            # because a citation that does not resolve is not a citation.
+            "id": str(row.get("lesson_id") or "")[:LESSON_REF_CHARS],
             "family": row.get("family"),
             "tried": row.get("changed") or {},
             "reason": row.get("reason"),
@@ -162,6 +166,16 @@ def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
                 "utf-8")) > LESSON_BRIEF_BYTES:
             brief.pop(0)
     return brief
+
+
+def _failed_variants(factory: FactoryLedger, *, vehicle: str,
+                     family: str | None = None) -> frozenset[str]:
+    """Parameter sets a graded lesson already proved do not work."""
+    try:
+        return frozenset(factory.failed_variant_ids(vehicle=vehicle,
+                                                    family=family))
+    except (sqlite3.Error, ValueError, KeyError):
+        return frozenset()
 
 
 def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
@@ -234,6 +248,22 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
     return seeded, proposal, "deterministic_discovery"
 
 
+@dataclass(frozen=True)
+class TunedVariant:
+    """One variant the orchestrator decided to evaluate, and why.
+
+    ``builds_on`` is the short citation of the graded lesson the proposal
+    reasoned from, present only when a model authored it against a non-empty
+    brief.  It is resolved to a real lesson id before storage, so an
+    unresolvable citation never becomes a link in the chain.
+    """
+
+    rule_spec: dict[str, Any]
+    reason: str
+    source: str
+    builds_on: str | None = None
+
+
 def _adapter(config: Mapping[str, Any],
              adapter: RuleProposalAdapter | None) -> RuleProposalAdapter:
     return adapter or RuleProposalAdapter(
@@ -249,8 +279,9 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     *, count: int, vehicle: str, llm_enabled: bool,
                     config: Mapping[str, Any],
                     adapter: RuleProposalAdapter | None,
-                    lessons: Sequence[Mapping[str, Any]] = ()
-                    ) -> tuple[list[tuple[dict, str, str]], ProposalResult | None]:
+                    lessons: Sequence[Mapping[str, Any]] = (),
+                    already_failed: frozenset[str] = frozenset()
+                    ) -> tuple[list[TunedVariant], ProposalResult | None]:
     """Choose this hypothesis's variants, each with the reason it was chosen.
 
     The root is always variant zero and is never replaced: its matched control
@@ -260,13 +291,14 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     With the LLM lane off this is exactly the previous deterministic mutation,
     unchanged spec-for-spec.  With it on, the model may propose the remaining
     variants from the diagnosis *and the graded outcomes of earlier reasons*,
-    and anything it does not supply — or supplies as a duplicate — is topped up
-    from the same deterministic table.  A tuned variant is not trusted more
+    and anything it does not supply — or supplies as a duplicate, as a repeat
+    of a recorded failure, or without citing what it learned from — is topped
+    up from the same deterministic table.  A tuned variant is not trusted more
     than a mutated one: both are content-addressed and both face every gate.
     """
     root = validate_rule_spec(hypothesis["rule_spec"])
     if not llm_enabled:
-        return ([(spec, reason, "deterministic")
+        return ([TunedVariant(spec, reason, "deterministic", None)
                  for spec, reason in mutate_with_reasons(root, diagnostic, count)],
                 None)
     # A wider deterministic pool than ``count`` so that topping up still has
@@ -285,23 +317,30 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     except Exception as exc:  # noqa: BLE001 - degraded, never fatal
         proposal = ProposalResult(False, schema=TUNING_SCHEMA,
                                   error=f"{type(exc).__name__}: {exc}")
-    chosen: list[tuple[dict, str, str]] = [(root, pool[0][1], "deterministic")]
+    chosen: list[TunedVariant] = [
+        TunedVariant(root, pool[0][1], "deterministic", None)]
     seen = {rule_variant_id(root)}
     if proposal is not None and proposal.success:
         for entry in proposal.variants:
             if len(chosen) >= int(count):
                 break
-            if entry["variant_id"] in seen:
+            variant_id = entry["variant_id"]
+            # Re-proposing a parameter set a graded lesson already recorded as
+            # an adequate failure is not a new experiment; the ledger has that
+            # answer.  Dropping it here is what makes "learn from the lessons"
+            # a property of the system rather than a request in a prompt.
+            if variant_id in seen or variant_id in already_failed:
                 continue
-            seen.add(entry["variant_id"])
-            chosen.append((entry["rule_spec"], entry["reason"], "llm"))
+            seen.add(variant_id)
+            chosen.append(TunedVariant(entry["rule_spec"], entry["reason"],
+                                       "llm", entry.get("builds_on")))
     for spec, reason in pool[1:]:
         if len(chosen) >= int(count):
             break
         if rule_variant_id(spec) in seen:
             continue
         seen.add(rule_variant_id(spec))
-        chosen.append((spec, reason, "deterministic"))
+        chosen.append(TunedVariant(spec, reason, "deterministic", None))
     return chosen, proposal
 
 
@@ -907,32 +946,36 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             if hypothesis_id in failed_hypotheses:
                 continue
             if task["mode"] == "shadow":
-                chosen = [(spec, "Carried forward unchanged for forward "
-                                 "validation; a proved variant is never re-tuned.",
-                           "carried_forward")
-                          for spec in task["existing_specs"]]
+                chosen = [TunedVariant(
+                    spec, "Carried forward unchanged for forward validation; "
+                          "a proved variant is never re-tuned.",
+                    "carried_forward", None)
+                    for spec in task["existing_specs"]]
                 task["diagnostic"] = {"primary_failure": "forward_validation"}
             else:
                 diagnostic = diagnostics.get(hypothesis_id)
                 if diagnostic is None:
                     continue
                 task["diagnostic"] = diagnostic
+                family = str(hypothesis["family"])
                 chosen, tuning = _tuned_variants(
                     hypothesis, diagnostic,
                     count=int(variants_per_strategy), vehicle=vehicle,
                     llm_enabled=llm_enabled, config=llm_config,
                     adapter=proposal_adapter,
                     lessons=_lesson_brief(factory, vehicle=vehicle,
-                                          family=str(hypothesis["family"])))
+                                          family=family),
+                    already_failed=_failed_variants(factory, vehicle=vehicle,
+                                                    family=family))
                 if tuning is not None:
                     entry = {"hypothesis_id": hypothesis_id,
                              "slot": int(hypothesis["slot"]),
-                             "family": str(hypothesis["family"]),
+                             "family": family,
                              "schema": tuning.schema,
                              "success": bool(tuning.success),
                              "evidence": dict(tuning.evidence),
                              "tuned_variants": sum(
-                                 1 for _s, _r, origin in chosen if origin == "llm")}
+                                 1 for item in chosen if item.source == "llm")}
                     if not tuning.success:
                         entry["error"] = tuning.error
                     tuning_proposals.append(entry)
@@ -944,22 +987,26 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                          "mutation supplied every variant"),
                         {key: value for key, value in entry.items()
                          if key not in {"hypothesis_id", "slot", "family"}})
-            task["specs"] = [spec for spec, _reason, _origin in chosen]
+            task["specs"] = [item.rule_spec for item in chosen]
             slot_proposals = proposals.setdefault(hypothesis_id, {})
-            for spec, reason, origin in chosen:
-                variant_id = rule_variant_id(spec)
-                slot_proposals[variant_id] = (reason, origin)
-                if origin == "carried_forward":
+            for item in chosen:
+                variant_id = rule_variant_id(item.rule_spec)
+                slot_proposals[variant_id] = (item.reason, item.source)
+                if item.source == "carried_forward":
                     continue
                 try:
                     factory.record_lesson(
                         hypothesis_id, vehicle=vehicle,
                         family=str(hypothesis["family"]), variant_id=variant_id,
                         kind="tuning",
-                        source="llm" if origin == "llm" else "deterministic",
-                        reason=reason,
-                        changed=spec_delta(hypothesis["rule_spec"], spec),
-                        diagnosis=task["diagnostic"])
+                        source="llm" if item.source == "llm" else "deterministic",
+                        reason=item.reason,
+                        changed=spec_delta(hypothesis["rule_spec"],
+                                           item.rule_spec),
+                        diagnosis=task["diagnostic"],
+                        parent_lesson_id=(
+                            factory.resolve_lesson_ref(item.builds_on)
+                            if item.builds_on else None))
                 except (FactoryError, KeyError, sqlite3.Error):
                     # Losing an annotation must not lose the evaluation.
                     pass
