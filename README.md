@@ -248,7 +248,9 @@ For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow
 [OPERATIONS.md](OPERATIONS.md). A paused-runtime recovery uses the
 authenticated, flat-only `main.py resume` command described there;
-`AZURE_DEPLOYMENT.md` is a compatibility pointer to those two authorities.
+[AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) covers the Azure-specific work that
+precedes SETUP.md: attaching and mounting a managed data disk, pointing Docker
+at it so the edge ledger is durable, and closing the network security group.
 
 ## Verification
 

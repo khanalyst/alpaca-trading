@@ -95,6 +95,13 @@ and recorded market data grow over time; a year of 1-minute bars and quotes for
 a handful of symbols is comfortably within 40 GB, but option snapshots are much
 larger if you raise the sampling limits in step 11.
 
+**On Azure, do the storage and network work first.**
+[AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md) covers attaching and mounting a
+managed data disk, pointing Docker at it, and closing the network security
+group — including the one mistake that quietly destroys all accumulated
+research, which is putting durable data on Azure's temporary resource disk.
+Come back here at step 3 afterwards.
+
 Restrict inbound access to SSH from your own address. Nothing in this stack
 should be exposed to the internet — the dashboard binds to localhost and you
 will reach it through an SSH tunnel.
