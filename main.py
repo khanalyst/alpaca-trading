@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, is_dataclass
+from decimal import Decimal
 import json
 import logging
 import os
 import signal
 import sys
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -25,6 +27,10 @@ def load_cfg(path: str | Path = ROOT / "config.yaml") -> dict:
 
 def _plain(value):
     """Convert provider dataclasses/enums into CLI-safe plain mappings."""
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return str(value)
     if is_dataclass(value):
         return {key: _plain(item) for key, item in asdict(value).items()}
     if isinstance(value, dict):

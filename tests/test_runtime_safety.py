@@ -1405,6 +1405,56 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(result["action"], "hold")
         self.assertEqual(provider.positions_live[0].symbol, "SPY")
 
+    def test_premarket_required_edge_refreshes_paused_heartbeat_after_cleanup(self):
+        class PreopenProvider(FakeProvider):
+            def clock(self):
+                now = self.day.open - timedelta(minutes=30)
+                return MarketClock(now, False, next_open=self.day.open,
+                                   next_close=self.day.close)
+
+        provider = PreopenProvider()
+        cfg = _cfg()
+        cfg["research"] = {
+            "enabled": True,
+            "require_validated_variant": True,
+            "db_path": str(Path(self.runtime_tmp.name) / "empty-edge.sqlite3"),
+        }
+        engine = Engine(cfg, provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.clock().timestamp
+
+        result = engine.run_once({})
+
+        self.assertEqual(result["action"], "hold")
+        self.assertIn("no latest-passing validated edge", result["reason"])
+        from agent import state
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "paused")
+        self.assertEqual(heartbeat["reason"], "validated_edge_required")
+        self.assertEqual(provider.orders_sent, [])
+
+    def test_premarket_with_no_required_edge_emits_fresh_running_heartbeat(self):
+        class PreopenProvider(FakeProvider):
+            def clock(self):
+                now = self.day.open - timedelta(minutes=30)
+                return MarketClock(now, False, next_open=self.day.open,
+                                   next_close=self.day.close)
+
+        provider = PreopenProvider()
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.clock().timestamp
+
+        result = engine.run_once({})
+
+        self.assertEqual(result["action"], "force_flat")
+        from agent import state
+        heartbeat = json.loads(state.HEARTBEAT_FILE.read_text())
+        self.assertEqual(heartbeat["status"], "running")
+        self.assertEqual(heartbeat["reason"], "outside_regular_session")
+        self.assertEqual(heartbeat["orders"], 0)
+        self.assertEqual(provider.orders_sent, [])
+
     def test_latest_entry_time_blocks_rule_independent_entry_path(self):
         provider = FakeProvider()
         cfg = _cfg()

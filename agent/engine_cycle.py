@@ -141,6 +141,17 @@ class EngineCycleMixin:
             except Exception as exc:  # noqa: BLE001
                 return {"action": "hold", "reason": "intraday_cleanup_failed",
                         "error": str(exc)}
+            # Edge eligibility is checked even when entries are closed.  A
+            # missing required proof must publish the policy's paused state;
+            # otherwise a premarket cycle leaves the startup heartbeat stale.
+            if not self._refresh_edge():
+                return {"action": "hold", "reason": self._edge_error or
+                        "validated edge champion is required"}
+            try:
+                state.write_heartbeat("running", run_id=self.run_id,
+                                      reason="outside_regular_session", orders=0)
+            except Exception:
+                pass
             return {"action": "force_flat", "reason": "outside_regular_session",
                     "closed": True, "residual": _plain(self.provider.positions())}
         if self.market.should_force_flat(now):

@@ -296,6 +296,48 @@ class AlpacaRuntimeTests(unittest.TestCase):
                                      "pattern_day_trader must be true or false"):
             provider.account()
 
+    def test_provider_defaults_missing_or_null_pattern_day_trader_to_false(self):
+        missing = object()
+
+        class AccountTrading(TradingFake):
+            def __init__(self, pattern_day_trader=missing):
+                self._pattern_day_trader = pattern_day_trader
+
+            def get_account(self):
+                account = {"id": "account", "status": "active",
+                           "equity": "100000", "cash": "100000",
+                           "buying_power": "100000", "currency": "USD"}
+                if self._pattern_day_trader is not missing:
+                    account["pattern_day_trader"] = self._pattern_day_trader
+                return account
+
+        for value in (missing, None):
+            with self.subTest(value=value):
+                provider = AlpacaProvider(
+                    {"mode": "paper"},
+                    session=AlpacaSession(
+                        paper=True, trading_client=AccountTrading(value)))
+                self.assertFalse(provider.account().pattern_day_trader)
+
+    def test_provider_accepts_boolean_pattern_day_trader(self):
+        class BooleanPdtTrading(TradingFake):
+            def __init__(self, pattern_day_trader):
+                self._pattern_day_trader = pattern_day_trader
+
+            def get_account(self):
+                return {"id": "account", "status": "active",
+                        "equity": "100000", "cash": "100000",
+                        "buying_power": "100000", "currency": "USD",
+                        "pattern_day_trader": self._pattern_day_trader}
+
+        for value in (True, False):
+            with self.subTest(value=value):
+                provider = AlpacaProvider(
+                    {"mode": "paper"},
+                    session=AlpacaSession(
+                        paper=True, trading_client=BooleanPdtTrading(value)))
+                self.assertIs(provider.account().pattern_day_trader, value)
+
     def test_market_status_does_not_construct_network_client(self):
         provider = AlpacaProvider({"mode": "paper"})
         market = MarketData(provider)

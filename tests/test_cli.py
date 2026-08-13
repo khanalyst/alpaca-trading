@@ -1,9 +1,11 @@
 """Truthful command exit semantics for operator-facing safety checks."""
 
 from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+import uuid
 import unittest
 from unittest.mock import patch
 
@@ -45,6 +47,20 @@ class CliSafetyTests(unittest.TestCase):
         cfg = main.load_cfg(Path(main.__file__).resolve().with_name("config.yaml"))
         self.assertEqual(cfg["mode"], "paper")
         self.assertTrue(cfg["research"]["require_validated_variant"])
+
+    def test_dump_yaml_serializes_nested_uuid_values(self):
+        account_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        payload = {"account": {"id": account_id, "equity": Decimal("100000")},
+                   "accounts": [account_id],
+                   "by_id": {account_id: {"id": account_id}}}
+
+        plain = main._plain(payload)
+        dumped = main._dump_yaml(payload)
+
+        self.assertEqual(plain["account"]["equity"], "100000")
+        self.assertIn(str(account_id), dumped)
+        self.assertIn("100000", dumped)
+        self.assertNotIn("UUID(", dumped)
 
     def test_check_and_status_fail_when_required_edge_is_missing(self):
         engine = _Engine(

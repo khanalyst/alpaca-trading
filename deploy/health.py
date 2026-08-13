@@ -85,7 +85,15 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
 
 def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
     files = [item for item in path.rglob("*.csv") if item.is_file()]
-    latest = max((item.stat().st_mtime for item in files), default=None)
+    latest_csv = max((item.stat().st_mtime for item in files), default=None)
+    # A deduplicated recorder cycle may append no corpus rows while still
+    # advancing the durable sidecar.  Only the sidecar at the recorder root
+    # is authoritative; nested files must not mask a stale recorder.
+    index_path = path / ".recorder-index.json"
+    index_write = index_path.stat().st_mtime if index_path.is_file() else None
+    writes = [timestamp for timestamp in (latest_csv, index_write)
+              if timestamp is not None]
+    latest = max(writes, default=None)
     fresh = _fresh(latest, max_age, now)
     return {
         "ok": bool(files) and fresh,
@@ -94,6 +102,8 @@ def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "fresh": fresh,
         "series_files": len(files),
         "latest_write_ts": latest,
+        "latest_csv_write_ts": latest_csv,
+        "index_write_ts": index_write,
     }
 
 

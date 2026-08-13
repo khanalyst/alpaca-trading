@@ -992,6 +992,54 @@ class DeployTests(unittest.TestCase):
             result = health.trader(path, max_age=30, now=100)
             self.assertTrue(result["ok"])
 
+    def test_recorder_health_uses_fresh_index_when_corpus_is_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "sessions" / "market-2026-08-07.csv"
+            csv_path.parent.mkdir()
+            csv_path.write_text("event_key\n", encoding="utf-8")
+            index_path = root / ".recorder-index.json"
+            index_path.write_text("{}", encoding="utf-8")
+            os.utime(csv_path, (0, 0))
+            os.utime(index_path, (900, 900))
+
+            result = health.recorder(root, max_age=300, now=1000)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["fresh"])
+            self.assertEqual(result["latest_csv_write_ts"], 0)
+            self.assertEqual(result["index_write_ts"], 900)
+            self.assertEqual(result["latest_write_ts"], 900)
+
+    def test_recorder_health_is_stale_when_index_and_corpus_are_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "market.csv"
+            csv_path.write_text("event_key\n", encoding="utf-8")
+            index_path = root / ".recorder-index.json"
+            index_path.write_text("{}", encoding="utf-8")
+            os.utime(csv_path, (0, 0))
+            os.utime(index_path, (0, 0))
+
+            result = health.recorder(root, max_age=300, now=1000)
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["fresh"])
+            self.assertEqual(result["status"], "stale_or_empty")
+
+    def test_recorder_health_requires_a_csv_corpus_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index_path = root / ".recorder-index.json"
+            index_path.write_text("{}", encoding="utf-8")
+            os.utime(index_path, (900, 900))
+
+            result = health.recorder(root, max_age=300, now=1000)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["fresh"])
+            self.assertEqual(result["series_files"], 0)
+
     def test_scheduler_accepts_paper_config_without_secret_loader(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.yaml"
