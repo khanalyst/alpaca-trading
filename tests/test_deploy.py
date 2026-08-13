@@ -286,10 +286,21 @@ class DeployTests(unittest.TestCase):
         self.assertIn(
             "ALPACA_SHADOW_DB: ${ALPACA_SHADOW_DB:-/app/shadow/shadow.sqlite3}",
             research)
+        self.assertIn(
+            "ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-2}",
+            research)
+        self.assertIn(
+            "mem_limit: ${ALPACA_RESEARCH_MEMORY_LIMIT:-10g}",
+            research)
         self.assertIn("- shadow-data:/app/shadow:ro", research)
         shadow = text.split("  shadow:", 1)[1].split("  dashboard:", 1)[0]
         self.assertIn("- shadow-data:/app/shadow", shadow)
         self.assertIn("- /app/shadow/shadow.sqlite3", shadow)
+        self.assertIn("depends_on:", shadow)
+        self.assertIn("shadow-init:", shadow)
+        shadow_init = text.split("  shadow-init:", 1)[1].split("  shadow:", 1)[0]
+        self.assertIn('user: "0:0"', shadow_init)
+        self.assertIn("chown 10001:10001 /app/shadow", shadow_init)
         unit = Path("deploy/alpaca-research.service").read_text(encoding="utf-8")
         self.assertNotIn("ALPACA_AGENT_SECRETS_FILE", unit)
         self.assertNotIn("agent.env", unit)

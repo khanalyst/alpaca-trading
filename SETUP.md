@@ -481,6 +481,12 @@ is a status record:
 `completed_no_edge` is what you should expect for a long time. It means the
 evidence gates did their job.
 
+The research Compose service defaults to two factory workers and a 10 GB
+container limit. Override `ALPACA_FACTORY_WORKERS` and
+`ALPACA_RESEARCH_MEMORY_LIMIT` in the deployment environment when the VM is
+smaller or larger; leave headroom for the recorder, trader, watchdog, and
+Docker itself.
+
 The scheduled cycle runs `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a harmless no-op. The
 offline cycle may produce a passing `lane=shadow` candidate, but that status is

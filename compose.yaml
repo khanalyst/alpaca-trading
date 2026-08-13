@@ -173,7 +173,7 @@ services:
       ALPACA_FACTORY_ENABLED: ${ALPACA_FACTORY_ENABLED:-1}
       ALPACA_FACTORY_STRATEGIES: ${ALPACA_FACTORY_STRATEGIES:-7}
       ALPACA_FACTORY_VARIANTS: ${ALPACA_FACTORY_VARIANTS:-4}
-      ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-7}
+      ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-2}
       ALPACA_FACTORY_STARTING_CASH: ${ALPACA_FACTORY_STARTING_CASH:-100000}
       ALPACA_FACTORY_MIN_TRADES: ${ALPACA_FACTORY_MIN_TRADES:-100}
       ALPACA_FACTORY_MIN_SESSIONS: ${ALPACA_FACTORY_MIN_SESSIONS:-10}
@@ -207,14 +207,42 @@ services:
       retries: 5
       start_period: 1m
     cpus: "1.50"
-    mem_limit: 3g
+    mem_limit: ${ALPACA_RESEARCH_MEMORY_LIMIT:-10g}
     pids_limit: 256
     stop_grace_period: 2m
+
+  shadow-init:
+    <<: *app
+    profiles: [shadow]
+    container_name: alpaca-shadow-init
+    # The application remains least-privilege. This short-lived initializer
+    # only repairs the ownership of the persistent WAL directory, then exits.
+    user: "0:0"
+    read_only: false
+    security_opt: []
+    cap_drop: []
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    network_mode: none
+    restart: "no"
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /app/shadow
+        chown 10001:10001 /app/shadow
+        chmod 0770 /app/shadow
+    volumes:
+      - shadow-data:/app/shadow
 
   shadow:
     <<: *app
     profiles: [shadow]
     container_name: alpaca-shadow
+    depends_on:
+      shadow-init:
+        condition: service_completed_successfully
     # This process has no broker credentials and cannot write the recorder or
     # EdgeLedger volumes.  Only its separate WAL database is writable.
     command:

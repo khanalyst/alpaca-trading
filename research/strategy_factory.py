@@ -58,7 +58,7 @@ from .factory_core import (
 )
 
 
-DEFAULT_WORKERS = 7
+DEFAULT_WORKERS = 2
 MAX_WORKERS = 16
 # Exact semantic aliases are always removed. Near-duplicate suppression is a
 # transparent policy knob for model-authored proposals; deterministic

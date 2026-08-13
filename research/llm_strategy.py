@@ -37,6 +37,10 @@ MAX_TUNED_VARIANTS = 8
 _AUTH_ERROR_TOKENS = ("authentication", "authorization", "unauthorized",
                       "forbidden", "invalid api key", "invalid_api_key",
                       "credentials are unavailable", "credential unavailable")
+_PROVIDER_CONFIG_ERROR_TOKENS = (
+    "deploymentnotfound", "deployment not found", "modelnotfound",
+    "model not found", "invalid deployment", "unknown deployment",
+)
 
 # The prompt is part of the evidence fingerprint.  Keep it stable and make
 # the output boundary explicit for providers that do not support JSON schema.
@@ -599,6 +603,8 @@ class RuleProposalAdapter:
         self._call_lock = Lock()
         self._auth_unavailable = False
         self._auth_error: str | None = None
+        self._provider_unavailable = False
+        self._provider_error: str | None = None
 
     def _config_hash(self) -> str:
         """Hash non-secret adapter configuration for reproducible evidence."""
@@ -622,15 +628,36 @@ class RuleProposalAdapter:
         return ("auth" in name or "credential" in name or
                 any(token in message for token in _AUTH_ERROR_TOKENS))
 
+    @staticmethod
+    def _is_provider_config_error(exc: BaseException) -> bool:
+        """Identify a missing model/deployment that retries cannot repair."""
+        status = getattr(exc, "status_code", None)
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            pass
+        message = str(exc).lower()
+        return status == 404 or any(
+            token in message for token in _PROVIDER_CONFIG_ERROR_TOKENS)
+
     def _mark_auth_unavailable(self, exc: BaseException) -> None:
         if self._is_auth_error(exc):
             self._auth_unavailable = True
             self._auth_error = _safe_error(exc)
 
+    def _mark_provider_unavailable(self, exc: BaseException) -> None:
+        if self._is_provider_config_error(exc):
+            self._provider_unavailable = True
+            self._provider_error = _safe_error(exc)
+
     def _reserve_call(self) -> None:
         with self._call_lock:
             if self._auth_unavailable:
                 raise RuntimeError("LLM authentication circuit is open")
+            if self._provider_unavailable:
+                raise RuntimeError(
+                    "LLM provider configuration circuit is open; "
+                    "verify the model/deployment name and base URL")
             if self._calls_used >= self.max_total_calls:
                 raise RuntimeError("LLM total call budget exhausted")
             self._calls_used += 1
@@ -640,7 +667,10 @@ class RuleProposalAdapter:
             used = self._calls_used
         return {"calls_used": used, "max_total_calls": self.max_total_calls,
                 "calls_remaining": max(0, self.max_total_calls - used),
-                "auth_circuit_open": self._auth_unavailable}
+                "auth_circuit_open": self._auth_unavailable,
+                "provider_circuit_open": self._provider_unavailable,
+                **({"provider_error": self._provider_error}
+                   if self._provider_error else {})}
 
     def _base_evidence(self, *, kind: str, schema_name: str,
                        prompt_hash: str | None = None,
@@ -852,7 +882,9 @@ class RuleProposalAdapter:
                 attempt_evidence.append(attempt_record)
                 errors.append(f"attempt {attempt}: {safe}")
                 self._mark_auth_unavailable(exc)
-                if self._auth_unavailable or "call budget" in str(exc).lower():
+                self._mark_provider_unavailable(exc)
+                if (self._auth_unavailable or self._provider_unavailable or
+                        "call budget" in str(exc).lower()):
                     break
         evidence = self._base_evidence(
             kind="proposal", schema_name=PROPOSAL_SCHEMA,
@@ -939,7 +971,9 @@ class RuleProposalAdapter:
                 attempt_evidence.append(attempt_record)
                 errors.append(f"attempt {attempt}: {safe}")
                 self._mark_auth_unavailable(exc)
-                if self._auth_unavailable or "call budget" in str(exc).lower():
+                self._mark_provider_unavailable(exc)
+                if (self._auth_unavailable or self._provider_unavailable or
+                        "call budget" in str(exc).lower()):
                     break
         evidence = self._base_evidence(
             kind="discovery", schema_name=DISCOVERY_SCHEMA,
@@ -1114,7 +1148,9 @@ class RuleProposalAdapter:
                 attempt_evidence.append(attempt_record)
                 errors.append(f"attempt {attempt}: {safe}")
                 self._mark_auth_unavailable(exc)
-                if self._auth_unavailable or "call budget" in str(exc).lower():
+                self._mark_provider_unavailable(exc)
+                if (self._auth_unavailable or self._provider_unavailable or
+                        "call budget" in str(exc).lower()):
                     break
         evidence = self._base_evidence(
             kind="tuning", schema_name=TUNING_SCHEMA,

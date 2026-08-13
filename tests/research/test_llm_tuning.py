@@ -213,6 +213,25 @@ class TuningContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("8192-byte", result.error)
 
+    def test_missing_provider_deployment_stops_retries_and_is_recorded(self):
+        class DeploymentMissing(RuntimeError):
+            status_code = 404
+
+        calls = []
+
+        def missing(*_args, **_kwargs):
+            calls.append(1)
+            raise DeploymentMissing("DeploymentNotFound: gpt-missing")
+
+        adapter = RuleProposalAdapter(model="gpt-missing", caller=missing,
+                                      max_attempts=3)
+        result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=1)
+
+        self.assertFalse(result.success)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result.evidence["provider_circuit_open"])
+        self.assertIn("DeploymentNotFound", result.error)
+
 
 class CitedLearningTests(unittest.TestCase):
     """A proposal has to say what it learned from, or it is a guess."""

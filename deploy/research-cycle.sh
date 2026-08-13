@@ -372,7 +372,7 @@ run_factory() {
     --agent-config "$agent_config" \
     --strategies "${ALPACA_FACTORY_STRATEGIES:-7}" \
     --variants "${ALPACA_FACTORY_VARIANTS:-4}" \
-    --workers "${ALPACA_FACTORY_WORKERS:-7}" \
+    --workers "${ALPACA_FACTORY_WORKERS:-2}" \
     --starting-cash "${ALPACA_FACTORY_STARTING_CASH:-100000}" \
     --min-trades "${ALPACA_FACTORY_MIN_TRADES:-100}" \
     --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-10}" \

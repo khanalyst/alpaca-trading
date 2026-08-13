@@ -18,8 +18,11 @@ is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 | `shadow` (profile `shadow`) | Broker-free incremental shadow evaluation and semantic replay parity; no broker authority | Read-only recorder/EdgeLedger mounts, isolated shadow WAL |
 
-All services run as UID/GID 10001, drop Linux capabilities, use a read-only
-root filesystem, and receive only the secret/config mounts they need. The
+All workload services run as UID/GID 10001, drop Linux capabilities, use a
+read-only root filesystem, and receive only the secret/config mounts they
+need. The short-lived `shadow-init` setup service is the deliberate exception:
+it has no credentials or network and only repairs the ownership of the shadow
+WAL directory before ShadowRunner starts. The
 dashboard receives no credentials. Health checks monitor recorder freshness,
 trader state, research progress, and dashboard availability. Recorder health is
 reported independently and does not gate trader startup.
@@ -75,7 +78,9 @@ still require sufficient history, and floor feasibility fails closed when the
 configured universe, never lower the floor.
 
 Start the broker-free shadow lane with `docker compose --profile shadow up -d
-shadow`. It mounts the recorder corpus and EdgeLedger read-only, has no broker
+shadow`. Compose first runs the short-lived `shadow-init` service to repair the
+ownership of the persistent WAL directory, then starts ShadowRunner as UID/GID
+10001. It mounts the recorder corpus and EdgeLedger read-only, has no broker
 credentials, and writes only `/app/shadow/shadow.sqlite3` (SQLite WAL). It
 evaluates eligible candidates in isolated virtual books from recorder events,
 creates exact-session candidate/root-baseline/randomized-null replays, and

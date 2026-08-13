@@ -31,7 +31,7 @@ from research.market_data import (
 )
 from research.gates import unevaluable_reason
 from research.proof import write_proof
-from research.strategy_factory import factory_status, run_factory
+from research.strategy_factory import DEFAULT_WORKERS, factory_status, run_factory
 from agent.config import load_config as load_agent_config
 
 
@@ -593,7 +593,7 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--strategies", type=int, default=7)
         parser.add_argument("--variants", type=int, default=4,
                             help="isolated variants/accounts per strategy")
-        parser.add_argument("--workers", type=int, default=7)
+        parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
         parser.add_argument("--starting-cash", type=float, default=100000.0)
         parser.add_argument("--min-trades", type=int, default=100)
         parser.add_argument("--min-sessions", type=int, default=10)
