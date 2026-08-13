@@ -19,7 +19,7 @@ separate, deliberately limited systems:
 2. **Research** searches a closed strategy grammar, simulates candidates, and
    applies chronological statistical gates.
 3. **The edge ledger** stores candidate state, source evidence, proof hashes,
-   and the exact verified shadow run that authorizes deployment.
+   and the exact parity-matched live-shadow run that authorizes deployment.
 4. **The trader** resolves only proved ledger records, recomputes their
    deterministic signals, applies account-wide risk limits, and submits orders.
 5. **State, journal, watchdog, and health services** reconcile broker truth,
@@ -32,8 +32,10 @@ flowchart LR
     B --> C["Session-partitioned corpus"]
     C --> D["Research factory + IBR baseline"]
     L["Optional research LLM"] -.->|bounded rule proposals only| D
-    D --> E["Chronological gates + later shadow validation"]
-    E --> F["Edge ledger + verified proof"]
+    D --> E["Offline chronological gates + forward replay"]
+    E --> S["Optional broker-free ShadowRunner + isolated WAL"]
+    S --> I2["edge ingest-shadow (read-only WAL) + live marker"]
+    I2 --> F["Edge ledger + verified proof"]
     F --> G["Edge resolver"]
     P["Operator pin for live (preferred)"] --> G
     G --> H["Deterministic trader + risk engine"]
@@ -48,26 +50,38 @@ flowchart LR
 
 ### How edge discovery works
 
-The strategy factory normally runs seven research slots. Each slot holds one
-hypothesis and evaluates four isolated-account variants drawn from a finite
-catalog of rule families. It diagnoses only chronological fit data, then judges
-the variants on untouched held-out data. A candidate must clear structural
-trade/session floors, matched controls, absolute after-cost profitability,
-falsification, walk-forward checks, and both family-local and cycle-global
-false-discovery correction. A family can legitimately pass its local test but
-fail the global one; only the global result can authorize cross-family
-selection.
+The strategy factory normally runs seven logical research slots. Each slot
+holds one hypothesis and evaluates four isolated-account variants drawn from
+the finite catalog of eleven bounded rule families. It diagnoses only
+chronological fit data, then judges the variants on untouched held-out data.
+Candidates are de-duplicated by their family-specific executable semantic
+signature (including v1/v2 no-op aliases), while a variant id with an adequate
+recorded failure is suppressed exactly; underpowered results remain eligible.
+A candidate must clear structural trade/session floors, matched controls,
+absolute after-cost profitability, falsification, fixed-rule rolling-origin
+stability, and family-local, cycle-global, and cumulative online false-discovery
+correction. A family can legitimately pass its local test but fail the global
+one; only the global result can authorize cross-family selection.
 
-The final qualification sessions are sealed before the workers run. Their
-candidate and baseline observations, declared sessions, and content digests are
-bound into the verified gate so the qualification decision can be recomputed.
-A backtest pass is still not deployable: the candidate must later pass a
-strictly newer shadow window. An underpowered shadow cycle advances no durable
-boundary, so those sessions are reconsidered when enough data exists instead
-of being silently consumed.
+The final qualification sessions are sealed before the workers run. After
+development ranking and correction preselect one candidate, that candidate
+alone consumes the sealed window; other variants remain diagnostic. Candidate
+and baseline observations, declared sessions, and content digests are bound
+into the verified gate so the qualification decision can be recomputed.
+A backtest pass is still not deployable. Offline historical or forward replay
+may persist a passing `lane=shadow` candidate proof, but that status is
+stability evidence only and never authorizes the runtime. A strictly newer
+recorder tail must be evaluated by the broker-free ShadowRunner, then consumed
+by `edge ingest-shadow` as a complete parity-matched proof before the candidate
+can become `validated` or `champion`. An underpowered, mismatched, or incomplete
+shadow cycle advances no durable boundary, so those sessions are reconsidered
+when enough data exists instead of being silently consumed.
 
 When a slot proves an edge, the proved rule is frozen and the slot is reseeded
-with a new hypothesis so research capacity does not shrink. Paper
+with a new hypothesis so research capacity does not shrink. Retirement requires
+adequate terminal negative evidence for every intended variant (and a valid
+bounded replacement when enabled); a demoted candidate may re-prove on a newer
+shadow run and starts a new evidence epoch. Paper
 `selection_mode: all_proved` can then select one strongest proved variant per
 independent family under one global risk book and correlation cap. Live paper
 outcomes are scoped to the exact shadow proof that authorized the trade; if the
@@ -93,7 +107,11 @@ blocking safety fault, never an empty book.
 A trader process uses one execution profile (`shares` or `options`) at a time.
 The market calendar is America/New_York (NYSE regular session). Entries outside
 the session are rejected, orders are day-only, and positions are force-closed
-before the close.
+before the close. Research replay receives the same runtime `ReplayPolicy`:
+strict 30-second market/quote freshness, configured DTE (default 7–60), option
+spread and liquidity checks, latest-entry and force-flat cutoffs, and
+portfolio/risk limits (position count/notional, gross/open risk, and daily
+loss) are all enforced rather than relaxed for simulation.
 
 ### Where the LLM is used
 
@@ -104,20 +122,25 @@ before the close.
 | Live runtime | Nothing; `llm.enabled: true` and injected decision brains are rejected | Participate in any live trading decision |
 
 Research works without an LLM because every proposal path has a deterministic
-fallback. Model requests are bounded and their prompt/request/response hashes
-are recorded. The optional paper-runtime call has a strict timeout. Empty or
-irrelevant output means “no veto,” returning control to the already-audited
-deterministic path; provider errors or malformed non-empty output veto that
-cycle. The LLM never has broker authority.
+fallback. Discovery, replacement, and tuning use strict full-schema structured
+contracts (`additionalProperties: false`, including the complete rule
+specification), and record schema/grammar hashes. The adapter enforces a
+per-run total-call budget, per-call attempt/timeout/response bounds, and an
+authentication circuit that stops further calls after an auth failure; result
+evidence records call counts, circuit state, and each attempt's hashes/errors.
+The optional paper-runtime call has a strict timeout. Empty or irrelevant
+output means “no veto,” returning control to the already-audited deterministic
+path; provider errors or malformed non-empty output veto that cycle. The LLM
+never has broker authority.
 
 Custom provider endpoints are a trust boundary. `llm.base_url`,
 `OPENAI_BASE_URL`, and `ANTHROPIC_BASE_URL` can receive the provider key and the
 prompt, so configure only a trusted HTTPS service; the application does not
 currently enforce a host allowlist for LLM endpoints. Recorded hashes prove
 which prompt/request/response was used, not that a provider will reproduce the
-same answer later. Attempts, time, and response size are bounded, but there is
-no aggregate daily spend budget, so enforce provider-side quotas for unattended
-research.
+same answer later. The adapter's call budget is a per-run call-count guard, not
+spend accounting; provider-side quotas remain an operational control for
+unattended research.
 
 ## How an edge reaches money
 
@@ -126,7 +149,7 @@ Four states, and only one transition a machine cannot make.
 | State | Who decides | Can it change on its own? |
 | --- | --- | --- |
 | **Research** — hypotheses, variants, gates | the factory | yes, continuously |
-| **Proved** — `validated`/`champion` in the ledger | the gates | yes, on evidence |
+| **Proved** — `validated`/`champion` plus a live-shadow marker | the gates and live ingestion | yes, on evidence |
 | **Trial** — trading the demo account, outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
 | **Pinned** — an id you wrote into `config.yaml` | **you only** | **no.** Guards still run and still report; they raise an alert and leave it in place |
 
@@ -154,6 +177,11 @@ has to resolve to a proved ledger record with a re-verified passing proof, so
 an id in a file cannot put an unproved variant on the book. A pin that cannot
 resolve is reported rather than silently substituted.
 
+Manual `edge promote` and offline replay cannot manufacture the live-shadow
+marker. A legacy `validated` or `champion` row without that marker may be
+evaluated by the live lane and migrated by `edge ingest-shadow`, but remains
+ineligible until a new authorized parity-matched proof is appended.
+
 Every `id` is yours and must be unique; it is the handle the audit trail, the
 dashboard, and the notifications all use. Separately, every distinct
 configuration the runtime loads is recorded with a content-addressed
@@ -172,7 +200,8 @@ successful audit clears it.
   `mode: live`, `broker.paper: false`, `broker.allow_live: true`, and
   `ALPACA_LIVE_ENABLE=true`; then either `strategy.selection_mode: pinned`
   with exactly one `strategy.pinned` entry, or `strategy.selection_mode:
-  specific` with one exact named validated/champion `strategy.variant_id`.
+  specific` with one exact named validated/champion `strategy.variant_id` whose
+  latest shadow proof carries the live-ingestion marker.
   Prefer `pinned`: it carries an operator-assigned promotion id, so the audit
   trail can name who deployed the edge and when. Live mode pins that edge and
   does not auto-switch. Keep live configuration, credentials, and
@@ -191,7 +220,8 @@ successful audit clears it.
   permissions only and disable withdrawals.
 - Research, recorder, trader, and dashboard state is isolated in named
   volumes. Runtime entries require a vehicle-local `validated` or `champion`
-  edge record in the SQLite ledger; research cannot place orders or mutate
+  edge record whose latest shadow proof carries the research-side
+  parity-matched live-ingestion marker; research cannot place orders or mutate
   broker state. A live preflight additionally requires the account to report
   `pattern_day_trader=true`.
 
@@ -226,22 +256,34 @@ The lean deployment topology is:
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and option snapshots (paper by default) | `runtime-data` |
 | `trader` | One intraday decision loop in its configured execution profile; no overnight book | `runtime-data` |
-| `research` | Scheduled replay, evidence, and reports | `runtime-data`, research volumes |
+| `research` | Scheduled offline replay, evidence, reports, and optional shadow-WAL ingestion | `runtime-data`, research volumes |
+| `shadow` (optional profile) | Broker-free virtual evaluation and semantic replay parity | Read-only recorder/EdgeLedger inputs, isolated WAL |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
 The research service is an opt-in Compose profile, but a fresh deployment must
-run it long enough to produce a champion before the trader can open risk. It
+run offline research, the broker-free shadow service, and the default
+shadow-WAL ingestion long enough to produce a live-shadow-marked champion
+before the trader can open risk. It
 consumes the recorder's mixed corpus (bars, quotes, and option snapshots),
 which is written one append-only partition per New York session date under
 `runtime/research/recorded/sessions/` with a sidecar index; the cycle script
 concatenates those partitions in session order.
 `ALPACA_RESEARCH_SESSION_WINDOW` limits it to the most recent N sessions and
-`ALPACA_RESEARCH_DATASET` overrides the source with normalized JSONL. By default each cycle schedules seven strategies,
-four isolated accounts per strategy, and up to seven worker processes. Its
+`ALPACA_RESEARCH_DATASET` overrides the source with normalized JSONL. By default
+each cycle schedules seven logical strategy slots and four isolated accounts per
+strategy. Each isolated book is processed by one bounded worker; the slot count
+is capacity, not the number of rule families. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
 status, latest re-verified passing edges, per-edge live paper results, edge
 proof reports, and the execution journal.
+
+The optional Compose `shadow` profile reads the recorder corpus and EdgeLedger
+read-only, has no broker credentials, and writes only its isolated shadow WAL.
+It evaluates eligible candidates in isolated virtual books from recorder events,
+creates exact-session candidate/root-baseline/randomized-null replays, and
+quarantines mismatch/incomplete rows. It compares semantic runtime-shadow
+signatures with factory/IBR replay and has no order or broker authority.
 
 The read-only dashboard (`http://127.0.0.1:8080`) is the detailed reporting
 surface. Beyond trader health it shows: demo trials with each edge's live
@@ -316,13 +358,17 @@ recorder to accumulate it:
 
 Backfill writes the same partitions, `as_of` semantics, and index the recorder
 writes, so no gate is weakened; options are not backfilled and still need
-recorded sessions. Clearing the 100-trade held-out floor depends on universe
-width as much as history — four symbols over 120 sessions yields roughly 84
-held-out trades — so widen `universe.symbols` too. On a
+recorded sessions. The shipped default universe is eight liquid ETFs (`SPY`,
+`QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`, `XLV`), which improves opportunity
+capacity, but real signal rates still require sufficient history. Floor
+feasibility fails closed when the 100-trade held-out floor cannot be met;
+widen the history and/or `universe.symbols`, never lower the evidence floor. On a
 fresh ledger, `run` starts safely but will not submit entries: first collect an
-initial corpus, let the strategy factory pass its backtest, and then collect a
-strictly later unseen tail for shadow validation and automatic champion
-selection. This delay is an intentional evidence gate, not a startup error.
+initial corpus, let offline research pass its backtest/forward prerequisites,
+then run the broker-free ShadowRunner and the research-side `edge ingest-shadow`
+on a strictly newer recorder tail. Only that complete parity-matched live proof
+can authorize validation/champion selection. This delay is an intentional
+evidence gate, not a startup error.
 
 For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow

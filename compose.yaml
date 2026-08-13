@@ -181,6 +181,8 @@ services:
       ALPACA_RESEARCH_SESSION_WINDOW: ${ALPACA_RESEARCH_SESSION_WINDOW:-0}
       ALPACA_FACTORY_MAX_GENERATIONS: ${ALPACA_FACTORY_MAX_GENERATIONS:-5}
       ALPACA_EDGE_DB: ${ALPACA_EDGE_DB:-runtime/research/edge_lab.sqlite3}
+      ALPACA_SHADOW_DB: ${ALPACA_SHADOW_DB:-/app/shadow/shadow.sqlite3}
+      ALPACA_SHADOW_INGEST_ENABLED: ${ALPACA_SHADOW_INGEST_ENABLED:-1}
       PYTHON: /usr/local/bin/python
     secrets:
       - source: research_llm_credentials
@@ -196,6 +198,8 @@ services:
       - runtime-data:/app/runtime
       - research-cache:/app/research/cache
       - research-results:/app/research/results
+      # ShadowRunner is the sole writer; research opens this WAL read-only.
+      - shadow-data:/app/shadow:ro
     healthcheck:
       test: ["CMD", "python", "deploy/health.py", "research", "--max-age", "180"]
       interval: 30s
@@ -206,6 +210,31 @@ services:
     mem_limit: 3g
     pids_limit: 256
     stop_grace_period: 2m
+
+  shadow:
+    <<: *app
+    profiles: [shadow]
+    container_name: alpaca-shadow
+    # This process has no broker credentials and cannot write the recorder or
+    # EdgeLedger volumes.  Only its separate WAL database is writable.
+    command:
+      - python
+      - deploy/shadow.py
+      - --corpus
+      - /app/runtime/research/recorded/data.csv
+      - --edge-db
+      - /app/runtime/research/edge_lab.sqlite3
+      - --shadow-db
+      - /app/shadow/shadow.sqlite3
+      - --interval
+      - ${ALPACA_SHADOW_INTERVAL_SECONDS:-60}
+    volumes:
+      - runtime-data:/app/runtime:ro
+      - shadow-data:/app/shadow
+    cpus: "0.50"
+    mem_limit: 768m
+    pids_limit: 128
+    stop_grace_period: 30s
 
   dashboard:
     <<: *app
@@ -250,3 +279,4 @@ volumes:
   runtime-data:
   research-cache:
   research-results:
+  shadow-data:

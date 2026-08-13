@@ -213,6 +213,13 @@ class EngineCycleMixin:
         if not isinstance(runtime, Mapping):
             return self._fail_closed("durable_risk_state_invalid",
                                     AlpacaError("durable runtime state is malformed"))
+        signal_sessions = runtime.get("signal_sessions", {})
+        if not isinstance(signal_sessions, Mapping) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in signal_sessions.items()):
+            return self._fail_closed("durable_risk_state_invalid",
+                                    AlpacaError("signal session state is malformed"))
+        signal_sessions = dict(signal_sessions)
         active = runtime.get("active_trades", {})
         if active is None:
             active = {}
@@ -296,14 +303,43 @@ class EngineCycleMixin:
                 if not row:
                     continue
                 bars = row.get("bars", [])
-                if str(edge_cfg.get("strategy", {}).get("id")) == "rule":
+                strategy_cfg = (edge_cfg.get("strategy", {})
+                                if isinstance(edge_cfg.get("strategy"), Mapping) else {})
+                if str(strategy_cfg.get("id")) == "rule":
                     signal = generate_rule_signal(symbol, bars, config=edge_cfg, now=now)
                 else:
+                    edge_identity = str(
+                        (edge_record or {}).get("candidate_id") or
+                        strategy_cfg.get("variant_id") or
+                        f"{strategy_cfg.get('id', 'ibr')}:{strategy_cfg.get('version', 'v1')}")
+                    signal_state_key = f"{edge_identity}|{symbol}"
+                    prior_session = signal_sessions.get(signal_state_key)
+                    session_state = {"signals": ({(symbol, prior_session)}
+                                                   if prior_session else set())}
                     signal = generate_ibr_signal(
-                        symbol, bars, config=edge_cfg.get("strategy", {}), now=now)
+                        symbol, bars, config=strategy_cfg, now=now,
+                        session_state=session_state)
                 if signal is None:
                     continue
                 signal = dict(signal)
+                if str(strategy_cfg.get("id")) != "rule":
+                    emitted_session = str(signal.get("session") or "")
+                    if len(emitted_session) != 10:
+                        return self._fail_closed(
+                            "signal_session_invalid",
+                            AlpacaError("IBR signal has no valid session date"))
+
+                    def remember_signal(current):
+                        remembered = dict(current.get("signal_sessions") or {})
+                        remembered[signal_state_key] = emitted_session
+                        current["signal_sessions"] = remembered
+                        return current
+
+                    try:
+                        self._runtime_state = state.update_state(remember_signal)
+                        signal_sessions = dict(self._runtime_state["signal_sessions"])
+                    except Exception as exc:  # noqa: BLE001
+                        return self._fail_closed("signal_session_persistence_failed", exc)
                 if edge_force_flat_at is not None:
                     signal["force_flat_at"] = edge_force_flat_at.isoformat()
                     signal["force_flat_ts"] = edge_force_flat_at.timestamp()

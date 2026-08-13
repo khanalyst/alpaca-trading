@@ -65,8 +65,8 @@ class TuningContractTests(unittest.TestCase):
 
     def test_a_valid_reply_normalizes_every_spec_and_keeps_its_reason(self):
         adapter = _adapter(_reply(_tuned({"threshold_bps": 40.0}),
-                                  _tuned({"threshold_bps": 55.0}, "Widened it "
-                                         "further to test the same idea harder.")))
+                                  _tuned({"threshold_bps": 55.0}, "Widened the "
+                                         "threshold further to test the same idea harder.")))
         result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=2)
         self.assertTrue(result.success, result.error)
         self.assertEqual(result.schema, TUNING_SCHEMA)
@@ -265,7 +265,7 @@ class CitedLearningTests(unittest.TestCase):
     def test_the_first_cycle_may_propose_without_a_citation(self):
         reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [
             {"rule_spec": {**ROOT, "threshold_bps": 40.0},
-             "reason": "Nothing has been tried yet; start wider."}]})
+             "reason": "Nothing has been tried yet; widen threshold."}]})
         result = _adapter(reply).tune("equity", 0, ROOT, DIAGNOSIS, count=1)
         self.assertTrue(result.success, result.error)
         self.assertIsNone(result.variants[0]["builds_on"])
@@ -374,7 +374,10 @@ class VariantSelectionTests(unittest.TestCase):
         # itself, so it is the null calibration, not a candidate.
         self.assertEqual(chosen[0].rule_spec, ROOT)
         self.assertEqual(origins[0], "deterministic")
-        self.assertEqual(origins.count("llm"), 2)
+        # The one-point threshold sweep is a semantic near duplicate at the
+        # default 0.001 radius, so only the first model proposal is accepted;
+        # the deterministic ladder still tops the request up to four arms.
+        self.assertEqual(origins.count("llm"), 1)
         self.assertEqual(
             len({rule_variant_id(item.rule_spec) for item in chosen}), 4)
 

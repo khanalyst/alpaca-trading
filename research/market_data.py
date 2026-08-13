@@ -169,8 +169,11 @@ def _identity(payload: Mapping[str, Any], *, provider: str | None = None,
     as_of = parse_timestamp(_field(payload, "as_of", "asof", default=ts),
                             name="as_of")
     zone = str(_field(payload, "timezone", "tz", default="America/New_York"))
+    if zone != "America/New_York":
+        raise NormalizationError(
+            "US equity and listed-option events must use America/New_York sessions")
     try:
-        local = ts.astimezone(ZoneInfo(zone))
+        local = ts.astimezone(ZoneInfo("America/New_York"))
     except Exception as exc:
         raise NormalizationError(f"invalid timezone: {zone!r}") from exc
     return EventIdentity(
@@ -179,7 +182,7 @@ def _identity(payload: Mapping[str, Any], *, provider: str | None = None,
         as_of=as_of,
         observed_at=observed,
         session_date=local.date(),
-        timezone=zone,
+        timezone="America/New_York",
         schema=str(_field(payload, "schema", "schema_version",
                           default="market-event.v1")),
     )
@@ -332,12 +335,22 @@ class OptionSnapshot:
     last: float | None
     underlying_price: float | None
     identity: EventIdentity
+    # Recorder-provided liquidity metadata.  Defaults preserve positional
+    # construction of older normalized fixtures while replay can now fail
+    # closed when every available liquidity field is absent/zero.
+    bid_size: float | None = None
+    ask_size: float | None = None
+    volume: float | None = None
+    open_interest: float | None = None
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise NormalizationError("option timestamp must include a timezone")
         numeric = [self.bid, self.ask]
         numeric.extend(value for value in (self.last, self.underlying_price)
+                       if value is not None)
+        numeric.extend(value for value in (
+            self.bid_size, self.ask_size, self.volume, self.open_interest)
                        if value is not None)
         if not all(math.isfinite(float(value)) for value in numeric):
             raise NormalizationError("option prices must be finite")
@@ -347,6 +360,12 @@ class OptionSnapshot:
             raise NormalizationError("option last must be non-negative")
         if self.underlying_price is not None and self.underlying_price <= 0:
             raise NormalizationError("underlying price must be positive")
+        for name, value in (("bid_size", self.bid_size),
+                            ("ask_size", self.ask_size),
+                            ("volume", self.volume),
+                            ("open_interest", self.open_interest)):
+            if value is not None and value < 0:
+                raise NormalizationError(f"{name} must be non-negative")
 
     @property
     def session_date(self) -> date:
@@ -367,6 +386,30 @@ class OptionSnapshot:
     @property
     def as_of_ts(self) -> float:
         return self.identity.as_of_ts
+
+
+def option_has_liquidity(snapshot: Any) -> bool:
+    """Return whether a normalized option has runtime-acceptable liquidity.
+
+    This mirrors ``RiskManager.select_option_contract``: an explicitly empty
+    displayed side rejects the quote, and otherwise at least one of volume,
+    open interest, or *both* displayed sizes must be positive.  In particular,
+    one-sided size metadata is not enough because the runtime treats the
+    displayed depth as unavailable unless both sides are present.
+    """
+    sizes = [getattr(snapshot, name, None) for name in ("bid_size", "ask_size")]
+    if any(value is not None and float(value) <= 0 for value in sizes):
+        return False
+    volume = getattr(snapshot, "volume", None)
+    open_interest = getattr(snapshot, "open_interest",
+                            getattr(snapshot, "oi", None))
+    displayed_size = (min(float(sizes[0]), float(sizes[1]))
+                      if sizes[0] is not None and sizes[1] is not None else 0.0)
+    return any(float(value) > 0 for value in (
+        volume if volume is not None else 0.0,
+        open_interest if open_interest is not None else 0.0,
+        displayed_size,
+    ))
 
 
 def normalize_underlying_bar(payload: Mapping[str, Any], *, provider: str | None = None,
@@ -471,6 +514,10 @@ def normalize_option_snapshot(payload: Mapping[str, Any], contract: OptionContra
         last=None if _field(payload, "last", "last_price", "p") is None else _number(_field(payload, "last", "last_price", "p"), "last"),
         underlying_price=None if _field(payload, "underlying_price", "underlying_last") is None else _number(_field(payload, "underlying_price", "underlying_last"), "underlying_price"),
         identity=_identity(payload, provider=provider or contract.provider, feed=feed or contract.feed, timestamp=ts),
+        bid_size=None if _field(payload, "bid_size", "bs") is None else _number(_field(payload, "bid_size", "bs"), "bid_size"),
+        ask_size=None if _field(payload, "ask_size", "as") is None else _number(_field(payload, "ask_size", "as"), "ask_size"),
+        volume=None if _field(payload, "volume", "day_volume", "v") is None else _number(_field(payload, "volume", "day_volume", "v"), "volume"),
+        open_interest=None if _field(payload, "open_interest", "oi") is None else _number(_field(payload, "open_interest", "oi"), "open_interest"),
     )
 
 
@@ -478,6 +525,6 @@ __all__ = [
     "EventIdentity", "NormalizationError", "OptionContract", "OptionSnapshot",
     "QuoteSnapshot", "UnderlyingBar", "normalize_option_contract",
     "normalize_option_snapshot", "normalize_quote",
-    "normalize_underlying_bar",
+    "normalize_underlying_bar", "option_has_liquidity",
     "parse_timestamp", "NEW_YORK", "UTC",
 ]

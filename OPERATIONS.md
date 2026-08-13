@@ -95,7 +95,8 @@ Paper is the default and the shipped Compose/systemd lanes set
 `ALPACA_LIVE_ENABLE=true`; `ALPACA_PAPER=true` must not be set. It must use
 either `strategy.selection_mode: pinned` with exactly one operator-named pin
 (preferred), or the legacy `selection_mode: specific` with one exact named
-validated/champion `strategy.variant_id`. It must keep `llm.enabled: false` —
+validated/champion `strategy.variant_id` whose latest shadow proof carries the
+parity-matched live-ingestion marker. It must keep `llm.enabled: false` —
 validation and the Engine constructor both reject a live runtime decision LLM,
 because a veto would deploy behavior that never passed the gates. The bounded
 research strategy-replacement adapter is a separate offline setting and is
@@ -246,9 +247,12 @@ recorder's option rows are sampled chain snapshots with quote-age semantics no
 historical endpoint reconstructs, so the option lane still needs recorded
 sessions. And **history alone is not enough**: `_simulate_trade` takes at most
 one trade per symbol-session, so the 100-trade held-out floor is as much a
-universe-width requirement as a history-length one. Four symbols over 120
-sessions yields roughly 84 held-out trades and will not clear it; widen
-`universe.symbols` as well as the backfill window.
+universe-width requirement as a history-length one. The shipped default
+universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`,
+`XLV`), improving opportunity capacity, but real signal rates still require
+sufficient history. Floor feasibility fails closed when 100 held-out trades
+cannot be supported; widen `universe.symbols` and/or the backfill window, never
+lower the evidence floor.
 
 Run the backfill before starting the trader, or outside market hours, so the
 recorder's first live cycle resumes from a completed session boundary.
@@ -338,7 +342,8 @@ An edge below its floor is parked (demoted) and the reason is written into the
 lesson ledger as live evidence, so the next tuning cycle proposes parameters
 against what actually happened rather than only against the backtest. Parking
 promotes nothing in its place: the replacement still has to earn a backtest
-pass, a strictly later shadow pass, and every gate. `ALPACA_TRIAL_REVIEW_ENABLED=0`
+pass, a strictly later offline shadow pass, every gate, and a new
+parity-matched live proof. `ALPACA_TRIAL_REVIEW_ENABLED=0`
 disables the review in a cycle.
 
 Paper outcomes are scoped to the exact passing shadow proof that authorized
@@ -390,31 +395,65 @@ recorder's mixed bars/quotes/options corpus under
 recent N session partitions), runs the autonomous strategy factory
 plus the explicit IBR baseline, scores shares and single-leg long-option
 vehicles separately, and writes evidence. Each variant has its own simulated
-cash/equity account; default capacity is seven parallel strategy workers and
-four variants per strategy, drawn from a catalog of eleven rule families. Paper `selection_mode: all_proved` keeps one best
+cash/equity account; default capacity is seven logical strategy slots and four
+variants per strategy, drawn from a catalog of eleven rule families (seven is
+slot/worker capacity, not family count). Each isolated book is processed by one
+bounded worker. Paper `selection_mode: all_proved` keeps one best
 proven variant per independent family under one global risk book. The edge
 ledger is
 initialized at `runtime/research/edge_lab.sqlite3`; inspect it with
 `python research.py edge status`. The autonomous lifecycle requires an initial
-corpus backtest followed by later unseen shadow evidence. Validation requires
+corpus backtest followed by later unseen offline forward-shadow evidence.
+Offline historical/forward replay may persist only a `lane=shadow` candidate
+status; it never authorizes runtime entries. Validation requires
 fit and held-out structural floors, matched controls, placebo/falsification,
-family-local and cycle-global FDR, and a durable verified gate. A family pass
+fixed-rule rolling-origin forward stability, family-local
+and cycle-global FDR, and a durable verified gate. Post-selection also consumes
+durable cumulative online-FDR state across cycles. A family pass
 with a global failure is a normal marginal result and cannot authorize
 selection. Final qualification evidence binds its declared sessions, bounded
 candidate/baseline observations, and content digests so it can be recomputed.
 Underpowered data is not a failure: a shadow worker advances no durable
 boundary until all intended variants are adequately powered, so the tail is
-reconsidered on a later cycle. Retirement waits until all intended variants
-are adequately tested and fail, and a valid bounded LLM replacement is
-registered first when that lane is enabled. Paper outcomes are appended for
-forward monitoring, scoped to their authorizing proof epoch, and may demote a
-deployed edge. Passing gates advance validated/champion state without
-manual promotion. Manual `edge promote` remains an audited control subject to
-lifecycle/evidence rules. Backward rollback is rejected; explicit demotion is
+reconsidered on a later cycle. The sealed qualification window is released
+once by one preselected candidate alone; other variants remain diagnostic.
+Retirement requires adequate terminal negative evidence for every intended
+variant, and a valid bounded LLM replacement is registered first when that lane
+is enabled. Demoted candidates may re-prove on a newer shadow run. Paper
+outcomes are appended for forward monitoring, scoped to their authorizing proof epoch, and may demote a
+deployed edge. Only the broker-free ShadowRunner plus research-side `edge
+ingest-shadow` can append a complete parity-matched live proof and advance
+`shadow` to `validated`/`champion`; manual/offline promotion cannot bypass that
+marker. Legacy validated/champion rows without it can be evaluated or migrated
+but remain ineligible until a new authorized live proof. Manual `edge promote`
+remains an audited control subject to lifecycle/evidence rules. Backward rollback is rejected; explicit demotion is
 the operator safety action. Good edges emit deterministic,
 content-addressed edge proof reports and may send an optional HTTPS webhook. Keep data
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
+Replay uses the runtime `ReplayPolicy`: strict 30-second market/quote freshness,
+DTE/spread/liquidity checks, latest-entry and force-flat cutoffs, and portfolio
+position/notional/gross/open-risk/daily-loss limits.
+
+### Broker-free live shadow and ingestion
+
+Run the optional lane with `docker compose --profile shadow up -d shadow`.
+ShadowRunner reads recorder events and eligible ledger candidates, evaluates
+each candidate in its own virtual book, and writes only its isolated SQLite WAL.
+For each complete session it records candidate, exact root-baseline, and
+randomized-entry-null replays; mismatch or incomplete rows remain quarantined
+and are not gate input. The service has no broker credentials and cannot mutate
+orders, broker state, runtime state, or the EdgeLedger.
+
+The scheduled research cycle invokes `edge ingest-shadow` by default when
+`ALPACA_SHADOW_INGEST_ENABLED=1`. The command opens the shadow WAL read-only
+from the shared `shadow-data` volume and is a no-op when the WAL is absent. It
+accepts only strictly newer,
+complete, parity-matched rows with prior qualification and matching
+source/config/code/provenance/replay/gate hashes; family and global BH plus
+durable online-FDR are applied before an immutable `lane=shadow` proof and
+live-ingestion marker are appended. A failed/mismatched/incomplete tail leaves
+the candidate unchanged and ineligible.
 
 Research studies only the vehicle this deployment can trade. A trader runs one
 execution profile, so proving an option edge in a `shares` deployment produces
@@ -426,7 +465,7 @@ counts any proved edges in the other one, so evidence accumulated under a
 previous profile is visible rather than silently unusable.
 
 A slot whose hypothesis proves an edge is reseeded with a new hypothesis in the
-same cycle, so parallel research capacity stays constant instead of shrinking
+same cycle, so logical research capacity stays constant instead of shrinking
 with every success. Each cycle result reports `reseeds`, `revived`, and
 `active_slots`; `active_slots` below the configured `--strategies` for more
 than one cycle is the signal that the factory has run out of unused hypotheses
@@ -449,9 +488,10 @@ drawdown, the held-out edge over baseline and its lower confidence bound, the
 multiple-testing-corrected q-value, and a plain-English list of which of the
 gates it missed. Each retirement carries the reason, the number of variants
 tested, the dominant failure mode, and the hypothesis that replaced it. An
-LLM-proposed hypothesis carries its model, attempt count, and the prompt,
-request and response content hashes — the audit trail without storing raw model
-output. The report is strictly derived and read-only; it cannot change a
+LLM-proposed hypothesis carries its model, attempt count, per-run call budget
+and circuit state, full-schema hashes, and per-attempt prompt/request/response
+hashes or errors — the audit trail without storing raw model output. The report
+is strictly derived and read-only; it cannot change a
 lifecycle state.
 
 Inspect raw lineage rows and isolated-account counts with
@@ -479,16 +519,14 @@ Score the shared cost model against what the account actually paid:
 python research.py calibrate runtime/paper/journal.db
 ```
 
-The command is read-only. It reconstructs each entry fill's plan price from the
-plan's notional and submitted quantity and reports the observed adverse cost in
-basis points, the model's bias against it, the share of fills inside the model,
-how many fills landed past the runtime's own slippage cap, and a verdict of
-`conservative`, `optimistic`, or `insufficient_data`. Under 20 referenced fills
-it issues no verdict at all, and an `optimistic` verdict exits non-zero so it
-cannot be missed in a scheduled run. It never adjusts the model; widening a
-cost assumption is a human decision. There is no exit-side calibration: the
-journal records no exit reference price, so an exit number would be invented
-rather than measured.
+The command is read-only. It reconstructs each referenced fill's plan price and
+reports adverse cost, model bias, runtime-cap overruns, and a verdict of
+`conservative`, `optimistic`, or `insufficient_data`. Calibration is stratified
+by runtime mode, vehicle, execution profile, and entry versus exit when journal
+references are present; thin or missing strata stay insufficient and equity and
+options are never pooled. An `optimistic` finding exits non-zero so it cannot be
+missed in a scheduled run. Calibration is advisory only and never adjusts the
+model; changing a cost assumption is a human decision.
 
 The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this

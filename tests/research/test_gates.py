@@ -194,8 +194,23 @@ class EvidenceGateTests(unittest.TestCase):
             p_value=.01, q_value=.02, alpha=.05,
             falsification={"passes": True}, separation={"passes": True},
             checks={"family_fdr_significant": True}, passes=True)
+        # Sparse evidence is deterministically downgraded rather than being
+        # allowed to manufacture a passing envelope.  A tampered re-signing
+        # that flips it back to a pass still fails strict verification.
+        self.assertFalse(envelope["passes"])
         self.assertTrue(verify_gate_envelope(envelope))
-        envelope["passes"] = False
+        # Re-signing a code-owned decision flag cannot detach it from the
+        # source evidence, even on a non-authorizing diagnostic envelope.
+        derived_tamper = copy.deepcopy(envelope)
+        derived_tamper["checks"]["fit_delta_positive"] = not derived_tamper[
+            "checks"]["fit_delta_positive"]
+        from research.gates import _content_hash
+        derived_tamper["content_hash"] = _content_hash({
+            key: value for key, value in derived_tamper.items()
+            if key != "content_hash"
+        })
+        self.assertFalse(verify_gate_envelope(derived_tamper))
+        envelope["passes"] = True
         self.assertFalse(verify_gate_envelope(envelope))
 
     def test_qualification_source_digests_are_recomputed_and_tampering_fails(self):

@@ -15,6 +15,7 @@ from .gates import verify_gate_envelope
 
 
 FACTORY_SCHEMA = "strategy-factory.v1"
+FACTORY_IDENTITY_SCHEMA = "strategy-experiment.v1"
 ACTIVE_HYPOTHESIS_STATES = {
     "queued", "testing", "backtest_passed", "pending_generation_limit",
     "pending_llm_replacement",
@@ -52,6 +53,83 @@ def _connect(path: Path) -> sqlite3.Connection:
     return db
 
 
+def experiment_identity(*, dataset_hash: str, vehicle: str,
+                        code_hash: str | None = None,
+                        config_hash: str | None = None,
+                        cost: Mapping | None = None,
+                        risk: Mapping | None = None,
+                        gate: Mapping | None = None,
+                        provenance: Mapping | None = None) -> dict[str, Any]:
+    """Build the deterministic identity that distinguishes factory runs.
+
+    The returned body is safe to persist and its ``identity_hash`` is stable
+    across process/cycle UUIDs.  Legacy callers can omit optional fields; the
+    dataset/vehicle identity remains backward-compatible while new callers
+    should bind every supplied assumption.
+    """
+    body = {"schema": FACTORY_IDENTITY_SCHEMA, "dataset_hash": str(dataset_hash),
+            "vehicle": str(vehicle), "code_hash": code_hash,
+            "config_hash": config_hash, "cost": dict(cost or {}),
+            "risk": dict(risk or {}), "gate": dict(gate or {}),
+            "provenance": dict(provenance or {})}
+    body["identity_hash"] = content_hash(body)
+    return body
+
+
+def experiment_provenance(*, dataset: Any = None, config: Any = None,
+                          code: Any = None, cost: Mapping | None = None,
+                          risk: Mapping | None = None,
+                          gate: Mapping | None = None) -> dict[str, str]:
+    """Hash the assumptions that materially affect a factory result."""
+    return {
+        "dataset_hash": content_hash(dataset if dataset is not None else {}),
+        "config_hash": content_hash(config if config is not None else {}),
+        "code_hash": content_hash(code if code is not None else {}),
+        "cost_hash": content_hash(dict(cost or {})),
+        "risk_hash": content_hash(dict(risk or {})),
+        "gate_hash": content_hash(dict(gate or {})),
+    }
+
+
+def _migrate_cycle_identity(db: sqlite3.Connection) -> None:
+    """Migrate the old dataset/vehicle uniqueness without losing rows."""
+    exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='factory_cycles'").fetchone()
+    if not exists:
+        return
+    columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(factory_cycles)")}
+    if "identity_hash" in columns:
+        if "identity_json" not in columns:
+            db.execute("DROP TRIGGER IF EXISTS factory_cycles_no_update")
+            db.execute("DROP TRIGGER IF EXISTS factory_cycles_no_delete")
+            db.execute("ALTER TABLE factory_cycles ADD COLUMN identity_json TEXT NOT NULL DEFAULT '{}'")
+            rows = db.execute("SELECT cycle_id,dataset_hash,vehicle,identity_hash FROM factory_cycles").fetchall()
+            for row in rows:
+                identity = experiment_identity(dataset_hash=row["dataset_hash"], vehicle=row["vehicle"])
+                db.execute("UPDATE factory_cycles SET identity_json=? WHERE cycle_id=?",
+                           (canonical_json(identity), row["cycle_id"]))
+        return
+    db.execute("DROP TRIGGER IF EXISTS factory_cycles_no_update")
+    db.execute("DROP TRIGGER IF EXISTS factory_cycles_no_delete")
+    db.execute("ALTER TABLE factory_cycles RENAME TO factory_cycles_legacy")
+    db.execute("""CREATE TABLE factory_cycles (
+        cycle_id TEXT PRIMARY KEY, dataset_hash TEXT NOT NULL,
+        vehicle TEXT NOT NULL, identity_hash TEXT NOT NULL,
+        identity_json TEXT NOT NULL, workers INTEGER NOT NULL,
+        strategies INTEGER NOT NULL, variants INTEGER NOT NULL,
+        result_json TEXT NOT NULL, created_at REAL NOT NULL)""")
+    rows = db.execute("SELECT * FROM factory_cycles_legacy").fetchall()
+    for row in rows:
+        identity = experiment_identity(dataset_hash=row["dataset_hash"], vehicle=row["vehicle"])
+        db.execute("""INSERT INTO factory_cycles
+            (cycle_id,dataset_hash,vehicle,identity_hash,identity_json,workers,
+             strategies,variants,result_json,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+                row["cycle_id"], row["dataset_hash"], row["vehicle"],
+                identity["identity_hash"], canonical_json(identity), row["workers"],
+                row["strategies"], row["variants"], row["result_json"], row["created_at"]))
+    db.execute("DROP TABLE factory_cycles_legacy")
+
+
 class FactoryLedger:
     """Store immutable hypotheses, accounts, events, and completed cycles."""
 
@@ -59,6 +137,7 @@ class FactoryLedger:
         self.path = Path(path)
         EdgeLedger(self.path)
         with closing(_connect(self.path)) as db, db:
+            _migrate_cycle_identity(db)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS factory_hypotheses (
                     hypothesis_id TEXT PRIMARY KEY,
@@ -102,12 +181,13 @@ class FactoryLedger:
                     cycle_id TEXT PRIMARY KEY,
                     dataset_hash TEXT NOT NULL,
                     vehicle TEXT NOT NULL,
+                    identity_hash TEXT NOT NULL,
+                    identity_json TEXT NOT NULL,
                     workers INTEGER NOT NULL,
                     strategies INTEGER NOT NULL,
                     variants INTEGER NOT NULL,
                     result_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    UNIQUE(dataset_hash,vehicle)
+                    created_at REAL NOT NULL
                 );
                 -- Why something was tried, and what happened when it was.
                 -- Split in two because the two facts are learned at different
@@ -208,6 +288,26 @@ class FactoryLedger:
             if columns and "parent_lesson_id" not in columns:
                 db.execute("ALTER TABLE factory_lessons "
                            "ADD COLUMN parent_lesson_id TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS factory_fdr (
+                decision_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
+                test_id TEXT NOT NULL, p_value REAL NOT NULL,
+                alpha REAL NOT NULL, allocated_alpha REAL NOT NULL,
+                decision INTEGER NOT NULL, created_at REAL NOT NULL,
+                UNIQUE(scope,test_id)
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS factory_fdr_scope ON factory_fdr(scope,created_at)")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS factory_fdr_no_update
+                BEFORE UPDATE ON factory_fdr BEGIN
+                SELECT RAISE(ABORT, 'factory FDR decisions are immutable'); END;""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS factory_fdr_no_delete
+                BEFORE DELETE ON factory_fdr BEGIN
+                SELECT RAISE(ABORT, 'factory FDR decisions are immutable'); END;""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS factory_cycles_no_update
+                BEFORE UPDATE ON factory_cycles BEGIN
+                SELECT RAISE(ABORT, 'factory cycles are immutable'); END;""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS factory_cycles_no_delete
+                BEFORE DELETE ON factory_cycles BEGIN
+                SELECT RAISE(ABORT, 'factory cycles are immutable'); END;""")
 
     def register(self, hypothesis: Any) -> dict:
         now = datetime.now().timestamp()
@@ -294,6 +394,16 @@ class FactoryLedger:
                     not verify_gate_envelope(envelope) or
                     envelope.get("passes") is not False):
                 raise FactoryError("hypothesis retirement requires adequate failed verified gates")
+            performance = envelope.get("performance")
+            try:
+                net = float(performance.get("heldout_net_pnl"))
+                expectancy = float(performance.get("heldout_expectancy"))
+            except (AttributeError, TypeError, ValueError):
+                raise FactoryError(
+                    "hypothesis retirement requires terminal negative performance evidence")
+            if not (net <= 0.0 and expectancy <= 0.0):
+                raise FactoryError(
+                    "hypothesis retirement requires terminal negative performance evidence")
             gate_hashes.append(str(envelope["content_hash"]))
         detail = {**dict(payload or {}), "cycle_id": cycle_id,
                   "expected_variants": int(expected_variants),
@@ -603,22 +713,109 @@ class FactoryLedger:
                 continue
         return max(values) if values else None
 
-    def existing_cycle(self, dataset_hash: str, vehicle: str) -> dict | None:
+    def existing_cycle(self, dataset_hash: str, vehicle: str,
+                       identity: Mapping | str | None = None) -> dict | None:
+        identity_hash = (str(identity.get("identity_hash")) if isinstance(identity, Mapping)
+                         and identity.get("identity_hash") else
+                         str(identity) if isinstance(identity, str) else None)
         with closing(_connect(self.path)) as db:
-            row = db.execute(
-                "SELECT result_json FROM factory_cycles WHERE dataset_hash=? AND vehicle=?",
-                (dataset_hash, vehicle),
-            ).fetchone()
+            if identity_hash:
+                row = db.execute(
+                    "SELECT result_json FROM factory_cycles WHERE identity_hash=?",
+                    (identity_hash,)).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT result_json FROM factory_cycles WHERE dataset_hash=? AND vehicle=? "
+                    "ORDER BY created_at DESC LIMIT 1", (dataset_hash, vehicle)).fetchone()
         return json.loads(row["result_json"]) if row else None
 
     def add_cycle(self, cycle_id: str, dataset_hash: str, vehicle: str,
                   workers: int, strategies: int, variants: int,
-                  result: Mapping) -> None:
+                  result: Mapping, *, identity: Mapping | str | None = None,
+                  provenance: Mapping | None = None) -> None:
+        if identity is None:
+            identity = experiment_identity(
+                dataset_hash=dataset_hash, vehicle=vehicle,
+                provenance=provenance)
+        elif isinstance(identity, str):
+            identity = {"schema": FACTORY_IDENTITY_SCHEMA,
+                        "dataset_hash": str(dataset_hash), "vehicle": str(vehicle),
+                        "identity_hash": identity}
+        else:
+            identity = dict(identity)
+            identity.setdefault("identity_hash", content_hash(identity))
+        recorded = dict(result)
+        recorded.setdefault("experiment_identity", identity)
         with closing(_connect(self.path)) as db, db:
-            db.execute("INSERT INTO factory_cycles VALUES(?,?,?,?,?,?,?,?)", (
-                cycle_id, dataset_hash, vehicle, workers, strategies, variants,
-                canonical_json(dict(result)), datetime.now().timestamp(),
+            db.execute("""INSERT INTO factory_cycles
+                (cycle_id,dataset_hash,vehicle,identity_hash,identity_json,workers,
+                 strategies,variants,result_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+                cycle_id, dataset_hash, vehicle, identity["identity_hash"],
+                canonical_json(identity), workers, strategies, variants,
+                canonical_json(recorded), datetime.now().timestamp(),
             ))
+
+    def record_fdr_decision(self, scope: str, test_id: str, p_value: float,
+                            *, alpha: float = .05) -> dict[str, Any]:
+        """Persist one cumulative LORD-style online-FDR decision.
+
+        The first preselected test receives 75% of nominal alpha.  The
+        remaining base wealth follows a telescoping tail, and each discovery
+        starts one identical reward stream.  This keeps autonomous search
+        accountable without making the first ordinary 3% result impossible.
+        """
+        p = float(p_value); nominal = float(alpha)
+        if not 0 <= p <= 1 or not 0 < nominal <= 1:
+            raise FactoryError("p_value must be in [0,1] and alpha in (0,1]")
+        scope, test_id = str(scope), str(test_id)
+        with closing(_connect(self.path)) as db, db:
+            existing = db.execute(
+                "SELECT * FROM factory_fdr WHERE scope=? AND test_id=?",
+                (scope, test_id)).fetchone()
+            if existing:
+                return dict(existing) | {"decision": bool(existing["decision"])}
+            rows = db.execute(
+                "SELECT decision FROM factory_fdr WHERE scope=? "
+                "ORDER BY created_at,decision_id", (scope,)).fetchall()
+            test_index = len(rows) + 1
+
+            def gamma(index: int) -> float:
+                if index <= 0:
+                    return 0.0
+                if index == 1:
+                    return .75
+                tail = index - 1
+                return .25 / (tail * (tail + 1))
+
+            allocated = nominal * gamma(test_index)
+            for discovery_index, row in enumerate(rows, start=1):
+                if bool(row["decision"]):
+                    allocated += nominal * gamma(test_index - discovery_index)
+            allocated = min(nominal, allocated)
+            decision = bool(p <= allocated)
+            db.execute("INSERT INTO factory_fdr VALUES(?,?,?,?,?,?,?,?)", (
+                uuid.uuid4().hex, scope, test_id, p, nominal, allocated,
+                int(decision), datetime.now().timestamp()))
+        return {"scope": scope, "test_id": test_id, "p_value": p,
+                "alpha": nominal, "allocated_alpha": allocated,
+                "decision": decision, "tests": test_index,
+                "cumulative": True, "method": "lord_telescoping_v1"}
+
+    # Explicit aliases are the integration seam for strategy_factory callers.
+    online_fdr = record_fdr_decision
+    cumulative_fdr = record_fdr_decision
+
+    def fdr_state(self, scope: str = "global") -> dict[str, Any]:
+        with closing(_connect(self.path)) as db:
+            rows = db.execute("SELECT * FROM factory_fdr WHERE scope=? ORDER BY created_at,decision_id",
+                              (str(scope),)).fetchall()
+        return {"scope": str(scope), "cumulative": True, "tests": len(rows),
+                "alpha_spent": sum(float(row["allocated_alpha"]) for row in rows),
+                "discoveries": sum(int(row["decision"]) for row in rows),
+                "decisions": [dict(row) for row in rows]}
+
+    online_fdr_state = fdr_state
 
     def status(self) -> dict:
         hypotheses = self.hypotheses()
@@ -632,6 +829,8 @@ class FactoryLedger:
 
 
 __all__ = [
-    "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_STATUSES",
+    "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_IDENTITY_SCHEMA", "FACTORY_STATUSES",
     "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
+    "experiment_identity",
+    "experiment_provenance",
 ]

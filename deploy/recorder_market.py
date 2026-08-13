@@ -258,7 +258,11 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             if (expiration is None or strike_number is None or strike_number <= 0 or
                     multiplier_number is None or multiplier_number <= 0 or
                     dte is None or dte < min_dte or dte > max_dte or
-                    bid is None or ask is None or bid < 0 or ask < bid):
+                    # Runtime option selection requires a strictly positive,
+                    # two-sided market.  Do not spend recorder capacity on
+                    # zero-bid/zero-ask rows that replay can never execute.
+                    bid is None or ask is None or bid <= 0 or ask <= 0 or
+                    ask < bid):
                 continue
             candidate = dict(candidate)
             candidate["symbol"] = symbol
@@ -280,6 +284,12 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             unique.extend(held)
             for candidate in unique:
                 timestamp = candidate.get("timestamp") or candidate.get("quote_ts")
+                volume = candidate.get("volume")
+                if volume is None:
+                    volume = candidate.get("day_volume")
+                open_interest = candidate.get("open_interest")
+                if open_interest is None:
+                    open_interest = candidate.get("oi")
                 yield {
                     "event_key": _event_key("option_snapshot", candidate["symbol"], _iso(timestamp)),
                     "observed_at": now.isoformat(), "provider": "alpaca",
@@ -288,7 +298,7 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                     "contract": candidate["symbol"],
                     "timestamp": _iso(timestamp), "as_of": _iso(timestamp),
                     "open": "", "high": "",
-                    "low": "", "close": "", "volume": _value(candidate.get("volume")),
+                    "low": "", "close": "", "volume": _value(volume),
                     "bid": _value(candidate.get("bid")), "ask": _value(candidate.get("ask")),
                     "last": _value(candidate.get("last")),
                     "underlying": underlying,
@@ -298,7 +308,7 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                     "multiplier": _value(candidate.get("multiplier") or candidate.get("contract_size")),
                     "bid_size": _value(candidate.get("bid_size")),
                     "ask_size": _value(candidate.get("ask_size")),
-                    "open_interest": _value(candidate.get("open_interest")),
+                    "open_interest": _value(open_interest),
                     "underlying_price": _value(candidate.get("underlying_price")),
                 }
 
@@ -327,14 +337,21 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             timestamp = _iso(getattr(bar, "timestamp", None))
             if not _point_in_time(timestamp):
                 raise RuntimeError(f"bar {symbol!r} has no point-in-time timestamp")
-            if _timestamp(timestamp) > now + timedelta(seconds=5):
+            bar_start = _timestamp(timestamp)
+            if bar_start > now + timedelta(seconds=5):
                 raise RuntimeError(f"bar {symbol!r} timestamp is in the future")
+            bar_complete = bar_start + timedelta(minutes=1)
+            # Alpaca timestamps one-minute bars at their open.  Never freeze an
+            # in-progress OHLC row under its immutable event key.
+            if bar_complete > now:
+                continue
             yield {
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca",
                 "feed": feed,
                 "event_type": "bar_1m", "symbol": symbol, "contract": "",
-                "timestamp": timestamp, "as_of": timestamp, "open": _value(bar.open),
+                "timestamp": timestamp, "as_of": bar_complete.isoformat(),
+                "open": _value(bar.open),
                 "high": _value(bar.high), "low": _value(bar.low),
                 "close": _value(bar.close), "volume": _value(bar.volume),
                 "bid": "", "ask": "", "last": "",

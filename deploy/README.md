@@ -13,9 +13,10 @@ is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and session observations (paper by default) | `runtime-data` |
 | `trader` | Exactly one intraday loop in one configured execution profile and broker reconciliation | `runtime-data`, `research-cache` |
-| `research` (profile `research`) | Scheduled seven-strategy parallel factory, validation, and replay; no broker authority | `runtime-data`, research volumes |
+| `research` (profile `research`) | Scheduled seven-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
 | `watchdog` | Independent stale-trader flatten; cancel and close only, never entries | `runtime-data` |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
+| `shadow` (profile `shadow`) | Broker-free incremental shadow evaluation and semantic replay parity; no broker authority | Read-only recorder/EdgeLedger mounts, isolated shadow WAL |
 
 All services run as UID/GID 10001, drop Linux capabilities, use a read-only
 root filesystem, and receive only the secret/config mounts they need. The
@@ -61,9 +62,32 @@ normalized JSONL. Start it with
 at `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate broker
 state. Paper `selection_mode: all_proved` runs one best proven variant per
-independent family under one global risk book. Defaults are seven concurrent
-strategy workers and four isolated variant accounts per strategy; capacity is
-configurable through the `ALPACA_FACTORY_*` environment variables.
+independent family under one global risk book. Defaults are seven logical
+strategy slots over eleven bounded rule families and four isolated variant
+accounts per strategy; each isolated book is processed by one bounded worker.
+Capacity is configurable through the
+`ALPACA_FACTORY_*` environment variables.
+
+The shipped/default universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`,
+`XLF`, `XLK`, `XLE`, `XLV`), improving opportunity capacity. Real signal rates
+still require sufficient history, and floor feasibility fails closed when the
+100-trade held-out floor cannot be supported; widen history and/or the
+configured universe, never lower the floor.
+
+Start the broker-free shadow lane with `docker compose --profile shadow up -d
+shadow`. It mounts the recorder corpus and EdgeLedger read-only, has no broker
+credentials, and writes only `/app/shadow/shadow.sqlite3` (SQLite WAL). It
+evaluates eligible candidates in isolated virtual books from recorder events,
+creates exact-session candidate/root-baseline/randomized-null replays, and
+quarantines mismatch/incomplete rows. Virtual opens use the deterministic
+runtime signal/setup/risk path; completed sessions compare semantic shadow
+signatures with factory/IBR replay. The lane cannot submit orders or mutate
+broker/runtime state.
+
+The scheduled research cycle invokes `edge ingest-shadow` by default when
+`ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a no-op. The consumer
+mounts the same `shadow-data` volume read-only at `/app/shadow` and is the only
+process that writes the live-ingestion authorization marker to EdgeLedger.
 
 The default Compose lane passes the Alpaca paper endpoint and feed settings
 explicitly through `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and
@@ -79,9 +103,12 @@ orders and flattens residuals, and the session policy force-flats before the
 regular NY close. The checked research config enables bounded `gpt-5` strategy
 replacement, using credentials only from optional
 `ALPACA_RESEARCH_LLM_SECRETS_FILE`; invalid or missing output leaves a pending
-replacement. Runtime decision LLM use remains disabled. The trader opens
+replacement. LLM discovery/replacement/tuning use full-schema structured
+contracts, a per-run call budget and authentication circuit, and record
+per-attempt evidence. Runtime decision LLM use remains disabled. The trader opens
 entries only when the SQLite ledger has a vehicle-local `validated` or
-`champion` edge for its configured execution profile.
+`champion` edge for its configured execution profile whose latest shadow proof
+carries the parity-matched live-ingestion marker.
 
 For Compose, set `ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of the
 separate research-provider dotenv file. It is mounted read-only as
@@ -93,16 +120,28 @@ separate reviewed config/runtime scope: `mode: live`, `broker.paper: false`,
 `broker.allow_live: true`, `ALPACA_LIVE_ENABLE=true`,
 and either `strategy.selection_mode: pinned` with exactly one operator-named
 entry (preferred), or legacy `selection_mode: specific` with one exact named
-validated/champion `strategy.variant_id`. The runtime resolves only that edge,
+validated/champion `strategy.variant_id` carrying the parity-matched
+live-ingestion marker. The runtime resolves only that edge,
 re-verifies its proof/configuration at startup refresh, and does not
 auto-switch. Runtime LLM decisions are rejected independently by configuration
 validation and the Engine constructor. The authenticated live preflight also
 requires `pattern_day_trader=true`.
 Research lifecycle gates include fit/held-out structural floors, matched
-controls, placebo/falsification, family-local and cycle-global FDR, sealed
-qualification source binding, and durable verification. Underpowered shadow
-data advances no boundary and is reconsidered. A valid bounded LLM replacement
-is registered before an adequately tested failed family can retire. Scheduler
+controls, placebo/falsification, fixed-rule rolling-origin stability,
+family-local/cycle-global FDR and cumulative online-FDR state, sealed
+qualification source binding (one preselected candidate alone consumes the
+window), and durable verification. Offline historical/forward replay may leave
+a candidate at `shadow` only and never authorizes runtime. Research-side `edge
+ingest-shadow` opens the shadow WAL read-only, requires strictly newer complete
+parity-matched rows, prior qualification, source/config/code/provenance/replay/
+gate hashes, family/global BH plus durable online FDR, then appends the
+immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
+incomplete shadow data advances no boundary and is reconsidered. Legacy
+validated/champion rows without the marker can be evaluated/migrated but remain
+ineligible until a new authorized live proof. Retirement requires adequate terminal negative
+evidence for every intended variant; a valid bounded LLM replacement is
+registered before retirement when enabled, and demoted candidates can re-prove
+on a newer shadow run. Scheduler
 terminal statuses are `completed`, `completed_no_edge`, `no_data`, and
 `failed`.
 

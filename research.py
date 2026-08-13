@@ -418,6 +418,24 @@ def cmd_edge_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edge_ingest_shadow(args: argparse.Namespace) -> int:
+    """Consume complete parity-matched broker-free shadow replays."""
+    from research.live_shadow_ingest import ShadowIngestConfig, ingest_shadow
+
+    shadow_db = Path(args.shadow_db or os.getenv("ALPACA_SHADOW_DB") or
+                     REPO / "runtime" / "research" / "shadow.sqlite3")
+    config = ShadowIngestConfig(
+        edge_db=_db(args), shadow_db=shadow_db,
+        vehicle=getattr(args, "vehicle", None),
+        candidate_id=getattr(args, "candidate", None),
+        baseline_candidate_id=getattr(args, "baseline_candidate", None),
+        null_candidate_id=getattr(args, "null_candidate", None),
+        min_trades=args.min_trades, min_sessions=args.min_sessions,
+        alpha=args.alpha)
+    print(json.dumps(ingest_shadow(config), sort_keys=True, default=str))
+    return 0
+
+
 def cmd_edge_discover(args: argparse.Namespace) -> int:
     agent_config = _agent_config(args)
     config = _read_json(args.config, {})
@@ -457,26 +475,27 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
     config = _read_json(getattr(args, "config", None), {})
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
-    # Scheduled jobs pass the validated agent config, not a second ad-hoc
-    # research config.  Use its execution caps and cost assumptions as the
-    # factory model; an explicit --config may override only those two blocks
-    # for an intentional offline experiment.
-    cost_config = dict(agent_config)
-    for block in ("costs", "execution"):
+    # Scheduled jobs pass the validated agent config. Research must replay the
+    # same execution, risk, session and strategy boundaries as runtime; an
+    # explicit JSON config may override those blocks for a named offline
+    # experiment, and the resulting assumptions are hashed into the cycle.
+    runtime_config = dict(agent_config)
+    for block in ("costs", "execution", "risk", "strategy", "session"):
         if block in config:
-            base = cost_config.get(block)
+            base = runtime_config.get(block)
             override = config.get(block)
             if isinstance(base, dict) and isinstance(override, dict):
-                cost_config[block] = {**base, **override}
+                runtime_config[block] = {**base, **override}
             else:
-                cost_config[block] = override
+                runtime_config[block] = override
     result = run_factory(
         args.data, db_path=_db(args), vehicle=args.vehicle,
         strategies=args.strategies, variants_per_strategy=args.variants,
         workers=args.workers, starting_cash=args.starting_cash,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha, max_generations=args.max_generations,
-        costs=CostModel.from_config(cost_config),
+        costs=CostModel.from_config(runtime_config),
+        runtime_config=runtime_config,
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"))
     proofs = _emit_proofs(args, result, agent_config)
     # Archive the narrative every cycle, not only when an edge proves out. A
@@ -580,6 +599,20 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("candidate")
         parser.add_argument("outcome")
         parser.set_defaults(func=cmd_edge_ingest)
+    elif command == "ingest-shadow":
+        parser.add_argument("candidate", nargs="?", default=None,
+                            help="one candidate id (default: every eligible candidate)")
+        parser.add_argument("--vehicle", choices=("equity", "option"), default=None)
+        parser.add_argument("--shadow-db", default=None,
+                            help="broker-free shadow WAL (default: ALPACA_SHADOW_DB)")
+        parser.add_argument("--baseline-candidate", default=None,
+                            help="paired baseline candidate id")
+        parser.add_argument("--null-candidate", default=None,
+                            help="paired randomized-null candidate id")
+        parser.add_argument("--min-trades", type=int, default=100)
+        parser.add_argument("--min-sessions", type=int, default=10)
+        parser.add_argument("--alpha", type=float, default=.05)
+        parser.set_defaults(func=cmd_edge_ingest_shadow)
     elif command == "paper":
         parser.add_argument("candidate", nargs="?", default=None,
                             help="one candidate id (default: every candidate)")
@@ -638,10 +671,10 @@ def build_parser() -> argparse.ArgumentParser:
     # jobs can stay terse while operators retain a discoverable command tree.
     edge = sub.add_parser("edge", help="auditable edge discovery ledger")
     edge_sub = edge.add_subparsers(dest="edge_command", required=True)
-    for name in ("init", "status", "promote", "ingest", "paper", "discover",
+    for name in ("init", "status", "promote", "ingest", "ingest-shadow", "paper", "discover",
                  "trials", "promotable"):
         _edge_parser(edge_sub, name, name)
-    for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest",
+    for name in ("edge-init", "edge-status", "edge-promote", "edge-ingest", "edge-ingest-shadow",
                  "edge-paper", "edge-discover", "edge-trials",
                  "edge-promotable"):
         _edge_parser(sub, name, name.split("-", 1)[1])

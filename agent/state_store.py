@@ -25,6 +25,10 @@ DEFAULT = {
     "operator_pause": False,
     "orders": {},
     "risk_day": {},
+    # Last emitted IBR session per immutable edge/symbol key.  Keeping only the
+    # latest session makes this bounded while preserving the one-signal/session
+    # contract across process restarts.
+    "signal_sessions": {},
     "last_reconciliation_ts": None,
     "preflight": {},
     # Closed-trade learning events awaiting durable ingestion by the research
@@ -56,9 +60,15 @@ def _validated(data: Mapping[str, Any]) -> dict:
             not fingerprint.startswith(f"alpaca-{value['runtime_mode']}-")):
         raise ValueError("account_fingerprint does not match runtime_mode")
     for key in ("active_trades", "protection", "opened_at",
-                "orders", "risk_day", "preflight"):
+                "orders", "risk_day", "signal_sessions", "preflight"):
         if not isinstance(value.get(key), dict):
             raise ValueError(f"{key} must be an object")
+    sessions = value["signal_sessions"]
+    if len(sessions) > 10_000 or any(
+            not isinstance(key, str) or not key or len(key) > 240 or
+            not isinstance(session, str) or len(session) != 10
+            for key, session in sessions.items()):
+        raise ValueError("signal_sessions must map bounded edge keys to ISO session dates")
     outbox = value.get("edge_outbox")
     if not isinstance(outbox, list) or any(not isinstance(item, dict) for item in outbox):
         raise ValueError("edge_outbox must be a list of objects")

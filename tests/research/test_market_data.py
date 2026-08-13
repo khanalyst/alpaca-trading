@@ -40,6 +40,14 @@ class MarketDataNormalizationTests(unittest.TestCase):
         })
         self.assertEqual(bar.session_date.isoformat(), "2024-03-11")
 
+    def test_non_new_york_session_timezone_is_rejected(self):
+        with self.assertRaisesRegex(NormalizationError, "America/New_York"):
+            normalize_underlying_bar({
+                "symbol": "SPY", "timestamp": "2024-03-11T13:30:00Z",
+                "open": 1, "high": 2, "low": 1, "close": 1.5, "volume": 1,
+                "provider": "alpaca", "feed": "iex", "timezone": "UTC",
+            })
+
     def test_naive_timestamp_and_future_asof_fail_closed(self):
         payload = {
             "symbol": "SPY", "timestamp": "2024-01-02T14:30:00",
@@ -73,6 +81,48 @@ class MarketDataNormalizationTests(unittest.TestCase):
         })
         self.assertEqual(contract.right, "call")
         self.assertEqual(contract.multiplier, 100)
+
+    def test_option_snapshot_preserves_liquidity_metadata(self):
+        snapshot = normalize_option_snapshot({
+            "symbol": "SPY240119C00500000", "underlying": "SPY",
+            "expiration": "2024-01-19", "strike": 500, "right": "C",
+            "timestamp": "2024-01-02T14:30:00Z", "bid": 1.0, "ask": 1.1,
+            "bid_size": 3, "ask_size": 4, "volume": 20,
+            "open_interest": 100, "provider": "alpaca", "feed": "opra",
+        })
+        self.assertEqual((snapshot.bid_size, snapshot.ask_size,
+                          snapshot.volume, snapshot.open_interest),
+                         (3.0, 4.0, 20.0, 100.0))
+
+    def test_option_snapshot_legacy_payload_defaults_and_aliases_are_safe(self):
+        # Existing recorded fixtures omit the newer recorder measurements;
+        # normalization remains compatible while preserving explicit aliases.
+        base = {
+            "symbol": "SPY240119C00500000", "underlying": "SPY",
+            "expiration": "2024-01-19", "strike": 500, "right": "C",
+            "timestamp": "2024-01-02T14:30:00Z", "bid": 1.0, "ask": 1.1,
+            "provider": "alpaca", "feed": "opra",
+        }
+        legacy = normalize_option_snapshot(base)
+        self.assertEqual((legacy.bid_size, legacy.ask_size,
+                          legacy.volume, legacy.open_interest),
+                         (None, None, None, None))
+        aliased = normalize_option_snapshot({
+            **base, "bs": 3, "as": 4, "day_volume": 20, "oi": 100,
+        })
+        self.assertEqual((aliased.bid_size, aliased.ask_size,
+                          aliased.volume, aliased.open_interest),
+                         (3.0, 4.0, 20.0, 100.0))
+
+    def test_option_snapshot_rejects_negative_liquidity_metadata(self):
+        payload = {
+            "symbol": "SPY240119C00500000", "underlying": "SPY",
+            "expiration": "2024-01-19", "strike": 500, "right": "C",
+            "timestamp": "2024-01-02T14:30:00Z", "bid": 1.0, "ask": 1.1,
+            "provider": "alpaca", "feed": "opra", "volume": -1,
+        }
+        with self.assertRaisesRegex(NormalizationError, "non-negative"):
+            normalize_option_snapshot(payload)
 
     def test_crypto_and_unknown_asset_classes_are_rejected(self):
         base = {

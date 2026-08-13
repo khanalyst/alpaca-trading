@@ -22,8 +22,8 @@ from research.edge_ledger import (
 )
 from research.gates import (
     falsification_gate, heldout_separation, matched_cluster_test,
-    performance_floor, placebo_null_distribution, structural_floor,
-    verified_gate_envelope, walk_forward_report,
+    max_drawdown_of, performance_floor, placebo_null_distribution, qualification_report,
+    structural_floor, verified_gate_envelope, walk_forward_report,
 )
 
 
@@ -75,12 +75,23 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
             # observation while leaving every level on the same side of itself.
             shift = index * .01
             for minute, (open_, high, low, close) in enumerate(values):
+                timestamp = session + timedelta(minutes=minute)
                 rows.append({
                     "symbol": symbol,
-                    "timestamp": (session + timedelta(minutes=minute)).isoformat(),
+                    "timestamp": timestamp.isoformat(),
+                    "as_of": (timestamp + timedelta(minutes=1)).isoformat(),
+                    "observed_at": (timestamp + timedelta(minutes=1)).isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "sip",
+                })
+                rows.append({
+                    "kind": "quote", "symbol": symbol,
+                    "timestamp": timestamp.isoformat(),
+                    "as_of": timestamp.isoformat(),
+                    "observed_at": timestamp.isoformat(),
+                    "bid": open_ + shift - .01, "ask": open_ + shift + .01,
+                    "provider": "alpaca", "feed": "sip",
                 })
     return rows
 
@@ -92,7 +103,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   r_multiples: list[float] | None = None) -> tuple[dict, dict]:
     prefix = f"{lane}-{'pass' if passes else 'fail'}"
     fit = [] if lane == "shadow" else [
-        {"vehicle": "equity", "session_date": "2024-01-02",
+        {"vehicle": "equity", "symbol": "SPY", "session_date": "2024-01-02",
          "opportunity_id": f"{prefix}-fit", "net_pnl": 1.0},
     ]
     # Eight held-out sessions: a sign-flip null over two clusters cannot
@@ -110,6 +121,12 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
          "net_pnl": value}
         for day, value in zip(range(3, 3 + len(values)), values)
     ]
+    baseline = [{**row, "net_pnl": 0.0,
+                 "opportunity_id": f"baseline-{index}"}
+                for index, row in enumerate(heldout)]
+    fit_baseline = [{**row, "net_pnl": 0.0,
+                     "opportunity_id": f"fit-baseline-{index}"}
+                    for index, row in enumerate(fit)]
     fit_floor = structural_floor(
         fit, vehicle="equity", min_trades=1, min_sessions=1,
         required=lane != "shadow")
@@ -119,30 +136,82 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": True, "mode": "new_data"})
     control, falsification, absolute, walk = _gate_evidence(heldout)
-    checks = {"edge_positive": passes, "family_fdr_significant": True,
-              "falsification": bool(passes and falsification["passes"]),
-              "heldout_net_pnl_positive": bool(passes and absolute["net_pnl_positive"]),
-              "heldout_expectancy_positive": bool(passes and absolute["expectancy_positive"]),
+    fit_control = (matched_cluster_test(fit, fit_baseline, vehicle="equity")
+                   if fit else {"available": True, "actual_control": True,
+                                "matched": 0, "mean_delta": None,
+                                "p_value": 1.0, "mode": "prior_backtest"})
+    qualification = qualification_report(
+        heldout, baseline, vehicle="equity",
+        sessions=sorted({row["session_date"] for row in heldout}),
+        candidate_id=candidate_id, preselected=True)
+    candidate = ledger.candidate(candidate_id)
+    candidate_config = json.loads(candidate["config_json"])
+    hashes = edge_ledger.provenance_hash(config=candidate_config)
+    checks = {"edge_positive": passes, "family_fdr_significant": passes,
+              "global_fdr_significant": passes,
+              "cumulative_fdr_significant": passes,
+              "falsification": bool(falsification["passes"]),
+              "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
+              "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
               "heldout_delta_lcb_positive": bool(
-                  passes and control["mean_delta_lcb"] is not None and
+                  control["mean_delta_lcb"] is not None and
                   control["mean_delta_lcb"] > 0),
-              "walk_forward_majority_positive": bool(passes and walk["majority_positive"])}
+              "walk_forward_majority_positive": bool(walk["majority_positive"])}
     envelope = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
+        fit_baseline=fit_baseline, heldout_baseline=baseline,
+        null_source=baseline,
         fit_floor=fit_floor, heldout_floor=held_floor,
+        fit_control=fit_control,
         control={**control, "kind": "matched_actual_baseline"},
-        p_value=control["p_value"], q_value=.02, alpha=.05,
+        p_value=control["p_value"], q_value=.02 if passes else 1.0, alpha=.05,
         falsification=falsification,
         separation=separation, checks=checks, passes=passes,
         walk_forward=walk,
+        qualification=qualification,
+        null_control={"kind": "randomized_entry_null",
+                      "matched": control["matched"], "available": True,
+                      "mean_delta": control["mean_delta"],
+                      "mean_delta_lcb": control["mean_delta_lcb"],
+                      "p_value": control["p_value"]},
+        online_fdr={"scope": "test", "test_id": f"{candidate_id}:{lane}",
+                    "p_value": .02 if passes else 1.0,
+                    "allocated_alpha": .05,
+                    "decision": passes},
+        provenance=hashes, candidate_id=candidate_id,
         performance={"heldout_delta": control["mean_delta"],
                      "heldout_delta_lcb": control["mean_delta_lcb"],
                      "heldout_net_pnl": absolute["net_pnl"],
                      "heldout_expectancy": absolute["expectancy"],
-                     "max_drawdown": 0.0 if passes else 8.0})
+                     "max_drawdown": max_drawdown_of(heldout)})
+    live_source = None
+    if lane == "shadow":
+        live_source = {
+            "schema": "shadow-ingest.v1", "candidate_id": candidate_id,
+            "vehicle": "equity",
+            "sessions": [{
+                "session_date": row["session_date"],
+                "source_digest": f"source:{row['session_date']}",
+                "shadow_digest": f"shadow:{row['session_date']}",
+                "replay_digest": f"replay:{row['session_date']}",
+                "account_id": f"account:{row['session_date']}",
+                "trade_count": 1,
+            } for row in heldout],
+            "baseline": {"candidate_id": "fixture:baseline",
+                         "rows_digest": edge_ledger.content_hash(baseline),
+                         "role": "paired_root_control"},
+            "null": {"candidate_id": "fixture:null",
+                      "rows_digest": edge_ledger.content_hash(baseline),
+                      "role": "randomized_entry_null"},
+        }
     run = ledger.append_run(
         candidate_id, lane=lane, vehicle="equity", fit=fit, heldout=heldout,
-        metrics={"gate": {"passes": not passes}, "confidence": 0.0})
+        config=candidate_config,
+        metrics={"gate": {"passes": not passes}, "confidence": 0.0,
+                 **({"shadow_source": live_source,
+                    "replay_digests": [item["replay_digest"]
+                                       for item in live_source["sessions"]]}
+                    if live_source is not None else {})})
     # ``r_multiples`` attaches the risk-normalized outcome the drift reference
     # is read from; the gate statistics themselves never consume it.
     per_trade = dict(zip((row["opportunity_id"] for row in heldout),
@@ -153,6 +222,15 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                             row if value is None else {**row, "r_multiple": value})
     if record:
         ledger.record_verified_gate(run["run_id"], envelope)
+        if live_source is not None:
+            ledger.append_evidence(
+                candidate_id, "shadow_ingestion",
+                {"schema": "shadow-ingest.v1", "candidate_id": candidate_id,
+                 "vehicle": "equity", "source": live_source,
+                 "replay_digests": [item["replay_digest"]
+                                    for item in live_source["sessions"]],
+                 "gate_hash": envelope["content_hash"]},
+                run_id=run["run_id"])
     return run, envelope
 
 
@@ -583,6 +661,7 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             })
             envelope["checks"]["heldout_delta_positive"] = False
             envelope["checks"]["heldout_delta_lcb_positive"] = False
+            envelope["checks"]["actual_control_available"] = False
             envelope["statistics"]["p_value"] = 1.0
             envelope["performance"]["heldout_delta"] = None
             envelope["performance"]["heldout_delta_lcb"] = None
@@ -867,7 +946,7 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertEqual(ledger.transition(
                 candidate_id, "backtest_passed", reason="gates passed")["status"],
                 "backtest_passed")
-            with self.assertRaisesRegex(ValueError, "passing shadow verified evidence"):
+            with self.assertRaisesRegex(ValueError, "verified gate evidence"):
                 ledger.transition(candidate_id, "shadow", reason="operator request")
 
     def test_retirement_rollback_and_forged_gate_cannot_bypass_evidence(self):
@@ -886,6 +965,22 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             envelope["passes"] = False
             with self.assertRaisesRegex(ValueError, "envelope/hash"):
                 ledger.record_verified_gate(run["run_id"], envelope)
+
+    def test_positive_but_inconclusive_gate_cannot_retire_a_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", vehicle="equity",
+                hypothesis="positive but not statistically authorized",
+                config={"strategy": {"target_r": 1.5}})
+            candidate_id = candidate["candidate_id"]
+            _persist_gate(
+                ledger, candidate_id, "backtest", passes=False,
+                scores=[1.0] * 8)
+            with self.assertRaisesRegex(ValueError, "terminally negative"):
+                ledger.transition(
+                    candidate_id, "retired", reason="inconclusive gate failure")
+            self.assertEqual(ledger.candidate(candidate_id)["status"], "candidate")
 
     def test_latest_failing_proof_makes_a_champion_ineligible(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -950,10 +1045,15 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             self.assertGreater(envelope["performance"]["heldout_delta"], 0)
             self.assertLessEqual(envelope["performance"]["heldout_delta_lcb"], 0)
             self.assertFalse(envelope["checks"]["heldout_delta_lcb_positive"])
-            # A positive point estimate with a lower bound straddling zero
-            # cannot be claimed as a pass, so it can never reach champion.
-            with self.assertRaises(ValueError):
-                ledger.record_verified_gate(run["run_id"], envelope)
+            # The builder has already downgraded the claim to a failed gate.
+            # Persisting that negative evidence is valid; only recording it as
+            # a pass or using it to advance the lifecycle would be a bypass.
+            self.assertFalse(envelope["passes"])
+            ledger.record_verified_gate(run["run_id"], envelope)
+            with self.assertRaisesRegex(ValueError, "passing backtest"):
+                ledger.transition(
+                    candidate["candidate_id"], "backtest_passed",
+                    reason="non-positive lower bound")
 
     def test_champion_ranks_by_lower_bound_not_raw_heldout_delta(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1040,7 +1140,9 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
                                config=config, min_trades=5, min_sessions=5,
                                lane="auto")
             candidate = forward["variants"][0]
-            self.assertIn(candidate["status"], {"validated", "champion"})
+            # Offline forward replay remains diagnostic; lifecycle validation
+            # is authorized only by the research-side live-shadow ingester.
+            self.assertIn(candidate["status"], {"shadow", "validated", "champion"})
             self.assertEqual(candidate["mode"], "shadow")
             self.assertEqual(candidate["unseen_sessions"], 20)
             trades = EdgeLedger(db).trades(candidate["candidate_id"], lane="shadow")
@@ -1059,6 +1161,10 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
     """
     winner = [(100, 101, 99, 100), (100, 102, 99, 102),
               (102, 103, 101, 102), (102, 107, 101, 106)]
+    price = 106.0
+    for _ in range(20):
+        winner.append((price, price + .05, price - .4, price - .35))
+        price -= .35
     loser = [(100, 101, 99, 100), (100, 102, 99, 102),
              (102, 103, 101, 102), (102, 102, 94, 95)]
     sealed_from = count - max(1, int(count * .2))
@@ -1069,12 +1175,23 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
         for index, symbol in enumerate(symbols):
             shift = index * .01
             for minute, (open_, high, low, close) in enumerate(values):
+                timestamp = session + timedelta(minutes=minute)
                 rows.append({
                     "symbol": symbol,
-                    "timestamp": (session + timedelta(minutes=minute)).isoformat(),
+                    "timestamp": timestamp.isoformat(),
+                    "as_of": (timestamp + timedelta(minutes=1)).isoformat(),
+                    "observed_at": (timestamp + timedelta(minutes=1)).isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "sip",
+                })
+                rows.append({
+                    "kind": "quote", "symbol": symbol,
+                    "timestamp": timestamp.isoformat(),
+                    "as_of": timestamp.isoformat(),
+                    "observed_at": timestamp.isoformat(),
+                    "bid": open_ + shift - .01, "ask": open_ + shift + .01,
+                    "provider": "alpaca", "feed": "sip",
                 })
     return rows
 
@@ -1100,12 +1217,23 @@ def _drift_sessions(start: datetime, count: int,
         for index, symbol in enumerate(symbols):
             shift = index * .01
             for minute, (open_, high, low, close) in enumerate(values):
+                timestamp = session + timedelta(minutes=minute)
                 rows.append({
                     "symbol": symbol,
-                    "timestamp": (session + timedelta(minutes=minute)).isoformat(),
+                    "timestamp": timestamp.isoformat(),
+                    "as_of": (timestamp + timedelta(minutes=1)).isoformat(),
+                    "observed_at": (timestamp + timedelta(minutes=1)).isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "sip",
+                })
+                rows.append({
+                    "kind": "quote", "symbol": symbol,
+                    "timestamp": timestamp.isoformat(),
+                    "as_of": timestamp.isoformat(),
+                    "observed_at": timestamp.isoformat(),
+                    "bid": open_ + shift - .01, "ask": open_ + shift + .01,
+                    "provider": "alpaca", "feed": "sip",
                 })
     return rows
 
@@ -1193,7 +1321,10 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         # the chance-entry comparison is not.
         self.assertFalse(checks["null_control_delta_positive"])
         self.assertFalse(candidate["gate"]["passes"])
-        self.assertEqual(candidate["status"], "retired")
+        # Failing a randomized-entry null means the thesis is inconclusive,
+        # not terminally loss-making.  Keep it available for a later, genuinely
+        # different sample instead of retiring it on a diagnostic failure.
+        self.assertEqual(candidate["status"], "candidate")
 
     def test_the_requested_alpha_reaches_the_falsification_decision(self):
         # The factory passed alpha through; the IBR lane decided falsification

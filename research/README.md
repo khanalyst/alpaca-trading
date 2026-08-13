@@ -25,11 +25,20 @@ corpus, appended into one partition per New York session date under
 partitions in session order (`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the
 most recent N), validates the result, and routes the vehicle-local discovery
 lanes from it.
-It also invokes `research.strategy_factory`, which evaluates seven concurrent
-rule families concurrently by default. Each generated variant owns an
-isolated simulated account; no capital or P&L is shared between arms.
+It also invokes `research.strategy_factory`, which evaluates seven logical
+strategy slots over the finite catalog of eleven rule families by default.
+Seven is slot/worker capacity, not the number of families. Each generated
+variant owns an isolated simulated account processed by one bounded worker; no
+capital or P&L is shared between arms.
 Paper runtime selection can then use `selection_mode: all_proved`, which keeps
 one best proven variant per independent family under one global risk book.
+
+The 100-trade held-out floor is evidence, not a tuning knob. The shipped
+default universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`,
+`XLE`, `XLV`), improving opportunity capacity, but real signal rates still
+require sufficient history. Replay allows at most one trade per symbol-session;
+floor feasibility fails closed when 100 held-out trades cannot be supported.
+Widen history and/or `universe.symbols`, never lower the evidence floor.
 
 The default session timezone is `America/New_York`. Session dates are derived
 after timezone conversion, so the daylight-saving transitions in March and
@@ -98,34 +107,35 @@ used to decide which vehicle lanes to run and to feed the standalone
 python research.py calibrate runtime/paper/journal.db
 ```
 
-`research.calibration` reads the runtime journal read-only and compares each
-recorded entry fill against the plan price that priced it, recovered from the
-plan's notional and submitted quantity. It reports the observed adverse cost
-in basis points, the model's bias against it, how many fills landed past the
-runtime's own slippage cap, and a verdict of `conservative`, `optimistic`, or
-`insufficient_data`. Under 20 referenced fills it issues no verdict at all: the
-sample cannot separate the model from noise. A fill whose reference cannot be
-reconstructed is counted as unreferenced rather than scored against a guess. It
-never adjusts the model; an optimistic model is a finding, and the command
-exits non-zero so it cannot be missed.
-
-There is deliberately no exit-side calibration. The journal records no exit
-reference price, so an exit cost could only be inferred, and an inferred number
-in a calibration report is indistinguishable from a measured one.
+`research.calibration` reads the runtime journal read-only and reports adverse
+cost in basis points, model bias, runtime-cap overruns, and a verdict of
+`conservative`, `optimistic`, or `insufficient_data`. Results are stratified by
+runtime mode, vehicle, execution profile, and by entry versus exit when
+references are present; missing or thin strata remain insufficient and equity
+and options are never pooled. A fill whose reference cannot be reconstructed is
+unreferenced rather than scored against a guess. Calibration is advisory only:
+it never adjusts the model, and an optimistic finding exits non-zero so it is
+visible to scheduled operation.
 
 ## Evidence and provenance
 
 Research artifacts should retain the normalized input digest, provider/feed
-identity, configuration, and code version alongside results.  Any feature or
+identity, configuration, code version, cost model, risk/`ReplayPolicy`, and
+gate assumptions alongside results. The experiment identity binds dataset,
+configuration, code, cost, risk, gates, and provenance hashes. Any feature or
 label must be computed from events at or before its as-of timestamp.  A
 completed-bar fixture and a no-look-ahead test are required for every new
-replay path.  Walk-forward, paired-baseline, placebo/falsification, and
+replay path.  Fixed-rule rolling-origin forward-stability, paired-baseline, placebo/falsification, and
 acceptance-floor checks are mandatory gates, with fit/held-out structural
 floors, family-local and cycle-global false-discovery correction, sealed
 qualification source binding, and a durable verified gate. A family-local pass
 with a cycle-global failure is a normal marginal result; only the global result
 can authorize cross-family selection. The gates are applied per vehicle and per
-session rather than to a pooled equity/options series.
+session rather than to a pooled equity/options series. Rolling-origin uses the
+same fixed rule in every fold. The cumulative
+online-FDR allocation is durable per vehicle scope and persists across cycles;
+the sealed qualification window is released once by one preselected candidate
+alone, while other variants remain diagnostic.
 
 ## Edge laboratory
 
@@ -137,24 +147,47 @@ SHA-256 hashes. The default database is `runtime/research/edge_lab.sqlite3`
 
 The lifecycle is forward-only: an initial corpus backtest moves a candidate to
 `backtest_passed`; a later corpus must contain sessions strictly after the
-persisted boundary, and passing unseen shadow gates moves it through `shadow`
-to `validated` and automatic champion selection. A shadow boundary advances
-only from a durable re-verifying passing proof; an underpowered worker persists
-no shadow result, so the same tail can be reconsidered later. Paper outcomes
+persisted boundary, and passing offline forward-shadow gates may move it to
+`shadow` only. Offline historical/forward replay never authorizes runtime.
+Only broker-free ShadowRunner output consumed by research-side
+`edge ingest-shadow` can append the parity-matched live marker and move a
+candidate to `validated`/`champion`. A shadow boundary advances only from a
+durable re-verifying passing proof; an underpowered worker persists no shadow
+result, so the same tail can be reconsidered later. Paper outcomes
 are append-only evidence scoped to the exact shadow proof that authorized the
-entry and may demote a deployed edge. Re-proving a candidate begins a new trial
-epoch instead of aggregating lifetime outcomes. Candidates are scored
+entry and may demote a deployed edge. A demoted candidate may re-prove on a
+newer shadow run; re-proving begins a new trial epoch instead of aggregating
+lifetime outcomes. Candidates are scored
 separately for `equity` and `option` vehicles. Gates require chronological
 held-out data, fit/held-out trade and session structural floors, matched
 controls, cluster-aware randomisation, family-local and cycle-global FDR,
 sealed qualification observations/digests, and placebo/falsification.
 Underpowered data is not failure. Retirement is allowed only after all
-intended variants are adequately tested and fail; a valid bounded LLM
-replacement must be registered first when that lane is enabled. Drawdown is
+intended variants have adequate terminal negative evidence and fail; a valid
+bounded LLM replacement must be registered first when that lane is enabled.
+Drawdown is
 measured and used in conservative champion ranking. Normal operation needs no
 manual promotion; the `edge promote` CLI is only for explicit, audited controls
-and remains subject to lifecycle/evidence rules. Backward rollback is rejected;
-explicit demotion is the operator safety action.
+and cannot bypass the live marker. Legacy validated/champion rows without that
+marker may be evaluated/migrated but remain ineligible until a new authorized
+live proof. Backward rollback is rejected; explicit demotion is the operator
+safety action.
+
+## Broker-free live shadow
+
+The optional Compose `shadow` profile reads recorder rows and EdgeLedger
+candidates through read-only connections, evaluates eligible candidates in
+isolated virtual books, and writes only its own WAL SQLite database. For each
+complete session it creates candidate, exact root-baseline, and
+randomized-entry-null replays; mismatch or incomplete rows are quarantined.
+It uses the deterministic runtime signal/setup/risk path and compares semantic
+shadow signatures with factory/IBR replay for parity. It has no broker
+credentials, order path, or broker/runtime state authority. The scheduled
+research cycle runs `edge ingest-shadow` by default when enabled; absent shadow
+DB is a no-op. Ingestion opens the WAL read-only and requires strictly newer,
+complete parity-matched rows, prior qualification, source/config/code/
+provenance/replay/gate hashes, family/global BH, and durable online FDR before
+appending the immutable `lane=shadow` proof and live marker.
 
 ## Autonomous strategy factory
 
@@ -186,7 +219,7 @@ v1 plan.
 
 ### Slots are capacity, not licences
 
-The factory runs a fixed number of parallel slots. A slot's hypothesis leaves
+The factory runs a fixed number of logical slots. A slot's hypothesis leaves
 the active set permanently once it proves an edge — the deployed variant is
 frozen and must never be re-tuned — so the slot is immediately reseeded with a
 *new* hypothesis in the same cycle. Without that reseed the factory would lose
@@ -281,12 +314,19 @@ Parameter search used to be a fixed table: three hand-written responses per
 diagnosed failure mode, with an arithmetic sweep filling anything past that.
 It worked, but nothing it learned in one cycle reached the next one.
 
-All three replies are strict JSON, size-capped, fence-rejecting, and validated
-against the rule grammar before anything is stored; keys that look like source,
-credentials, or market rows are refused outright. A discovered hypothesis is
+All three replies use strict full-schema structured JSON (`additionalProperties:
+false`, including the complete rule specification), are size-capped,
+fence-rejecting, and validated against the rule grammar before anything is
+stored; keys that look like source, credentials, or market rows are refused
+outright. The adapter enforces a per-run total-call budget, bounded attempts,
+timeouts, and response bytes, and opens an authentication circuit after an auth
+failure. Result evidence records schema/grammar hashes, call counts, circuit
+state, and each attempt's hashes/errors. A discovered hypothesis is
 registered `queued` with no run, no gate, and no candidate — it must earn
-`backtest_passed` and then a strictly later forward shadow pass through exactly
-the same gates as a deterministic one. A tuned variant gets its own isolated
+`backtest_passed` and then a strictly later offline forward-shadow pass through
+exactly the same gates as a deterministic one. That pass may leave the
+candidate at `shadow`; only live parity ingestion can authorize runtime. A
+tuned variant gets its own isolated
 simulated account and faces every gate a mutated variant faces. **The LLM
 chooses what to try next; it can never shorten the evidence path or authorize
 trading.** Every seeding and tuning path falls back to the deterministic
@@ -328,6 +368,11 @@ property of the system instead:
 
 That is the whole loop: propose with a reason and a citation, evaluate under
 unchanged gates, grade the reason, and hand the grade forward.
+
+Across all discovery lanes, executable variants are de-duplicated by a
+family-specific semantic signature, including v1/v2 no-op aliases. A graded
+adequate failure suppresses only its exact failed variant id; underpowered
+results remain eligible.
 
 ### Learning shared across every strategy
 
@@ -386,15 +431,19 @@ A failed or unverifiable latest shadow proof quarantines history rather than
 falling back to lifetime aggregation.
 
 Parking an edge never promotes anything in its place. The replacement still has
-to earn `backtest_passed`, a strictly later shadow pass, and every gate.
+to earn `backtest_passed`, a strictly later offline shadow pass, and every gate,
+then obtain a new parity-matched live proof before runtime eligibility.
 
 ```bash
 python research.py factory report --format markdown   # includes the graded reasons
 ```
 
-The unmutated root is always variant zero and is never proposed away. Its
-matched control is itself, so it cannot pass; it is the null calibration the
-hypothesis's real variants are measured against.
+The unmutated root is always variant zero and is never proposed away. It is
+compared with an independent randomized-entry null that preserves the
+candidate's session/symbol/direction distribution and exit rules; it is never
+compared with itself. The root remains a real candidate in the family and
+cycle-global Benjamini–Hochberg denominators, so it consumes multiplicity like
+any mutation.
 
 The checked config enables these adapters with OpenAI `gpt-5`. They are
 optional and read provider keys only from `ALPACA_RESEARCH_LLM_SECRETS_FILE`,
@@ -406,11 +455,11 @@ to an HTTPS webhook without changing the durable artifact.
 
 `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` are trust boundaries: a configured
 endpoint receives the provider key and the bounded aggregate prompt. Use only a
-trusted HTTPS service; there is no application host allowlist. Prompt,
-request, and raw-response hashes prove what the cycle consumed, but they do not
-make a mutable model/provider response reproducible. The adapter caps attempts,
-timeout, and response bytes; provider-side quotas must supply any aggregate
-spend/rate budget.
+trusted HTTPS service; there is no application host allowlist. Prompt, request,
+and raw-response hashes prove what the cycle consumed, but they do not make a
+mutable model/provider response reproducible. The adapter's call budget is a
+per-run call-count guard rather than spend accounting; provider-side quotas
+remain an operational control.
 
 The scheduled cycle reports `completed`, `completed_no_edge`, `no_data`, or
 `failed`. `completed_no_edge` means the input was valid but no candidate passed

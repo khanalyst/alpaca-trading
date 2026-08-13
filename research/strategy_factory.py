@@ -19,18 +19,22 @@ import sqlite3
 from typing import Any, Mapping, Sequence
 import uuid
 
-from agent.contracts.rule import (RULE_FAMILIES, hold_deadline, rule_variant_id,
+from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V1, RULE_SCHEMA_V2,
+                                  V2_DEFAULT_EXTENSIONS, hold_deadline,
+                                  rule_semantic_distance,
+                                  rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
-from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
+from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
+from .edge_ledger_store import provenance_hash
 # One randomized-entry null control serves both research lanes; it lives in
 # the shared discovery helpers and is re-exported here for its callers.
 from .edge_discovery_core import corpus_slice, null_control_account
 from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
-    FactoryLedger,
+    FactoryLedger, experiment_identity, experiment_provenance,
 )
 from .gates import (chronological_split, heldout_separation,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
@@ -40,8 +44,9 @@ from .gates import (chronological_split, heldout_separation,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
-from .llm_strategy import (DISCOVERY_SCHEMA, LESSON_REF_CHARS, TUNING_SCHEMA,
-                           ProposalResult, RuleProposalAdapter)
+from .llm_strategy import (DISCOVERY_SCHEMA, LESSON_REF_CHARS, PROPOSAL_SCHEMA,
+                           TUNING_SCHEMA, ProposalResult, RuleProposalAdapter,
+                           _tuning_reason_check)
 from .stats import benjamini_hochberg, stable_seed
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
@@ -55,6 +60,10 @@ from .factory_core import (
 
 DEFAULT_WORKERS = 7
 MAX_WORKERS = 16
+# Exact semantic aliases are always removed. Near-duplicate suppression is a
+# transparent policy knob for model-authored proposals; deterministic
+# parameter sweeps remain a complete search regardless of this value.
+NEAR_DUPLICATE_DISTANCE = 0.001
 # Rotation makes generation exhaustion recoverable without removing the cap.
 # A slot may be reseeded with a fresh family at most ``MAX_ROTATIONS`` times,
 # each rotation granting one further ``max_generations`` mutation budget, and
@@ -77,7 +86,8 @@ SHARED_LEARNING_ROWS = 12
 # would be worse than reporting nothing.
 SHARED_LEARNING_MIN_ATTEMPTS = 3
 # Hypothesis-level lessons are graded by the best variant the hypothesis
-# produced, not by the root, which by construction cannot beat itself.
+# produced; the root is an ordinary null-tested candidate and consumes
+# multiplicity alongside its mutations.
 HYPOTHESIS_LESSON_KINDS = ("discovery", "reseed", "replacement", "rotation")
 
 
@@ -191,6 +201,76 @@ def _failed_variants(factory: FactoryLedger, *, vehicle: str,
         return frozenset()
 
 
+def _variant_keys(spec: Mapping[str, Any]) -> set[str]:
+    """Exact and semantic ids used by all discovery lanes."""
+    normalized = validate_rule_spec(spec)
+    return {rule_variant_id(normalized),
+            f"semantic:{rule_semantic_signature(normalized)}"}
+
+
+def _variant_seen(spec: Mapping[str, Any], seen: set[str]) -> bool:
+    return bool(_variant_keys(spec) & set(seen))
+
+
+def _near_duplicate_distance(config: Mapping[str, Any]) -> float:
+    """Resolve the bounded semantic-neighborhood policy for one LLM lane."""
+    try:
+        value = float(config.get("near_duplicate_distance",
+                                NEAR_DUPLICATE_DISTANCE))
+    except (TypeError, ValueError, OverflowError):
+        return NEAR_DUPLICATE_DISTANCE
+    if not math.isfinite(value):
+        return NEAR_DUPLICATE_DISTANCE
+    return max(0.0, min(1.0, value))
+
+
+def _semantic_duplicate(spec: Mapping[str, Any],
+                        candidates: Sequence[Mapping[str, Any]], *,
+                        near_distance: float) -> bool:
+    """Whether *spec* aliases an executable rule already in *candidates*.
+
+    Exact semantic aliases are rejected even when the configured neighborhood
+    is zero.  The family guard is intentional: a distance of ``1.0`` is the
+    cross-family sentinel, and a broad threshold must never collapse distinct
+    rule families.
+    """
+    normalized = validate_rule_spec(spec)
+    threshold = max(0.0, min(1.0, float(near_distance)))
+    for candidate in candidates:
+        try:
+            other = validate_rule_spec(candidate)
+        except (TypeError, ValueError, KeyError):
+            continue
+        if normalized.get("family") != other.get("family"):
+            continue
+        if rule_semantic_distance(normalized, other) <= threshold:
+            return True
+    return False
+
+
+def _mark_variant(spec: Mapping[str, Any], seen: set[str]) -> None:
+    seen.update(_variant_keys(spec))
+
+
+def _failed_variant(spec: Mapping[str, Any], failed: set[str]) -> bool:
+    """Match exact ids plus the v1/v2 no-op grammar alias."""
+    normalized = validate_rule_spec(spec)
+    if _variant_keys(normalized) & failed:
+        return True
+    schema = normalized.get("schema")
+    if schema == RULE_SCHEMA_V1:
+        alias = dict(normalized, schema=RULE_SCHEMA_V2, **V2_DEFAULT_EXTENSIONS)
+    elif (schema == RULE_SCHEMA_V2 and
+          all(normalized.get(name) == value
+              for name, value in V2_DEFAULT_EXTENSIONS.items())):
+        alias = {key: value for key, value in normalized.items()
+                 if key not in V2_DEFAULT_EXTENSIONS}
+        alias["schema"] = RULE_SCHEMA_V1
+    else:
+        alias = None
+    return alias is not None and rule_variant_id(alias) in failed
+
+
 def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
                   family: str | None = None,
                   limit: int = LESSON_BRIEF_LIMIT) -> list[dict]:
@@ -296,7 +376,8 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
                not_before: str | None, existing_variant_ids: set[str],
                tried_families: set[str], context: Mapping[str, Any],
                llm_enabled: bool, config: Mapping[str, Any],
-               adapter: RuleProposalAdapter | None = None
+               adapter: RuleProposalAdapter | None = None,
+               existing_specs: Sequence[Mapping[str, Any]] = ()
                ) -> tuple[StrategyHypothesis | None, ProposalResult | None, str]:
     """Seed a free slot: LLM discovery first, deterministic ladder second.
 
@@ -307,6 +388,14 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
     """
     vehicle = str(previous["vehicle"])
     slot = int(previous["slot"])
+    near_distance = _near_duplicate_distance(config)
+    # ``previous`` is deliberately included even when it is a genesis
+    # template that has not been registered.  Otherwise a model can return
+    # the template with a different content hash and masquerade as discovery.
+    comparison_specs = list(existing_specs)
+    previous_spec = previous.get("rule_spec")
+    if isinstance(previous_spec, Mapping):
+        comparison_specs.append(previous_spec)
     proposal: ProposalResult | None = None
     if llm_enabled:
         selected = adapter or RuleProposalAdapter(
@@ -315,6 +404,7 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
             max_attempts=int(config.get("max_attempts", 1)),
             timeout_seconds=float(config.get("timeout_seconds", 30)),
             max_response_bytes=int(config.get("max_response_bytes", 16_384)),
+            max_total_calls=int(config.get("max_total_calls", 64)),
         )
         discover = getattr(selected, "discover", None)
         try:
@@ -325,24 +415,53 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
             proposal = (discover(vehicle=vehicle, slot=slot,
                                  context=dict(context))
                         if callable(discover) else None)
+            if proposal is not None and not isinstance(proposal, ProposalResult):
+                proposal = ProposalResult(False, schema=DISCOVERY_SCHEMA,
+                                          error="provider returned malformed discovery result")
         except Exception as exc:  # noqa: BLE001 - degraded, never fatal
             proposal = ProposalResult(False, schema=DISCOVERY_SCHEMA,
-                                      error=f"{type(exc).__name__}: {exc}")
+                                      error=f"{type(exc).__name__}: provider discovery unavailable")
         if (proposal is not None and proposal.success and
-                proposal.rule_spec is not None and proposal.variant_id and
-                proposal.variant_id not in existing_variant_ids):
-            spec = validate_rule_spec(proposal.rule_spec)
-            return StrategyHypothesis(
-                _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
-                vehicle, str(spec["family"]),
-                # The model's own one-sentence rationale is recorded as the
-                # thesis when it supplied one; it is displayed text, never an
-                # instruction, and the falsification stays machine-generated.
-                proposal.thesis or _thesis(spec), _falsification(spec), spec,
-                str(previous["hypothesis_id"]), not_before), proposal, "llm_discovery"
-    seeded = discovery_hypothesis(
-        previous, generation=generation, not_before=not_before,
-        existing_variant_ids=existing_variant_ids, tried_families=tried_families)
+                proposal.rule_spec is not None and proposal.variant_id):
+            try:
+                spec = validate_rule_spec(proposal.rule_spec)
+                if proposal.variant_id != rule_variant_id(spec):
+                    raise ValueError("discovery variant id does not match normalized spec")
+                duplicate = (_variant_seen(spec, existing_variant_ids) or
+                             _semantic_duplicate(spec, comparison_specs,
+                                                 near_distance=near_distance))
+            except Exception as exc:  # malformed success degrades to ladder
+                duplicate = True
+                proposal = ProposalResult(False, schema=DISCOVERY_SCHEMA,
+                                          error=f"{type(exc).__name__}: malformed discovery",
+                                          evidence=dict(proposal.evidence))
+            if not duplicate:
+                return StrategyHypothesis(
+                    _hypothesis_id(vehicle, slot, generation, spec), slot, generation,
+                    vehicle, str(spec["family"]),
+                    # The model's own one-sentence rationale is recorded as the
+                    # thesis when it supplied one; it is displayed text, never an
+                    # instruction, and the falsification stays machine-generated.
+                    proposal.thesis or _thesis(spec), _falsification(spec), spec,
+                    str(previous["hypothesis_id"]), not_before), proposal, "llm_discovery"
+    # The deterministic helper predates semantic aliases and only knows exact
+    # variant ids. Feed each semantically duplicate result back as an exact
+    # exclusion so the bounded ladder advances rather than re-registering it.
+    # No fuzzy distance is applied here: the deterministic ladder is the
+    # complete audited search space and must not lose neighboring points.
+    deterministic_seen = set(existing_variant_ids)
+    seeded = None
+    for _ in range(MAX_VARIANTS * 4):
+        candidate = discovery_hypothesis(
+            previous, generation=generation, not_before=not_before,
+            existing_variant_ids=deterministic_seen,
+            tried_families=tried_families)
+        if candidate is None:
+            break
+        if not _variant_seen(candidate.rule_spec, existing_variant_ids):
+            seeded = candidate
+            break
+        deterministic_seen.add(rule_variant_id(candidate.rule_spec))
     if seeded is None:
         return None, proposal, "exhausted"
     return seeded, proposal, "deterministic_discovery"
@@ -372,6 +491,7 @@ def _adapter(config: Mapping[str, Any],
         max_attempts=int(config.get("max_attempts", 1)),
         timeout_seconds=float(config.get("timeout_seconds", 30)),
         max_response_bytes=int(config.get("max_response_bytes", 16_384)),
+        max_total_calls=int(config.get("max_total_calls", 64)),
     )
 
 
@@ -381,13 +501,14 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     adapter: RuleProposalAdapter | None,
                     lessons: Sequence[Mapping[str, Any]] = (),
                     already_failed: frozenset[str] = frozenset(),
-                    shared: Mapping[str, Any] | None = None
+                    shared: Mapping[str, Any] | None = None,
+                    existing_specs: Sequence[Mapping[str, Any]] = ()
                     ) -> tuple[list[TunedVariant], ProposalResult | None]:
     """Choose this hypothesis's variants, each with the reason it was chosen.
 
-    The root is always variant zero and is never replaced: its matched control
-    is itself, so it cannot pass, and it is the null calibration the rest of
-    the hypothesis is measured against.
+    The root is always variant zero.  It is tested against an independent
+    randomized-entry null and consumes the same cycle-wide multiplicity as
+    every mutation; it is not a free self-control that can never pass.
 
     With the LLM lane off this is exactly the previous deterministic mutation,
     unchanged spec-for-spec.  With it on, the model may propose the remaining
@@ -398,9 +519,12 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     than a mutated one: both are content-addressed and both face every gate.
     """
     root = validate_rule_spec(hypothesis["rule_spec"])
+    failed = set(already_failed)
+    near_distance = _near_duplicate_distance(config)
     if not llm_enabled:
         return ([TunedVariant(spec, reason, "deterministic", None)
-                 for spec, reason in mutate_with_reasons(root, diagnostic, count)],
+                 for spec, reason in mutate_with_reasons(root, diagnostic, MAX_VARIANTS)
+                 if not _failed_variant(spec, failed)][:int(count)],
                 None)
     # A wider deterministic pool than ``count`` so that topping up still has
     # unused candidates left after the model's proposals claim some ids.
@@ -420,32 +544,65 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                          rule_spec=root, diagnosis=diagnosis,
                          count=max(1, int(count) - 1), lessons=list(lessons))
                     if callable(tune) else None)
+        if proposal is not None and not isinstance(proposal, ProposalResult):
+            proposal = ProposalResult(False, schema=TUNING_SCHEMA,
+                                      error="provider returned malformed tuning result")
     except Exception as exc:  # noqa: BLE001 - degraded, never fatal
         proposal = ProposalResult(False, schema=TUNING_SCHEMA,
-                                  error=f"{type(exc).__name__}: {exc}")
-    chosen: list[TunedVariant] = [
-        TunedVariant(root, pool[0][1], "deterministic", None)]
-    seen = {rule_variant_id(root)}
-    if proposal is not None and proposal.success:
+                                  error=f"{type(exc).__name__}: provider tuning unavailable")
+    chosen: list[TunedVariant] = []
+    seen: set[str] = set()
+    if not _failed_variant(root, failed):
+        chosen.append(TunedVariant(root, pool[0][1], "deterministic", None))
+        _mark_variant(root, seen)
+    if (proposal is not None and proposal.success and
+            isinstance(proposal.variants, (list, tuple))):
         for entry in proposal.variants:
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("rule_spec"), Mapping):
+                continue
             if len(chosen) >= int(count):
                 break
-            variant_id = entry["variant_id"]
+            try:
+                normalized_entry = validate_rule_spec(entry["rule_spec"])
+                canonical_id = rule_variant_id(normalized_entry)
+                if entry.get("variant_id") and str(entry["variant_id"]) != canonical_id:
+                    continue
+                variant_id = canonical_id
+                _tuning_reason_check(
+                    str(entry.get("reason") or ""), root, normalized_entry,
+                    diagnostic, lessons)
+            except (TypeError, ValueError, KeyError):
+                continue
             # Re-proposing a parameter set a graded lesson already recorded as
             # an adequate failure is not a new experiment; the ledger has that
             # answer.  Dropping it here is what makes "learn from the lessons"
             # a property of the system rather than a request in a prompt.
-            if variant_id in seen or variant_id in already_failed:
+            if (variant_id in seen or _failed_variant(entry["rule_spec"], failed) or
+                    _variant_seen(entry["rule_spec"], seen)):
                 continue
-            seen.add(variant_id)
-            chosen.append(TunedVariant(entry["rule_spec"], entry["reason"],
+            # Only provider-authored candidates are fuzzy-filtered. Include
+            # persisted hypotheses/candidates, the current root, and earlier
+            # accepted proposals in this cycle; deterministic pool entries
+            # below intentionally retain every neighboring point.
+            if _semantic_duplicate(
+                    normalized_entry,
+                    [*existing_specs, root,
+                     *(item.rule_spec for item in chosen)],
+                    near_distance=near_distance):
+                continue
+            _mark_variant(normalized_entry, seen)
+            chosen.append(TunedVariant(normalized_entry, str(entry.get("reason") or "provider tuning"),
                                        "llm", entry.get("builds_on")))
     for spec, reason in pool[1:]:
         if len(chosen) >= int(count):
             break
-        if rule_variant_id(spec) in seen:
+        if _failed_variant(spec, failed) or _variant_seen(spec, seen):
             continue
-        seen.add(rule_variant_id(spec))
+        # The deterministic ladder is an explicit bounded search space; keep
+        # its neighboring points as coverage. Near-duplicate suppression is
+        # applied to model aliases above, where it prevents paying for
+        # semantically redundant provider output.
+        _mark_variant(spec, seen)
         chosen.append(TunedVariant(spec, reason, "deterministic", None))
     return chosen, proposal
 
@@ -454,7 +611,11 @@ def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],
                      config: Mapping[str, Any], max_generations: int,
                      not_before: str | None,
                      existing_variant_ids: set[str],
-                     adapter: RuleProposalAdapter | None = None
+                     adapter: RuleProposalAdapter | None = None,
+                     lessons: Sequence[Mapping[str, Any]] = (),
+                     failed_variant_ids: frozenset[str] = frozenset(),
+                     tried_families: Sequence[str] = (),
+                     existing_specs: Sequence[Mapping[str, Any]] = ()
                      ) -> tuple[StrategyHypothesis | None, ProposalResult | None, str | None]:
     generation = int(previous["generation"]) + 1
     if generation >= int(max_generations):
@@ -465,15 +626,44 @@ def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],
         max_attempts=int(config.get("max_attempts", 1)),
         timeout_seconds=float(config.get("timeout_seconds", 30)),
         max_response_bytes=int(config.get("max_response_bytes", 16_384)),
+        max_total_calls=int(config.get("max_total_calls", 64)),
     )
-    proposal = selected.propose(
-        vehicle=str(previous["vehicle"]), generation=generation,
-        prior_validated_rule_spec=previous["rule_spec"], diagnosis=diagnostic)
+    enriched = dict(diagnostic)
+    enriched["lessons"] = list(lessons)
+    enriched["already_failed_variant_ids"] = sorted(str(item) for item in failed_variant_ids)
+    enriched["tried_families"] = sorted(str(item) for item in tried_families)
+    try:
+        proposal = selected.propose(
+            vehicle=str(previous["vehicle"]), generation=generation,
+            prior_validated_rule_spec=previous["rule_spec"], diagnosis=enriched)
+    except Exception as exc:  # provider failures are a safe degraded lane
+        proposal = ProposalResult(
+            False, schema=PROPOSAL_SCHEMA,
+            error=f"{type(exc).__name__}: provider replacement unavailable")
+    if not isinstance(proposal, ProposalResult):
+        proposal = ProposalResult(False, schema=PROPOSAL_SCHEMA,
+                                  error="provider returned malformed replacement result")
     if not proposal.success or proposal.rule_spec is None or not proposal.variant_id:
         return None, proposal, "llm_proposal_failed"
-    if proposal.variant_id in existing_variant_ids:
+    try:
+        proposed_spec = validate_rule_spec(proposal.rule_spec)
+        if proposal.variant_id != rule_variant_id(proposed_spec):
+            raise ValueError("replacement variant id does not match normalized spec")
+    except Exception as exc:
+        return None, ProposalResult(False, schema=PROPOSAL_SCHEMA,
+                                    error=f"{type(exc).__name__}: malformed replacement"), \
+            "llm_proposal_failed"
+    near_distance = _near_duplicate_distance(config)
+    comparison_specs = list(existing_specs)
+    previous_spec = previous.get("rule_spec")
+    if isinstance(previous_spec, Mapping):
+        comparison_specs.append(previous_spec)
+    if (_failed_variant(proposed_spec, set(failed_variant_ids)) or
+            _variant_seen(proposed_spec, existing_variant_ids) or
+            _semantic_duplicate(proposed_spec, comparison_specs,
+                                near_distance=near_distance)):
         return None, proposal, "duplicate_llm_variant"
-    spec = validate_rule_spec(proposal.rule_spec)
+    spec = proposed_spec
     vehicle = str(previous["vehicle"])
     slot = int(previous["slot"])
     hypothesis = StrategyHypothesis(
@@ -539,7 +729,8 @@ def _record_seed_lesson(factory: FactoryLedger, seed: Any, *, vehicle: str,
 def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                   strategies: int, existing_variant_ids: set[str],
                   llm_enabled: bool, llm_config: Mapping[str, Any],
-                  adapter: RuleProposalAdapter | None
+                  adapter: RuleProposalAdapter | None,
+                  existing_specs: Sequence[Mapping[str, Any]] | None = None
                   ) -> tuple[list[dict], list[dict]]:
     """Give every configured slot an active hypothesis before scheduling.
 
@@ -553,6 +744,29 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
     """
     latest = factory.slot_latest(vehicle)
     active_slots = {int(item["slot"]) for item in factory.active(vehicle)}
+    if existing_specs is None:
+        known_specs: list[Mapping[str, Any]] = []
+        for item in factory.hypotheses(vehicle=vehicle):
+            spec = item.get("rule_spec")
+            if isinstance(spec, Mapping):
+                known_specs.append(spec)
+        for candidate in edge.status(vehicle=vehicle):
+            if candidate.get("strategy_id") != "rule":
+                continue
+            try:
+                config = json.loads(candidate.get("config_json") or "{}")
+                spec = (config.get("strategy") or {}).get("rule_spec")
+                if isinstance(spec, Mapping):
+                    validate_rule_spec(spec)
+                    known_specs.append(spec)
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+    else:
+        # The orchestrator passes a mutable list so accepted proposals from
+        # earlier slots in this cycle are visible to later discovery calls.
+        # Copy immutable test seams without making them a required contract.
+        known_specs = (existing_specs if isinstance(existing_specs, list)
+                       else list(existing_specs))
     seeded_slots: list[dict] = []
     revived: list[dict] = []
     # Slots are seeded sequentially, so each proposal can be told what the
@@ -582,6 +796,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                      "hypothesis_id": seed.hypothesis_id},
                     generation=0, not_before=None,
                     existing_variant_ids=existing_variant_ids,
+                    existing_specs=known_specs,
                     tried_families=set(),
                     context=_discovery_context(
                         slot=slot, reason="fresh_slot", previous={
@@ -600,7 +815,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                     # does not exist and break every lineage read afterwards.
                     seed = replace(proposed, parent_hypothesis_id=None)
                     source = proposed_source
-            if rule_variant_id(seed.rule_spec) in existing_variant_ids:
+            if _variant_seen(seed.rule_spec, existing_variant_ids):
                 continue
         else:
             tried = factory.slot_families(vehicle, slot)
@@ -608,6 +823,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                 previous, generation=factory.next_generation(vehicle, slot),
                 not_before=previous.get("not_before"),
                 existing_variant_ids=existing_variant_ids,
+                existing_specs=known_specs,
                 tried_families=tried,
                 context=_discovery_context(
                     slot=slot, reason="slot_had_no_active_hypothesis",
@@ -619,7 +835,8 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
             if seed is None:
                 continue
         factory.register(seed)
-        existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+        _mark_variant(seed.rule_spec, existing_variant_ids)
+        known_specs.append(seed.rule_spec)
         cycle_seeds.append({"slot": int(seed.slot), "family": str(seed.family)})
         _record_seed_lesson(factory, seed, vehicle=vehicle, kind="discovery",
                             source=source, proposal=genesis_proposal)
@@ -638,12 +855,21 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
                           f"slot seeded via {source}", payload)
             seeded_slots.append({**asdict(seed), "source": source})
             continue
+        revive_payload: dict[str, Any] = {
+            "reseed": True, "source": source,
+            "successor_hypothesis_id": seed.hypothesis_id,
+            "successor_variant_id": rule_variant_id(seed.rule_spec),
+        }
+        if genesis_proposal is not None:
+            revive_payload.update({
+                "proposal_schema": genesis_proposal.schema,
+                "llm_evidence": genesis_proposal.evidence,
+            })
+            if not genesis_proposal.success:
+                revive_payload["llm_error"] = genesis_proposal.error
         factory.event(
             previous["hypothesis_id"], str(previous.get("status") or "validated"),
-            "idle slot revived with a new hypothesis",
-            {"reseed": True, "source": source,
-             "successor_hypothesis_id": seed.hypothesis_id,
-             "successor_variant_id": rule_variant_id(seed.rule_spec)})
+            "idle slot revived with a new hypothesis", revive_payload)
         revived.append({**asdict(seed), "source": source})
     return seeded_slots, revived
 
@@ -687,6 +913,7 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
         fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
         account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
         starting_cash=starting_cash, costs=payload["costs"], quotes=quotes,
+        policy=payload.get("policy"),
     )
     return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
             "diagnostic": diagnose(root_account["rows"],
@@ -701,6 +928,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
     mode = str(payload["mode"])
     starting_cash = float(payload["starting_cash"])
     costs = payload["costs"]
+    policy = payload.get("policy")
     diagnostic = dict(payload["diagnostic"])
     # The orchestrator decided which specs to evaluate — deterministically
     # mutated, model-tuned, or carried forward for forward validation — so the
@@ -710,6 +938,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
         account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
         starting_cash=starting_cash, costs=costs, quotes=quotes,
+        policy=policy,
     )
     variants = []
     null_rows: dict[str, list] = {}
@@ -719,11 +948,13 @@ def _worker(payload: Mapping[str, Any]) -> dict:
         account = simulate_account(
             bars, snapshots, spec, vehicle=vehicle, account_id=account_id,
             starting_cash=starting_cash, costs=costs, quotes=quotes,
+            policy=policy,
         )
         null_rows[variant_id] = null_control_account(
             bars, snapshots, spec, vehicle=vehicle, reference_rows=account["rows"],
             account_id=f"null:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}",
-            starting_cash=starting_cash, costs=costs, quotes=quotes)["rows"]
+            starting_cash=starting_cash, costs=costs, quotes=quotes,
+            policy=policy)["rows"]
         variants.append({
             "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
             "account": account, "diagnostic": diagnose(account["rows"], starting_cash=starting_cash),
@@ -742,12 +973,17 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
           vehicle: str, mode: str,
           min_trades: int, min_sessions: int, alpha: float,
           null_rows: Sequence[Mapping] = (),
+          is_root: bool = False,
           qualification: Mapping | None = None,
           folds: int = 3) -> dict:
+    # Roots are hypotheses, not mutations. Compare their exact rule to an
+    # independent randomized-entry null; descendants retain the root-relative
+    # baseline so a parameter effect remains attributable to that family.
+    comparison_baseline = list(null_rows) if is_root and null_rows else list(baseline)
     ordered = sorted(rows, key=lambda row: (str(row.get("session_date", "")),
                                              str(row.get("entry_timestamp", ""))))
-    base_ordered = sorted(baseline, key=lambda row: (str(row.get("session_date", "")),
-                                                      str(row.get("entry_timestamp", ""))))
+    base_ordered = sorted(comparison_baseline, key=lambda row: (str(row.get("session_date", "")),
+                                                                  str(row.get("entry_timestamp", ""))))
     if mode == "shadow":
         fit, heldout, base_fit, base_heldout = [], ordered, [], base_ordered
     else:
@@ -777,6 +1013,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"]),
         "clusters": int(placebo["cluster_count"]),
     }
+
     separation = (heldout_separation(fit, heldout) if mode != "shadow" else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": bool(heldout), "mode": "new_data"})
@@ -786,16 +1023,25 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     held_sessions = {str(row.get("session_date") or "") for row in heldout}
     null_heldout = [row for row in null_rows
                     if str(row.get("session_date") or "") in held_sessions]
-    null_test = matched_cluster_test(heldout, null_heldout, vehicle=vehicle)
+    null_test = (test if is_root else
+                 matched_cluster_test(heldout, null_heldout, vehicle=vehicle))
     null_control = {"kind": "randomized_entry_null", "matched": null_test["matched"],
                     "available": bool(null_test["available"]),
                     "mean_delta": null_test["mean_delta"],
                     "mean_delta_lcb": null_test["mean_delta_lcb"],
                     "p_value": float(null_test["p_value"])}
-    walk_forward = walk_forward_report(heldout, base_heldout, vehicle=vehicle,
-                                       folds=folds)
-    final = dict(qualification or {"available": False, "sessions": [],
-                                   "net_positive": False, "delta_positive": False})
+    walk_forward = walk_forward_report(
+        heldout, base_heldout, vehicle=vehicle, folds=folds,
+        min_test_sessions=max(1, int(min_sessions) // max(1, int(folds))),
+        # Forward-stability folds are diagnostics inside an already adequate
+        # held-out partition. Requiring the full aggregate floor in every fold
+        # would make the gate mathematically unreachable for ordinary corpora.
+        min_test_trades=max(1, int(min_trades) // max(2, int(folds) * 2)))
+    final = dict(qualification or {
+        "available": False, "sessions": [], "net_positive": False,
+        "delta_positive": False,
+        "post_selection": {"preselected": False, "candidate_id": None},
+    })
     lcb = test.get("mean_delta_lcb")
     checks = {
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
@@ -818,18 +1064,25 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
             float(null_control["p_value"]) <= float(alpha)),
         "walk_forward_majority_positive": bool(walk_forward["available"] and
                                                walk_forward["majority_positive"]),
+        "walk_forward_adequate": bool(walk_forward.get("adequate")),
         "qualification_net_positive": bool(final.get("available") and
                                            final.get("net_positive")),
         "qualification_delta_positive": bool(final.get("available") and
                                              final.get("delta_positive")),
     }
+    development_checks = {
+        name: value for name, value in checks.items()
+        if name not in {"qualification_net_positive",
+                        "qualification_delta_positive"}
+    }
     return {
         "passes_without_family": bool(all(checks.values())),
+        "development_passes_without_family": bool(all(development_checks.values())),
         "passes": False, "p_raw": float(test["p_value"]),
         "sample_adequate": bool(fit_floor["adequate"]),
         "heldout_sample_adequate": bool(held_floor["adequate"] and
                                         walk_forward["available"] and
-                                        bool(final.get("available"))),
+                                        walk_forward.get("adequate")),
         "confidence": 1.0 - float(test["p_value"]),
         "floor": overall_floor, "fit_floor": fit_floor, "heldout_floor": held_floor,
         "fit_net_pnl": fit_net, "heldout_net_pnl": held_net,
@@ -839,14 +1092,39 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
         "heldout_delta_lcb": lcb,
         "max_drawdown": max_drawdown_of(ordered), "test": test,
-        "fit_test": fit_test, "control": {**test, "kind": "matched_root_baseline"},
+        "fit_test": fit_test, "control": {**test, "kind": (
+            "randomized_entry_root_null" if is_root else "matched_root_baseline")},
         "null_control": null_control, "walk_forward": walk_forward,
         "qualification": final,
         "falsification": falsification, "heldout_separation": separation,
         "checks_without_family": checks,
-        "mode": mode, "alpha": float(alpha),
+        "mode": mode, "alpha": float(alpha), "is_root": bool(is_root),
         "_fit_rows": fit, "_heldout_rows": heldout,
+        "_fit_baseline_rows": base_fit,
+        "_heldout_baseline_rows": base_heldout,
+        "_null_rows": null_heldout,
     }
+
+
+def _terminal_negative(local: Sequence[tuple[Mapping, Mapping]]) -> bool:
+    """Only adequately powered, absolutely negative results may retire a slot."""
+    if not local:
+        return False
+    for _, gate in local:
+        if not (gate.get("sample_adequate") and gate.get("heldout_sample_adequate")):
+            return False
+        net = gate.get("heldout_net_pnl")
+        expectancy = gate.get("heldout_expectancy")
+        try:
+            if net is None or expectancy is None:
+                return False
+            # FDR, walk-forward, or qualification-only failures are
+            # inconclusive when the unseen performance is positive.
+            if float(net) > 0.0 or float(expectancy) > 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def _existing_specs(edge: EdgeLedger, hypothesis_id: str, vehicle: str) -> list[dict]:
@@ -878,6 +1156,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 rotation_budget: int = ROTATION_BUDGET,
                 strategy_llm: Mapping[str, Any] | None = None,
                 costs: CostModel | None = None,
+                runtime_config: Mapping[str, Any] | None = None,
                 proposal_adapter: RuleProposalAdapter | None = None) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
     if vehicle not in {"equity", "option"}:
@@ -899,28 +1178,98 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             f"rotation stays bounded: max_rotations<={MAX_ROTATIONS}, "
             f"rotation_budget<={ROTATION_BUDGET}")
     model = costs or CostModel()
+    policy = ReplayPolicy.from_config(runtime_config)
     llm_config = dict(strategy_llm or {})
+    llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
     llm_enabled = bool(llm_config.get("enabled", False))
     if llm_enabled and not str(llm_config.get("model") or "").strip() and proposal_adapter is None:
         raise FactoryError("strategy LLM model is required when autonomous LLM replacement is enabled")
+    # One adapter owns the cycle's provider call budget and authentication
+    # circuit. Constructing it once is what makes max_total_calls a run-wide
+    # bound rather than one independent allowance per helper invocation.
+    llm_adapter = proposal_adapter
+    if llm_enabled and llm_adapter is None:
+        llm_adapter = RuleProposalAdapter(
+            provider=str(llm_config.get("provider") or "openai"),
+            model=str(llm_config.get("model") or ""),
+            max_attempts=int(llm_config.get("max_attempts", 1)),
+            timeout_seconds=float(llm_config.get("timeout_seconds", 30)),
+            max_response_bytes=int(llm_config.get("max_response_bytes", 16_384)),
+            max_total_calls=int(llm_config.get("max_total_calls", 64)),
+        )
     raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(data)
     dataset_hash = content_hash(raw_rows)
+    gate_assumptions = {
+        "min_trades": int(min_trades), "min_sessions": int(min_sessions),
+        "alpha": float(alpha), "qualification_fraction": .2,
+        "walk_forward_folds": 3,
+    }
+    llm_assumptions = {
+        key: llm_config.get(key) for key in (
+            "enabled", "provider", "model", "max_attempts", "timeout_seconds",
+            "max_response_bytes", "max_total_calls", "near_duplicate_distance")
+        if key in llm_config
+    }
+    experiment_config = {
+        "schema": FACTORY_SCHEMA, "vehicle": vehicle,
+        "strategies": int(strategies),
+        "variants_per_strategy": int(variants_per_strategy),
+        "starting_cash": float(starting_cash),
+        "max_generations": int(max_generations),
+        "max_rotations": int(max_rotations),
+        "rotation_budget": int(rotation_budget),
+        "costs": model.as_dict(), "replay_policy": policy.as_dict(),
+        "gate": gate_assumptions, "strategy_llm": llm_assumptions,
+    }
+    identity_hashes = provenance_hash(
+        dataset=raw_rows, config=experiment_config, code=Path(__file__),
+        provenance={"factory": FACTORY_SCHEMA, "experiment": experiment_config})
+    experiment_provenance_body = experiment_provenance(
+        dataset=raw_rows, config=experiment_config,
+        code=identity_hashes["code_hash"], cost=model.as_dict(),
+        risk=policy.as_dict(), gate=gate_assumptions)
+    experiment_provenance_body["code_hash"] = identity_hashes["code_hash"]
+    identity = experiment_identity(
+        dataset_hash=dataset_hash, vehicle=vehicle,
+        code_hash=identity_hashes["code_hash"],
+        config_hash=identity_hashes["config_hash"], cost=model.as_dict(),
+        risk=policy.as_dict(), gate=gate_assumptions,
+        provenance=experiment_provenance_body)
     factory = FactoryLedger(db_path)
-    duplicate = factory.existing_cycle(dataset_hash, vehicle)
+    duplicate = factory.existing_cycle(dataset_hash, vehicle, identity)
     if duplicate is not None:
         return {**duplicate, "duplicate": True}
     edge = EdgeLedger(db_path)
     # Seeding a fresh ledger and reviving an idle slot are the same operation:
     # give every configured slot an active hypothesis. Keeping one path means
     # genesis gets discovery too, instead of always starting from templates.
-    existing_variant_ids = {
-        rule_variant_id(item["rule_spec"])
-        for item in factory.hypotheses(vehicle=vehicle)
-    }
+    existing_variant_ids: set[str] = set()
+    existing_specs: list[Mapping[str, Any]] = []
+    for item in factory.hypotheses(vehicle=vehicle):
+        _mark_variant(item["rule_spec"], existing_variant_ids)
+        existing_specs.append(item["rule_spec"])
+    # Candidate/variant rows outlive a factory hypothesis (tuned variants are
+    # deliberately not roots). Include them before discovery so an immutable
+    # edge identity can never be re-registered under a new lineage.
+    for candidate in edge.status(vehicle=vehicle):
+        if candidate.get("strategy_id") != "rule":
+            continue
+        try:
+            config = json.loads(candidate.get("config_json") or "{}")
+            spec = (config.get("strategy") or {}).get("rule_spec")
+            if isinstance(spec, Mapping):
+                try:
+                    _mark_variant(spec, existing_variant_ids)
+                    existing_specs.append(validate_rule_spec(spec))
+                except (TypeError, ValueError, KeyError):
+                    continue
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
     seeded, revived = _ensure_slots(
         factory, edge, vehicle=vehicle, strategies=strategies,
         existing_variant_ids=existing_variant_ids, llm_enabled=llm_enabled,
-        llm_config=llm_config, adapter=proposal_adapter)
+        llm_config=llm_config, adapter=llm_adapter,
+        existing_specs=existing_specs)
     active = factory.active(vehicle)[:int(strategies)]
     if not active:
         return {"schema": FACTORY_SCHEMA, "status": "exhausted", "dataset_hash": dataset_hash,
@@ -976,7 +1325,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         task = {
             "hypothesis": hypothesis, "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
-            "starting_cash": starting_cash, "costs": model,
+            "starting_cash": starting_cash, "costs": model, "policy": policy,
         }
         if corpus_source is None:
             task.update({
@@ -1072,12 +1421,13 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     hypothesis, diagnostic,
                     count=int(variants_per_strategy), vehicle=vehicle,
                     llm_enabled=llm_enabled, config=llm_config,
-                    adapter=proposal_adapter,
+                    adapter=llm_adapter,
                     lessons=_lesson_brief(factory, vehicle=vehicle,
                                           family=family),
                     already_failed=_failed_variants(factory, vehicle=vehicle,
                                                     family=family),
-                    shared=shared)
+                    shared=shared,
+                    existing_specs=existing_specs)
                 if tuning is not None:
                     entry = {"hypothesis_id": hypothesis_id,
                              "slot": int(hypothesis["slot"]),
@@ -1099,6 +1449,11 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                         {key: value for key, value in entry.items()
                          if key not in {"hypothesis_id", "slot", "family"}})
             task["specs"] = [item.rule_spec for item in chosen]
+            # Make accepted specs visible to later model proposals in this
+            # cycle.  This is deliberately after selection: deterministic
+            # neighbors are retained, while a later LLM alias cannot claim a
+            # fresh experiment against one already accepted by an earlier slot.
+            existing_specs.extend(item.rule_spec for item in chosen)
             slot_proposals = proposals.setdefault(hypothesis_id, {})
             for item in chosen:
                 variant_id = rule_variant_id(item.rule_spec)
@@ -1137,52 +1492,28 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         worker["variants"] = sorted(worker["variants"],
                                     key=lambda item: str(item["variant_id"]))
 
-    # The sealed window is opened exactly once per hypothesis, here in the
-    # orchestrator, after every worker has finished proposing and diagnosing.
-    qualifications: dict[str, dict] = {}
-    for worker in worker_results:
-        hypothesis_id = str(worker["hypothesis"]["hypothesis_id"])
-        sealed, sealed_snapshots, sealed_quotes = sealed_windows.get(
-            hypothesis_id, (None, [], []))
-        qualification_bars = (sealed.release(reason=f"final qualification {hypothesis_id}")
-                              if sealed is not None and sealed.session_dates else None)
-        sessions = tuple(sealed.session_dates) if sealed is not None else ()
-        control_rows = (simulate_account(
-            qualification_bars, sealed_snapshots, worker["hypothesis"]["rule_spec"],
-            vehicle=vehicle, account_id=f"qualification:control:{hypothesis_id}",
-            starting_cash=starting_cash, costs=model,
-            quotes=sealed_quotes)["rows"] if qualification_bars else [])
-        for variant in worker["variants"]:
-            rows = (simulate_account(
-                qualification_bars, sealed_snapshots, variant["rule_spec"],
-                vehicle=vehicle,
-                account_id=f"qualification:{hypothesis_id}:{variant['variant_id']}",
-                starting_cash=starting_cash, costs=model,
-                quotes=sealed_quotes)["rows"] if qualification_bars else [])
-            qualifications[f"{hypothesis_id}:{variant['variant_id']}"] = (
-                _qualification_report(rows, control_rows, vehicle=vehicle,
-                                      sessions=sessions))
-
     variant_rows = []
     for worker in worker_results:
-        hypothesis_id = str(worker["hypothesis"]["hypothesis_id"])
         for variant in worker["variants"]:
             gate = _gate(variant["account"]["rows"], vehicle=vehicle,
                          baseline=worker["control_rows"],
                          mode=worker["mode"], min_trades=min_trades,
                          min_sessions=min_sessions, alpha=alpha,
+                         is_root=(variant["variant_id"] == rule_variant_id(
+                             worker["hypothesis"]["rule_spec"])),
                          null_rows=(worker.get("null_rows") or {}).get(
-                             variant["variant_id"], []),
-                         qualification=qualifications.get(
-                             f"{hypothesis_id}:{variant['variant_id']}"))
+                             variant["variant_id"], []))
             variant_rows.append((worker, variant, gate))
     # Selection compares candidates across every family and lane in the cycle,
     # so the false-discovery correction that authorizes a champion has to be
     # global.  The family-local correction is retained as reported evidence.
+    # A root is a real hypothesis compared against an independent randomized
+    # entry null. It is therefore a tested candidate and consumes multiplicity
+    # exactly like a mutation; excluding it would grant a free hypothesis.
+    candidate_rows = list(variant_rows)
     global_correction = benjamini_hochberg(
         {f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}": gate["p_raw"]
-         for owner, variant, gate in variant_rows}, alpha=alpha)
-    partitions: dict[str, tuple[list, list]] = {}
+         for owner, variant, gate in candidate_rows}, alpha=alpha)
     for worker in worker_results:
         local_rows = [(variant, gate) for owner, variant, gate in variant_rows
                       if owner is worker]
@@ -1190,44 +1521,187 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             {variant["variant_id"]: gate["p_raw"] for variant, gate in local_rows},
             alpha=alpha)
         for variant, gate in local_rows:
-            family = correction[variant["variant_id"]]
-            overall = global_correction[
-                f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}"]
-            checks = {**gate["checks_without_family"],
-                      "family_fdr_significant": bool(family["significant"]),
-                      "global_fdr_significant": bool(overall["significant"])}
+            family = correction.get(variant["variant_id"], {
+                "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
+                "significant": float(gate["p_raw"]) <= float(alpha),
+                "family_size": len(correction)})
+            overall = global_correction.get(
+                f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}", {
+                    "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
+                    "significant": float(gate["p_raw"]) <= float(alpha),
+                    "family_size": len(global_correction)})
             gate["multiple_tests"] = {**family, "method": "benjamini_hochberg",
                                       "scope": "family"}
             gate["global_multiple_tests"] = {**overall,
                                              "method": "benjamini_hochberg",
                                              "scope": "cycle_global"}
-            gate["passes"] = bool(gate["passes_without_family"] and
-                                  family["significant"] and overall["significant"])
             gate["confidence"] = 1.0 - float(overall["p_adjusted"])
-            fit = gate.pop("_fit_rows")
-            heldout = gate.pop("_heldout_rows")
-            envelope = verified_gate_envelope(
-                lane=worker["mode"], vehicle=vehicle, fit=fit, heldout=heldout,
-                fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
-                control=gate["control"], p_value=gate["p_raw"],
-                q_value=overall["p_adjusted"],
-                family_q_value=family["p_adjusted"], alpha=alpha,
-                falsification=gate["falsification"],
-                separation=gate["heldout_separation"], checks=checks,
-                passes=gate["passes"],
-                walk_forward=gate["walk_forward"],
-                qualification=gate["qualification"],
-                null_control=gate["null_control"],
-                performance={"heldout_delta": gate["test"].get("mean_delta"),
-                             "heldout_delta_lcb": gate["heldout_delta_lcb"],
-                             "heldout_net_pnl": gate["heldout_net_pnl"],
-                             "heldout_expectancy": gate["heldout_expectancy"],
-                             "max_drawdown": gate["max_drawdown"]})
-            gate["verified_gate"] = envelope
-            gate["gate_hash"] = envelope["content_hash"]
-            gate["failed_checks"] = sorted(
-                name for name, ok in checks.items() if ok is False)
-            partitions[variant["account"]["account_id"]] = (fit, heldout)
+
+    # The final window is a genuine post-selection test: rank on development
+    # evidence, correct the entire cycle, consume one cumulative online test,
+    # and only then open one sealed window for one candidate.  Every other
+    # variant remains useful diagnostic evidence but cannot authorize a proof.
+    def _selection_rank(item: tuple[Mapping, Mapping, Mapping]) -> tuple:
+        owner, variant, gate = item
+        overall = gate["global_multiple_tests"]
+        lcb = gate.get("heldout_delta_lcb")
+        return (
+            0 if gate.get("development_passes_without_family") else 1,
+            float(overall.get("p_adjusted", 1.0)),
+            -float(lcb) if lcb is not None else float("inf"),
+            -float(gate.get("heldout_net_pnl") or 0.0),
+            int(owner["hypothesis"]["slot"]), str(variant["variant_id"]),
+        )
+
+    ranked = sorted(variant_rows, key=_selection_rank)
+    selected_test = ranked[0] if ranked else None
+    selected_test_key = (None if selected_test is None else
+                         f"{selected_test[0]['hypothesis']['hypothesis_id']}:"
+                         f"{selected_test[1]['variant_id']}")
+    selected_p = (1.0 if selected_test is None else
+                  float(selected_test[2]["global_multiple_tests"].get(
+                      "p_adjusted", 1.0)))
+    cumulative = factory.record_fdr_decision(
+        f"strategy_factory:{vehicle}",
+        f"{identity['identity_hash']}:post_selection", selected_p, alpha=alpha)
+    qualification_target = None
+    if selected_test is not None:
+        family = selected_test[2]["multiple_tests"]
+        overall = selected_test[2]["global_multiple_tests"]
+        if (selected_test[2].get("development_passes_without_family") and
+                family.get("significant") and overall.get("significant") and
+                cumulative.get("decision")):
+            qualification_target = selected_test
+
+    qualification_key = None
+    qualification_report: dict[str, Any] | None = None
+    if qualification_target is not None:
+        selected_worker, selected_variant, _selected_gate = qualification_target
+        hypothesis_id = str(selected_worker["hypothesis"]["hypothesis_id"])
+        sealed, sealed_snapshots, sealed_quotes = sealed_windows.get(
+            hypothesis_id, (None, [], []))
+        qualification_bars = (sealed.release(
+            reason=f"post-selection qualification {selected_variant['variant_id']}")
+            if sealed is not None and sealed.session_dates else None)
+        sessions = tuple(sealed.session_dates) if sealed is not None else ()
+        if qualification_bars:
+            control_rows = simulate_account(
+                qualification_bars, sealed_snapshots,
+                selected_worker["hypothesis"]["rule_spec"], vehicle=vehicle,
+                account_id=f"qualification:control:{hypothesis_id}",
+                starting_cash=starting_cash, costs=model, quotes=sealed_quotes,
+                policy=policy)["rows"]
+            root_variant_id = rule_variant_id(
+                selected_worker["hypothesis"]["rule_spec"])
+            baseline_rows = control_rows
+            if selected_variant["variant_id"] == root_variant_id:
+                baseline_rows = null_control_account(
+                    qualification_bars, sealed_snapshots,
+                    selected_worker["hypothesis"]["rule_spec"], vehicle=vehicle,
+                    reference_rows=control_rows,
+                    account_id=f"qualification:null:{hypothesis_id}",
+                    starting_cash=starting_cash, costs=model,
+                    quotes=sealed_quotes, policy=policy)["rows"]
+            candidate_rows = simulate_account(
+                qualification_bars, sealed_snapshots,
+                selected_variant["rule_spec"], vehicle=vehicle,
+                account_id=(f"qualification:{hypothesis_id}:"
+                            f"{selected_variant['variant_id']}"),
+                starting_cash=starting_cash, costs=model, quotes=sealed_quotes,
+                policy=policy)["rows"]
+            qualification_report = _qualification_report(
+                candidate_rows, baseline_rows, vehicle=vehicle,
+                sessions=sessions, candidate_id=selected_variant["variant_id"],
+                preselected=True)
+            qualification_key = selected_test_key
+
+    partitions: dict[str, tuple[list, list]] = {}
+    run_contexts: dict[str, tuple[dict, dict]] = {}
+    for worker, variant, gate in variant_rows:
+        key = f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}"
+        selected = key == qualification_key and qualification_report is not None
+        final = (dict(qualification_report) if selected else {
+            "available": False, "sessions": [], "net_pnl": 0.0,
+            "matched": 0, "mean_delta": None, "trades": 0,
+            "net_positive": False, "delta_positive": False,
+            "post_selection": {"preselected": False,
+                                "candidate_id": variant["variant_id"]},
+        })
+        gate["qualification"] = final
+        gate["checks_without_family"]["qualification_net_positive"] = bool(
+            final.get("available") and final.get("net_positive"))
+        gate["checks_without_family"]["qualification_delta_positive"] = bool(
+            final.get("available") and final.get("delta_positive"))
+        family = gate["multiple_tests"]
+        overall = gate["global_multiple_tests"]
+        checks = {
+            **gate["checks_without_family"],
+            "family_fdr_significant": bool(family["significant"]),
+            "global_fdr_significant": bool(overall["significant"]),
+            "cumulative_fdr_significant": bool(selected and
+                                               cumulative.get("decision")),
+        }
+        gate["cumulative_multiple_tests"] = (
+            dict(cumulative) if key == selected_test_key else
+            {"scope": f"strategy_factory:{vehicle}", "tested": False,
+             "decision": False, "selected_test_id": selected_test_key})
+        gate["post_selection"] = {
+            "selected_test_id": selected_test_key,
+            "qualified_variant_id": (variant["variant_id"] if selected else None),
+            "qualification_consumed": bool(selected),
+        }
+        gate["passes_without_family"] = bool(
+            all(gate["checks_without_family"].values()))
+        gate["passes"] = bool(all(checks.values()))
+        fit = gate.pop("_fit_rows")
+        heldout = gate.pop("_heldout_rows")
+        fit_baseline = gate.pop("_fit_baseline_rows", [])
+        heldout_baseline = gate.pop("_heldout_baseline_rows", [])
+        null_source = gate.pop("_null_rows", [])
+        config = {"strategy": {"id": "rule", "version": "v1",
+                                "variant_id": variant["variant_id"],
+                                "rule_spec": variant["rule_spec"]}}
+        run_provenance = {
+            "factory": FACTORY_SCHEMA,
+            "experiment_identity": identity["identity_hash"],
+            "hypothesis_id": worker["hypothesis"]["hypothesis_id"],
+            "variant_id": variant["variant_id"],
+            "costs": model.as_dict(), "replay_policy": policy.as_dict(),
+            "gate": gate_assumptions,
+            "cumulative_fdr": (dict(cumulative)
+                               if key == selected_test_key else None),
+        }
+        envelope = verified_gate_envelope(
+            lane=worker["mode"], vehicle=vehicle, fit=fit, heldout=heldout,
+            fit_baseline=fit_baseline, heldout_baseline=heldout_baseline,
+            null_source=null_source,
+            fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
+            fit_control=gate["fit_test"], control=gate["control"],
+            p_value=gate["p_raw"],
+            q_value=overall["p_adjusted"],
+            family_q_value=family["p_adjusted"], alpha=alpha,
+            falsification=gate["falsification"],
+            separation=gate["heldout_separation"], checks=checks,
+            passes=gate["passes"], walk_forward=gate["walk_forward"],
+            qualification=gate["qualification"],
+            null_control=gate["null_control"],
+            online_fdr=(cumulative if key == selected_test_key else {}),
+            provenance=provenance_hash(
+                dataset=raw_rows, config=config, code=Path(__file__),
+                provenance=run_provenance),
+            candidate_id=variant["variant_id"],
+            performance={"heldout_delta": gate["test"].get("mean_delta"),
+                         "heldout_delta_lcb": gate["heldout_delta_lcb"],
+                         "heldout_net_pnl": gate["heldout_net_pnl"],
+                         "heldout_expectancy": gate["heldout_expectancy"],
+                         "max_drawdown": gate["max_drawdown"]})
+        gate["passes"] = bool(envelope["passes"])
+        gate["verified_gate"] = envelope
+        gate["gate_hash"] = envelope["content_hash"]
+        gate["failed_checks"] = sorted(
+            name for name, ok in envelope["checks"].items() if ok is False)
+        run_contexts[variant["account"]["account_id"]] = (config, run_provenance)
+        partitions[variant["account"]["account_id"]] = (fit, heldout)
 
     def _lesson_outcome(gate: Mapping[str, Any]) -> dict:
         """Grade one reason against the gate its variant actually earned."""
@@ -1287,19 +1761,26 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             # against it.  That pairing is what later prompts read back.
             _grade(str(hypothesis["hypothesis_id"]), variant["variant_id"],
                    "tuning", gate)
-            config = {"strategy": {"id": "rule", "version": "v1",
-                                     "variant_id": variant["variant_id"],
-                                     "rule_spec": variant["rule_spec"]}}
-            candidate = edge.register_candidate(
-                variant["variant_id"], strategy_id="rule", vehicle=vehicle,
-                base_version="v1", hypothesis=hypothesis["thesis"], config=config,
-                axes={"hypothesis_id": hypothesis["hypothesis_id"],
-                      "slot": hypothesis["slot"], "generation": hypothesis["generation"],
-                      "diagnostic": variant["diagnostic"],
-                      "simulated_account_id": variant["account"]["account_id"]},
-                dataset=raw_rows, code=Path(__file__),
-                provenance={"factory": FACTORY_SCHEMA, "mode": worker["mode"],
-                            "worker_pid": variant["worker_pid"]})
+            config, run_provenance = run_contexts[
+                variant["account"]["account_id"]]
+            try:
+                candidate = edge.register_candidate(
+                    variant["variant_id"], strategy_id="rule", vehicle=vehicle,
+                    base_version="v1", hypothesis=hypothesis["thesis"], config=config,
+                    axes={"hypothesis_id": hypothesis["hypothesis_id"],
+                          "slot": hypothesis["slot"], "generation": hypothesis["generation"],
+                          "diagnostic": variant["diagnostic"],
+                          "simulated_account_id": variant["account"]["account_id"]},
+                    dataset=raw_rows, code=Path(__file__),
+                    provenance=run_provenance)
+            except (ValueError, sqlite3.Error):
+                # A legacy ledger may already contain this immutable variant
+                # under another hypothesis. Reuse that record rather than
+                # crashing the cycle; semantic de-duplication prevents new
+                # duplicates, while this keeps old ledgers recoverable.
+                candidate = edge.candidate_by_variant(variant["variant_id"], vehicle)
+                if candidate is None:
+                    raise
             lineage = _llm_lineage_evidence(factory, hypothesis)
             if lineage is not None:
                 prior = [item for item in edge.evidence(candidate["candidate_id"])
@@ -1315,14 +1796,15 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             # same unseen observations on the next cycle.
             persist_run = (gate["sample_adequate"] and
                            gate["heldout_sample_adequate"] and
+                           bool((gate.get("post_selection") or {}).get(
+                               "qualification_consumed")) and
                            (worker["mode"] != "shadow" or all_intended_adequate))
             if persist_run:
                 fit, held = partitions[variant["account"]["account_id"]]
                 run = edge.append_run(
                     candidate["candidate_id"], lane=worker["mode"], vehicle=vehicle,
                     dataset=raw_rows, config=config, code=Path(__file__),
-                    provenance={"factory": FACTORY_SCHEMA,
-                                "simulated_account_id": variant["account"]["account_id"]},
+                    provenance=run_provenance,
                     fit=fit, heldout=held,
                     metrics={"gate": gate, "account": {k: v for k, v in variant["account"].items()
                                                        if k != "rows"},
@@ -1342,19 +1824,27 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     edge.transition(candidate["candidate_id"], "backtest_passed",
                                     reason="autonomous held-out gate passed")
                 elif gate["passes"] and worker["mode"] == "shadow":
-                    if current == "backtest_passed":
+                    if current in {"backtest_passed", "demoted"}:
                         edge.transition(candidate["candidate_id"], "shadow",
                                         reason="later unseen simulated paper gate passed")
                         current = "shadow"
-                    if current == "shadow":
-                        edge.transition(candidate["candidate_id"], "validated",
-                                        reason="backtest and forward simulated paper gates passed")
-                elif not gate["passes"] and current in {"candidate", "backtest_passed"}:
+                    # Offline forward replay is prerequisite stability data;
+                    # the live-shadow ingester owns the validated transition.
+                elif (not gate["passes"] and _terminal_negative([(variant, gate)]) and
+                      current in {"candidate", "backtest_passed"}):
                     edge.transition(candidate["candidate_id"], "retired",
-                                    reason="adequately powered autonomous gate failed")
-                elif not gate["passes"] and current in {"shadow", "validated", "champion"}:
+                                    reason="adequately powered autonomous gate was terminally negative")
+                elif (not gate["passes"] and _terminal_negative([(variant, gate)]) and
+                      current in {"shadow", "validated", "champion"}):
                     edge.transition(candidate["candidate_id"], "demoted",
-                                    reason="latest autonomous gate failed mandatory checks")
+                                    reason="latest autonomous gate was terminally negative")
+                elif not gate["passes"]:
+                    edge.append_event(
+                        candidate_id=candidate["candidate_id"],
+                        event_type="inconclusive_gate", actor="strategy_factory",
+                        reason="mandatory gate failed without terminal negative evidence",
+                        payload={"gate_hash": gate.get("gate_hash"),
+                                 "failed_checks": gate.get("failed_checks") or []},)
             summaries.append({
                 "hypothesis_id": hypothesis["hypothesis_id"],
                 "candidate_id": candidate["candidate_id"],
@@ -1368,7 +1858,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             })
         # A hypothesis-level reason — why this slot was given this idea at all
         # — is answered by the best variant the idea produced, never by the
-        # root, whose own control is itself and which therefore cannot pass.
+        # root. Roots are evaluated against a randomized-entry null, so they
+        # can win legitimately; ranking uses the same evidence as every
+        # mutation.
         if local:
             best = max(local, key=lambda item: (
                 bool(item[1]["passes"]),
@@ -1377,68 +1869,18 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 _grade(str(hypothesis["hypothesis_id"]),
                        rule_variant_id(hypothesis["rule_spec"]), kind, best)
         if passing:
-            new_state = "validated" if worker["mode"] == "shadow" else "backtest_passed"
+            new_state = "testing" if worker["mode"] == "shadow" else "backtest_passed"
             factory.event(hypothesis["hypothesis_id"], new_state,
-                          f"{len(passing)} autonomous variant(s) passed {worker['mode']}",
+                          (f"{len(passing)} autonomous variant(s) passed offline shadow; "
+                           "awaiting parity-matched live ingestion"
+                           if worker["mode"] == "shadow" else
+                           f"{len(passing)} autonomous variant(s) passed {worker['mode']}"),
                           {"passing": [item[0]["variant_id"] for item in passing]})
-            if worker["mode"] == "shadow":
-                # A proved hypothesis leaves the active set for good: its
-                # variant is deployed and must never be re-tuned.  The *slot*
-                # is a unit of parallel research capacity, not a one-shot
-                # licence, so it is immediately reseeded with a new hypothesis.
-                # Without this the factory loses a worker on every success and
-                # eventually reports ``exhausted`` with nothing left to search.
-                slot = int(hypothesis["slot"])
-                tried = _slot_families(factory, vehicle, slot)
-                seed, proposal, source = _seed_slot(
-                    hypothesis,
-                    generation=factory.next_generation(vehicle, slot),
-                    not_before=worker["evaluation_end"],
-                    existing_variant_ids=existing_variant_ids,
-                    tried_families=tried,
-                    context=_discovery_context(
-                        slot=slot, reason="slot_proved_an_edge",
-                        previous=hypothesis, tried_families=tried,
-                        proved_families=_proved_families(edge, vehicle),
-                        lessons=_lesson_brief(factory, vehicle=vehicle),
-                        shared=shared),
-                    llm_enabled=llm_enabled, config=llm_config,
-                    adapter=proposal_adapter)
-                reseed_payload: dict[str, Any] = {
-                    "reseed": True, "source": source,
-                    "proved_variants": [item[0]["variant_id"] for item in passing],
-                }
-                if seed is None:
-                    reseed_payload["reseed"] = False
-                    factory.event(
-                        hypothesis["hypothesis_id"], new_state,
-                        "slot proved an edge but no unused successor hypothesis remains",
-                        reseed_payload)
-                else:
-                    factory.register(seed)
-                    existing_variant_ids.add(rule_variant_id(seed.rule_spec))
-                    _record_seed_lesson(factory, seed, vehicle=vehicle,
-                                        kind="reseed", source=source,
-                                        proposal=proposal)
-                    reseed_payload.update({
-                        "successor_hypothesis_id": seed.hypothesis_id,
-                        "successor_variant_id": rule_variant_id(seed.rule_spec),
-                        "successor_family": seed.family,
-                        "successor_rule_schema": seed.rule_spec["schema"],
-                    })
-                    if proposal is not None:
-                        reseed_payload.update({
-                            "proposal_schema": proposal.schema,
-                            "llm_evidence": proposal.evidence,
-                        })
-                        if not proposal.success:
-                            reseed_payload["llm_error"] = proposal.error
-                    factory.event(
-                        hypothesis["hypothesis_id"], new_state,
-                        "slot proved an edge and was reseeded with a new hypothesis",
-                        reseed_payload)
-                    reseeds.append(asdict(seed))
-        elif all_intended_adequate:
+            # A shadow pass remains in ``testing`` until live-shadow parity
+            # ingestion marks the hypothesis validated.  The next factory
+            # cycle then sees the validated hypothesis as inactive and
+            # deterministically reseeds the slot in _ensure_slots.
+        elif all_intended_adequate and _terminal_negative(local):
             aggregate = max((item[0]["diagnostic"] for item in local),
                             key=lambda value: abs(float(value.get("net_pnl", 0.0))))
             proposal = None
@@ -1457,14 +1899,30 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                     max_generations=generation_cap,
                     not_before=worker["evaluation_end"],
                     existing_variant_ids=existing_variant_ids,
-                    adapter=proposal_adapter)
+                    adapter=llm_adapter,
+                    lessons=_lesson_brief(factory, vehicle=vehicle),
+                    failed_variant_ids=_failed_variants(factory, vehicle=vehicle),
+                    tried_families=_slot_families(factory, vehicle, slot),
+                    existing_specs=existing_specs)
+                # A model alias is not a reason to strand a research slot. An
+                # exact or near semantic duplicate falls back to the existing
+                # deterministic replacement policy; malformed/provider
+                # failures retain their explicit pending state for audit.
+                if replacement is None and replacement_error == "duplicate_llm_variant":
+                    replacement = replacement_hypothesis(
+                        hypothesis, aggregate, max_generations=generation_cap,
+                        not_before=worker["evaluation_end"])
+                    proposal = None
+                    replacement_error = (None if replacement is not None
+                                         else "generation_limit")
             else:
                 replacement = replacement_hypothesis(
                     hypothesis, aggregate, max_generations=generation_cap,
                     not_before=worker["evaluation_end"])
             if replacement is not None:
                 factory.register(replacement)
-                existing_variant_ids.add(rule_variant_id(replacement.rule_spec))
+                _mark_variant(replacement.rule_spec, existing_variant_ids)
+                existing_specs.append(replacement.rule_spec)
                 try:
                     factory.record_lesson(
                         replacement.hypothesis_id, vehicle=vehicle,
@@ -1536,6 +1994,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                         generation=factory.next_generation(vehicle, slot),
                         not_before=worker["evaluation_end"],
                         existing_variant_ids=existing_variant_ids,
+                        existing_specs=existing_specs,
                         tried_families=tried,
                         context=_discovery_context(
                             slot=slot, reason="generation_budget_exhausted",
@@ -1545,7 +2004,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                             lessons=_lesson_brief(factory, vehicle=vehicle),
                             shared=shared),
                         llm_enabled=llm_enabled, config=llm_config,
-                        adapter=proposal_adapter)
+                        adapter=llm_adapter)
                 if seed is None:
                     factory.event(
                         hypothesis["hypothesis_id"], "pending_generation_limit",
@@ -1558,7 +2017,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                                     "reason": "generation_limit"})
                 else:
                     factory.register(seed)
-                    existing_variant_ids.add(rule_variant_id(seed.rule_spec))
+                    _mark_variant(seed.rule_spec, existing_variant_ids)
+                    existing_specs.append(seed.rule_spec)
                     _record_seed_lesson(factory, seed, vehicle=vehicle,
                                         kind="rotation", source=rotation_source,
                                         proposal=rotation_proposal,
@@ -1586,6 +2046,17 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                         reason="generation budget exhausted; slot rotated to a fresh family",
                         payload=rotation_payload)
                     rotations.append(asdict(seed))
+        elif all_intended_adequate:
+            # Adequate evidence can still be inconclusive: FDR, walk-forward,
+            # or the sealed qualification window may fail while held-out
+            # performance remains positive. Keep the hypothesis active so
+            # those policy-only failures never become terminal retirement.
+            factory.event(
+                hypothesis["hypothesis_id"], hypothesis.get("status", "testing"),
+                "adequate evidence was inconclusive; terminal retirement requires negative performance",
+                {"evaluated_variants": len(local),
+                 "intended_variants": int(worker.get("expected_variants", 0)),
+                 "retirement_eligible": False})
         else:
             factory.event(hypothesis["hypothesis_id"], hypothesis.get("status", "queued"),
                           "sample floor not met; observations were not treated as failure",
@@ -1597,12 +2068,19 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     if validated:
         champion = edge.select_champion(vehicle=vehicle, min_confidence=1.0 - alpha,
                                         strategy_id="rule")
+    budget_evidence = {}
+    if llm_adapter is not None:
+        budget = getattr(llm_adapter, "_budget_evidence", None)
+        if callable(budget):
+            budget_evidence = dict(budget())
     result = {
         "schema": FACTORY_SCHEMA,
         "status": ("partial_worker_failure" if worker_failures else
                    "pending_replacement_capacity" if pending else "complete"),
         "cycle_id": cycle_id,
         "dataset_hash": dataset_hash, "vehicle": vehicle,
+        "experiment_identity": identity,
+        "experiment_provenance": experiment_provenance_body,
         "parallel_workers": max_workers,
         "parallel_backend": backend,
         "worker_pids": sorted({row["worker_pid"] for row in summaries}),
@@ -1617,19 +2095,31 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         "active_slots": len(factory.active(vehicle)),
         "rotation_budget": int(rotation_budget), "max_rotations": int(max_rotations),
         "pending": pending, "worker_failures": worker_failures,
-        "strategy_llm": {"enabled": llm_enabled,
-                         "provider": llm_config.get("provider") if llm_enabled else None,
-                         "model": llm_config.get("model") if llm_enabled else None},
+        "strategy_llm": {
+            "enabled": llm_enabled,
+            "provider": llm_config.get("provider") if llm_enabled else None,
+            "model": llm_config.get("model") if llm_enabled else None,
+            **budget_evidence,
+        },
         # What the model was asked to tune, and how much of it survived
         # validation and de-duplication into an actual isolated account.
         "tuning": tuning_proposals,
+        "post_selection": {
+            "selected_test_id": selected_test_key,
+            "qualified_test_id": qualification_key,
+            "cumulative_fdr": cumulative,
+        },
+        "cumulative_fdr_state": factory.fdr_state(
+            f"strategy_factory:{vehicle}"),
         "champion": ({key: champion.get(key) for key in
                       ("candidate_id", "variant_id", "strategy_id", "vehicle", "status")}
                      if champion else None),
     }
     if not worker_failures:
         factory.add_cycle(cycle_id, dataset_hash, vehicle, max_workers,
-                          len(worker_results), len(summaries), result)
+                          len(worker_results), len(summaries), result,
+                          identity=identity,
+                          provenance=experiment_provenance_body)
     return result
 
 

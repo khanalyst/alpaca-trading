@@ -1,0 +1,1300 @@
+"""Broker-free, incremental real-time shadow evaluation.
+
+The shadow lane deliberately has no authority over the trading runtime.  It
+reads the recorder corpus and the EdgeLedger through read-only connections,
+evaluates each immutable candidate in an isolated virtual book, and writes
+only to its own WAL SQLite database.  A virtual open is an observation of what
+the candidate would have requested; it is never treated as a fill and no P&L
+is fabricated when a safe exit cannot be reconstructed.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import dataclasses
+from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+import hashlib
+import json
+import math
+from pathlib import Path
+import sqlite3
+import time
+from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
+
+from agent.contracts.ibr import generate_ibr_signal
+from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate_rule_spec
+from agent.risk import RiskEngine
+from agent.strategy import build_setup_plan
+from deploy.recorder import iter_corpus_rows
+from research.costs import ReplayPolicy
+from research.edge_discovery_core import _effective_ibr_config
+from research.edge_discovery_core import _null_reference_rows, null_control_account
+from research.edge_lab import _null_spec
+from research.factory_core import simulate_account
+from research.ibr import IBRConfig, replay_ibr
+from research.costs import CostModel
+from research.market_data import (
+    NormalizationError,
+    normalize_option_snapshot,
+    normalize_quote,
+    normalize_underlying_bar,
+)
+
+
+UTC = timezone.utc
+NEW_YORK = ZoneInfo("America/New_York")
+SCHEMA = "live-shadow.v1"
+DEFAULT_EQUITY = 100_000.0
+DEFAULT_MAX_CANDIDATES = 32
+DEFAULT_MAX_EVENTS = 20_000
+DEFAULT_MAX_DECISIONS = 100_000
+DEFAULT_RETENTION_DAYS = 14
+
+
+class ShadowError(RuntimeError):
+    """Base error for a shadow run."""
+
+
+class InputConflict(ShadowError):
+    """The same recorder event key was observed with different content."""
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False, default=str)
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _finite(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _plain(value: Any) -> Any:
+    """Convert normalized dataclasses into finite JSON-safe mappings."""
+    if dataclasses.is_dataclass(value):
+        return _plain(dataclasses.asdict(value))
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def _iso_time(value: Any) -> str | None:
+    parsed = _timestamp(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _number_or_none(value: Any) -> float | None:
+    number = _finite(value)
+    return None if number is None else round(number, 10)
+
+
+def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project a runtime shadow open into the replay comparison contract."""
+    if row.get("kind") != "open_incomplete":
+        return None
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    signal = payload.get("signal") if isinstance(payload.get("signal"), Mapping) else {}
+    plan = payload.get("setup_plan") if isinstance(payload.get("setup_plan"), Mapping) else {}
+    risk_plan = payload.get("risk_plan") if isinstance(payload.get("risk_plan"), Mapping) else {}
+    execution_profile = str(plan.get("execution_profile") or
+                            risk_plan.get("execution_profile") or "shares").lower()
+    signal_ts = _finite(plan.get("signal_ts", signal.get("signal_ts")))
+    entry_ts = None
+    if signal_ts is not None:
+        entry_ts = (datetime.fromtimestamp(signal_ts, UTC) +
+                    timedelta(seconds=60)).isoformat()
+    return {
+        "symbol": str(row.get("symbol") or plan.get("symbol") or signal.get("symbol") or ""),
+        "session_date": str(row.get("session_date") or plan.get("session") or signal.get("session") or ""),
+        "direction": str(plan.get("direction") or signal.get("direction") or ""),
+        "setup_type": str(plan.get("setup_type") or signal.get("setup_type") or ""),
+        "signal_ts": _iso_time(datetime.fromtimestamp(signal_ts, UTC).isoformat()) if signal_ts is not None else None,
+        "entry_ts": entry_ts,
+        "stop_price": _number_or_none(plan.get("stop_price", signal.get("stop_price"))),
+        "target_price": _number_or_none(plan.get("target_price", signal.get("target_price"))),
+        "stop_distance": _number_or_none(plan.get("stop_distance", signal.get("stop_distance"))),
+        "range_high": _number_or_none(plan.get("range_high", signal.get("range_high"))),
+        "range_low": _number_or_none(plan.get("range_low", signal.get("range_low"))),
+        "target_r": _number_or_none(plan.get("target_r", signal.get("target_r"))),
+        "vehicle": ("option" if execution_profile
+                     in {"option", "options"} else "equity"),
+        "profile": execution_profile,
+    }
+
+
+def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
+                      strategy_id: str, target_r: float | None = None,
+                      setup_type: str | None = None) -> dict[str, Any] | None:
+    """Project a factory/IBR replay trade into the same semantic contract."""
+    if row.get("no_trade") is True:
+        return None
+    signal_ts = row.get("signal_timestamp")
+    entry_ts = row.get("entry_timestamp")
+    direction = str(row.get("direction") or "")
+    stop = _number_or_none(row.get("stop_price"))
+    target = _number_or_none(row.get("target_price"))
+    distance = _number_or_none(row.get("stop_distance"))
+    if distance is None and stop is not None and row.get("entry_reference") is not None:
+        reference = _finite(row.get("entry_reference"))
+        distance = _number_or_none(abs(reference - stop)) if reference is not None else None
+    resolved_target_r = target_r
+    if resolved_target_r is None and stop is not None and target is not None and distance:
+        resolved_target_r = abs(target - stop) / distance - 1.0
+    setup_type = ("ibr_breakout" if strategy_id == "ibr" else
+                  str(setup_type or row.get("setup_type") or "rule_signal"))
+    return {
+        "symbol": str(row.get("symbol") or ""),
+        "session_date": str(row.get("session_date") or ""),
+        "direction": direction,
+        "setup_type": setup_type,
+        "signal_ts": _iso_time(signal_ts),
+        "entry_ts": _iso_time(entry_ts),
+        "stop_price": stop,
+        "target_price": target,
+        "stop_distance": distance,
+        "range_high": _number_or_none(row.get("range_high")),
+        "range_low": _number_or_none(row.get("range_low")),
+        "target_r": _number_or_none(resolved_target_r),
+        "vehicle": "option" if vehicle in {"option", "options"} else "equity",
+        "profile": "options" if vehicle in {"option", "options"} else "shares",
+    }
+
+
+def _signature_diffs(expected: Sequence[Mapping[str, Any]],
+                    observed: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return deterministic, field-level differences between semantic rows."""
+    key_fields = ("symbol", "session_date", "direction", "setup_type")
+    compare_fields = ("signal_ts", "entry_ts", "stop_price", "target_price",
+                      "stop_distance", "range_high", "range_low", "target_r",
+                      "vehicle", "profile")
+    left = sorted((dict(item) for item in expected),
+                  key=lambda item: tuple(str(item.get(key) or "") for key in key_fields))
+    right = sorted((dict(item) for item in observed),
+                   key=lambda item: tuple(str(item.get(key) or "") for key in key_fields))
+    differences: list[dict[str, Any]] = []
+    for index in range(max(len(left), len(right))):
+        before = left[index] if index < len(left) else None
+        after = right[index] if index < len(right) else None
+        if before is None or after is None:
+            differences.append({"index": index, "kind": "missing" if after is None else "extra",
+                                "expected": before, "observed": after})
+            continue
+        for field in key_fields + compare_fields:
+            if before.get(field) != after.get(field):
+                differences.append({"index": index, "field": field,
+                                    "expected": before.get(field),
+                                    "observed": after.get(field)})
+    return differences
+
+
+def _row_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    # Empty CSV cells are absent from normalized payloads.  Keeping the raw
+    # key set out of the contract also makes equivalent CSV exports hash alike.
+    return {str(key): value for key, value in row.items()
+            if value is not None and str(value) != ""}
+
+
+def _normalize_row(row: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
+    raw = _row_payload(row)
+    event_type = str(raw.get("event_type") or "").strip().lower()
+    provider = str(raw.get("provider") or "recorder")
+    feed = str(raw.get("feed") or "recorded")
+    if event_type in {"bar", "bar_1m"}:
+        event = normalize_underlying_bar(raw, provider=provider, feed=feed)
+    elif event_type == "quote":
+        event = normalize_quote(raw, provider=provider, feed=feed)
+    elif event_type in {"option", "option_snapshot"}:
+        event = normalize_option_snapshot(raw, provider=provider, feed=feed)
+    else:
+        raise NormalizationError(f"unsupported recorder event_type {event_type!r}")
+    return raw, event
+
+
+@dataclass(frozen=True)
+class ShadowConfig:
+    """Bounded paths and resource limits for one shadow process."""
+
+    corpus_path: Path
+    edge_db: Path
+    shadow_db: Path
+    max_candidates: int = DEFAULT_MAX_CANDIDATES
+    max_events: int = DEFAULT_MAX_EVENTS
+    max_decisions: int = DEFAULT_MAX_DECISIONS
+    retention_days: int = DEFAULT_RETENTION_DAYS
+    equity: float = DEFAULT_EQUITY
+    poll_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        for name in ("max_candidates", "max_events", "max_decisions", "retention_days"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value or int(value) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if _finite(self.equity) is None or float(self.equity) <= 0:
+            raise ValueError("equity must be positive and finite")
+
+
+class ShadowStore:
+    """Own the isolated append-only shadow database."""
+
+    def __init__(self, path: str | Path, *, retention_days: int = DEFAULT_RETENTION_DAYS,
+                 readonly: bool = False):
+        self.path = Path(path)
+        self.readonly = bool(readonly)
+        if not self.readonly:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.retention_days = int(retention_days)
+        if not self.readonly:
+            self._init()
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.readonly:
+            if not self.path.is_file():
+                raise ShadowError(f"shadow database is unavailable: {self.path}")
+            uri = f"file:{self.path.resolve()}?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=30)
+        else:
+            db = sqlite3.connect(str(self.path), timeout=30)
+        db.row_factory = sqlite3.Row
+        if not self.readonly:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
+    @contextmanager
+    def _connection(self):
+        db = self._connect()
+        try:
+            yield db
+            if not self.readonly:
+                db.commit()
+        finally:
+            db.close()
+
+    def _init(self) -> None:
+        with self._connection() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS cursor (
+                    scope TEXT PRIMARY KEY, last_event_key TEXT NOT NULL,
+                    last_timestamp TEXT NOT NULL, last_digest TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS events (
+                    event_key TEXT PRIMARY KEY, digest TEXT NOT NULL,
+                    event_json TEXT NOT NULL, event_type TEXT NOT NULL,
+                    symbol TEXT NOT NULL, timestamp TEXT NOT NULL,
+                    as_of TEXT, inserted_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS candidates (
+                    candidate_id TEXT PRIMARY KEY, variant_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL, vehicle TEXT NOT NULL,
+                    status TEXT NOT NULL, config_json TEXT NOT NULL,
+                    proof_json TEXT NOT NULL, observed_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS decisions (
+                    decision_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL, session_date TEXT NOT NULL,
+                    symbol TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT,
+                    payload_json TEXT NOT NULL, created_at REAL NOT NULL,
+                    UNIQUE(candidate_id, event_key)
+                );
+                CREATE TABLE IF NOT EXISTS virtual_books (
+                    book_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL,
+                    status TEXT NOT NULL, quantity REAL, entry_price REAL,
+                    plan_json TEXT NOT NULL, created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS replay_diffs (
+                    diff_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
+                    session_date TEXT NOT NULL, source_digest TEXT NOT NULL,
+                    shadow_digest TEXT NOT NULL, replay_digest TEXT,
+                    status TEXT NOT NULL, details_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(candidate_id, session_date)
+                );
+                CREATE TABLE IF NOT EXISTS shadow_accounts (
+                    account_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
+                    session_date TEXT NOT NULL, replay_digest TEXT NOT NULL,
+                    vehicle TEXT NOT NULL, starting_cash REAL NOT NULL,
+                    ending_cash REAL NOT NULL, realized_pnl REAL NOT NULL,
+                    trade_count INTEGER NOT NULL, replay_status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(candidate_id, session_date, replay_digest)
+                );
+                CREATE TABLE IF NOT EXISTS shadow_trades (
+                    trade_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
+                    session_date TEXT NOT NULL, replay_digest TEXT NOT NULL,
+                    replay_status TEXT NOT NULL, trade_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+                  BEGIN SELECT RAISE(ABORT, 'shadow events are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+                  BEGIN SELECT RAISE(ABORT, 'shadow events are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS candidates_no_update BEFORE UPDATE ON candidates
+                  BEGIN SELECT RAISE(ABORT, 'shadow candidates are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS candidates_no_delete BEFORE DELETE ON candidates
+                  BEGIN SELECT RAISE(ABORT, 'shadow candidates are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS decisions_no_update BEFORE UPDATE ON decisions
+                  BEGIN SELECT RAISE(ABORT, 'shadow decisions are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS decisions_no_delete BEFORE DELETE ON decisions
+                  BEGIN SELECT RAISE(ABORT, 'shadow decisions are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS shadow_accounts_no_update BEFORE UPDATE ON shadow_accounts
+                  BEGIN SELECT RAISE(ABORT, 'shadow accounts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS shadow_accounts_no_delete BEFORE DELETE ON shadow_accounts
+                  BEGIN SELECT RAISE(ABORT, 'shadow accounts are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS shadow_trades_no_update BEFORE UPDATE ON shadow_trades
+                  BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS shadow_trades_no_delete BEFORE DELETE ON shadow_trades
+                  BEGIN SELECT RAISE(ABORT, 'shadow trades are immutable'); END;
+            """)
+
+    def ingest_event(self, row: Mapping[str, Any], *, max_events: int) -> tuple[str, bool]:
+        event_key = str(row.get("event_key") or "").strip()
+        if not event_key:
+            raise ShadowError("recorder row has no event_key")
+        # The corpus remains a streamed source, but known rows do not need to
+        # be normalized again.  We still hash every row before skipping it so
+        # a changed payload for an old key is always a hard conflict.
+        payload = _row_payload(row)
+        digest = _digest(payload)
+        with self._connection() as db:
+            existing = db.execute("SELECT digest FROM events WHERE event_key=?",
+                                  (event_key,)).fetchone()
+            if existing is not None:
+                if existing["digest"] != digest:
+                    raise InputConflict(f"event_key {event_key} changed content")
+                return event_key, False
+        payload, event = _normalize_row(row)
+        timestamp = _timestamp(payload.get("timestamp"))
+        as_of = _timestamp(payload.get("as_of") or payload.get("timestamp"))
+        if timestamp is None:
+            raise ShadowError(f"event {event_key} has invalid timestamp")
+        symbol = str(payload.get("symbol") or getattr(event, "symbol", ""))
+        event_type = str(payload.get("event_type") or "").lower()
+        with self._connection() as db:
+            count = int(db.execute("SELECT count(*) FROM events").fetchone()[0])
+            if count >= int(max_events):
+                raise ShadowError(f"shadow event bound {max_events} exceeded")
+            db.execute("""INSERT INTO events
+                (event_key,digest,event_json,event_type,symbol,timestamp,as_of,inserted_at)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (event_key, digest, _json(payload), event_type, symbol,
+                 timestamp.isoformat(), as_of.isoformat() if as_of else None,
+                 time.time()))
+            cursor = db.execute("SELECT last_timestamp,last_event_key FROM cursor WHERE scope='corpus'").fetchone()
+            if cursor is None or (timestamp.isoformat(), event_key) >= (cursor[0], cursor[1]):
+                db.execute("""INSERT INTO cursor(scope,last_event_key,last_timestamp,last_digest,updated_at)
+                    VALUES('corpus',?,?,?,?)
+                    ON CONFLICT(scope) DO UPDATE SET last_event_key=excluded.last_event_key,
+                        last_timestamp=excluded.last_timestamp,last_digest=excluded.last_digest,
+                        updated_at=excluded.updated_at""",
+                    (event_key, timestamp.isoformat(), digest, time.time()))
+        return event_key, True
+
+    def upsert_candidate(self, candidate: Mapping[str, Any]) -> None:
+        config = candidate.get("config")
+        if config is None:
+            encoded = candidate.get("config_json")
+            if isinstance(encoded, str):
+                try:
+                    decoded = json.loads(encoded)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = None
+                if isinstance(decoded, Mapping):
+                    config = decoded
+        if not isinstance(config, Mapping):
+            config = {}
+        proof = {key: candidate.get(key) for key in (
+            "dataset_hash", "config_hash", "code_hash", "provenance_hash", "status")}
+        with self._connection() as db:
+            db.execute("""INSERT OR IGNORE INTO candidates
+                (candidate_id,variant_id,strategy_id,vehicle,status,config_json,proof_json,observed_at)
+                VALUES(?,?,?,?,?,?,?,?)""", (
+                    str(candidate["candidate_id"]), str(candidate.get("variant_id") or ""),
+                    str(candidate.get("strategy_id") or ""), str(candidate.get("vehicle") or ""),
+                    str(candidate.get("status") or ""), _json(config), _json(proof), time.time()))
+
+    def decision(self, *, candidate_id: str, event_key: str, session_date: str,
+                 symbol: str, kind: str, reason: str | None, payload: Mapping,
+                 max_decisions: int) -> bool:
+        decision_id = _digest({"candidate_id": candidate_id, "event_key": event_key})
+        with self._connection() as db:
+            existing = db.execute("SELECT 1 FROM decisions WHERE candidate_id=? AND event_key=?",
+                                  (candidate_id, event_key)).fetchone()
+            if existing is not None:
+                return False
+            count = int(db.execute("SELECT count(*) FROM decisions").fetchone()[0])
+            if count >= int(max_decisions):
+                raise ShadowError(f"shadow decision bound {max_decisions} exceeded")
+            db.execute("""INSERT INTO decisions
+                (decision_id,candidate_id,event_key,session_date,symbol,kind,reason,payload_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""", (decision_id, candidate_id, event_key,
+                    session_date, symbol, kind, reason, _json(payload), time.time()))
+        return True
+
+    def virtual_open(self, *, candidate_id: str, decision_id: str, symbol: str,
+                     plan: Mapping) -> None:
+        quantity = _finite(plan.get("contracts", plan.get("shares")))
+        entry = _finite(plan.get("entry_price"))
+        with self._connection() as db:
+            db.execute("""INSERT OR IGNORE INTO virtual_books
+                (book_id,candidate_id,decision_id,symbol,status,quantity,entry_price,plan_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""", (_digest({"candidate_id": candidate_id,
+                "decision_id": decision_id}), candidate_id, decision_id, symbol,
+                "open_incomplete", quantity, entry, _json(plan), time.time()))
+
+    def has_open(self, candidate_id: str, symbol: str) -> bool:
+        with self._connection() as db:
+            return db.execute("""SELECT 1 FROM virtual_books WHERE candidate_id=?
+                AND symbol=? AND status='open_incomplete' LIMIT 1""", (candidate_id, symbol)).fetchone() is not None
+
+    def open_books(self, candidate_id: str) -> list[dict]:
+        """Return this candidate's still-open virtual books only.
+
+        The shadow lane never shares portfolio state across candidates.  This
+        read is intentionally scoped by candidate and leaves the immutable
+        book rows untouched; callers decode ``plan_json`` for admission.
+        """
+        with self._connection() as db:
+            rows = db.execute("""SELECT * FROM virtual_books
+                WHERE candidate_id=? AND status='open_incomplete'
+                ORDER BY created_at, book_id""", (candidate_id,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def close_session_books(self, candidate_id: str, session_date: str) -> int:
+        """Close incomplete virtual observations once that session is replayed."""
+        with self._connection() as db:
+            cursor = db.execute("""UPDATE virtual_books SET status='closed_replay'
+                WHERE candidate_id=? AND status='open_incomplete' AND decision_id IN
+                    (SELECT decision_id FROM decisions WHERE candidate_id=? AND session_date=?)""",
+                               (candidate_id, candidate_id, session_date))
+            return int(cursor.rowcount)
+
+    def candidates(self) -> list[dict]:
+        with self._connection() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM candidates ORDER BY candidate_id")]
+
+    def events(self) -> list[dict]:
+        with self._connection() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM events ORDER BY timestamp,event_key")]
+
+    def decisions(self, candidate_id: str | None = None) -> list[dict]:
+        with self._connection() as db:
+            if candidate_id:
+                rows = db.execute("SELECT * FROM decisions WHERE candidate_id=? ORDER BY created_at,decision_id", (candidate_id,)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM decisions ORDER BY created_at,decision_id").fetchall()
+            return [dict(row) for row in rows]
+
+    def replay_diff(self, *, candidate_id: str, session_date: str, source_digest: str,
+                    shadow_digest: str, replay_digest: str | None, status: str,
+                    details: Mapping) -> None:
+        with self._connection() as db:
+            db.execute("""INSERT INTO replay_diffs
+                (diff_id,candidate_id,session_date,source_digest,shadow_digest,replay_digest,status,details_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(candidate_id,session_date) DO UPDATE SET
+                    source_digest=excluded.source_digest,
+                    shadow_digest=excluded.shadow_digest,
+                    replay_digest=excluded.replay_digest,
+                    status=excluded.status,
+                    details_json=excluded.details_json,
+                    created_at=excluded.created_at""", (_digest({"candidate_id": candidate_id, "session_date": session_date}),
+                    candidate_id, session_date, source_digest, shadow_digest, replay_digest,
+                    status, _json(details), time.time()))
+
+    def record_replay_evidence(self, *, candidate_id: str, session_date: str,
+                               replay_digest: str, vehicle: str,
+                               starting_cash: float, ending_cash: float,
+                               realized_pnl: float, trades: Sequence[Mapping],
+                               replay_status: str) -> None:
+        """Persist immutable replay outcomes in the isolated shadow WAL.
+
+        Rows are deliberately not written to EdgeLedger.  ``gate_rows`` below
+        joins them to the current replay diff and exposes them only when the
+        completed same-session replay has semantic parity.
+        """
+        values = (float(starting_cash), float(ending_cash), float(realized_pnl))
+        if not all(math.isfinite(value) for value in values):
+            raise ShadowError("shadow account cash/P&L must be finite")
+        ordered: list[dict[str, Any]] = []
+        for trade in trades:
+            if not isinstance(trade, Mapping) or trade.get("no_trade") is True:
+                continue
+            ordered.append(dict(trade))
+        ordered.sort(key=_json)
+        account_id = _digest({"candidate_id": candidate_id,
+                              "session_date": session_date,
+                              "replay_digest": replay_digest})
+        with self._connection() as db:
+            db.execute("""INSERT OR IGNORE INTO shadow_accounts
+                (account_id,candidate_id,session_date,replay_digest,vehicle,
+                 starting_cash,ending_cash,realized_pnl,trade_count,replay_status,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                    account_id, candidate_id, session_date, replay_digest,
+                    str(vehicle), values[0], values[1], values[2], len(ordered),
+                    str(replay_status), time.time()))
+            occurrence: dict[str, int] = {}
+            for trade in ordered:
+                trade_digest = _digest(trade)
+                index = occurrence.get(trade_digest, 0)
+                occurrence[trade_digest] = index + 1
+                trade_id = _digest({"candidate_id": candidate_id,
+                                    "session_date": session_date,
+                                    "replay_digest": replay_digest,
+                                    "trade_digest": trade_digest,
+                                    "occurrence": index})
+                db.execute("""INSERT OR IGNORE INTO shadow_trades
+                    (trade_id,candidate_id,session_date,replay_digest,replay_status,
+                     trade_json,created_at)
+                    VALUES(?,?,?,?,?,?,?)""", (
+                        trade_id, candidate_id, session_date, replay_digest,
+                        str(replay_status), _json(trade), time.time()))
+
+    def replay_accounts(self, candidate_id: str | None = None) -> list[dict]:
+        with self._connection() as db:
+            if candidate_id is None:
+                rows = db.execute("""SELECT * FROM shadow_accounts
+                    ORDER BY session_date,candidate_id,replay_digest""").fetchall()
+            else:
+                rows = db.execute("""SELECT * FROM shadow_accounts
+                    WHERE candidate_id=? ORDER BY session_date,replay_digest""",
+                                  (candidate_id,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def replay_metadata(self, candidate_id: str | None = None) -> list[dict]:
+        """Return replay diffs joined to their immutable account summaries.
+
+        Ingestion uses this read-only projection as the completion/parity
+        boundary.  Keeping the join here prevents callers from accidentally
+        treating a diagnostic trade row as authorizing evidence without its
+        same-session source and replay digests.
+        """
+        query = """SELECT d.candidate_id, d.session_date, d.source_digest,
+                   d.shadow_digest, d.replay_digest, d.status,
+                   d.details_json, a.account_id, a.vehicle, a.starting_cash,
+                   a.ending_cash, a.realized_pnl, a.trade_count,
+                   a.replay_status, a.created_at AS account_created_at
+                   FROM replay_diffs d LEFT JOIN shadow_accounts a
+                   ON a.candidate_id=d.candidate_id
+                   AND a.session_date=d.session_date
+                   AND a.replay_digest=d.replay_digest"""
+        params: tuple[Any, ...] = ()
+        if candidate_id is not None:
+            query += " WHERE d.candidate_id=?"
+            params = (str(candidate_id),)
+        query += " ORDER BY d.session_date,d.candidate_id"
+        with self._connection() as db:
+            rows = db.execute(query, params).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["details"] = json.loads(item.pop("details_json"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["details"] = {}
+            result.append(item)
+        return result
+
+    def gate_rows(self, candidate_id: str, session_date: str | None = None) -> list[dict]:
+        """Return rows eligible for existing gates after replay parity only."""
+        params: list[Any] = [candidate_id]
+        clause = ""
+        if session_date is not None:
+            clause = " AND t.session_date=?"
+            params.append(session_date)
+        with self._connection() as db:
+            rows = db.execute(f"""SELECT t.trade_json FROM shadow_trades t
+                JOIN replay_diffs d ON d.candidate_id=t.candidate_id
+                    AND d.session_date=t.session_date
+                    AND d.replay_digest=t.replay_digest
+                WHERE t.candidate_id=? AND d.status='match'
+                    AND t.replay_status='match'{clause}
+                ORDER BY t.session_date,t.trade_id""", tuple(params)).fetchall()
+            result: list[dict] = []
+            for row in rows:
+                try:
+                    item = json.loads(row["trade_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(item, Mapping):
+                    result.append(dict(item))
+            return result
+
+    def prune(self) -> None:
+        floor = time.time() - max(1, self.retention_days) * 86400
+        # Retention is the only intentional deletion.  The append-only rows
+        # themselves cannot be updated or deleted by ordinary writes.
+        with self._connection() as db:
+            db.execute("DELETE FROM replay_diffs WHERE created_at < ?", (floor,))
+
+
+def _read_candidates(path: Path, *, max_candidates: int) -> list[dict]:
+    """Resolve candidates without constructing EdgeLedger (which migrates DBs)."""
+    if not path.exists():
+        return []
+    uri = f"file:{path.resolve()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=5) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute("""SELECT c.*, s.status FROM candidates c JOIN candidate_state s
+                ON c.candidate_id=s.candidate_id
+                WHERE (s.status IN ('backtest_passed','shadow','demoted','validated','champion')
+                       AND c.strategy_id IN ('ibr','rule'))
+                   OR (c.strategy_id='ibr' AND c.variant_id='ibr.baseline')
+                ORDER BY CASE WHEN c.strategy_id='ibr' AND c.variant_id='ibr.baseline'
+                              THEN 0 ELSE 1 END, c.created_at,c.candidate_id
+                LIMIT ?""", (int(max_candidates),)).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["config"] = json.loads(item.pop("config_json"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["config"] = {}
+                try:
+                    item["axes"] = json.loads(item.pop("axes_json"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["axes"] = {}
+                result.append(item)
+            return result
+    except sqlite3.OperationalError as exc:
+        # A deployment may start before the research cycle has created its
+        # ledger.  Treat that as an empty read-only source, never initialize
+        # or mutate it from this process.
+        if "no such table" in str(exc).lower():
+            return []
+        raise ShadowError(f"cannot read EdgeLedger read-only: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise ShadowError(f"cannot read EdgeLedger read-only: {exc}") from exc
+
+
+def _read_factory_rule_roots(path: Path) -> dict[str, dict[str, Any]]:
+    """Read immutable factory root specs without opening a writable ledger.
+
+    The live shadow worker may read the research ledger, but it must never
+    initialize or migrate it.  ``factory_hypotheses`` is therefore queried
+    directly through SQLite's read-only URI and malformed rows are ignored.
+    """
+    if not path.is_file():
+        return {}
+    uri = f"file:{path.resolve()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=5) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT hypothesis_id,vehicle,spec_json FROM factory_hypotheses"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    roots: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            raw = json.loads(row["spec_json"])
+            spec = validate_rule_spec(raw)
+            roots[str(row["hypothesis_id"])] = {
+                "vehicle": str(row["vehicle"]),
+                "rule_spec": spec,
+                "variant_id": rule_variant_id(spec),
+            }
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+    return roots
+
+
+def _policy(config: Mapping[str, Any]) -> ReplayPolicy:
+    try:
+        return ReplayPolicy.from_config(config)
+    except Exception:
+        return ReplayPolicy()
+
+
+def _safe_config(candidate: Mapping[str, Any]) -> dict:
+    config = candidate.get("config")
+    # EdgeLedger's public candidate row stores the immutable configuration as
+    # ``config_json``.  The read-only resolver decodes that field before
+    # handing rows to the runner, but direct callers (and older integrations)
+    # may provide the raw ledger row.  Preserve the same replay path for both
+    # shapes without ever mutating the candidate mapping.
+    if config is None:
+        encoded = candidate.get("config_json")
+        if isinstance(encoded, str):
+            try:
+                decoded = json.loads(encoded)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, Mapping):
+                config = decoded
+    out = dict(config) if isinstance(config, Mapping) else {}
+    strategy = dict(out.get("strategy") or {})
+    strategy.setdefault("id", candidate.get("strategy_id") or "ibr")
+    strategy.setdefault("version", candidate.get("base_version") or "v1")
+    strategy.setdefault("variant_id", candidate.get("variant_id"))
+    out["strategy"] = strategy
+    return out
+
+
+class ShadowRunner:
+    """Incrementally ingest, evaluate, and replay one broker-free corpus."""
+
+    def __init__(self, config: ShadowConfig):
+        self.config = config
+        self.store = ShadowStore(config.shadow_db, retention_days=config.retention_days)
+        self._factory_roots = _read_factory_rule_roots(config.edge_db)
+
+    def _rule_root_control(self, candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Build the exact-window root control for a tuned rule candidate.
+
+        Factory hypotheses are the authority for a slot's root rule.  A
+        descendant is therefore compared with a synthetic control namespace
+        tied to its own candidate id; this keeps the control replay isolated
+        from any EdgeLedger lifecycle state and prevents a candidate from
+        accidentally selecting its own mutated spec as its baseline.
+        """
+        if str(candidate.get("strategy_id")) != "rule":
+            return None
+        axes = candidate.get("axes")
+        if axes is None and isinstance(candidate.get("axes_json"), str):
+            try:
+                axes = json.loads(str(candidate["axes_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                axes = None
+        hypothesis_id = axes.get("hypothesis_id") if isinstance(axes, Mapping) else None
+        root = self._factory_roots.get(str(hypothesis_id)) if hypothesis_id else None
+        if not isinstance(root, Mapping) or root.get("vehicle") != str(candidate.get("vehicle")):
+            return None
+        root_variant = str(root.get("variant_id") or "")
+        if not root_variant or str(candidate.get("variant_id")) == root_variant:
+            # The root hypothesis is itself the control target.  Its paired
+            # baseline is the randomized-entry null generated by _replay.
+            return None
+        config = _safe_config(candidate)
+        strategy = dict(config.get("strategy") or {})
+        strategy.update({"id": "rule", "variant_id": root_variant,
+                         "rule_spec": dict(root["rule_spec"])})
+        config["strategy"] = strategy
+        return {**dict(candidate),
+                "candidate_id": f"shadow:baseline:{candidate['candidate_id']}",
+                "variant_id": root_variant,
+                "config": config,
+                "axes": {"hypothesis_id": hypothesis_id, "role": "paired_root_control"}}
+
+    def _load_events(self) -> tuple[list[dict], dict[str, list[dict]], dict[str, list[dict]], dict[str, list[dict]]]:
+        bars: dict[str, list[dict]] = {}
+        quotes: dict[str, list[dict]] = {}
+        options: dict[str, list[dict]] = {}
+        for row in self.store.events():
+            try:
+                payload = json.loads(row["event_json"])
+                _, event = _normalize_row(payload)
+            except (TypeError, ValueError, json.JSONDecodeError, NormalizationError):
+                continue
+            plain = payload
+            symbol = str(row["symbol"])
+            if row["event_type"] in {"bar", "bar_1m"}:
+                bars.setdefault(symbol, []).append(plain)
+            elif row["event_type"] == "quote":
+                quotes.setdefault(symbol, []).append(plain)
+            elif row["event_type"] in {"option", "option_snapshot"}:
+                underlying = str(plain.get("underlying") or "")
+                options.setdefault(underlying, []).append(plain)
+        for values in (bars, quotes, options):
+            for key in values:
+                values[key].sort(key=lambda row: str(row.get("timestamp") or ""))
+        return self.store.events(), bars, quotes, options
+
+    @staticmethod
+    def _latest_quote(rows: Sequence[Mapping], at: datetime) -> Mapping | None:
+        valid = []
+        for row in rows:
+            stamp = _timestamp(row.get("timestamp"))
+            if stamp is not None and stamp <= at:
+                bid, ask = _finite(row.get("bid")), _finite(row.get("ask"))
+                if bid is not None and ask is not None and bid > 0 and ask >= bid:
+                    valid.append((stamp, row))
+        return max(valid, key=lambda pair: pair[0])[1] if valid else None
+
+    def _evaluate(self, candidate: Mapping[str, Any], event: Mapping[str, Any],
+                  bars: Mapping[str, list], quotes: Mapping[str, list],
+                  options: Mapping[str, list]) -> tuple[str, str | None, dict, dict | None]:
+        symbol = str(event.get("symbol") or "")
+        cfg = _safe_config(candidate)
+        strategy = cfg.get("strategy", {})
+        event_at = _timestamp(event.get("as_of") or event.get("timestamp"))
+        if event_at is None:
+            return "no_data", "event timestamp unavailable", {}, None
+        session = event_at.astimezone(NEW_YORK).date().isoformat()
+        stream = [row for row in bars.get(symbol, [])
+                  if (_timestamp(row.get("as_of") or row.get("timestamp")) or datetime.min.replace(tzinfo=UTC)) <= event_at]
+        if len(stream) < 2:
+            return "no_data", "insufficient bars", {"session_date": session}, None
+        strategy_id = str(candidate.get("strategy_id") or strategy.get("id") or "ibr")
+        try:
+            signal = (generate_rule_signal(symbol, stream, config=cfg, now=event_at)
+                      if strategy_id == "rule" else
+                      generate_ibr_signal(symbol, stream, config=cfg, now=event_at))
+        except Exception as exc:
+            return "reject", f"signal exception: {type(exc).__name__}", {"error": str(exc)[:240]}, None
+        base = {"session_date": session, "strategy_id": strategy_id,
+                "variant_id": candidate.get("variant_id"), "signal": signal}
+        if signal is None:
+            return "no_trade", "no signal", base, None
+        quote = self._latest_quote(quotes.get(symbol, ()), event_at)
+        policy = _policy(cfg)
+        snap: dict[str, Any] = {"price": _finite(event.get("close")) or _finite(event.get("open")),
+                                "close": _finite(event.get("close")),
+                                "spread_bps": None, "stale": True, "quote_stale": True,
+                                "session": session, "signal_ts": signal.get("signal_ts")}
+        if quote is not None:
+            quote_at = _timestamp(quote.get("timestamp"))
+            bid, ask = _finite(quote.get("bid")), _finite(quote.get("ask"))
+            age = None if quote_at is None else max(0.0, (event_at - quote_at).total_seconds())
+            if bid and ask and bid > 0 and ask >= bid:
+                snap.update(price=(bid + ask) / 2, spread_bps=(ask - bid) / ((bid + ask) / 2) * 10_000,
+                            quote_ts=quote_at.isoformat() if quote_at else None,
+                            quote_age_seconds=age,
+                            stale=bool(age is None or age > policy.max_market_data_age_seconds),
+                            quote_stale=bool(age is None or age > policy.max_market_data_age_seconds))
+        # The setup primitive consumes the exact signal geometry while the
+        # quote fields above carry strict point-in-time freshness metadata.
+        snap.update({key: value for key, value in signal.items()
+                     if key not in {"symbol", "action"} and value is not None})
+        snap["price"] = snap.get("price") or _finite(signal.get("entry_price"))
+        snap["entry_price"] = _finite(signal.get("entry_price")) or snap.get("price")
+        if signal.get("range_high") is not None and signal.get("range_low") is not None:
+            snap["ibr_range"] = {"high": signal.get("range_high"),
+                                  "low": signal.get("range_low"),
+                                  "width": signal.get("range_width"),
+                                  "complete": True}
+        if str(candidate.get("vehicle") or "equity") == "option":
+            option_rows = []
+            for row in options.get(symbol, ()):
+                stamp = _timestamp(row.get("timestamp"))
+                if stamp is not None and stamp <= event_at:
+                    item = dict(row)
+                    item.setdefault("quote_ts", stamp.isoformat())
+                    age = max(0.0, (event_at - stamp).total_seconds())
+                    item.setdefault("quote_age_seconds", age)
+                    option_rows.append(item)
+            snap["option_chain"] = option_rows
+        if snap["stale"] or snap["quote_stale"]:
+            return "unpriced", "stale or unavailable quote", base | {"snapshot": snap}, None
+        try:
+            plan, why = build_setup_plan(signal, snap, cfg)
+        except Exception as exc:
+            return "reject", f"setup exception: {type(exc).__name__}", base, None
+        if plan is None:
+            return "reject", why or "setup rejected", base | {"snapshot": snap}, None
+        # A candidate's virtual book is isolated and feeds only that
+        # candidate's portfolio admission.  Plans are immutable observations;
+        # no fills, mark-to-market, or fabricated P&L is introduced here.
+        try:
+            positions, active_trades, gross_notional = self._portfolio_state(
+                str(candidate["candidate_id"]))
+        except ShadowError as exc:
+            return "reject", f"portfolio state unavailable: {exc}", base, None
+        risk = RiskEngine(cfg)
+        try:
+            risk_plan, why = risk.vet_open(
+                plan, float(self.config.equity), positions, {symbol: snap}, {},
+                gross_notional, active_trades=active_trades,
+                now=event_at.timestamp())
+        except Exception as exc:
+            return "reject", f"risk exception: {type(exc).__name__}", base, None
+        if risk_plan is None:
+            return "reject", why or "risk rejected", base | {"snapshot": snap}, None
+        return "open_incomplete", "virtual open; fills and P&L incomplete", base | {
+            "snapshot": snap, "setup_plan": plan, "risk_plan": risk_plan,
+        }, risk_plan
+
+    def _portfolio_state(self, candidate_id: str) -> tuple[list[dict], dict[str, dict], float]:
+        """Build risk admission state from one candidate's open books."""
+        positions: list[dict] = []
+        active_trades: dict[str, dict] = {}
+        gross_notional = 0.0
+        for row in self.store.open_books(candidate_id):
+            try:
+                plan = json.loads(row.get("plan_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ShadowError("open book plan is invalid") from exc
+            if not isinstance(plan, Mapping):
+                raise ShadowError("open book plan is invalid")
+            symbol = str(row.get("symbol") or plan.get("symbol") or "")
+            if not symbol:
+                raise ShadowError("open book symbol is unavailable")
+            risk_usd = _finite(plan.get("risk_usd"))
+            notional = _finite(plan.get("notional"))
+            if risk_usd is None or risk_usd < 0:
+                raise ShadowError(f"open book risk is unavailable for {symbol}")
+            if notional is None or notional < 0:
+                raise ShadowError(f"open book notional is unavailable for {symbol}")
+            position = dict(plan)
+            position["symbol"] = symbol
+            if row.get("quantity") is not None:
+                position.setdefault("quantity", row["quantity"])
+            if row.get("entry_price") is not None:
+                position.setdefault("entry_price", row["entry_price"])
+            positions.append(position)
+            active_trade = dict(position)
+            active_trade["risk_usd"] = risk_usd
+            active_trades[symbol] = active_trade
+            gross_notional += notional
+        return positions, active_trades, gross_notional
+
+    def _replay(self, candidate: Mapping[str, Any], session: str,
+                session_bars: Sequence[Mapping], session_quotes: Sequence[Mapping],
+                decisions: Sequence[Mapping],
+                session_options: Sequence[Mapping] | None = None) -> bool:
+        candidate_id = str(candidate["candidate_id"])
+        # Option replay is also point-in-time input.  Include it in the source
+        # digest so a corrected/stale option snapshot cannot be mistaken for
+        # the same replay window merely because the underlying bars/quotes
+        # were unchanged.
+        source_digest = _digest({"bars": session_bars, "quotes": session_quotes,
+                                 "options": session_options or ()})
+        shadow_signatures = []
+        for row in decisions:
+            if row.get("session_date") != session:
+                continue
+            signature = _shadow_signature(row)
+            if signature is not None:
+                shadow_signatures.append(signature)
+        shadow_signatures.sort(key=lambda row: _json(row))
+        shadow_digest = _digest(shadow_signatures)
+        cfg = _safe_config(candidate)
+        replay_digest = None
+        replay_ok = False
+        replay_signatures: list[dict[str, Any]] = []
+        evidence_rows: list[dict[str, Any]] = []
+        null_rows: list[dict[str, Any]] = []
+        null_account: dict[str, Any] = {}
+        starting_cash = float(self.config.equity)
+        ending_cash = starting_cash
+        realized_pnl = 0.0
+        details: dict[str, Any] = {"complete": False, "trade_count": 0,
+                                   "shadow_signatures": shadow_signatures,
+                                   "replay_signatures": replay_signatures}
+        def event_end(row: Mapping[str, Any]) -> datetime:
+            as_of = _timestamp(row.get("as_of"))
+            if as_of is not None:
+                return as_of
+            stamp = _timestamp(row.get("timestamp"))
+            return ((stamp + timedelta(seconds=60)) if stamp is not None else
+                    datetime.min.replace(tzinfo=UTC))
+
+        complete = any(event_end(row).astimezone(NEW_YORK).time() >= dt_time(16, 0)
+                       for row in session_bars)
+        try:
+            normalized_bars = [_normalize_row(row)[1] for row in session_bars]
+            normalized_quotes = [_normalize_row(row)[1] for row in session_quotes]
+            normalized_options = [_normalize_row(row)[1]
+                                 for row in (session_options or ())]
+            if str(candidate.get("strategy_id")) == "ibr":
+                replay_cfg, _ = _effective_ibr_config(cfg, {}, close_confirmed=True)
+                result = replay_ibr(normalized_bars, config=replay_cfg,
+                                    vehicle=str(candidate.get("vehicle") or "equity"), quotes=normalized_quotes)
+                trades = [_plain(trade) for trade in result.trades]
+                evidence_rows = trades
+                realized_pnl = sum(_finite(trade.get("net_pnl")) or 0.0
+                                   for trade in trades)
+                ending_cash = starting_cash + realized_pnl
+                replay_signatures = [signature for trade in trades
+                                     if (signature := _replay_signature(
+                                         trade, vehicle=str(candidate.get("vehicle") or "equity"),
+                                         strategy_id="ibr", target_r=replay_cfg.target_r)) is not None]
+                details.update(complete=complete, trade_count=len(trades), trades=trades,
+                               replay_signatures=replay_signatures)
+                # Persist the exact-window randomized-entry null alongside the
+                # candidate replay.  It is a diagnostic research source, not a
+                # runtime shadow decision, and therefore receives its own
+                # synthetic WAL candidate id below.
+                try:
+                    null_account = null_control_account(
+                        normalized_bars, normalized_options, _null_spec(replay_cfg),
+                        vehicle=str(candidate.get("vehicle") or "equity"),
+                        reference_rows=_null_reference_rows(
+                            result, normalized_bars,
+                            str(candidate.get("vehicle") or "equity")),
+                        account_id=f"shadow:null:{candidate_id}:{session}",
+                        starting_cash=float(self.config.equity), costs=replay_cfg.costs,
+                        quotes=normalized_quotes, fixed_quantity=replay_cfg.quantity,
+                        policy=_policy(cfg))
+                    null_rows = list(null_account.get("rows") or [])
+                    details["null_control"] = True
+                    details["null_trade_count"] = len([
+                        row for row in null_rows if row.get("no_trade") is not True])
+                except Exception as exc:
+                    details["null_control"] = False
+                    details["null_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                replay_ok = True
+            else:
+                strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
+                spec = strategy.get("rule_spec") if isinstance(strategy, Mapping) else None
+                if not isinstance(spec, Mapping):
+                    raise ValueError("rule candidate has no validated rule_spec")
+                policy = _policy(cfg)
+                account = simulate_account(
+                    normalized_bars, normalized_options,
+                    spec, vehicle=str(candidate.get("vehicle") or "equity"),
+                    account_id=f"shadow:{candidate_id}:{session}",
+                    starting_cash=float(self.config.equity),
+                    risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
+                    quotes=normalized_quotes, policy=policy)
+                rows = list(account.get("rows") or [])
+                evidence_rows = rows
+                starting_cash = _finite(account.get("starting_cash")) or starting_cash
+                ending_cash = _finite(account.get("ending_equity")) or starting_cash
+                realized_pnl = _finite(account.get("realized_pnl"))
+                if realized_pnl is None:
+                    realized_pnl = ending_cash - starting_cash
+                replay_signatures = [signature for trade in rows
+                                     if (signature := _replay_signature(
+                                         trade, vehicle=str(candidate.get("vehicle") or "equity"),
+                                         strategy_id="rule", target_r=float(spec.get("target_r", 2.0)),
+                                         setup_type=f"rule_{spec.get('family', 'signal')}")) is not None]
+                details.update(complete=complete, trade_count=len(replay_signatures),
+                               replay_signatures=replay_signatures, account=account)
+                try:
+                    null_account = null_control_account(
+                        normalized_bars, normalized_options, spec,
+                        vehicle=str(candidate.get("vehicle") or "equity"),
+                        reference_rows=rows,
+                        account_id=f"shadow:null:{candidate_id}:{session}",
+                        starting_cash=float(self.config.equity),
+                        risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
+                        costs=CostModel.from_config(cfg), quotes=normalized_quotes,
+                        policy=policy)
+                    null_rows = list(null_account.get("rows") or [])
+                    details["null_control"] = True
+                    details["null_trade_count"] = len([
+                        row for row in null_rows if row.get("no_trade") is not True])
+                except Exception as exc:
+                    details["null_control"] = False
+                    details["null_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+                replay_ok = True
+        except Exception as exc:
+            details.update(complete=complete, error=f"{type(exc).__name__}: {str(exc)[:240]}")
+        differences = _signature_diffs(shadow_signatures, replay_signatures)
+        replay_digest = _digest(replay_signatures) if details.get("complete") and replay_ok else None
+        details.update(signature_match=not differences,
+                       signature_mismatches=differences)
+        status = ("incomplete" if not details.get("complete") or not replay_ok or replay_digest is None
+                  else ("match" if not differences else "mismatch"))
+        if complete and replay_ok:
+            details["account_summary"] = {
+                "starting_cash": starting_cash,
+                "ending_cash": ending_cash,
+                "realized_pnl": realized_pnl,
+                "trade_count": len([row for row in evidence_rows
+                                     if row.get("no_trade") is not True]),
+                "replay_status": status,
+            }
+        self.store.replay_diff(candidate_id=candidate_id, session_date=session,
+                               source_digest=source_digest, shadow_digest=shadow_digest,
+                               replay_digest=replay_digest, status=status, details=details)
+        if complete and replay_ok and replay_digest is not None:
+            # Persist fills/exits/P&L in the isolated shadow database.  The
+            # rows are diagnostic while parity is mismatched; ``gate_rows``
+            # exposes them to existing gates only for a current ``match``.
+            self.store.record_replay_evidence(
+                candidate_id=candidate_id, session_date=session,
+                replay_digest=replay_digest,
+                vehicle=str(candidate.get("vehicle") or "equity"),
+                starting_cash=starting_cash, ending_cash=ending_cash,
+                realized_pnl=realized_pnl, trades=evidence_rows,
+                replay_status=status)
+            # Randomized-entry nulls are generated from this exact normalized
+            # session, so their source digest is identical.  They have no
+            # runtime semantic signature to compare; ``match`` here means the
+            # deterministic null replay completed, not that a broker decision
+            # matched it.
+            null_digest = _digest(null_rows)
+            null_candidate_id = f"shadow:null:{candidate_id}"
+            self.store.replay_diff(
+                candidate_id=null_candidate_id, session_date=session,
+                source_digest=source_digest, shadow_digest=_digest([]),
+                replay_digest=null_digest, status="match",
+                details={"complete": True, "signature_match": True,
+                         "null_control": True, "replay_signatures": [],
+                         "null_rows_digest": null_digest})
+            self.store.record_replay_evidence(
+                candidate_id=null_candidate_id, session_date=session,
+                replay_digest=null_digest,
+                vehicle=str(candidate.get("vehicle") or "equity"),
+                starting_cash=_finite(null_account.get("starting_cash")) or starting_cash,
+                ending_cash=_finite(null_account.get("ending_equity")) or starting_cash,
+                realized_pnl=_finite(null_account.get("realized_pnl")) or 0.0,
+                trades=null_rows, replay_status="match")
+        # A closing timestamp alone is not enough: malformed input or a
+        # replay exception must remain diagnostic and keep the virtual open
+        # blocked rather than silently declaring it settled.
+        if complete and replay_ok:
+            self.store.close_session_books(candidate_id, session)
+        return complete
+
+    def run_once(self) -> dict[str, Any]:
+        # Factory hypotheses can be registered by the research cycle between
+        # shadow polls; refresh the read-only root catalog for every pass.
+        self._factory_roots = _read_factory_rule_roots(self.config.edge_db)
+        candidates = _read_candidates(self.config.edge_db, max_candidates=self.config.max_candidates)
+        for candidate in candidates:
+            self.store.upsert_candidate(candidate)
+        ingested = 0
+        conflicts = 0
+        for raw in iter_corpus_rows(self.config.corpus_path):
+            try:
+                _, added = self.store.ingest_event(raw, max_events=self.config.max_events)
+            except InputConflict:
+                conflicts += 1
+                raise
+            if added:
+                ingested += 1
+        events, bars, quotes, options = self._load_events()
+        # Process one local session at a time.  A completed replay closes that
+        # session's virtual books before the next session is evaluated, which
+        # is essential when the recorder is catching up multiple sessions in
+        # a single invocation.  Replay receives the complete symbol set for a
+        # session; its diff row is unique by candidate/session and must not be
+        # overwritten once per symbol.
+        def row_session(row: Mapping[str, Any]) -> str | None:
+            stamp = _timestamp(row.get("as_of") or row.get("timestamp"))
+            return (stamp.astimezone(NEW_YORK).date().isoformat()
+                    if stamp is not None else None)
+
+        session_events: dict[str, list[dict]] = {}
+        for event in events:
+            if event.get("event_type") not in {"bar", "bar_1m"}:
+                continue
+            session = row_session(event)
+            if session is not None:
+                session_events.setdefault(session, []).append(event)
+
+        session_inputs: dict[str, tuple[list[dict], list[dict], list[dict]]] = {}
+        for session in sorted(session_events):
+            session_inputs[session] = (
+                [row for values in bars.values() for row in values
+                 if row_session(row) == session],
+                [row for values in quotes.values() for row in values
+                 if row_session(row) == session],
+                [row for values in options.values() for row in values
+                 if row_session(row) == session],
+            )
+
+        for candidate in candidates:
+            if str(candidate.get("vehicle") or "equity") not in {"equity", "option"}:
+                continue
+            cid = str(candidate["candidate_id"])
+            for session in sorted(session_events):
+                for event in session_events[session]:
+                    symbol = str(event.get("symbol"))
+                    if self.store.has_open(cid, symbol):
+                        kind, reason, payload, plan = (
+                            "no_trade", "virtual book has an incomplete open",
+                            {"session_date": session, "strategy_id": candidate.get("strategy_id"),
+                             "variant_id": candidate.get("variant_id")}, None)
+                    else:
+                        kind, reason, payload, plan = self._evaluate(candidate, event, bars, quotes, options)
+                    inserted = self.store.decision(
+                        candidate_id=cid, event_key=str(event["event_key"]),
+                        session_date=session, symbol=symbol, kind=kind, reason=reason,
+                        payload=payload, max_decisions=self.config.max_decisions)
+                    if inserted and plan is not None:
+                        self.store.virtual_open(
+                            candidate_id=cid,
+                            decision_id=_digest({"candidate_id": cid, "event_key": event["event_key"]}),
+                            symbol=symbol, plan=plan)
+
+                rows = self.store.decisions(cid)
+                session_bars, session_quotes, session_options = session_inputs[session]
+                self._replay(candidate, session, session_bars, session_quotes,
+                             rows, session_options)
+                root_control = self._rule_root_control(candidate)
+                if root_control is not None:
+                    self._replay(root_control, session, session_bars, session_quotes,
+                                 self.store.decisions(str(root_control["candidate_id"])),
+                                 session_options)
+        self.store.prune()
+        return {"candidates": len(candidates), "ingested_events": ingested,
+                "events": len(events), "decisions": len(self.store.decisions()),
+                "conflicts": conflicts}
+
+
+def run_shadow_once(config: ShadowConfig) -> dict[str, Any]:
+    """Convenience entrypoint used by operations and tests."""
+    return ShadowRunner(config).run_once()
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--corpus", type=Path, default=Path("runtime/research/recorded/data.csv"))
+    parser.add_argument("--edge-db", type=Path, default=Path("runtime/research/edge_lab.sqlite3"))
+    parser.add_argument("--shadow-db", type=Path, default=Path("runtime/research/shadow.sqlite3"))
+    parser.add_argument("--once", action="store_true", help="ingest and evaluate one cycle")
+    parser.add_argument("--interval", type=float, default=60.0)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    cfg = ShadowConfig(corpus_path=args.corpus, edge_db=args.edge_db,
+                       shadow_db=args.shadow_db, poll_seconds=args.interval)
+    while True:
+        try:
+            print(json.dumps(run_shadow_once(cfg), sort_keys=True), flush=True)
+        except Exception as exc:
+            print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), flush=True)
+            if args.once:
+                return 1
+        if args.once:
+            return 0
+        time.sleep(max(1.0, float(args.interval)))
+
+
+__all__ = [
+    "DEFAULT_EQUITY", "InputConflict", "ShadowConfig", "ShadowError",
+    "ShadowRunner", "ShadowStore", "run_shadow_once", "main",
+]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

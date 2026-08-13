@@ -23,6 +23,7 @@ from agent.contracts.rule import (BAR_SECONDS, RuleSpecError,
 from agent.engine import Engine
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
+from research.costs import ReplayPolicy
 from research.factory_core import _simulate_trade, simulate_account
 from research.market_data import normalize_underlying_bar
 
@@ -36,6 +37,12 @@ SPEC = validate_rule_spec({
 # is index 4 and the bounded hold expires at the end of index 7.
 RISING = [100.2, 100.4, 100.6, 100.8]
 FLAT = [100.8] * 8
+# These differential fixtures deliberately isolate bar-level exit geometry.
+# Production replay defaults to strict quote-backed fills; the test opts into
+# bar pricing explicitly instead of weakening that safe default.
+BAR_ONLY_POLICY = ReplayPolicy(strict_market_data=False)
+BAR_ONLY_SIZING_POLICY = ReplayPolicy(
+    strict_market_data=False, risk_per_trade_pct=.05)
 
 
 def _payloads(closes, opens=None, ranges=None):
@@ -304,7 +311,8 @@ class ExitContractDifferentialTests(unittest.TestCase):
     def _differential(self, closes, name, *, force_flat_from=None, opens=None,
                       ranges=None, start_index=5):
         bars = _bars(closes, opens, ranges)
-        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        simulated = _simulate_trade(
+            bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertIsNotNone(simulated)
         engine, plan = self._open_runtime_trade(bars, name)
         if force_flat_from is not None:
@@ -456,12 +464,14 @@ class ExitContractDifferentialTests(unittest.TestCase):
         # A resting broker leg does not wait for the close, so research must
         # not either; the local poller cannot observe this and is not driven.
         bars = _bars(RISING + FLAT, ranges={4: (100.85, 100.4)})
-        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        simulated = _simulate_trade(
+            bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertEqual(simulated["exit_reason"], "stop")
         self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
         self.assertAlmostEqual(simulated["exit_reference"], 100.5, places=9)
         bars = _bars(RISING + FLAT, ranges={4: (101.45, 100.75)})
-        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        simulated = _simulate_trade(
+            bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertEqual(simulated["exit_reason"], "target")
         self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
         self.assertAlmostEqual(simulated["exit_reference"], 101.4, places=9)
@@ -470,7 +480,8 @@ class ExitContractDifferentialTests(unittest.TestCase):
         # Both levels inside one bar's range: the intrabar path is unknowable,
         # so the established rule resolves it against the strategy.
         bars = _bars(RISING + FLAT, ranges={4: (101.45, 100.4)})
-        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        simulated = _simulate_trade(
+            bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertEqual(simulated["exit_reason"], "stop")
         self.assertIs(simulated["tie_broken"], True)
 
@@ -479,7 +490,8 @@ class ExitContractDifferentialTests(unittest.TestCase):
         # trade: the fill is the entry price, never the better level the
         # widened range would otherwise offer.
         bars = _bars(RISING + FLAT, opens={4: 100.3}, ranges={4: (100.9, 100.0)})
-        simulated = _simulate_trade(bars, SPEC, [], "equity")
+        simulated = _simulate_trade(
+            bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertEqual(simulated["exit_reason"], "stop")
         self.assertIs(simulated["entry_gap_fill"], True)
         self.assertEqual(simulated["exit_reference"], 100.3)
@@ -508,7 +520,7 @@ class GappedEntrySizingTests(unittest.TestCase):
     def _row(self, opens=None):
         book = simulate_account(_bars(RISING + FLAT, opens), [], SPEC,
                                 vehicle="equity", account_id="sizing",
-                                risk_pct=.05)
+                                risk_pct=.05, policy=BAR_ONLY_SIZING_POLICY)
         row = book["rows"][0]
         self.assertIs(row["no_trade"], False)
         return row
@@ -546,7 +558,7 @@ class GappedEntrySizingTests(unittest.TestCase):
     def test_an_entry_through_the_stop_is_booked_as_a_losing_trade(self):
         book = simulate_account(_bars(RISING + FLAT, {4: 100.3}), [], SPEC,
                                 vehicle="equity", account_id="sizing",
-                                risk_pct=.05)
+                                risk_pct=.05, policy=BAR_ONLY_SIZING_POLICY)
         row = book["rows"][0]
         # The runtime cannot see this gap: it submits, fills at 100.30, and the
         # resting stop leg triggers on arrival.  That is an executed trade.

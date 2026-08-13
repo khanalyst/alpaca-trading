@@ -8,7 +8,7 @@ orchestrator.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 import math
 from statistics import mean
 from typing import Any, Mapping, Sequence
@@ -18,11 +18,12 @@ from agent.contracts.rule import (
     RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, evaluate_rule_signal,
     hold_deadline, rule_variant_id, validate_rule_spec,
 )
-from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
+from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
 from .gates import max_drawdown_of
-from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
+from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
+                          option_has_liquidity)
 
 
 # `risk.max_position_notional_pct` in the checked runtime config.  Research
@@ -35,8 +36,11 @@ NOTIONAL_CAP_PCT = 25.0
 # still used, but charged the modelled half-spread instead of being trusted as
 # a fill.  Beyond five cycles it is not a fill price at all and the observation
 # is rejected explicitly rather than priced off a quote from another regime.
-FRESH_OPTION_QUOTE_SECONDS = 60.0
-MAX_OPTION_QUOTE_STALENESS_SECONDS = 300.0
+# Runtime execution rejects market data older than one recorder cycle.  These
+# constants are retained as named provenance for callers that persist replay
+# assumptions; an explicit ReplayPolicy may tighten them further.
+FRESH_OPTION_QUOTE_SECONDS = 30.0
+MAX_OPTION_QUOTE_STALENESS_SECONDS = 30.0
 
 DEFAULT_STRATEGIES = 7
 DEFAULT_VARIANTS = 4
@@ -144,31 +148,55 @@ def _visible(row: Any, cutoff: datetime) -> bool:
 
 
 def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
-               direction: str, cutoff: datetime, contract_symbol: str | None = None) -> OptionSnapshot | None:
+               direction: str, cutoff: datetime, contract_symbol: str | None = None,
+               policy: ReplayPolicy | Mapping[str, Any] | None = None) -> OptionSnapshot | None:
     right = "call" if direction == "long" else "put"
     # A pinned exit lookup always has at least the entry snapshot available, so
     # without this bound the "no quote" branch is unreachable and a contract
     # that stopped being quoted at 10:05 silently prices a 15:30 exit off its
     # last morning bid.  Bounding staleness turns that fabrication back into a
     # visible rejection.
-    floor = cutoff.timestamp() - MAX_OPTION_QUOTE_STALENESS_SECONDS
+    resolved_policy = (ReplayPolicy() if policy is None else
+                       (ReplayPolicy.from_config(policy)
+                        if isinstance(policy, Mapping) else policy))
+    max_age = resolved_policy.max_market_data_age_seconds
+    floor = cutoff.timestamp() - max_age
+    latest = sorted(snapshots, key=lambda item: (item.timestamp, item.contract.symbol))
     eligible = [snap for snap in snapshots
                 if snap.contract.underlying.upper() == symbol.upper()
                 and snap.session_date == day and snap.timestamp <= cutoff
                 and snap.timestamp.timestamp() >= floor
                 and _visible(snap, cutoff) and snap.bid > 0 and snap.ask > 0
+                # Runtime rejects 0DTE even when a configured lower bound is
+                # zero; research must preserve that hard executable boundary.
+                and (snap.contract.expiration - day).days >= max(
+                    1, resolved_policy.options_min_dte)
+                and (snap.contract.expiration - day).days <= resolved_policy.options_max_dte
+                and ((snap.ask - snap.bid) / ((snap.ask + snap.bid) / 2.0) * 100.0
+                     <= resolved_policy.options_max_spread_pct)
+                and option_has_liquidity(snap)
                 and (contract_symbol is None
                      or snap.contract.symbol == contract_symbol)
                 and (contract_symbol is not None or snap.contract.right.lower() == right)]
     if not eligible:
         return None
     if contract_symbol is not None:
-        return max(eligible, key=lambda item: item.timestamp)
-    spot = eligible[-1].underlying_price
+        return max(eligible, key=lambda item: (
+            item.timestamp, item.identity.as_of, item.bid, -item.ask))
+    # Snapshot input may be a set/dict-derived sequence.  Never use sequence
+    # order as a proxy for recency when choosing moneyness.
+    latest_spot = next((item.underlying_price for item in reversed(latest)
+                        if item in eligible and item.underlying_price), None)
+    spot = latest_spot
     return min(eligible, key=lambda item: (
         abs(item.contract.strike - (spot or item.contract.strike)),
         (item.ask - item.bid) / item.ask, -item.timestamp.timestamp(),
         item.contract.symbol))
+
+
+def _option_liquid(snapshot: OptionSnapshot) -> bool:
+    """Backward-compatible private alias for the shared runtime rule."""
+    return option_has_liquidity(snapshot)
 
 
 def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
@@ -185,18 +213,70 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
             "entry_timestamp": entry_bar.timestamp.isoformat()}
 
 
+def _coerce_policy(policy: ReplayPolicy | Mapping[str, Any] | None) -> ReplayPolicy:
+    if policy is None:
+        # Omitted policy is the checked runtime policy, not a permissive
+        # historical-fixture mode.  Tests/diagnostics that need bar fallback
+        # must opt out explicitly with ReplayPolicy(strict_market_data=False).
+        return ReplayPolicy()
+    return ReplayPolicy.from_config(policy) if isinstance(policy, Mapping) else policy
+
+
+def _session_bars_valid(rows: Sequence[UnderlyingBar]) -> bool:
+    """Reject malformed replay streams without repairing them by sorting."""
+    if not rows:
+        return False
+    seen: set[datetime] = set()
+    previous: datetime | None = None
+    for row in rows:
+        if row.interval_seconds != 60 or row.timestamp in seen:
+            return False
+        if previous is not None and row.timestamp <= previous:
+            return False
+        seen.add(row.timestamp)
+        previous = row.timestamp
+    for left, right in zip(rows, rows[1:]):
+        if right.timestamp - left.timestamp != timedelta(minutes=1):
+            return False
+    return True
+
+
+def _at_or_before_force_flat(timestamp: datetime, policy: ReplayPolicy) -> bool:
+    if policy.force_flat_time is None:
+        return True
+    local = timestamp.astimezone(ZoneInfo("America/New_York"))
+    return local.time() < policy.force_flat_time
+
+
 def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, Any],
                     snapshots: Sequence[OptionSnapshot], vehicle: str,
-                    quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None) -> dict | None:
+                    quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None,
+                    policy: ReplayPolicy | Mapping[str, Any] | None = None) -> dict | None:
+    resolved_policy = _coerce_policy(policy)
+    if not _session_bars_valid(session_bars):
+        return None
     for index in range(1, len(session_bars) - 1):
         signal_bar = session_bars[index]
-        if not _visible(signal_bar, signal_bar.end):
+        # Every feature prefix is point-in-time visible at the signal cutoff;
+        # checking only the latest candle lets a corrected historical bar leak
+        # into an otherwise valid-looking signal.
+        if not _visible(signal_bar, signal_bar.end) or not all(
+                _visible(item, signal_bar.end)
+                for item in session_bars[:index + 1]):
             continue
         signal = evaluate_rule_signal(session_bars[:index + 1], spec)
         if signal is None:
             continue
         entry_bar = session_bars[index + 1]
-        if not _visible(entry_bar, entry_bar.end):
+        # The completed bar record is not visible until its end, but its open
+        # is the boundary observation used for next-bar entry.  Never consume
+        # the entry bar's high/low/close before that bar ends; executable entry
+        # pricing below still requires a point-in-time quote at this boundary.
+        local_entry = entry_bar.timestamp.astimezone(ZoneInfo("America/New_York"))
+        if (resolved_policy.latest_entry_time is not None and
+                local_entry.time() > resolved_policy.latest_entry_time):
+            continue
+        if not _at_or_before_force_flat(entry_bar.timestamp, resolved_policy):
             continue
         direction = signal["direction"]
         entry_underlying = float(entry_bar.open)
@@ -218,10 +298,14 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         for probe in range(index + 2, len(session_bars)):
             if session_bars[probe].end.timestamp() > deadline:
                 break
+            if not _at_or_before_force_flat(session_bars[probe].timestamp,
+                                            resolved_policy):
+                break
             last_index = probe
         exit_bar = session_bars[last_index]
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
+        pricing_cutoff = exit_at
         reason = "time"
         tie = False
         gapped = False
@@ -241,7 +325,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             reason = "stop" if through_stop else "target"
             exit_ref = entry_underlying
             exit_bar = entry_bar
-            exit_at = entry_bar.timestamp
+            # The resting leg can execute at the entry boundary, but the
+            # completed-bar replay only observes and records that outcome at
+            # the bar close.  Pricing stays pinned to the earlier executable
+            # instant so no later quote leaks into the fill.
+            exit_at = entry_bar.end
+            pricing_cutoff = entry_bar.timestamp
         else:
             # The scan starts at the entry bar, not the one after it.  Since
             # commit 11e87c8 the broker's bracket legs are live the moment the
@@ -268,14 +357,20 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                     # that is exactly the point of modelling it.
                     reason = "stop" if gap_stop else "target"
                     exit_ref, exit_bar = float(bar.open), bar
-                    exit_at, exit_gapped = bar.timestamp, True
+                    exit_at, pricing_cutoff, exit_gapped = (
+                        bar.end, bar.timestamp, True)
                     break
                 if hit_stop or hit_target:
                     tie = hit_stop and hit_target
                     reason = "stop" if hit_stop else "target"
                     exit_ref = stop if hit_stop else target
                     exit_bar = bar
+                    # Minute bars do not reveal the intrabar trigger instant.
+                    # Price option exits only from information available at
+                    # the bar open; a later quote from the same bar would be
+                    # lookahead relative to an unknown trigger.
                     exit_at = bar.end
+                    pricing_cutoff = bar.timestamp
                     break
         day = signal_bar.session_date
         multiplier = 1
@@ -287,26 +382,42 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # recorded quote is its executable price.  A level-triggered exit
             # inside a bar has no such instant and keeps the bar's level.
             side = "buy" if direction == "long" else "sell"
-            quoted = quote_fill(quotes, symbol=signal_bar.symbol,
-                                at=entry_bar.timestamp, side=side)
+            quoted = quote_fill(
+                quotes, symbol=signal_bar.symbol, at=entry_bar.timestamp,
+                side=side,
+                max_age_seconds=resolved_policy.max_market_data_age_seconds,
+                session_date=day)
             if quoted is not None:
                 entry_ref, entry_source = quoted, QUOTE
+            elif resolved_policy.strict_market_data:
+                return _unpriced(signal_bar, entry_bar, day, direction,
+                                 "no fresh equity quote at entry")
             if reason == "time" or gapped or exit_gapped:
                 quoted_exit = quote_fill(
-                    quotes, symbol=signal_bar.symbol, at=exit_at,
-                    side="sell" if direction == "long" else "buy")
+                    quotes, symbol=signal_bar.symbol, at=pricing_cutoff,
+                    side="sell" if direction == "long" else "buy",
+                    max_age_seconds=resolved_policy.max_market_data_age_seconds,
+                    session_date=day)
                 if quoted_exit is not None:
                     exit_ref, exit_source = quoted_exit, QUOTE
+                elif resolved_policy.strict_market_data:
+                    return _unpriced(signal_bar, entry_bar, day, direction,
+                                     "no fresh equity quote at exit")
         entry_age = exit_age = 0.0
         if vehicle == "option":
             entry_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
-                                    direction=direction, cutoff=entry_bar.end)
+                                    direction=direction, cutoff=entry_bar.timestamp,
+                                    policy=resolved_policy)
             if entry_snap is None:
                 return _unpriced(signal_bar, entry_bar, day, direction,
                                  "no option quote within staleness bound at entry")
             exit_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
-                                   direction=direction, cutoff=exit_bar.end,
-                                   contract_symbol=entry_snap.contract.symbol)
+                                   direction=direction,
+                                   cutoff=(pricing_cutoff if
+                                           resolved_policy.strict_market_data else
+                                           exit_bar.end),
+                                   contract_symbol=entry_snap.contract.symbol,
+                                   policy=resolved_policy)
             if exit_snap is None:
                 return _unpriced(signal_bar, entry_bar, day, direction,
                                  "entry contract stopped being quoted before exit",
@@ -318,14 +429,17 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # A snapshot inside the exit bar but after a level-triggered instant
             # is not stale, it is simply the bar's quote; only genuinely older
             # quotes carry an age.
-            entry_age = max(0.0, (entry_bar.end - entry_snap.timestamp).total_seconds())
-            exit_age = max(0.0, (exit_at - exit_snap.timestamp).total_seconds())
+            entry_age = max(0.0, (entry_bar.timestamp - entry_snap.timestamp).total_seconds())
+            exit_age = max(0.0, (pricing_cutoff - exit_snap.timestamp).total_seconds())
         return {
             "vehicle": vehicle, "symbol": signal_bar.symbol,
             "session_date": day.isoformat(), "direction": direction,
             "signal_timestamp": signal_bar.end.isoformat(),
             "entry_timestamp": entry_bar.timestamp.isoformat(),
-            "exit_timestamp": exit_bar.end.isoformat(),
+            # A gap exit happens at the bar open; an intrabar level exit is
+            # conservatively represented at the completed bar cutoff used for
+            # its bar-level price.  Never imply a quote after the trigger.
+            "exit_timestamp": exit_at.isoformat(),
             "entry_reference": entry_ref, "exit_reference": exit_ref,
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
@@ -348,97 +462,219 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     return None
 
 
-def _fresh(raw: Mapping[str, Any], leg: str) -> bool:
-    return float(raw.get(f"{leg}_quote_age_seconds") or 0.0) <= FRESH_OPTION_QUOTE_SECONDS
+def _fresh(raw: Mapping[str, Any], leg: str,
+           max_age_seconds: float | None = None) -> bool:
+    limit = FRESH_OPTION_QUOTE_SECONDS if max_age_seconds is None else float(max_age_seconds)
+    return float(raw.get(f"{leg}_quote_age_seconds") or 0.0) <= limit
+
+
+def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime) -> float | None:
+    """Return the last bar price that was observable at ``cutoff``.
+
+    A bar's open is the boundary observation used for an entry at its
+    timestamp (the same convention used by :func:`_simulate_trade`).  A
+    partial bar otherwise contributes nothing until its completed record is
+    visible, so its close/high/low can never leak into an earlier mark.
+    """
+    for row in reversed(rows):
+        if row.timestamp == cutoff:
+            return float(row.open)
+        if row.end <= cutoff and _visible(row, row.end):
+            return float(row.close)
+    return None
 
 
 def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSnapshot],
                      spec: Mapping[str, Any], *, vehicle: str, account_id: str,
                      starting_cash: float = 100_000.0, risk_pct: float = .5,
                      costs: CostModel | None = None,
-                     quotes: Sequence[QuoteSnapshot] | None = None) -> dict:
-    """Replay one variant in a completely isolated cash/equity book."""
+                     quotes: Sequence[QuoteSnapshot] | None = None,
+                     policy: ReplayPolicy | Mapping[str, Any] | None = None) -> dict:
+    """Replay one variant in an event-ordered isolated cash/equity book."""
     spec = validate_rule_spec(spec)
     model = costs or CostModel()
+    # Keep the explicit risk_pct argument meaningful for direct callers while
+    # still applying the safe ReplayPolicy defaults when no policy is passed.
+    resolved_policy = (_coerce_policy(policy) if policy is not None else
+                       ReplayPolicy(risk_per_trade_pct=float(risk_pct)))
     quote_index = index_quotes(quotes)
     grouped: dict[tuple[str, date], list[UnderlyingBar]] = {}
-    for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
+    for bar in bars:
         grouped.setdefault((bar.symbol, bar.session_date), []).append(bar)
-    cash = float(starting_cash)
-    peak = cash
-    drawdown = 0.0
-    rows = []
-    for (symbol, day), session_bars in sorted(grouped.items(), key=lambda item: (item[0][1], item[0][0])):
+    rows: list[dict] = []
+    candidates: list[dict] = []
+    bars_by_symbol: dict[str, list[UnderlyingBar]] = {}
+    for bar in bars:
+        bars_by_symbol.setdefault(str(bar.symbol).upper(), []).append(bar)
+    for symbol_rows in bars_by_symbol.values():
+        symbol_rows.sort(key=lambda item: item.timestamp)
+    for (symbol, day), session_bars in sorted(
+            grouped.items(), key=lambda item: (item[0][1], item[0][0])):
         opportunity = f"{rule_variant_id(spec)}:{vehicle}:{symbol}:{day.isoformat()}"
         raw = _simulate_trade(session_bars, spec, snapshots, vehicle,
-                              quotes=quote_index)
+                              quotes=quote_index, policy=resolved_policy)
         if raw is None or raw.get("unpriced_reason"):
             row = {"vehicle": vehicle, "symbol": symbol,
                    "session_date": day.isoformat(), "opportunity_id": opportunity,
                    "net_pnl": 0.0, "return_value": 0.0, "no_trade": True}
             if raw is not None:
-                # A no-trade row keeps the session in the structural sample and
-                # out of expectancy/win-rate, which is exactly right: this was a
-                # signal that could not be filled, not a flat trade.
                 row.update({key: value for key, value in raw.items()
                             if key != "unpriced_reason"})
                 row["reject_reason"] = str(raw["unpriced_reason"])
             rows.append(row)
             continue
-        risk_budget = max(0.0, cash * float(risk_pct) / 100.0)
+        candidates.append({**raw, "opportunity_id": opportunity,
+                           "_symbol": symbol, "_day": day})
+
+    cash = float(starting_cash)
+    peak = cash
+    drawdown = 0.0
+    active: list[dict] = []
+    realized_by_day: dict[str, float] = {}
+    day_start_equity: dict[str, float] = {}
+
+    def realize_until(timestamp: datetime) -> None:
+        nonlocal cash, peak, drawdown
+        closing = [item for item in active
+                   if datetime.fromisoformat(item["exit_timestamp"]) <= timestamp]
+        for item in sorted(closing, key=lambda value: (
+                value["exit_timestamp"], value["symbol"])):
+            cash += float(item["net_pnl"])
+            day_key = item["session_date"]
+            realized_by_day[day_key] = realized_by_day.get(day_key, 0.0) + float(item["net_pnl"])
+            peak = max(peak, cash)
+            drawdown = max(drawdown, peak - cash)
+            active.remove(item)
+
+    def mark_active(timestamp: datetime) -> float:
+        """Mark open positions from information visible at ``timestamp``.
+
+        Equity marks prefer the executable side of a fresh recorded quote and
+        fall back to the exact bar open/last completed close.  Long options
+        use the visible bid for liquidation.  Closed rows are removed by
+        ``realize_until`` before this function runs, so realized P&L and
+        unrealized P&L cannot be counted twice.
+        """
+        unrealized = 0.0
+        for item in active:
+            symbol = str(item.get("symbol", "")).upper()
+            direction = str(item.get("direction", "long"))
+            mark: float | None = None
+            if vehicle == "option":
+                snap = _option_at(
+                    snapshots, symbol=symbol,
+                    day=date.fromisoformat(str(item["session_date"])),
+                    direction=direction, cutoff=timestamp,
+                    contract_symbol=item.get("contract"), policy=resolved_policy)
+                if snap is not None:
+                    mark = float(snap.bid)
+            else:
+                side = "sell" if direction == "long" else "buy"
+                mark = quote_fill(
+                    quote_index, symbol=symbol, at=timestamp, side=side,
+                    max_age_seconds=resolved_policy.max_market_data_age_seconds,
+                    session_date=date.fromisoformat(str(item["session_date"])))
+                if mark is None:
+                    mark = _visible_bar_mark(bars_by_symbol.get(symbol, ()), timestamp)
+            if mark is None:
+                # No visible mark is a zero-move assumption, not permission to
+                # inspect a future exit price.  Entry-side fees still reduce
+                # equity immediately, as they do in the runtime account.
+                mark = float(item["entry_price"])
+            quantity = float(item.get("quantity", 0.0))
+            multiplier = float(item.get("contract_multiplier", 1))
+            entry = float(item["entry_price"])
+            gross = ((mark - entry) if direction == "long" else
+                     (entry - mark)) * quantity * multiplier
+            entry_fees = model.fees(
+                entry, entry, quantity, multiplier, vehicle=vehicle) / 2.0
+            unrealized += gross - entry_fees
+        return unrealized
+
+    for raw in sorted(candidates, key=lambda item: (
+            item["entry_timestamp"], item["_symbol"], item["_day"])):
+        entry_at = datetime.fromisoformat(raw["entry_timestamp"])
+        realize_until(entry_at)
+        symbol, day, opportunity = raw["_symbol"], raw["_day"], raw["opportunity_id"]
+        day_key = day.isoformat()
+        day_start_equity.setdefault(day_key, cash)
+        current_equity = cash + mark_active(entry_at)
+        effective_risk_pct = float(resolved_policy.risk_per_trade_pct)
+        risk_budget = max(0.0, current_equity * effective_risk_pct / 100.0)
         per_unit = max(float(raw["risk_per_unit"]), 1e-9)
         quantity = math.floor(risk_budget / per_unit)
         if vehicle == "equity":
-            # `RiskEngine.size_shares` caps notional at plan time against the
-            # same signal-close price it prices the bracket from.  Capping on
-            # the gapped fill instead would silently size a different position
-            # than the runtime, exactly as the stop anchor once did.
-            notional_cap = max(0.0, cash * NOTIONAL_CAP_PCT / 100.0)
-            quantity = min(quantity, math.floor(notional_cap / max(float(raw["plan_entry"]), 1e-9)))
+            notional_pct = (NOTIONAL_CAP_PCT if
+                            resolved_policy.max_position_notional_pct is None else
+                            resolved_policy.max_position_notional_pct)
+            quantity = min(quantity, math.floor(
+                max(0.0, current_equity * float(notional_pct) / 100.0) /
+                max(float(raw["plan_entry"]), 1e-9)))
+        elif resolved_policy.max_position_notional_pct is not None:
+            quantity = min(quantity, math.floor(
+                max(0.0, current_equity * float(resolved_policy.max_position_notional_pct) / 100.0) /
+                max(float(raw["entry_reference"]) * int(raw["contract_multiplier"]), 1e-9)))
+        multiplier = int(raw["contract_multiplier"])
+        risk_usd = quantity * float(raw["realized_risk_per_unit"])
+        entry_notional = float(raw["entry_reference"]) * quantity * multiplier
+        reject_reason = None
+        if (resolved_policy.max_concurrent_positions is not None and
+                len(active) >= resolved_policy.max_concurrent_positions):
+            reject_reason = "max concurrent positions reached"
+        elif (resolved_policy.max_gross_exposure_pct is not None and
+              sum(float(item.get("entry_notional", 0.0)) for item in active) + entry_notional >
+              current_equity * float(resolved_policy.max_gross_exposure_pct) / 100.0):
+            reject_reason = "buying power/notional limit reached"
+        elif (resolved_policy.max_open_risk_pct is not None and
+              sum(float(item.get("risk_usd", 0.0)) for item in active) + risk_usd >
+              current_equity * float(resolved_policy.max_open_risk_pct) / 100.0):
+            reject_reason = "max open risk reached"
+        elif (resolved_policy.daily_loss_limit_pct is not None and
+              current_equity - day_start_equity[day_key] <=
+              -day_start_equity[day_key] *
+              float(resolved_policy.daily_loss_limit_pct) / 100.0):
+            reject_reason = "daily loss limit reached"
         if quantity <= 0:
+            reject_reason = reject_reason or "isolated account risk budget cannot fund one unit"
+        if reject_reason:
             rows.append({"vehicle": vehicle, "symbol": symbol,
                          "session_date": day.isoformat(), "opportunity_id": opportunity,
                          "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
-                         "reject_reason": "isolated account risk budget cannot fund one unit"})
+                         "reject_reason": reject_reason})
             continue
         execution_direction = "long" if vehicle == "option" else raw["direction"]
-        # An option bid/ask is executable only while it is current.  A quote
-        # older than one recorder cycle is an approximation of the fill, so it
-        # is charged the modelled half-spread rather than trusted at face value.
-        fresh = vehicle == "option" and _fresh(raw, "entry")
         entry = model.execution_price(
             raw["entry_reference"], execution_direction, entry=True,
-            executable_quote=fresh or raw.get("entry_fill_source") == QUOTE)
-        fresh = vehicle == "option" and _fresh(raw, "exit")
+            executable_quote=(vehicle == "option" and _fresh(
+                raw, "entry", resolved_policy.max_market_data_age_seconds)) or
+            raw.get("entry_fill_source") == QUOTE)
         exit_price = model.execution_price(
             raw["exit_reference"], execution_direction, entry=False,
-            executable_quote=fresh or raw.get("exit_fill_source") == QUOTE)
-        multiplier = int(raw["contract_multiplier"])
+            executable_quote=(vehicle == "option" and _fresh(
+                raw, "exit", resolved_policy.max_market_data_age_seconds)) or
+            raw.get("exit_fill_source") == QUOTE)
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
-        fees = model.fees(entry, exit_price, quantity, multiplier)
+        fees = model.fees(entry, exit_price, quantity, multiplier, vehicle=vehicle)
         net = gross - fees
-        before = cash
-        cash += net
-        peak = max(peak, cash)
-        drawdown = max(drawdown, peak - cash)
-        # Size on the nominal distance because the runtime does; report the risk
-        # the fill actually committed, which a gapped entry can push past the
-        # budget the sizing believed it was spending.
-        risk_usd = quantity * float(raw["realized_risk_per_unit"])
-        rows.append({**raw, "opportunity_id": opportunity, "quantity": quantity,
-                     "entry_price": entry, "exit_price": exit_price,
-                     "gross_pnl": gross, "costs": fees, "net_pnl": net,
-                     "risk_budget": risk_budget, "risk_usd": risk_usd,
-                     "r_multiple": net / risk_usd if risk_usd > 0 else None,
-                     "return_value": net / before if before > 0 else 0.0,
-                     "no_trade": False})
+        row = {key: value for key, value in raw.items() if not key.startswith("_")}
+        row.update({"quantity": quantity, "entry_price": entry, "exit_price": exit_price,
+                    "gross_pnl": gross, "costs": fees, "net_pnl": net,
+                    "risk_budget": risk_budget, "risk_usd": risk_usd,
+                    "r_multiple": net / risk_usd if risk_usd > 0 else None,
+                    "return_value": net / cash if cash > 0 else 0.0,
+                    "no_trade": False, "entry_notional": entry_notional})
+        rows.append(row)
+        active.append(row)
+    if active:
+        realize_until(max(datetime.fromisoformat(item["exit_timestamp"]) for item in active))
+    rows.sort(key=lambda row: (str(row.get("session_date", "")),
+                               str(row.get("symbol", "")),
+                               str(row.get("entry_timestamp", ""))))
     executed = [row for row in rows if row.get("no_trade") is not True]
-    return {
-        "account_id": account_id, "starting_cash": float(starting_cash),
-        "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
-        "max_drawdown": drawdown, "trades": len(executed), "rows": rows,
-    }
+    return {"account_id": account_id, "starting_cash": float(starting_cash),
+            "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
+            "max_drawdown": drawdown, "trades": len(executed), "rows": rows}
 
 
 def diagnose(rows: Sequence[Mapping], *, starting_cash: float = 100_000.0) -> dict:
@@ -635,7 +871,12 @@ _DISCOVERY_SHAPES: tuple[tuple[str, float, float, int], ...] = (
     ("long", 2.0, 1.0, 60), ("short", 2.0, 1.0, 60), ("both", 1.5, 2.0, 45),
     ("both", 4.0, 1.0, 240),
 )
-MAX_DISCOVERY_ATTEMPTS = 512
+# One complete Cartesian traversal is the bounded search contract.  Derive the
+# cap from the declared dimensions so adding an axis cannot silently make the
+# tail unreachable.
+MAX_DISCOVERY_ATTEMPTS = (
+    len(_DISCOVERY_WINDOWS) * len(_DISCOVERY_CONFIRMATIONS) *
+    len(_DISCOVERY_BANDS) * len(_DISCOVERY_SHAPES))
 
 
 def discovery_spec(index: int, *, family: str) -> dict[str, Any]:

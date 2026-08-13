@@ -26,6 +26,19 @@ from .stats import (
 
 
 GATE_ENVELOPE_SCHEMA = "verified-research-gate.v2"
+GATE_REQUIRED_CHECKS = frozenset({
+    "actual_control_available", "fit_delta_positive",
+    "heldout_delta_positive", "heldout_p_significant",
+    "heldout_delta_lcb_positive", "heldout_net_pnl_positive",
+    "heldout_expectancy_positive", "falsification", "separated",
+    "walk_forward_available", "walk_forward_adequate",
+    "walk_forward_majority_positive", "null_control_available",
+    "null_control_delta_positive", "fit_floor_adequate", "heldout_floor_adequate",
+    "family_fdr_significant", "global_fdr_significant",
+    "cumulative_fdr_significant", "qualification_available",
+    "qualification_net_positive", "qualification_delta_positive",
+    "max_drawdown_supported",
+})
 CLUSTER_SECONDS = 86_400
 LOWER_BOUND_CONFIDENCE = .95
 # Qualification observations are source evidence carried outside the run's
@@ -114,23 +127,101 @@ def _session_key(row: Mapping) -> str:
 
 def structural_floor(rows: Iterable[Mapping], *, vehicle: str,
                      min_trades: int, min_sessions: int,
-                     min_clusters: int = 0, required: bool = True) -> dict:
+                     min_clusters: int = 0, required: bool = True,
+                     available_sessions: int | None = None,
+                     universe_size: int | None = None,
+                     signal_opportunities: int | None = None,
+                     target_total: int | None = None) -> dict:
     """Report structural adequacy without treating profitability as sample size.
 
     Profitability is deliberately absent here.  ``AcceptanceFloor.min_net_pnl``
     is exercised by :func:`performance_floor`, which is a separate, mandatory
     gate check rather than a sample-size statement.
     """
+    materialized = list(rows)
     report = AcceptanceFloor(
         min_trades=min_trades, min_sessions=min_sessions,
         min_clusters=min_clusters,
-    ).check(rows, vehicle=vehicle)
+    ).check(materialized, vehicle=vehicle)
     report["minimums"] = {"trades": int(min_trades),
                           "sessions": int(min_sessions),
                           "clusters": int(min_clusters)}
     report["required"] = bool(required)
     report["adequate"] = bool(report["structural_passes"] if required else True)
+    report["feasibility"] = floor_feasibility(
+        materialized, vehicle=vehicle, min_trades=min_trades,
+        min_sessions=min_sessions, min_clusters=min_clusters,
+        available_sessions=available_sessions, universe_size=universe_size,
+        signal_opportunities=signal_opportunities, target_total=target_total)
     return report
+
+
+def floor_feasibility(rows: Iterable[Mapping], *, vehicle: str,
+                      min_trades: int, min_sessions: int,
+                      min_clusters: int = 0,
+                      available_sessions: int | None = None,
+                      universe_size: int | None = None,
+                      signal_opportunities: int | None = None,
+                      target_total: int | None = None) -> dict:
+    """Classify whether a floor is impossible, underpowered or inconclusive.
+
+    A failed structural floor is not automatically a negative result.  The
+    potential sample is estimated from all rows (including explicit
+    ``no_trade`` opportunities), while callers may provide a stronger bound
+    from the full session/universe inventory.  This report is deliberately
+    descriptive and never lowers a configured floor.
+    """
+    materialized = [row for row in rows if row.get("vehicle", vehicle) == vehicle]
+    sessions = {str(_session_key(row)) for row in materialized if _session_key(row)}
+    clusters = {str(row.get("cluster") or _session_key(row))
+                for row in materialized if row.get("cluster") or _session_key(row)}
+    observed_trades = sum(1 for row in materialized if row.get("no_trade") is not True)
+    capacity_explicit = (available_sessions is not None or universe_size is not None or
+                          signal_opportunities is not None or target_total is not None)
+    available = len(sessions) if available_sessions is None else max(0, int(available_sessions))
+    opportunities = (len(materialized) if signal_opportunities is None
+                     else max(0, int(signal_opportunities)))
+    if target_total is not None:
+        opportunities = max(opportunities, int(target_total))
+    if universe_size is not None and available:
+        opportunities = max(opportunities, int(universe_size) * available)
+    impossible_reasons = []
+    if available < int(min_sessions):
+        impossible_reasons.append("available_sessions_below_minimum")
+    if opportunities < int(min_trades):
+        impossible_reasons.append("available_opportunities_below_minimum")
+    if min_clusters and len(clusters) < int(min_clusters) and available < int(min_clusters):
+        impossible_reasons.append("available_clusters_below_minimum")
+    structural_pass = (observed_trades >= int(min_trades) and
+                        len(sessions) >= int(min_sessions) and
+                        len(clusters) >= int(min_clusters))
+    net_pnl = sum(float(row.get("net_pnl", 0.0)) for row in materialized)
+    if impossible_reasons and capacity_explicit:
+        status = "impossible"
+    elif structural_pass and net_pnl < 0:
+        status = "negative"
+    elif structural_pass:
+        status = "inconclusive"
+    else:
+        status = "underpowered"
+    return {
+        "status": status,
+        "classification": status,
+        "observed": {"trades": observed_trades, "sessions": len(sessions),
+                      "clusters": len(clusters)},
+        "available": {"trades": opportunities, "sessions": available,
+                      "clusters": max(len(clusters), available)},
+        "minimums": {"trades": int(min_trades), "sessions": int(min_sessions),
+                     "clusters": int(min_clusters)},
+        "shortfall": {"trades": max(0, int(min_trades) - observed_trades),
+                      "sessions": max(0, int(min_sessions) - len(sessions)),
+                      "clusters": max(0, int(min_clusters) - len(clusters))},
+        "reasons": impossible_reasons or (["sample_below_floor"]
+                   if not structural_pass else (["negative_performance"]
+                   if net_pnl < 0 else ["floor_met_but_performance_untested"])),
+        "net_pnl": net_pnl,
+        "adequate": bool(structural_pass),
+    }
 
 
 def performance_floor(rows: Iterable[Mapping], *, vehicle: str,
@@ -378,12 +469,16 @@ def sample_counts(rows: Iterable[Mapping], *, vehicle: str) -> dict:
 
 
 def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
-                        vehicle: str, folds: int = 3) -> dict:
-    """Roll the origin forward and require a majority of positive test folds.
+                        vehicle: str, folds: int = 3,
+                        min_fit_sessions: int = 1,
+                        min_test_sessions: int = 1,
+                        min_test_trades: int = 1) -> dict:
+    """Return deterministic rolling-origin *forward stability* evidence.
 
-    Each fold trains on every session before its test block, so no fold ever
-    scores a period that precedes its own fit window.  A single chronological
-    cut can be survived by one lucky regime; a majority requirement cannot.
+    The rules are fixed; no refit is implied.  Each test fold is a contiguous
+    multi-session block and its fit window contains only earlier sessions.
+    Fold adequacy is reported separately from positivity so an empty or
+    underpowered fold can never be mistaken for a negative result.
     """
     if int(folds) < 2:
         raise ValueError("walk-forward requires at least two folds")
@@ -391,40 +486,79 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
                                                  str(row.get("entry_timestamp", ""))))
     sessions = sorted({_session_key(row) for row in ordered if _session_key(row)})
     count = int(folds)
-    # One fit block plus ``folds`` test blocks must each hold a whole session.
-    if len(sessions) < count + 1:
+    fit_min = max(1, int(min_fit_sessions))
+    test_min = max(1, int(min_test_sessions))
+    trade_min = max(1, int(min_test_trades))
+    # Keep an initial fit history, then divide the remaining sessions into
+    # deterministic contiguous test blocks.  ``divmod`` makes the earliest
+    # blocks receive the extra session and is stable across processes.
+    tail = sessions[fit_min:]
+    if len(sessions) < fit_min + count * test_min or len(tail) < count:
         return {"available": False, "folds": count, "tested_folds": 0,
-                "positive_folds": 0, "majority_positive": False,
-                "sessions": len(sessions), "results": []}
-    start = len(sessions) - count
+                "positive_folds": 0, "adequate_folds": 0,
+                "majority_positive": False, "adequate": False,
+                "sessions": len(sessions), "fit_sessions_required": fit_min,
+                "test_sessions_required": test_min, "results": [], "fold_reports": []}
+    block_count = min(count, len(tail))
+    base, extra = divmod(len(tail), block_count)
+    blocks = []
+    cursor = 0
+    for index in range(block_count):
+        width = base + (1 if index < extra else 0)
+        blocks.append(tail[cursor:cursor + width])
+        cursor += width
     results = []
-    for index in range(count):
-        test_sessions = {sessions[start + index]}
-        fit_sessions = set(sessions[:start + index])
+    for index, block in enumerate(blocks):
+        test_sessions = set(block)
+        fit_sessions = set(sessions[:sessions.index(block[0])])
         test_rows = [row for row in ordered if _session_key(row) in test_sessions]
         base_rows = [row for row in baseline if _session_key(row) in test_sessions]
         pairs = matched_pairs(test_rows, base_rows, vehicle=vehicle)
         delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
         net = sum(float(row.get("net_pnl", 0.0)) for row in test_rows)
+        test_trades = sum(1 for row in test_rows if row.get("no_trade") is not True)
+        adequate = bool(len(fit_sessions) >= fit_min and
+                        len(test_sessions) >= test_min and
+                        test_trades >= trade_min and pairs["matched"] >= trade_min)
         results.append({"fold": index, "fit_sessions": len(fit_sessions),
                         "test_sessions": sorted(test_sessions),
-                        "matched": pairs["matched"], "mean_delta": delta,
-                        "net_pnl": net,
-                        "positive": bool(delta is not None and delta > 0 and net > 0)})
-    positive = sum(1 for item in results if item["positive"])
-    return {"available": True, "folds": count, "tested_folds": len(results),
+                        "matched": pairs["matched"], "test_trades": test_trades,
+                        "mean_delta": delta, "net_pnl": net,
+                        "adequate": adequate,
+                        "adequacy_reason": ("ok" if adequate else
+                            "fit_or_test_floor_not_met"),
+                        "positive": bool(adequate and delta is not None and
+                                          delta > 0 and net > 0)})
+    adequate_results = [item for item in results if item["adequate"]]
+    positive = sum(1 for item in adequate_results if item["positive"])
+    return {"available": bool(adequate_results), "folds": count,
+            "tested_folds": len(results), "adequate_folds": len(adequate_results),
             "positive_folds": positive,
-            "majority_positive": bool(positive * 2 > len(results)),
-            "sessions": len(sessions), "results": results}
+            "majority_positive": bool(adequate_results and
+                                       positive * 2 > len(adequate_results)),
+            "adequate": bool(len(adequate_results) == len(results) and results),
+            "sessions": len(sessions), "fit_sessions_required": fit_min,
+            "test_sessions_required": test_min, "test_trades_required": trade_min,
+            "method": "fixed-rule_rolling-origin_forward-stability",
+            "results": results, "fold_reports": results}
 
 
 def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
-                         vehicle: str, sessions: Sequence[str]) -> dict:
-    """Score the sealed final window: go/no-go only, never diagnosis."""
+                         vehicle: str, sessions: Sequence[str],
+                         candidate_id: str | None = None,
+                         preselected: bool = False) -> dict:
+    """Score a sealed final window for one preselected candidate.
+
+    Qualification is post-selection evidence.  Callers that searched a
+    qualification window across variants must leave ``preselected`` false;
+    such a report remains diagnostic and cannot authorize a passing envelope.
+    """
     if not rows or not sessions:
         return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
                 "matched": 0, "mean_delta": None, "trades": 0,
-                "net_positive": False, "delta_positive": False}
+                "net_positive": False, "delta_positive": False,
+                "post_selection": {"preselected": bool(preselected),
+                                    "candidate_id": candidate_id}}
     declared = tuple(str(item) for item in sessions)
     declared_set = set(declared)
     if (len(declared_set) != len(declared) or
@@ -471,7 +605,10 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
             # consumers while retaining the descriptive field names above.
             "candidate_digest": candidate_digest,
             "baseline_digest": baseline_digest,
-            "observation_schema": "qualification-observations.v1"}
+            "observation_schema": "qualification-observations.v1",
+            "post_selection": {"preselected": bool(preselected),
+                                "candidate_id": (str(candidate_id)
+                                                 if candidate_id is not None else None)}}
 
 
 @dataclass
@@ -537,6 +674,9 @@ def seal_final_window(items: Sequence[Any], *, session_of, fraction: float = .2,
 
 def verified_gate_envelope(*, lane: str, vehicle: str,
                            fit: Sequence[Mapping], heldout: Sequence[Mapping],
+                           fit_baseline: Sequence[Mapping] = (),
+                           heldout_baseline: Sequence[Mapping] = (),
+                           null_source: Sequence[Mapping] = (),
                            fit_floor: Mapping, heldout_floor: Mapping,
                            control: Mapping, p_value: float, q_value: float,
                            alpha: float,
@@ -546,17 +686,89 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            family_q_value: float | None = None,
                            walk_forward: Mapping | None = None,
                            qualification: Mapping | None = None,
-                           null_control: Mapping | None = None) -> dict:
+                           null_control: Mapping | None = None,
+                           fit_control: Mapping | None = None,
+                           online_fdr: Mapping | None = None,
+                           provenance: Mapping | None = None,
+                           candidate_id: str | None = None) -> dict:
     """Build the immutable, content-addressed gate decision persisted per run.
 
     ``q_value`` is the cycle-global false-discovery q; ``family_q_value`` is
     the family-local one.  Both are persisted so a proof states exactly which
     correction authorized it.
     """
-    reported = dict(performance or {})
+    # Malformed callers must produce an unverifiable envelope, not an
+    # AttributeError that escapes the durable proof boundary.
+    falsification = dict(falsification) if isinstance(falsification, Mapping) else {}
+    separation = dict(separation) if isinstance(separation, Mapping) else {}
+    reported = dict(performance or {}) if isinstance(performance, Mapping) else {}
     reported.setdefault("heldout_delta", control.get("mean_delta"))
     reported.setdefault("heldout_delta_lcb", control.get("mean_delta_lcb"))
-    reported.setdefault("max_drawdown", 0.0)
+    reported.setdefault("max_drawdown", max_drawdown_of(heldout))
+    derived = {str(key): bool(value) for key, value in checks.items()}
+    derived["actual_control_available"] = bool(
+        control.get("actual_control") is True and control.get("available") is True and
+        isinstance(control.get("matched"), int) and int(control.get("matched")) > 0)
+    delta = control.get("mean_delta")
+    lcb = control.get("mean_delta_lcb")
+    derived["heldout_delta_positive"] = bool(delta is not None and float(delta) > 0)
+    derived["heldout_delta_lcb_positive"] = bool(lcb is not None and float(lcb) > 0)
+    fit_summary = dict(fit_control or {})
+    derived["fit_delta_positive"] = bool(
+        lane == "shadow" or (fit_summary.get("mean_delta") is not None and
+                              float(fit_summary["mean_delta"]) > 0))
+    derived["heldout_p_significant"] = float(p_value) <= float(alpha)
+    derived["heldout_net_pnl_positive"] = bool(
+        float(reported.get("heldout_net_pnl", sum(float(row.get("net_pnl", 0.0))
+                                                    for row in heldout))) > 0)
+    trades = sample_counts(heldout, vehicle=vehicle)["trades"]
+    net = float(reported.get("heldout_net_pnl", sum(float(row.get("net_pnl", 0.0))
+                                                     for row in heldout)))
+    derived["heldout_expectancy_positive"] = bool(trades and net / trades > 0)
+    derived["falsification"] = bool((falsification or {}).get("passes") is True)
+    derived["separated"] = bool((separation or {}).get("passes") is True)
+    walk = dict(walk_forward or {})
+    derived["walk_forward_available"] = bool(walk.get("available"))
+    derived["walk_forward_adequate"] = bool(walk.get("adequate"))
+    derived["walk_forward_majority_positive"] = bool(walk.get("majority_positive"))
+    null = dict(null_control or {})
+    derived["null_control_available"] = bool(
+        null.get("available", null.get("actual_control", False)))
+    null_delta = null.get("mean_delta")
+    null_p = null.get("p_value")
+    derived["null_control_delta_positive"] = bool(
+        null_delta is not None and null_p is not None and
+        float(null_delta) > 0 and float(null_p) <= float(alpha))
+    derived["fit_floor_adequate"] = bool((fit_floor or {}).get("adequate"))
+    derived["heldout_floor_adequate"] = bool((heldout_floor or {}).get("adequate"))
+    stats = {"q_value": q_value, "family_q_value":
+             q_value if family_q_value is None else family_q_value, "alpha": alpha}
+    derived["family_fdr_significant"] = float(stats["family_q_value"]) <= float(alpha)
+    derived["global_fdr_significant"] = float(q_value) <= float(alpha)
+    online = dict(online_fdr or {})
+    online_p = online.get("p_value")
+    online_alpha = online.get("allocated_alpha")
+    derived["cumulative_fdr_significant"] = bool(
+        online.get("decision") is True and online_p is not None and
+        online_alpha is not None and float(online_p) <= float(online_alpha))
+    qual = dict(qualification or {})
+    derived["qualification_available"] = bool(qual.get("available"))
+    derived["qualification_net_positive"] = bool(
+        qual.get("available") and qual.get("net_positive"))
+    derived["qualification_delta_positive"] = bool(
+        qual.get("available") and qual.get("delta_positive"))
+    derived["max_drawdown_supported"] = bool(
+        isinstance(reported.get("max_drawdown"), (int, float)) and
+        math.isfinite(float(reported.get("max_drawdown"))))
+    # Required checks are the minimum schema, not a licence to ignore an
+    # additional veto supplied by a caller.  A passing envelope must agree
+    # with every persisted boolean decision, exactly as durable proof
+    # verification does.
+    effective_passes = bool(
+        passes and
+        all(derived.get(key, False) for key in GATE_REQUIRED_CHECKS) and
+        all(derived.values())
+    )
     body: dict[str, Any] = {
         "schema": GATE_ENVELOPE_SCHEMA,
         "lane": str(lane),
@@ -566,7 +778,15 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
             "heldout": sample_counts(heldout, vehicle=vehicle),
             "total": sample_counts([*fit, *heldout], vehicle=vehicle),
         },
+        # Source rows make critical conclusions independently recomputable
+        # after persistence; callers must not ship a summary-only pass.
+        "fit_source": [dict(row) for row in fit],
+        "heldout_source": [dict(row) for row in heldout],
+        "fit_baseline_source": [dict(row) for row in fit_baseline],
+        "heldout_baseline_source": [dict(row) for row in heldout_baseline],
+        "null_source": [dict(row) for row in null_source],
         "floors": {"fit": dict(fit_floor), "heldout": dict(heldout_floor)},
+        "fit_control": fit_summary,
         "control": dict(control),
         "statistics": {"p_value": float(p_value), "q_value": float(q_value),
                        "family_q_value": float(q_value if family_q_value is None
@@ -578,14 +798,19 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "walk_forward": dict(walk_forward or {}),
         "qualification": dict(qualification or {}),
         "null_control": dict(null_control or {}),
-        "checks": {str(key): bool(value) for key, value in checks.items()},
-        "passes": bool(passes),
+        "online_fdr": online,
+        "provenance": dict(provenance or {}),
+        "candidate_id": (str(candidate_id) if candidate_id is not None else None),
+        "checks": derived,
+        "passes": effective_passes,
     }
     return {**body, "content_hash": _content_hash(body)}
 
 
 def verify_gate_envelope(envelope: Mapping) -> bool:
     try:
+        if not isinstance(envelope, Mapping):
+            return False
         qualification = envelope.get("qualification")
         if not isinstance(qualification, Mapping):
             return False
@@ -613,7 +838,11 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 return False
             expected = qualification_report(
                 candidate, baseline, vehicle=str(envelope.get("vehicle")),
-                sessions=qualification.get("sessions") or ())
+                sessions=qualification.get("sessions") or (),
+                candidate_id=((qualification.get("post_selection") or {}).get("candidate_id")
+                              if isinstance(qualification.get("post_selection"), Mapping) else None),
+                preselected=bool((qualification.get("post_selection") or {}).get("preselected"))
+                if isinstance(qualification.get("post_selection"), Mapping) else False)
             for key in ("sessions", "net_pnl", "trades", "matched", "mean_delta",
                         "net_positive", "delta_positive"):
                 if expected.get(key) != qualification.get(key):
@@ -621,6 +850,89 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         body = {key: value for key, value in envelope.items() if key != "content_hash"}
         statistics = envelope.get("statistics")
         checks = envelope.get("checks")
+        if (not isinstance(checks, Mapping) or
+                not all(isinstance(value, bool) for value in checks.values())):
+            return False
+        if envelope.get("passes") and (
+                not GATE_REQUIRED_CHECKS.issubset(set(checks)) or
+                not all(bool(checks.get(key)) for key in GATE_REQUIRED_CHECKS) or
+                not all(checks.values())):
+            return False
+        if envelope.get("passes"):
+            provenance = envelope.get("provenance")
+            if (not isinstance(provenance, Mapping) or
+                    any(not provenance.get(key) for key in (
+                        "dataset_hash", "config_hash", "code_hash", "provenance_hash"))):
+                return False
+        if envelope.get("passes") and qualification.get("available"):
+            post = qualification.get("post_selection")
+            if (not isinstance(post, Mapping) or post.get("preselected") is not True or
+                    (envelope.get("candidate_id") is not None and
+                     post.get("candidate_id") != envelope.get("candidate_id"))):
+                return False
+        null_control = envelope.get("null_control")
+        if envelope.get("passes"):
+            if (not isinstance(null_control, Mapping) or
+                    null_control.get("kind") not in {"randomized_entry_null", "null_control"} or
+                    not isinstance(null_control.get("available"), bool) or
+                    not isinstance(null_control.get("matched"), int) or
+                    not isinstance(null_control.get("mean_delta"), (int, float))):
+                return False
+        sources_fit = envelope.get("fit_source")
+        sources_held = envelope.get("heldout_source")
+        baseline_fit = envelope.get("fit_baseline_source")
+        baseline_held = envelope.get("heldout_baseline_source")
+        null_source = envelope.get("null_source")
+        if (not isinstance(sources_fit, Sequence) or isinstance(sources_fit, (str, bytes)) or
+                not isinstance(sources_held, Sequence) or isinstance(sources_held, (str, bytes)) or
+                not isinstance(baseline_fit, Sequence) or isinstance(baseline_fit, (str, bytes)) or
+                not isinstance(baseline_held, Sequence) or isinstance(baseline_held, (str, bytes)) or
+                not isinstance(null_source, Sequence) or isinstance(null_source, (str, bytes)) or
+                not all(isinstance(row, Mapping) for row in [
+                    *sources_fit, *sources_held, *baseline_fit, *baseline_held,
+                    *null_source])):
+            return False
+        vehicle = str(envelope.get("vehicle") or "")
+        expected_counts = {
+            "fit": sample_counts(sources_fit, vehicle=vehicle),
+            "heldout": sample_counts(sources_held, vehicle=vehicle),
+            "total": sample_counts([*sources_fit, *sources_held], vehicle=vehicle),
+        }
+        if envelope.get("counts") != expected_counts:
+            return False
+        floors = envelope.get("floors")
+        if not isinstance(floors, Mapping):
+            return False
+        for name, source in (("fit", sources_fit), ("heldout", sources_held)):
+            report = floors.get(name)
+            if not isinstance(report, Mapping):
+                return False
+            feasibility = report.get("feasibility")
+            minimums = report.get("minimums")
+            if not isinstance(feasibility, Mapping) or not isinstance(minimums, Mapping):
+                return False
+            try:
+                recomputed_feasibility = floor_feasibility(
+                    source, vehicle=vehicle,
+                    min_trades=int(minimums.get("trades")),
+                    min_sessions=int(minimums.get("sessions")),
+                    min_clusters=int(minimums.get("clusters")))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (feasibility.get("status") != recomputed_feasibility.get("status") or
+                    bool(feasibility.get("adequate")) != bool(recomputed_feasibility.get("adequate"))):
+                return False
+        performance = envelope.get("performance")
+        if isinstance(performance, Mapping) and "max_drawdown" in performance:
+            try:
+                reported_drawdown = float(performance["max_drawdown"])
+                if not (_close_number(reported_drawdown, max_drawdown_of(sources_held)) or
+                        _close_number(reported_drawdown,
+                                      max_drawdown_of([*sources_fit, *sources_held]))):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+        statistics = envelope.get("statistics")
         if isinstance(statistics, Mapping) and isinstance(checks, Mapping):
             alpha = float(statistics.get("alpha"))
             global_q = float(statistics.get("q_value"))
@@ -635,6 +947,89 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             if ("global_fdr_significant" in checks and
                     bool(checks["global_fdr_significant"]) != (global_q <= alpha)):
                 return False
+            online = envelope.get("online_fdr")
+            if not isinstance(online, Mapping):
+                return False
+            if envelope.get("passes"):
+                allocated = float(online.get("allocated_alpha"))
+                online_p = float(online.get("p_value"))
+                if (online.get("decision") is not True or
+                        not math.isfinite(allocated) or allocated <= 0 or
+                        not math.isfinite(online_p) or online_p > allocated or
+                        not _close_number(online_p, global_q)):
+                    return False
+            # Rebuild the code-owned decision flags from the persisted source
+            # evidence.  Callers may add stricter custom vetoes, but they may
+            # not override a required gate flag or detach it from the report
+            # that supposedly produced it.
+            rebuilt = verified_gate_envelope(
+                lane=str(envelope.get("lane") or ""), vehicle=vehicle,
+                fit=sources_fit, heldout=sources_held,
+                fit_baseline=baseline_fit, heldout_baseline=baseline_held,
+                null_source=null_source,
+                fit_floor=floors.get("fit") or {},
+                heldout_floor=floors.get("heldout") or {},
+                fit_control=envelope.get("fit_control") or {},
+                control=envelope.get("control") or {},
+                p_value=float(statistics.get("p_value")), q_value=global_q,
+                family_q_value=family_q, alpha=alpha,
+                falsification=envelope.get("falsification") or {},
+                separation=envelope.get("separation") or {},
+                checks=checks, passes=bool(envelope.get("passes")),
+                performance=performance,
+                walk_forward=envelope.get("walk_forward") or {},
+                qualification=qualification,
+                null_control=envelope.get("null_control") or {},
+                online_fdr=online,
+                provenance=envelope.get("provenance") or {},
+                candidate_id=envelope.get("candidate_id"),
+            )
+            if (rebuilt.get("checks") != dict(checks) or
+                    rebuilt.get("passes") != envelope.get("passes")):
+                return False
+        if envelope.get("passes"):
+            if not isinstance(statistics, Mapping):
+                return False
+            expected_control = matched_cluster_test(
+                sources_held, baseline_held, vehicle=vehicle)
+            control = envelope.get("control") or {}
+            for key in ("matched", "mean_delta", "mean_delta_lcb", "p_value"):
+                if not _close_number(expected_control.get(key), control.get(key)):
+                    return False
+            if envelope.get("lane") == "backtest":
+                expected_fit_control = matched_cluster_test(
+                    sources_fit, baseline_fit, vehicle=vehicle)
+                fit_control = envelope.get("fit_control") or {}
+                for key in ("matched", "mean_delta", "p_value"):
+                    if not _close_number(expected_fit_control.get(key),
+                                         fit_control.get(key)):
+                        return False
+            expected_null = matched_cluster_test(
+                sources_held, null_source, vehicle=vehicle)
+            for key in ("matched", "mean_delta", "mean_delta_lcb", "p_value"):
+                if not _close_number(expected_null.get(key), null_control.get(key)):
+                    return False
+            walk = envelope.get("walk_forward") or {}
+            expected_walk = walk_forward_report(
+                sources_held, baseline_held, vehicle=vehicle,
+                folds=int(walk.get("folds", 3)),
+                min_fit_sessions=int(walk.get("fit_sessions_required", 1)),
+                min_test_sessions=int(walk.get("test_sessions_required", 1)),
+                min_test_trades=int(walk.get("test_trades_required", 1)))
+            for key in ("available", "adequate", "majority_positive",
+                        "tested_folds", "adequate_folds", "positive_folds"):
+                if expected_walk.get(key) != walk.get(key):
+                    return False
+            recomputed = recompute_gate_statistics(envelope)
+            if not recomputed.get("available"):
+                return False
+            if (not _close_number(recomputed.get("mean_delta"), control.get("mean_delta")) or
+                    not _close_number(recomputed.get("p_value"), statistics.get("p_value"))):
+                return False
+            performance = envelope.get("performance") or {}
+            if "heldout_delta_lcb" in performance and not _close_number(
+                    recomputed.get("mean_delta_lcb"), performance.get("heldout_delta_lcb")):
+                return False
         return bool(
             envelope.get("schema") == GATE_ENVELOPE_SCHEMA and
             envelope.get("lane") in {"backtest", "shadow"} and
@@ -642,11 +1037,13 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             isinstance(envelope.get("passes"), bool) and
             isinstance(envelope.get("counts"), Mapping) and
             isinstance(envelope.get("floors"), Mapping) and
+            isinstance(envelope.get("fit_control"), Mapping) and
             isinstance(envelope.get("control"), Mapping) and
             isinstance(envelope.get("statistics"), Mapping) and
             isinstance(envelope.get("walk_forward"), Mapping) and
             isinstance(envelope.get("qualification"), Mapping) and
             isinstance(envelope.get("null_control"), Mapping) and
+            isinstance(envelope.get("online_fdr"), Mapping) and
             envelope.get("content_hash") == _content_hash(body))
     except (TypeError, ValueError, OverflowError):
         return False
@@ -733,7 +1130,18 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
+    try:
+        if left is None or right is None:
+            return left is None and right is None
+        return abs(float(left) - float(right)) <= tolerance * max(
+            1.0, abs(float(left)), abs(float(right)))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
+    "GATE_REQUIRED_CHECKS", "floor_feasibility",
     "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
            "QUALIFICATION_MAX_BYTES", "QUALIFICATION_MAX_ROWS",
            "SealedWindowError", "chronological_split",

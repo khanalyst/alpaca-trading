@@ -14,10 +14,11 @@ from agent.contracts.rule import (
 )
 from agent.edge import apply_variant, resolve_validated_variant
 from research.edge_lab import EdgeLedger
+from research.edge_ledger_store import content_hash, provenance_hash
 from research.gates import (
     falsification_gate, heldout_separation, matched_cluster_test,
-    performance_floor, placebo_null_distribution, structural_floor,
-    verified_gate_envelope,
+    performance_floor, placebo_null_distribution, qualification_report,
+    structural_floor, verified_gate_envelope, walk_forward_report,
 )
 from research.llm_strategy import PROPOSAL_SCHEMA, ProposalResult
 import research.factory_core as core_module
@@ -98,7 +99,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
     fit = [] if lane == "shadow" else [
-        {"vehicle": "equity", "session_date": "2026-01-05",
+        {"vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-05",
          "opportunity_id": f"{lane}-fit", "net_pnl": 1.0}]
     # Eight held-out sessions are the minimum that can carry a sign-flip
     # falsification below alpha; two never could.
@@ -108,6 +109,9 @@ def persist_rule_gate(ledger, candidate_id, lane):
         for day in range(6, 14)]
     baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
                 for index, row in enumerate(heldout)]
+    fit_baseline = [{**row, "net_pnl": 0.0,
+                     "opportunity_id": f"fit-base-{index}"}
+                    for index, row in enumerate(fit)]
     fit_floor = structural_floor(
         fit, vehicle="equity", min_trades=1, min_sessions=1,
         required=lane != "shadow")
@@ -116,23 +120,48 @@ def persist_rule_gate(ledger, candidate_id, lane):
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"passes": True, "mode": "new_data"})
     control = matched_cluster_test(heldout, baseline, vehicle="equity")
+    fit_control = (matched_cluster_test(fit, fit_baseline, vehicle="equity")
+                   if fit else {"available": True, "actual_control": True,
+                                "matched": 0, "mean_delta": None,
+                                "p_value": 1.0, "mode": "prior_backtest"})
     placebo = placebo_null_distribution(heldout, baseline, vehicle="equity")
     falsification = {
         **falsification_gate(placebo["observed"], placebo["placebo"]),
         "draws": int(placebo["draws"]), "seed": int(placebo["seed"])}
     absolute = performance_floor(heldout, vehicle="equity")
+    walk = walk_forward_report(heldout, baseline, vehicle="equity", folds=3)
+    qualification = qualification_report(
+        heldout, baseline, vehicle="equity",
+        sessions=sorted({row["session_date"] for row in heldout}),
+        candidate_id=candidate_id, preselected=True)
+    hashes = provenance_hash(config=candidate_config)
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
+        fit_baseline=fit_baseline, heldout_baseline=baseline,
+        null_source=baseline,
         fit_floor=fit_floor, heldout_floor=held_floor,
+        fit_control=fit_control,
         control={**control, "kind": "matched_root_baseline"},
         p_value=control["p_value"], q_value=.01, alpha=.05,
         falsification=falsification, separation=separation,
         checks={"family_fdr_significant": True, "global_fdr_significant": True,
+                "cumulative_fdr_significant": True,
                 "falsification": bool(falsification["passes"]),
                 "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
                 "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
                 "heldout_delta_lcb_positive": bool(control["mean_delta_lcb"] > 0)},
         passes=True,
+        walk_forward=walk,
+        qualification=qualification,
+        null_control={"kind": "randomized_entry_null",
+                      "matched": control["matched"], "available": True,
+                      "mean_delta": control["mean_delta"],
+                      "mean_delta_lcb": control["mean_delta_lcb"],
+                      "p_value": control["p_value"]},
+        online_fdr={"scope": "test", "test_id": f"{candidate_id}:{lane}",
+                    "p_value": .01, "allocated_alpha": .05,
+                    "decision": True},
+        provenance=hashes, candidate_id=candidate_id,
         performance={"heldout_delta": control["mean_delta"],
                      "heldout_delta_lcb": control["mean_delta_lcb"],
                      "heldout_net_pnl": absolute["net_pnl"],
@@ -142,10 +171,39 @@ def persist_rule_gate(ledger, candidate_id, lane):
                             config=candidate_config,
                             metrics={"gate": {"passes": True}, "confidence": .99,
                                      "heldout_delta": 1.0, "max_drawdown": 0.0,
-                                     "heldout_trades": len(heldout)})
+                                     "heldout_trades": len(heldout),
+                                     **({"shadow_source": {
+                                         "schema": "shadow-ingest.v1",
+                                         "candidate_id": candidate_id,
+                                         "vehicle": "equity",
+                                         "sessions": [{
+                                             "session_date": row["session_date"],
+                                             "source_digest": f"source:{row['session_date']}",
+                                             "shadow_digest": f"shadow:{row['session_date']}",
+                                             "replay_digest": f"replay:{row['session_date']}",
+                                             "account_id": f"account:{row['session_date']}",
+                                             "trade_count": 1,
+                                         } for row in heldout],
+                                         "baseline": {"candidate_id": "fixture:baseline",
+                                                      "rows_digest": content_hash(baseline),
+                                                      "role": "paired_root_control"},
+                                         "null": {"candidate_id": "fixture:null",
+                                                   "rows_digest": content_hash(baseline),
+                                                   "role": "randomized_entry_null"},
+                                     }, "replay_digests": [f"replay:{row['session_date']}"
+                                                           for row in heldout]}
+                                     if lane == "shadow" else {})})
     for row in [*fit, *heldout]:
         ledger.append_trade(run["run_id"], row)
     ledger.record_verified_gate(run["run_id"], gate)
+    if lane == "shadow":
+        source = ledger.run(run["run_id"])["metrics"]["shadow_source"]
+        ledger.append_evidence(
+            candidate_id, "shadow_ingestion",
+            {"schema": "shadow-ingest.v1", "candidate_id": candidate_id,
+             "vehicle": "equity", "source": source,
+             "replay_digests": [item["replay_digest"] for item in source["sessions"]],
+             "gate_hash": gate["content_hash"]}, run_id=run["run_id"])
 
 
 class StrategyFactoryTests(unittest.TestCase):
@@ -330,7 +388,12 @@ class StrategyFactoryTests(unittest.TestCase):
         self.assertFalse(target["gate"]["global_multiple_tests"]["significant"])
         self.assertTrue(target["gate"]["checks_without_family"])
         self.assertFalse(target["gate"]["passes"])
-        self.assertIsNotNone(target["run_id"])
+        # A development-only family pass is diagnostic. It does not consume a
+        # sealed window or create an authoritative EdgeLedger proof run when
+        # the cycle-global correction rejects it.
+        self.assertIsNone(target["run_id"])
+        self.assertFalse(target["gate"]["post_selection"][
+            "qualification_consumed"])
         self.assertFalse(result["worker_failures"])
 
     def test_rule_grammar_is_bounded_and_content_addressed(self):

@@ -9,6 +9,7 @@ recorded quote when one exists at the fill instant.
 """
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import sqlite3
 import unittest
 
@@ -16,8 +17,10 @@ from agent.contracts.rule import validate_rule_spec
 from agent.risk import RiskEngine
 from research import calibration
 from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
+                            DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
-                            RUNTIME_MAX_SLIPPAGE_BPS, index_quotes, quote_fill)
+                            RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
+                            index_quotes, quote_fill)
 from research.edge_discovery_core import (DiscoveryError,
                                           _effective_ibr_config,
                                           _read_discovery_rows)
@@ -33,6 +36,7 @@ SPEC = validate_rule_spec({
     "atr_period": 3, "threshold_bps": 1.0, "stop_atr": 1.0, "target_r": 2.0,
     "max_hold_bars": 3, "confirmation": "none",
 })
+PERMISSIVE_POLICY = ReplayPolicy(strict_market_data=False)
 # Four rising bars signal at index 3, so entry is index 4 and the bounded hold
 # expires at the end of index 7.  Stop 100.50, target 101.40.
 RISING = [100.2, 100.4, 100.6, 100.8]
@@ -68,6 +72,12 @@ def _quote(minute, bid, ask, *, as_of_minute=None):
 
 
 class CostModelTests(unittest.TestCase):
+    def test_option_default_has_a_conservative_two_side_contract_fee(self):
+        option = CostModel().fees(2.0, 2.0, 1, 100, vehicle="option")
+        equity = CostModel().fees(2.0, 2.0, 1, 100, vehicle="equity")
+        self.assertGreaterEqual(
+            option - equity, 2 * DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE)
+
     def test_entry_cost_is_half_the_spread_plus_slippage(self):
         model = CostModel(spread_bps=2.0, slippage_bps=3.0)
         self.assertAlmostEqual(model.entry_cost_bps, 4.0, places=12)
@@ -134,9 +144,10 @@ class SharedModelTests(unittest.TestCase):
         self.assertEqual(IBRConfig().costs, CostModel())
         priced = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
                                   account_id="explicit", risk_pct=.05,
-                                  costs=CostModel())
+                                  costs=CostModel(), policy=PERMISSIVE_POLICY)
         implied = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
-                                   account_id="implied", risk_pct=.05)
+                                   account_id="implied", risk_pct=.05,
+                                   policy=PERMISSIVE_POLICY)
         self.assertEqual(priced["rows"][0]["net_pnl"], implied["rows"][0]["net_pnl"])
 
     def test_discovery_no_longer_sources_slippage_from_the_rejection_cap(self):
@@ -156,6 +167,71 @@ class SharedModelTests(unittest.TestCase):
     def test_a_replay_config_cannot_carry_loose_cost_numbers(self):
         with self.assertRaises(TypeError):
             IBRConfig(spread_bps=1.0)
+
+
+class DailyLossReplayTests(unittest.TestCase):
+    """The replay gate sees the same intraday equity loss as runtime."""
+
+    @staticmethod
+    def _shifted(rows, *, symbol, minutes):
+        return [replace(row, symbol=symbol,
+                        timestamp=row.timestamp + timedelta(minutes=minutes))
+                for row in rows]
+
+    @classmethod
+    def _book(cls, first_values, *, second_shift=1, limit=.01):
+        first = _bars(first_values)
+        # A second isolated symbol creates a later entry while the first
+        # position remains open.  strict_market_data=False intentionally uses
+        # the visible bar boundary marks for this focused MTM fixture.
+        second = cls._shifted(_bars(RISING + FLAT), symbol="QQQ",
+                              minutes=second_shift)
+        return simulate_account(
+            first + second, [], SPEC, vehicle="equity", account_id="mtm",
+            policy=ReplayPolicy(daily_loss_limit_pct=limit,
+                                strict_market_data=False))
+
+    def test_open_unrealized_loss_halts_a_later_same_day_entry(self):
+        book = self._book(RISING + [100.6, 100.6] + FLAT[:6])
+        by_symbol = {row["symbol"]: row for row in book["rows"]}
+        self.assertFalse(by_symbol["SPY"]["no_trade"])
+        self.assertTrue(by_symbol["QQQ"]["no_trade"])
+        self.assertEqual(by_symbol["QQQ"]["reject_reason"],
+                         "daily loss limit reached")
+
+    def test_mark_does_not_consume_a_future_price(self):
+        baseline = self._book(RISING + [100.6, 100.6] + FLAT[:6])
+        future_drop = self._book(
+            RISING + [100.6, 100.6, 90.0] + FLAT[:5])
+        baseline_qqq = next(row for row in baseline["rows"] if row["symbol"] == "QQQ")
+        future_qqq = next(row for row in future_drop["rows"] if row["symbol"] == "QQQ")
+        self.assertEqual((baseline_qqq["no_trade"], baseline_qqq["reject_reason"]),
+                         (future_qqq["no_trade"], future_qqq["reject_reason"]))
+
+    def test_realized_exit_is_counted_once_and_caps_can_be_disabled(self):
+        # The first trade hits its stop before the second symbol's entry.  Its
+        # realized loss is in cash exactly once when the later gate runs.
+        realized = self._book(RISING + [100.8, 100.4] + FLAT[:6],
+                              second_shift=2)
+        realized_qqq = next(row for row in realized["rows"] if row["symbol"] == "QQQ")
+        self.assertEqual(realized_qqq["reject_reason"], "daily loss limit reached")
+
+        uncapped = self._book(RISING + [100.8, 100.6] + FLAT[:6], limit=None)
+        loose = self._book(RISING + [100.8, 100.6] + FLAT[:6], limit=100.0)
+        self.assertEqual(uncapped["trades"], loose["trades"])
+        self.assertEqual(
+            [row["no_trade"] for row in uncapped["rows"]],
+            [row["no_trade"] for row in loose["rows"]],
+        )
+
+    def test_open_loss_reduces_the_next_entry_sizing_denominator(self):
+        flat = self._book(RISING + [100.8, 100.8] + FLAT[:6], limit=None)
+        losing = self._book(RISING + [100.6, 100.6] + FLAT[:6], limit=None)
+        flat_entry = next(row for row in flat["rows"] if row["symbol"] == "QQQ")
+        losing_entry = next(row for row in losing["rows"] if row["symbol"] == "QQQ")
+        self.assertFalse(flat_entry["no_trade"])
+        self.assertFalse(losing_entry["no_trade"])
+        self.assertLess(losing_entry["risk_budget"], flat_entry["risk_budget"])
 
 
 class RecordedQuotesReachTheReplayTests(unittest.TestCase):
@@ -190,14 +266,16 @@ class ExitGapThroughTests(unittest.TestCase):
 
     def test_a_gap_through_the_stop_fills_worse_than_the_stop(self):
         # Stop is 100.50; bar 6 opens at 100.20 and never trades back.
-        row = _simulate_trade(_bars(RISING + FLAT, {6: 100.2}), SPEC, [], "equity")
+        row = _simulate_trade(_bars(RISING + FLAT, {6: 100.2}), SPEC, [], "equity",
+                              policy=PERMISSIVE_POLICY)
         self.assertEqual(row["exit_reason"], "stop")
         self.assertIs(row["exit_gap_fill"], True)
         self.assertAlmostEqual(row["exit_reference"], 100.2, places=9)
         self.assertLess(row["exit_reference"], row["stop_price"])
 
     def test_a_gap_through_the_target_fills_at_the_open_not_the_target(self):
-        row = _simulate_trade(_bars(RISING + FLAT, {6: 101.9}), SPEC, [], "equity")
+        row = _simulate_trade(_bars(RISING + FLAT, {6: 101.9}), SPEC, [], "equity",
+                              policy=PERMISSIVE_POLICY)
         self.assertEqual(row["exit_reason"], "target")
         self.assertIs(row["exit_gap_fill"], True)
         self.assertAlmostEqual(row["exit_reference"], 101.9, places=9)
@@ -207,7 +285,7 @@ class ExitGapThroughTests(unittest.TestCase):
         # 100.4 closes below the 100.50 stop without opening through it, so the
         # resting leg triggers at its own price.
         row = _simulate_trade(_bars(RISING + [100.8, 100.4] + FLAT[:5]),
-                              SPEC, [], "equity")
+                              SPEC, [], "equity", policy=PERMISSIVE_POLICY)
         self.assertEqual(row["exit_reason"], "stop")
         self.assertIs(row["exit_gap_fill"], False)
         self.assertAlmostEqual(row["exit_reference"], row["stop_price"], places=9)
@@ -216,7 +294,8 @@ class ExitGapThroughTests(unittest.TestCase):
         # A bar opening at 100.20 with a 102.0 close spans stop and target.
         # The stop is encountered at the open, so ties stay stop-first.
         row = _simulate_trade(_bars(RISING + FLAT[:1] + [100.8, 102.0] + FLAT[:4],
-                                    {6: 100.2}), SPEC, [], "equity")
+                                    {6: 100.2}), SPEC, [], "equity",
+                              policy=PERMISSIVE_POLICY)
         self.assertEqual(row["exit_reason"], "stop")
         self.assertAlmostEqual(row["exit_reference"], 100.2, places=9)
 
@@ -225,10 +304,10 @@ class ExitGapThroughTests(unittest.TestCase):
         # opens through the stop.  Stop-side gaps must cost money.
         clean = simulate_account(_bars(RISING + FLAT), [], SPEC,
                                  vehicle="equity", account_id="clean",
-                                 risk_pct=.05)
+                                 risk_pct=.05, policy=PERMISSIVE_POLICY)
         gapped = simulate_account(_bars(RISING + FLAT, {6: 100.2}), [], SPEC,
                                   vehicle="equity", account_id="gapped",
-                                  risk_pct=.05)
+                                  risk_pct=.05, policy=PERMISSIVE_POLICY)
         self.assertLess(gapped["rows"][0]["net_pnl"], clean["rows"][0]["net_pnl"])
 
 
@@ -256,7 +335,8 @@ class QuoteDrivenFillTests(unittest.TestCase):
     def test_an_entry_uses_the_recorded_ask_and_records_the_source(self):
         bars = _bars(RISING + FLAT)
         quoted = _simulate_trade(bars, SPEC, [], "equity",
-                                 quotes=index_quotes([_quote(4, 100.70, 100.90)]))
+                                 quotes=index_quotes([_quote(4, 100.70, 100.90)]),
+                                 policy=PERMISSIVE_POLICY)
         self.assertEqual(quoted["entry_fill_source"], QUOTE)
         self.assertAlmostEqual(quoted["entry_reference"], 100.90, places=9)
         # A short thesis would lift the bid instead; the long path is enough to
@@ -264,16 +344,23 @@ class QuoteDrivenFillTests(unittest.TestCase):
         self.assertNotEqual(quoted["entry_reference"], bars[4].open)
 
     def test_a_missing_quote_falls_back_to_the_bar_and_says_so(self):
-        row = _simulate_trade(_bars(RISING + FLAT), SPEC, [], "equity")
+        row = _simulate_trade(_bars(RISING + FLAT), SPEC, [], "equity",
+                              policy=PERMISSIVE_POLICY)
         self.assertEqual(row["entry_fill_source"], BAR)
         self.assertEqual(row["exit_fill_source"], BAR)
         self.assertAlmostEqual(row["entry_reference"], 100.8, places=9)
+
+    def test_omitted_policy_requires_a_fresh_equity_quote(self):
+        row = _simulate_trade(_bars(RISING + FLAT), SPEC, [], "equity")
+        self.assertEqual(row["unpriced_reason"],
+                         "no fresh equity quote at entry")
 
     def test_an_intrabar_level_exit_keeps_the_bar_because_it_has_no_instant(self):
         # The stop triggers somewhere inside bar 5; no quote is at that instant,
         # so a quote recorded at the boundary must not be used as the fill.
         row = _simulate_trade(_bars(RISING + [100.8, 100.4] + FLAT[:5]), SPEC, [],
-                              "equity", quotes=index_quotes([_quote(6, 90.0, 90.1)]))
+                              "equity", quotes=index_quotes([_quote(6, 90.0, 90.1)]),
+                              policy=PERMISSIVE_POLICY)
         self.assertEqual(row["exit_reason"], "stop")
         self.assertEqual(row["exit_fill_source"], BAR)
         self.assertAlmostEqual(row["exit_reference"], row["stop_price"], places=9)
@@ -282,7 +369,8 @@ class QuoteDrivenFillTests(unittest.TestCase):
         bars = _bars(RISING + FLAT)
         quotes = [_quote(4, 100.79, 100.81), _quote(8, 100.79, 100.81)]
         book = simulate_account(bars, [], SPEC, vehicle="equity", risk_pct=.05,
-                                account_id="quoted", quotes=quotes)
+                                account_id="quoted", quotes=quotes,
+                                policy=PERMISSIVE_POLICY)
         row = book["rows"][0]
         model = CostModel()
         self.assertEqual(row["entry_fill_source"], QUOTE)
@@ -296,12 +384,13 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
 
     def _null(self, bars):
         reference = simulate_account(bars, [], SPEC, vehicle="equity",
-                                     account_id="reference", risk_pct=.05)["rows"]
+                                     account_id="reference", risk_pct=.05,
+                                     policy=PERMISSIVE_POLICY)["rows"]
         # The entry bar is drawn from a seed derived from account, spec and
         # session set, so two same-shaped series draw the same bar.
         return null_control_account(bars, [], SPEC, vehicle="equity",
                                     reference_rows=reference, account_id="null",
-                                    risk_pct=.05)
+                                    risk_pct=.05, policy=PERMISSIVE_POLICY)
 
     # The null enters at bar 9 and its stop sits at 100.50.  Bar 10 reaches
     # that stop either way; only the fill differs.
@@ -315,14 +404,16 @@ class NullControlSharesTheFillModelTests(unittest.TestCase):
     def test_the_null_is_priced_by_the_shared_cost_model(self):
         bars = _bars(RISING + FLAT)
         reference = simulate_account(bars, [], SPEC, vehicle="equity",
-                                     account_id="reference", risk_pct=.05)["rows"]
+                                     account_id="reference", risk_pct=.05,
+                                     policy=PERMISSIVE_POLICY)["rows"]
         free = null_control_account(
             bars, [], SPEC, vehicle="equity", reference_rows=reference,
             account_id="null", risk_pct=.05,
-            costs=CostModel(spread_bps=0, slippage_bps=0, fee_bps=0))
+            costs=CostModel(spread_bps=0, slippage_bps=0, fee_bps=0),
+            policy=PERMISSIVE_POLICY)
         priced = null_control_account(
             bars, [], SPEC, vehicle="equity", reference_rows=reference,
-            account_id="null", risk_pct=.05)
+            account_id="null", risk_pct=.05, policy=PERMISSIVE_POLICY)
         self.assertGreater(free["ending_equity"], priced["ending_equity"])
 
 
@@ -337,7 +428,8 @@ class NotionalCapAnchorTests(unittest.TestCase):
 
     def test_a_gapped_entry_caps_on_the_plan_price_like_the_runtime(self):
         book = simulate_account(_bars(RISING + FLAT, {4: 101.0}), [], SPEC,
-                                vehicle="equity", account_id="cap", risk_pct=50.0)
+                                vehicle="equity", account_id="cap", risk_pct=50.0,
+                                policy=PERMISSIVE_POLICY)
         row = book["rows"][0]
         self.assertAlmostEqual(row["plan_entry"], 100.8, places=9)
         self.assertAlmostEqual(row["underlying_entry"], 101.0, places=9)
@@ -350,7 +442,8 @@ class NotionalCapAnchorTests(unittest.TestCase):
 
     def test_the_cap_percentage_matches_the_runtime_risk_block(self):
         book = simulate_account(_bars(RISING + FLAT), [], SPEC, vehicle="equity",
-                                account_id="cap-pct", risk_pct=50.0)
+                                account_id="cap-pct", risk_pct=50.0,
+                                policy=PERMISSIVE_POLICY)
         row = book["rows"][0]
         self.assertEqual(row["quantity"],
                          int(100_000.0 * NOTIONAL_CAP_PCT / 100.0 / row["plan_entry"]))

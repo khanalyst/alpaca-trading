@@ -29,11 +29,12 @@ fed and readable so that silence is informative rather than worrying.
 | **Rule spec** | The edge itself, stored as *data* in a fixed grammar — never code. The LLM can only emit these. |
 | **Family** | The kind of signal (opening-range breakout, mean reversion, VWAP reversion, …). There are 11. |
 | **Variant** | One family with specific numbers — a 15-minute range instead of 20, a 2.0R target instead of 1.5R. |
-| **Slot** | One of 7 parallel research workers. Each holds one hypothesis at a time. |
+| **Slot** | One of 7 logical research slots; each isolated book is processed by one bounded worker. |
 | **Generation** | How many times a slot's hypothesis has been replaced after failing. |
 | **Backtest lane** | First test, on the corpus split into fit and held-out parts. |
-| **Shadow lane** | Second test, on sessions recorded *strictly after* the backtest. This is the one that matters. |
-| **Validated / champion** | An edge that passed both lanes. Only these may trade. |
+| **Offline shadow lane** | Forward replay on sessions recorded *strictly after* the backtest; it may leave a candidate at `shadow` but never authorizes runtime. |
+| **Live-shadow marker** | Research-side proof from `edge ingest-shadow` after complete recorder parity; required for runtime eligibility. |
+| **Validated / champion** | An edge with a passing live-shadow proof and marker. Only these may trade. |
 | **R** | Profit measured in units of the risk taken. +1R means it made exactly what it risked. |
 | **Corpus** | The recorded market data research runs on. |
 
@@ -44,7 +45,7 @@ fed and readable so that silence is informative rather than worrying.
 | Day 1 | Install, backfill history, start recording. Trader idle. |
 | Day 1 + first research cycle | Hypotheses seeded, variants tested, most fail. Trader still idle. |
 | Weeks 1–8 | Families are tried, retired, replaced. Reports get interesting. Trader still idle. |
-| First validated edge | Trader begins placing paper trades under risk limits. |
+| First live-shadow-validated edge | Trader begins placing paper trades under risk limits. |
 | Ongoing | Proved edges are frozen; slots keep searching for new ones forever. |
 
 **Without a historical backfill this takes months** — the recorder only samples
@@ -240,12 +241,13 @@ else:
 Two settings are worth understanding now, because they shape how long step 12
 takes:
 
-**`universe.symbols`** defaults to `["SPY", "QQQ", "IWM", "DIA"]`. Research
-takes at most one trade per symbol per session, so the 100-trade evidence floor
-is as much a *universe width* requirement as a history-length one. Four symbols
-over 120 sessions yields roughly 84 held-out trades and will **not** clear the
-floor. Widening to 10–15 liquid ETFs is the single cheapest way to reach a first
-proof sooner. Keep them US equity/ETF symbols.
+**`universe.symbols`** defaults to `["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"]`.
+Research takes at most one trade per symbol per session, so the 100-trade
+evidence floor is as much a *universe width* requirement as a history-length
+one. The eight-symbol default improves opportunity capacity, but real signal
+rates still require sufficient history. Floor feasibility fails closed when the
+100-trade floor cannot be supported; widen history and/or `universe.symbols`,
+never lower the floor. Keep them US equity/ETF symbols.
 
 **`strategy.execution_mode`** picks one profile per trader process:
 
@@ -420,9 +422,11 @@ docker compose exec -T watchdog python deploy/health.py watchdog
 ```
 
 **Expected:** the trader starts, reports healthy, and places **no trades**. On
-a fresh deployment it must remain idle because no validated edge exists. Do not
-disable `research.require_validated_variant` to force entries — that flag is
-the only thing standing between you and trading an unproven rule.
+a fresh deployment it must remain idle because no live-shadow-marked validated
+edge exists. Do not
+disable `research.require_validated_variant` to force entries — that guard is
+part of the boundary standing between you and trading an unproven or
+live-shadow-unmarked rule.
 
 The watchdog should report `watching`. That is the steady state; `acted` means
 it authenticated the scoped account and confirmed flattening. `degraded` or
@@ -477,6 +481,28 @@ is a status record:
 `completed_no_edge` is what you should expect for a long time. It means the
 evidence gates did their job.
 
+The scheduled cycle runs `edge ingest-shadow` by default when
+`ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a harmless no-op. The
+offline cycle may produce a passing `lane=shadow` candidate, but that status is
+only forward-stability evidence. Start the optional broker-free live lane and
+then ingest its complete parity-matched sessions before validation/champion
+selection can authorize the trader:
+
+```bash
+docker compose --profile shadow up -d shadow
+docker compose --profile research run --rm research \
+  python research.py edge ingest-shadow
+```
+
+ShadowRunner has no broker credentials or mutation path. It evaluates eligible
+candidates in isolated virtual books from recorder events, writes only its WAL,
+and records candidate/root-baseline/randomized-null exact-session replays.
+Mismatch or incomplete rows are quarantined. Ingestion opens that WAL
+read-only, requires strictly newer sessions, prior qualification, complete
+parity, and matching source/config/code/provenance/replay/gate hashes; family
+and global BH plus durable online FDR must pass before an immutable live marker
+is appended. Manual/offline promotion cannot bypass it.
+
 ### How much data a first proof actually needs
 
 The bare structural floor is 100 executed trades and 10 sessions per required
@@ -490,8 +516,9 @@ floors apply to windows that are themselves fractions of the corpus:
 - **both** partitions must clear the floor, and the held-out one binds: 10
   held-out sessions out of a 70/30 split needs about 31 development sessions,
   which after the 20% seal needs about 38 recorded sessions **with trades**;
-- the shadow evaluation is a second, strictly later corpus, sealed the same
-  way, needing about 12 further sessions of its own;
+- the offline forward-shadow evaluation is a second, strictly later corpus,
+  sealed the same way, needing about 12 further sessions of its own; live
+  ShadowRunner ingestion then needs a still-newer complete parity-matched tail;
 - walk-forward needs a fit block plus three test blocks;
 - the falsification gate is an empirical p-value against cluster-level
   sign-flip draws where a cluster is one session, so with C held-out sessions
@@ -627,13 +654,15 @@ an execution console.
 
 ## 15. What a proved edge looks like
 
-When an edge finally qualifies:
+When a candidate finally earns a live-shadow proof:
 
-1. Its ledger candidate becomes `validated` or `champion`.
+1. `edge ingest-shadow` appends an immutable `lane=shadow` run and
+   parity-matched live-ingestion marker; its ledger candidate may then become
+   `validated` or `champion`.
 2. A deterministic, content-addressed edge proof report is written under
    `research/results/edges/<vehicle>/`.
-3. The dashboard lists it — but only while its latest verified shadow gate
-   still passes.
+3. The dashboard lists it — but only while its latest verified shadow gate and
+   live-ingestion marker still pass.
 4. The paper trader may select it on a later cycle, under the global risk
    limits and the correlation cap.
 5. Its slot is immediately reseeded with a **new** hypothesis. The proved rule
@@ -712,7 +741,7 @@ strategy:
   selection_mode: pinned
   pinned:
     - id: <operator-assigned-promotion-id>
-      variant_id: <exact-validated-or-champion-variant>
+      variant_id: <exact-live-shadow-marked-validated-or-champion-variant>
       vehicle: equity
       strategy_id: rule
 llm:
@@ -744,7 +773,10 @@ in step 12. The bounded research adapter of step 6 is a separate offline
 setting and is unaffected.
 
 Live startup fails unless the exact named vehicle-local edge has a latest
-passing verified shadow proof. The account must report
+passing verified shadow proof with the research-side parity-matched
+live-ingestion marker. A legacy validated/champion row without that marker is
+evaluated or migrated but remains ineligible until a new authorized live proof.
+The account must report
 `pattern_day_trader=true`.
 
 The shipped Compose services are paper-scoped. Build a separately reviewed live
@@ -757,7 +789,7 @@ place.
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| Trader healthy but never trades | No validated edge yet | Expected. Check `factory report`. |
+| Trader healthy but never trades | No live-shadow-marked validated edge yet | Expected. Check `factory report`, ShadowRunner, and `edge ingest-shadow`. |
 | `research-cycle` says `no_data` | Corpus empty or path wrong | Re-run step 10; check the recorder volume. |
 | `research-cycle` says `completed_no_edge` every night | Normal, or too little data | Check `factory report` — if variants show `underpowered`, widen `universe.symbols` and backfill more. |
 | Every variant fails only on "held-out sample big enough" | Universe too narrow | Add symbols. This is the most common first-deployment wall. |

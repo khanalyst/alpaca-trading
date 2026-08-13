@@ -138,8 +138,11 @@ def _family(record: Mapping) -> str:
     config = record.get("config") if isinstance(record.get("config"), Mapping) else {}
     strategy = config.get("strategy") if isinstance(config.get("strategy"), Mapping) else {}
     spec = strategy.get("rule_spec") if isinstance(strategy.get("rule_spec"), Mapping) else {}
-    return str(axes.get("hypothesis_id") or axes.get("family") or
-               spec.get("family") or record.get("strategy_id") or "unknown")
+    # Hypothesis ids identify parameter lineages, not executable families.
+    # all_proved must keep one strongest edge per actual rule family so a
+    # mutation cannot multiply runtime risk merely by changing its lineage.
+    return str(spec.get("family") or axes.get("family") or
+               axes.get("hypothesis_id") or record.get("strategy_id") or "unknown")
 
 
 # One notion of "better evidence" for the whole runtime: the ledger's own

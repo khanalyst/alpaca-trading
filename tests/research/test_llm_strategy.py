@@ -46,6 +46,44 @@ class LLMRuleStrategyTests(unittest.TestCase):
             prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
         self.assertTrue(result.ok)
         self.assertEqual(result.evidence["attempts"], 2)
+        self.assertEqual(len(result.evidence["attempt_evidence"]), 2)
+        for attempt in result.evidence["attempt_evidence"]:
+            self.assertRegex(attempt["config_hash"], r"^[0-9a-f]{64}$")
+            self.assertRegex(attempt["response_schema_hash"], r"^[0-9a-f]{64}$")
+
+    def test_total_call_budget_is_shared_across_requests(self):
+        calls = []
+        adapter = RuleProposalAdapter(
+            caller=lambda **_: (calls.append(True) or proposal()),
+            max_attempts=1, max_total_calls=1)
+        first = adapter.propose(
+            vehicle="equity", generation=1,
+            prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
+        second = adapter.propose(
+            vehicle="equity", generation=2,
+            prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
+        self.assertTrue(first.success)
+        self.assertFalse(second.success)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second.evidence["calls_remaining"], 0)
+
+    def test_auth_failure_opens_circuit_without_retries(self):
+        calls = []
+
+        class AuthenticationError(Exception):
+            pass
+
+        def fail(**_):
+            calls.append(True)
+            raise AuthenticationError("invalid api key")
+
+        adapter = RuleProposalAdapter(caller=fail, max_attempts=3)
+        result = adapter.propose(
+            vehicle="equity", generation=1,
+            prior_validated_rule_spec=DEFAULT_RULE_SPEC, diagnosis={})
+        self.assertFalse(result.success)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result.evidence["auth_circuit_open"])
 
     def test_rejects_fences_unknown_source_and_nonfinite(self):
         bad = [

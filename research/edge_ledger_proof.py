@@ -137,6 +137,13 @@ class EdgeLedgerProofMixin:
         }
         if expected != actual:
             return "verified gate counts do not match persisted trades"
+        # Source-bind every critical conclusion to the exact durable run.
+        source_fit = envelope.get("fit_source")
+        source_held = envelope.get("heldout_source")
+        if (not isinstance(source_fit, list) or not isinstance(source_held, list) or
+                sample_counts(source_fit, vehicle=run["vehicle"]) != actual["fit"] or
+                sample_counts(source_held, vehicle=run["vehicle"]) != actual["heldout"]):
+            return "verified gate source evidence is missing or does not match persisted trades"
         floors = envelope.get("floors")
         if not isinstance(floors, Mapping):
             return "verified gate floor report is missing"
@@ -186,6 +193,19 @@ class EdgeLedgerProofMixin:
                 return "verified gate structural floor result is inconsistent"
             if reported_adequate != (structural_passes if required else True):
                 return "verified gate adequacy result is inconsistent"
+            feasibility = report.get("feasibility")
+            if not isinstance(feasibility, Mapping):
+                return "verified gate floor feasibility evidence is missing"
+            from .gates import floor_feasibility
+            recomputed_feasibility = floor_feasibility(
+                fit_rows if name == "fit" else heldout_rows,
+                vehicle=run["vehicle"],
+                min_trades=normalized_minimums["trades"],
+                min_sessions=normalized_minimums["sessions"],
+                min_clusters=normalized_minimums["clusters"])
+            if (feasibility.get("status") != recomputed_feasibility.get("status") or
+                    bool(feasibility.get("adequate")) != bool(recomputed_feasibility.get("adequate"))):
+                return "verified gate floor feasibility evidence is inconsistent"
         checks = envelope.get("checks")
         if not isinstance(checks, Mapping) or not checks:
             return "verified gate decision checks are missing"
@@ -193,6 +213,19 @@ class EdgeLedgerProofMixin:
             return "verified gate decision checks are invalid"
         if envelope.get("passes") != all(checks.values()):
             return "verified gate pass decision is inconsistent"
+        if envelope.get("passes"):
+            from .gates import GATE_REQUIRED_CHECKS
+            if (not GATE_REQUIRED_CHECKS.issubset(set(checks)) or
+                    not all(bool(checks.get(key)) for key in GATE_REQUIRED_CHECKS)):
+                return "passing verified gate is missing a required decision check"
+            provenance = envelope.get("provenance")
+            if (not isinstance(provenance, Mapping) or
+                    any(not provenance.get(key) for key in
+                        ("dataset_hash", "config_hash", "code_hash", "provenance_hash"))):
+                return "passing verified gate provenance is missing"
+            for key in ("dataset_hash", "config_hash", "code_hash", "provenance_hash"):
+                if run.get(key) and str(provenance.get(key)) != str(run.get(key)):
+                    return "passing verified gate provenance does not match persisted run"
         statistics = envelope.get("statistics")
         if not isinstance(statistics, Mapping):
             return "verified gate p/q evidence is invalid"
@@ -292,6 +325,10 @@ class EdgeLedgerProofMixin:
         if (max_drawdown is None or
                 max_drawdown < 0):
             return "verified gate performance evidence is invalid"
+        from .gates import max_drawdown_of
+        if (not _close(max_drawdown, max_drawdown_of(heldout_rows)) and
+                not _close(max_drawdown, max_drawdown_of(rows))):
+            return "verified gate max drawdown does not match persisted trades"
         # Re-verification repeats the analysis from the persisted source rows
         # and matched deltas.  A recorded decision the evidence no longer
         # reproduces is not a proof, however well formed its hashes are.
@@ -398,11 +435,65 @@ class EdgeLedgerProofMixin:
         if candidate is None:
             raise KeyError(candidate_id)
         proof = self.latest_verified_run(candidate_id, lane=lane)
+        authorized = (lane != "shadow" or
+                      (proof is not None and self._live_shadow_authorized(proof)))
         eligible = bool(
             candidate.get("status") in {"validated", "champion"} and
-            proof is not None and proof["verified_gate"].get("passes") is True)
+            proof is not None and proof["verified_gate"].get("passes") is True and
+            authorized)
         return {"candidate_id": candidate_id, "status": candidate["status"],
                 "lane": lane, "eligible": eligible, "latest_verified_run": proof}
+
+    def _live_shadow_authorized(self, run: Mapping) -> bool:
+        """Require the research-side parity-ingestion marker for deployment."""
+        if not isinstance(run, Mapping) or run.get("lane") != "shadow":
+            return False
+        metrics = run.get("metrics")
+        source = metrics.get("shadow_source") if isinstance(metrics, Mapping) else None
+        if (not isinstance(source, Mapping) or
+                source.get("schema") != "shadow-ingest.v1" or
+                not source.get("candidate_id") or not source.get("sessions")):
+            return False
+        replay_digests = metrics.get("replay_digests") if isinstance(metrics, Mapping) else None
+        expected_replays = [item.get("replay_digest") for item in source.get("sessions", ())
+                            if isinstance(item, Mapping)]
+        if not isinstance(replay_digests, list) or replay_digests != expected_replays:
+            return False
+        with closing(_connect(self.path)) as db:
+            row = db.execute(
+                """SELECT payload_json,evidence_hash FROM evidence
+                   WHERE candidate_id=? AND run_id=? AND kind='shadow_ingestion'
+                   ORDER BY created_at DESC,evidence_id DESC LIMIT 1""",
+                (run.get("candidate_id"), run.get("run_id"))).fetchone()
+            gate_row = db.execute(
+                """SELECT payload_json,evidence_hash FROM evidence
+                   WHERE candidate_id=? AND run_id=? AND kind='verified_gate'
+                   ORDER BY created_at DESC,evidence_id DESC LIMIT 1""",
+                (run.get("candidate_id"), run.get("run_id"))).fetchone()
+        if row is None or gate_row is None:
+            return False
+        try:
+            payload = json.loads(row["payload_json"])
+            gate_payload = json.loads(gate_row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if (not isinstance(payload, Mapping) or
+                row["evidence_hash"] != content_hash(payload) or
+                not isinstance(gate_payload, Mapping) or
+                gate_row["evidence_hash"] != content_hash(gate_payload)):
+            return False
+        evidence_source = payload.get("source")
+        gate_hash = gate_payload.get("gate_hash")
+        gate = gate_payload.get("gate")
+        if not isinstance(gate, Mapping) or gate_hash != gate.get("content_hash"):
+            return False
+        return (
+            isinstance(evidence_source, Mapping)
+            and dict(evidence_source) == dict(source)
+            and payload.get("replay_digests") == replay_digests
+            and payload.get("gate_hash") == gate_hash
+            and gate_hash == gate.get("content_hash")
+        )
 
 
 __all__ = ["EdgeLedgerProofMixin"]

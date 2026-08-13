@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 import unittest
 
 from agent.contracts.rule import validate_rule_spec
+from research.costs import ReplayPolicy
 from research.factory_core import (
     FRESH_OPTION_QUOTE_SECONDS, MAX_OPTION_QUOTE_STALENESS_SECONDS, _option_at,
     _simulate_trade, diagnose, simulate_account,
@@ -37,11 +38,17 @@ def _bar(minute: int, close: float) -> UnderlyingBar:
                          identity=_identity(ts), interval_seconds=60)
 
 
-def _snap(minute: int, *, bid: float = 2.0, contract: OptionContract = CONTRACT,
-          seconds: int = 0) -> OptionSnapshot:
+def _snap(minute: int, *, bid: float = 2.0, ask: float | None = None,
+          contract: OptionContract = CONTRACT,
+          seconds: int = 0, bid_size: float | None = 5,
+          ask_size: float | None = 5, volume: float | None = 20,
+          open_interest: float | None = 100) -> OptionSnapshot:
     ts = OPEN + timedelta(minutes=minute, seconds=seconds)
-    return OptionSnapshot(contract=contract, timestamp=ts, bid=bid, ask=bid + .1,
-                          last=bid, underlying_price=500.0, identity=_identity(ts))
+    return OptionSnapshot(contract=contract, timestamp=ts, bid=bid,
+                          ask=bid + .1 if ask is None else ask,
+                          last=bid, underlying_price=500.0, identity=_identity(ts),
+                          bid_size=bid_size, ask_size=ask_size, volume=volume,
+                          open_interest=open_interest)
 
 
 def _rising_session(minutes: int = 40) -> list[UnderlyingBar]:
@@ -51,9 +58,44 @@ def _rising_session(minutes: int = 40) -> list[UnderlyingBar]:
 
 
 class OptionExitToleranceTests(unittest.TestCase):
-    def test_pinned_lookup_tolerates_a_skipped_recorder_cycle(self):
+    def test_missing_or_empty_liquidity_is_not_an_eligible_option_quote(self):
         bars = _rising_session()
-        snaps = [_snap(1), _snap(3, bid=6.0)]
+        for kwargs in (
+                {"bid_size": None, "ask_size": None, "volume": None,
+                 "open_interest": None},
+                {"bid_size": 0, "ask_size": 0, "volume": 0,
+                 "open_interest": 0}):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNone(_option_at(
+                    [_snap(6, **kwargs)], symbol="SPY", day=SESSION,
+                    direction="long", cutoff=bars[6].timestamp,
+                    contract_symbol=CONTRACT.symbol))
+
+    def test_runtime_liquidity_rule_requires_volume_oi_or_both_sizes(self):
+        bars = _rising_session()
+        for kwargs in (
+                {"bid_size": None, "ask_size": None, "volume": 1,
+                 "open_interest": None},
+                {"bid_size": 1, "ask_size": 1, "volume": None,
+                 "open_interest": None}):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNotNone(_option_at(
+                    [_snap(6, **kwargs)], symbol="SPY", day=SESSION,
+                    direction="long", cutoff=bars[6].timestamp,
+                    contract_symbol=CONTRACT.symbol))
+
+        # A one-sided displayed size is not executable depth.  Runtime risk
+        # treats it as unavailable unless volume or open interest supplies an
+        # independent liquidity measurement.
+        self.assertIsNone(_option_at(
+            [_snap(6, bid_size=1, ask_size=None, volume=None,
+                   open_interest=None)], symbol="SPY", day=SESSION,
+            direction="long", cutoff=bars[6].timestamp,
+            contract_symbol=CONTRACT.symbol))
+
+    def test_pinned_lookup_requires_a_quote_within_the_runtime_age_limit(self):
+        bars = _rising_session()
+        snaps = [_snap(6, seconds=30, bid=6.0)]
         found = _option_at(snaps, symbol="SPY", day=SESSION, direction="long",
                            cutoff=bars[6].end, contract_symbol=CONTRACT.symbol)
         self.assertIsNotNone(found)
@@ -73,12 +115,33 @@ class OptionExitToleranceTests(unittest.TestCase):
                            seconds=MAX_OPTION_QUOTE_STALENESS_SECONDS),
                        contract_symbol=CONTRACT.symbol))
 
+    def test_factory_option_bounds_use_runtime_spread_formula_and_avoid_zero_dte(self):
+        bars = _rising_session()
+        policy = ReplayPolicy(options_min_dte=0, options_max_dte=60,
+                              options_max_spread_pct=5.0)
+        # (ask-bid)/mid * 100 = 4.878%, just inside the runtime 5% cap.
+        self.assertIsNotNone(_option_at(
+            [_snap(6, bid=2.0, ask=2.1)], symbol="SPY", day=SESSION,
+            direction="long", cutoff=bars[6].timestamp,
+            contract_symbol=CONTRACT.symbol, policy=policy))
+        # A 5.485% midpoint spread is rejected at the same boundary.
+        self.assertIsNone(_option_at(
+            [_snap(6, bid=1.95, ask=2.06)], symbol="SPY", day=SESSION,
+            direction="long", cutoff=bars[6].timestamp,
+            contract_symbol=CONTRACT.symbol, policy=policy))
+        zero_dte = OptionContract(
+            symbol="SPY240102C00500000", underlying="SPY", expiration=SESSION,
+            strike=500.0, right="call", multiplier=100, currency="USD",
+            provider="alpaca", feed="opra")
+        self.assertIsNone(_option_at(
+            [_snap(6, contract=zero_dte)], symbol="SPY", day=SESSION,
+            direction="long", cutoff=bars[6].timestamp,
+            contract_symbol=zero_dte.symbol, policy=policy))
+
     def test_contract_that_stops_being_quoted_yields_a_reasoned_no_trade(self):
         bars = _rising_session()
-        # The recorder quotes the contract around the entry and then loses it.
-        # Quoted up to 14:42 and never again: the entry at 14:45 is still
-        # inside the bound, the 14:48 exit is not.
-        snaps = [_snap(minute) for minute in range(1, 13)]
+        # The recorder quotes the contract at the entry and then loses it.
+        snaps = [_snap(15)]
         raw = _simulate_trade(bars, validate_rule_spec(SPEC), snaps, "option")
         self.assertIsNotNone(raw)
         self.assertEqual(raw.get("unpriced_reason"),
@@ -107,7 +170,7 @@ class OptionExitToleranceTests(unittest.TestCase):
                          "no option quote within staleness bound at entry")
         self.assertEqual(row["net_pnl"], 0.0)
 
-    def test_stale_exit_is_priced_recorded_and_charged_a_spread(self):
+    def test_stale_exit_is_rejected_explicitly(self):
         bars = _rising_session()
         quoted = [_snap(minute) for minute in range(1, 40)]
         gapped = [snap for snap in quoted
@@ -120,17 +183,12 @@ class OptionExitToleranceTests(unittest.TestCase):
         (fresh_row,) = fresh_book["rows"]
         (stale_row,) = stale_book["rows"]
         self.assertFalse(fresh_row["no_trade"])
-        self.assertFalse(stale_row["no_trade"])
+        self.assertTrue(stale_row["no_trade"])
         self.assertLessEqual(fresh_row["exit_quote_age_seconds"],
                              FRESH_OPTION_QUOTE_SECONDS)
-        self.assertGreater(stale_row["exit_quote_age_seconds"],
-                           FRESH_OPTION_QUOTE_SECONDS)
-        # Same bid, same quantity: the only difference is that the stale exit is
-        # not treated as an executable quote, so it is filled worse.
-        self.assertEqual(stale_row["quantity"], fresh_row["quantity"])
-        self.assertLess(stale_row["exit_price"], fresh_row["exit_price"])
+        self.assertIn("stopped being quoted", stale_row["reject_reason"])
 
-    def test_realistic_gapped_corpus_recovers_rather_than_discards(self):
+    def test_realistic_gapped_corpus_rejects_stale_quotes_explicitly(self):
         # Ten sessions of one-minute bars; on five of them the recorder drops
         # the pinned contract for three minutes around the exit, on three it
         # loses the contract entirely after the entry.
@@ -156,7 +214,8 @@ class OptionExitToleranceTests(unittest.TestCase):
                 ts = OPEN + timedelta(minutes=offset + minute)
                 snaps.append(OptionSnapshot(
                     contract=CONTRACT, timestamp=ts, bid=2.0, ask=2.1, last=2.0,
-                    underlying_price=500.0,
+                    underlying_price=500.0, bid_size=5, ask_size=5, volume=20,
+                    open_interest=100,
                     identity=EventIdentity(
                         provider="alpaca", feed="opra", as_of=ts, observed_at=ts,
                         session_date=ts.date(), timezone="America/New_York")))
@@ -166,20 +225,13 @@ class OptionExitToleranceTests(unittest.TestCase):
         self.assertEqual(len(rows), 10)
         priced = [row for row in rows if row.get("no_trade") is False]
         rejected = [row for row in rows if row.get("reject_reason")]
-        self.assertEqual(len(priced), 7)
-        self.assertEqual(len(rejected), 3)
-        self.assertTrue(all("stopped being quoted" in row["reject_reason"]
-                            for row in rejected))
-        # Five of the seven are recovered across a real recorder gap and carry
-        # the staleness that recovery cost them.
-        recovered = [row for row in priced
-                     if row["exit_quote_age_seconds"] > FRESH_OPTION_QUOTE_SECONDS]
-        self.assertEqual(len(recovered), 5)
-        self.assertTrue(all(row["exit_quote_age_seconds"] <=
-                            MAX_OPTION_QUOTE_STALENESS_SECONDS for row in recovered))
+        self.assertEqual(len(priced), 2)
+        self.assertEqual(len(rejected), 8)
+        self.assertTrue(all(row.get("reject_reason") for row in rejected))
+        # Quotes beyond the runtime freshness boundary are not reused.
         # Every session stays in the sample; none silently vanished.
         self.assertEqual(diagnose(rows)["sessions"], 10)
-        self.assertEqual(diagnose(rows)["trades"], 7)
+        self.assertEqual(diagnose(rows)["trades"], 2)
 
 
 if __name__ == "__main__":

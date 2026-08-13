@@ -832,6 +832,41 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(seen["entry_price"], 100.0)
         self.assertEqual(seen["price"], 100.0)
 
+    def test_engine_persists_one_ibr_signal_per_edge_symbol_session(self):
+        from agent import state
+
+        provider = FakeProvider()
+        engine = Engine(_cfg(), provider=provider, brain=BrainFake())
+        self.addCleanup(engine.close)
+        engine._wall_clock = lambda: provider.now
+        snapshot = {"SPY": {"bars": [], "quote": {
+            "symbol": "SPY", "timestamp": provider.now,
+            "bid": 100, "ask": 100.1}}}
+        seen_states = []
+
+        def one_signal(_symbol, _bars, *, session_state, **_kwargs):
+            seen_states.append(session_state)
+            key = ("SPY", "2026-08-07")
+            if key in session_state["signals"]:
+                return None
+            session_state["signals"].add(key)
+            return {"symbol": "SPY", "direction": "long",
+                    "setup_type": "ibr_breakout", "entry_price": 100.0,
+                    "signal_ts": provider.now.timestamp(),
+                    "relative_volume": 2.0, "session": "2026-08-07"}
+
+        with patch.object(engine_module, "generate_ibr_signal", side_effect=one_signal), \
+             patch.object(engine_module, "build_setup_plan",
+                          return_value=(None, "test rejection")):
+            engine.run_once(snapshot)
+            engine.run_once(snapshot)
+
+        self.assertEqual(len(seen_states), 2)
+        self.assertEqual(seen_states[0]["signals"], {("SPY", "2026-08-07")})
+        self.assertEqual(seen_states[1]["signals"], {("SPY", "2026-08-07")})
+        remembered = state.load_state()["signal_sessions"]
+        self.assertEqual(list(remembered.values()), ["2026-08-07"])
+
     def test_entry_slippage_strictly_above_fifty_bps_is_rejected(self):
         engine = Engine(_cfg(), light=True, provider=FakeProvider())
         self.addCleanup(engine.close)

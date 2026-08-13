@@ -28,7 +28,8 @@ REPORT_SCHEMA = "factory-report.v1"
 
 # Origins where the model actually authored the hypothesis.  Everything else
 # is deterministic, even when a provider was asked first and refused.
-_LLM_ORIGINS = frozenset(("llm_discovery", "llm_replacement"))
+_LLM_ORIGINS = frozenset(("llm_discovery", "llm_replacement",
+                          "reseed_after_proof"))
 
 # Ordered so the narrative reads as a lifecycle rather than an alphabet.
 _CHECK_LABELS = {
@@ -120,6 +121,8 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         "p_raw": _number(gate.get("p_raw")),
         "q_value": q_value,
         "confidence": _number(gate.get("confidence")),
+        "is_root": bool(gate.get("is_root")),
+        "null_control": gate.get("null_control"),
         "passes": bool(gate.get("passes")),
         "underpowered": not (gate.get("sample_adequate") and
                              gate.get("heldout_sample_adequate")),
@@ -154,6 +157,9 @@ def _origin(events: Sequence[Mapping[str, Any]],
                                   "reason": event.get("reason")}
         evidence = payload.get("llm_evidence")
         if isinstance(evidence, Mapping):
+            attempt_errors = evidence.get("attempt_errors")
+            if not isinstance(attempt_errors, (list, tuple)):
+                attempt_errors = []
             origin["llm"] = {
                 "provider": evidence.get("provider"),
                 "model": evidence.get("model"),
@@ -161,6 +167,15 @@ def _origin(events: Sequence[Mapping[str, Any]],
                 "request_hash": evidence.get("request_hash"),
                 "response_hash": evidence.get("raw_response_hash"),
                 "prompt_hash": evidence.get("system_prompt_hash"),
+                "config_hash": evidence.get("config_hash"),
+                "response_schema_hash": evidence.get("response_schema_hash"),
+                "grammar_schema_hash": evidence.get("grammar_schema_hash"),
+                "max_total_calls": evidence.get("max_total_calls"),
+                "calls_used": evidence.get("calls_used"),
+                "calls_remaining": evidence.get("calls_remaining"),
+                "auth_circuit_open": evidence.get("auth_circuit_open"),
+                "attempt_errors": [str(item)[:240] for item in attempt_errors[:3]],
+                "attempt_evidence": list(evidence.get("attempt_evidence") or ())[:3],
             }
         if payload.get("llm_error"):
             origin["llm_error"] = payload["llm_error"]
@@ -187,6 +202,9 @@ def _origin(events: Sequence[Mapping[str, Any]],
         if source:
             origin["source"] = source
         if isinstance(evidence, Mapping):
+            attempt_errors = evidence.get("attempt_errors")
+            if not isinstance(attempt_errors, (list, tuple)):
+                attempt_errors = []
             origin["llm"] = {
                 "provider": evidence.get("provider"),
                 "model": evidence.get("model"),
@@ -194,6 +212,15 @@ def _origin(events: Sequence[Mapping[str, Any]],
                 "request_hash": evidence.get("request_hash"),
                 "response_hash": evidence.get("raw_response_hash"),
                 "prompt_hash": evidence.get("system_prompt_hash"),
+                "config_hash": evidence.get("config_hash"),
+                "response_schema_hash": evidence.get("response_schema_hash"),
+                "grammar_schema_hash": evidence.get("grammar_schema_hash"),
+                "max_total_calls": evidence.get("max_total_calls"),
+                "calls_used": evidence.get("calls_used"),
+                "calls_remaining": evidence.get("calls_remaining"),
+                "auth_circuit_open": evidence.get("auth_circuit_open"),
+                "attempt_errors": [str(item)[:240] for item in attempt_errors[:3]],
+                "attempt_evidence": list(evidence.get("attempt_evidence") or ())[:3],
             }
         if payload.get("llm_error"):
             origin["llm_error"] = payload["llm_error"]
@@ -235,6 +262,29 @@ def _outcome(events: Sequence[Mapping[str, Any]], status: str) -> dict:
                     "max_generations": payload.get("max_generations"),
                     "rotations_used": payload.get("rotations_used")}
     return {"kind": status or "active"}
+
+
+def _tuning_events(events: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Expose provider tuning evidence recorded on testing events."""
+    output: list[dict] = []
+    for event in events:
+        payload = event.get("payload") or {}
+        if not isinstance(payload, Mapping) or "evidence" not in payload:
+            continue
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, Mapping) or evidence.get("kind") != "tuning":
+            continue
+        item = {
+            "created_at": event.get("created_at"),
+            "schema": payload.get("schema"),
+            "success": bool(payload.get("success")),
+            "tuned_variants": payload.get("tuned_variants", 0),
+            "evidence": dict(evidence),
+        }
+        if payload.get("error"):
+            item["error"] = str(payload["error"])[:500]
+        output.append(item)
+    return output
 
 
 def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
@@ -297,7 +347,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             reasons: dict[str, str] = {}
             for row in db.execute(
                     f"""SELECT l.lesson_id, {parent}, l.vehicle, l.family,
-                              l.kind, l.source, l.reason,
+                              l.kind, l.source, l.reason, l.evidence_json,
                               l.changed_json, l.variant_id, l.created_at,
                               o.passed, o.underpowered, o.heldout_delta,
                               o.q_value, o.failed_checks_json, o.outcome_id
@@ -317,6 +367,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                     "proposed_by": row["source"], "reason": row["reason"],
                     "variant_id": row["variant_id"],
                     "changed": _loads(row["changed_json"]) or {},
+                    "evidence": _loads(row["evidence_json"]) or {},
                     "graded": graded,
                     "verdict": (None if not graded else
                                 "passed" if row["passed"] else
@@ -368,6 +419,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "origin": _origin(own, parent, hypothesis_id,
                                   int(item["generation"])),
                 "variants": variants,
+                "tuning": _tuning_events(own),
                 "variants_tested": len(variants),
                 "outcome": _outcome(own, str(item["status"] or "")),
             })
@@ -404,7 +456,10 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 # as an LLM-seeded hypothesis.
                 "llm_seeded_hypotheses": sum(
                     1 for rows in slots.values() for item in rows
-                    if item["origin"]["kind"] in _LLM_ORIGINS),
+                    if item["origin"]["kind"] in {
+                        "llm_discovery", "llm_replacement"} or
+                    (item["origin"]["kind"] == "reseed_after_proof" and
+                     str(item["origin"].get("source") or "").startswith("llm"))),
                 "llm_proposals_rejected": sum(
                     1 for rows in slots.values() for item in rows
                     if item["origin"].get("llm_error")),
@@ -416,6 +471,10 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "llm_tuned_variants": sum(
                     1 for item in local_lessons
                     if item["proposed_by"] == "llm" and item["kind"] == "tuning"),
+                "llm_reseeds": sum(
+                    1 for rows in slots.values() for item in rows
+                    if item["origin"]["kind"] == "reseed_after_proof" and
+                    str(item["origin"].get("source") or "").startswith("llm")),
                 # Proposals that named the earlier result they reasoned from,
                 # rather than starting from nothing.
                 "reasons_built_on_a_prior_lesson": sum(
@@ -479,6 +538,7 @@ def render_text(report: Mapping[str, Any]) -> str:
             f" ({summary['reasons_graded']} graded,"
             f" {summary['reasons_built_on_a_prior_lesson']} built on an"
             f" earlier lesson)")
+        add(f"  LLM reseeds after proof: {summary['llm_reseeds']}")
         proved = summary["proved_variants"]
         add(f"  PROVED EDGES: {', '.join(proved) if proved else 'none yet'}")
         if vehicle.get("lessons"):
@@ -519,6 +579,16 @@ def render_text(report: Mapping[str, Any]) -> str:
                     add(f"        prompt {str(llm.get('prompt_hash'))[:16]}…"
                         f"  request {str(llm.get('request_hash'))[:16]}…"
                         f"  response {str(llm.get('response_hash'))[:16]}…")
+                for tuning in item.get("tuning", ()):
+                    evidence = tuning.get("evidence") or {}
+                    add(f"      tuning {'accepted' if tuning.get('success') else 'rejected'}"
+                        f" ({tuning.get('tuned_variants', 0)} variant(s))"
+                        f" schema {str(evidence.get('response_schema_hash'))[:16]}…"
+                        f" config {str(evidence.get('config_hash'))[:16]}…")
+                    add(f"        request {str(evidence.get('request_hash'))[:16]}…"
+                        f" response {str(evidence.get('raw_response_hash'))[:16]}…")
+                    for error in (evidence.get('attempt_errors') or ())[:3]:
+                        add(f"        tuning attempt: {str(error)[:240]}")
                 if origin.get("llm_error"):
                     add(f"      LLM proposal rejected: {origin['llm_error']}")
                 if item["variants"]:
@@ -584,6 +654,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f" ({summary['llm_proposals_rejected']} refused)",
                 f"- Retired or rotated: {summary['retired_hypotheses']}",
                 f"- Variants the model tuned: {summary['llm_tuned_variants']}",
+                f"- LLM reseeds after proof: {summary['llm_reseeds']}",
                 f"- Reasons recorded: {summary['reasons_recorded']}"
                 f" ({summary['reasons_graded']} graded)",
                 f"- Proved edges: {', '.join(summary['proved_variants']) or 'none yet'}"]
@@ -619,6 +690,17 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 outcome = item["outcome"]
                 out += ["", f"**Outcome:** {outcome['kind'].replace('_', ' ')}"
                             f" — {outcome.get('reason') or ''}"]
+                for tuning in item.get("tuning", ()):
+                    evidence = tuning.get("evidence") or {}
+                    out.append(
+                        f"- Tuning {'accepted' if tuning.get('success') else 'rejected'}"
+                        f" ({tuning.get('tuned_variants', 0)} variants); "
+                        f"schema `{str(evidence.get('response_schema_hash'))[:16]}…`, "
+                        f"config `{str(evidence.get('config_hash'))[:16]}…`, "
+                        f"request `{str(evidence.get('request_hash'))[:16]}…`, "
+                        f"response `{str(evidence.get('raw_response_hash'))[:16]}…`")
+                    for error in (evidence.get('attempt_errors') or ())[:3]:
+                        out.append(f"  - Tuning attempt: {str(error)[:240]}")
                 if outcome.get("variants_tested") is not None:
                     out.append(f" (after {outcome['variants_tested']} variants)")
     return "\n".join(out) + "\n"

@@ -105,6 +105,143 @@ _V2_BOUNDS = {
 _EXTRA_CONFIRMATIONS = tuple(name for name in CONFIRMATIONS if name != "none")
 MAX_CONFIRMATIONS = len(_EXTRA_CONFIRMATIONS)
 
+# Fields that affect the executable signal or its bounded exits.  ``schema``
+# is deliberately not part of this set: v1 and v2 are aliases when every v2
+# extension is at its documented no-op default.
+EXECUTABLE_RULE_FIELDS = tuple(name for name in DEFAULT_RULE_SPEC
+                               if name != "schema")
+_COMMON_EXECUTABLE_FIELDS = frozenset(
+    ("family", "side", "stop_atr", "target_r", "max_hold_bars", "atr_period",
+     "confirmation"))
+_FAMILY_EXECUTABLE_FIELDS = {
+    "opening_range_breakout": ("range_minutes", "threshold_bps"),
+    "opening_range_fade": ("range_minutes", "threshold_bps"),
+    "momentum_continuation": ("lookback", "threshold_bps"),
+    "mean_reversion": ("lookback", "zscore"),
+    "trend_pullback": ("lookback", "slow_lookback", "threshold_bps"),
+    "volatility_breakout": ("lookback", "threshold_bps", "compression_bps"),
+    "volume_breakout": ("lookback", "threshold_bps", "volume_multiplier"),
+    "vwap_reversion": ("lookback", "threshold_bps"),
+    "vwap_trend": ("lookback", "threshold_bps"),
+    "range_expansion": ("lookback", "threshold_bps", "volume_multiplier"),
+    "opening_drive": ("range_minutes", "threshold_bps"),
+}
+
+
+def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
+    fields = set(_COMMON_EXECUTABLE_FIELDS)
+    fields.update(_FAMILY_EXECUTABLE_FIELDS.get(str(spec["family"]), ()))
+    # Confirmation predicates activate their own input parameters even when
+    # the base family's signal does not use them.
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    if "trend" in confirmations:
+        fields.update(("lookback", "slow_lookback"))
+    if "volume" in confirmations:
+        fields.add("volume_multiplier")
+    if "volatility" in confirmations:
+        fields.update(("atr_period", "compression_bps"))
+    return fields
+
+
+def rule_semantic_signature(value: Mapping[str, Any]) -> str:
+    """Return the canonical executable identity of a rule.
+
+    Content hashes remain immutable storage ids and therefore retain the
+    authored grammar version.  This signature is the behaviour-level id used
+    for de-duplication: an omitted v2 extension (v1) and an explicit v2
+    extension at its no-op default collapse to the same identity, while every
+    family-relevant executable field remains represented.
+    """
+    spec = validate_rule_spec(value)
+    effective = {name: spec[name] for name in _semantic_fields(spec)
+                 if name in spec}
+    if spec.get("schema") == RULE_SCHEMA_V2:
+        for name, default in V2_DEFAULT_EXTENSIONS.items():
+            current = spec.get(name, default)
+            if current != default:
+                effective[name] = current
+    return json.dumps(effective, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def rule_semantic_distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    """Return a small deterministic normalized distance between two rules.
+
+    The metric is intentionally transparent (no fuzzy model): categorical
+    executable changes cost one, and numeric changes are normalized by their
+    audited grammar span.  A distance of zero means semantic equivalence.
+    """
+    a = validate_rule_spec(left)
+    b = validate_rule_spec(right)
+    if a["family"] != b["family"]:
+        return 1.0
+    distance = 0.0
+    dimensions = 0
+    bounds = {**_BOUNDS, **_V2_BOUNDS}
+    fields = _semantic_fields(a) | _semantic_fields(b)
+    for name, default in V2_DEFAULT_EXTENSIONS.items():
+        if a.get(name, default) != default or b.get(name, default) != default:
+            fields.add(name)
+    for name in sorted(fields):
+        av, bv = a.get(name), b.get(name)
+        dimensions += 1
+        if name == "confirmations":
+            distance += 0.0 if set(av or ()) == set(bv or ()) else 1.0
+        elif name in bounds and isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+            low, high, _ = bounds[name]
+            span = max(float(high) - float(low), 1.0)
+            distance += min(1.0, abs(float(av) - float(bv)) / span)
+        else:
+            distance += 0.0 if av == bv else 1.0
+    return distance / max(dimensions, 1)
+
+
+def rule_spec_json_schema(schema: str | None = None) -> dict[str, Any]:
+    """Expose the complete provider-facing JSON grammar and audited bounds."""
+    schemas = [schema] if schema is not None else list(RULE_SCHEMAS)
+    if any(item not in RULE_SCHEMAS for item in schemas):
+        raise RuleSpecError(f"unknown rule schema: {schema!r}")
+
+    def one(name: str) -> dict[str, Any]:
+        properties: dict[str, Any] = {
+            "schema": {"type": "string", "const": name},
+            "family": {"type": "string", "enum": list(RULE_FAMILIES)},
+            "side": {"type": "string", "enum": list(SIDES)},
+            "lookback": {"type": "integer", "minimum": 3, "maximum": 120},
+            "slow_lookback": {"type": "integer", "minimum": 5, "maximum": 240},
+            "range_minutes": {"type": "integer", "minimum": 3, "maximum": 120},
+            "threshold_bps": {"type": "number", "minimum": 0.0, "maximum": 500.0},
+            "compression_bps": {"type": "number", "minimum": 1.0, "maximum": 2000.0},
+            "zscore": {"type": "number", "minimum": 0.25, "maximum": 5.0},
+            "volume_multiplier": {"type": "number", "minimum": 0.25, "maximum": 10.0},
+            "atr_period": {"type": "integer", "minimum": 3, "maximum": 100},
+            "stop_atr": {"type": "number", "minimum": 0.2, "maximum": 10.0},
+            "target_r": {"type": "number", "minimum": 0.25, "maximum": 10.0},
+            "max_hold_bars": {"type": "integer", "minimum": 1, "maximum": 390},
+            "confirmation": {"type": "string", "enum": list(CONFIRMATIONS)},
+        }
+        required = list(DEFAULT_RULE_SPEC)
+        if name == RULE_SCHEMA_V2:
+            properties.update({
+                "confirmations": {"type": "array", "maxItems": MAX_CONFIRMATIONS,
+                                  "uniqueItems": True,
+                                  "items": {"type": "string", "enum": list(_EXTRA_CONFIRMATIONS)}},
+                "entry_after_minutes": {"type": "integer", "minimum": 0,
+                                         "maximum": SESSION_MINUTES - 1},
+                "entry_before_minutes": {"type": "integer", "minimum": 1,
+                                          "maximum": SESSION_MINUTES},
+                "min_atr_bps": {"type": "number", "minimum": 0.0, "maximum": 2000.0},
+                "max_atr_bps": {"type": "number", "minimum": 1.0, "maximum": 5000.0},
+            })
+            required += list(V2_DEFAULT_EXTENSIONS)
+        return {"type": "object", "additionalProperties": False,
+                "required": required, "properties": properties}
+
+    if len(schemas) == 1:
+        return one(schemas[0])
+    return {"oneOf": [one(name) for name in schemas]}
+
 
 class RuleSpecError(ValueError):
     """Raised when an autonomous rule leaves the audited grammar."""
@@ -630,7 +767,9 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
 __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
-    "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
+           "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
+           "EXECUTABLE_RULE_FIELDS", "rule_semantic_signature",
+           "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "evaluate_rule_signal",
     "generate_rule_signal", "hold_deadline", "rule_spec_hash",
     "rule_variant_id", "setup_evidence", "validate_rule_spec",

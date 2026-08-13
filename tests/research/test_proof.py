@@ -22,7 +22,7 @@ class FakeLedger:
             "config_hash": "c" * 64,
             "code_hash": "k" * 64,
             "provenance_hash": "p" * 64,
-            "config_json": '{"strategy":{"rule_spec":' + __import__("json").dumps(DEFAULT_RULE_SPEC) + '}',
+            "config_json": '{"strategy":{"rule_spec":' + __import__("json").dumps(DEFAULT_RULE_SPEC) + '}}',
         }
 
     def candidate(self, candidate_id):
@@ -66,6 +66,43 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(one["llm_evidence_hashes"], ["e" * 64])
         self.assertNotIn("created_at", one)
         self.assertEqual(payload_hash(one), payload_hash(two))
+
+    def test_authorized_run_ignores_caller_metric_spec_and_hash_overrides(self):
+        class AuthorizedLedger(FakeLedger):
+            def runs(self, candidate_id):
+                return [{**super().runs(candidate_id)[0],
+                         "heldout_end": "2024-01-02"}]
+
+            def evidence(self, candidate_id):
+                return [{"evidence_id": "gate-1", "run_id": "run-1",
+                         "kind": "verified_gate", "evidence_hash": "g" * 64,
+                         "payload": {"run_id": "run-1", "gate": {
+                             "passes": False,
+                             "counts": {"fit": {"trades": 12},
+                                        "heldout": {"trades": 8}},
+                             "performance": {"max_drawdown": .12}}}}]
+
+            def trades(self, candidate_id):
+                return []
+
+        malicious = dict(DEFAULT_RULE_SPEC)
+        malicious["family"] = "opening_drive"
+        payload = build_proof_payload(AuthorizedLedger(), "candidate-1", {
+            "authorized_run_id": "run-1",
+            "metrics": {"confidence": 1.0, "gate": {"passes": True}},
+            "samples": {"fit": 999, "heldout": 999, "shadow": 999},
+            "rule_spec": malicious,
+            "hashes": {"dataset_hash": "x" * 64, "config_hash": "x" * 64,
+                       "code_hash": "x" * 64, "provenance_hash": "x" * 64},
+            "llm_evidence_hashes": ["x" * 64],
+            "statuses": {"forged": "champion"},
+        })
+        self.assertEqual(payload["gate"]["passes"], False)
+        self.assertEqual(payload["samples"], {"fit": 12, "heldout": 8, "shadow": 5})
+        self.assertEqual(payload["normalized_rule_spec"], DEFAULT_RULE_SPEC)
+        self.assertEqual(payload["dataset_hash"], "d" * 64)
+        self.assertNotIn("forged", payload["statuses"])
+        self.assertEqual(payload["llm_evidence_hashes"], [])
 
     def test_equity_and_option_paths_and_no_overwrite(self):
         for vehicle in ("equity", "option"):

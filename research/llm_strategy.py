@@ -16,11 +16,12 @@ import math
 import os
 from queue import Empty, Queue
 import re
-from threading import Thread
-from typing import Any, Callable, Mapping
+from threading import Lock, Thread
+from typing import Any, Callable, Mapping, Sequence
 
-from agent.contracts.rule import (rule_spec_hash, rule_variant_id,
-                                  validate_rule_spec)
+from agent.contracts.rule import (RULE_SCHEMA_V1, RULE_SCHEMA_V2,
+                                  rule_spec_hash, rule_variant_id,
+                                  rule_spec_json_schema, validate_rule_spec)
 
 
 PROPOSAL_SCHEMA = "llm-rule-proposal.v1"
@@ -29,16 +30,23 @@ TUNING_SCHEMA = "llm-variant-tuning.v1"
 DEFAULT_RESPONSE_BYTES = 16_384
 DEFAULT_ATTEMPTS = 2
 DEFAULT_TIMEOUT_SECONDS = 20.0
+DEFAULT_TOTAL_CALLS = 64
 # A tuning reply proposes the variants of one hypothesis, so it is bounded by
 # the same ``MAX_VARIANTS`` the factory itself accepts.
 MAX_TUNED_VARIANTS = 8
+_AUTH_ERROR_TOKENS = ("authentication", "authorization", "unauthorized",
+                      "forbidden", "invalid api key", "invalid_api_key",
+                      "credentials are unavailable", "credential unavailable")
 
 # The prompt is part of the evidence fingerprint.  Keep it stable and make
 # the output boundary explicit for providers that do not support JSON schema.
 SYSTEM_PROMPT = """You propose bounded replacement rule strategies for an audited
 research process.  Return one JSON object and nothing else, exactly:
 {"schema":"llm-rule-proposal.v1","rule_spec":{...}}
-The rule_spec must use only the finite rule-strategy.v1 grammar.  Never return
+The rule_spec must include every required key of either the explicit
+rule-strategy.v1 or rule-strategy.v2 grammar; schema is never inferred.
+All numeric bounds and enum values are exactly those shown in the provider JSON
+schema. Never return
 markdown, Python/source code, executable instructions, credentials, market
 rows, or fields outside schema and rule_spec.
 """
@@ -50,7 +58,7 @@ rows, or fields outside schema and rule_spec.
 DISCOVERY_SYSTEM_PROMPT = """You propose new bounded intraday edge hypotheses for
 an audited research process.  Return one JSON object and nothing else, exactly:
 {"schema":"llm-edge-discovery.v1","rule_spec":{...},"thesis":"..."}
-The rule_spec must use only the finite rule-strategy grammar.  Set
+The rule_spec must use only the finite rule-strategy grammar and must set
 "schema":"rule-strategy.v2" inside rule_spec to use the wider grammar, which
 adds: "confirmations" (a list of extra filters from trend/volume/volatility,
 all of which must hold), "entry_after_minutes" and "entry_before_minutes"
@@ -76,9 +84,11 @@ and nothing else, exactly:
 {"schema":"llm-variant-tuning.v1","variants":[
   {"rule_spec":{...},"reason":"...","builds_on":"<lesson id>"}]}
 
-WHAT YOU MAY CHANGE.  You are given a root rule_spec.  Copy it and change the
-VALUES of its existing fields, within the grammar's bounds.  You may not add,
-remove or rename a field, you may not change "family", and you may not change
+WHAT YOU MAY CHANGE.  You are given a fully normalized root rule_spec. Return
+the full normalized key set exactly (omitting a key is a contract failure).
+Copy it and change only VALUES of its existing fields, within the grammar's
+bounds. You may not add, remove or rename a field, you may not change "family",
+and you may not change
 "schema".  The signals themselves — the families, the confirmation filters, and
 how each is computed from the bars — are fixed code that you are tuning, not
 designing.  You cannot introduce a new signal, indicator or data source, and a
@@ -234,6 +244,54 @@ def _safe_reason(value: Any) -> str:
     return _safe_text(value, label="reason", limit=MAX_REASON_CHARS)
 
 
+def _tuning_reason_check(reason: str, root: Mapping[str, Any],
+                         normalized: Mapping[str, Any],
+                         diagnosis: Mapping[str, Any],
+                         lessons: Sequence[Mapping[str, Any]]) -> None:
+    """Require a tuning rationale to name its actual change and evidence."""
+    changed = [str(key) for key in root
+               if root.get(key) != normalized.get(key)]
+    if not changed:
+        raise ValueError("tuning reason has no changed field to justify")
+    text = reason.lower()
+    field_cues: set[str] = set()
+    for key in changed:
+        field_cues.add(key.lower())
+        field_cues.add(key.lower().replace("_", " "))
+        field_cues.update(part.lower() for part in key.split("_")
+                          if len(part) >= 4 and part.lower() not in {
+                              "before", "after"})
+    if not any(cue in text for cue in field_cues):
+        raise ValueError(
+            "tuning reason must name a changed field: " + ", ".join(changed))
+    if lessons:
+        # A cited id proves which lesson was selected; the prose must still
+        # acknowledge that evidence rather than being an ungrounded guess.
+        cues = {"lesson", "prior", "earlier", "cited", "failed", "passed",
+                "attempt", "overshot", "showed", "diagnosis"}
+        for value in diagnosis.values():
+            cues.update(token for token in re.findall(r"[a-z0-9_]+",
+                                                       str(value).lower())
+                        if len(token) >= 5)
+        for lesson in lessons:
+            for value in lesson.values():
+                cues.update(token for token in re.findall(r"[a-z0-9_]+",
+                                                           str(value).lower())
+                            if len(token) >= 5)
+        if not any(cue in text for cue in cues):
+            raise ValueError(
+                "tuning reason must cite a lesson or diagnosed problem")
+
+
+def _safe_error(exc: BaseException, *, limit: int = 240) -> str:
+    """Describe a provider failure without persisting response/secret content."""
+    message = " ".join(str(exc).split())
+    for token in ("api_key", "apikey", "token", "secret", "password", "credential"):
+        message = re.sub(rf"{token}\s*[=:]\s*[^ ,;]+", f"{token}=<redacted>",
+                         message, flags=re.IGNORECASE)
+    return f"{type(exc).__name__}: {message[:limit]}"
+
+
 def _safe_tuned_variants(value: Any, *, limit: int,
                          known_lessons: frozenset[str] = frozenset()
                          ) -> list[dict[str, Any]]:
@@ -289,20 +347,47 @@ def _safe_tuned_variants(value: Any, *, limit: int,
     return parsed
 
 
-def _raw_text(value: Any) -> str:
-    """Extract text from common SDK response shapes without trusting it."""
+def _bounded_append(pieces: list[str], value: str, used: int,
+                    max_bytes: int | None) -> int:
+    """Append one text block without crossing the materialization budget."""
+    encoded = value.encode("utf-8")
+    if max_bytes is not None and used + len(encoded) > max_bytes:
+        raise ValueError(f"provider response exceeds {max_bytes}-byte cap")
+    pieces.append(value)
+    return used + len(encoded)
+
+
+def _bounded_json(value: Mapping[str, Any], max_bytes: int | None) -> str:
+    """Serialize a mapping incrementally, before joining the complete text."""
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False,
+                               default=_json_default)
+    pieces: list[str] = []
+    used = 0
+    for chunk in encoder.iterencode(value):
+        used = _bounded_append(pieces, chunk, used, max_bytes)
+    return "".join(pieces)
+
+
+def _raw_text(value: Any, *, max_bytes: int | None = None) -> str:
+    """Extract bounded text from common SDK response shapes without trusting it."""
 
     if isinstance(value, str):
+        pieces: list[str] = []
+        _bounded_append(pieces, value, 0, max_bytes)
         return value
     if isinstance(value, Mapping):
-        return canonical_json(value)
+        return _bounded_json(value, max_bytes)
     output_text = getattr(value, "output_text", None)
     if isinstance(output_text, str):
+        pieces = []
+        _bounded_append(pieces, output_text, 0, max_bytes)
         return output_text
+    pieces: list[str] = []
+    used = 0
     # Responses API: output -> content -> text.
     output = getattr(value, "output", None)
     if output:
-        pieces: list[str] = []
         for item in output:
             content = getattr(item, "content", None)
             if content is None and isinstance(item, Mapping):
@@ -312,7 +397,7 @@ def _raw_text(value: Any) -> str:
                 if text is None and isinstance(block, Mapping):
                     text = block.get("text")
                 if isinstance(text, str):
-                    pieces.append(text)
+                    used = _bounded_append(pieces, text, used, max_bytes)
         if pieces:
             return "".join(pieces)
     # Chat Completions and Anthropic Messages response shapes.
@@ -321,16 +406,18 @@ def _raw_text(value: Any) -> str:
         message = getattr(choices[0], "message", None)
         text = getattr(message, "content", None)
         if isinstance(text, str):
+            _bounded_append(pieces, text, 0, max_bytes)
             return text
     content = getattr(value, "content", None)
     if content:
         pieces = []
+        used = 0
         for block in content:
             text = getattr(block, "text", None)
             if text is None and isinstance(block, Mapping):
                 text = block.get("text")
             if isinstance(text, str):
-                pieces.append(text)
+                used = _bounded_append(pieces, text, used, max_bytes)
         if pieces:
             return "".join(pieces)
     raise ValueError("provider response did not contain text")
@@ -341,10 +428,7 @@ def _parse_response(value: Any, *, max_bytes: int,
                     keys: frozenset[str] = _RESPONSE_KEYS,
                     spec_key: str | None = "rule_spec"
                     ) -> tuple[dict[str, Any], str]:
-    raw = _raw_text(value)
-    raw_bytes = raw.encode("utf-8")
-    if len(raw_bytes) > max_bytes:
-        raise ValueError(f"provider response exceeds {max_bytes}-byte cap")
+    raw = _raw_text(value, max_bytes=max_bytes)
     # Fences are rejected rather than stripped: silently accepting prose or
     # markdown would make the contract less auditable.
     if "```" in raw:
@@ -486,6 +570,7 @@ class RuleProposalAdapter:
                  max_attempts: int = DEFAULT_ATTEMPTS,
                  timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                  max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+                 max_total_calls: int = DEFAULT_TOTAL_CALLS,
                  client: Any = None):
         provider = str(provider).lower().strip()
         if provider not in {"openai", "anthropic"}:
@@ -497,6 +582,8 @@ class RuleProposalAdapter:
             raise ValueError("timeout_seconds must be finite, positive, and <= 120")
         if max_response_bytes < 1_024 or max_response_bytes > 65_536:
             raise ValueError("max_response_bytes is outside its bounded range")
+        if isinstance(max_total_calls, bool) or not 1 <= int(max_total_calls) <= 256:
+            raise ValueError("max_total_calls must be between 1 and 256")
         self.provider = provider
         self.model = str(model)
         self.caller = caller
@@ -507,14 +594,101 @@ class RuleProposalAdapter:
         self.max_attempts = int(max_attempts)
         self.timeout_seconds = float(timeout_seconds)
         self.max_response_bytes = int(max_response_bytes)
+        self.max_total_calls = int(max_total_calls)
+        self._calls_used = 0
+        self._call_lock = Lock()
+        self._auth_unavailable = False
+        self._auth_error: str | None = None
+
+    def _config_hash(self) -> str:
+        """Hash non-secret adapter configuration for reproducible evidence."""
+        return content_hash({"provider": self.provider, "model": self.model,
+                             "max_attempts": self.max_attempts,
+                             "timeout_seconds": self.timeout_seconds,
+                             "max_response_bytes": self.max_response_bytes,
+                             "max_total_calls": self.max_total_calls})
+
+    @staticmethod
+    def _is_auth_error(exc: BaseException) -> bool:
+        status = getattr(exc, "status_code", None)
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            pass
+        if status in {401, 403}:
+            return True
+        name = type(exc).__name__.lower()
+        message = str(exc).lower()
+        return ("auth" in name or "credential" in name or
+                any(token in message for token in _AUTH_ERROR_TOKENS))
+
+    def _mark_auth_unavailable(self, exc: BaseException) -> None:
+        if self._is_auth_error(exc):
+            self._auth_unavailable = True
+            self._auth_error = _safe_error(exc)
+
+    def _reserve_call(self) -> None:
+        with self._call_lock:
+            if self._auth_unavailable:
+                raise RuntimeError("LLM authentication circuit is open")
+            if self._calls_used >= self.max_total_calls:
+                raise RuntimeError("LLM total call budget exhausted")
+            self._calls_used += 1
+
+    def _budget_evidence(self) -> dict[str, Any]:
+        with self._call_lock:
+            used = self._calls_used
+        return {"calls_used": used, "max_total_calls": self.max_total_calls,
+                "calls_remaining": max(0, self.max_total_calls - used),
+                "auth_circuit_open": self._auth_unavailable}
+
+    def _base_evidence(self, *, kind: str, schema_name: str,
+                       prompt_hash: str | None = None,
+                       request_hash: str | None = None) -> dict[str, Any]:
+        evidence = {
+            "provider": self.provider,
+            "model": self.model,
+            "kind": kind,
+            "config_hash": self._config_hash(),
+            "response_schema_hash": self._schema_hash(schema_name),
+            "grammar_schema_hash": content_hash(rule_spec_json_schema()),
+        }
+        if prompt_hash is not None:
+            evidence["system_prompt_hash"] = prompt_hash
+        if request_hash is not None:
+            evidence["request_hash"] = request_hash
+        evidence.update(self._budget_evidence())
+        if self._auth_error:
+            evidence["auth_error"] = self._auth_error
+        return evidence
+
+    def _attempt_evidence(self, *, attempt: int,
+                          schema_name: str,
+                          prompt_hash: str,
+                          request_hash: str) -> dict[str, Any]:
+        return {
+            "attempt": int(attempt),
+            "request_hash": request_hash,
+            "system_prompt_hash": prompt_hash,
+            "config_hash": self._config_hash(),
+            "response_schema_hash": self._schema_hash(schema_name),
+            "grammar_schema_hash": content_hash(rule_spec_json_schema()),
+        }
+
+    def _schema_hash(self, name: str) -> str:
+        return content_hash(self._schema(name))
 
     def _lazy_client(self) -> Any:
+        if self._auth_unavailable:
+            raise RuntimeError("LLM authentication circuit is open")
         if self.client is not None:
             return self.client
         env_name = "OPENAI_API_KEY" if self.provider == "openai" else "ANTHROPIC_API_KEY"
         api_key = os.getenv(env_name)
         if not api_key:
-            raise RuntimeError("LLM credentials are unavailable")
+            exc = RuntimeError("LLM credentials are unavailable")
+            self._mark_auth_unavailable(exc)
+            raise exc
         if self.provider == "openai":
             from openai import OpenAI  # optional dependency, imported lazily
             kwargs = {"api_key": api_key, "max_retries": 0}
@@ -536,6 +710,7 @@ class RuleProposalAdapter:
         # OpenAI Responses API JSON schema; Anthropic accepts the same schema
         # under ``output_config.format`` on versions supporting structured
         # outputs.  additionalProperties is deliberately false.
+        rule_schema = rule_spec_json_schema()
         if name == TUNING_SCHEMA:
             return {
                 "type": "object", "additionalProperties": False,
@@ -549,8 +724,7 @@ class RuleProposalAdapter:
                             "type": "object", "additionalProperties": False,
                             "required": ["rule_spec", "reason", "builds_on"],
                             "properties": {
-                                "rule_spec": {"type": "object",
-                                              "additionalProperties": True},
+                                "rule_spec": rule_schema,
                                 "reason": {"type": "string",
                                            "maxLength": MAX_REASON_CHARS},
                                 # Nullable: the first cycle has no lesson to
@@ -562,7 +736,7 @@ class RuleProposalAdapter:
                             }}}}}
         properties: dict[str, Any] = {
             "schema": {"type": "string", "const": name},
-            "rule_spec": {"type": "object", "additionalProperties": True},
+            "rule_spec": rule_schema,
         }
         required = ["schema", "rule_spec"]
         if name == DISCOVERY_SCHEMA:
@@ -574,6 +748,7 @@ class RuleProposalAdapter:
     def _provider_call(self, system_prompt: str,
                        request: Mapping[str, Any], timeout: float,
                        schema_name: str = PROPOSAL_SCHEMA) -> Any:
+        self._reserve_call()
         if self.caller is not None:
             # The outer proposal loop applies the hard timeout. Keeping this
             # seam direct also makes fake callers easy to inspect in tests.
@@ -595,7 +770,7 @@ class RuleProposalAdapter:
                                   "schema": self._schema(schema_name)}},
                 timeout=timeout,
             )
-            return _raw_text(response)
+            return _raw_text(response, max_bytes=self.max_response_bytes)
         response = client.messages.create(
             model=self.model, max_tokens=1200, temperature=0,
             system=system_prompt,
@@ -604,7 +779,7 @@ class RuleProposalAdapter:
                                       "schema": self._schema(schema_name)}},
             timeout=timeout,
         )
-        return _raw_text(response)
+        return _raw_text(response, max_bytes=self.max_response_bytes)
 
     def propose(self, vehicle: str, generation: int,
                 prior_validated_rule_spec: Mapping[str, Any],
@@ -625,15 +800,19 @@ class RuleProposalAdapter:
             request_hash = content_hash(request)
             system_hash = content_hash(self.system_prompt)
         except Exception as exc:
-            return ProposalResult(False, error=str(exc), evidence={
-                "provider": self.provider,
-                "model": self.model,
-                "system_prompt_hash": content_hash(self.system_prompt),
-            })
+            return ProposalResult(
+                False, error=str(exc),
+                evidence=self._base_evidence(
+                    kind="proposal", schema_name=PROPOSAL_SCHEMA,
+                    prompt_hash=content_hash(self.system_prompt)))
 
         errors: list[str] = []
         raw_hash: str | None = None
+        attempt_evidence: list[dict[str, Any]] = []
         for attempt in range(1, self.max_attempts + 1):
+            attempt_record = self._attempt_evidence(
+                attempt=attempt, schema_name=PROPOSAL_SCHEMA,
+                prompt_hash=system_hash, request_hash=request_hash)
             try:
                 raw_value = _call_with_timeout(
                     self._provider_call, self.timeout_seconds,
@@ -641,34 +820,48 @@ class RuleProposalAdapter:
                 # Hash the received representation even when strict parsing
                 # subsequently rejects it.  Evidence never stores the raw
                 # response itself.
-                raw_hash = content_hash(_raw_text(raw_value))
-                parsed, raw = _parse_response(raw_value,
+                raw = _raw_text(raw_value, max_bytes=self.max_response_bytes)
+                raw_hash = content_hash(raw)
+                attempt_record["response_hash"] = raw_hash
+                parsed, raw = _parse_response(raw,
                                               max_bytes=self.max_response_bytes)
                 normalized = validate_rule_spec(parsed["rule_spec"])
                 spec_hash = rule_spec_hash(normalized)
                 variant = rule_variant_id(normalized)
-                raw_hash = content_hash(raw)
+                attempt_record["normalized_spec_hash"] = spec_hash
+                attempt_record["variant_id"] = variant
+                attempt_evidence.append(attempt_record)
                 evidence = {
-                    "provider": self.provider,
-                    "model": self.model,
-                    "system_prompt_hash": system_hash,
-                    "request_hash": request_hash,
+                    **self._base_evidence(
+                        kind="proposal", schema_name=PROPOSAL_SCHEMA,
+                        prompt_hash=system_hash, request_hash=request_hash),
                     "raw_response_hash": raw_hash,
                     "normalized_spec_hash": spec_hash,
                     "spec_id": spec_hash,
                     "variant_id": variant,
                     "attempts": attempt,
+                    "attempt_errors": errors[-3:],
+                    "attempt_evidence": attempt_evidence,
                 }
                 return ProposalResult(True, schema=PROPOSAL_SCHEMA,
                                       rule_spec=normalized, variant_id=variant,
                                       spec_id=spec_hash, evidence=evidence)
             except Exception as exc:
-                errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
-        evidence = {"provider": self.provider, "model": self.model,
-                    "system_prompt_hash": system_hash,
-                    "request_hash": request_hash, "attempts": self.max_attempts}
+                safe = _safe_error(exc)
+                attempt_record["error"] = safe
+                attempt_evidence.append(attempt_record)
+                errors.append(f"attempt {attempt}: {safe}")
+                self._mark_auth_unavailable(exc)
+                if self._auth_unavailable or "call budget" in str(exc).lower():
+                    break
+        evidence = self._base_evidence(
+            kind="proposal", schema_name=PROPOSAL_SCHEMA,
+            prompt_hash=system_hash, request_hash=request_hash)
+        evidence["attempts"] = len(attempt_evidence)
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
+        evidence["attempt_errors"] = errors[-3:]
+        evidence["attempt_evidence"] = attempt_evidence
         return ProposalResult(False, error="; ".join(errors), evidence=evidence)
 
     def discover(self, vehicle: str, slot: int,
@@ -694,52 +887,68 @@ class RuleProposalAdapter:
             request_hash = content_hash(request)
             system_hash = content_hash(prompt)
         except Exception as exc:
-            return ProposalResult(False, error=str(exc),
-                                  schema=DISCOVERY_SCHEMA,
-                                  evidence={"provider": self.provider,
-                                            "model": self.model,
-                                            "kind": "discovery",
-                                            "system_prompt_hash": content_hash(prompt)})
+            return ProposalResult(
+                False, error=str(exc), schema=DISCOVERY_SCHEMA,
+                evidence=self._base_evidence(
+                    kind="discovery", schema_name=DISCOVERY_SCHEMA,
+                    prompt_hash=content_hash(prompt)))
 
         errors: list[str] = []
         raw_hash: str | None = None
+        attempt_evidence: list[dict[str, Any]] = []
         for attempt in range(1, self.max_attempts + 1):
+            attempt_record = self._attempt_evidence(
+                attempt=attempt, schema_name=DISCOVERY_SCHEMA,
+                prompt_hash=system_hash, request_hash=request_hash)
             try:
                 raw_value = _call_with_timeout(
                     self._discovery_call, self.timeout_seconds, prompt, request)
-                raw_hash = content_hash(_raw_text(raw_value))
+                raw = _raw_text(raw_value, max_bytes=self.max_response_bytes)
+                raw_hash = content_hash(raw)
+                attempt_record["response_hash"] = raw_hash
                 parsed, raw = _parse_response(
-                    raw_value, max_bytes=self.max_response_bytes,
+                    raw, max_bytes=self.max_response_bytes,
                     schema=DISCOVERY_SCHEMA, keys=_DISCOVERY_RESPONSE_KEYS)
                 normalized = validate_rule_spec(parsed["rule_spec"])
                 thesis = _safe_thesis(parsed["thesis"])
                 spec_hash = rule_spec_hash(normalized)
                 variant = rule_variant_id(normalized)
-                raw_hash = content_hash(raw)
+                attempt_record["normalized_spec_hash"] = spec_hash
+                attempt_record["variant_id"] = variant
+                attempt_evidence.append(attempt_record)
                 evidence = {
-                    "provider": self.provider,
-                    "model": self.model,
-                    "kind": "discovery",
-                    "system_prompt_hash": system_hash,
-                    "request_hash": request_hash,
+                    **self._base_evidence(
+                        kind="discovery", schema_name=DISCOVERY_SCHEMA,
+                        prompt_hash=system_hash, request_hash=request_hash),
                     "raw_response_hash": raw_hash,
                     "normalized_spec_hash": spec_hash,
                     "spec_id": spec_hash,
                     "variant_id": variant,
                     "rule_schema": normalized["schema"],
                     "attempts": attempt,
+                    "attempt_errors": errors[-3:],
+                    "attempt_evidence": attempt_evidence,
                 }
                 return ProposalResult(True, schema=DISCOVERY_SCHEMA,
                                       rule_spec=normalized, variant_id=variant,
                                       spec_id=spec_hash, evidence=evidence,
                                       thesis=thesis)
             except Exception as exc:
-                errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
-        evidence = {"provider": self.provider, "model": self.model,
-                    "kind": "discovery", "system_prompt_hash": system_hash,
-                    "request_hash": request_hash, "attempts": self.max_attempts}
+                safe = _safe_error(exc)
+                attempt_record["error"] = safe
+                attempt_evidence.append(attempt_record)
+                errors.append(f"attempt {attempt}: {safe}")
+                self._mark_auth_unavailable(exc)
+                if self._auth_unavailable or "call budget" in str(exc).lower():
+                    break
+        evidence = self._base_evidence(
+            kind="discovery", schema_name=DISCOVERY_SCHEMA,
+            prompt_hash=system_hash, request_hash=request_hash)
+        evidence["attempts"] = len(attempt_evidence)
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
+        evidence["attempt_errors"] = errors[-3:]
+        evidence["attempt_evidence"] = attempt_evidence
         return ProposalResult(False, error="; ".join(errors),
                               schema=DISCOVERY_SCHEMA, evidence=evidence)
 
@@ -793,21 +1002,27 @@ class RuleProposalAdapter:
             request_hash = content_hash(request)
             system_hash = content_hash(prompt)
         except Exception as exc:
-            return ProposalResult(False, error=str(exc), schema=TUNING_SCHEMA,
-                                  evidence={"provider": self.provider,
-                                            "model": self.model,
-                                            "kind": "tuning",
-                                            "system_prompt_hash": content_hash(prompt)})
+            return ProposalResult(
+                False, error=str(exc), schema=TUNING_SCHEMA,
+                evidence=self._base_evidence(
+                    kind="tuning", schema_name=TUNING_SCHEMA,
+                    prompt_hash=content_hash(prompt)))
 
         errors: list[str] = []
         raw_hash: str | None = None
+        attempt_evidence: list[dict[str, Any]] = []
         for attempt in range(1, self.max_attempts + 1):
+            attempt_record = self._attempt_evidence(
+                attempt=attempt, schema_name=TUNING_SCHEMA,
+                prompt_hash=system_hash, request_hash=request_hash)
             try:
                 raw_value = _call_with_timeout(
                     self._tuning_call, self.timeout_seconds, prompt, request)
-                raw_hash = content_hash(_raw_text(raw_value))
+                raw = _raw_text(raw_value, max_bytes=self.max_response_bytes)
+                raw_hash = content_hash(raw)
+                attempt_record["response_hash"] = raw_hash
                 parsed, raw = _parse_response(
-                    raw_value, max_bytes=self.max_response_bytes,
+                    raw, max_bytes=self.max_response_bytes,
                     schema=TUNING_SCHEMA, keys=_TUNING_RESPONSE_KEYS,
                     spec_key=None)
                 entries = _safe_tuned_variants(parsed["variants"], limit=count,
@@ -815,12 +1030,13 @@ class RuleProposalAdapter:
                 variants: list[dict[str, Any]] = []
                 seen: set[str] = set()
                 for index, entry in enumerate(entries):
-                    normalized = validate_rule_spec(entry["rule_spec"])
-                    # The signal primitives are fixed code.  Tuning changes the
-                    # values inside one of them; it may not swap the family for
-                    # another, and it may not raise the grammar version, which
-                    # would unlock whole categories of predicate the root was
-                    # never expressed in.  Either is a new signal, not a tune.
+                    try:
+                        normalized = validate_rule_spec(entry["rule_spec"])
+                    except Exception:
+                        # Preserve the grammar validator's precise contract
+                        # (unknown fields, unsupported family, or bad bounds)
+                        # before applying the stricter tuning key-set policy.
+                        raise
                     if normalized["family"] != root["family"]:
                         raise ValueError(
                             f"variants[{index}] changed family; tuning may not "
@@ -828,8 +1044,34 @@ class RuleProposalAdapter:
                     if normalized["schema"] != root["schema"]:
                         raise ValueError(
                             f"variants[{index}] changed schema from "
-                            f"{root['schema']!r}; tuning may not widen the "
-                            "grammar")
+                            f"{root['schema']!r}; tuning may not widen the grammar")
+                    # Normalization may fill omitted grammar defaults. Tuning
+                    # is stricter: the provider must echo the complete root
+                    # key set, with family and schema explicitly pinned.
+                    raw_keys = set(entry["rule_spec"])
+                    root_keys = set(root)
+                    if raw_keys != root_keys:
+                        missing = sorted(root_keys - raw_keys)
+                        extra = sorted(raw_keys - root_keys)
+                        detail = []
+                        if missing:
+                            detail.append("missing " + ", ".join(missing))
+                        if extra:
+                            detail.append("unknown " + ", ".join(extra))
+                        raise ValueError(
+                            f"variants[{index}].rule_spec must echo the full "
+                            f"normalized root key set ({'; '.join(detail)})")
+                    if "family" not in entry["rule_spec"] or "schema" not in entry["rule_spec"]:
+                        raise ValueError(
+                            f"variants[{index}].rule_spec must explicitly pin family and schema")
+                    _tuning_reason_check(
+                        entry["reason"], root, normalized, diagnosis,
+                        safe_lessons)
+                    # The signal primitives are fixed code.  Tuning changes the
+                    # values inside one of them; it may not swap the family for
+                    # another, and it may not raise the grammar version, which
+                    # would unlock whole categories of predicate the root was
+                    # never expressed in.  Either is a new signal, not a tune.
                     variant = rule_variant_id(normalized)
                     # A repeated spec is a duplicate, not a contract breach:
                     # keep the first and let the caller top up the remainder.
@@ -842,13 +1084,13 @@ class RuleProposalAdapter:
                                      "builds_on": entry["builds_on"]})
                 if not variants:
                     raise ValueError("tuning reply contained no usable variant")
-                raw_hash = content_hash(raw)
+                attempt_record["normalized_spec_hash"] = content_hash(
+                    {item["variant_id"]: item["rule_spec"] for item in variants})
+                attempt_evidence.append(attempt_record)
                 evidence = {
-                    "provider": self.provider,
-                    "model": self.model,
-                    "kind": "tuning",
-                    "system_prompt_hash": system_hash,
-                    "request_hash": request_hash,
+                    **self._base_evidence(
+                        kind="tuning", schema_name=TUNING_SCHEMA,
+                        prompt_hash=system_hash, request_hash=request_hash),
                     "raw_response_hash": raw_hash,
                     "root_variant_id": rule_variant_id(root),
                     "family": root["family"],
@@ -860,20 +1102,32 @@ class RuleProposalAdapter:
                         {entry["builds_on"] for entry in variants
                          if entry["builds_on"]}),
                     "attempts": attempt,
+                    "attempt_errors": errors[-3:],
+                    "attempt_evidence": attempt_evidence,
                 }
                 return ProposalResult(True, schema=TUNING_SCHEMA,
                                       rule_spec=root, evidence=evidence,
                                       variants=tuple(variants))
             except Exception as exc:
-                errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
-        evidence = {"provider": self.provider, "model": self.model,
-                    "kind": "tuning", "system_prompt_hash": system_hash,
-                    "request_hash": request_hash,
-                    "requested": int(count),
-                    "lessons_supplied": len(safe_lessons),
-                    "attempts": self.max_attempts}
+                safe = _safe_error(exc)
+                attempt_record["error"] = safe
+                attempt_evidence.append(attempt_record)
+                errors.append(f"attempt {attempt}: {safe}")
+                self._mark_auth_unavailable(exc)
+                if self._auth_unavailable or "call budget" in str(exc).lower():
+                    break
+        evidence = self._base_evidence(
+            kind="tuning", schema_name=TUNING_SCHEMA,
+            prompt_hash=system_hash, request_hash=request_hash)
+        evidence.update({
+            "requested": int(count),
+            "lessons_supplied": len(safe_lessons),
+            "attempts": len(attempt_evidence),
+        })
         if raw_hash is not None:
             evidence["raw_response_hash"] = raw_hash
+        evidence["attempt_errors"] = errors[-3:]
+        evidence["attempt_evidence"] = attempt_evidence
         return ProposalResult(False, error="; ".join(errors),
                               schema=TUNING_SCHEMA, evidence=evidence)
 
@@ -914,7 +1168,7 @@ def tune_rule(*args: Any, adapter: RuleProposalAdapter | None = None,
 
 
 __all__ = [
-    "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
+    "DEFAULT_TOTAL_CALLS", "DISCOVERY_SCHEMA", "DISCOVERY_SYSTEM_PROMPT", "LESSON_REF_CHARS",
     "MAX_REASON_CHARS", "MAX_THESIS_CHARS", "MAX_TUNED_VARIANTS",
     "PROPOSAL_SCHEMA", "SYSTEM_PROMPT", "TUNING_SCHEMA", "TUNING_SYSTEM_PROMPT",
     "ProposalResult", "RuleProposalResult",

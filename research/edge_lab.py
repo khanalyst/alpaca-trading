@@ -83,7 +83,12 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
     base_heldout = [row for row in baseline
                     if str(row.get("session_date") or "") in sessions]
     absolute = performance_floor(heldout, vehicle=vehicle)
-    walk = walk_forward_report(heldout, base_heldout, vehicle=vehicle)
+    minimums = (gate.get("heldout_floor") or {}).get("minimums") or {}
+    folds = 3
+    walk = walk_forward_report(
+        heldout, base_heldout, vehicle=vehicle, folds=folds,
+        min_test_sessions=max(1, int(minimums.get("sessions", 1)) // folds),
+        min_test_trades=max(1, int(minimums.get("trades", 1)) // (folds * 2)))
     bound = gate["heldout_paired_baseline"].get("mean_delta_lcb")
     gate["checks_without_family"].update({
         "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
@@ -91,7 +96,17 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
         "heldout_delta_lcb_positive": bool(bound is not None and float(bound) > 0),
         "walk_forward_majority_positive": bool(walk["available"] and
                                                walk["majority_positive"]),
+        "walk_forward_adequate": bool(walk.get("adequate")),
     })
+    development_checks = {
+        name: value for name, value in gate["checks_without_family"].items()
+        if name not in {"qualification_net_positive",
+                        "qualification_delta_positive"}
+    }
+    gate["development_passes_without_family"] = bool(
+        all(development_checks.values()) and
+        gate["paired_baseline"].get("mean_delta") is not None and
+        float(gate["paired_baseline"]["mean_delta"]) > 0)
     gate["passes_without_family"] = bool(
         all(gate["checks_without_family"].values()) and
         gate["paired_baseline"].get("mean_delta") is not None and
@@ -189,14 +204,6 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         configs[variant.variant_id] = cfg
 
     qualification_rows: dict[str, list[dict]] = {}
-    if sealed_sessions:
-        window_bars = sealed_window.release(
-            reason=f"final qualification {vehicle} {data_hash[:12]}")
-        for variant in selected:
-            qualification_rows[variant.variant_id] = _opportunity_rows(
-                replay(window_bars, sealed_snapshots, sealed_quotes,
-                       configs[variant.variant_id]),
-                window_bars, vehicle)
 
     def latest_boundary(record: Mapping | None) -> str | None:
         if not record:
@@ -249,17 +256,20 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 if str(row.get("session_date") or "") > str(boundary)]
 
     baseline_eval = tail(baseline_rows, baseline_boundary) if baseline_mode == "shadow" else baseline_rows
-    baseline_window_rows = tail(
-        qualification_rows.get(baseline_variant.variant_id, []),
-        baseline_boundary if baseline_mode == "shadow" else None)
-    if lane == "shadow" and not baseline_eval and not baseline_window_rows:
+    baseline_window_rows: list[dict] = []
+    unseen_sealed_sessions = [
+        session for session in sealed_window.session_dates
+        if baseline_boundary is None or session > baseline_boundary]
+    if lane == "shadow" and not baseline_eval and not unseen_sealed_sessions:
         raise DiscoveryError("shadow corpus contains no unseen sessions after the persisted boundary")
 
-    def final_window(rows: Sequence[Mapping], control: Sequence[Mapping]) -> dict:
+    def final_window(rows: Sequence[Mapping], control: Sequence[Mapping], *,
+                     candidate_id: str, preselected: bool) -> dict:
         """Score one variant over the sealed sessions: go/no-go, never diagnosis."""
         return qualification_report(
             rows, control, vehicle=vehicle,
-            sessions=sorted({str(row.get("session_date") or "") for row in rows}))
+            sessions=sorted({str(row.get("session_date") or "") for row in rows}),
+            candidate_id=candidate_id, preselected=preselected)
 
     modes: dict[str, str] = {}
     eval_rows: dict[str, list[dict]] = {}
@@ -267,10 +277,14 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     window_reports: dict[str, dict] = {}
     for variant in candidates:
         record = existing.get(variant.variant_id)
-        if record is not None and record.get("status") in {"retired", "demoted"}:
+        if record is not None and record.get("status") == "retired":
             # A failed, adequately-powered evaluation closes this hypothesis
             # for every lane, including an explicitly requested backtest.
             mode = "skip"
+        elif record is not None and record.get("status") == "demoted":
+            # Demotion is a reversible safety state.  Only a strictly later
+            # unseen shadow sample may re-prove it; a repeated backtest cannot.
+            mode = "shadow" if lane in {"auto", "shadow"} else "skip"
         elif lane == "backtest":
             mode = "backtest"
         elif lane == "shadow":
@@ -285,15 +299,17 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 if mode == "shadow" else
                 ([] if mode == "skip" else base_results[variant.variant_id]))
         eval_rows[variant.variant_id] = rows
-        window_rows[variant.variant_id] = (
-            [] if mode == "skip" else
-            tail(qualification_rows.get(variant.variant_id, []),
-                 boundary if mode == "shadow" else None))
-        window_reports[variant.variant_id] = final_window(
-            window_rows[variant.variant_id],
-            tail(qualification_rows.get(baseline_variant.variant_id, []),
-                 boundary if mode == "shadow" else None))
-        if lane == "shadow" and not rows and not window_rows[variant.variant_id]:
+        window_rows[variant.variant_id] = []
+        window_reports[variant.variant_id] = {
+            "available": False, "sessions": [], "net_positive": False,
+            "delta_positive": False,
+            "post_selection": {"preselected": False,
+                                "candidate_id": variant.variant_id},
+        }
+        has_unseen_sealed = any(
+            boundary is None or session > boundary
+            for session in sealed_window.session_dates)
+        if lane == "shadow" and not rows and not has_unseen_sealed:
             raise DiscoveryError(
                 f"shadow corpus contains no unseen sessions for {variant.variant_id!r}")
 
@@ -315,9 +331,72 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
 
+    ranked_ids = sorted(gates, key=lambda variant_id: (
+        0 if gates[variant_id].get("development_passes_without_family") else 1,
+        float(corrected.get(variant_id, {}).get("p_adjusted", 1.0)),
+        -float(gates[variant_id].get("heldout_delta_lcb") or float("-inf")),
+        -float((gates[variant_id].get("heldout_performance") or {}).get(
+            "net_pnl", 0.0)),
+        variant_id))
+    selected_test_id = ranked_ids[0] if ranked_ids else None
+    selected_q = (1.0 if selected_test_id is None else float(
+        corrected.get(selected_test_id, {}).get("p_adjusted", 1.0)))
+    # Imported lazily: factory_ledger exposes the shared durable online-FDR
+    # store and itself imports this module for legacy facade symbols.
+    from .factory_ledger import FactoryLedger
+    cumulative = FactoryLedger(db_path).record_fdr_decision(
+        f"edge_discovery:{vehicle}",
+        f"{data_hash}:{lane}:post_selection", selected_q, alpha=alpha)
+    qualification_target = None
+    if selected_test_id is not None:
+        selected_gate = gates[selected_test_id]
+        selected_family = corrected.get(selected_test_id, {})
+        if (selected_gate.get("development_passes_without_family") and
+                selected_family.get("significant") and
+                cumulative.get("decision")):
+            qualification_target = selected_test_id
+
+    if qualification_target is not None and sealed_window.session_dates:
+        window_bars = sealed_window.release(
+            reason=f"post-selection qualification {qualification_target}")
+        baseline_all = _opportunity_rows(
+            replay(window_bars, sealed_snapshots, sealed_quotes,
+                   configs[baseline_variant.variant_id]),
+            window_bars, vehicle)
+        variant_cfg = configs[qualification_target]
+        candidate_all = _opportunity_rows(
+            replay(window_bars, sealed_snapshots, sealed_quotes, variant_cfg),
+            window_bars, vehicle)
+        target_boundary = latest_boundary(existing.get(qualification_target))
+        baseline_window_rows = tail(
+            baseline_all, target_boundary
+            if modes[qualification_target] == "shadow" else None)
+        candidate_window = tail(
+            candidate_all, target_boundary
+            if modes[qualification_target] == "shadow" else None)
+        qualification_rows[baseline_variant.variant_id] = baseline_window_rows
+        qualification_rows[qualification_target] = candidate_window
+        window_rows[qualification_target] = candidate_window
+        window_reports[qualification_target] = final_window(
+            candidate_window, baseline_window_rows,
+            candidate_id=qualification_target, preselected=True)
+        gate = gates[qualification_target]
+        gate["qualification"] = window_reports[qualification_target]
+        gate["checks_without_family"]["qualification_net_positive"] = bool(
+            gate["qualification"].get("available") and
+            gate["qualification"].get("net_positive"))
+        gate["checks_without_family"]["qualification_delta_positive"] = bool(
+            gate["qualification"].get("available") and
+            gate["qualification"].get("delta_positive"))
+        gate["passes_without_family"] = bool(
+            all(gate["checks_without_family"].values()) and
+            gate["paired_baseline"].get("mean_delta") is not None and
+            float(gate["paired_baseline"]["mean_delta"]) > 0)
+
     # Attach the family decision before writing any shadow rows.  A failed or
     # under-powered forward check is not "consumed": the same unseen tail may
     # be reconsidered when the append-only recorder supplies more sessions.
+    run_provenances: dict[str, dict] = {}
     for variant in candidates:
         if modes[variant.variant_id] == "skip":
             continue
@@ -325,7 +404,21 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         family = corrected.get(variant.variant_id, {"p": gate["candidate_p_raw"],
                                                      "p_adjusted": 1.0,
                                                      "significant": False})
-        _finalize_gate(gate, lane=modes[variant.variant_id], family=family)
+        run_provenance = {
+            "lane": lane, "vehicle": vehicle,
+            "selected_test_id": selected_test_id,
+            "qualified_test_id": qualification_target,
+            "cumulative_fdr": (dict(cumulative)
+                               if variant.variant_id == selected_test_id else None),
+        }
+        run_provenances[variant.variant_id] = run_provenance
+        _finalize_gate(
+            gate, lane=modes[variant.variant_id], family=family,
+            online_fdr=(cumulative if variant.variant_id == selected_test_id else {}),
+            provenance=provenance_hash(
+                dataset=raw_rows, config=effective_configs[variant.variant_id],
+                code=code_path, provenance=run_provenance),
+            candidate_id=variant.variant_id)
     forward_success = any(
         modes[variant.variant_id] == "shadow" and
         gates.get(variant.variant_id, {}).get("passes", False)
@@ -339,10 +432,12 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         code=code_path, provenance={"lane": lane, "vehicle": vehicle, "role": "baseline"},
         overrides=baseline_variant.overrides)
     # The baseline's own control is the synthetic zero reference, in the final
-    # window exactly as in the development one.
+    # window exactly as in the development one. It is a control arm, not a
+    # separately selected hypothesis, so it never receives an authorizing
+    # qualification report of its own.
     baseline_window = final_window(
-        baseline_window_rows,
-        [{**row, "net_pnl": 0.0, "return_value": 0.0} for row in baseline_window_rows])
+        [], [],
+        candidate_id=baseline_variant.variant_id, preselected=False)
     baseline_gate = _strengthen_gate(
         _discover_gate(
             baseline_eval, baseline_zero, vehicle=vehicle,
@@ -357,7 +452,15 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         family={"p": baseline_gate["candidate_p_raw"],
                 "p_adjusted": baseline_gate["candidate_p_raw"],
                 "significant": baseline_gate["candidate_p_raw"] <= alpha,
-                "family_size": 1})
+                "family_size": 1},
+        online_fdr={},
+        provenance=provenance_hash(
+            dataset=raw_rows,
+            config=effective_configs[baseline_variant.variant_id],
+            code=code_path,
+            provenance={"lane": lane, "vehicle": vehicle,
+                        "role": "baseline", "selected_test_id": selected_test_id}),
+        candidate_id=baseline_variant.variant_id)
     baseline_run = None
     baseline_adequate = _adequate(baseline_gate)
     if baseline_eval and not baseline_adequate:
@@ -407,6 +510,14 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         gate = gates[variant.variant_id]
         family = gate["multiple_tests"]["candidate"]
         adequate = _adequate(gate)
+        selected_for_proof = bool(
+            variant.variant_id == qualification_target and
+            (gate.get("qualification") or {}).get("available"))
+        development_adequate = bool(
+            gate.get("fit_floor", {}).get("adequate") and
+            gate.get("heldout_floor", {}).get("adequate") and
+            (gate.get("walk_forward") or {}).get("available") and
+            (gate.get("walk_forward") or {}).get("adequate"))
         run = None
         shadow_run = None
         status = record.get("status", "candidate")
@@ -417,10 +528,10 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 payload={"dataset_hash": data_hash, "mode": mode,
                          "rows": 0, "trades": 0, "sessions": 0,
                          "boundary": latest_boundary(record)})
-        elif rows and not adequate:
+        elif rows and not development_adequate:
             ledger.append_event(
                 candidate_id=record["candidate_id"], event_type="insufficient_data",
-                actor="edge_lab", reason="sample floor not met; no observations consumed",
+                actor="edge_lab", reason="development sample floor not met; no observations consumed",
                 payload={"dataset_hash": data_hash, "mode": mode,
                          "rows": len(rows),
                          "trades": gate.get("floor", {}).get("trades", 0),
@@ -428,7 +539,23 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                          "heldout_trades": gate.get("heldout_floor", {}).get("trades", 0),
                          "heldout_sessions": gate.get("heldout_floor", {}).get("sessions", 0),
                          "boundary": latest_boundary(record)})
-        elif rows:
+        elif (variant.variant_id == selected_test_id and
+              not sealed_window.session_dates):
+            ledger.append_event(
+                candidate_id=record["candidate_id"], event_type="insufficient_data",
+                actor="edge_lab",
+                reason="no sealed qualification window; no observations consumed",
+                payload={"dataset_hash": data_hash, "mode": mode,
+                         "rows": len(rows), "selected_test_id": selected_test_id})
+        elif not selected_for_proof:
+            ledger.append_event(
+                candidate_id=record["candidate_id"],
+                event_type="development_diagnostic", actor="edge_lab",
+                reason="candidate was not selected for the sealed qualification window",
+                payload={"dataset_hash": data_hash, "mode": mode,
+                         "selected_test_id": selected_test_id,
+                         "candidate_p": gate.get("candidate_p_raw")})
+        elif rows and selected_for_proof:
             if mode == "shadow":
                 fit_rows, heldout_rows = [], rows
             else:
@@ -436,7 +563,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             run = ledger.append_run(
                 record["candidate_id"], lane=mode, vehicle=vehicle, dataset=raw_rows,
                 config=effective_configs[variant.variant_id], code=code_path,
-                provenance={"lane": lane, "vehicle": vehicle},
+                provenance=run_provenances[variant.variant_id],
                 fit=fit_rows, heldout=heldout_rows,
                 metrics={"gate": gate, "confidence": 1.0 - family.get("p_adjusted", 1.0),
                          "heldout_delta": gate["heldout_paired_baseline"].get("mean_delta") or 0.0,
@@ -454,20 +581,27 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             ledger.transition(record["candidate_id"], "backtest_passed",
                               reason="pre-registered backtest gates passed")
             status = "backtest_passed"
-        if adequate and gate["passes"] and mode == "shadow" and status in {"backtest_passed", "shadow"}:
-            if status == "backtest_passed":
+        if (adequate and gate["passes"] and mode == "shadow" and
+                status in {"backtest_passed", "shadow", "demoted"}):
+            if status in {"backtest_passed", "demoted"}:
                 ledger.transition(record["candidate_id"], "shadow",
                                   reason="later unseen shadow lane started")
                 status = "shadow"
             shadow_run = run
             if status == "shadow":
-                ledger.transition(record["candidate_id"], "validated",
-                                  reason="later unseen shadow gates passed")
-                status = "validated"
-        elif adequate and not gate["passes"] and status not in {"retired", "demoted"}:
+                # Offline forward replay is stability/prerequisite evidence;
+                # only the research-side live-shadow ingester may authorize
+                # deployment after parity with the runtime shadow decisions.
+                status = "shadow"
+        absolute = gate.get("heldout_performance") or {}
+        terminal_negative = bool(
+            adequate and float(absolute.get("net_pnl", 0.0)) <= 0.0 and
+            float(absolute.get("expectancy", 0.0)) <= 0.0)
+        if (selected_for_proof and terminal_negative and not gate["passes"] and
+                status not in {"retired", "demoted"}):
             target = "demoted" if status in {"shadow", "validated", "champion"} else "retired"
             ledger.transition(record["candidate_id"], target,
-                              reason=f"{mode} evidence failed mandatory gates")
+                              reason=f"{mode} evidence was adequately powered and terminally negative")
             status = target
         results.append({"variant_id": variant.variant_id, "vehicle": vehicle,
                         "candidate_id": record["candidate_id"], "status": status,
@@ -482,6 +616,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     champion = ledger.select_champion(vehicle=vehicle) if lane in {"auto", "shadow"} else None
     return {"vehicle": vehicle, "lane": lane, "dataset_hash": data_hash,
             "variants": results, "family_correction": corrected,
+            "post_selection": {"selected_test_id": selected_test_id,
+                               "qualified_test_id": qualification_target,
+                               "cumulative_fdr": cumulative},
             "baseline": {"candidate_id": baseline_record["candidate_id"],
                          "run_id": baseline_run["run_id"] if baseline_run else None,
                          "gate": baseline_gate, "mode": baseline_mode,

@@ -119,10 +119,16 @@ def _candidate_record(ledger: Any, candidate_id: str, context: Mapping[str, Any]
 
 def _records(ledger: Any, candidate_id: str, context: Mapping[str, Any],
              name: str, singular: str) -> list[dict[str, Any]]:
-    direct = context.get(name)
+    direct = None
+    # A real ledger method outranks caller-supplied collections; the latter
+    # are only a compatibility seam for tiny mapping/fake ledgers.
+    if not isinstance(ledger, Mapping) and callable(getattr(ledger, name, None)):
+        direct = _call(ledger, name, candidate_id)
+    if direct is None:
+        direct = context.get(name)
     if direct is None and isinstance(ledger, Mapping):
         direct = ledger.get(name)
-    if direct is None:
+    if direct is None and not (not isinstance(ledger, Mapping) and callable(getattr(ledger, name, None))):
         direct = _call(ledger, name, candidate_id)
     if direct is None:
         one = context.get(singular)
@@ -143,6 +149,52 @@ def _latest(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         str(item.get("created_at") or item.get("timestamp") or ""),
         str(item.get("run_id") or item.get("evidence_id") or item.get("event_id") or ""),
     ))[-1])
+
+
+def _run_bound_records(records: Sequence[Mapping[str, Any]], run_id: str) -> list[dict[str, Any]]:
+    """Keep only records explicitly bound to one authorized run."""
+    output = []
+    for item in records:
+        payload = _json_field(item.get("payload") or item.get("payload_json"), {})
+        bound = item.get("run_id") or (payload.get("run_id") if isinstance(payload, Mapping) else None)
+        if str(bound or "") == str(run_id):
+            output.append(dict(item))
+    return output
+
+
+def _select_authorized_shadow_run(runs: Sequence[Mapping[str, Any]],
+                                  evidence: Sequence[Mapping[str, Any]],
+                                  context: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    requested = context.get("authorized_run_id", context.get("run_id"))
+    verified_ids = set()
+    for item in evidence:
+        if str(item.get("kind") or "") != "verified_gate":
+            continue
+        payload = _json_field(item.get("payload") or item.get("payload_json"), {})
+        bound = item.get("run_id") or (payload.get("run_id") if isinstance(payload, Mapping) else None)
+        if bound:
+            verified_ids.add(str(bound))
+    strict = bool(requested or verified_ids)
+    if requested:
+        matches = [item for item in runs if str(item.get("run_id")) == str(requested)]
+        if len(matches) != 1:
+            raise ValueError("authorized proof run is missing or ambiguous")
+        run = dict(matches[0])
+        if run.get("lane") != "shadow":
+            raise ValueError("proof authorization requires a shadow run")
+        if verified_ids and str(requested) not in verified_ids:
+            raise ValueError("authorized proof run lacks verified gate evidence")
+        return run, True
+    if verified_ids:
+        matches = [item for item in runs if str(item.get("run_id")) in verified_ids
+                   and item.get("lane") == "shadow"]
+        if not matches:
+            raise ValueError("no verified shadow run is available for proof")
+        return _latest(matches), True
+    # Legacy/fake ledgers may not expose evidence run bindings.  Keep their
+    # deterministic behavior while requiring explicit authorization whenever
+    # a real ledger supplies run-scoped verified evidence.
+    return _latest(runs), strict
 
 
 def _extract_spec(candidate: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -343,12 +395,22 @@ def build_proof_payload(ledger: Any, candidate_id: str,
 
     context = dict(context or {})
     candidate_id = str(candidate_id)
-    candidate = _candidate_record(ledger, candidate_id, context)
+    candidate = _candidate_record(
+        ledger, candidate_id,
+        {} if (context.get("authorized_run_id") or context.get("run_id")) else context)
     if not candidate:
         raise KeyError(f"unknown candidate {candidate_id!r}")
-    runs = _records(ledger, candidate_id, context, "runs", "run")
-    evidence = _records(ledger, candidate_id, context, "evidence", "evidence_item")
-    events = _records(ledger, candidate_id, context, "events", "event")
+    # Once a run is explicitly authorized, context collections are hints only;
+    # source-bound records must come from the ledger API and cannot be swapped
+    # in from another lane.
+    record_context = dict(context)
+    if context.get("authorized_run_id") or context.get("run_id"):
+        for key in ("runs", "run", "evidence", "evidence_item", "events", "event",
+                    "history", "trades", "trade"):
+            record_context.pop(key, None)
+    runs = _records(ledger, candidate_id, record_context, "runs", "run")
+    evidence = _records(ledger, candidate_id, record_context, "evidence", "evidence_item")
+    events = _records(ledger, candidate_id, record_context, "events", "event")
     if not events and "events" not in context:
         events = _records(ledger, candidate_id, context, "history", "event")
     # Reporting events are intentionally excluded from their own payload so
@@ -356,18 +418,57 @@ def build_proof_payload(ledger: Any, candidate_id: str,
     # report was announced.
     events = [item for item in events
               if not str(item.get("event_type") or "").startswith("proof_")]
-    trades = _records(ledger, candidate_id, context, "trades", "trade")
-    run = _latest(runs)
+    trades = _records(ledger, candidate_id, record_context, "trades", "trade")
+    run, strict_authorization = _select_authorized_shadow_run(runs, evidence, context)
+    run_id = str(run.get("run_id") or "")
+    if strict_authorization:
+        persisted_candidate = _candidate_record(ledger, candidate_id, {})
+        if persisted_candidate:
+            supplied_candidate = context.get("candidate")
+            if isinstance(supplied_candidate, Mapping):
+                for key in ("vehicle", "variant_id", "strategy_id"):
+                    if supplied_candidate.get(key) is not None and str(
+                            supplied_candidate.get(key)) != str(persisted_candidate.get(key) or ""):
+                        raise ValueError(f"proof context candidate {key} does not match persisted record")
+            candidate = persisted_candidate
+        evidence = _run_bound_records(evidence, run_id)
+        events = _run_bound_records(events, run_id) if events else []
+        trades = _run_bound_records(trades, run_id)
+        if not evidence or not any(str(item.get("kind") or "") == "verified_gate"
+                                   for item in evidence):
+            raise ValueError("proof requires evidence from the authorized verified shadow run")
     evidence_latest = _latest(evidence)
     vehicle = str(context.get("vehicle") or candidate.get("vehicle") or run.get("vehicle") or "")
     if vehicle not in {"equity", "option"}:
         raise ValueError("vehicle must be equity or option")
+    if strict_authorization:
+        for key, expected in (("vehicle", run.get("vehicle")),
+                              ("lane", run.get("lane"))):
+            supplied = context.get(key)
+            if supplied is not None and str(supplied) != str(expected):
+                raise ValueError(f"proof context {key} does not match authorized run")
+        vehicle = str(run.get("vehicle"))
     status = str(context.get("status") or candidate.get("status") or "unknown")
-    spec = _extract_spec(candidate, context)
-    metric_values, samples = _metrics(run, context, evidence, trades)
-    hashes = _hashes(candidate, run, context)
-    provider = _provider_info(candidate, run, evidence, context)
-    session = _session_info(context, candidate, run, evidence)
+    if strict_authorization and context.get("status") is not None:
+        persisted_status = str(candidate.get("status") or "unknown")
+        if str(context.get("status")) != persisted_status:
+            raise ValueError("proof context status does not match persisted candidate")
+    trusted_context = {} if strict_authorization else context
+    spec = _extract_spec(candidate, trusted_context)
+    if strict_authorization:
+        for key in ("variant_id", "strategy_id"):
+            if context.get(key) is not None and str(context[key]) != str(candidate.get(key) or ""):
+                raise ValueError(f"proof context {key} does not match persisted candidate")
+    metric_values, samples = _metrics(run, trusted_context, evidence, trades)
+    hashes = _hashes(candidate, run, trusted_context)
+    if strict_authorization and isinstance(metric_values.get("gate"), Mapping) and \
+            metric_values["gate"].get("passes") is True:
+        missing = [key for key in _HASH_FIELDS if not hashes.get(key)]
+        if missing:
+            raise ValueError("qualifying proof is missing provenance hashes: " +
+                             ", ".join(missing))
+    provider = _provider_info(candidate, run, evidence, trusted_context)
+    session = _session_info(trusted_context, candidate, run, evidence)
 
     run_ids = sorted({str(item.get("run_id")) for item in runs if item.get("run_id") is not None})
     evidence_ids = sorted({str(item.get("evidence_id")) for item in evidence if item.get("evidence_id") is not None})
@@ -375,12 +476,12 @@ def build_proof_payload(ledger: Any, candidate_id: str,
     statuses = {"candidate": status,
                 "runs": sorted(str(item.get("lane") or item.get("status") or "")
                                 for item in runs)}
-    if isinstance(context.get("statuses"), Mapping):
+    if not strict_authorization and isinstance(context.get("statuses"), Mapping):
         statuses.update(_finite(context["statuses"]))
 
-    llm_hashes = context.get("llm_evidence_hashes")
+    llm_hashes = trusted_context.get("llm_evidence_hashes")
     if llm_hashes is None:
-        llm_context = context.get("llm_evidence")
+        llm_context = trusted_context.get("llm_evidence")
         if isinstance(llm_context, Mapping):
             llm_hashes = [str(value) for key, value in llm_context.items()
                           if "hash" in str(key).lower() and value is not None]
@@ -406,15 +507,16 @@ def build_proof_payload(ledger: Any, candidate_id: str,
         "schema": PROOF_SCHEMA,
         "candidate_id": candidate_id,
         "run_id": run.get("run_id"),
+        "authorized_run_id": run.get("run_id") if strict_authorization else None,
         "run_ids": run_ids,
         "evidence_id": evidence_latest.get("evidence_id"),
         "evidence_ids": evidence_ids,
         "event_ids": event_ids,
         "status": status,
         "statuses": statuses,
-        "variant_id": str(context.get("variant_id") or candidate.get("variant_id") or ""),
-        "strategy_id": str(context.get("strategy_id") or candidate.get("strategy_id") or ""),
-        "strategy": str(context.get("strategy_id") or candidate.get("strategy_id") or ""),
+        "variant_id": str(trusted_context.get("variant_id") or candidate.get("variant_id") or ""),
+        "strategy_id": str(trusted_context.get("strategy_id") or candidate.get("strategy_id") or ""),
+        "strategy": str(trusted_context.get("strategy_id") or candidate.get("strategy_id") or ""),
         "vehicle": vehicle,
         "hashes": hashes,
         "dataset_hash": hashes["dataset_hash"],
@@ -470,4 +572,3 @@ def render_markdown(payload: Mapping[str, Any], digest: str | None = None) -> st
                   html.escape(canonical_json(payload), quote=False).replace("`", "&#96;"),
                   "```", ""])
     return "\n".join(lines)
-

@@ -165,7 +165,7 @@ class CorpusEquivalenceTests(unittest.TestCase):
             self.assertEqual(local.date(), date(2026, 3, 19))
             self.assertEqual((local.hour, local.minute), (15, 59))
 
-    def test_as_of_is_the_bar_open_so_replay_visibility_is_unchanged(self):
+    def test_as_of_is_the_completed_bar_boundary(self):
         provider = FakeProvider(bars_per_session=3)
         with tempfile.TemporaryDirectory() as directory:
             output = _corpus(directory)
@@ -173,7 +173,9 @@ class CorpusEquivalenceTests(unittest.TestCase):
             rows = list(iter_corpus_rows(output))
             self.assertTrue(rows)
             for row in rows:
-                self.assertEqual(row["as_of"], row["timestamp"])
+                self.assertEqual(
+                    datetime.fromisoformat(row["as_of"]),
+                    datetime.fromisoformat(row["timestamp"]) + timedelta(minutes=1))
                 self.assertEqual(row["event_type"], "bar_1m")
                 self.assertEqual(row["provider"], "alpaca")
                 self.assertEqual(row["feed"], "iex")

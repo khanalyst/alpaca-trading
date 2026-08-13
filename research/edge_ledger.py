@@ -299,10 +299,14 @@ class EdgeLedger(EdgeLedgerProofMixin):
             "champion": "shadow",
         }.get(to_status)
         if required_lane:
-            run, gate = self._latest_verified_gate(candidate_id)
-            if run["lane"] != required_lane or gate.get("passes") is not True:
+            run, gate = self._latest_verified_gate(candidate_id, lane=required_lane)
+            if gate.get("passes") is not True:
                 raise ValueError(
                     f"{to_status} requires latest persisted passing {required_lane} verified evidence")
+            if (to_status in {"validated", "champion"} and
+                    not self._live_shadow_authorized(run)):
+                raise ValueError(
+                    f"{to_status} requires a parity-matched live-shadow ingestion")
             if from_status == "demoted" and to_status == "shadow":
                 with closing(_connect(self.path)) as db:
                     demotion = db.execute("""SELECT created_at FROM events
@@ -317,8 +321,17 @@ class EdgeLedger(EdgeLedgerProofMixin):
             structurally_adequate = all(
                 isinstance(floors.get(name), Mapping) and floors[name].get("adequate") is True
                 for name in ("fit", "heldout"))
-            if gate.get("passes") is not False or not structurally_adequate:
-                raise ValueError("retirement requires latest adequate failed verified gate evidence")
+            performance = gate.get("performance") or {}
+            heldout_net = _finite_number(performance.get("heldout_net_pnl"))
+            heldout_expectancy = _finite_number(performance.get("heldout_expectancy"))
+            terminal_negative = bool(
+                heldout_net is not None and heldout_net <= 0.0 and
+                heldout_expectancy is not None and heldout_expectancy <= 0.0)
+            if (gate.get("passes") is not False or not structurally_adequate or
+                    not terminal_negative):
+                raise ValueError(
+                    "retirement requires latest adequate, terminally negative "
+                    "failed verified gate evidence")
         now = _utc()
         event_type = "safety_demotion" if to_status == "demoted" else "lifecycle_transition"
         with closing(_connect(self.path)) as db, db:
@@ -399,6 +412,8 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 continue
             if (not isinstance(run, Mapping) or not isinstance(gate, Mapping) or
                     run.get("lane") != "shadow" or gate.get("passes") is not True):
+                continue
+            if not self._live_shadow_authorized(run):
                 continue
             # Conservative ranking: held-out lower confidence bound first,
             # then drawdown and sample size.  No metric can cross vehicles.

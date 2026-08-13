@@ -20,8 +20,8 @@ Every replay must establish the following invariants:
 - a fill landing on a bar boundary uses a recorded quote at that instant when
   one exists, and otherwise records that it fell back to the bar;
 - spread, slippage, and both-side fees are charged from one shared model;
-- an option leg is priced only from a quote no older than the staleness bound
-  (300s) at the instant being priced; a signal whose contract has no such quote
+- an option leg is priced only from a quote no older than the strict 30-second
+  freshness bound at the instant being priced; a signal whose contract has no such quote
   is recorded as an explicit unpriced row, never dropped and never filled from
   the contract's last quote of the morning;
 - positions are force-flat before the session close;
@@ -37,8 +37,16 @@ spread/slippage/fee numbers. Its parameters come from one `costs` config
 block. The runtime's `execution.max_slippage_bps` and `max_spread_bps` are
 rejection caps, not expectations: they bound the model, and a model expecting
 a cost the runtime would refuse to submit fails closed. `research/calibration.py`
-scores that model against the entry fills recorded in the runtime journal and
-names an optimistic model rather than absorbing it.
+provides a read-only advisory calibration stratified by runtime mode, vehicle,
+execution profile, and entry versus exit when references are present. Thin or
+missing strata are `insufficient_data`; no pooled equity/options verdict is
+emitted and the model is never adjusted automatically.
+
+`ReplayPolicy.from_config` is the runtime policy source for replay. It carries
+the strict 30-second market-data age, option DTE (default 7–60), option spread
+and liquidity checks, latest-entry and force-flat times, and portfolio limits
+(concurrent positions, position notional, gross exposure, open risk, and daily
+loss). Research cannot relax these constraints while simulating.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
 missing or partial opening range is `no trade`, not an imputed range. A missing
@@ -49,7 +57,9 @@ an outage.
 
 An evidence package should include the normalized input digest, event count,
 provider/feed/schema identities, timezone/session policy, as-of cutoff,
-configuration, code fingerprint, and deterministic fixture result. Results
+configuration, code fingerprint, cost model, risk/`ReplayPolicy`, gate
+assumptions, and deterministic fixture result. The experiment identity binds
+dataset, configuration, code, cost, risk, gates, and provenance hashes. Results
 without this provenance are descriptive only and cannot pass a qualification
 gate. Walk-forward and held-out checks must be chronological. Paired baseline,
 placebo, and acceptance-floor checks are evaluated independently for each
@@ -60,7 +70,9 @@ vehicle and may not pool option and underlying returns.
 Four states, one of which no automatic process may enter.
 
 *Research* and *proved* are the lanes above: gates decide, and they may move a
-candidate in either direction on evidence.
+candidate in either direction on evidence. Offline historical and forward
+replay may persist a passing `lane=shadow` proof, but that status is stability
+evidence only and never authorizes runtime entries.
 
 *Trial* is a proved, unpinned edge trading the paper account. Its live outcomes
 are append-only evidence attributed to the exact passing shadow proof that
@@ -68,8 +80,9 @@ authorized entry. After a configured window of sessions and trades it is
 judged against an explicit floor. An edge below the floor is demoted and the
 result is recorded as a graded lesson sourced from live paper, which later
 proposals may read. An edge above it keeps trading and is reported as
-promotable. If the same candidate is later re-proved, the new trial begins a
-new proof epoch and cannot inherit the earlier epoch's wins or losses.
+promotable. If a demoted candidate later earns a newer passing shadow proof, it
+may re-prove; the new trial begins a new proof epoch and cannot inherit the
+earlier epoch's wins or losses.
 Underpowered windows and outcomes without a usable risk reference are never
 treated as failure; a failed or unverifiable latest shadow proof quarantines
 history rather than falling back to lifetime aggregation.
@@ -108,7 +121,8 @@ surface for the explicit IBR baseline. Autonomous multi-strategy research uses
 the finite, validated data-only grammar in `agent/contracts/rule.py`; generated
 variant ids are content hashes of those specifications. Arbitrary source code
 or unbounded fields are rejected. `agent.edge` resolves only a SQLite candidate
-whose status is `validated` or `champion` for the configured strategy/vehicle.
+whose status is `validated` or `champion` for the configured strategy/vehicle
+and whose latest shadow proof carries the parity-matched live-ingestion marker.
 Paper `selection_mode: all_proved` may run one strongest passing variant per
 independent family under one global risk book. Live mode resolves exactly one
 proved record: preferably one `selection_mode: pinned` entry, or one legacy
@@ -117,14 +131,24 @@ candidate when the requested proof/configuration no longer re-verifies.
 
 Backtests and forward-shadow runs are persisted with immutable hashes and
 trade/evidence rows. The autonomous lane first evaluates the initial corpus as
-a backtest, then accepts only a later, unseen session tail for shadow
-evidence. Passing gates advance `candidate` -> `backtest_passed` -> `shadow` ->
-`validated`, after which champion selection is automatic; runtime entries stay
-blocked until a validated/champion record exists for the selected vehicle.
+a backtest, then accepts only a later, unseen session tail for offline
+forward-shadow evidence. Passing gates advance `candidate` ->
+`backtest_passed` -> `shadow` only; runtime entries stay blocked because
+offline replay cannot authorize deployment. The broker-free ShadowRunner
+evaluates eligible candidates in isolated virtual books from recorder events,
+creates exact-session candidate/root-baseline/randomized-null replays, and
+quarantines mismatch/incomplete rows. Research-side `edge ingest-shadow` opens
+the shadow WAL read-only, requires strictly newer complete parity-matched rows,
+prior qualification, source/config/code/provenance/replay/gate hashes, family
+and global BH plus durable online FDR, then appends the immutable `lane=shadow`
+proof and live marker; only then can the candidate become `validated`/`champion`.
 A candidate cannot skip the lifecycle or silently move backwards. Paper
 outcomes are append-only, proof-epoch scoped, and may demote a deployed edge.
 Normal operation needs no manual promotion. Explicit `edge promote` is
-supported only as an audited control subject to lifecycle/evidence rules.
+supported only as an audited control subject to lifecycle/evidence rules and
+cannot bypass the live marker. Legacy validated/champion rows without that
+marker can be evaluated/migrated but remain ineligible until a new authorized
+live proof.
 Backward rollback is rejected; explicit demotion is the operator safety
 action.
 
@@ -146,6 +170,13 @@ variant must preserve both its root's `family` and its root's grammar
 Selecting a different family, or a wider grammar version, is a discovery
 decision and follows the discovery path with its own gates.
 
+The three LLM request contracts use strict full-schema structured output with
+`additionalProperties: false`; tuning must echo the complete normalized root
+specification. The adapter enforces a per-run total-call budget, bounded
+attempts/time/response bytes, and an authentication circuit. Each result keeps
+schema/grammar hashes, call counts, circuit state, and per-attempt hashes or
+errors as evidence.
+
 Every proposal — deterministic or model-authored — records a stated reason
 before the gate that judges it is computed, and that reason is graded against
 the resulting gate afterwards. Both records are append-only and the grade is
@@ -159,6 +190,11 @@ already-corrected evaluations, doing so adds no information about unseen data.
 Multiple-test correction is what prices the search, so a tuned variant counts
 against the same family-local and cycle-global false-discovery budget as a
 mutated one.
+
+Variant identity is de-duplicated by a family-specific executable semantic
+signature, including the v1/v2 no-op alias. A graded adequate failure suppresses
+only that exact failed variant id; underpowered outcomes do not suppress a
+future attempt and do not close the family.
 Multiple-test correction covers every variant evaluated in the cycle. A
 replacement hypothesis may be generated only after the root family has an
 adequate trade/session sample and no variant passes; underpowered data must not
@@ -174,12 +210,18 @@ less conservative than family q; a family pass/global fail is therefore a
 normal result for a marginal candidate, and proof verification must compare
 each decision flag with its own q-value.
 
+The post-selection test also consumes a durable cumulative online-FDR
+allocation. Its LORD-style state is stored per scope in the factory ledger and
+persists across cycles, so alpha allocation and discoveries are not reset by a
+new run.
+
 Beating a control is necessary but never sufficient. A variant must also show
 absolute after-cost profitability on unseen data (positive net P&L and
 positive per-trade expectancy), a positive lower confidence bound on the mean
 held-out delta, a positive delta against a randomized-entry null control that
 shares the candidate's session/symbol/direction distribution and exit rules,
-and a majority of positive rolling-origin walk-forward folds.
+and a majority of positive fixed-rule rolling-origin forward-stability folds.
+The same rule is evaluated in every fold.
 
 The falsification check is a seeded permutation test: at least ten thousand
 cluster-level sign-flip draws form an explicit null distribution, and the
@@ -189,8 +231,10 @@ is reproducible.
 
 The last sessions of every evaluation corpus are sealed into a final
 qualification window before any worker is scheduled. Selection, mutation and
-diagnosis never receive them; the window is opened exactly once, by the
-orchestrator, for the last go/no-go. Sealed sessions are scored, never split,
+diagnosis never receive them. Development evidence is ranked and corrected
+first; one preselected candidate alone releases and consumes the sealed window
+exactly once for the last go/no-go. Other variants remain diagnostic and cannot
+authorize a proof. Sealed sessions are scored, never split,
 so they enter no fit/held-out run, trade row, or family correction. The verified
 gate does retain a bounded copy of the candidate and baseline qualification
 observations, the exact declared session set, and content digests. Verification
@@ -203,6 +247,13 @@ autonomous factory lane share one randomized-entry null control and one sealed
 final window rather than each carrying its own; a corpus too thin to seal a
 window or to support rolling-origin folds is underpowered, not failed.
 
+The held-out trade floor is evidence, not a tuning knob. The shipped default
+universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`,
+`XLV`), improving opportunity capacity, but real signal rates still require
+sufficient history. Replay allows at most one trade per symbol-session; floor
+feasibility fails closed when 100 held-out trades cannot be supported. Widen
+history and/or the universe, never lower the floor.
+
 The complete gate is durably persisted and re-verified before validation or
 champion selection. Re-verification recomputes the analysis — matched deltas,
 p-value, lower bound, falsification, absolute profitability — from the stored
@@ -210,15 +261,33 @@ source rows and compares it against the recorded decision, rather than only
 re-checking hashes. Champions are ranked by the lower confidence bound, not
 the raw held-out delta.
 Underpowered data is not failure. Retirement is permitted only after every
-intended variant is adequately tested and fails; an enabled LLM lane must first
-register a valid bounded replacement. Drawdown is persisted and used to rank
-otherwise qualified champions conservatively.
+intended variant has adequate terminal negative evidence and fails; an enabled
+LLM lane must first register a valid bounded replacement. A demoted candidate
+may re-prove on a newer shadow run, starting a new evidence epoch. Drawdown is
+persisted and used to rank otherwise qualified champions conservatively.
 
-The forward-shadow boundary advances only from a durable, re-verifying passing
-shadow proof. Diagnostic account rows never advance it. If even one intended
-variant in a worker lacks the required trade/session floors, that worker
-persists no shadow proof, transition, or reseed, and the complete tail remains
-eligible for reconsideration on the next cycle.
+The offline forward-shadow boundary advances only from a durable,
+re-verifying passing replay proof. Diagnostic account rows never advance it. If
+even one intended variant in a worker lacks the required trade/session floors,
+that worker persists no shadow proof, transition, or reseed, and the complete
+tail remains eligible for reconsideration on the next cycle. Offline shadow
+status never authorizes runtime. The live ShadowRunner consumes recorder
+events in candidate-isolated virtual books and creates exact-session candidate,
+root-baseline, and randomized-null replays; mismatched/incomplete rows are
+quarantined. `edge ingest-shadow` is the sole authorization boundary: it opens
+the WAL read-only, requires strictly newer complete parity-matched rows, prior
+qualification, source/config/code/provenance/replay/gate hashes, family/global
+BH, and durable online FDR before appending immutable `lane=shadow` proof and
+the live-ingestion marker.
+
+The optional live-shadow Compose profile is broker-free: it reads recorder rows
+and EdgeLedger candidates through read-only connections, evaluates isolated
+virtual books, and writes only its own WAL SQLite database. It has no broker
+credentials or broker/runtime mutation path. The scheduled research cycle
+invokes `edge ingest-shadow` by default when enabled; a missing shadow DB is a
+no-op. It compares runtime shadow semantic signatures with factory/IBR replay
+signatures for parity; only the research consumer can append the authorization
+marker.
 
 The checked research config enables the bounded strategy LLM with model
 `gpt-5`. It reads only the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing

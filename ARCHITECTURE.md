@@ -8,7 +8,8 @@ multi-leg options, naked options, and short-option exposure are rejected.
 
 ## System boundaries
 
-The repository contains six cooperating processes:
+The repository contains six core processes plus an optional broker-free shadow
+process:
 
 | Process | Authority | Durable output |
 | --- | --- | --- |
@@ -18,10 +19,12 @@ The repository contains six cooperating processes:
 | Trader | Authenticated account reads and order/position mutation | Mode-scoped runtime state, operational journal, events, and heartbeat |
 | Watchdog | Cancel and flatten only, never entries | Its own health status file |
 | Dashboard | Read-only observation | No authoritative writes |
+| Shadow (optional Compose profile) | Read-only recorder/EdgeLedger replay and semantic parity checks; no broker authority | Isolated WAL SQLite database |
 
 Research cannot submit orders or mutate broker state. The trader cannot create
 an edge: it may only select an already verified `validated` or `champion`
-record from the research ledger. The dashboard is not an execution console.
+record whose latest shadow proof carries the parity-matched live-ingestion
+marker. The dashboard is not an execution console.
 
 Paper and live runtimes use separate directories and account fingerprints.
 Paper is the documented default. Live mode requires an explicit live
@@ -29,7 +32,7 @@ configuration, environment guard, authenticated preflight, pattern-day-trader
 status, one exact proved variant, and `llm.enabled: false`. The preferred route
 is `selection_mode: pinned` with exactly one operator-named promotion; the
 legacy `selection_mode: specific` route remains supported for one exact
-validated/champion variant. Neither route may auto-switch, and a runtime LLM
+validated/champion variant with that live marker. Neither route may auto-switch, and a runtime LLM
 veto would deploy a different strategy from the deterministic one the gates
 passed.
 
@@ -68,6 +71,18 @@ unprivileged user, dropped Linux capabilities, bounded CPU/memory/PIDs, Docker
 secrets, and named volumes for runtime and research data. There is one trader
 replica because the mode-scoped run lock is an additional safety boundary, not
 a substitute for single-owner deployment.
+
+The optional `shadow` Compose profile mounts the recorder corpus and EdgeLedger
+read-only, has no broker credentials, and writes only its separate WAL database.
+It evaluates eligible candidates in isolated virtual books from recorder events,
+creates exact-session candidate/root-baseline/randomized-null replays, and
+quarantines mismatch/incomplete rows. It uses the same deterministic
+signal/setup/risk path and compares semantic signatures with factory/IBR replay;
+it has no order, broker, or runtime-state mutation path.
+
+The scheduled research cycle invokes `edge ingest-shadow` by default when
+enabled. The consumer treats a missing shadow WAL as a no-op and never creates
+or migrates that WAL; the live service remains the sole writer.
 
 ## Trading runtime
 
@@ -228,6 +243,9 @@ The risk engine:
 - rejects stale/future/naive timestamps and malformed freshness flags;
 - enforces DTE, spread, volume/open-interest, displayed-size, moneyness,
   per-contract loss, contract-count, notional, gross-risk, and daily-loss caps;
+- applies the runtime `ReplayPolicy` in research: strict 30-second market/quote
+  freshness, latest-entry and force-flat cutoffs, and portfolio limits for
+  concurrent positions, position notional, gross exposure, and open risk;
 - treats explicit malformed values as errors rather than falling back to a
   default; and
 - emits a durable plan whose entry/stop/target/risk/notional fields are the
@@ -364,7 +382,7 @@ reported rather than silently unusable.
 
 ### Slot lifecycle
 
-A slot is a unit of parallel research capacity. Its hypothesis leaves
+A slot is a unit of logical research capacity. Its hypothesis leaves
 `ACTIVE_HYPOTHESIS_STATES` permanently on a shadow pass, because the proved
 variant is deployed and must never be re-tuned; the slot is therefore reseeded
 with a new hypothesis in the same cycle. Reseeding prefers an untried family at
@@ -389,11 +407,18 @@ the parameter it changed and the diagnosed problem it should fix. All three
 replies are strict, size-capped, fence- and unsafe-key-rejecting JSON validated
 against the rule grammar before storage. A proposal is only ever a *seed*: the
 resulting hypothesis is registered `queued` and must earn `backtest_passed` and
-a strictly later shadow pass through the same gates as a deterministic one. The
-LLM decides what to try next; it cannot shorten the evidence path, retire a
-family on invalid output, or authorize trading. Every seeding and tuning path
-has a deterministic fallback, so the factory keeps discovering with no provider
-configured.
+a strictly later offline forward-shadow pass through the same gates as a
+deterministic one. That pass may leave the candidate at `shadow`; live parity
+ingestion is still required. All three requests use strict full-schema
+structured output (`additionalProperties:
+false`, including the complete rule specification). The adapter enforces a
+per-run total-call budget, bounded attempts/time/response bytes, and an
+authentication circuit that stops further calls after an auth failure; evidence
+records schema/grammar hashes, call counts, circuit state, and per-attempt
+hashes/errors. The LLM decides what to try next; it cannot shorten the evidence
+path, retire a family on invalid output, or authorize trading. Every seeding and
+tuning path has a deterministic fallback, so the factory keeps discovering with
+no provider configured.
 
 `agent.brain.DecisionBrain` is a separate optional paper-runtime adapter. It is
 consulted only after a deterministic strategy has produced a setup; it can
@@ -417,17 +442,25 @@ root's `schema`. The family pin keeps "which idea is under test" a discovery
 decision; the schema pin stops a v1 root reaching v2's extra predicate
 categories, which would be adding structure rather than tuning values. What is
 left is the values of fields the root already carries. The unmutated root is
-always variant zero and is never proposed away — its own matched control is
-itself, so it cannot pass and serves as the hypothesis's null calibration.
+always variant zero and is never proposed away. It is compared with an
+independent randomized-entry null that preserves the candidate's
+session/symbol/direction distribution and exit rules; it is never compared with
+itself. The root remains a real candidate in the family and cycle-global
+Benjamini–Hochberg denominators, so it consumes multiplicity like any mutation.
 Anything the model does not supply, supplies as a duplicate, or supplies
 invalidly is topped up from the same deterministic mutation table, so the
-variant count is unchanged whether a provider answered or not.
+variant count is unchanged whether a provider answered or not. Discovery and
+tuning de-duplicate by the family-specific executable semantic signature
+(including v1/v2 no-op aliases); only exact variant ids with an adequate
+recorded failure are suppressed, while underpowered failures remain eligible.
 
 The cycle therefore runs in two scheduled phases. `_diagnose_worker` replays
 each hypothesis's root on its fit partition only; the orchestrator then chooses
 that hypothesis's variants; `_worker` replays them. Splitting the passes is
 what keeps every provider call in the parent process — no adapter is ever
-pickled into a worker — while the expensive replay stays parallel.
+pickled into a worker. Isolated books are logically concurrent but each is
+processed by one bounded worker; this is a capacity description, not a claim of
+unbounded OS-level parallelism.
 
 ### Reasons, and grading them
 
@@ -462,12 +495,18 @@ edge the report renders and counts.
 
 `research.gates` provides chronological splits, structural floors, paired and
 cluster-aware controls, placebo/falsification tests, held-out separation,
-drawdown, sample counts, family-local and cycle-global false-discovery
-correction inputs, and the verified-gate envelope. The family and global
-decisions are separate: global q is always at least as conservative as the
-family q, so a marginal candidate commonly passes its family test while
-failing the cycle-global test. Proof verification compares each flag with its
-own q-value; only the global decision can authorize cross-family selection.
+drawdown, sample counts, fixed-rule rolling-origin forward-stability checks,
+family-local and cycle-global false-discovery correction inputs, and the
+verified-gate envelope. The family and global decisions are separate: global q
+is always at least as conservative as the family q, so a marginal candidate
+commonly passes its family test while failing the cycle-global test. The
+rolling-origin rule is fixed across folds. Proof verification compares each
+flag with its own q-value; only the global decision
+can authorize cross-family selection.
+
+Post-selection consumes one durable cumulative online-FDR allocation per
+vehicle scope. Its LORD-style state is persisted in the factory ledger across
+cycles, so a new cycle cannot reset the allocated alpha or discovery history.
 
 `research.edge_ledger_store` owns the SQLite schema and hashing primitives.
 `research.edge_ledger_proof` owns verified-gate persistence and re-verification.
@@ -477,24 +516,48 @@ champion selection, and paper-outcome monitoring.
 The lifecycle is forward-only:
 
 ```text
-candidate -> backtest_passed -> shadow -> validated -> champion
-                                      \-> retired/demoted when rules permit
+candidate -> backtest_passed -> shadow (offline evidence)
+                                  --ingest-shadow + live marker-->
+                                  shadow (authorized) -> validated -> champion
+                                                        \-> retired/demoted when rules permit
 ```
 
-Every accepted proof retains content hashes for data, configuration, code, and
-provenance. Gate envelopes are re-verified before use. Malformed legacy proof
+Every experiment identity binds the dataset, runtime configuration, code, cost
+model, risk/`ReplayPolicy`, gate assumptions, and provenance hashes. Every
+accepted proof retains those content hashes. Offline historical or forward
+replay may persist a passing `lane=shadow` proof, but it is prerequisite
+stability evidence only and never authorizes runtime entries. Gate envelopes are
+re-verified before use. Malformed legacy proof
 rows are skipped rather than crashing champion selection. The final sealed
 qualification decision retains bounded candidate/baseline source observations,
 their declared session set, and content digests in the envelope; verification
 recomputes the qualification report and rejects missing, extra, or tampered
 sessions. Paper outcomes are append-only and can demote an edge; they cannot
-manufacture a proof.
+manufacture a proof. Retirement requires adequate terminal negative evidence
+for every intended variant (and a valid bounded replacement when that lane is
+enabled), not an underpowered or transient result. A demoted candidate remains
+eligible to re-prove on a newer shadow run, which starts a new evidence epoch.
+Only the research-side `edge ingest-shadow` consumer may append the
+parity-matched live-shadow marker required for `validated`/`champion`
+eligibility; manual/offline promotion cannot bypass it. Legacy
+validated/champion rows without that marker can be evaluated or migrated but
+remain ineligible until a new authorized live proof.
 
-Forward-shadow boundaries advance only from a durable, re-verifying passing
-shadow proof. Diagnostic account rows do not move the boundary, and a worker
-whose intended variants are not all adequately powered persists no shadow
-proof or lifecycle result. Its tail is therefore reconsidered instead of being
-lost to a prematurely advanced boundary.
+Qualification is post-selection: development evidence is ranked and corrected
+first, then one preselected candidate alone releases and consumes the sealed
+window. Other variants may retain diagnostic qualification records, but their
+sealed rows cannot authorize a proof.
+
+Offline forward-shadow boundaries advance only from a durable, re-verifying
+passing replay proof. Diagnostic account rows do not move the boundary, and a
+worker whose intended variants are not all adequately powered persists no
+shadow proof or lifecycle result. Its tail is therefore reconsidered instead of
+being lost to a prematurely advanced boundary. The live ShadowRunner consumes
+strictly newer recorder sessions in candidate-isolated books; `edge
+ingest-shadow` opens its WAL read-only, requires complete parity matches and
+prior qualification plus source/config/code/provenance/replay/gate hashes,
+applies family and global BH with durable online FDR, and only then appends an
+immutable `lane=shadow` proof that may transition a candidate to `validated`.
 
 Retirement guards every deployed candidate, not only the champion, because
 `all_proved` selection trades one validated candidate per family. Two

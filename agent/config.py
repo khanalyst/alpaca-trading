@@ -65,7 +65,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
     "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
-    "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
+    "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
     "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
     "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0},
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100},
@@ -77,7 +77,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "champion_min_confidence": 0.95,
         "strategy_llm": {"enabled": True, "provider": "openai", "model": "gpt-5",
                          "max_attempts": 1, "timeout_seconds": 30,
-                         "max_response_bytes": 16_384},
+                         "max_response_bytes": 16_384,
+                         "max_total_calls": 64,
+                         "near_duplicate_distance": 0.001},
         "proof": {"directory": "research/results/edges", "webhook_url": "",
                   "webhook_timeout_seconds": 10},
         # The demo-account trial window.  An auto-lane edge trades paper for
@@ -303,7 +305,8 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     strategy_llm = dict(strategy_llm_defaults)
     strategy_llm.update(_map(research.get("strategy_llm", {}), "research.strategy_llm"))
     _unknown(strategy_llm, {"enabled", "provider", "model", "max_attempts",
-                            "timeout_seconds", "max_response_bytes"},
+                            "timeout_seconds", "max_response_bytes",
+                            "max_total_calls", "near_duplicate_distance"},
              "research.strategy_llm")
     strategy_llm["enabled"] = _bool(
         strategy_llm, "enabled", "research.strategy_llm", False)
@@ -319,6 +322,11 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         strategy_llm, "timeout_seconds", "research.strategy_llm", 1, 120, 30)
     strategy_llm["max_response_bytes"] = _int(
         strategy_llm, "max_response_bytes", "research.strategy_llm", 1024, 65_536, 16_384)
+    strategy_llm["max_total_calls"] = _int(
+        strategy_llm, "max_total_calls", "research.strategy_llm", 1, 256, 64)
+    strategy_llm["near_duplicate_distance"] = _num(
+        strategy_llm, "near_duplicate_distance", "research.strategy_llm", 0, 1,
+        0.001)
     proof_defaults = DEFAULT_CONFIG["research"]["proof"]
     proof = dict(proof_defaults)
     proof.update(_map(research.get("proof", {}), "research.proof"))

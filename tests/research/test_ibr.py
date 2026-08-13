@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from zoneinfo import ZoneInfo
 
-from research.costs import CostModel
+from research.costs import CostModel, ReplayPolicy
 from research.ibr import IBRConfig, ReplayError, replay_ibr, replay_ibr_vehicles
 from research.costs import BAR, QUOTE
 from research.market_data import (normalize_option_snapshot, normalize_quote,
@@ -11,7 +11,15 @@ from research.market_data import (normalize_option_snapshot, normalize_quote,
 
 # A zero-cost model isolates the fill geometry under test from the expected
 # cost model, which has its own tests.
-FREE = CostModel(spread_bps=0, slippage_bps=0, fee_bps=0)
+FREE = CostModel(spread_bps=0, slippage_bps=0, fee_bps=0,
+                 option_fee_per_contract_side=0)
+PERMISSIVE_POLICY = ReplayPolicy(strict_market_data=False)
+
+
+def permissive_config(**kwargs):
+    """Keep legacy bar-only fixtures explicit under the safe replay default."""
+    kwargs.setdefault("policy", PERMISSIVE_POLICY)
+    return IBRConfig(**kwargs)
 
 
 def bars_for_day(*, breakout=True, gap=False):
@@ -57,8 +65,13 @@ def bars_to_close():
 
 
 class IBRReplayTests(unittest.TestCase):
-    def test_range_is_completed_and_entry_is_next_bar(self):
+    def test_omitted_policy_is_strict_for_bar_only_equity(self):
         result = replay_ibr(bars_for_day(), config=IBRConfig(
+            stop_pct=.01, target_pct=.02, costs=FREE))
+        self.assertEqual(result.trades, [])
+
+    def test_range_is_completed_and_entry_is_next_bar(self):
+        result = replay_ibr(bars_for_day(), config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertEqual(len(result.trades), 1)
         trade = result.trades[0]
@@ -74,7 +87,7 @@ class IBRReplayTests(unittest.TestCase):
             "open": 101, "high": 104, "low": 98, "close": 100,
             "volume": 1, "provider": "alpaca", "feed": "sip",
         })
-        result = replay_ibr(bars, config=IBRConfig(
+        result = replay_ibr(bars, config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertEqual(result.trades[0].exit_reason, "stop")
         self.assertTrue(result.trades[0].tie_broken)
@@ -91,7 +104,7 @@ class IBRReplayTests(unittest.TestCase):
             "open": 95, "high": 96, "low": 94, "close": 95,
             "volume": 1, "provider": "alpaca", "feed": "sip",
         })
-        result = replay_ibr(bars, config=IBRConfig(
+        result = replay_ibr(bars, config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertTrue(result.trades[0].gap_fill)
         self.assertEqual(result.trades[0].exit_price, 95)
@@ -102,11 +115,11 @@ class IBRReplayTests(unittest.TestCase):
         for gap in (False, True):
             with self.subTest(gap=gap):
                 bars = bars_for_day(gap=gap)
-                percent = replay_ibr(bars, config=IBRConfig(
+                percent = replay_ibr(bars, config=permissive_config(
                     stop_pct=.01, target_pct=.02, costs=FREE)).trades[0]
                 self.assertAlmostEqual(percent.stop_price, 99.99, places=9)
                 self.assertAlmostEqual(percent.target_price, 103.02, places=9)
-                ranged = replay_ibr(bars, config=IBRConfig(
+                ranged = replay_ibr(bars, config=permissive_config(
                     range_stop=True, target_r=2.0, stop_pct=.01, target_pct=.02,
                     costs=FREE)).trades[0]
                 self.assertAlmostEqual(ranged.stop_price, 99.0, places=9)
@@ -125,15 +138,19 @@ class IBRReplayTests(unittest.TestCase):
         entry = normalize_option_snapshot({
             **contract, "timestamp": entry_time.isoformat(),
             "bid": 1.9, "ask": 2.0, "last": 1.95,
-            "underlying_price": 101, "provider": "alpaca", "feed": "opra",
+            "underlying_price": 101, "bid_size": 5, "ask_size": 5,
+            "volume": 20, "open_interest": 100,
+            "provider": "alpaca", "feed": "opra",
         })
         exit_quote = normalize_option_snapshot({
             **contract, "timestamp": exit_time.isoformat(),
             "bid": 3.0, "ask": 3.1, "last": 3.05,
-            "underlying_price": 103, "provider": "alpaca", "feed": "opra",
+            "underlying_price": 103, "bid_size": 5, "ask_size": 5,
+            "volume": 20, "open_interest": 100,
+            "provider": "alpaca", "feed": "opra",
         })
         results = replay_ibr_vehicles(
-            bars, config=IBRConfig(stop_pct=.01, target_pct=.02, costs=FREE),
+            bars, config=permissive_config(stop_pct=.01, target_pct=.02, costs=FREE),
             vehicles=("equity", "option"),
             option_snapshots={entry_time: entry, exit_time: exit_quote})
         self.assertEqual(set(results), {"equity", "option"})
@@ -160,7 +177,7 @@ class IBRReplayTests(unittest.TestCase):
             replay_ibr([bars[1], bars[0]])
 
     def test_force_flat_uses_boundary_open_not_intrabar_range(self):
-        result = replay_ibr(bars_to_close(), config=IBRConfig(
+        result = replay_ibr(bars_to_close(), config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE))
         self.assertEqual(len(result.trades), 1)
         self.assertEqual(result.trades[0].exit_reason, "force_flat")
@@ -178,28 +195,71 @@ def equity_quote(minute, bid, ask):
     })
 
 
+def option_quote(timestamp, bid=2.0, ask=2.1, *, expiration="2024-02-16",
+                 bid_size=5, ask_size=5, volume=20, open_interest=100):
+    expiry = expiration[:10].replace("-", "")
+    return normalize_option_snapshot({
+        "symbol": f"SPY{expiry[2:]}C00101000", "underlying": "SPY",
+        "expiration": expiration, "strike": 101, "right": "call",
+        "timestamp": timestamp.isoformat(), "bid": bid, "ask": ask,
+        "last": (bid + ask) / 2, "underlying_price": 101,
+        "bid_size": bid_size, "ask_size": ask_size, "volume": volume,
+        "open_interest": open_interest, "provider": "alpaca", "feed": "opra",
+    })
+
+
 class IBRQuoteFillTests(unittest.TestCase):
     """A recorded quote at the fill instant beats a bar-derived reference."""
 
     def test_the_entry_uses_the_recorded_ask_and_records_the_source(self):
         # The entry bar (minute 31) opens at 101; the book at that instant is
         # 100.98 x 101.06, so the marketable buy lifts 101.06.
-        trade = replay_ibr(bars_for_day(), config=IBRConfig(
+        trade = replay_ibr(bars_for_day(), config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE),
             quotes=[equity_quote(31, 100.98, 101.06)]).trades[0]
         self.assertEqual(trade.entry_fill_source, QUOTE)
         self.assertAlmostEqual(trade.entry_reference, 101.06, places=9)
         self.assertAlmostEqual(trade.entry_price, 101.06, places=9)
 
+    def test_option_liquidity_and_dte_match_runtime_acceptance_boundary(self):
+        bars = bars_for_day()
+        entry_time = bars[31].timestamp
+        exit_time = bars[31].end
+        cases = (
+            # volume, open interest, or both displayed sides can establish
+            # liquidity; one-sided size metadata cannot.
+            ({"bid_size": None, "ask_size": None, "volume": 1,
+              "open_interest": None}, True),
+            ({"bid_size": 1, "ask_size": 1, "volume": None,
+              "open_interest": None}, True),
+            ({"bid_size": 1, "ask_size": None, "volume": None,
+              "open_interest": None}, False),
+            # Runtime rejects 0DTE even if options_min_dte is configured to 0.
+            ({"expiration": "2024-01-02"}, False),
+        )
+        for metadata, accepted in cases:
+            with self.subTest(metadata=metadata):
+                entry = option_quote(entry_time, **metadata)
+                exit_quote = option_quote(exit_time, **metadata)
+                result = replay_ibr_vehicles(
+                    bars, config=permissive_config(stop_pct=.01, target_pct=.02,
+                                                   costs=FREE,
+                                                   policy=ReplayPolicy(
+                                                       strict_market_data=False,
+                                                       options_min_dte=0)),
+                    vehicles=("option",),
+                    option_snapshots={entry_time: entry, exit_time: exit_quote})
+                self.assertEqual(bool(result["option"].trades), accepted)
+
     def test_a_missing_quote_falls_back_to_the_bar_and_says_so(self):
-        trade = replay_ibr(bars_for_day(), config=IBRConfig(
+        trade = replay_ibr(bars_for_day(), config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE)).trades[0]
         self.assertEqual(trade.entry_fill_source, BAR)
         self.assertEqual(trade.exit_fill_source, BAR)
         self.assertAlmostEqual(trade.entry_reference, 101, places=9)
 
     def test_a_quote_after_the_fill_instant_is_not_used(self):
-        trade = replay_ibr(bars_for_day(), config=IBRConfig(
+        trade = replay_ibr(bars_for_day(), config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE),
             quotes=[equity_quote(32, 100.98, 101.06)]).trades[0]
         self.assertEqual(trade.entry_fill_source, BAR)
@@ -214,7 +274,7 @@ class IBRQuoteFillTests(unittest.TestCase):
             "symbol": "SPY", "timestamp": bars[32].timestamp.isoformat(),
             "open": 95, "high": 96, "low": 94, "close": 95,
             "volume": 1, "provider": "alpaca", "feed": "sip"})
-        trade = replay_ibr(bars, config=IBRConfig(
+        trade = replay_ibr(bars, config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE),
             quotes=[equity_quote(32, 94.9, 95.1)]).trades[0]
         self.assertTrue(trade.gap_fill)
@@ -234,7 +294,7 @@ class IBRQuoteFillTests(unittest.TestCase):
             "symbol": "SPY", "timestamp": bars[32].timestamp.isoformat(),
             "open": 101, "high": 101.5, "low": 99, "close": 100,
             "volume": 1, "provider": "alpaca", "feed": "sip"})
-        trade = replay_ibr(bars, config=IBRConfig(
+        trade = replay_ibr(bars, config=permissive_config(
             stop_pct=.01, target_pct=.02, costs=FREE),
             quotes=[equity_quote(32, 80.0, 80.1)]).trades[0]
         self.assertEqual(trade.exit_reason, "stop")

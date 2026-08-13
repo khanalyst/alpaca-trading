@@ -18,9 +18,9 @@ Three boundaries keep it honest:
 * Only *completed* sessions are written.  A partial session would leave the
   recorder's continuity check staring at a mid-session hole, and a partial
   session is not a research observation anyway.
-* ``as_of`` is the bar's own opening timestamp, exactly as the recorder records
-  it, so the point-in-time visibility rule that stops research seeing a bar
-  before it closed applies unchanged to backfilled rows.
+* ``as_of`` is the bar's completed one-minute boundary, exactly as the recorder
+  records it, so research cannot see the bar's high, low, close, or volume
+  before that minute has finished.
 * Options are not backfilled.  The recorder's option rows are sampled chain
   snapshots with quote-age semantics that a historical endpoint cannot
   reconstruct, so inventing them would fabricate the one thing option research
@@ -134,9 +134,10 @@ def _bar_rows(provider, symbols, day: date, *, feed: str, observed: str):
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca", "feed": feed,
                 "event_type": "bar_1m", "symbol": symbol, "contract": "",
-                # ``as_of`` is the bar's own open, matching the recorder, so the
-                # completed-bar visibility rule is unchanged for these rows.
-                "timestamp": timestamp, "as_of": timestamp,
+                # A one-minute OHLC row is knowable only after its closing
+                # boundary, even when the provider timestamps it at the open.
+                "timestamp": timestamp,
+                "as_of": (parsed + timedelta(minutes=1)).isoformat(),
                 "open": _value(bar.open), "high": _value(bar.high),
                 "low": _value(bar.low), "close": _value(bar.close),
                 "volume": _value(bar.volume), "bid": "", "ask": "", "last": "",

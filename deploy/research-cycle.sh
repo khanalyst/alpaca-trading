@@ -296,10 +296,45 @@ edge_db="${ALPACA_EDGE_DB:-$repo_root/runtime/research/edge_lab.sqlite3}"
 if [[ "$edge_db" != /* ]]; then
   edge_db="$repo_root/$edge_db"
 fi
+shadow_db="${ALPACA_SHADOW_DB:-$repo_root/runtime/research/shadow.sqlite3}"
+if [[ "$shadow_db" != /* ]]; then
+  shadow_db="$repo_root/$shadow_db"
+fi
 agent_config="${ALPACA_AGENT_CONFIG:-$repo_root/config.yaml}"
 if [[ "$agent_config" != /* ]]; then
   agent_config="$repo_root/$agent_config"
 fi
+
+# Calibration is read-only and advisory.  A missing/thin journal or an
+# optimistic finding must never promote, demote, or mutate a broker account;
+# emit the result for operators and continue the offline cycle.
+run_calibration() {
+  [ "${ALPACA_RESEARCH_CALIBRATION_ENABLED:-1}" = "1" ] || return 0
+  local journal="${ALPACA_RESEARCH_JOURNAL:-$repo_root/runtime/paper/journal.db}"
+  if [[ "$journal" != /* ]]; then
+    journal="$repo_root/$journal"
+  fi
+  [ -s "$journal" ] || {
+    echo '{"schema":"research-calibration.v1","status":"skipped","reason":"journal_unavailable"}' >&2
+    return 0
+  }
+  set +e
+  local calibration_config="${ALPACA_RESEARCH_CALIBRATION_CONFIG:-}"
+  if [ -n "$calibration_config" ]; then
+    if [[ "$calibration_config" != /* ]]; then
+      calibration_config="$repo_root/$calibration_config"
+    fi
+    "$python_bin" "$repo_root/research.py" calibrate "$journal" \
+      --config "$calibration_config" >&2
+  else
+    "$python_bin" "$repo_root/research.py" calibrate "$journal" >&2
+  fi
+  local status=$?
+  set -e
+  echo "{\"schema\":\"research-calibration.v1\",\"status\":\"completed\",\"exit_code\":$status}" >&2
+  return 0
+}
+run_calibration
 
 run_discovery() {
   local vehicle="$1"
@@ -344,6 +379,24 @@ run_factory() {
     cycle_outcomes+=("$vehicle:factory:no_proof")
   else
     finish "failed" "$vehicle factory failed" "$status"
+  fi
+}
+
+run_shadow_ingest() {
+  local vehicle="$1"
+  [ "${ALPACA_SHADOW_INGEST_ENABLED:-1}" = "1" ] || return 0
+  set +e
+  "$python_bin" "$repo_root/research.py" edge ingest-shadow \
+    --vehicle "$vehicle" --db "$edge_db" --shadow-db "$shadow_db" \
+    --min-trades "${ALPACA_FACTORY_MIN_TRADES:-100}" \
+    --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-10}" \
+    --alpha "${ALPACA_FACTORY_ALPHA:-0.05}"
+  local status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    cycle_outcomes+=("$vehicle:shadow-ingest:completed")
+  else
+    finish "failed" "$vehicle shadow ingestion failed" "$status"
   fi
 }
 
@@ -402,6 +455,7 @@ for vehicle in $vehicles; do
   if [ "${ALPACA_FACTORY_ENABLED:-1}" = "1" ]; then
     run_factory "$vehicle"
   fi
+  run_shadow_ingest "$vehicle"
 done
 
 if [ "$cycle_success" -eq 1 ]; then

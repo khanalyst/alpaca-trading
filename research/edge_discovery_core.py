@@ -17,7 +17,7 @@ import random
 from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import hold_deadline
-from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
+from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
 from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 from .stats import stable_seed
 
@@ -270,6 +270,7 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
         costs=costs,
         close_confirmed=bool(close_confirmed),
         timezone=str((source.get("session") or {}).get("timezone", "America/New_York")),
+        policy=ReplayPolicy.from_config(source),
     )
     effective = dict(source)
     effective["strategy"] = strategy
@@ -321,7 +322,8 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                          starting_cash: float = 100_000.0, risk_pct: float = .5,
                          costs: CostModel | None = None,
                          quotes: Sequence[Any] | None = None,
-                         fixed_quantity: float | None = None) -> dict:
+                         fixed_quantity: float | None = None,
+                         policy: ReplayPolicy | Mapping | None = None) -> dict:
     """Replay a chance-entry null with the strategy's own exit and cost rules.
 
     The null keeps the candidate's session/symbol/direction distribution and
@@ -334,6 +336,10 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
     differently would measure position size, not timing.
     """
     model = costs or CostModel()
+    # Omitted policy is the checked runtime policy.  Historical bar fallback
+    # is available only through an explicit ReplayPolicy(strict_market_data=False).
+    policy = (ReplayPolicy.from_config(policy) if isinstance(policy, Mapping)
+              else (ReplayPolicy() if policy is None else policy))
     quote_index = index_quotes(quotes)
     grouped: dict[tuple[str, str], list] = {}
     for bar in sorted(bars, key=lambda item: (item.timestamp, item.symbol)):
@@ -369,8 +375,18 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             continue
         entry_index = rng.randrange(1, len(session_bars) - 1)
         entry_bar = session_bars[entry_index]
+        # The entry bar's open is the boundary observation; its completed
+        # record must be available by the bar end, just as the primary replay
+        # lane models it.  Strict policy still requires a fresh executable
+        # quote below, while the bar's later OHLC never prices the entry.
         if not _visible(entry_bar, entry_bar.end):
             rows.append(_null_row(symbol, day, opportunity, vehicle))
+            continue
+        if (policy.latest_entry_time is not None and
+                entry_bar.timestamp.astimezone(ZoneInfo("America/New_York")).time() >
+                policy.latest_entry_time):
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "latest entry boundary"))
             continue
         entry_underlying = float(entry_bar.open)
         stop = (entry_underlying - distance if direction == "long" else
@@ -379,6 +395,14 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                   if direction == "long" else
                   entry_underlying - distance * float(spec["target_r"]))
         deadline = hold_deadline(entry_bar.timestamp, spec)
+        if policy.force_flat_time is not None:
+            force_flat = entry_bar.timestamp.astimezone(
+                ZoneInfo("America/New_York")).replace(
+                    hour=policy.force_flat_time.hour,
+                    minute=policy.force_flat_time.minute,
+                    second=policy.force_flat_time.second,
+                    microsecond=policy.force_flat_time.microsecond)
+            deadline = min(deadline, force_flat.timestamp())
         last_index = entry_index
         for probe in range(entry_index + 1, len(session_bars)):
             if session_bars[probe].end.timestamp() > deadline:
@@ -413,22 +437,37 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         risk_per_unit = distance
         if vehicle == "equity":
             side = "buy" if direction == "long" else "sell"
-            quoted = quote_fill(quote_index, symbol=symbol,
-                                at=entry_bar.timestamp, side=side)
+            quoted = quote_fill(
+                quote_index, symbol=symbol, at=entry_bar.timestamp, side=side,
+                max_age_seconds=policy.max_market_data_age_seconds,
+                session_date=entry_bar.session_date)
             if quoted is not None:
                 entry_ref, entry_source = quoted, QUOTE
-            quoted_exit = (quote_fill(quote_index, symbol=symbol, at=exit_at,
-                                      side="sell" if direction == "long" else "buy")
-                           if boundary_exit else None)
+            elif policy.strict_market_data:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "no fresh equity quote at entry"))
+                continue
+            quoted_exit = (quote_fill(
+                           quote_index, symbol=symbol, at=exit_at,
+                           side="sell" if direction == "long" else "buy",
+                           max_age_seconds=policy.max_market_data_age_seconds,
+                           session_date=entry_bar.session_date)
+                       if boundary_exit else None)
             if quoted_exit is not None:
                 exit_ref, exit_source = quoted_exit, QUOTE
+            elif policy.strict_market_data and boundary_exit:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "no fresh equity quote at exit"))
+                continue
         if vehicle == "option":
             entry_snap = _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
-                                    direction=direction, cutoff=entry_bar.end)
+                                    direction=direction, cutoff=entry_bar.timestamp,
+                                    policy=policy)
             exit_snap = (None if entry_snap is None else
                          _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
-                                    direction=direction, cutoff=exit_bar.end,
-                                    contract_symbol=entry_snap.contract.symbol))
+                                    direction=direction, cutoff=exit_at,
+                                    contract_symbol=entry_snap.contract.symbol,
+                                    policy=policy))
             if entry_snap is None or exit_snap is None:
                 rows.append(_null_row(symbol, day, opportunity, vehicle))
                 continue
@@ -461,7 +500,7 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             executable_quote=executable or exit_source == QUOTE)
         gross = ((exit_price - entry) if execution_direction == "long" else
                  (entry - exit_price)) * quantity * multiplier
-        fees = model.fees(entry, exit_price, quantity, multiplier)
+        fees = model.fees(entry, exit_price, quantity, multiplier, vehicle=vehicle)
         net = gross - fees
         before = cash
         cash += net
@@ -580,8 +619,11 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                     "mean_delta": null_test["mean_delta"],
                     "mean_delta_lcb": null_test["mean_delta_lcb"],
                     "p_value": float(null_test["p_value"])}
-    final = dict(qualification or {"available": False, "sessions": [],
-                                   "net_positive": False, "delta_positive": False})
+    final = dict(qualification or {
+        "available": False, "sessions": [], "net_positive": False,
+        "delta_positive": False,
+        "post_selection": {"preselected": False, "candidate_id": None},
+    })
     candidate_p = float(delta_held.get("p_value", 1.0))
     checks = {
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
@@ -605,12 +647,21 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "qualification_delta_positive": bool(final.get("available") and
                                              final.get("delta_positive")),
     }
+    development_checks = {
+        name: value for name, value in checks.items()
+        if name not in {"qualification_net_positive",
+                        "qualification_delta_positive"}
+    }
+    development_passes = bool(
+        all(development_checks.values()) and delta_all.get("mean_delta") is not None and
+        float(delta_all["mean_delta"]) > 0)
     passes_without_family = bool(
         all(checks.values()) and delta_all.get("mean_delta") is not None and
         float(delta_all["mean_delta"]) > 0)
     return {"vehicle": vehicle, "shadow": shadow,
             "alpha": float(alpha),
             "passes_without_family": passes_without_family,
+            "development_passes_without_family": development_passes,
             "candidate_p_raw": candidate_p,
             "floor": overall_floor, "fit_floor": fit_floor, "heldout_floor": held_floor,
             "heldout_separation": separation, "paired_baseline": delta_all,
@@ -625,18 +676,34 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
             "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
             "fit_sessions": len({row.get("session_date") for row in fit}),
             "heldout_sessions": len({row.get("session_date") for row in heldout}),
-            "_fit_rows": fit, "_heldout_rows": heldout}
+            "_fit_rows": fit, "_heldout_rows": heldout,
+            "_fit_baseline_rows": base_fit,
+            "_heldout_baseline_rows": base_heldout,
+            "_null_rows": null_heldout}
 
 
-def _finalize_gate(gate: dict, *, lane: str, family: Mapping) -> dict:
+def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
+                   online_fdr: Mapping | None = None,
+                   global_fdr: Mapping | None = None,
+                   provenance: Mapping | None = None,
+                   candidate_id: str | None = None) -> dict:
+    online = dict(online_fdr or {})
+    global_data = dict(global_fdr or family)
     checks = {**gate["checks_without_family"],
-              "family_fdr_significant": bool(family.get("significant", False))}
-    passes = bool(gate["passes_without_family"] and checks["family_fdr_significant"])
+              "family_fdr_significant": bool(family.get("significant", False)),
+              "global_fdr_significant": bool(global_data.get("significant", False)),
+              "cumulative_fdr_significant": bool(online.get("decision"))}
+    passes = bool(gate["passes_without_family"] and all(checks.values()))
     gate["multiple_tests"] = {"candidate": dict(family),
+                              "global": dict(global_data),
                               "method": "benjamini_hochberg"}
     gate["passes"] = passes
+    gate["cumulative_multiple_tests"] = online
     fit = gate.pop("_fit_rows")
     heldout = gate.pop("_heldout_rows")
+    fit_baseline = gate.pop("_fit_baseline_rows", [])
+    heldout_baseline = gate.pop("_heldout_baseline_rows", [])
+    null_source = gate.pop("_null_rows", [])
     # Only report what this gate actually computed: an absent statistic must
     # stay absent rather than be persisted as a null the proof then has to
     # reproduce.
@@ -650,17 +717,27 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping) -> dict:
             performance[f"heldout_{key}"] = absolute[key]
     envelope = verified_gate_envelope(
         lane=lane, vehicle=gate["vehicle"], fit=fit, heldout=heldout,
+        fit_baseline=fit_baseline, heldout_baseline=heldout_baseline,
+        null_source=null_source,
         fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
-        control=gate["control"], p_value=gate["candidate_p_raw"],
-        q_value=float(family.get("p_adjusted", 1.0)), alpha=gate.get("alpha", 0.05),
+        fit_control=gate["fit_paired_baseline"], control=gate["control"],
+        p_value=gate["candidate_p_raw"],
+        q_value=float(global_data.get("p_adjusted",
+                                     family.get("p_adjusted", 1.0))),
+        family_q_value=float(family.get("p_adjusted", 1.0)),
+        alpha=gate.get("alpha", 0.05),
         falsification=gate["falsification"], separation=gate["heldout_separation"],
         checks=checks, passes=passes,
         walk_forward=gate.get("walk_forward"),
         qualification=gate.get("qualification"),
         null_control=gate.get("null_control"),
-        performance=performance)
+        online_fdr=online, provenance=provenance,
+        candidate_id=candidate_id, performance=performance)
+    gate["passes"] = bool(envelope["passes"])
     gate["verified_gate"] = envelope
     gate["gate_hash"] = envelope["content_hash"]
+    gate["failed_checks"] = sorted(
+        key for key, value in envelope["checks"].items() if not value)
     return gate
 
 

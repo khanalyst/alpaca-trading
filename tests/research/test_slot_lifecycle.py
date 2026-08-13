@@ -332,7 +332,11 @@ class LLMDiscoveryTests(unittest.TestCase):
                 def discover(inner, *, vehicle, slot, context):
                     briefs.append(context)
                     spec = {"schema": RULE_SCHEMA_V2, "family": "vwap_reversion",
-                            "entry_after_minutes": 30 + slot,
+                            # Keep each slot's deliberately distinct proposal
+                            # outside the configured near-duplicate radius;
+                            # the test is about genesis discovery, not alias
+                            # suppression between siblings.
+                            "entry_after_minutes": 30 + slot * 20,
                             "entry_before_minutes": 300}
                     from agent.contracts.rule import validate_rule_spec
                     normalized = validate_rule_spec(spec)

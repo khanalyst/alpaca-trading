@@ -14,8 +14,11 @@ from datetime import date, datetime, time, timedelta
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from .costs import BAR, QUOTE, CostModel, index_quotes, quote_fill
-from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
+from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
+
+RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
+from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
+                          option_has_liquidity)
 
 
 class ReplayError(ValueError):
@@ -41,6 +44,10 @@ class IBRConfig:
     # completed signal close explicitly.  The option is persisted in the
     # config hash so the two interpretations cannot be mixed in one run.
     close_confirmed: bool = False
+    # Replay always uses the checked runtime policy.  Diagnostics that need
+    # legacy bar fallback must opt out explicitly with
+    # ``ReplayPolicy(strict_market_data=False)``.
+    policy: ReplayPolicy | Mapping | None = field(default_factory=ReplayPolicy)
 
     def __post_init__(self) -> None:
         if (isinstance(self.range_minutes, bool)
@@ -62,6 +69,15 @@ class IBRConfig:
             raise ReplayError("breakout_buffer_bps cannot be negative")
         if not isinstance(self.close_confirmed, bool):
             raise ReplayError("close_confirmed must be true or false")
+        try:
+            resolved = (ReplayPolicy() if self.policy is None else
+                        ReplayPolicy.from_config(self.policy)
+                        if isinstance(self.policy, Mapping) else self.policy)
+        except Exception as exc:
+            raise ReplayError(f"invalid replay policy: {exc}") from exc
+        if not isinstance(resolved, ReplayPolicy):
+            raise ReplayError("policy must be a ReplayPolicy or mapping")
+        object.__setattr__(self, "policy", resolved)
         try:
             ZoneInfo(self.timezone)
         except Exception as exc:
@@ -132,6 +148,11 @@ def _local(ts: datetime, zone: ZoneInfo) -> datetime:
     return ts.astimezone(zone)
 
 
+def _option_liquid(snapshot: OptionSnapshot) -> bool:
+    """Backward-compatible private alias for the shared runtime rule."""
+    return option_has_liquidity(snapshot)
+
+
 def _session_start(day: date, cfg: IBRConfig, zone: ZoneInfo) -> datetime:
     return datetime.combine(day, cfg.session_open, tzinfo=zone)
 
@@ -188,7 +209,8 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
     signed_move = ((exit_price - entry_price) if execution_direction == "long"
                    else (entry_price - exit_price))
     gross = signed_move * cfg.quantity * multiplier
-    costs = cfg.costs.fees(entry_price, exit_price, cfg.quantity, multiplier)
+    costs = cfg.costs.fees(entry_price, exit_price, cfg.quantity, multiplier,
+                           vehicle=vehicle)
     return IBRTrade(
         vehicle=vehicle, session_date=day, symbol=symbol, direction=direction,
         range_high=range_high, range_low=range_low,
@@ -214,6 +236,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     start = _session_start(day, cfg, zone)
     range_end = start + timedelta(minutes=cfg.range_minutes)
     close_at = datetime.combine(day, cfg.force_flat, tzinfo=zone)
+    if cfg.policy.force_flat_time is not None:
+        close_at = datetime.combine(day, cfg.policy.force_flat_time, tzinfo=zone)
     # Restrict by the source's point-in-time session identity as well as the
     # wall-clock conversion.  A late-corrected event must never migrate into a
     # neighbouring session merely because its timestamp does.
@@ -240,6 +264,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     post.sort(key=lambda b: b.timestamp)
     if not post:
         return None
+    for previous, current in zip(post, post[1:]):
+        if current.timestamp - previous.timestamp != timedelta(minutes=1):
+            return None
     # Express the buffer against the range boundary.  Using the signal close
     # as the denominator makes the effective threshold subtly depend on the
     # size of the move (and is asymmetric with the short side); a registered
@@ -259,9 +286,14 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         # "Next bar" means the immediate following one-minute bar; carrying a
         # signal across an outage would turn a stale breakout into an entry.
         return None
-    # A completed breakout must have been available by its close, and the
-    # next bar's opening price must have been available at entry time.
-    if not _visible(signal, signal.end) or not _visible(entry_bar, entry_bar.timestamp):
+    # The completed breakout must be visible by its close.  The next bar's
+    # *open* is the boundary observation; the completed bar record itself is
+    # naturally not published until its end. Executable pricing below still
+    # requires a point-in-time quote at the boundary.
+    if not _visible(signal, signal.end):
+        return None
+    if (cfg.policy.latest_entry_time is not None and
+            _local(entry_bar.timestamp, zone).time() > cfg.policy.latest_entry_time):
         return None
     long_break = (buffer_long(signal) if cfg.close_confirmed else signal.high > high)
     short_break = (buffer_short(signal) if cfg.close_confirmed else signal.low < low)
@@ -280,11 +312,17 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         # The fill instant is the entry bar's open.  A quote recorded at that
         # instant is the real executable price; the bar open is a trade print
         # that has to be marked up by the modelled spread instead.
-        quoted = quote_fill(quotes, symbol=symbol, at=entry_bar.timestamp,
-                            side="buy" if direction == "long" else "sell")
+        quoted = quote_fill(
+            quotes, symbol=symbol, at=entry_bar.timestamp,
+            side="buy" if direction == "long" else "sell",
+            max_age_seconds=cfg.policy.max_market_data_age_seconds,
+            session_date=day)
         if quoted is not None:
             entry_ref, entry_source = quoted, QUOTE
+        elif cfg.policy.strict_market_data:
+            return None
     if vehicle == "option":
+        option_policy = cfg.policy
         if option_snapshots is None:
             return None
         wanted_right = "call" if direction == "long" else "put"
@@ -292,14 +330,24 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     if s.timestamp <= entry_bar.timestamp
                     and _visible(s, entry_bar.timestamp)
                     and s.session_date == day and s.ask > 0 and s.bid > 0
+                    and entry_bar.timestamp.timestamp() - s.timestamp.timestamp() <=
+                        option_policy.max_market_data_age_seconds
                     and str(s.contract.underlying).upper() == str(symbol).upper()
-                    and s.contract.expiration >= day
+                    and max(1, option_policy.options_min_dte) <= (s.contract.expiration - day).days <=
+                        option_policy.options_max_dte
+                    and ((s.ask - s.bid) / ((s.ask + s.bid) / 2.0) * 100.0 <=
+                         option_policy.options_max_spread_pct)
+                    and option_has_liquidity(s)
                     and str(s.contract.right).lower() in {
                         wanted_right, wanted_right[0]}]
         if not eligible:
             return None
+        spot = next((item.underlying_price for item in sorted(
+            eligible, key=lambda item: (item.timestamp, item.contract.symbol), reverse=True)
+            if item.underlying_price), underlying_entry)
         snap = min(eligible, key=lambda item: (
-            abs(float(item.contract.strike) - underlying_entry),
+            abs(float(item.contract.strike) - float(spot)),
+            (item.ask - item.bid) / ((item.ask + item.bid) / 2.0),
             -item.timestamp.timestamp(), item.contract.symbol))
         contract = snap.contract
         selected_contract = contract
@@ -332,7 +380,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                           if selected_contract is not None
                           and s.contract == selected_contract
                           and s.timestamp <= cutoff and _visible(s, cutoff)
-                          and s.session_date == day and s.bid > 0]
+                          and s.session_date == day and s.bid > 0
+                          and cutoff.timestamp() - s.timestamp.timestamp() <=
+                              cfg.policy.max_market_data_age_seconds]
         if not eligible_exits:
             return None
         return max(eligible_exits, key=lambda item: item.timestamp).bid
@@ -343,7 +393,10 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         """Price a fill that happens at a bar boundary, quote-first."""
         if vehicle != "equity":
             return reference, BAR
-        quoted = quote_fill(quotes, symbol=symbol, at=at, side=exit_side)
+        quoted = quote_fill(
+            quotes, symbol=symbol, at=at, side=exit_side,
+            max_age_seconds=cfg.policy.max_market_data_age_seconds,
+            session_date=day)
         return (quoted, QUOTE) if quoted is not None else (reference, BAR)
 
     for bar in post[signal_idx + 1:]:
@@ -368,6 +421,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 exit_reference = option_exit_reference(bar.timestamp)
             else:
                 exit_reference, exit_source = boundary_exit(bar.open, bar.timestamp)
+            if (cfg.policy.strict_market_data and vehicle == "equity" and
+                    exit_source != QUOTE):
+                return None
             if exit_reference is None:
                 return None
             return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
@@ -382,7 +438,11 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             # Stop wins if both are touched by one candle.
             reason = "stop" if hit_stop else "target"
             level = stop if reason == "stop" else target
-            exit_reference = (option_exit_reference(bar.end)
+            # Intrabar trigger has no precise quote instant.  Use the latest
+            # snapshot available at the bar open, never a post-trigger bar-end
+            # quote that would look into the future.
+            exit_reference = (option_exit_reference(
+                bar.timestamp if cfg.policy.strict_market_data else bar.end)
                               if vehicle == "option" else level)
             if exit_reference is None:
                 return None
@@ -407,9 +467,11 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             return None
         last = candidates[-1]
         exit_ref, exit_source = boundary_exit(last.close, last.end)
-    if vehicle == "option":
-        exit_ref = option_exit_reference(last.timestamp)
-        if exit_ref is None:
+        if vehicle == "option":
+            exit_ref = option_exit_reference(last.timestamp)
+            if exit_ref is None:
+                return None
+        elif cfg.policy.strict_market_data and exit_source != QUOTE:
             return None
     return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
                             range_high=high, range_low=low, signal=signal,

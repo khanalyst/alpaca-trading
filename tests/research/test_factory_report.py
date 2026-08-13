@@ -108,7 +108,11 @@ class ReportContentTests(unittest.TestCase):
                 self.assertIsNotNone(variant["heldout_delta"])
                 self.assertEqual(variant["primary_failure"], "negative_expectancy")
                 self.assertIn("made money held-out", variant["failed_checks"])
-                self.assertEqual(variant["ledger_status"], "retired")
+                # The hypothesis was retired after all development variants
+                # failed.  Nonselected diagnostic candidates have no sealed
+                # proof run, so their EdgeLedger lifecycle correctly remains
+                # at candidate rather than inventing a retirement proof.
+                self.assertEqual(variant["ledger_status"], "candidate")
 
             # What was retired, why, and after how many variants.
             outcome = first["outcome"]

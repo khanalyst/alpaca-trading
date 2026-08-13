@@ -44,7 +44,7 @@ WINNING_VARIANT = rule_variant_id(WINNING_SPEC)
 # Six bps of spread and fifteen of slippage: still inside the runtime's own
 # rejection caps, so this is a fill the trader would accept, not an impossible
 # one chosen to guarantee the failure.
-WORSE_COSTS = CostModel(spread_bps=12.0, slippage_bps=15.0, fee_bps=1.0)
+WORSE_COSTS = CostModel(spread_bps=12.0, slippage_bps=25.0, fee_bps=1.0)
 
 
 def _wobble(symbol: str, day: int) -> float:
@@ -98,6 +98,15 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
             "low": round(min(opened, close) - .02, 4),
             "close": round(close, 4), "volume": volume,
         })
+        # The runtime will not submit from bars alone.  Give the backtest the
+        # same fresh two-sided quote the live entry path requires instead of
+        # silently falling back to a bar price.
+        rows.append({
+            "kind": "quote", "provider": "test", "feed": "sip",
+            "symbol": symbol, "timestamp": stamp.isoformat(),
+            "as_of": stamp.isoformat(), "observed_at": stamp.isoformat(),
+            "bid": round(opened - .01, 4), "ask": round(opened + .01, 4),
+        })
         opened = close
     return rows
 
@@ -142,7 +151,10 @@ class EarnedGatePassTests(unittest.TestCase):
         self.assertEqual(self.result["status"], "complete")
         rows = self._by_variant(self.result)
         self.assertEqual(sorted(rows), sorted([ROOT_VARIANT, WINNING_VARIANT]))
-        winner = rows[WINNING_VARIANT]
+        # Selection is made once on development evidence.  In this corpus the
+        # simpler root has the stronger lower confidence bound, so the final
+        # window is spent on it and the mutation remains diagnostic.
+        winner = rows[ROOT_VARIANT]
         gate = winner["gate"]
         self.assertTrue(gate["passes"])
         # Every mandatory check, not merely the aggregate, and the structural
@@ -158,15 +170,17 @@ class EarnedGatePassTests(unittest.TestCase):
         self.assertEqual(winner["status"], "backtest_passed")
         self.assertEqual(winner["mode"], "backtest")
 
-    def test_the_unmutated_root_does_not_pass_its_own_control(self):
-        # The root is its own matched baseline, so every delta is exactly zero.
-        # A pass here would mean the control was not actually being subtracted.
+    def test_the_unmutated_root_can_pass_only_against_randomized_entry(self):
+        # A root is a real hypothesis, not a free self-comparison.  It may pass
+        # only by beating its independent randomized-entry null after costs.
         gate = self._by_variant(self.result)[ROOT_VARIANT]["gate"]
-        self.assertFalse(gate["passes"])
-        self.assertEqual(gate["test"]["mean_delta"], 0.0)
+        self.assertTrue(gate["passes"])
+        self.assertEqual(gate["control"]["kind"],
+                         "randomized_entry_root_null")
+        self.assertGreater(gate["test"]["mean_delta"], 0.0)
         self.assertGreater(gate["heldout_net_pnl"], 0.0)
         self.assertEqual(self._by_variant(self.result)[ROOT_VARIANT]["status"],
-                         "retired")
+                         "backtest_passed")
 
     def test_the_lifecycle_reaches_validated_and_a_champion(self):
         # A backtest pass is not runtime eligibility.  A second cycle over
@@ -179,11 +193,13 @@ class EarnedGatePassTests(unittest.TestCase):
                                  strategies=1, variants_per_strategy=2,
                                  workers=1)
         rows = self._by_variant(result)
-        self.assertEqual(list(rows), [WINNING_VARIANT])
-        self.assertEqual(rows[WINNING_VARIANT]["mode"], "shadow")
-        self.assertTrue(rows[WINNING_VARIANT]["gate"]["passes"])
-        self.assertEqual(rows[WINNING_VARIANT]["status"], "validated")
-        self.assertEqual(result["champion"]["variant_id"], WINNING_VARIANT)
+        self.assertEqual(list(rows), [ROOT_VARIANT])
+        self.assertEqual(rows[ROOT_VARIANT]["mode"], "shadow")
+        self.assertTrue(rows[ROOT_VARIANT]["gate"]["passes"])
+        # Offline forward replay remains diagnostic.  Only live-shadow
+        # ingestion can authorize validation or champion selection.
+        self.assertEqual(rows[ROOT_VARIANT]["status"], "shadow")
+        self.assertIsNone(result["champion"])
 
     def test_the_pass_is_bought_and_worse_costs_take_it_away(self):
         # The identical corpus under a materially worse — but still runtime

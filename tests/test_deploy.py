@@ -283,6 +283,13 @@ class DeployTests(unittest.TestCase):
         self.assertIn("source: research_llm_credentials", research)
         self.assertNotIn("OPENAI_API_KEY:", research)
         self.assertNotIn("ANTHROPIC_API_KEY:", research)
+        self.assertIn(
+            "ALPACA_SHADOW_DB: ${ALPACA_SHADOW_DB:-/app/shadow/shadow.sqlite3}",
+            research)
+        self.assertIn("- shadow-data:/app/shadow:ro", research)
+        shadow = text.split("  shadow:", 1)[1].split("  dashboard:", 1)[0]
+        self.assertIn("- shadow-data:/app/shadow", shadow)
+        self.assertIn("- /app/shadow/shadow.sqlite3", shadow)
         unit = Path("deploy/alpaca-research.service").read_text(encoding="utf-8")
         self.assertNotIn("ALPACA_AGENT_SECRETS_FILE", unit)
         self.assertNotIn("agent.env", unit)
@@ -430,10 +437,12 @@ class DeployTests(unittest.TestCase):
                 summaries[label] = _cycle_payloads(result.stdout, "vehicle")[0]
             # The routed quotes are the executable price at the fill instant,
             # so a corpus carrying them must not replay like the bars alone.
+            # Strict replay does not fabricate an executable fill from a bar
+            # when the recorded point-in-time quote is absent.
             self.assertEqual(summaries["quotes"]["trades"], 1)
-            self.assertEqual(summaries["bars_only"]["trades"], 1)
-            self.assertNotEqual(summaries["quotes"]["net_pnl"],
-                                summaries["bars_only"]["net_pnl"])
+            self.assertEqual(summaries["bars_only"]["trades"], 0)
+            self.assertGreater(summaries["quotes"]["net_pnl"],
+                               summaries["bars_only"]["net_pnl"])
 
     def test_research_cycle_reads_a_partitioned_corpus_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -656,6 +665,17 @@ class DeployTests(unittest.TestCase):
                                          ("bars", "sip"), ("quotes", "sip")])
             self.assertEqual(len({row["event_key"] for row in rows}), 2)
             self.assertTrue(all(row["feed"] == "sip" for row in rows))
+
+    def test_recorder_never_persists_an_active_partial_bar(self):
+        fake = _MarketFake()
+        active = datetime(2026, 8, 8, 13, 30, 30, tzinfo=timezone.utc)
+        rows = list(recorder._rows(fake, ["SPY"], active, feed="iex"))
+        self.assertEqual([row["event_type"] for row in rows], ["quote"])
+
+        complete = datetime(2026, 8, 8, 13, 31, tzinfo=timezone.utc)
+        rows = list(recorder._rows(fake, ["SPY"], complete, feed="iex"))
+        bar = next(row for row in rows if row["event_type"] == "bar_1m")
+        self.assertEqual(bar["as_of"], complete.isoformat())
 
     def test_recorder_resumes_from_durable_watermark_after_long_outage(self):
         fake = _WindowFake()
