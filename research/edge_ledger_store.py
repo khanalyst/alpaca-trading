@@ -21,6 +21,23 @@ DEFAULT_DB_PATH = Path(os.getenv(
     "ALPACA_EDGE_DB",
     str(Path(__file__).resolve().parents[1] / "runtime" / "research" / "edge_lab.sqlite3")))
 SCHEMA_VERSION = 3
+# The replay-correctness generation that produced a run.  This is not the
+# storage schema: rows stay readable across epochs, but evidence recorded by an
+# older replay engine cannot authorize deployment, because the fills, quote-age
+# bounds, partition arithmetic and multiplicity accounting it was measured
+# under are not the ones the current gates assume.
+#
+# Epoch 2 is the first to carry point-in-time option entry pricing, bounded and
+# session-scoped equity quote ages, per-signal (not per-session) bar adjacency,
+# runtime portfolio limits inside the simulated book, contiguous multi-session
+# walk-forward folds, post-selection sealed-window qualification, and a
+# cumulative cross-cycle false-discovery budget.  Epoch 1 evidence predates all
+# of it and is quarantined rather than deleted: the rows remain auditable, they
+# simply cannot promote anything.
+#
+# Bump this whenever a replay or gate change invalidates previously recorded
+# runs.  Runs are stamped at ``append_run``; a run with no stamp is epoch 1.
+REPLAY_ENGINE_EPOCH = 2
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 

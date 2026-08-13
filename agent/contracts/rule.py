@@ -128,6 +128,59 @@ _FAMILY_EXECUTABLE_FIELDS = {
 }
 
 
+# Families whose statistics accumulate from the session open.  A missing bar
+# anywhere earlier in the session changes what they compute, so their feature
+# window is the whole session prefix rather than a bounded trailing count.
+SESSION_ACCUMULATING_FAMILIES = frozenset(("vwap_reversion", "vwap_trend"))
+# Trailing completed bars each remaining family reads, beyond the prefix
+# ``evaluate_rule_signal`` always consumes.  Opening-anchored families are
+# absent on purpose: their window is selected by clock time and is already
+# guarded by an explicit minimum-bar count, not by adjacency.
+_FAMILY_FEATURE_BARS = {
+    "momentum_continuation": lambda spec: spec["lookback"] + 2,
+    "mean_reversion": lambda spec: spec["lookback"],
+    "trend_pullback": lambda spec: spec["slow_lookback"],
+    "volatility_breakout": lambda spec: spec["lookback"] + 1,
+    "volume_breakout": lambda spec: spec["lookback"] + 1,
+    "range_expansion": lambda spec: spec["lookback"] + 1,
+}
+_CONFIRMATION_FEATURE_BARS = {
+    "trend": lambda spec: spec["slow_lookback"],
+    "volume": lambda spec: spec["lookback"] + 1,
+    "volatility": lambda spec: spec["atr_period"] + 1,
+}
+
+
+def feature_window_bars(value: Mapping[str, Any]) -> int | None:
+    """Trailing completed bars :func:`evaluate_rule_signal` reads for a spec.
+
+    ``None`` means the family accumulates from the session open and has no
+    bounded trailing window.
+
+    Replay uses this to require adjacency over exactly the bars a signal is
+    computed from.  A fixed lookback silently stretched across an outage is a
+    different statistic than the one the spec names, so the bars it reads must
+    be consecutive — but a minute missing *after* that window cannot change the
+    signal, and deleting the observation for it would discard good evidence.
+    """
+    spec = validate_rule_spec(value)
+    family = str(spec["family"])
+    if family in SESSION_ACCUMULATING_FAMILIES:
+        return None
+    # The prefix ``evaluate_rule_signal`` consumes before dispatching a family.
+    needed = max(spec["lookback"] + 1, spec["atr_period"] + 1)
+    resolve = _FAMILY_FEATURE_BARS.get(family)
+    if resolve is not None:
+        needed = max(needed, resolve(spec))
+    confirmations = {str(spec.get("confirmation") or "none")}
+    confirmations.update(str(item) for item in spec.get("confirmations") or ())
+    for kind in confirmations:
+        resolve = _CONFIRMATION_FEATURE_BARS.get(kind)
+        if resolve is not None:
+            needed = max(needed, resolve(spec))
+    return int(needed)
+
+
 def _semantic_fields(spec: Mapping[str, Any]) -> set[str]:
     fields = set(_COMMON_EXECUTABLE_FIELDS)
     fields.update(_FAMILY_EXECUTABLE_FIELDS.get(str(spec["family"]), ()))
@@ -768,7 +821,8 @@ __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
            "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
-           "EXECUTABLE_RULE_FIELDS", "rule_semantic_signature",
+           "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
+           "feature_window_bars", "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
     "RuleSpecError", "evaluate_rule_signal",
     "generate_rule_signal", "hold_deadline", "rule_spec_hash",

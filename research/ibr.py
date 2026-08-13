@@ -264,9 +264,10 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     post.sort(key=lambda b: b.timestamp)
     if not post:
         return None
-    for previous, current in zip(post, post[1:]):
-        if current.timestamp - previous.timestamp != timedelta(minutes=1):
-            return None
+    # Adjacency is required where it changes an outcome — the next-bar entry
+    # below, and the hold window — not across the whole post-range period.  A
+    # minute missing at 15:40 does not invalidate a 10:05 breakout, and
+    # rejecting the session for it deletes good observations.
     # Express the buffer against the range boundary.  Using the signal close
     # as the denominator makes the effective threshold subtly depend on the
     # size of the move (and is asymmetric with the short side); a registered
@@ -286,6 +287,15 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         # "Next bar" means the immediate following one-minute bar; carrying a
         # signal across an outage would turn a stale breakout into an entry.
         return None
+    # The hold window is the consecutive run beginning at the entry.  Every
+    # exit below — level, gap, and force-flat alike — is resolved inside it, so
+    # a position is never carried across a data outage and a later recorded
+    # minute is never treated as adjacent to the bar before the gap.
+    hold = [entry_bar]
+    for bar in post[signal_idx + 2:]:
+        if bar.timestamp != hold[-1].end:
+            break
+        hold.append(bar)
     # The completed breakout must be visible by its close.  The next bar's
     # *open* is the boundary observation; the completed bar record itself is
     # naturally not published until its end. Executable pricing below still
@@ -399,7 +409,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             session_date=day)
         return (quoted, QUOTE) if quoted is not None else (reference, BAR)
 
-    for bar in post[signal_idx + 1:]:
+    for bar in hold:
         if _local(bar.timestamp, zone) >= close_at:
             break
         if not _visible(bar, bar.end):
@@ -455,14 +465,14 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     stop_price=stop, target_price=target,
                                     entry_source=entry_source)
     # Force-flat at the last completed bar before the configured close.
-    boundary = next((b for b in post if _local(b.timestamp, zone) >= close_at
+    boundary = next((b for b in hold if _local(b.timestamp, zone) >= close_at
                      and _visible(b, b.timestamp)), None)
     exit_source = BAR
     if boundary is not None:
         last = boundary
         exit_ref, exit_source = boundary_exit(last.open, last.timestamp)
     else:
-        candidates = [b for b in post if b.end <= close_at and _visible(b, b.end)]
+        candidates = [b for b in hold if b.end <= close_at and _visible(b, b.end)]
         if not candidates:
             return None
         last = candidates[-1]

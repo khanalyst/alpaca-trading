@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, evaluate_rule_signal,
-    hold_deadline, rule_variant_id, validate_rule_spec,
+    feature_window_bars, hold_deadline, rule_variant_id, validate_rule_spec,
 )
 from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
 from .edge_ledger import content_hash
@@ -223,7 +223,14 @@ def _coerce_policy(policy: ReplayPolicy | Mapping[str, Any] | None) -> ReplayPol
 
 
 def _session_bars_valid(rows: Sequence[UnderlyingBar]) -> bool:
-    """Reject malformed replay streams without repairing them by sorting."""
+    """Reject malformed replay streams without repairing them by sorting.
+
+    Adjacency is deliberately *not* required across the whole session.  A
+    recorder that misses one low-volume minute at 15:40 has not invalidated a
+    signal computed at 10:05, and rejecting the session for it discards a
+    quarter of the sample on real data.  :func:`_contiguous` instead enforces
+    adjacency over exactly the bars each signal and each hold actually reads.
+    """
     if not rows:
         return False
     seen: set[datetime] = set()
@@ -235,10 +242,15 @@ def _session_bars_valid(rows: Sequence[UnderlyingBar]) -> bool:
             return False
         seen.add(row.timestamp)
         previous = row.timestamp
-    for left, right in zip(rows, rows[1:]):
-        if right.timestamp - left.timestamp != timedelta(minutes=1):
-            return False
     return True
+
+
+def _contiguous(rows: Sequence[UnderlyingBar], start: int, stop: int) -> bool:
+    """True when ``rows[start:stop]`` are consecutive one-minute bars."""
+    if start < 0 or stop > len(rows) or start >= stop:
+        return False
+    return all(right.timestamp - left.timestamp == timedelta(minutes=1)
+               for left, right in zip(rows[start:stop - 1], rows[start + 1:stop]))
 
 
 def _at_or_before_force_flat(timestamp: datetime, policy: ReplayPolicy) -> bool:
@@ -255,6 +267,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     resolved_policy = _coerce_policy(policy)
     if not _session_bars_valid(session_bars):
         return None
+    # ``None`` means the family accumulates from the session open, so its
+    # window starts at the session's first bar rather than a trailing offset.
+    window = feature_window_bars(spec)
     for index in range(1, len(session_bars) - 1):
         signal_bar = session_bars[index]
         # Every feature prefix is point-in-time visible at the signal cutoff;
@@ -264,10 +279,21 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                 _visible(item, signal_bar.end)
                 for item in session_bars[:index + 1]):
             continue
+        # The bars a signal is computed from must be consecutive: a gap inside
+        # the feature window stretches a fixed lookback across an outage and
+        # silently evaluates a different statistic than the spec names.
+        feature_start = (0 if window is None
+                         else max(0, index + 1 - int(window)))
+        if not _contiguous(session_bars, feature_start, index + 1):
+            continue
         signal = evaluate_rule_signal(session_bars[:index + 1], spec)
         if signal is None:
             continue
         entry_bar = session_bars[index + 1]
+        # "Next bar" means the immediate following one-minute bar.  Carrying a
+        # signal across an outage would turn a stale breakout into an entry.
+        if entry_bar.timestamp != signal_bar.end:
+            continue
         # The completed bar record is not visible until its end, but its open
         # is the boundary observation used for next-bar entry.  Never consume
         # the entry bar's high/low/close before that bar ends; executable entry
@@ -296,6 +322,13 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         deadline = hold_deadline(entry_bar.timestamp, spec)
         last_index = index + 1
         for probe in range(index + 2, len(session_bars)):
+            # The hold never crosses an outage.  Treating the next recorded
+            # minute as adjacent would let a stop or target "trigger" on a bar
+            # the position could not have been carried into; the position is
+            # resolved on the last observed bar instead.
+            if (session_bars[probe].timestamp -
+                    session_bars[probe - 1].timestamp != timedelta(minutes=1)):
+                break
             if session_bars[probe].end.timestamp() > deadline:
                 break
             if not _at_or_before_force_flat(session_bars[probe].timestamp,

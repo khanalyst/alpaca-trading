@@ -15,6 +15,15 @@ Every replay must establish the following invariants:
 - range features use completed bars only;
 - entries occur on the next bar, never on the signal bar;
 - an early, reversed, or duplicate bar fails closed;
+- bar adjacency is required exactly where a missing minute changes an outcome,
+  and nowhere else: over the bars a signal is computed from
+  (`agent/contracts/rule.py::feature_window_bars`, which is the whole session
+  prefix for the session-accumulating VWAP families), between a signal and its
+  entry, and across a hold — a hold walk stops at a discontinuity and resolves
+  the position on the last observed bar rather than treating the next recorded
+  minute as adjacent. A gap after a position is resolved does not delete the
+  observation: rejecting a whole symbol-session for one missing low-volume
+  minute discards a large, non-random share of a real corpus;
 - same-bar stop/target ties resolve to the stop;
 - a gap through a level, on entry or exit, fills at the gap open;
 - a fill landing on a bar boundary uses a recorded quote at that instant when
@@ -260,6 +269,21 @@ p-value, lower bound, falsification, absolute profitability — from the stored
 source rows and compares it against the recorded decision, rather than only
 re-checking hashes. Champions are ranked by the lower confidence bound, not
 the raw held-out delta.
+
+Every run also records the replay generation it was measured under
+(`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
+and never accepted from a caller. A run from a superseded generation cannot
+authorize `validated`, `champion`, or runtime eligibility, and
+`EdgeLedger.eligibility` names that quarantine rather than reporting a bare
+ineligibility. This is deliberately not a digest check: evidence measured under
+a replay engine that has since been corrected still re-hashes and still
+recomputes, because the recorded rows are exactly what that engine produced.
+What changed is that those rows describe fills, quote ages, portfolio limits or
+multiplicity accounting the current protocol does not accept. Quarantine is not
+deletion — the rows stay readable and the lifecycle history stays intact — so
+re-deriving under the current engine is the only route back to a deployable
+proof. The constant is raised whenever a replay or gate change invalidates
+evidence recorded before it.
 Underpowered data is not failure. Retirement is permitted only after every
 intended variant has adequate terminal negative evidence and fails; an enabled
 LLM lane must first register a valid bounded replacement. A demoted candidate

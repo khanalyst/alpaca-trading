@@ -8,6 +8,34 @@ from typing import Mapping
 import uuid
 
 
+def run_engine_epoch(run: Mapping) -> int:
+    """The replay generation a persisted run was measured under.
+
+    A run written before the stamp existed reports epoch 1, which is exactly
+    what it is: evidence from the engine that preceded point-in-time option
+    entry pricing, bounded quote ages, and post-selection qualification.
+    """
+    if not isinstance(run, Mapping):
+        return 1
+    metrics = run.get("metrics")
+    value = metrics.get("replay_engine_epoch") if isinstance(metrics, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return int(value)
+
+
+def run_engine_epoch_current(run: Mapping) -> bool:
+    """Whether a run may authorize deployment under the current engine.
+
+    Older evidence is quarantined, never rewritten.  The rows stay auditable
+    and the lifecycle history is intact; the run simply cannot promote a
+    candidate, so a re-derivation under the current engine is the only route
+    back to ``validated``.
+    """
+    from .edge_ledger_store import REPLAY_ENGINE_EPOCH
+    return run_engine_epoch(run) >= int(REPLAY_ENGINE_EPOCH)
+
+
 def _facade_helper(name: str):
     """Resolve an EdgeLedger helper at call time for patch-compatible facades."""
     from . import edge_ledger
@@ -441,12 +469,23 @@ class EdgeLedgerProofMixin:
             candidate.get("status") in {"validated", "champion"} and
             proof is not None and proof["verified_gate"].get("passes") is True and
             authorized)
+        # Name the quarantine explicitly.  "Not eligible" and "proved by an
+        # engine that has since been corrected" are different operator
+        # situations, and only the second one is fixed by re-deriving.
+        epoch = run_engine_epoch(proof) if proof is not None else None
         return {"candidate_id": candidate_id, "status": candidate["status"],
-                "lane": lane, "eligible": eligible, "latest_verified_run": proof}
+                "lane": lane, "eligible": eligible, "latest_verified_run": proof,
+                "replay_engine_epoch": epoch,
+                "engine_epoch_current": (proof is not None and
+                                         run_engine_epoch_current(proof)),
+                "quarantined": bool(proof is not None and
+                                    not run_engine_epoch_current(proof))}
 
     def _live_shadow_authorized(self, run: Mapping) -> bool:
         """Require the research-side parity-ingestion marker for deployment."""
         if not isinstance(run, Mapping) or run.get("lane") != "shadow":
+            return False
+        if not run_engine_epoch_current(run):
             return False
         metrics = run.get("metrics")
         source = metrics.get("shadow_source") if isinstance(metrics, Mapping) else None

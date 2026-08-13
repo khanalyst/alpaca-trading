@@ -12,7 +12,8 @@ import uuid
 
 from .edge_ledger_store import (
     BACKTEST_PASSED, CANDIDATE, CHAMPION, DEFAULT_DB_PATH, DEMOTED, LANES,
-    LIFECYCLE, PAPER_DEMOTION_MIN_OUTCOMES, PAPER_DEMOTION_R_FLOOR, RETIRED,
+    LIFECYCLE, PAPER_DEMOTION_MIN_OUTCOMES, PAPER_DEMOTION_R_FLOOR,
+    REPLAY_ENGINE_EPOCH, RETIRED,
     SCHEMA_VERSION, SHADOW, VALIDATED, VEHICLES, _connect, _json, _row, _utc,
     canonical_json, content_hash, hash_config, hash_dataset, hash_file,
     hash_provenance, init_db, init_ledger, provenance_hash,
@@ -148,6 +149,11 @@ class EdgeLedger(EdgeLedgerProofMixin):
                                  code=code, provenance=provenance)
         fit_rows, held_rows = list(fit or ()), list(heldout or ())
         payload = dict(metrics or {})
+        # Stamp the replay generation that actually produced this run.  It is
+        # assigned here rather than accepted from the caller so a run can never
+        # claim an engine it was not measured under; runs written before the
+        # stamp existed carry none and are treated as epoch 1.
+        payload["replay_engine_epoch"] = int(REPLAY_ENGINE_EPOCH)
         payload.setdefault("fit_trades", len(fit_rows))
         payload.setdefault("heldout_trades", len(held_rows))
         run_id = run_id or uuid.uuid4().hex
