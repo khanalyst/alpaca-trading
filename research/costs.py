@@ -159,7 +159,29 @@ class ReplayPolicy:
                                float(risk.get("max_total_open_risk_pct",
                                               risk.get("max_open_risk_pct")))),
             daily_loss_limit_pct=(None if risk.get("daily_loss_limit_pct") is None else float(risk["daily_loss_limit_pct"])),
+            # Every other policy field is read here; omitting this one pinned it
+            # at the strict default with no way to change it from configuration.
+            # A bars-only corpus (a backfill without ``--quotes``) then prices
+            # nothing at all, which is a data-shape mismatch rather than a
+            # research result -- see ``fill_source_summary``.
+            strict_market_data=_strict_market_data(execution),
         )
+
+
+def _strict_market_data(execution: Mapping) -> bool:
+    """Resolve ``execution.strict_market_data``, defaulting to strict.
+
+    Strict replay refuses to price a fill it has no recorded quote for, which
+    is right when a quote *should* exist and did not.  A corpus that never
+    carried quotes at all is a different situation: nothing can price, and the
+    honest response is to say so rather than to report an edgeless run.
+    """
+    value = execution.get("strict_market_data", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise CostError("execution.strict_market_data must be true or false")
 
 
 def _bps(value: Any, name: str) -> float:

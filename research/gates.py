@@ -19,6 +19,7 @@ from statistics import mean
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
+from .costs import QUOTE as QUOTE_FILL
 from .stats import (
     DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS, cluster_bootstrap_lower_bound,
     paired_cluster_sign_flip, sign_flip_null_statistics, stable_seed,
@@ -672,6 +673,92 @@ def seal_final_window(items: Sequence[Any], *, session_of, fraction: float = .2,
         _payload=qualification)
 
 
+def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str) -> dict:
+    """Report what actually priced the fills behind a result.
+
+    ``entry_fill_source`` is recorded per row but was never aggregated, so a
+    finished proof could not say whether it rested on recorded executable
+    quotes or on bar prints marked up by the modelled half-spread.  Those are
+    materially different evidence and a proof has to state which it is.
+
+    ``dominant_reject_reason`` names why unpriced opportunities were refused.
+    When a corpus prices *nothing*, that reason is the difference between "no
+    edge here" and "this corpus cannot be evaluated at all".
+    """
+    local = [row for row in rows if row.get("vehicle", vehicle) == vehicle]
+    executed = [row for row in local if row.get("no_trade") is not True]
+    sources: dict[str, int] = {}
+    for row in executed:
+        name = str(row.get("entry_fill_source") or "unknown")
+        sources[name] = sources.get(name, 0) + 1
+    rejects: dict[str, int] = {}
+    for row in local:
+        if row.get("no_trade") is not True:
+            continue
+        reason = row.get("reject_reason")
+        if reason:
+            rejects[str(reason)] = rejects.get(str(reason), 0) + 1
+    dominant = max(rejects.items(), key=lambda item: (item[1], item[0]))[0] if rejects else None
+    quoted = sources.get(QUOTE_FILL, 0)
+    return {
+        "vehicle": vehicle,
+        "opportunities": len(local),
+        "executed": len(executed),
+        "sources": dict(sorted(sources.items())),
+        "quoted_fraction": (quoted / len(executed)) if executed else None,
+        "reject_reasons": dict(sorted(rejects.items())),
+        "dominant_reject_reason": dominant,
+        # Nothing priced, and every refusal shares one cause: this is a
+        # data-shape mismatch, not an edgeless corpus.
+        "priced_nothing": bool(local and not executed),
+    }
+
+
+def unevaluable_reason(gates: Iterable[Mapping]) -> str | None:
+    """Why a run tested nothing, when that is a data problem not a result.
+
+    A cycle where every lane materialised opportunities and executed no trades
+    has not evaluated a single hypothesis.  Reported as "nothing passed the
+    gates" it is indistinguishable from a genuine negative, so a corpus the
+    replay cannot price at all -- bars with no recorded quotes under a strict
+    market-data policy, most often a backfill run without ``--quotes`` -- looks
+    exactly like weeks of healthy, edgeless research.
+
+    Returns the shared refusal reason when that is what happened, else None.
+    """
+    reasons: set[str] = set()
+    saw_opportunity = False
+    for gate in gates:
+        if not isinstance(gate, Mapping):
+            continue
+        quality = gate.get("fill_quality")
+        if not isinstance(quality, Mapping):
+            nested = gate.get("verified_gate")
+            quality = (nested.get("fill_quality")
+                       if isinstance(nested, Mapping) else None)
+        if not isinstance(quality, Mapping):
+            continue
+        for partition in ("fit", "heldout"):
+            summary = quality.get(partition)
+            if not isinstance(summary, Mapping):
+                continue
+            if int(summary.get("opportunities") or 0) <= 0:
+                continue
+            saw_opportunity = True
+            if int(summary.get("executed") or 0) > 0:
+                # Something priced, so the corpus is evaluable and any
+                # remaining failure is a research verdict.
+                return None
+            reason = summary.get("dominant_reject_reason")
+            if reason:
+                reasons.add(str(reason))
+    if not saw_opportunity:
+        return None
+    if not reasons:
+        return "every opportunity was refused without a recorded reason"
+    return "; ".join(sorted(reasons))
+
+
 def verified_gate_envelope(*, lane: str, vehicle: str,
                            fit: Sequence[Mapping], heldout: Sequence[Mapping],
                            fit_baseline: Sequence[Mapping] = (),
@@ -786,6 +873,12 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "heldout_baseline_source": [dict(row) for row in heldout_baseline],
         "null_source": [dict(row) for row in null_source],
         "floors": {"fit": dict(fit_floor), "heldout": dict(heldout_floor)},
+        # What priced these fills, so a persisted proof states its own
+        # evidence quality instead of leaving it unauditable.
+        "fill_quality": {
+            "fit": fill_source_summary(fit, vehicle=vehicle),
+            "heldout": fill_source_summary(heldout, vehicle=vehicle),
+        },
         "fit_control": fit_summary,
         "control": dict(control),
         "statistics": {"p_value": float(p_value), "q_value": float(q_value),
@@ -1141,7 +1234,8 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
 
 
 __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
-    "GATE_REQUIRED_CHECKS", "floor_feasibility",
+    "GATE_REQUIRED_CHECKS", "fill_source_summary", "floor_feasibility",
+           "unevaluable_reason",
     "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
            "QUALIFICATION_MAX_BYTES", "QUALIFICATION_MAX_ROWS",
            "SealedWindowError", "chronological_split",

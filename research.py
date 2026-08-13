@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parent
@@ -29,6 +29,7 @@ from research.market_data import (
     normalize_underlying_bar,
     parse_timestamp,
 )
+from research.gates import unevaluable_reason
 from research.proof import write_proof
 from research.strategy_factory import factory_status, run_factory
 from agent.config import load_config as load_agent_config
@@ -436,6 +437,21 @@ def cmd_edge_ingest_shadow(args: argparse.Namespace) -> int:
     return 0
 
 
+# A run that priced nothing is not a research verdict.  It exits distinctly so
+# the scheduled cycle reports ``no_data`` with the cause instead of
+# ``completed_no_edge``, which would be indistinguishable from real negatives.
+UNEVALUABLE_EXIT = 4
+
+
+def _report_unevaluable(result: Mapping, gates: Sequence[Mapping]) -> bool:
+    """Print and mark a run whose corpus could not be priced at all."""
+    reason = unevaluable_reason(gates)
+    if reason is None:
+        return False
+    result["unevaluable"] = {"schema": "research-unevaluable.v1", "reason": reason}
+    return True
+
+
 def cmd_edge_discover(args: argparse.Namespace) -> int:
     agent_config = _agent_config(args)
     config = _read_json(args.config, {})
@@ -447,7 +463,12 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha)
     _emit_proofs(args, result, agent_config)
+    stalled = _report_unevaluable(
+        result, [item.get("gate") for item in result.get("variants", [])
+                 if isinstance(item, Mapping)])
     print(json.dumps(result, sort_keys=True, default=str))
+    if stalled:
+        return UNEVALUABLE_EXIT
     promoted = any(item.get("status") in {"validated", "champion"}
                    for item in result.get("variants", []))
     return 0 if promoted else 2
@@ -503,7 +524,12 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
     # and on a headless deployment the dashboard's report list is the only
     # place they will see it.
     result["report"] = _write_factory_report(args)
+    stalled = _report_unevaluable(
+        result, [item.get("gate") for item in result.get("results", [])
+                 if isinstance(item, Mapping)])
     print(json.dumps(result, sort_keys=True, default=str))
+    if stalled:
+        return UNEVALUABLE_EXIT
     return 0 if proofs else 2
 
 

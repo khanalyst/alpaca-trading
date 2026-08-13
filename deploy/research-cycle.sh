@@ -14,6 +14,7 @@ fi
 cycle_finalized=0
 cycle_success=0
 cycle_no_edge=0
+cycle_unevaluable=0
 cycle_outcomes=()
 
 emit_cycle() {
@@ -350,6 +351,14 @@ run_discovery() {
   elif [ "$status" -eq 2 ]; then
     cycle_no_edge=1
     cycle_outcomes+=("$vehicle:discover:no_edge")
+  elif [ "$status" -eq 4 ]; then
+    # Opportunities existed and none could be priced. That is a corpus the
+    # replay cannot evaluate -- usually bars recorded without quotes under a
+    # strict market-data policy -- not an absence of edges, and reporting it
+    # as "no edge" would hide the misconfiguration indefinitely. It is scoped
+    # to this vehicle: another one may still have a corpus that prices.
+    cycle_unevaluable=1
+    cycle_outcomes+=("$vehicle:discover:unevaluable")
   else
     finish "failed" "$vehicle edge discovery failed" "$status"
   fi
@@ -377,6 +386,9 @@ run_factory() {
   elif [ "$status" -eq 2 ]; then
     cycle_no_edge=1
     cycle_outcomes+=("$vehicle:factory:no_proof")
+  elif [ "$status" -eq 4 ]; then
+    cycle_unevaluable=1
+    cycle_outcomes+=("$vehicle:factory:unevaluable")
   else
     finish "failed" "$vehicle factory failed" "$status"
   fi
@@ -460,6 +472,12 @@ done
 
 if [ "$cycle_success" -eq 1 ]; then
   finish "completed" "research cycle completed with proof" 0
+fi
+# A vehicle whose corpus priced nothing tested nothing. Reporting that as
+# "no edge passed the gates" is indistinguishable from a real negative, so the
+# cycle says so plainly -- but only when no vehicle produced a verdict either.
+if [ "$cycle_unevaluable" -eq 1 ] && [ "$cycle_no_edge" -eq 0 ]; then
+  finish "no_data" "corpus could not be priced; see .unevaluable.reason" 0
 fi
 cycle_no_edge=1
 finish "completed_no_edge" "no edge or proof passed the research gates" 0
