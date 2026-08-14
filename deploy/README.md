@@ -134,7 +134,11 @@ corrupt/delete operational state.
 
 Before market-data or order calls, run `python main.py check`; this is the
 authenticated preflight by default (`--offline` is local configuration only,
-not a trading preflight). Orders are day-only; startup cleanup cancels working
+not a trading preflight). A guarded paper-endpoint round trip is available as
+`python main.py paper-smoke --symbol SPY --confirm PAPER`; it requires the
+paper runtime lock, an open market, and an initially flat account, then buys
+and closes one share and proves the account is flat. Orders are day-only;
+startup cleanup cancels working
 orders and flattens residuals, and the session policy force-flats before the
 regular NY close. The checked research config enables bounded `gpt-5` strategy
 replacement, using credentials only from optional

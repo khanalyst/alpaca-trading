@@ -1,6 +1,7 @@
 """Truthful command exit semantics for operator-facing safety checks."""
 
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
@@ -10,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import main
+from agent.alpaca_domain import Account, MarketClock, Order, Position
 
 
 class _Engine:
@@ -40,6 +42,72 @@ class _Engine:
 
     def close(self):
         self.closed += 1
+
+
+class _SmokeProvider:
+    mode = "paper"
+    paper = True
+
+    def __init__(self, *, market_open=True, fail_first_close=False):
+        self.market_open = market_open
+        self.fail_first_close = fail_first_close
+        self.close_calls = 0
+        self.cancel_calls = 0
+        self.positions_live = []
+        self.orders_by_client_id = {}
+        self.requests = []
+
+    def account(self):
+        return Account("paper-account", "active", Decimal("100000"),
+                       Decimal("100000"), Decimal("200000"))
+
+    def clock(self):
+        now = datetime(2026, 8, 14, 15, 0, tzinfo=timezone.utc)
+        close = datetime(2026, 8, 14, 20, 0, tzinfo=timezone.utc)
+        return MarketClock(now, self.market_open, next_close=close)
+
+    def positions(self):
+        return list(self.positions_live)
+
+    def orders(self, *, status=None, client_order_id=None):
+        if client_order_id:
+            order = self.orders_by_client_id.get(client_order_id)
+            return [order] if order is not None else []
+        if status == "open":
+            return []
+        return list(self.orders_by_client_id.values())
+
+    def submit_order(self, request):
+        self.requests.append(request)
+        order = Order(
+            f"order-{len(self.requests)}", request.symbol, request.qty,
+            request.side, "filled", request.type, request.time_in_force,
+            client_order_id=request.client_order_id,
+            filled_qty=request.qty, filled_avg_price=Decimal("500"))
+        self.orders_by_client_id[request.client_order_id] = order
+        if request.side == "buy":
+            self.positions_live = [Position(
+                request.symbol, request.qty, "long")]
+        else:
+            self.positions_live = []
+        return order
+
+    def close_position(self, symbol, qty=None, *, client_order_id=None,
+                       order_type="market", time_in_force="day"):
+        self.close_calls += 1
+        if self.fail_first_close and self.close_calls == 1:
+            raise RuntimeError("injected close failure")
+        held = next((position for position in self.positions_live
+                     if position.symbol == symbol), None)
+        if held is None:
+            return None
+        return self.submit_order(SimpleNamespace(
+            symbol=symbol, qty=Decimal(str(qty or held.qty)), side="sell",
+            type=order_type, time_in_force=time_in_force,
+            client_order_id=client_order_id))
+
+    def cancel_all_orders(self):
+        self.cancel_calls += 1
 
 
 class CliSafetyTests(unittest.TestCase):
@@ -139,6 +207,92 @@ class CliSafetyTests(unittest.TestCase):
             code = main.cmd_resume(SimpleNamespace(), {})
         self.assertEqual(code, 1)
         self.assertIn("resume failed: provider unavailable", error.getvalue())
+
+    def test_paper_smoke_places_closes_and_proves_flat(self):
+        provider = _SmokeProvider()
+        output = StringIO()
+        cfg = {"mode": "paper", "broker": {
+            "paper": True, "allow_live": False}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main, "_provider", return_value=provider), \
+                redirect_stdout(output), redirect_stderr(StringIO()):
+            code = main.cmd_paper_smoke(args, cfg)
+
+        self.assertEqual(code, 0)
+        self.assertEqual([request.side for request in provider.requests],
+                         ["buy", "sell"])
+        self.assertTrue(provider.requests[0].client_order_id.startswith(
+            "smoke-open-"))
+        self.assertTrue(provider.requests[1].client_order_id.startswith(
+            "smoke-close-"))
+        self.assertEqual(provider.positions(), [])
+        self.assertIn("paper-order-smoke.v1", output.getvalue())
+        self.assertTrue("flat: true" in output.getvalue() or
+                        '"flat": true' in output.getvalue())
+
+    def test_paper_smoke_refuses_live_without_constructing_provider(self):
+        cfg = {"mode": "live", "broker": {
+            "paper": False, "allow_live": True}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main, "_provider") as factory, \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            code = main.cmd_paper_smoke(args, cfg)
+        self.assertEqual(code, 2)
+        factory.assert_not_called()
+
+    def test_paper_smoke_refuses_closed_market_without_order(self):
+        provider = _SmokeProvider(market_open=False)
+        cfg = {"mode": "paper", "broker": {
+            "paper": True, "allow_live": False}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main, "_provider", return_value=provider), \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()) as error:
+            code = main.cmd_paper_smoke(args, cfg)
+        self.assertEqual(code, 1)
+        self.assertEqual(provider.requests, [])
+        self.assertIn("market is closed", error.getvalue())
+
+    def test_paper_smoke_failure_recovers_to_flat(self):
+        provider = _SmokeProvider(fail_first_close=True)
+        cfg = {"mode": "paper", "broker": {
+            "paper": True, "allow_live": False}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main, "_provider", return_value=provider), \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()) as error:
+            code = main.cmd_paper_smoke(args, cfg)
+        self.assertEqual(code, 1)
+        self.assertEqual(provider.cancel_calls, 1)
+        self.assertEqual(provider.close_calls, 2)
+        self.assertEqual(provider.positions(), [])
+        self.assertTrue("flat: true" in error.getvalue() or
+                        '"flat": true' in error.getvalue())
+
+    def test_paper_smoke_never_mutates_preexisting_exposure(self):
+        provider = _SmokeProvider()
+        provider.positions_live = [Position("QQQ", Decimal("1"), "long")]
+        cfg = {"mode": "paper", "broker": {
+            "paper": True, "allow_live": False}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main, "_provider", return_value=provider), \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()) as error:
+            code = main.cmd_paper_smoke(args, cfg)
+        self.assertEqual(code, 1)
+        self.assertEqual(provider.cancel_calls, 0)
+        self.assertEqual(provider.close_calls, 0)
+        self.assertEqual(provider.positions_live[0].symbol, "QQQ")
+        self.assertIn("must start flat", error.getvalue())
+
+    def test_paper_smoke_refuses_when_trader_holds_runtime_lock(self):
+        cfg = {"mode": "paper", "broker": {
+            "paper": True, "allow_live": False}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main.state, "acquire_run_lock", return_value=None), \
+                patch.object(main, "_provider") as factory, \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()) as error:
+            code = main.cmd_paper_smoke(args, cfg)
+        self.assertEqual(code, 1)
+        factory.assert_not_called()
+        self.assertIn("stop the trader", error.getvalue())
 
 
 if __name__ == "__main__":

@@ -334,6 +334,26 @@ because no edge is proved yet — that is expected here.
 **If authentication fails**, the usual causes are: live keys pasted into the
 paper file, a typo in the secret, or a feed your account is not entitled to.
 
+To prove the paper broker can both open and close an order, run the guarded
+one-share smoke test during regular market hours. The paper account must start
+flat with no open orders. Stop both broker-control services so nothing can race
+the test:
+
+```bash
+docker compose stop trader watchdog
+docker compose run --rm trader python main.py paper-smoke --symbol SPY --confirm PAPER
+docker compose up -d trader watchdog
+```
+
+Success reports `status: ok`, filled entry and exit orders, `flat: true`, and
+`open_orders: 0`. This proves broker plumbing only; it does not bypass the
+validated-edge gate or authorize a strategy. If the command reports a cleanup
+with `flat: false`, reconcile the Alpaca paper dashboard immediately and run:
+
+```bash
+docker compose run --rm trader python main.py flatten --reason paper-smoke-recovery
+```
+
 ## 10. Backfill historical market data
 
 This is the step that turns "months before anything happens" into "days".
