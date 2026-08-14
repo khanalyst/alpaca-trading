@@ -292,6 +292,10 @@ class DeployTests(unittest.TestCase):
         self.assertIn(
             "mem_limit: ${ALPACA_RESEARCH_MEMORY_LIMIT:-10g}",
             research)
+        recorder = text.split("  recorder:", 1)[1].split("  trader:", 1)[0]
+        self.assertIn(
+            "mem_limit: ${ALPACA_RECORDER_MEMORY_LIMIT:-768m}",
+            recorder)
         self.assertIn("- shadow-data:/app/shadow:ro", research)
         shadow = text.split("  shadow:", 1)[1].split("  dashboard:", 1)[0]
         self.assertIn("- shadow-data:/app/shadow", shadow)

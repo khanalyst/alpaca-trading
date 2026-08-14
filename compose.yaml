@@ -60,7 +60,11 @@ services:
       retries: 5
       start_period: 2m
     cpus: "0.75"
-    mem_limit: 768m
+    # The steady-state recorder is small, but its recovery path rebuilds the
+    # dedup index by reading the whole corpus, and that grows with every
+    # recorded session.  A host with room to spare should be able to raise the
+    # ceiling without editing a tracked file.
+    mem_limit: ${ALPACA_RECORDER_MEMORY_LIMIT:-768m}
     pids_limit: 128
     stop_grace_period: 45s
 
