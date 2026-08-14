@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from agent.alpaca_provider import AlpacaProvider
 from agent.alpaca_sdk import _canonical_feed
@@ -203,6 +203,7 @@ def _option_rank(candidate: dict, underlying_price: object) -> tuple:
 def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                  *, feed: str, config: dict | None, limit: int,
                  minimum_timestamp: datetime | None = None,
+                 observed_at: datetime | None = None,
                  pinned: frozenset[str] = frozenset()):
     """Project bounded provider candidates into append-only option events.
 
@@ -247,10 +248,11 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             timestamp = candidate.get("timestamp") or candidate.get("quote_ts")
             multiplier = candidate.get("multiplier") or candidate.get("contract_size")
             parsed_timestamp = _timestamp(timestamp)
+            observation = observed_at or now
             if (right not in selected or not symbol or parsed_timestamp is None or
                     (minimum_timestamp is not None and
                      parsed_timestamp < minimum_timestamp) or
-                    parsed_timestamp > now + timedelta(seconds=5)):
+                    parsed_timestamp > observation + timedelta(seconds=5)):
                 continue
             bid = _number(candidate.get("bid")); ask = _number(candidate.get("ask"))
             strike_number = _number(strike); multiplier_number = _number(multiplier)
@@ -296,7 +298,7 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                     open_interest = candidate.get("oi")
                 yield {
                     "event_key": _event_key("option_snapshot", candidate["symbol"], _iso(timestamp)),
-                    "observed_at": now.isoformat(), "provider": "alpaca",
+                    "observed_at": observation.isoformat(), "provider": "alpaca",
                     "feed": str(candidate.get("feed") or option_feed),
                     "event_type": "option_snapshot", "symbol": candidate["symbol"],
                     "contract": candidate["symbol"],
@@ -336,7 +338,12 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
                               feed=feed)
     quotes = _call_quotes(provider.quotes, symbols, start=start, end=now,
                           feed=feed)
-    observed = (observed_at or now).isoformat()
+    # ``now`` is the requested window end captured before network I/O. The
+    # observation timestamp must reflect when the responses were actually
+    # available or a quote arriving during the request can incorrectly have
+    # as_of > observed_at.
+    observation = max(observed_at or now, datetime.now(timezone.utc))
+    observed = observation.isoformat()
     for raw_symbol, values in bars.items():
         symbol = validate_equity_symbol(raw_symbol)
         for bar in values:
@@ -384,4 +391,5 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
             provider, symbols, quotes, now, feed=feed, config=config,
             limit=max(1, min(MAX_OPTION_LIMIT, int(option_limit))),
             minimum_timestamp=start,
+            observed_at=observation,
             pinned=frozenset(str(item).upper() for item in option_pins))

@@ -1301,6 +1301,7 @@ class ShadowRunner:
             self.store.upsert_candidate(candidate)
         ingested = 0
         conflicts = 0
+        invalid_events = 0
         sources = _corpus_sources(self.config.corpus_path)
         offsets = self.store.source_offsets()
         forward_floor = self.store.forward_event_floor()
@@ -1337,6 +1338,14 @@ class ShadowRunner:
             except InputConflict:
                 conflicts += 1
                 raise
+            except NormalizationError:
+                # Recorder versions before the post-fetch observation fix can
+                # contain a small number of rows whose source timestamp is
+                # later than their cycle-start observed_at. They are unusable
+                # point-in-time evidence, so quarantine them and advance the
+                # durable source offset instead of retrying the batch forever.
+                invalid_events += 1
+                continue
             if added:
                 ingested += 1
         self.store.save_source_offsets(next_offsets)
@@ -1407,7 +1416,7 @@ class ShadowRunner:
         self.store.prune()
         return {"candidates": len(candidates), "ingested_events": ingested,
                 "events": len(events), "decisions": len(self.store.decisions()),
-                "conflicts": conflicts}
+                "conflicts": conflicts, "invalid_events": invalid_events}
 
 
 def run_shadow_once(config: ShadowConfig) -> dict[str, Any]:
