@@ -484,6 +484,62 @@ class DeployTests(unittest.TestCase):
                 self.assertGreater(db.execute(
                     "SELECT COUNT(*) FROM candidates").fetchone()[0], 0)
 
+    def test_research_cycle_quarantines_legacy_observation_inversions(self):
+        csv_text = (
+            "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
+            "open,high,low,close,volume,bid,ask,bid_size,ask_size\n"
+            "bar,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY,"
+            "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
+            "100,101,99,100.5,10,,,,\n"
+            "quote,2026-08-08T13:31:00+00:00,alpaca,iex,quote,SPY,"
+            "2026-08-08T13:31:00+00:00,2026-08-08T13:32:00+00:00,"
+            ",,,,,100,101,10,10\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.csv"
+            dataset.write_text(csv_text, encoding="utf-8")
+            result = _run_research_cycle(dataset, root)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            reports = [item for item in _cycle_payloads(result.stderr, "schema")
+                       if item["schema"] == "research-cycle-quarantine.v1"]
+            self.assertEqual(reports, [{
+                "by_kind": {"quote": 1}, "first_source_row": 3,
+                "kept_rows": 1, "last_source_row": 3,
+                "reason": "as_of_after_observed_at", "rows": 1,
+                "schema": "research-cycle-quarantine.v1",
+                "status": "quarantined",
+            }])
+            views = [item for item in _cycle_payloads(result.stderr, "schema")
+                     if item["schema"] == "research-cycle-views.v1"][0]
+            self.assertEqual((views["bars"], views["quotes"], views["options"]),
+                             (1, 0, 0))
+            validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
+            self.assertTrue(validation["valid"])
+            # The append-only source remains evidence, including the quarantined
+            # row; only the temporary research view is filtered.
+            self.assertEqual(dataset.read_text(encoding="utf-8"), csv_text)
+
+    def test_research_cycle_keeps_other_integrity_errors_fail_closed(self):
+        csv_text = (
+            "event_key,observed_at,provider,feed,event_type,symbol,timestamp,as_of,"
+            "open,high,low,close,volume\n"
+            "bad,2026-08-08T13:31:00+00:00,alpaca,iex,bar_1m,SPY/QQQ,"
+            "2026-08-08T13:30:00+00:00,2026-08-08T13:31:00+00:00,"
+            "100,101,99,100.5,10\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "market.csv"
+            dataset.write_text(csv_text, encoding="utf-8")
+            result = _run_research_cycle(dataset, root)
+            self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+            terminal = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertEqual(terminal["status"], "failed")
+            self.assertEqual(terminal["reason"],
+                             "research dataset validation failed")
+            validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
+            self.assertFalse(validation["valid"])
+            self.assertIn("slash pair", validation["errors"][0])
+
     def test_research_cycle_routes_recorded_quotes_into_the_replay(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

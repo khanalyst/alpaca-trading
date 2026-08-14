@@ -166,87 +166,17 @@ options_input="$tmp_dir/options.jsonl"
 # shared cost/fill model use recorded quotes instead of bar prices.
 quotes_input="$tmp_dir/quotes.jsonl"
 
-if [[ "$validated_input" == *.csv ]]; then
-  validated_input="$tmp_dir/market.jsonl"
-  "$python_bin" - "$dataset" "$validated_input" "$bars_input" "$options_input" "$quotes_input" <<'PY'
-import csv
-import json
-import sys
-
-source, target, bars_target, options_target, quotes_target = sys.argv[1:]
-def clean(value):
-    return None if value in (None, "") else value
-
-with open(source, newline="", encoding="utf-8") as handle, open(
-        target, "w", encoding="utf-8") as output, open(
-        bars_target, "w", encoding="utf-8") as bars_output, open(
-        options_target, "w", encoding="utf-8") as options_output, open(
-        quotes_target, "w", encoding="utf-8") as quotes_output:
-    for row in csv.DictReader(handle):
-        event = str(row.get("event_type") or "").lower()
-        common = {
-            "provider": row.get("provider") or "alpaca",
-            "feed": row.get("feed") or "iex", "symbol": clean(row.get("symbol")),
-            "timestamp": clean(row.get("timestamp")),
-            "observed_at": clean(row.get("observed_at") or row.get("timestamp")),
-            "as_of": clean(row.get("as_of") or row.get("timestamp")),
-        }
-        if event in {"bar", "bar_1m"}:
-            payload = {"kind": "bar", **common, "open": clean(row.get("open")),
-                       "high": clean(row.get("high")), "low": clean(row.get("low")),
-                       "close": clean(row.get("close")), "volume": clean(row.get("volume"))}
-            serialized = json.dumps(payload, sort_keys=True) + "\n"
-            output.write(serialized)
-            bars_output.write(serialized)
-        elif event == "quote":
-            payload = {"kind": "quote", **common, "bid": clean(row.get("bid")),
-                       "ask": clean(row.get("ask")), "bid_size": clean(row.get("bid_size")),
-                       "ask_size": clean(row.get("ask_size"))}
-            serialized = json.dumps(payload, sort_keys=True) + "\n"
-            output.write(serialized)
-            quotes_output.write(serialized)
-        elif event in {"option", "option_snapshot"}:
-            payload = {"kind": "option_snapshot", **common,
-                       "contract": clean(row.get("contract")),
-                       "underlying": clean(row.get("underlying")),
-                       "expiration": clean(row.get("expiration")),
-                       "strike": clean(row.get("strike")), "right": clean(row.get("right")),
-                       "multiplier": clean(row.get("multiplier")),
-                       "bid": clean(row.get("bid")), "ask": clean(row.get("ask")),
-                       "last": clean(row.get("last")), "bid_size": clean(row.get("bid_size")),
-                       "ask_size": clean(row.get("ask_size")), "volume": clean(row.get("volume")),
-                       "open_interest": clean(row.get("open_interest")),
-                       "underlying_price": clean(row.get("underlying_price"))}
-            serialized = json.dumps(payload, sort_keys=True) + "\n"
-            output.write(serialized)
-            options_output.write(serialized)
-PY
-else
-  # Validate the complete mixed JSONL input but derive bars/options-only views
-  # for local replay and presence checks. Invalid JSON remains a hard failure.
-  "$python_bin" - "$validated_input" "$bars_input" "$options_input" "$quotes_input" <<'PY'
-import json
-import sys
-
-source, bars_target, options_target, quotes_target = sys.argv[1:]
-with open(source, encoding="utf-8") as source_handle, open(
-        bars_target, "w", encoding="utf-8") as bars_output, open(
-        options_target, "w", encoding="utf-8") as options_output, open(
-        quotes_target, "w", encoding="utf-8") as quotes_output:
-    for line in source_handle:
-        if not line.strip():
-            continue
-        payload = json.loads(line)
-        kind = str(payload.get("kind", "bar")).lower()
-        serialized = json.dumps(payload, sort_keys=True) + "\n"
-        if kind in {"bar", "underlying", "underlying_bar"}:
-            bars_output.write(serialized)
-        elif kind in {"option", "option_snapshot"}:
-            options_output.write(serialized)
-        elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
-            quotes_output.write(serialized)
-PY
-fi
+source_format="jsonl"
+[[ "$validated_input" == *.csv ]] && source_format="csv"
+normalized_input="$tmp_dir/market.jsonl"
+# Preserve the append-only recorder corpus byte-for-byte. Only the temporary
+# research view quarantines the known legacy point-in-time inversion; malformed
+# timestamps, symbols, values, and event kinds remain for validate-data to
+# reject as hard integrity failures.
+"$python_bin" "$repo_root/deploy/research_dataset.py" "$validated_input" \
+  --format "$source_format" --normalized "$normalized_input" \
+  --bars "$bars_input" --quotes "$quotes_input" --options "$options_input" >&2
+validated_input="$normalized_input"
 
 # Report what each view actually received. Routing quotes into their own view
 # is only useful if rows arrive there, and that is otherwise invisible.
