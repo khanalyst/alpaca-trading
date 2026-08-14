@@ -390,15 +390,26 @@ def _opportunity_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) -> li
     zone = ZoneInfo("America/New_York")
     sessions = sorted({(bar.symbol, bar.timestamp.astimezone(zone).date()) for bar in bars})
     by_session = {(trade.symbol, trade.session_date): trade for trade in result.trades}
+    # The replay records why it declined each session.  Carrying that onto the
+    # no-trade row is what lets the gates tell a corpus they could not price
+    # from one that simply held no edge.
+    refused = {(refusal.symbol, refusal.session_date): refusal
+               for refusal in getattr(result, "refusals", ())}
     rows: list[dict] = []
     for symbol, day in sessions:
         opportunity_id = f"ibr:{vehicle}:{symbol}:{day.isoformat()}"
         trade = by_session.get((symbol, day))
         if trade is None:
-            rows.append({"vehicle": vehicle, "symbol": symbol,
-                         "session_date": day.isoformat(),
-                         "opportunity_id": opportunity_id, "net_pnl": 0.0,
-                         "return_value": 0.0, "no_trade": True})
+            row = {"vehicle": vehicle, "symbol": symbol,
+                   "session_date": day.isoformat(),
+                   "opportunity_id": opportunity_id, "net_pnl": 0.0,
+                   "return_value": 0.0, "no_trade": True}
+            refusal = refused.get((symbol, day))
+            if refusal is not None:
+                row["reject_reason"] = refusal.reason
+                if refusal.detail:
+                    row["reject_detail"] = dict(refusal.detail)
+            rows.append(row)
             continue
         row = {key: value for key, value in vars(trade).items()}
         row.update({"session_date": trade.session_date.isoformat(),
