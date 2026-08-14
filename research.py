@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 import sys
@@ -533,6 +533,16 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
                 runtime_config[block] = {**base, **override}
             else:
                 runtime_config[block] = override
+    def _research_progress(phase: str, done: int, total: int) -> None:
+        units = {"diagnosing": "hypotheses", "evaluating": "accounts",
+                 "aggregating": "candidates", "persisting": "accounts"}
+        print(json.dumps({"schema": "research-progress.v1", "phase": phase,
+                          "unit": units.get(phase, "steps"),
+                          "vehicle": args.vehicle, "done": int(done),
+                          "total": int(total),
+                          "updated_ts": datetime.now(timezone.utc).isoformat()},
+                         separators=(",", ":")), flush=True)
+
     result = run_factory(
         args.data, db_path=_db(args), vehicle=args.vehicle,
         strategies=args.strategies, variants_per_strategy=args.variants,
@@ -541,7 +551,9 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         alpha=args.alpha, max_generations=args.max_generations,
         costs=CostModel.from_config(runtime_config),
         runtime_config=runtime_config,
-        strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"))
+        strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
+        worker_data=getattr(args, "worker_data", None),
+        progress_callback=_research_progress)
     proofs = _emit_proofs(args, result, agent_config)
     # Archive the narrative every cycle, not only when an edge proves out. A
     # cycle that found nothing is exactly the one an operator needs to read,
@@ -611,6 +623,8 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.set_defaults(func=cmd_factory_report)
     else:
         parser.add_argument("--data", required=True, help="normalized mixed market JSONL")
+        parser.add_argument("--worker-data", default=None,
+                            help="optional bar+option JSONL replay view for workers")
         parser.add_argument("--agent-config", default=None,
                             help="validated agent config (default: config.yaml)")
         parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")

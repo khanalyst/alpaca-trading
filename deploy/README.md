@@ -154,7 +154,14 @@ Research never rewrites the append-only recorder corpus. A temporary cycle view
 explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,
 emits `research-cycle-quarantine.v1` counts, and lets replay coverage/refusal
 gates account for the missing evidence. All other normalization and integrity
-errors still fail the cycle before discovery.
+errors still fail the cycle before discovery. The same source pass builds a
+compact bar/option worker view; factory workers share the parent's finalized
+read-only quote index, so each hypothesis no longer rescans and reindexes the
+full quote corpus. The parent verifies that view against the full normalized
+bar/option projection before scheduling workers, and workers verify its digest
+when they read it. `research-progress.v1` records expose the current bounded
+phase through scheduler health and the dashboard without changing gate or
+promotion semantics.
 
 For Compose, set `ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of the
 separate research-provider dotenv file. It is mounted read-only as

@@ -316,6 +316,23 @@ BAR = "bar"
 QUOTE = "quote"
 
 
+@dataclass(frozen=True)
+class SQLiteQuoteIndexDescriptor:
+    """Serializable, read-only handle for a finalized quote index.
+
+    The descriptor intentionally carries the symbol-id map and summary
+    metadata in addition to the SQLite path.  A worker can therefore resolve
+    quotes without rebuilding an index or depending on mutable parent state.
+    The owning :class:`SQLiteQuoteIndex` remains responsible for the temporary
+    directory lifetime until all children have closed their handles.
+    """
+
+    path: str
+    symbols: tuple[tuple[str, int], ...]
+    count: int
+    max_session_date: str | None
+
+
 class SQLiteQuoteIndex:
     """Disk-backed quote resolver for large recorded corpora.
 
@@ -340,6 +357,7 @@ class SQLiteQuoteIndex:
             root.mkdir(parents=True, exist_ok=True)
         self.path = root / "quotes.sqlite3"
         self._db = sqlite3.connect(str(self.path), timeout=30)
+        self._read_only = False
         self._db.execute("PRAGMA journal_mode=OFF")
         self._db.execute("PRAGMA synchronous=OFF")
         self._db.execute("PRAGMA temp_store=FILE")
@@ -362,9 +380,56 @@ class SQLiteQuoteIndex:
         self._max_session_day: int | None = None
         self._closed = False
 
+    @classmethod
+    def open_read_only(cls, descriptor: SQLiteQuoteIndexDescriptor):
+        """Open a finalized index from a serializable descriptor.
+
+        The returned object owns only a read-only SQLite connection.  Closing
+        it never removes the descriptor's file or its parent temporary
+        directory.
+        """
+        import sqlite3
+
+        if not isinstance(descriptor, SQLiteQuoteIndexDescriptor):
+            raise TypeError("descriptor must be a SQLiteQuoteIndexDescriptor")
+        path = Path(descriptor.path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        obj = cls.__new__(cls)
+        obj._temporary = None
+        obj.path = path
+        obj._db = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True, timeout=30)
+        obj._read_only = True
+        obj._symbols = dict(descriptor.symbols)
+        obj._pending = []
+        obj._sequence = 0
+        obj._count = int(descriptor.count)
+        max_session = descriptor.max_session_date
+        obj._max_session_day = (None if max_session is None
+                                else date.fromisoformat(max_session).toordinal())
+        obj._closed = False
+        return obj
+
+
+    def descriptor(self) -> SQLiteQuoteIndexDescriptor:
+        """Return a serializable descriptor for this finalized index."""
+        if self._closed:
+            raise RuntimeError("quote index is closed")
+        self.finalize()
+        return SQLiteQuoteIndexDescriptor(
+            path=str(self.path),
+            symbols=tuple(sorted(self._symbols.items())),
+            count=self._count,
+            max_session_date=(None if self.max_session_date is None
+                              else self.max_session_date.isoformat()),
+        )
+
     def add(self, quote: Any) -> None:
         if self._closed:
             raise RuntimeError("quote index is closed")
+        if self._read_only:
+            raise RuntimeError("read-only quote index cannot write")
         symbol = str(quote.symbol).upper()
         symbol_id = self._symbols.get(symbol)
         if symbol_id is None:
@@ -387,13 +452,15 @@ class SQLiteQuoteIndex:
     def _flush(self) -> None:
         if not self._pending:
             return
+        if self._read_only:
+            raise RuntimeError("read-only quote index cannot write")
         self._db.executemany(
             "INSERT INTO quotes VALUES (?,?,?,?,?,?,?)", self._pending)
         self._db.commit()
         self._pending.clear()
 
     def finalize(self) -> "SQLiteQuoteIndex":
-        if not self._closed:
+        if not self._closed and not self._read_only:
             self._flush()
         return self
 
@@ -412,7 +479,8 @@ class SQLiteQuoteIndex:
         """Resolve the same latest-visible quote as the in-memory index."""
         if self._closed or self._count == 0:
             return None
-        self._flush()
+        if not self._read_only:
+            self._flush()
         symbol_id = self._symbols.get(str(symbol).upper())
         if symbol_id is None:
             return None
@@ -444,7 +512,8 @@ class SQLiteQuoteIndex:
         if self._closed:
             return
         try:
-            self._flush()
+            if not self._read_only:
+                self._flush()
             self._db.close()
         finally:
             self._closed = True
@@ -519,5 +588,5 @@ __all__ = [
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS", "ReplayPolicy",
-    "SQLiteQuoteIndex", "index_quotes", "quote_fill",
+    "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes", "quote_fill",
 ]

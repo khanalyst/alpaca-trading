@@ -19,6 +19,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from deploy import load_config
+from deploy.scheduler_output import structured_research_progress
 
 
 def _read_json(path: Path) -> dict:
@@ -163,6 +164,10 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "last_exit_code": last_exit,
         "next_run_ts": heartbeat.get("next_run_ts"),
         "structured_failures": heartbeat.get("structured_failures") or [],
+        # Keep the health response bounded even if an operator hand-edits a
+        # status file; scheduler-produced values already satisfy this schema.
+        "research_progress": structured_research_progress(
+            heartbeat.get("research_progress")),
     }
 
 

@@ -24,14 +24,16 @@ from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V1, RULE_SCHEMA_V2,
                                   rule_semantic_distance,
                                   rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
-from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
+from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
+                    index_quotes, quote_fill)
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
 from .edge_ledger_store import provenance_hash
 # One randomized-entry null control serves both research lanes; it lives in
 # the shared discovery helpers and is re-exported here for its callers.
-from .edge_discovery_core import corpus_slice, null_control_account
+from .edge_discovery_core import (corpus_slice, null_control_account,
+                                  validate_worker_projection)
 from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
     FactoryLedger, experiment_identity, experiment_provenance,
@@ -887,8 +889,24 @@ def _task_corpus(payload: Mapping[str, Any]) -> tuple[list, list, list]:
     if corpus is None:
         return (list(payload["bars"]), list(payload["snapshots"]),
                 list(payload["quotes"]))
-    return corpus_slice(corpus["source"], after=corpus["after"],
-                        until=corpus["until"], exclude=corpus["exclude"])
+    options = {
+        "after": corpus["after"], "until": corpus["until"],
+        "exclude": corpus["exclude"],
+    }
+    if corpus.get("projection_digest") is not None:
+        options["expected_digest"] = corpus["projection_digest"]
+    if corpus.get("quote_descriptor") is None:
+        return corpus_slice(corpus["source"], **options)
+    return corpus_slice(corpus["source"],
+                        quote_descriptor=corpus["quote_descriptor"],
+                        **options)
+
+
+def _close_task_quotes(quotes: Any) -> None:
+    """Close a worker-owned SQLite resolver without affecting list callers."""
+    close = getattr(quotes, "close", None)
+    if callable(close) and isinstance(quotes, SQLiteQuoteIndex):
+        close()
 
 
 def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
@@ -901,72 +919,79 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
     stays parallel.  The fit cut is computed exactly as it was inside the
     worker, so the diagnosis is the same one the previous single pass produced.
     """
-    hypothesis = dict(payload["hypothesis"])
     bars, snapshots, quotes = _task_corpus(payload)
-    vehicle = str(payload["vehicle"])
-    starting_cash = float(payload["starting_cash"])
-    sessions = sorted({_session(bar) for bar in bars})
-    cut = max(1, min(len(sessions) - 1, int(len(sessions) * .7))) if len(sessions) > 1 else len(sessions)
-    fit_sessions = set(sessions[:cut])
-    fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
-    root_account = simulate_account(
-        fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
-        account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
-        starting_cash=starting_cash, costs=payload["costs"], quotes=quotes,
-        policy=payload.get("policy"),
-    )
-    return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
-            "diagnostic": diagnose(root_account["rows"],
-                                   starting_cash=starting_cash),
-            "worker_pid": os.getpid()}
+    try:
+        hypothesis = dict(payload["hypothesis"])
+        vehicle = str(payload["vehicle"])
+        starting_cash = float(payload["starting_cash"])
+        sessions = sorted({_session(bar) for bar in bars})
+        cut = (max(1, min(len(sessions) - 1, int(len(sessions) * .7)))
+               if len(sessions) > 1 else len(sessions))
+        fit_sessions = set(sessions[:cut])
+        fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
+        root_account = simulate_account(
+            fit_bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
+            account_id=f"diagnostic:{hypothesis['hypothesis_id']}",
+            starting_cash=starting_cash, costs=payload["costs"], quotes=quotes,
+            policy=payload.get("policy"),
+        )
+        return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
+                "diagnostic": diagnose(root_account["rows"],
+                                       starting_cash=starting_cash),
+                "worker_pid": os.getpid()}
+    finally:
+        _close_task_quotes(quotes)
 
 
 def _worker(payload: Mapping[str, Any]) -> dict:
-    hypothesis = dict(payload["hypothesis"])
     bars, snapshots, quotes = _task_corpus(payload)
-    vehicle = str(payload["vehicle"])
-    mode = str(payload["mode"])
-    starting_cash = float(payload["starting_cash"])
-    costs = payload["costs"]
-    policy = payload.get("policy")
-    diagnostic = dict(payload["diagnostic"])
-    # The orchestrator decided which specs to evaluate — deterministically
-    # mutated, model-tuned, or carried forward for forward validation — so the
-    # worker only replays them.
-    specs = [validate_rule_spec(item) for item in payload["specs"]]
-    control_account = simulate_account(
-        bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
-        account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
-        starting_cash=starting_cash, costs=costs, quotes=quotes,
-        policy=policy,
-    )
-    variants = []
-    null_rows: dict[str, list] = {}
-    for spec in specs:
-        variant_id = rule_variant_id(spec)
-        account_id = f"sim:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}:{uuid.uuid4().hex[:8]}"
-        account = simulate_account(
-            bars, snapshots, spec, vehicle=vehicle, account_id=account_id,
+    try:
+        hypothesis = dict(payload["hypothesis"])
+        vehicle = str(payload["vehicle"])
+        mode = str(payload["mode"])
+        starting_cash = float(payload["starting_cash"])
+        costs = payload["costs"]
+        policy = payload.get("policy")
+        diagnostic = dict(payload["diagnostic"])
+        # The orchestrator decided which specs to evaluate — deterministically
+        # mutated, model-tuned, or carried forward for forward validation — so
+        # the worker only replays them.
+        specs = [validate_rule_spec(item) for item in payload["specs"]]
+        control_account = simulate_account(
+            bars, snapshots, hypothesis["rule_spec"], vehicle=vehicle,
+            account_id=f"control:{hypothesis['hypothesis_id']}:{uuid.uuid4().hex[:8]}",
             starting_cash=starting_cash, costs=costs, quotes=quotes,
             policy=policy,
         )
-        null_rows[variant_id] = null_control_account(
-            bars, snapshots, spec, vehicle=vehicle, reference_rows=account["rows"],
-            account_id=f"null:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}",
-            starting_cash=starting_cash, costs=costs, quotes=quotes,
-            policy=policy)["rows"]
-        variants.append({
-            "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
-            "account": account, "diagnostic": diagnose(account["rows"], starting_cash=starting_cash),
-            "worker_pid": os.getpid(),
-        })
-    sessions = sorted({_session(bar) for bar in bars})
-    return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
-            "evaluation_start": sessions[0] if sessions else None,
-            "evaluation_end": sessions[-1] if sessions else None,
-            "variants": sorted(variants, key=lambda item: item["variant_id"]),
-            "control_rows": control_account["rows"], "null_rows": null_rows,
-            "expected_variants": len(specs), "worker_pid": os.getpid()}
+        variants = []
+        null_rows: dict[str, list] = {}
+        for spec in specs:
+            variant_id = rule_variant_id(spec)
+            account_id = f"sim:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}:{uuid.uuid4().hex[:8]}"
+            account = simulate_account(
+                bars, snapshots, spec, vehicle=vehicle, account_id=account_id,
+                starting_cash=starting_cash, costs=costs, quotes=quotes,
+                policy=policy,
+            )
+            null_rows[variant_id] = null_control_account(
+                bars, snapshots, spec, vehicle=vehicle, reference_rows=account["rows"],
+                account_id=f"null:{hypothesis['hypothesis_id']}:{variant_id}:{vehicle}",
+                starting_cash=starting_cash, costs=costs, quotes=quotes,
+                policy=policy)["rows"]
+            variants.append({
+                "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
+                "account": account, "diagnostic": diagnose(account["rows"], starting_cash=starting_cash),
+                "worker_pid": os.getpid(),
+            })
+        sessions = sorted({_session(bar) for bar in bars})
+        return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
+                "evaluation_start": sessions[0] if sessions else None,
+                "evaluation_end": sessions[-1] if sessions else None,
+                "variants": sorted(variants, key=lambda item: item["variant_id"]),
+                "control_rows": control_account["rows"], "null_rows": null_rows,
+                "expected_variants": len(specs), "worker_pid": os.getpid()}
+    finally:
+        _close_task_quotes(quotes)
 
 
 def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
@@ -1157,7 +1182,43 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 strategy_llm: Mapping[str, Any] | None = None,
                 costs: CostModel | None = None,
                 runtime_config: Mapping[str, Any] | None = None,
-                proposal_adapter: RuleProposalAdapter | None = None) -> dict:
+                proposal_adapter: RuleProposalAdapter | None = None,
+                worker_data: str | Path | None = None,
+                progress_callback: Any | None = None) -> dict:
+    """Run one cycle and always release its parent-owned quote index."""
+    resources: list[SQLiteQuoteIndex] = []
+    try:
+        return _run_factory(
+            data, db_path=db_path, vehicle=vehicle, strategies=strategies,
+            variants_per_strategy=variants_per_strategy, workers=workers,
+            starting_cash=starting_cash, min_trades=min_trades,
+            min_sessions=min_sessions, alpha=alpha,
+            max_generations=max_generations, max_rotations=max_rotations,
+            rotation_budget=rotation_budget, strategy_llm=strategy_llm,
+            costs=costs, runtime_config=runtime_config,
+            proposal_adapter=proposal_adapter, worker_data=worker_data,
+            progress_callback=progress_callback, _resources=resources)
+    finally:
+        for resource in reversed(resources):
+            resource.close()
+
+
+def _run_factory(data: str | Path | Sequence[Mapping], *,
+                db_path: str | Path = DEFAULT_DB_PATH, vehicle: str = "equity",
+                strategies: int = DEFAULT_STRATEGIES,
+                variants_per_strategy: int = DEFAULT_VARIANTS,
+                workers: int = DEFAULT_WORKERS, starting_cash: float = 100_000.0,
+                min_trades: int = 100, min_sessions: int = 10,
+                alpha: float = .05, max_generations: int = 5,
+                max_rotations: int = MAX_ROTATIONS,
+                rotation_budget: int = ROTATION_BUDGET,
+                strategy_llm: Mapping[str, Any] | None = None,
+                costs: CostModel | None = None,
+                runtime_config: Mapping[str, Any] | None = None,
+                proposal_adapter: RuleProposalAdapter | None = None,
+                worker_data: str | Path | None = None,
+                progress_callback: Any | None = None,
+                _resources: list[SQLiteQuoteIndex]) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
     if vehicle not in {"equity", "option"}:
         raise FactoryError("vehicle must be equity or option")
@@ -1177,6 +1238,19 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError(
             f"rotation stays bounded: max_rotations<={MAX_ROTATIONS}, "
             f"rotation_budget<={ROTATION_BUDGET}")
+    worker_data_path = None
+    if worker_data is not None:
+        if not isinstance(data, (str, Path)):
+            raise FactoryError("worker_data requires a file or directory data source")
+        worker_data_path = Path(worker_data)
+        if worker_data_path.is_dir():
+            available = [item for item in worker_data_path.glob("*.jsonl")
+                         if item.is_file() and item.stat().st_size > 0]
+            if not available:
+                raise FactoryError("worker_data directory contains no non-empty JSONL")
+        elif (not worker_data_path.is_file() or
+              worker_data_path.stat().st_size <= 0):
+            raise FactoryError("worker_data must be a non-empty JSONL file")
     model = costs or CostModel()
     policy = ReplayPolicy.from_config(runtime_config)
     llm_config = dict(strategy_llm or {})
@@ -1197,7 +1271,35 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             max_response_bytes=int(llm_config.get("max_response_bytes", 16_384)),
             max_total_calls=int(llm_config.get("max_total_calls", 64)),
         )
-    raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(data)
+    # A worker-data path is an optional bars+options replay view.  The parent
+    # still normalizes and hashes the complete source, and forces one shared
+    # SQLite quote index so child processes never rebuild/read quote rows.
+    if worker_data_path is None:
+        raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(data)
+    else:
+        raw_rows, bars, snapshot_map, quote_rows = _read_discovery_rows(
+            data, force_quote_index=isinstance(data, (str, Path)))
+    parent_quote_index = (quote_rows if isinstance(quote_rows, SQLiteQuoteIndex)
+                          else None)
+    if parent_quote_index is not None:
+        _resources.append(parent_quote_index)
+    projection_digest = None
+    if worker_data_path is not None:
+        projection_digest = validate_worker_projection(
+            worker_data_path, bars=bars, snapshots=snapshot_map)
+    quote_descriptor = (parent_quote_index.descriptor()
+                        if parent_quote_index is not None and worker_data_path is not None
+                        else None)
+
+    def _progress(phase: str, done: int, total: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(str(phase), int(done), int(total))
+        except Exception:
+            # Progress is an observability hook and must never alter research
+            # outcomes or persistence semantics.
+            return
     dataset_hash = content_hash(raw_rows)
     gate_assumptions = {
         "min_trades": int(min_trades), "min_sessions": int(min_sessions),
@@ -1286,8 +1388,10 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     # further sessions while this cycle runs.
     # Absolute: a worker resolves the descriptor in its own process, and a
     # relative path is only the same file by coincidence of working directory.
-    corpus_source = (str(Path(data).resolve()) if isinstance(data, (str, Path))
-                     else None)
+    corpus_source = (str(worker_data_path.resolve()) if
+                     (quote_descriptor is not None and worker_data_path is not None)
+                     else (str(Path(data).resolve()) if isinstance(data, (str, Path))
+                           else None))
     quote_sessions = []
     if quote_resolver:
         latest_quote_session = getattr(quote_rows, "max_session_date", None)
@@ -1346,6 +1450,13 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                             if quote.session_date.isoformat() not in sealed_sessions]
                            if not quote_resolver else selected_quotes),
             })
+        elif quote_descriptor is not None and worker_data_path is not None:
+            task["corpus"] = {
+                "source": corpus_source, "after": boundary,
+                "until": corpus_end, "exclude": sorted(sealed_sessions),
+                "quote_descriptor": quote_descriptor,
+                "projection_digest": projection_digest,
+            }
         else:
             task["corpus"] = {"source": corpus_source, "after": boundary,
                               "until": corpus_end,
@@ -1391,6 +1502,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
         diagnostics: dict[str, dict] = {}
         pending_diagnosis = [task for task in tasks if task["mode"] == "backtest"]
         failed_hypotheses: set[str] = set()
+        _progress("diagnosing", 0, len(pending_diagnosis))
+        diagnosis_done = 0
         if pending_diagnosis:
             futures = {pool.submit(_diagnose_worker, task): task
                        for task in pending_diagnosis}
@@ -1401,9 +1514,13 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 except Exception as exc:
                     _requeue(task, exc, "diagnosis")
                     failed_hypotheses.add(str(task["hypothesis"]["hypothesis_id"]))
+                    diagnosis_done += 1
+                    _progress("diagnosing", diagnosis_done, len(pending_diagnosis))
                     continue
                 diagnostics[str(result["hypothesis_id"])] = dict(
                     result["diagnostic"])
+                diagnosis_done += 1
+                _progress("diagnosing", diagnosis_done, len(pending_diagnosis))
 
         # Between the phases, and only in this process, the variants are
         # chosen.  Every provider call the factory makes lives here, so no
@@ -1491,12 +1608,16 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
 
         # Phase two: replay every chosen variant in its own isolated account.
         futures = {pool.submit(_worker, task): task for task in scheduled}
+        _progress("evaluating", 0, len(scheduled))
+        evaluation_done = 0
         for future in as_completed(futures):
             task = futures[future]
             try:
                 worker_results.append(future.result())
             except Exception as exc:
                 _requeue(task, exc, "worker")
+            evaluation_done += 1
+            _progress("evaluating", evaluation_done, len(scheduled))
     worker_results.sort(key=lambda item: (int(item["hypothesis"]["slot"]),
                                           str(item["hypothesis"]["hypothesis_id"])))
     for worker in worker_results:
@@ -1504,6 +1625,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                                     key=lambda item: str(item["variant_id"]))
 
     variant_rows = []
+    aggregation_total = sum(len(worker["variants"]) for worker in worker_results)
+    _progress("aggregating", 0, aggregation_total)
+    aggregation_done = 0
     for worker in worker_results:
         for variant in worker["variants"]:
             gate = _gate(variant["account"]["rows"], vehicle=vehicle,
@@ -1515,6 +1639,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                          null_rows=(worker.get("null_rows") or {}).get(
                              variant["variant_id"], []))
             variant_rows.append((worker, variant, gate))
+            aggregation_done += 1
+            _progress("aggregating", aggregation_done, aggregation_total)
     # Selection compares candidates across every family and lane in the cycle,
     # so the false-discovery correction that authorizes a champion has to be
     # global.  The family-local correction is retained as reported evidence.
@@ -1743,6 +1869,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     rotations: list[dict] = []
     reseeds: list[dict] = []
     pending = []
+    persist_total = sum(len(item.get("variants", ())) for item in worker_results)
+    _progress("persisting", 0, persist_total)
+    persisting_done = 0
     for worker in worker_results:
         hypothesis = worker["hypothesis"]
         local = [(variant, gate) for owner, variant, gate in variant_rows
@@ -1867,6 +1996,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 "status": (edge.candidate(candidate["candidate_id"]) or {}).get("status"),
                 "run_id": run.get("run_id") if run else None,
             })
+            persisting_done += 1
+            _progress("persisting", persisting_done, persist_total)
         # A hypothesis-level reason — why this slot was given this idea at all
         # — is answered by the best variant the idea produced, never by the
         # root. Roots are evaluated against a randomized-entry null, so they

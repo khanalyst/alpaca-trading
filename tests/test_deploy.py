@@ -513,6 +513,7 @@ class DeployTests(unittest.TestCase):
                      if item["schema"] == "research-cycle-views.v1"][0]
             self.assertEqual((views["bars"], views["quotes"], views["options"]),
                              (1, 0, 0))
+            self.assertEqual(views["replay"], 1)
             validation = [item for item in _cycle_payloads(result.stdout, "valid")][0]
             self.assertTrue(validation["valid"])
             # The append-only source remains evidence, including the quarantined
@@ -555,6 +556,7 @@ class DeployTests(unittest.TestCase):
                          if item["schema"] == "research-cycle-views.v1"][0]
                 self.assertEqual(views["quotes"], 60 if label == "quotes" else 0)
                 self.assertEqual(views["bars"], 60)
+                self.assertEqual(views["replay"], 60)
                 summaries[label] = _cycle_payloads(result.stdout, "vehicle")[0]
             # The routed quotes are the executable price at the fill instant,
             # so a corpus carrying them must not replay like the bars alone.
@@ -579,6 +581,7 @@ class DeployTests(unittest.TestCase):
             views = [item for item in _cycle_payloads(result.stderr, "schema")
                      if item["schema"] == "research-cycle-views.v1"][0]
             self.assertEqual(views["bars"], 6)  # two sessions, not twelve
+            self.assertEqual(views["replay"], 6)
 
     def test_research_cycle_reports_no_data_as_structured_nonzero_outcome(self):
         with tempfile.TemporaryDirectory() as directory:

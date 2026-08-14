@@ -26,7 +26,7 @@ from typing import Iterable, Mapping
 
 BAR_KINDS = {"bar", "bar_1m", "underlying", "underlying_bar"}
 QUOTE_KINDS = {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}
-OPTION_KINDS = {"option", "option_snapshot"}
+OPTION_KINDS = {"option", "option_snapshot", "option_quote"}
 
 
 def _clean(value):
@@ -60,7 +60,7 @@ def _csv_payload(row: Mapping[str, object]) -> dict:
             "bid_size": _clean(row.get("bid_size")),
             "ask_size": _clean(row.get("ask_size")),
         }
-    if event in {"option", "option_snapshot"}:
+    if event in OPTION_KINDS:
         return {
             "kind": "option_snapshot", **common,
             "contract": _clean(row.get("contract")),
@@ -126,10 +126,13 @@ def _csv_rows(path: Path) -> Iterable[tuple[int, dict]]:
 
 
 def build_views(source: Path, *, input_format: str, normalized: Path,
-                bars: Path, quotes: Path, options: Path) -> dict:
+                bars: Path, quotes: Path, options: Path,
+                replay: Path | None = None) -> dict:
     rows = _csv_rows(source) if input_format == "csv" else _jsonl_rows(source)
     quarantined = Counter()
     kept = 0
+    view_counts = {"normalized": 0, "bars": 0, "quotes": 0,
+                   "options": 0, "replay": 0}
     first_source_row = None
     last_source_row = None
     with ExitStack() as stack:
@@ -137,6 +140,8 @@ def build_views(source: Path, *, input_format: str, normalized: Path,
         bars_output = stack.enter_context(bars.open("w", encoding="utf-8"))
         quotes_output = stack.enter_context(quotes.open("w", encoding="utf-8"))
         options_output = stack.enter_context(options.open("w", encoding="utf-8"))
+        replay_output = (stack.enter_context(replay.open("w", encoding="utf-8"))
+                         if replay is not None else None)
         for source_row, payload in rows:
             kind = str(payload.get("kind", "bar")).lower()
             if _legacy_observation_inversion(payload):
@@ -148,12 +153,22 @@ def build_views(source: Path, *, input_format: str, normalized: Path,
             serialized = json.dumps(payload, sort_keys=True) + "\n"
             normalized_output.write(serialized)
             kept += 1
+            view_counts["normalized"] += 1
             if kind in BAR_KINDS:
                 bars_output.write(serialized)
+                view_counts["bars"] += 1
+                if replay_output is not None:
+                    replay_output.write(serialized)
+                    view_counts["replay"] += 1
             elif kind in QUOTE_KINDS:
                 quotes_output.write(serialized)
+                view_counts["quotes"] += 1
             elif kind in OPTION_KINDS:
                 options_output.write(serialized)
+                view_counts["options"] += 1
+                if replay_output is not None:
+                    replay_output.write(serialized)
+                    view_counts["replay"] += 1
     skipped = sum(quarantined.values())
     return {
         "schema": "research-cycle-quarantine.v1",
@@ -161,6 +176,7 @@ def build_views(source: Path, *, input_format: str, normalized: Path,
         "reason": "as_of_after_observed_at" if skipped else None,
         "rows": skipped,
         "kept_rows": kept,
+        "view_counts": view_counts,
         "by_kind": dict(sorted(quarantined.items())),
         "first_source_row": first_source_row,
         "last_source_row": last_source_row,
@@ -175,10 +191,13 @@ def main() -> int:
     parser.add_argument("--bars", type=Path, required=True)
     parser.add_argument("--quotes", type=Path, required=True)
     parser.add_argument("--options", type=Path, required=True)
+    parser.add_argument("--replay", dest="replay", type=Path,
+                        help="optional bar+option JSONL view for replay workers")
     args = parser.parse_args()
     result = build_views(
         args.source, input_format=args.format, normalized=args.normalized,
-        bars=args.bars, quotes=args.quotes, options=args.options)
+        bars=args.bars, quotes=args.quotes, options=args.options,
+        replay=args.replay)
     print(json.dumps(result, sort_keys=True))
     return 0
 

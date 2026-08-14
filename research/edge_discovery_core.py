@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import hold_deadline
 from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
-                    index_quotes, quote_fill)
+                    SQLiteQuoteIndexDescriptor, index_quotes, quote_fill)
 from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 from .stats import stable_seed
 
@@ -224,7 +224,7 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                 if keep is None or keep(quote.session_date.isoformat()):
                     if quote_index is None:
                         quotes.append(quote)
-                    else:
+                    elif not getattr(quote_index, "_read_only", False):
                         quote_index.add(quote)
             # Other metadata stays in the dataset hash without being fed into
             # an OHLC replay.
@@ -242,7 +242,8 @@ def _bar_session(bar: UnderlyingBar) -> str:
     return bar.timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
 
 
-def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
+def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
+                         force_quote_index: bool = False) -> tuple[
         list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Load one normalized JSONL corpus: bars, option quotes, equity quotes.
 
@@ -253,7 +254,7 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
     if isinstance(data, (str, Path)):
         source = Path(data)
         size = _corpus_size(source)
-        if size < QUOTE_INDEX_MIN_BYTES:
+        if size < QUOTE_INDEX_MIN_BYTES and not force_quote_index:
             # Preserve the small-corpus/list contract used by notebooks and
             # callers that keep a temporary source only for the duration of
             # this call.  Large production corpora take the streaming branch
@@ -300,15 +301,71 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
     if any(not isinstance(row, Mapping) for row in raw_rows):
         raise DiscoveryError("discovery rows must be JSON objects")
     if not isinstance(data, (str, Path)):
-        bars, snapshots, quotes = _normalize_corpus(raw_rows)
+        if force_quote_index:
+            quote_index = SQLiteQuoteIndex()
+            try:
+                bars, snapshots, quotes = _normalize_corpus(
+                    raw_rows, quote_index=quote_index)
+            except Exception:
+                quote_index.close()
+                raise
+        else:
+            bars, snapshots, quotes = _normalize_corpus(raw_rows)
     if not bars:
         raise DiscoveryError("discovery corpus contains no underlying bars")
     return raw_rows, bars, snapshots, quotes
 
 
+def validate_worker_projection(source: str | Path, *,
+                               bars: Sequence[UnderlyingBar],
+                               snapshots: Mapping[str, OptionSnapshot]) -> str:
+    """Verify that a compact worker view is exactly the full replay projection.
+
+    The view is an optimization, not a second research dataset.  Validate it
+    once in the parent before scheduling workers so an omitted or altered bar
+    or option snapshot can never change gates while retaining the full
+    corpus's experiment identity.
+    """
+    allowed = {
+        "bar", "underlying", "underlying_bar",
+        "option", "option_snapshot", "option_quote",
+    }
+    hasher = hashlib.sha256()
+    hasher.update(b"[")
+    first = True
+
+    def projection_rows():
+        nonlocal first
+        for number, row in enumerate(_stream_rows(Path(source)), 1):
+            if not isinstance(row, Mapping):
+                raise DiscoveryError("worker_data rows must be JSON objects")
+            kind = str(row.get("kind", "bar")).lower()
+            if kind not in allowed:
+                raise DiscoveryError(
+                    f"worker_data row {number} must contain only bars and option snapshots")
+            if not first:
+                hasher.update(b",")
+            hasher.update(_canonical_json(row).encode("utf-8"))
+            first = False
+            yield row
+
+    projected_bars, projected_snapshots, projected_quotes = _normalize_corpus(
+        projection_rows())
+    if projected_quotes:
+        raise DiscoveryError("worker_data must not contain equity quotes")
+    if (projected_bars != list(bars) or
+            projected_snapshots != dict(snapshots)):
+        raise DiscoveryError(
+            "worker_data does not match the full corpus replay projection")
+    hasher.update(b"]")
+    return hasher.hexdigest()
+
+
 def corpus_slice(source: str | Path, *, after: str | None = None,
                  until: str | None = None,
-                 exclude: Sequence[str] = ()) -> tuple[
+                 exclude: Sequence[str] = (),
+                 quote_descriptor: SQLiteQuoteIndexDescriptor | None = None,
+                 expected_digest: str | None = None) -> tuple[
                      list[UnderlyingBar], list[OptionSnapshot], list[QuoteSnapshot]]:
     """Re-read one recorded corpus and keep only a session window of it.
 
@@ -327,13 +384,39 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
                 session not in dropped)
 
     source_path = Path(source)
-    quote_index = (SQLiteQuoteIndex() if _corpus_size(source_path) >=
-                   QUOTE_INDEX_MIN_BYTES else None)
+    supplied = quote_descriptor
+    owns_quote_index = False
+    if supplied is not None:
+        quote_index = SQLiteQuoteIndex.open_read_only(supplied)
+        owns_quote_index = True
+    else:
+        quote_index = (SQLiteQuoteIndex() if _corpus_size(source_path) >=
+                       QUOTE_INDEX_MIN_BYTES else None)
+        owns_quote_index = quote_index is not None
+    digest = hashlib.sha256() if expected_digest is not None else None
+
+    def rows():
+        first = True
+        if digest is not None:
+            digest.update(b"[")
+        for row in _stream_rows(source_path):
+            if digest is not None:
+                if not first:
+                    digest.update(b",")
+                digest.update(_canonical_json(row).encode("utf-8"))
+                first = False
+            yield row
+        if digest is not None:
+            digest.update(b"]")
+
     try:
         bars, snapshots, quotes = _normalize_corpus(
-            _stream_rows(source_path), keep=keep, quote_index=quote_index)
+            rows(), keep=keep, quote_index=quote_index)
+        if (digest is not None and
+                digest.hexdigest() != str(expected_digest)):
+            raise DiscoveryError("worker_data changed after parent validation")
     except Exception:
-        if quote_index is not None:
+        if owns_quote_index and quote_index is not None:
             quote_index.close()
         raise
     return bars, list(snapshots.values()), quotes

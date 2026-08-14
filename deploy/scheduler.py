@@ -27,6 +27,7 @@ from deploy.scheduler_output import (  # noqa: E402
     _drain,
     _start_capture,
     structured_failure,
+    structured_research_progress,
     structured_research_cycle,
 )
 
@@ -152,9 +153,11 @@ def _wait_for_child_with_heartbeats(
         try:
             return int(child.wait(timeout=wait_for))
         except subprocess.TimeoutExpired:
-            write_status(
-                status_path, "running", **running_detail,
-                **_capture_detail(stdout_capture, stderr_capture))
+            heartbeat_detail = {
+                **running_detail,
+                **_capture_detail(stdout_capture, stderr_capture),
+            }
+            write_status(status_path, "running", **heartbeat_detail)
 
 
 def run_scheduler(args) -> int:
@@ -178,7 +181,7 @@ def run_scheduler(args) -> int:
             "job_id", "started_ts", "completed_ts", "run_date",
             "timeout_seconds", "structured_failures", "stdout_chars",
             "stderr_chars", "stdout_truncated", "stderr_truncated",
-            "cycle_status", "research_cycle")
+            "cycle_status", "research_cycle", "research_progress")
         if key in previous
     }
     signal.signal(signal.SIGTERM, _stop)
@@ -240,7 +243,10 @@ def run_scheduler(args) -> int:
             "last_run_date": last_date,
             "last_exit_code": last_exit,
         }
-        write_status(status_path, "running", **running_detail)
+        # Include the field from the first heartbeat onward.  Subsequent
+        # heartbeats replace it with the latest validated child event.
+        write_status(status_path, "running", **running_detail,
+                     research_progress=None)
         timed_out = False
         try:
             try:
@@ -262,6 +268,7 @@ def run_scheduler(args) -> int:
             thread.join(timeout=5)
         stdout = (stdout_capture[0] if stdout_capture else _BoundedCapture(1))
         stderr = (stderr_capture[0] if stderr_capture else _BoundedCapture(1))
+        capture_detail = _capture_detail(stdout, stderr)
         structured_failures = list(stdout.structured_failures)
         structured_failures.extend(stderr.structured_failures)
         research_cycles = [*stdout.research_cycles, *stderr.research_cycles]
@@ -319,6 +326,7 @@ def run_scheduler(args) -> int:
             structured_failures=structured_failures,
             cycle_status=cycle_status,
             research_cycle=research_cycle,
+            research_progress=capture_detail["research_progress"],
             stdout_tail=stdout.tail, stderr_tail=stderr.tail,
             stdout_chars=stdout.total_chars, stderr_chars=stderr.total_chars,
             stdout_truncated=stdout.truncated,
@@ -330,6 +338,7 @@ def run_scheduler(args) -> int:
             "structured_failures": structured_failures,
             "cycle_status": cycle_status,
             "research_cycle": research_cycle,
+            "research_progress": capture_detail["research_progress"],
             "stdout_chars": stdout.total_chars,
             "stderr_chars": stderr.total_chars,
             "stdout_truncated": stdout.truncated,

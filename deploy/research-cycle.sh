@@ -17,6 +17,26 @@ cycle_no_edge=0
 cycle_unevaluable=0
 cycle_outcomes=()
 
+emit_progress() {
+  local phase="$1"
+  local done="$2"
+  local total="$3"
+  local unit="$4"
+  local vehicle="${5:-both}"
+  "$python_bin" - "$phase" "$unit" "$vehicle" "$done" "$total" <<'PY' >&2
+from datetime import datetime, timezone
+import json
+import sys
+
+phase, unit, vehicle, done, total = sys.argv[1:]
+print(json.dumps({
+    "schema": "research-progress.v1", "phase": phase, "unit": unit,
+    "vehicle": vehicle, "done": int(done), "total": int(total),
+    "updated_ts": datetime.now(timezone.utc).isoformat(),
+}, separators=(",", ":"), sort_keys=True), flush=True)
+PY
+}
+
 emit_cycle() {
   local status="$1"
   local reason="$2"
@@ -95,6 +115,7 @@ fi
 tmp_root="${TMPDIR:-/tmp}"
 mkdir -p "$tmp_root"
 tmp_dir="$(mktemp -d "$tmp_root/alpaca-research.XXXXXX")"
+emit_progress "preparing" 0 1 "steps" "both"
 
 # The recorder partitions its corpus by session date. Concatenate the requested
 # window of partitions once, in order, instead of keeping an unbounded file.
@@ -165,6 +186,7 @@ options_input="$tmp_dir/options.jsonl"
 # into their own view keeps the bars-only replay input valid while letting the
 # shared cost/fill model use recorded quotes instead of bar prices.
 quotes_input="$tmp_dir/quotes.jsonl"
+replay_input="$tmp_dir/replay.jsonl"
 
 source_format="jsonl"
 [[ "$validated_input" == *.csv ]] && source_format="csv"
@@ -173,22 +195,30 @@ normalized_input="$tmp_dir/market.jsonl"
 # research view quarantines the known legacy point-in-time inversion; malformed
 # timestamps, symbols, values, and event kinds remain for validate-data to
 # reject as hard integrity failures.
-"$python_bin" "$repo_root/deploy/research_dataset.py" "$validated_input" \
+dataset_report="$("$python_bin" "$repo_root/deploy/research_dataset.py" "$validated_input" \
   --format "$source_format" --normalized "$normalized_input" \
-  --bars "$bars_input" --quotes "$quotes_input" --options "$options_input" >&2
+  --bars "$bars_input" --quotes "$quotes_input" --options "$options_input" \
+  --replay "$replay_input")"
 validated_input="$normalized_input"
 
-# Report what each view actually received. Routing quotes into their own view
-# is only useful if rows arrive there, and that is otherwise invisible.
-"$python_bin" - "$bars_input" "$quotes_input" "$options_input" <<'PY' >&2
+# Preserve the quarantine record and report view sizes without rescanning the
+# generated files. ``research_dataset.py`` counted them during its source pass.
+"$python_bin" - "$dataset_report" <<'PY' >&2
 import json
 import sys
 
-print(json.dumps({"schema": "research-cycle-views.v1", **{
-    name: sum(1 for line in open(path, encoding="utf-8") if line.strip())
-    for name, path in zip(("bars", "quotes", "options"), sys.argv[1:])}},
-    sort_keys=True))
+report = json.loads(sys.argv[1])
+counts = report.pop("view_counts", {})
+print(json.dumps(report, sort_keys=True))
+print(json.dumps({
+    "schema": "research-cycle-views.v1",
+    "bars": int(counts.get("bars", 0)),
+    "quotes": int(counts.get("quotes", 0)),
+    "options": int(counts.get("options", 0)),
+    "replay": int(counts.get("replay", 0)),
+}, sort_keys=True))
 PY
+emit_progress "preparing" 1 1 "steps" "both"
 
 # A CSV containing only its header is not a usable research dataset even
 # though the source file itself is non-empty.
@@ -197,6 +227,7 @@ if [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; t
 fi
 
 feed="${ALPACA_DATA_FEED:-${ALPACA_STOCK_FEED:-iex}}"
+emit_progress "validation" 0 1 "steps" "both"
 set +e
 "$python_bin" "$repo_root/research.py" validate-data "$validated_input" \
   --provider alpaca --feed "$feed"
@@ -205,8 +236,10 @@ set -e
 if [ "$validation_status" -ne 0 ]; then
   finish "failed" "research dataset validation failed" "$validation_status"
 fi
+emit_progress "validation" 1 1 "steps" "both"
 
 if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
+  emit_progress "backtest" 0 1 "steps" "equity"
   set +e
   if [ -s "$quotes_input" ]; then
     "$python_bin" "$repo_root/research.py" backtest-ibr "$bars_input" \
@@ -223,6 +256,7 @@ if [ "${ALPACA_RESEARCH_BACKTEST:-1}" = "1" ] && [ -s "$bars_input" ]; then
   if [ "$backtest_status" -ne 0 ]; then
     finish "failed" "research backtest failed" "$backtest_status"
   fi
+  emit_progress "backtest" 1 1 "steps" "equity"
 fi
 
 edge_db="${ALPACA_EDGE_DB:-$repo_root/runtime/research/edge_lab.sqlite3}"
@@ -271,6 +305,7 @@ run_calibration
 
 run_discovery() {
   local vehicle="$1"
+  emit_progress "discovery" 0 1 "steps" "$vehicle"
   set +e
   "$python_bin" "$repo_root/research.py" edge discover \
     --data "$validated_input" --vehicle "$vehicle" --lane auto --db "$edge_db" \
@@ -294,13 +329,16 @@ run_discovery() {
   else
     finish "failed" "$vehicle edge discovery failed" "$status"
   fi
+  emit_progress "discovery" 1 1 "steps" "$vehicle"
 }
 
 run_factory() {
   local vehicle="$1"
+  emit_progress "factory" 0 1 "tasks" "$vehicle"
   set +e
   "$python_bin" "$repo_root/research.py" factory run \
-    --data "$validated_input" --vehicle "$vehicle" --db "$edge_db" \
+    --data "$validated_input" --worker-data "$replay_input" \
+    --vehicle "$vehicle" --db "$edge_db" \
     --agent-config "$agent_config" \
     --strategies "${ALPACA_FACTORY_STRATEGIES:-7}" \
     --variants "${ALPACA_FACTORY_VARIANTS:-4}" \
@@ -324,11 +362,13 @@ run_factory() {
   else
     finish "failed" "$vehicle factory failed" "$status"
   fi
+  emit_progress "factory" 1 1 "tasks" "$vehicle"
 }
 
 run_shadow_ingest() {
   local vehicle="$1"
   [ "${ALPACA_SHADOW_INGEST_ENABLED:-1}" = "1" ] || return 0
+  emit_progress "shadow_ingest" 0 1 "steps" "$vehicle"
   set +e
   "$python_bin" "$repo_root/research.py" edge ingest-shadow \
     --vehicle "$vehicle" --db "$edge_db" --shadow-db "$shadow_db" \
@@ -342,6 +382,7 @@ run_shadow_ingest() {
   else
     finish "failed" "$vehicle shadow ingestion failed" "$status"
   fi
+  emit_progress "shadow_ingest" 1 1 "steps" "$vehicle"
 }
 
 # A trader process runs one execution profile, so proving an edge in the other
@@ -362,6 +403,7 @@ fi
 # operator-visible outcome, not a failure.
 review_trials() {
   local vehicle="$1"
+  emit_progress "trial" 0 1 "steps" "$vehicle"
   set +e
   "$python_bin" "$repo_root/research.py" edge trials \
     --vehicle "$vehicle" --db "$edge_db" --agent-config "$agent_config"
@@ -372,6 +414,7 @@ review_trials() {
     3) cycle_outcomes+=("$vehicle:trial:parked") ;;
     *) finish "failed" "$vehicle trial review failed" "$status" ;;
   esac
+  emit_progress "trial" 1 1 "steps" "$vehicle"
 }
 
 for vehicle in $vehicles; do
@@ -403,13 +446,16 @@ for vehicle in $vehicles; do
 done
 
 if [ "$cycle_success" -eq 1 ]; then
+  emit_progress "completed" 1 1 "cycles" "both"
   finish "completed" "research cycle completed with proof" 0
 fi
 # A vehicle whose corpus priced nothing tested nothing. Reporting that as
 # "no edge passed the gates" is indistinguishable from a real negative, so the
 # cycle says so plainly -- but only when no vehicle produced a verdict either.
 if [ "$cycle_unevaluable" -eq 1 ] && [ "$cycle_no_edge" -eq 0 ]; then
+  emit_progress "completed" 1 1 "cycles" "both"
   finish "no_data" "corpus could not be priced; see .unevaluable.reason" 0
 fi
 cycle_no_edge=1
+emit_progress "completed" 1 1 "cycles" "both"
 finish "completed_no_edge" "no edge or proof passed the research gates" 0

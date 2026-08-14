@@ -495,8 +495,15 @@ docker compose --profile research run --rm research \
   /bin/bash deploy/research-cycle.sh
 ```
 
-This takes minutes to tens of minutes depending on corpus size. The last line
-is a status record:
+Runtime depends on corpus size and configured factory capacity. While a cycle
+runs, `runtime/health/research.json` and the dashboard show the current phase
+and completed/total work. The factory validates and hashes the full normalized
+corpus once, then its workers read a compact bar/option replay view and share
+the parent's read-only quote index instead of rebuilding the multi-million-row
+index for every hypothesis. The parent verifies that compact view against the
+canonical full-corpus projection before any worker or evidence write, and each
+worker verifies the validated digest while reading it. The last line is a
+status record:
 
 | Status | Meaning | Action |
 | --- | --- | --- |
@@ -512,7 +519,9 @@ The research Compose service defaults to two factory workers and a 10 GB
 container limit. Override `ALPACA_FACTORY_WORKERS` and
 `ALPACA_RESEARCH_MEMORY_LIMIT` in the deployment environment when the VM is
 smaller or larger; leave headroom for the recorder, trader, watchdog, and
-Docker itself.
+Docker itself. `ALPACA_RESEARCH_SESSION_WINDOW=0` deliberately validates the
+whole corpus. A nonzero window is an explicit evidence-scope decision; do not
+use it merely to hide malformed older data or to lower the configured floors.
 
 The scheduled cycle runs `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a harmless no-op. The
