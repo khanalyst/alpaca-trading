@@ -114,10 +114,36 @@ class IBRTrade:
     exit_fill_source: str = BAR
 
 
+@dataclass(frozen=True)
+class IBRRefusal:
+    """One symbol/session the replay declined, and the reason it declined it.
+
+    ``reason`` is a stable machine token rather than prose so downstream gates
+    can aggregate it; ``detail`` carries the numbers that make the refusal
+    actionable without re-running the replay.
+    """
+
+    vehicle: str
+    symbol: str
+    session_date: date
+    reason: str
+    detail: Mapping[str, object] = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        return {"vehicle": self.vehicle, "symbol": self.symbol,
+                "session_date": self.session_date.isoformat(),
+                "reason": self.reason, "detail": dict(self.detail)}
+
+
 @dataclass
 class IBRResult:
     vehicle: str
     trades: list[IBRTrade] = field(default_factory=list)
+    # Why the sessions that produced no trade produced none.  A replay that
+    # refuses every opportunity is either an edgeless corpus or one the policy
+    # cannot price, and those demand opposite responses; without the reason
+    # the two are indistinguishable downstream.
+    refusals: list["IBRRefusal"] = field(default_factory=list)
 
     @property
     def net_pnl(self) -> float:
@@ -228,11 +254,26 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
 def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     cfg: IBRConfig, option_snapshots: Mapping[datetime, OptionSnapshot] | None = None,
                     quotes: Mapping[str, Sequence[QuoteSnapshot]] | None = None,
-                    multiplier: int = 1) -> IBRTrade | None:
+                    multiplier: int = 1,
+                    refusals: list[IBRRefusal] | None = None) -> IBRTrade | None:
     if not bars:
         return None
     zone = ZoneInfo(cfg.timezone)
     day = _local(bars[0].timestamp, zone).date()
+
+    def refuse(reason: str, detail: Mapping[str, object] | None = None) -> None:
+        """Record why this session yields no trade, then decline it.
+
+        Every refusal below is a decision the replay makes on the operator's
+        behalf.  Returning a bare ``None`` for all of them makes an unpriceable
+        corpus and an edgeless one produce byte-identical output.
+        """
+        if refusals is not None:
+            refusals.append(IBRRefusal(vehicle=vehicle, symbol=symbol,
+                                       session_date=day, reason=reason,
+                                       detail=dict(detail or {})))
+        return None
+
     start = _session_start(day, cfg, zone)
     range_end = start + timedelta(minutes=cfg.range_minutes)
     close_at = datetime.combine(day, cfg.force_flat, tzinfo=zone)
@@ -248,11 +289,12 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # edge by shrinking the range.
     expected = cfg.range_minutes
     if len(range_bars) != expected:
-        return None
+        return refuse("incomplete_opening_range",
+                      {"observed": len(range_bars), "expected": expected})
     range_bars.sort(key=lambda b: b.timestamp)
     for previous, current in zip(range_bars, range_bars[1:]):
         if current.timestamp - previous.timestamp != timedelta(minutes=1):
-            return None
+            return refuse("opening_range_gap")
     high = max(b.high for b in range_bars)
     low = min(b.low for b in range_bars)
     # Keep the first bar at the force-flat boundary so its opening price can
@@ -263,7 +305,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             and _local(b.timestamp, zone) < close_at + timedelta(minutes=1)]
     post.sort(key=lambda b: b.timestamp)
     if not post:
-        return None
+        return refuse("no_post_range_bars")
     # Adjacency is required where it changes an outcome — the next-bar entry
     # below, and the hold window — not across the whole post-range period.  A
     # minute missing at 15:40 does not invalidate a 10:05 breakout, and
@@ -279,14 +321,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         return ((buffer_long(bar) or buffer_short(bar)) if cfg.close_confirmed
                 else (bar.high > high or bar.low < low))
     signal_idx = next((i for i, b in enumerate(post) if breaks(b)), None)
-    if signal_idx is None or signal_idx + 1 >= len(post):
-        return None
+    if signal_idx is None:
+        return refuse("no_breakout")
+    if signal_idx + 1 >= len(post):
+        return refuse("breakout_on_final_bar")
     signal = post[signal_idx]
     entry_bar = post[signal_idx + 1]
     if entry_bar.timestamp != signal.end:
         # "Next bar" means the immediate following one-minute bar; carrying a
         # signal across an outage would turn a stale breakout into an entry.
-        return None
+        return refuse("entry_bar_not_adjacent")
     # The hold window is the consecutive run beginning at the entry.  Every
     # exit below — level, gap, and force-flat alike — is resolved inside it, so
     # a position is never carried across a data outage and a later recorded
@@ -301,10 +345,10 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # naturally not published until its end. Executable pricing below still
     # requires a point-in-time quote at the boundary.
     if not _visible(signal, signal.end):
-        return None
+        return refuse("breakout_not_visible")
     if (cfg.policy.latest_entry_time is not None and
             _local(entry_bar.timestamp, zone).time() > cfg.policy.latest_entry_time):
-        return None
+        return refuse("past_latest_entry_time")
     long_break = (buffer_long(signal) if cfg.close_confirmed else signal.high > high)
     short_break = (buffer_short(signal) if cfg.close_confirmed else signal.low < low)
     # If one completed bar breaks both sides, stop-first tie semantics choose
@@ -330,11 +374,11 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         if quoted is not None:
             entry_ref, entry_source = quoted, QUOTE
         elif cfg.policy.strict_market_data:
-            return None
+            return refuse("no_quote_at_entry")
     if vehicle == "option":
         option_policy = cfg.policy
         if option_snapshots is None:
-            return None
+            return refuse("no_option_snapshots")
         wanted_right = "call" if direction == "long" else "put"
         eligible = [s for s in option_snapshots.values()
                     if s.timestamp <= entry_bar.timestamp
@@ -351,7 +395,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     and str(s.contract.right).lower() in {
                         wanted_right, wanted_right[0]}]
         if not eligible:
-            return None
+            return refuse("no_eligible_option_contract")
         spot = next((item.underlying_price for item in sorted(
             eligible, key=lambda item: (item.timestamp, item.contract.symbol), reverse=True)
             if item.underlying_price), underlying_entry)
@@ -363,7 +407,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         selected_contract = contract
         entry_ref = snap.ask
         if entry_ref <= 0:
-            return None
+            return refuse("option_entry_ask_not_positive")
         multiplier = snap.contract.multiplier
     # The runtime derives both levels from the completed breakout bar's close,
     # because the bracket legs are submitted with the entry and no fill price
@@ -433,9 +477,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 exit_reference, exit_source = boundary_exit(bar.open, bar.timestamp)
             if (cfg.policy.strict_market_data and vehicle == "equity" and
                     exit_source != QUOTE):
-                return None
+                return refuse("no_quote_at_gap_exit")
             if exit_reference is None:
-                return None
+                return refuse("no_exit_reference_at_gap")
             return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
                                     range_high=high, range_low=low, signal=signal,
                                     entry_bar=entry_bar, entry_reference=entry_ref,
@@ -455,7 +499,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                 bar.timestamp if cfg.policy.strict_market_data else bar.end)
                               if vehicle == "option" else level)
             if exit_reference is None:
-                return None
+                return refuse("no_option_exit_reference_at_level")
             return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
                                     range_high=high, range_low=low, signal=signal,
                                     entry_bar=entry_bar, entry_reference=entry_ref,
@@ -474,15 +518,15 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     else:
         candidates = [b for b in hold if b.end <= close_at and _visible(b, b.end)]
         if not candidates:
-            return None
+            return refuse("no_visible_bar_before_force_flat")
         last = candidates[-1]
         exit_ref, exit_source = boundary_exit(last.close, last.end)
         if vehicle == "option":
             exit_ref = option_exit_reference(last.timestamp)
             if exit_ref is None:
-                return None
+                return refuse("no_option_exit_reference_at_force_flat")
         elif cfg.policy.strict_market_data and exit_source != QUOTE:
-            return None
+            return refuse("no_quote_at_force_flat_exit")
     return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
                             range_high=high, range_low=low, signal=signal,
                             entry_bar=entry_bar, entry_reference=entry_ref,
@@ -520,7 +564,7 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
     for (sym, _), session_bars in sorted(sessions.items(), key=lambda item: item[0]):
         trade = _replay_session(session_bars, vehicle=vehicle, symbol=sym, cfg=cfg,
                                 option_snapshots=option_snapshots,
-                                quotes=quote_index)
+                                quotes=quote_index, refusals=result.refusals)
         if trade is not None:
             result.trades.append(trade)
     return result
