@@ -528,6 +528,25 @@ class ShadowStore:
             db.execute("""INSERT INTO meta(key,value) VALUES('corpus_source_offsets',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (payload,))
 
+    def forward_event_floor(self) -> float | None:
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key='forward_event_floor'").fetchone()
+        if row is None:
+            return None
+        try:
+            value = float(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise ShadowError("shadow forward event floor is invalid") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ShadowError("shadow forward event floor is invalid")
+        return value
+
+    def save_forward_event_floor(self, value: float) -> None:
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES('forward_event_floor',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                       (str(float(value)),))
+
     def upsert_candidate(self, candidate: Mapping[str, Any]) -> None:
         config = candidate.get("config")
         if config is None:
@@ -611,9 +630,11 @@ class ShadowStore:
         with self._connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM candidates ORDER BY candidate_id")]
 
-    def events(self) -> list[dict]:
+    def events(self, *, inserted_after: float = 0.0) -> list[dict]:
         with self._connection() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM events ORDER BY timestamp,event_key")]
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM events WHERE inserted_at>=? ORDER BY timestamp,event_key",
+                (float(inserted_after),))]
 
     def decisions(self, candidate_id: str | None = None) -> list[dict]:
         with self._connection() as db:
@@ -920,7 +941,9 @@ class ShadowRunner:
         bars: dict[str, list[dict]] = {}
         quotes: dict[str, list[dict]] = {}
         options: dict[str, list[dict]] = {}
-        for row in self.store.events():
+        floor = self.store.forward_event_floor() or 0.0
+        event_rows = self.store.events(inserted_after=floor)
+        for row in event_rows:
             try:
                 payload = json.loads(row["event_json"])
                 _, event = _normalize_row(payload)
@@ -938,7 +961,7 @@ class ShadowRunner:
         for values in (bars, quotes, options):
             for key in values:
                 values[key].sort(key=lambda row: str(row.get("timestamp") or ""))
-        return self.store.events(), bars, quotes, options
+        return event_rows, bars, quotes, options
 
     @staticmethod
     def _latest_quote(rows: Sequence[Mapping], at: datetime) -> Mapping | None:
@@ -1280,6 +1303,14 @@ class ShadowRunner:
         conflicts = 0
         sources = _corpus_sources(self.config.corpus_path)
         offsets = self.store.source_offsets()
+        forward_floor = self.store.forward_event_floor()
+        if forward_floor is None:
+            # feaca71 established source offsets before filtering the legacy
+            # event cache. Mark the migration boundary once and keep all later
+            # cycles scoped to genuinely forward observations.
+            forward_floor = (time.time() if self.store.event_count() >=
+                             self.config.max_events else 0.0)
+            self.store.save_forward_event_floor(forward_floor)
         if offsets is None:
             # A pre-upgrade WAL already at the old total-event ceiling has
             # consumed historical evidence. Baseline at the current committed
