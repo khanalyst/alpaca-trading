@@ -54,6 +54,7 @@ DEFAULT_MAX_CANDIDATES = 32
 DEFAULT_MAX_EVENTS = 20_000
 DEFAULT_MAX_DECISIONS = 100_000
 DEFAULT_RETENTION_DAYS = 14
+MAX_PENDING_CORPUS_BYTES = 64 * 1024 * 1024
 
 
 class ShadowError(RuntimeError):
@@ -546,6 +547,18 @@ class ShadowStore:
             db.execute("""INSERT INTO meta(key,value) VALUES('forward_event_floor',?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                        (str(float(value)),))
+
+    def quarantine_through_session(self) -> str | None:
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='quarantine_through_session'").fetchone()
+        return None if row is None else str(row["value"])
+
+    def save_quarantine_through_session(self, value: str) -> None:
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value)
+                VALUES('quarantine_through_session',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (value,))
 
     def upsert_candidate(self, candidate: Mapping[str, Any]) -> None:
         config = candidate.get("config")
@@ -1323,11 +1336,27 @@ class ShadowRunner:
             self.store.save_source_offsets(offsets)
         pending: list[dict] = []
         next_offsets = dict(offsets)
-        for source in sources:
-            key = str(source.resolve())
-            rows, consumed = _read_corpus_append(source, offsets.get(key, 0))
-            pending.extend(rows)
-            next_offsets[key] = consumed
+        pending_bytes = sum(max(0, source.stat().st_size - offsets.get(
+            str(source.resolve()), 0)) for source in sources)
+        skipped_recovery_bytes = 0
+        if pending_bytes > MAX_PENDING_CORPUS_BYTES:
+            # A failed pre-offset consumer may leave hundreds of megabytes of
+            # raw quotes pending. Do not materialize that range merely to
+            # compact it. Baseline it explicitly and quarantine the current
+            # NY session so a partial forward window can never qualify.
+            skipped_recovery_bytes = pending_bytes
+            next_offsets = {str(source.resolve()): source.stat().st_size
+                            for source in sources}
+            forward_floor = time.time()
+            self.store.save_forward_event_floor(forward_floor)
+            self.store.save_quarantine_through_session(
+                datetime.now(UTC).astimezone(NEW_YORK).date().isoformat())
+        else:
+            for source in sources:
+                key = str(source.resolve())
+                rows, consumed = _read_corpus_append(source, offsets.get(key, 0))
+                pending.extend(rows)
+                next_offsets[key] = consumed
         selected = _compact_shadow_rows(pending)
         if len(selected) > self.config.max_events:
             raise ShadowError(
@@ -1362,11 +1391,13 @@ class ShadowRunner:
                     if stamp is not None else None)
 
         session_events: dict[str, list[dict]] = {}
+        quarantine_through = self.store.quarantine_through_session()
         for event in events:
             if event.get("event_type") not in {"bar", "bar_1m"}:
                 continue
             session = row_session(event)
-            if session is not None:
+            if session is not None and (
+                    quarantine_through is None or session > quarantine_through):
                 session_events.setdefault(session, []).append(event)
 
         session_inputs: dict[str, tuple[list[dict], list[dict], list[dict]]] = {}
@@ -1416,7 +1447,9 @@ class ShadowRunner:
         self.store.prune()
         return {"candidates": len(candidates), "ingested_events": ingested,
                 "events": len(events), "decisions": len(self.store.decisions()),
-                "conflicts": conflicts, "invalid_events": invalid_events}
+                "conflicts": conflicts, "invalid_events": invalid_events,
+                "skipped_recovery_bytes": skipped_recovery_bytes,
+                "quarantine_through_session": quarantine_through}
 
 
 def run_shadow_once(config: ShadowConfig) -> dict[str, Any]:
