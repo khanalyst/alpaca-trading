@@ -863,7 +863,14 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
         window_end = min(cursor + window, now)
         rows = list(_rows(
             provider, symbols, window_end, feed=resolved_feed, config=config,
-            include_options=bool(include_options), option_limit=option_limit,
+            # Option-chain snapshots are observations made now, not historical
+            # market data. Sampling them in every stale catch-up window can
+            # admit an illiquid contract's old quote timestamp and incorrectly
+            # trip the equity dedup horizon. Sample once, in the live window,
+            # and let recorder_market discard candidates older than that
+            # request's lower bound.
+            include_options=bool(include_options and window_end >= now),
+            option_limit=option_limit,
             start=cursor, option_pins=frozenset(pins), observed_at=now))
         total_rows += len(rows)
         index, seen, watermark, latest_bars, pins, unique = _ingest_chunk(

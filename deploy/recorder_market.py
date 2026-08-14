@@ -202,6 +202,7 @@ def _option_rank(candidate: dict, underlying_price: object) -> tuple:
 
 def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                  *, feed: str, config: dict | None, limit: int,
+                 minimum_timestamp: datetime | None = None,
                  pinned: frozenset[str] = frozenset()):
     """Project bounded provider candidates into append-only option events.
 
@@ -247,6 +248,8 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             multiplier = candidate.get("multiplier") or candidate.get("contract_size")
             parsed_timestamp = _timestamp(timestamp)
             if (right not in selected or not symbol or parsed_timestamp is None or
+                    (minimum_timestamp is not None and
+                     parsed_timestamp < minimum_timestamp) or
                     parsed_timestamp > now + timedelta(seconds=5)):
                 continue
             bid = _number(candidate.get("bid")); ask = _number(candidate.get("ask"))
@@ -380,4 +383,5 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
         yield from _option_rows(
             provider, symbols, quotes, now, feed=feed, config=config,
             limit=max(1, min(MAX_OPTION_LIMIT, int(option_limit))),
+            minimum_timestamp=start,
             pinned=frozenset(str(item).upper() for item in option_pins))

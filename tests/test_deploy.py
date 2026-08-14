@@ -142,12 +142,24 @@ class _OptionFake(_MarketFake):
     def __init__(self):
         super().__init__(feed="iex")
         self.option_calls = []
+        self.option_timestamp = datetime.now(timezone.utc) - timedelta(minutes=2)
+
+    def bars(self, symbols, *, start, end, feed, **kwargs):
+        self.seen.append(("bars", feed))
+        return {"SPY": [SimpleNamespace(
+            timestamp=self.option_timestamp.replace(microsecond=0),
+            open=100, high=101, low=99, close=100.5, volume=10)]}
+
+    def quotes(self, symbols, *, start, end, feed):
+        self.seen.append(("quotes", feed))
+        return {"SPY": [SimpleNamespace(
+            timestamp=self.option_timestamp, bid=100, ask=101, last=100.5)]}
 
     def option_candidates(self, symbol, *, now, underlying_price, feed,
                           min_dte, max_dte):
         self.option_calls.append((symbol, underlying_price, feed,
                                   min_dte, max_dte))
-        timestamp = datetime(2026, 8, 8, 13, 30, 2, tzinfo=timezone.utc)
+        timestamp = self.option_timestamp
         expiration = datetime.now(timezone.utc).date() + timedelta(days=30)
         rows = []
         for right in ("call", "put"):
@@ -1148,7 +1160,7 @@ class DeployTests(unittest.TestCase):
         from deploy import recorder_market
         fake = _OptionFake()
         quotes = fake.quotes(["SPY"], start=None, end=None, feed="iex")
-        now = datetime(2026, 8, 8, 13, 31, tzinfo=timezone.utc)
+        now = fake.option_timestamp + timedelta(minutes=1)
         expiry = datetime.now(timezone.utc).date() + timedelta(days=30)
         drifted = f"SPY{expiry:%y%m%d}C00105000"
 
@@ -1160,6 +1172,16 @@ class DeployTests(unittest.TestCase):
         self.assertNotIn(drifted, sample())
         self.assertIn(drifted, sample(frozenset({drifted})))
         self.assertEqual(len(sample(frozenset({drifted}))), len(sample()) + 1)
+
+    def test_recorder_discards_option_quotes_older_than_the_fetch_window(self):
+        from deploy import recorder_market
+        fake = _OptionFake()
+        quotes = fake.quotes(["SPY"], start=None, end=None, feed="iex")
+        now = datetime.now(timezone.utc)
+        rows = list(recorder_market._option_rows(
+            fake, ["SPY"], quotes, now, feed="iex", config=None, limit=2,
+            minimum_timestamp=fake.option_timestamp + timedelta(seconds=1)))
+        self.assertEqual(rows, [])
 
     def test_recorder_pins_sampled_contracts_until_the_hold_expires(self):
         fake = _OptionFake()
