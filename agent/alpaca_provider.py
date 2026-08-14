@@ -8,9 +8,10 @@ clock checks.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import uuid
-import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -111,6 +112,30 @@ def _order_status_matches(value: Any, requested: str | None) -> bool:
     if requested == "closed":
         return status in _TERMINAL_ORDER_STATUSES
     return status == requested
+
+
+def _order_lookup_not_found(exc: Exception) -> bool:
+    """Recognize Alpaca's exact missing-order response without hiding 404s."""
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status_code", None)
+    message = str(getattr(exc, "message", "") or "")
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    for value in getattr(exc, "args", ()):
+        if isinstance(value, Mapping):
+            code = value.get("code", code)
+            message = str(value.get("message", message) or message)
+    try:
+        payload = json.loads(str(exc))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, Mapping):
+        code = payload.get("code", code)
+        message = str(payload.get("message", message) or message)
+    if str(code or "") == "40410000":
+        return True
+    return str(status or "") == "404" and "order not found" in message.lower()
 
 
 class AlpacaProvider(AlpacaMarketDataMixin):
@@ -280,9 +305,16 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             # order history when reconciling one id after a timeout.
             if client_order_id and hasattr(self.session.trading, "get_order_by_client_id"):
                 try:
-                    row = self.session.trading.get_order_by_client_id(client_order_id=client_order_id)
-                except TypeError:
-                    row = self.session.trading.get_order_by_client_id(client_order_id)
+                    try:
+                        row = self.session.trading.get_order_by_client_id(
+                            client_order_id=client_order_id)
+                    except TypeError:
+                        row = self.session.trading.get_order_by_client_id(
+                            client_order_id)
+                except Exception as exc:  # noqa: BLE001
+                    if _order_lookup_not_found(exc):
+                        return []
+                    raise
                 # Fakes and old SDKs occasionally ignore the lookup argument;
                 # never return an unrelated order as an idempotency match.
                 if row is None:

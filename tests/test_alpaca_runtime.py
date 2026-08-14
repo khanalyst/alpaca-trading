@@ -240,6 +240,42 @@ class AlpacaRuntimeTests(unittest.TestCase):
         with self.assertRaises(IdempotencyConflict):
             provider.submit_order(request)
 
+    def test_exact_order_lookup_treats_alpaca_missing_code_as_absent(self):
+        class OrderNotFound(Exception):
+            def __str__(self):
+                return ('{"code":40410000,"message":"order not found for '
+                        'smoke-open-test"}')
+
+        class MissingLookup(TradingFake):
+            def get_order_by_client_id(self, client_order_id):
+                raise OrderNotFound()
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=MissingLookup()))
+        self.assertEqual(provider.orders(client_order_id="smoke-open-test"), [])
+        order = provider.submit_order(OrderRequest(
+            "SPY", Decimal("1"), "buy",
+            client_order_id="smoke-open-test"))
+        self.assertEqual(order.client_order_id, "smoke-open-test")
+
+    def test_exact_order_lookup_does_not_hide_unrelated_404(self):
+        class RouteNotFound(Exception):
+            status_code = 404
+
+            def __str__(self):
+                return '{"code":40400000,"message":"route not found"}'
+
+        class BrokenLookup(TradingFake):
+            def get_order_by_client_id(self, client_order_id):
+                raise RouteNotFound()
+
+        provider = AlpacaProvider(
+            {"mode": "paper"}, session=AlpacaSession(
+                paper=True, trading_client=BrokenLookup()))
+        with self.assertRaisesRegex(AlpacaError, "route not found"):
+            provider.orders(client_order_id="smoke-open-test")
+
     def test_idempotency_full_bounded_history_does_not_prove_absence(self):
         class FullHistory(TradingFake):
             def get_orders(self, **kwargs):
