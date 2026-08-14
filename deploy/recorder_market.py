@@ -317,7 +317,8 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
           *, feed: str | None = None, config: dict | None = None,
           include_options: bool = False, option_limit: int = 5,
           start: datetime | None = None,
-          option_pins: frozenset[str] = frozenset()):
+          option_pins: frozenset[str] = frozenset(),
+          observed_at: datetime | None = None):
     start = start or now - timedelta(minutes=3)
     if start.tzinfo is None or start.utcoffset() is None or start > now:
         raise ValueError("recorder start must be an aware timestamp at or before now")
@@ -330,7 +331,7 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
                               feed=feed)
     quotes = _call_quotes(provider.quotes, symbols, start=start, end=now,
                           feed=feed)
-    observed = now.isoformat()
+    observed = (observed_at or now).isoformat()
     for raw_symbol, values in bars.items():
         symbol = validate_equity_symbol(raw_symbol)
         for bar in values:

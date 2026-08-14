@@ -20,8 +20,11 @@ import argparse
 import csv
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 import time
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -108,6 +111,8 @@ PARTITION_DIR = "sessions"
 # failure rather than a silent append -- replaying an old key is impossible, not
 # merely unlikely.
 DEDUP_HORIZON = timedelta(minutes=15)
+DEFAULT_FETCH_WINDOW_MINUTES = 15
+MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 
 
 def _session_date(value: datetime) -> date:
@@ -151,30 +156,92 @@ def iter_corpus_rows(output: Path):
             raise RuntimeError(f"cannot read recorder dataset {source}: {exc}") from exc
 
 
-def _scan_corpus(output: Path) -> dict:
-    """Rebuild durable state by reading the corpus once. Recovery path only."""
-    keys: dict[str, str] = {}
-    watermark: datetime | None = None
-    latest_bars: dict[str, str] = {}
+def _validated_corpus_rows(output: Path):
+    """Yield validated corpus rows without retaining the corpus in memory."""
     for row in iter_corpus_rows(output):
         key = str(row.get("event_key") or "").strip()
         if not key:
             raise RuntimeError("recorder dataset row has no event_key")
         event, symbol, parsed = _validate_dataset_row(row)
-        if key in keys:
-            raise RuntimeError(f"recorder dataset repeats event_key {key}")
-        keys[key] = parsed.isoformat()
+        yield row, key, event, symbol, parsed
+
+
+def _scan_corpus(output: Path) -> dict:
+    """Rebuild live state with memory bounded by the deduplication window.
+
+    The live recorder needs the watermark, latest bars, and recent event keys;
+    it does not need an in-memory set of every historical event key.  A first
+    pass validates the corpus and finds the watermark.  A second pass retains
+    only keys inside ``DEDUP_HORIZON``.  Exact historical duplicate detection
+    is provided by :func:`audit_corpus`, which is intentionally an explicit
+    offline operation.
+    """
+    watermark: datetime | None = None
+    latest_bars: dict[str, str] = {}
+    for _row, _key, event, symbol, parsed in _validated_corpus_rows(output):
         if watermark is None or parsed > watermark:
             watermark = parsed
         if event in {"bar", "bar_1m"}:
             previous = latest_bars.get(symbol)
             if previous is None or parsed.isoformat() > previous:
                 latest_bars[symbol] = parsed.isoformat()
+
+    recent_keys: dict[str, str] = {}
+    if watermark is not None:
+        floor = watermark - DEDUP_HORIZON
+        for _row, key, _event, _symbol, parsed in _validated_corpus_rows(output):
+            if parsed < floor:
+                continue
+            if key in recent_keys:
+                raise RuntimeError(f"recorder dataset repeats recent event_key {key}")
+            recent_keys[key] = parsed.isoformat()
+
     index = {"schema": INDEX_SCHEMA,
              "watermark": watermark.isoformat() if watermark else None,
-             "latest_bars": latest_bars, "recent_keys": keys,
+             "latest_bars": latest_bars, "recent_keys": recent_keys,
              "option_pins": {}, "partitions": _partition_sizes(output)}
     return _prune_index(index)
+
+
+def audit_corpus(output: Path) -> dict:
+    """Validate every row and detect global duplicate keys on disk.
+
+    SQLite provides an exact uniqueness constraint without allocating a Python
+    set proportional to the corpus.  This is deliberately separate from live
+    recovery: a full historical audit can be expensive, while normal recorder
+    startup must remain bounded by the recent deduplication window.
+    """
+    root = _corpus_root(output)
+    root.mkdir(parents=True, exist_ok=True)
+    rows = 0
+    watermark: datetime | None = None
+    with tempfile.TemporaryDirectory(prefix=".recorder-audit-", dir=str(root)) as directory:
+        database = Path(directory) / "keys.sqlite3"
+        with closing(sqlite3.connect(database)) as db:
+            with db:
+                db.execute("PRAGMA journal_mode=OFF")
+                db.execute("PRAGMA synchronous=OFF")
+                db.execute("PRAGMA temp_store=FILE")
+                db.execute("CREATE TABLE event_keys (event_key TEXT PRIMARY KEY)")
+                for _row, key, _event, _symbol, parsed in _validated_corpus_rows(output):
+                    try:
+                        db.execute("INSERT INTO event_keys(event_key) VALUES (?)", (key,))
+                    except sqlite3.IntegrityError as exc:
+                        raise RuntimeError(
+                            f"recorder dataset repeats event_key {key}") from exc
+                    rows += 1
+                    if watermark is None or parsed > watermark:
+                        watermark = parsed
+                    if rows % 10_000 == 0:
+                        db.commit()
+                db.commit()
+    return {
+        "schema": "recorder-audit.v1",
+        "status": "ok",
+        "rows": rows,
+        "watermark": watermark.isoformat() if watermark else None,
+        "partitions": _partition_sizes(output),
+    }
 
 
 def _partition_sizes(output: Path) -> dict[str, int]:
@@ -352,9 +419,10 @@ def _migrate_header(output: Path) -> None:
     """Upgrade a pre-dedup CSV before appending rows with ``event_key``."""
     if not output.exists() or output.stat().st_size == 0:
         return
+    temporary = output.with_suffix(output.suffix + ".migrate")
     try:
-        with output.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
+        with output.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
             if "event_key" in (reader.fieldnames or []):
                 return
             required = {"event_type", "symbol", "timestamp"}
@@ -362,26 +430,26 @@ def _migrate_header(output: Path) -> None:
             if not required.issubset(fields):
                 raise RuntimeError(
                     f"legacy recorder dataset has invalid header; missing {sorted(required - fields)}")
-            rows = list(reader)
-            if any(None in row for row in rows):
-                raise RuntimeError("legacy recorder dataset contains a malformed CSV row")
+            with temporary.open("w", newline="", encoding="utf-8") as target:
+                writer = csv.DictWriter(target, fieldnames=FIELDS)
+                writer.writeheader()
+                for raw in reader:
+                    if None in raw:
+                        raise RuntimeError("legacy recorder dataset contains a malformed CSV row")
+                    row = {str(key): value for key, value in raw.items() if key is not None}
+                    _validate_dataset_row(row)
+                    row["event_key"] = _event_key(
+                        row.get("event_type", ""), row.get("symbol", ""),
+                        row.get("timestamp", ""))
+                    writer.writerow({field: row.get(field, "") for field in FIELDS})
+                target.flush()
+                os.fsync(target.fileno())
     except (OSError, csv.Error) as exc:
+        temporary.unlink(missing_ok=True)
         raise RuntimeError(f"cannot migrate recorder dataset {output}: {exc}") from exc
-    migrated = []
-    for row in rows:
-        row = {str(key): value for key, value in row.items() if key is not None}
-        _validate_dataset_row(row)
-        row["event_key"] = _event_key(row.get("event_type", ""),
-                                       row.get("symbol", ""),
-                                       row.get("timestamp", ""))
-        migrated.append({field: row.get(field, "") for field in FIELDS})
-    temporary = output.with_suffix(output.suffix + ".migrate")
-    with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(migrated)
-        handle.flush()
-        os.fsync(handle.fileno())
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     os.replace(temporary, output)
 
 
@@ -417,24 +485,118 @@ def migrate_corpus(output: Path) -> int:
     _migrate_header(output)
     if not output.exists() or output.stat().st_size == 0:
         return 0
-    rows: list[dict] = []
-    seen: set[str] = set()
-    for row in iter_corpus_rows(output):
-        key = str(row.get("event_key") or "").strip()
-        if not key:
-            raise RuntimeError("recorder dataset row has no event_key")
-        _validate_dataset_row(row)
-        if key in seen:  # the migration is the one chance to restore uniqueness
-            continue
-        seen.add(key)
-        rows.append(row)
     if corpus_partitions(output):
         raise RuntimeError(
             f"cannot migrate {output}: session partitions already exist")
-    _append_partitions(output, rows)
+
+    # Migration is an explicit offline operation, so validate all historical
+    # keys with the disk-backed audit before streaming rows into partitions.
+    audit_corpus(output)
+    staged: dict[date, tuple[object, csv.DictWriter, Path]] = {}
+    count = 0
+    try:
+        for row, _key, _event, _symbol, parsed in _validated_corpus_rows(output):
+            day = _session_date(parsed)
+            path = _partition_path(output, day)
+            temporary = path.with_suffix(path.suffix + ".migrate")
+            if day not in staged:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary.unlink(missing_ok=True)
+                handle = temporary.open("w", newline="", encoding="utf-8")
+                writer = csv.DictWriter(handle, fieldnames=FIELDS)
+                writer.writeheader()
+                staged[day] = (handle, writer, path)
+            handle, writer, _path = staged[day]
+            writer.writerow({field: row.get(field, "") for field in FIELDS})
+            count += 1
+        for handle, _writer, _path in staged.values():
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+        for _day, (_handle, _writer, path) in staged.items():
+            temporary = path.with_suffix(path.suffix + ".migrate")
+            os.replace(temporary, path)
+    except Exception:
+        for handle, _writer, path in staged.values():
+            try:
+                handle.close()
+            except OSError:
+                pass
+            path.with_suffix(path.suffix + ".migrate").unlink(missing_ok=True)
+        raise
     os.replace(output, output.with_name(output.name + ".migrated"))
     _save_index(output, _scan_corpus(output))
-    return len(rows)
+    return count
+
+
+def _fetch_window_minutes() -> int:
+    raw = os.getenv("ALPACA_RECORDER_FETCH_WINDOW_MINUTES",
+                    str(DEFAULT_FETCH_WINDOW_MINUTES))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "ALPACA_RECORDER_FETCH_WINDOW_MINUTES must be a positive integer"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            "ALPACA_RECORDER_FETCH_WINDOW_MINUTES must be a positive integer")
+    return value
+
+
+def _ingest_chunk(output: Path, index: dict, seen: set[str],
+                  watermark: datetime | None,
+                  latest_bars: dict[str, datetime], pins: dict,
+                  rows: list[dict], symbols: list[str],
+                  window_end: datetime, observed_at: datetime,
+                  option_hold: timedelta,
+                  horizon: datetime | None,
+                  calendar: CalendarCache | None):
+    """Validate and durably append one bounded provider response."""
+    _verify_bar_continuity(rows, latest_bars, window_end, symbols, calendar)
+    unique_rows: list[dict] = []
+    for row in rows:
+        parsed = _timestamp(row.get("timestamp"))
+        if parsed is None:
+            raise RuntimeError("recorder row has an invalid timestamp")
+        if horizon is not None and parsed < horizon:
+            # Outside the durable dedup window uniqueness cannot be proven, so
+            # the row is refused rather than risking a silent replay.
+            raise RuntimeError(
+                "recorder received rows older than the dedup window")
+        key = str(row.get("event_key") or "").strip()
+        if not key:
+            raise RuntimeError("recorder row has no event_key")
+        if row.get("event_type") == "option_snapshot":
+            # Refresh the hold even when the snapshot itself is a duplicate;
+            # the option contract remains pinned while the recorder observes it.
+            pins[str(row.get("contract") or row.get("symbol"))] = (
+                observed_at + option_hold).isoformat()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+        index["recent_keys"][key] = parsed.isoformat()
+        if watermark is None or parsed > watermark:
+            watermark = parsed
+        if row.get("event_type") in {"bar", "bar_1m"}:
+            symbol = str(row.get("symbol") or "")
+            if index["latest_bars"].get(symbol, "") < parsed.isoformat():
+                index["latest_bars"][symbol] = parsed.isoformat()
+            previous = latest_bars.get(symbol)
+            if previous is None or parsed > previous:
+                latest_bars[symbol] = parsed
+
+    index["option_pins"] = pins
+    index["watermark"] = watermark.isoformat() if watermark else None
+    index = _prune_index(index)
+    if rows:
+        if unique_rows:
+            _append_partitions(output, unique_rows)
+        # Persist even a duplicate-only response: the sidecar write is the
+        # recorder's durable liveness signal, while the corpus remains unchanged.
+        _save_index(output, index)
+    return index, set(index["recent_keys"]), watermark, latest_bars, pins, len(unique_rows)
 
 
 def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
@@ -463,54 +625,35 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
         raise RuntimeError("recorder dataset watermark is in the future")
     # Resume from durable data rather than a fixed three-minute lookback. The
     # one-minute overlap makes retries safe while the event key removes dupes.
+    # A stale watermark is split into bounded requests so a long outage cannot
+    # materialize millions of quotes in one provider response.
     start = (watermark - timedelta(minutes=1)
              if watermark is not None else now - timedelta(minutes=3))
     pins = {contract: value for contract, value in index["option_pins"].items()
             if str(value) > now.isoformat()}
-    rows = list(_rows(provider, symbols, now, feed=feed, config=config,
-                      include_options=bool(include_options),
-                      option_limit=option_limit, start=start,
-                      option_pins=frozenset(pins)))
-    if not rows:
-        raise RuntimeError("Alpaca returned no point-in-time bars or quotes")
-    _verify_bar_continuity(rows, latest_bars, now, symbols, calendar)
     horizon = None if watermark is None else watermark - DEDUP_HORIZON
-    unique_rows = []
-    for row in rows:
-        parsed = _timestamp(row.get("timestamp"))
-        if parsed is None:
-            raise RuntimeError("recorder row has an invalid timestamp")
-        if horizon is not None and parsed < horizon:
-            # Outside the durable dedup window uniqueness cannot be proven, so
-            # the row is refused rather than risking a replayed key.
-            raise RuntimeError(
-                "recorder received rows older than the dedup window")
-        key = row["event_key"]
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_rows.append(row)
-        index["recent_keys"][key] = parsed.isoformat()
-        if watermark is None or parsed > watermark:
-            watermark = parsed
-        if row.get("event_type") in {"bar", "bar_1m"}:
-            symbol = str(row.get("symbol") or "")
-            if index["latest_bars"].get(symbol, "") < parsed.isoformat():
-                index["latest_bars"][symbol] = parsed.isoformat()
-    for row in rows:
-        # Any sampled contract stays sampled for the hold horizon, so a
-        # simulated trade opened on it keeps quotes through its exit.
-        if row.get("event_type") == "option_snapshot":
-            pins[str(row.get("contract") or row.get("symbol"))] = (
-                now + option_hold).isoformat()
-    index["option_pins"] = pins
-    if not unique_rows:
-        _save_index(output, index)
-        return 0
-    index["watermark"] = watermark.isoformat() if watermark else None
-    _append_partitions(output, unique_rows)
-    _save_index(output, _prune_index(index))
-    return len(unique_rows)
+    window = timedelta(minutes=_fetch_window_minutes())
+    cursor = start
+    total_rows = 0
+    total_unique = 0
+    while True:
+        window_end = min(cursor + window, now)
+        rows = list(_rows(
+            provider, symbols, window_end, feed=feed, config=config,
+            include_options=bool(include_options), option_limit=option_limit,
+            start=cursor, option_pins=frozenset(pins), observed_at=now))
+        total_rows += len(rows)
+        index, seen, watermark, latest_bars, pins, unique = _ingest_chunk(
+            output, index, seen, watermark, latest_bars, pins, rows, symbols,
+            window_end, now, option_hold, horizon, calendar)
+        total_unique += unique
+        if window_end >= now:
+            break
+        cursor = window_end
+
+    if total_rows == 0:
+        raise RuntimeError("Alpaca returned no point-in-time bars or quotes")
+    return total_unique
 
 
 def parser() -> argparse.ArgumentParser:
@@ -518,6 +661,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="runtime/research/recorded")
     p.add_argument("--interval", type=float, default=60.0)
     p.add_argument("--once", action="store_true")
+    p.add_argument("--audit", action="store_true",
+                   help="validate the full corpus and detect duplicate keys")
     p.add_argument("--config", default="config.yaml")
     return p
 
@@ -529,13 +674,24 @@ def main(argv=None) -> int:
     env_file = os.getenv("ALPACA_AGENT_SECRETS_FILE")
     if env_file:
         load_dotenv(env_file, override=False)
+    output = Path(args.out) / "market.csv"
+    if args.audit:
+        try:
+            print(json.dumps(audit_corpus(output), sort_keys=True))
+            return 0
+        except Exception as exc:  # explicit audit must report a machine-readable failure
+            print(json.dumps({
+                "schema": "recorder-audit.v1",
+                "status": "failed",
+                "error": str(exc),
+            }, sort_keys=True), file=sys.stderr, flush=True)
+            return 2
     from main import load_cfg
     cfg = load_cfg(args.config)
     symbols = list(cfg.get("universe", {}).get("symbols") or [])
     if not symbols:
         raise SystemExit("config.universe.symbols is empty")
     provider = AlpacaProvider(cfg)
-    output = Path(args.out) / "market.csv"
     option_limit = max(1, min(MAX_OPTION_LIMIT,
                               int(os.getenv("ALPACA_RECORDER_OPTION_LIMIT", "10"))))
     option_hold = timedelta(minutes=max(1, int(
@@ -543,11 +699,33 @@ def main(argv=None) -> int:
     include_options = any(str(value).lower() in {"us_option", "option"}
                           for value in cfg.get("universe", {}).get("asset_classes", []))
     calendar = CalendarCache(provider)
+    failure_count = 0
     while True:
-        count = record_once(provider, symbols, output, config=cfg,
-                            include_options=include_options,
-                            option_limit=option_limit,
-                            option_hold=option_hold, calendar=calendar)
+        try:
+            count = record_once(provider, symbols, output, config=cfg,
+                                include_options=include_options,
+                                option_limit=option_limit,
+                                option_hold=option_hold, calendar=calendar)
+        except Exception as exc:
+            failure_count += 1
+            delay = min(
+                MAX_ERROR_BACKOFF_SECONDS,
+                max(args.interval, 1.0) * (2 ** min(failure_count - 1, 4)),
+            )
+            payload = {
+                "schema": "recorder-error.v1",
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "failure_count": failure_count,
+                "retry_seconds": delay,
+            }
+            print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
+            if args.once:
+                return 1
+            time.sleep(delay)
+            continue
+        failure_count = 0
         print(f"recorded {count} Alpaca rows to {output}", flush=True)
         if args.once:
             return 0

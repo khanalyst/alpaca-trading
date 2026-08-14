@@ -54,6 +54,7 @@ from deploy.recorder import (  # noqa: E402
     _partition_path,
     _save_index,
     _scan_corpus,
+    audit_corpus,
     corpus_partitions,
 )
 from deploy.recorder_market import (  # noqa: E402
@@ -233,10 +234,9 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
         written_sessions.append(day.isoformat())
         if progress is not None:
             progress(day, len(unique))
-    # Rebuilding the index from the corpus is what makes the result
-    # indistinguishable from recorded data: the watermark, per-symbol last bar,
-    # and dedup window all come from the same scan the recorder would do, and a
-    # repeated key anywhere in the corpus fails here rather than downstream.
+    # Backfill is an explicit offline operation, so retain the full duplicate
+    # audit before rebuilding the bounded live index.
+    audit_corpus(output)
     _save_index(output, _scan_corpus(output))
     return {
         "schema": "recorder-backfill.v1", "feed": resolved_feed,

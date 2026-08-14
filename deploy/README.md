@@ -45,9 +45,20 @@ York session date under `runtime/research/recorded/sessions/market-<date>.csv`,
 with a sidecar `.recorder-index.json` holding the watermark, the per-symbol last
 bar, a fifteen-minute dedup window and the option contracts held open for
 continued sampling. A cycle costs O(new rows); the index is verified against
-partition sizes on load and rebuilt from the partitions when they disagree. A
-legacy single-file `market.csv` is partitioned in place on the first run after
-upgrade and kept beside the corpus as `market.csv.migrated`.
+partition sizes on load and rebuilt from the partitions when they disagree. The
+rebuild retains only the bounded dedup window; use the explicit audit command
+when a full historical duplicate check is required:
+
+```sh
+docker compose run --rm --no-deps recorder \
+  python deploy/recorder.py --out runtime/research/recorded --audit
+```
+
+Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
+windows (15 minutes by default), so a long outage cannot materialize the whole
+quote backlog in one process. A legacy single-file `market.csv` is streamed,
+audited, and partitioned in place on the first run after upgrade, then kept
+beside the corpus as `market.csv.migrated`.
 
 Option sampling takes `ALPACA_RECORDER_OPTION_LIMIT` contracts per side per
 sample (default 10, capped at 25) and keeps every contract it has sampled in

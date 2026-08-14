@@ -40,10 +40,14 @@ def setUpModule() -> None:                                     # noqa: N802
     root = Path(_ARTIFACTS.name)
     os.environ["ALPACA_RESEARCH_REPORT_DIR"] = str(root / "reports")
     os.environ["ALPACA_RESEARCH_PROOF_DIR"] = str(root / "proofs")
+    # Keep legacy recorder fakes on one request; chunking itself has dedicated
+    # tests with a deliberately small window.
+    os.environ["ALPACA_RECORDER_FETCH_WINDOW_MINUTES"] = "1000000"
 
 
 def tearDownModule() -> None:                                  # noqa: N802
-    for name in ("ALPACA_RESEARCH_REPORT_DIR", "ALPACA_RESEARCH_PROOF_DIR"):
+    for name in ("ALPACA_RESEARCH_REPORT_DIR", "ALPACA_RESEARCH_PROOF_DIR",
+                 "ALPACA_RECORDER_FETCH_WINDOW_MINUTES"):
         os.environ.pop(name, None)
     if _ARTIFACTS is not None:
         _ARTIFACTS.cleanup()
@@ -79,6 +83,23 @@ class _WindowFake(_MarketFake):
     def quotes(self, symbols, *, start, end, feed):
         self.starts.append(start)
         return super().quotes(symbols, start=start, end=end, feed=feed)
+
+
+class _QuoteChunkFake:
+    data_feed = "iex"
+
+    def __init__(self):
+        self.windows = []
+
+    def bars(self, symbols, *, start, end, feed, **kwargs):
+        self.windows.append(("bars", start, end))
+        return {}
+
+    def quotes(self, symbols, *, start, end, feed):
+        self.windows.append(("quotes", start, end))
+        timestamp = end - timedelta(seconds=1)
+        return {"SPY": [SimpleNamespace(
+            timestamp=timestamp, bid=100, ask=101, last=100.5)]}
 
 
 class _MissingQuoteTimestampFake(_MarketFake):
@@ -700,6 +721,53 @@ class DeployTests(unittest.TestCase):
                                 tzinfo=timezone.utc)
             self.assertEqual(fake.starts[-2:], [expected, expected])
 
+    def test_recorder_chunks_a_stale_quote_catch_up_window(self):
+        fake = _QuoteChunkFake()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            stamp = datetime.now(timezone.utc) - timedelta(hours=3)
+            row = {field: "" for field in recorder.FIELDS}
+            row.update({
+                "event_key": recorder._event_key("quote", "SPY", stamp.isoformat()),
+                "observed_at": stamp.isoformat(), "provider": "alpaca",
+                "feed": "iex", "event_type": "quote", "symbol": "SPY",
+                "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
+                "bid": "100", "ask": "101", "last": "100.5",
+            })
+            recorder._append_partitions(path, [row])
+            recorder._save_index(path, recorder._scan_corpus(path))
+            with patch.dict(os.environ, {"ALPACA_RECORDER_FETCH_WINDOW_MINUTES": "30"}):
+                count = recorder.record_once(fake, ["SPY"], path)
+            self.assertGreater(count, 1)
+            windows = [item for item in fake.windows if item[0] == "quotes"]
+            self.assertGreater(len(windows), 1)
+            self.assertTrue(all(end - start <= timedelta(minutes=30)
+                                for _kind, start, end in windows))
+
+    def test_recorder_scan_retains_only_recent_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market.csv"
+            rows = _corpus_rows(sessions=30, per_session=200)
+            recorder._append_partitions(path, rows)
+            index = recorder._scan_corpus(path)
+            self.assertLess(len(index["recent_keys"]), len(rows))
+            self.assertLessEqual(len(index["recent_keys"]), 16)
+
+    def test_recorder_service_retries_errors_without_exiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(recorder, "AlpacaProvider", return_value=object()), \
+                    patch.object(recorder, "record_once",
+                                 side_effect=[RuntimeError("continuity gap"),
+                                              KeyboardInterrupt()]) as record, \
+                    patch.object(recorder.time, "sleep") as sleep:
+                with self.assertRaises(KeyboardInterrupt):
+                    recorder.main([
+                        "--config", "config.yaml", "--out", directory,
+                        "--interval", "2",
+                    ])
+            self.assertEqual(record.call_count, 2)
+            sleep.assert_called_once_with(2.0)
+
     def test_recorder_skips_quotes_without_point_in_time_timestamp(self):
         fake = _MissingQuoteTimestampFake()
         with tempfile.TemporaryDirectory() as directory:
@@ -824,7 +892,7 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(len(keys), len(set(keys)))
             recorder._append_partitions(path, rows[:1])
             with self.assertRaisesRegex(RuntimeError, "repeats event_key"):
-                recorder._scan_corpus(path)
+                recorder.audit_corpus(path)
 
     def test_recorder_refuses_rows_older_than_the_dedup_window(self):
         fake = _MarketFake()
