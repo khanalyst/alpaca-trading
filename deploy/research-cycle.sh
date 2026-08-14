@@ -92,7 +92,9 @@ if [[ "$recorded_root" != /* ]]; then
   recorded_root="$repo_root/$recorded_root"
 fi
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/alpaca-research.XXXXXX")"
+tmp_root="${TMPDIR:-/tmp}"
+mkdir -p "$tmp_root"
+tmp_dir="$(mktemp -d "$tmp_root/alpaca-research.XXXXXX")"
 
 # The recorder partitions its corpus by session date. Concatenate the requested
 # window of partitions once, in order, instead of keeping an unbounded file.

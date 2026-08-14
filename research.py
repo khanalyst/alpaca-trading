@@ -18,7 +18,7 @@ if str(REPO) not in sys.path:
 
 from research.calibration import json_report as calibration_report
 from research.costs import (CostModel, DEFAULT_FEE_BPS, DEFAULT_SLIPPAGE_BPS,
-                            DEFAULT_SPREAD_BPS)
+                            DEFAULT_SPREAD_BPS, SQLiteQuoteIndex)
 from research.ibr import IBRConfig, replay_ibr, replay_ibr_vehicles
 from research.edge_lab import (EdgeLedger, DEFAULT_DB_PATH, discover,
                                init_ledger)
@@ -35,13 +35,13 @@ from research.strategy_factory import DEFAULT_WORKERS, factory_status, run_facto
 from agent.config import load_config as load_agent_config
 
 
-def _json_rows(path: str | Path) -> list[dict[str, Any]]:
+def _iter_json_rows(path: str | Path):
+    """Yield JSONL objects without retaining the complete source in memory."""
     source = Path(path)
     if source == Path("-"):
         lines = sys.stdin
     else:
         lines = source.open(encoding="utf-8")
-    rows: list[dict[str, Any]] = []
     try:
         for number, line in enumerate(lines, 1):
             line = line.strip()
@@ -53,11 +53,15 @@ def _json_rows(path: str | Path) -> list[dict[str, Any]]:
                 raise SystemExit(f"{source}:{number}: invalid JSON: {exc}") from exc
             if not isinstance(value, dict):
                 raise SystemExit(f"{source}:{number}: expected an object")
-            rows.append(value)
+            yield value
     finally:
         if source != Path("-"):
             lines.close()
-    return rows
+
+
+def _json_rows(path: str | Path) -> list[dict[str, Any]]:
+    """Load JSONL rows for the small callers that need random access."""
+    return list(_iter_json_rows(path))
 
 
 def _config(args: argparse.Namespace) -> IBRConfig:
@@ -84,7 +88,7 @@ def _time(value: str):
 def cmd_validate_data(args: argparse.Namespace) -> int:
     counts = {"bars": 0, "quotes": 0, "options": 0}
     errors: list[str] = []
-    for number, row in enumerate(_json_rows(args.input), 1):
+    for number, row in enumerate(_iter_json_rows(args.input), 1):
         kind = str(row.get("kind", "bar")).lower()
         try:
             if kind in {"bar", "underlying_bar", "underlying"}:
@@ -127,34 +131,54 @@ def _add_cost_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def _quotes(args: argparse.Namespace):
-    """Load the optional executable-quote view replay prices boundaries from."""
+    """Build a bounded-memory executable-quote view for replay boundaries."""
     path = getattr(args, "quotes", None)
     if not path:
         return None
-    quotes = []
-    for number, row in enumerate(_json_rows(path), 1):
-        try:
-            quotes.append(normalize_quote(
-                row, provider=args.provider, feed=args.feed))
-        except (NormalizationError, ValueError) as exc:
-            raise SystemExit(f"quote row {number}: {exc}") from exc
-    return quotes or None
+    source = Path(path)
+    index = SQLiteQuoteIndex()
+    try:
+        with source.open(encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("expected an object")
+                    index.add(normalize_quote(
+                        row, provider=args.provider, feed=args.feed))
+                except (json.JSONDecodeError, NormalizationError, ValueError) as exc:
+                    index.close()
+                    raise SystemExit(f"{source}:{number}: invalid quote: {exc}") from exc
+    except OSError as exc:
+        index.close()
+        raise SystemExit(f"{source}: unable to read quotes: {exc}") from exc
+    if not index:
+        index.close()
+        return None
+    return index
 
 
 def cmd_backtest_ibr(args: argparse.Namespace) -> int:
     bars = _bars(args)
     quotes = _quotes(args)
     cfg = _config(args)
-    if args.vehicle == "both":
-        result = replay_ibr_vehicles(bars, config=cfg, quotes=quotes,
-                                     vehicles=("equity", "option"))
-        print(json.dumps({key: value.summary() for key, value in result.items()},
-                         sort_keys=True))
-    else:
-        result = replay_ibr(bars, config=cfg, vehicle=args.vehicle,
-                            symbol=args.symbol, quotes=quotes)
-        print(json.dumps(result.summary(), sort_keys=True))
-    return 0
+    try:
+        if args.vehicle == "both":
+            result = replay_ibr_vehicles(bars, config=cfg, quotes=quotes,
+                                         vehicles=("equity", "option"))
+            print(json.dumps({key: value.summary() for key, value in result.items()},
+                             sort_keys=True))
+        else:
+            result = replay_ibr(bars, config=cfg, vehicle=args.vehicle,
+                                symbol=args.symbol, quotes=quotes)
+            print(json.dumps(result.summary(), sort_keys=True))
+        return 0
+    finally:
+        if quotes is not None and callable(getattr(quotes, "close", None)):
+            quotes.close()
 
 
 def _read_json(path: str | Path | None, default):

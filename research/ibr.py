@@ -505,6 +505,9 @@ def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,
     if vehicle not in {"equity", "option"}:
         raise ReplayError("vehicle must be 'equity' or 'option'")
     cfg = config or IBRConfig()
+    # A large recorded corpus may provide a disk-backed resolver.  Passing it
+    # through avoids materializing every quote just to answer boundary fills;
+    # ordinary test/in-memory iterables retain the historical grouping path.
     quote_index = index_quotes(quotes)
     rows = _validate_bars(list(bars), cfg)
     if symbol is not None:
@@ -539,11 +542,13 @@ def replay_ibr_vehicles(
     if len(set(requested)) != len(requested):
         raise ReplayError("vehicles must be unique")
     materialized = list(bars)
-    materialized_quotes = list(quotes or ())
+    quote_index = (quotes if quotes is not None and
+                   callable(getattr(quotes, "quote_fill", None)) else
+                   list(quotes or ()))
     return {
         vehicle: replay_ibr(
             materialized, symbol=symbol, config=config, vehicle=vehicle,
-            option_snapshots=option_snapshots, quotes=materialized_quotes)
+            option_snapshots=option_snapshots, quotes=quote_index)
         for vehicle in requested
     }
 

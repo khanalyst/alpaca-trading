@@ -49,6 +49,9 @@ def canonical_json(value: Any) -> str:
 
 
 def content_hash(value: Any) -> str:
+    streamed = getattr(value, "content_hash", None)
+    if callable(streamed):
+        return str(streamed())
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 

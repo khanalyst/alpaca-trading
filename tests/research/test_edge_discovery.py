@@ -25,6 +25,7 @@ from research.gates import (
     max_drawdown_of, performance_floor, placebo_null_distribution, qualification_report,
     structural_floor, verified_gate_envelope, walk_forward_report,
 )
+from research.costs import SQLiteQuoteIndex, quote_fill
 
 
 def _gate_evidence(heldout, *, alpha=.05):
@@ -480,6 +481,25 @@ class DiscoveryCorpusStreamingTests(unittest.TestCase):
                 handle.write("{not json\n")
             with self.assertRaisesRegex(DiscoveryError, broken.name):
                 edge_discovery_core._read_discovery_rows(corpus)
+
+    def test_large_file_spills_quotes_without_changing_dataset_hash(self):
+        rows = self._rows(sessions=1)
+        timestamp = rows[0]["timestamp"]
+        rows.append({"kind": "quote", "provider": "alpaca", "feed": "sip",
+                     "symbol": "SPY", "timestamp": timestamp,
+                     "as_of": timestamp, "observed_at": timestamp,
+                     "bid": 99.9, "ask": 100.1})
+        with tempfile.TemporaryDirectory() as directory:
+            source = self._write(Path(directory), rows, partitioned=False)
+            with mock.patch.object(edge_discovery_core, "QUOTE_INDEX_MIN_BYTES", 1):
+                raw, bars, _, quotes = edge_discovery_core._read_discovery_rows(source)
+            self.assertIsInstance(raw, edge_discovery_core._StreamingRawRows)
+            self.assertIsInstance(quotes, SQLiteQuoteIndex)
+            self.assertEqual(content_hash(raw), content_hash(rows))
+            self.assertAlmostEqual(
+                quote_fill(quotes, symbol="SPY", at=datetime.fromisoformat(timestamp),
+                           side="buy"), 100.1, places=9)
+            quotes.close()
 
 
 class EdgeDiscoveryLifecycleTests(unittest.TestCase):

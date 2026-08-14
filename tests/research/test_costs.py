@@ -20,7 +20,7 @@ from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
                             RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
-                            index_quotes, quote_fill)
+                            SQLiteQuoteIndex, index_quotes, quote_fill)
 from research.edge_discovery_core import (DiscoveryError,
                                           _effective_ibr_config,
                                           _read_discovery_rows)
@@ -331,6 +331,31 @@ class QuoteDrivenFillTests(unittest.TestCase):
         self.assertIsNone(quote_fill(None, symbol="SPY", at=BASE, side="buy"))
         self.assertIsNone(quote_fill(index_quotes([_quote(4, 100.0, 100.1)]),
                                      symbol="QQQ", at=BASE, side="buy"))
+
+
+class SQLiteQuoteIndexTests(unittest.TestCase):
+    """The bounded quote store must preserve point-in-time fill semantics."""
+
+    def test_latest_visible_quote_matches_the_in_memory_index(self):
+        visible = _quote(4, 100.0, 100.1)
+        delayed = _quote(5, 101.0, 101.1, as_of_minute=6)
+        expected = index_quotes([visible, delayed])
+        index = SQLiteQuoteIndex()
+        try:
+            index.add(visible)
+            index.add(delayed)
+            at = BASE + timedelta(minutes=5)
+            self.assertEqual(
+                quote_fill(index, symbol="SPY", at=at, side="buy",
+                           max_age_seconds=90),
+                quote_fill(expected, symbol="SPY", at=at, side="buy",
+                           max_age_seconds=90),
+            )
+            self.assertAlmostEqual(
+                quote_fill(index, symbol="SPY", at=at, side="buy",
+                           max_age_seconds=90), 100.1, places=9)
+        finally:
+            index.close()
 
     def test_an_entry_uses_the_recorded_ask_and_records_the_source(self):
         bars = _bars(RISING + FLAT)

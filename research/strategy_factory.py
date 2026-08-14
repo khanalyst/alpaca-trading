@@ -1278,7 +1278,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
-    quotes = list(quote_rows)
+    quote_resolver = callable(getattr(quote_rows, "quote_fill", None))
+    quotes = quote_rows if quote_resolver else list(quote_rows)
     # A recorded corpus is re-read by each worker from its own descriptor; an
     # in-memory one has no path to re-read and still travels with the task.
     # ``corpus_end`` pins the window against an append-only recorder writing
@@ -1287,17 +1288,25 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
     # relative path is only the same file by coincidence of working directory.
     corpus_source = (str(Path(data).resolve()) if isinstance(data, (str, Path))
                      else None)
+    quote_sessions = []
+    if quote_resolver:
+        latest_quote_session = getattr(quote_rows, "max_session_date", None)
+        if latest_quote_session is not None:
+            quote_sessions.append(latest_quote_session.isoformat())
+    else:
+        quote_sessions = [quote.session_date.isoformat() for quote in quotes]
     corpus_end = max([_session(bar) for bar in bars] +
                      [snap.session_date.isoformat() for snap in snapshots] +
-                     [quote.session_date.isoformat() for quote in quotes])
+                     quote_sessions)
     for hypothesis in active:
         mode = "shadow" if hypothesis.get("status") == "backtest_passed" else "backtest"
         boundary = (factory.last_boundary(hypothesis["hypothesis_id"], vehicle)
                     if mode == "shadow" else hypothesis.get("not_before"))
         selected_bars = [bar for bar in bars if boundary is None or _session(bar) > boundary]
         selected_snapshots = [snap for snap in snapshots if boundary is None or snap.session_date.isoformat() > boundary]
-        selected_quotes = [quote for quote in quotes
-                           if boundary is None or quote.session_date.isoformat() > boundary]
+        selected_quotes = (quotes if quote_resolver else
+                           [quote for quote in quotes
+                            if boundary is None or quote.session_date.isoformat() > boundary])
         specs = _existing_specs(edge, hypothesis["hypothesis_id"], vehicle) if mode == "shadow" else []
         if mode == "shadow" and not specs:
             factory.event(hypothesis["hypothesis_id"], "backtest_passed",
@@ -1320,8 +1329,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             sealed,
             [snap for snap in selected_snapshots
              if snap.session_date.isoformat() in sealed_sessions],
-            [quote for quote in selected_quotes
-             if quote.session_date.isoformat() in sealed_sessions])
+            (selected_quotes if quote_resolver else
+             [quote for quote in selected_quotes
+              if quote.session_date.isoformat() in sealed_sessions]))
         task = {
             "hypothesis": hypothesis, "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
@@ -1332,8 +1342,9 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 "bars": development_bars,
                 "snapshots": [snap for snap in selected_snapshots
                               if snap.session_date.isoformat() not in sealed_sessions],
-                "quotes": [quote for quote in selected_quotes
-                           if quote.session_date.isoformat() not in sealed_sessions],
+                "quotes": ([quote for quote in selected_quotes
+                            if quote.session_date.isoformat() not in sealed_sessions]
+                           if not quote_resolver else selected_quotes),
             })
         else:
             task["corpus"] = {"source": corpus_source, "after": boundary,

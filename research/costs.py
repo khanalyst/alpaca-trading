@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import math
+from pathlib import Path
+import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 # A quoted spread of ~2 bps covers a one- to two-cent book on the configured
@@ -314,8 +316,156 @@ BAR = "bar"
 QUOTE = "quote"
 
 
-def index_quotes(quotes: Iterable[Any] | None) -> dict[str, list]:
+class SQLiteQuoteIndex:
+    """Disk-backed quote resolver for large recorded corpora.
+
+    A research cycle only asks for the latest visible quote at a fill boundary;
+    retaining millions of normalized quote objects in a Python list is both
+    wasteful and the source of the backtest OOM.  This index stores the small
+    set of fields needed by :func:`quote_fill` in a temporary SQLite database
+    and keeps only the symbol-id map and a write batch in memory.
+    """
+
+    _BATCH_SIZE = 10_000
+
+    def __init__(self, directory: str | Path | None = None):
+        import sqlite3
+
+        self._temporary: tempfile.TemporaryDirectory | None = None
+        if directory is None:
+            self._temporary = tempfile.TemporaryDirectory(prefix="alpaca-quotes-")
+            root = Path(self._temporary.name)
+        else:
+            root = Path(directory)
+            root.mkdir(parents=True, exist_ok=True)
+        self.path = root / "quotes.sqlite3"
+        self._db = sqlite3.connect(str(self.path), timeout=30)
+        self._db.execute("PRAGMA journal_mode=OFF")
+        self._db.execute("PRAGMA synchronous=OFF")
+        self._db.execute("PRAGMA temp_store=FILE")
+        self._db.execute("""
+            CREATE TABLE quotes (
+                symbol_id INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                as_of REAL NOT NULL,
+                bid REAL NOT NULL,
+                ask REAL NOT NULL,
+                session_day INTEGER NOT NULL,
+                sequence INTEGER NOT NULL,
+                PRIMARY KEY (symbol_id, timestamp, sequence)
+            ) WITHOUT ROWID
+        """)
+        self._symbols: dict[str, int] = {}
+        self._pending: list[tuple[int, float, float, float, float, int, int]] = []
+        self._sequence = 0
+        self._count = 0
+        self._max_session_day: int | None = None
+        self._closed = False
+
+    def add(self, quote: Any) -> None:
+        if self._closed:
+            raise RuntimeError("quote index is closed")
+        symbol = str(quote.symbol).upper()
+        symbol_id = self._symbols.get(symbol)
+        if symbol_id is None:
+            symbol_id = len(self._symbols) + 1
+            self._symbols[symbol] = symbol_id
+        timestamp = float(quote.timestamp.timestamp())
+        as_of = float(quote.identity.as_of.timestamp())
+        session_day = int(quote.session_date.toordinal())
+        self._pending.append((
+            symbol_id, timestamp, as_of, float(quote.bid), float(quote.ask),
+            session_day, self._sequence,
+        ))
+        self._sequence += 1
+        self._count += 1
+        if self._max_session_day is None or session_day > self._max_session_day:
+            self._max_session_day = session_day
+        if len(self._pending) >= self._BATCH_SIZE:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            return
+        self._db.executemany(
+            "INSERT INTO quotes VALUES (?,?,?,?,?,?,?)", self._pending)
+        self._db.commit()
+        self._pending.clear()
+
+    def finalize(self) -> "SQLiteQuoteIndex":
+        if not self._closed:
+            self._flush()
+        return self
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def max_session_date(self) -> date | None:
+        return (date.fromordinal(self._max_session_day)
+                if self._max_session_day is not None else None)
+
+    def quote_fill(self, *, symbol: str, at: datetime, side: str,
+                   max_age_seconds: float | None = 30.0,
+                   session_date: date | None = None) -> float | None:
+        """Resolve the same latest-visible quote as the in-memory index."""
+        if self._closed or self._count == 0:
+            return None
+        self._flush()
+        symbol_id = self._symbols.get(str(symbol).upper())
+        if symbol_id is None:
+            return None
+        at_ts = float(at.timestamp())
+        limit = 30.0 if max_age_seconds is None else float(max_age_seconds)
+        session_day = (None if session_date is None else
+                       int(session_date.toordinal()))
+        cursor = self._db.execute(
+            """SELECT timestamp, as_of, bid, ask, session_day
+                 FROM quotes
+                WHERE symbol_id=? AND timestamp<=?
+                ORDER BY timestamp DESC, sequence DESC""",
+            (symbol_id, at_ts),
+        )
+        for timestamp, as_of, bid, ask, row_session_day in cursor:
+            age = at_ts - float(timestamp)
+            if age > limit:
+                # Rows are newest first, so all remaining rows are stale.
+                break
+            if session_day is not None and int(row_session_day) != session_day:
+                continue
+            if float(as_of) > at_ts:
+                continue
+            price = float(ask if side == "buy" else bid)
+            return price if math.isfinite(price) and price > 0 else None
+        return None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._flush()
+            self._db.close()
+        finally:
+            self._closed = True
+            if self._temporary is not None:
+                self._temporary.cleanup()
+                self._temporary = None
+
+    def __bool__(self) -> bool:
+        return self._count > 0 and not self._closed
+
+    def __del__(self):  # pragma: no cover - interpreter shutdown cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def index_quotes(quotes: Iterable[Any] | None) -> dict[str, list] | SQLiteQuoteIndex:
     """Group quote snapshots by symbol in chronological order."""
+    if quotes is not None and callable(getattr(quotes, "quote_fill", None)):
+        return quotes
     grouped: dict[str, list] = {}
     for quote in quotes or ():
         grouped.setdefault(str(quote.symbol).upper(), []).append(quote)
@@ -324,7 +474,7 @@ def index_quotes(quotes: Iterable[Any] | None) -> dict[str, list]:
     return grouped
 
 
-def quote_fill(indexed: Mapping[str, Sequence[Any]] | None, *, symbol: str,
+def quote_fill(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None, *, symbol: str,
                at: datetime, side: str, max_age_seconds: float | None = 30.0,
                session_date: date | None = None) -> float | None:
     """Return the executable side of the last quote visible at a fill instant.
@@ -332,6 +482,13 @@ def quote_fill(indexed: Mapping[str, Sequence[Any]] | None, *, symbol: str,
     ``None`` means no quote was recorded for that instant; the caller must
     fall back to the bar and say so rather than inventing a price.
     """
+    if indexed is None:
+        return None
+    resolver = getattr(indexed, "quote_fill", None)
+    if callable(resolver):
+        return resolver(symbol=symbol, at=at, side=side,
+                        max_age_seconds=max_age_seconds,
+                        session_date=session_date)
     if not indexed:
         return None
     rows = indexed.get(str(symbol).upper())
@@ -362,5 +519,5 @@ __all__ = [
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS", "ReplayPolicy",
-    "index_quotes", "quote_fill",
+    "SQLiteQuoteIndex", "index_quotes", "quote_fill",
 ]

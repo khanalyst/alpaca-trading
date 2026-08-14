@@ -9,6 +9,7 @@ patch seams while keeping this module import-safe on its own.
 from __future__ import annotations
 
 from datetime import date, datetime
+import hashlib
 import json
 import math
 import os
@@ -17,7 +18,8 @@ import random
 from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import hold_deadline
-from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
+from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
+                    index_quotes, quote_fill)
 from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 from .stats import stable_seed
 
@@ -107,6 +109,51 @@ class DiscoveryError(ValueError):
 
 
 SESSION_WINDOW_ENV = "ALPACA_RESEARCH_SESSION_WINDOW"
+QUOTE_INDEX_MIN_BYTES = 32 * 1024 * 1024
+
+
+def _canonical_json(value: Any) -> str:
+    """Match the ledger's canonical JSON encoding without importing SQLite."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False, default=str)
+
+
+class _StreamingRawRows:
+    """List-compatible raw rows whose canonical digest was built while reading."""
+
+    def __init__(self, source: Path, count: int, digest: str):
+        self.source = source
+        self.count = int(count)
+        self.digest = str(digest)
+
+    def __iter__(self):
+        return _stream_rows(self.source)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, key):
+        return list(iter(self))[key]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple, _StreamingRawRows)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    def content_hash(self) -> str:
+        return self.digest
+
+
+def _corpus_size(source: Path) -> int:
+    """Return the available JSONL bytes without reading any row into memory."""
+    paths = (sorted(source.glob("*.jsonl")) if source.is_dir() else [source])
+    total = 0
+    for path in paths:
+        try:
+            total += int(path.stat().st_size)
+        except OSError as exc:
+            raise DiscoveryError(f"unable to stat discovery JSONL {path}: {exc}") from exc
+    return total
 
 
 def corpus_partitions(source: Path, *, window: int | None = None) -> list[Path]:
@@ -136,7 +183,7 @@ def _stream_rows(source: Path):
             raise DiscoveryError(f"invalid discovery JSONL {partition}: {exc}") from exc
 
 
-def _normalize_corpus(rows, *, keep=None) -> tuple[
+def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None = None) -> tuple[
         list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Normalize one row stream into the three replay books.
 
@@ -146,7 +193,7 @@ def _normalize_corpus(rows, *, keep=None) -> tuple[
     """
     bars: list[UnderlyingBar] = []
     snapshots: dict[str, OptionSnapshot] = {}
-    quotes: list[QuoteSnapshot] = []
+    quotes: list[QuoteSnapshot] = [] if quote_index is None else quote_index
     for number, source_row in enumerate(rows, 1):
         if not isinstance(source_row, Mapping):
             raise DiscoveryError("discovery rows must be JSON objects")
@@ -175,12 +222,18 @@ def _normalize_corpus(rows, *, keep=None) -> tuple[
                 # else still falls back to the bar and says so.
                 quote = normalize_quote(row, provider=provider, feed=feed)
                 if keep is None or keep(quote.session_date.isoformat()):
-                    quotes.append(quote)
+                    if quote_index is None:
+                        quotes.append(quote)
+                    else:
+                        quote_index.add(quote)
             # Other metadata stays in the dataset hash without being fed into
             # an OHLC replay.
         except (TypeError, ValueError) as exc:
             raise DiscoveryError(f"row {number}: {exc}") from exc
-    quotes.sort(key=lambda item: (item.symbol, item.timestamp))
+    if quote_index is None:
+        quotes.sort(key=lambda item: (item.symbol, item.timestamp))
+    else:
+        quote_index.finalize()
     return bars, snapshots, quotes
 
 
@@ -198,12 +251,56 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping]) -> tuple[
     computes is identical either way.
     """
     if isinstance(data, (str, Path)):
-        raw_rows = list(_stream_rows(Path(data)))
+        source = Path(data)
+        size = _corpus_size(source)
+        if size < QUOTE_INDEX_MIN_BYTES:
+            # Preserve the small-corpus/list contract used by notebooks and
+            # callers that keep a temporary source only for the duration of
+            # this call.  Large production corpora take the streaming branch
+            # below and never retain raw rows in memory.
+            raw_rows = list(_stream_rows(source))
+            if any(not isinstance(row, Mapping) for row in raw_rows):
+                raise DiscoveryError("discovery rows must be JSON objects")
+            bars, snapshots, quotes = _normalize_corpus(raw_rows)
+            if not bars:
+                raise DiscoveryError("discovery corpus contains no underlying bars")
+            return raw_rows, bars, snapshots, quotes
+        hasher = hashlib.sha256()
+        hasher.update(b"[")
+        first = True
+        count = 0
+
+        def digest_rows():
+            nonlocal first, count
+            for row in _stream_rows(source):
+                if not first:
+                    hasher.update(b",")
+                hasher.update(_canonical_json(row).encode("utf-8"))
+                first = False
+                count += 1
+                yield row
+
+        hasher_source = digest_rows()
+        quote_index = SQLiteQuoteIndex()
+        try:
+            bars, snapshots, quotes = _normalize_corpus(
+                hasher_source, quote_index=quote_index)
+        except Exception:
+            if quote_index is not None:
+                quote_index.close()
+            raise
+        hasher.update(b"]")
+        raw_rows = _StreamingRawRows(source, count, hasher.hexdigest())
+        if not bars:
+            quote_index.close()
+            raise DiscoveryError("discovery corpus contains no underlying bars")
+        return raw_rows, bars, snapshots, quotes
     else:
         raw_rows = [dict(row) for row in data]
     if any(not isinstance(row, Mapping) for row in raw_rows):
         raise DiscoveryError("discovery rows must be JSON objects")
-    bars, snapshots, quotes = _normalize_corpus(raw_rows)
+    if not isinstance(data, (str, Path)):
+        bars, snapshots, quotes = _normalize_corpus(raw_rows)
     if not bars:
         raise DiscoveryError("discovery corpus contains no underlying bars")
     return raw_rows, bars, snapshots, quotes
@@ -229,8 +326,16 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
                 (until is None or session <= str(until)) and
                 session not in dropped)
 
-    bars, snapshots, quotes = _normalize_corpus(
-        _stream_rows(Path(source)), keep=keep)
+    source_path = Path(source)
+    quote_index = (SQLiteQuoteIndex() if _corpus_size(source_path) >=
+                   QUOTE_INDEX_MIN_BYTES else None)
+    try:
+        bars, snapshots, quotes = _normalize_corpus(
+            _stream_rows(source_path), keep=keep, quote_index=quote_index)
+    except Exception:
+        if quote_index is not None:
+            quote_index.close()
+        raise
     return bars, list(snapshots.values()), quotes
 
 

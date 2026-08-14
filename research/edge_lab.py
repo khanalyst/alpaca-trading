@@ -168,12 +168,20 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     sealed_sessions = set(sealed_window.session_dates)
     sealed_snapshots = {key: snap for key, snap in snapshots.items()
                         if snap.session_date.isoformat() in sealed_sessions}
-    sealed_quotes = [quote for quote in quotes
-                     if quote.session_date.isoformat() in sealed_sessions]
+    # A disk-backed quote resolver already applies the session predicate at
+    # each fill boundary.  Reusing it for both windows avoids copying millions
+    # of quote snapshots into separate sealed/development lists; in-memory
+    # callers retain the historical exact slices.
+    quote_resolver = callable(getattr(quotes, "quote_fill", None))
+    if quote_resolver:
+        sealed_quotes = development_quotes = quotes
+    else:
+        sealed_quotes = [quote for quote in quotes
+                         if quote.session_date.isoformat() in sealed_sessions]
+        development_quotes = [quote for quote in quotes
+                              if quote.session_date.isoformat() not in sealed_sessions]
     development_snapshots = {key: snap for key, snap in snapshots.items()
                              if snap.session_date.isoformat() not in sealed_sessions}
-    development_quotes = [quote for quote in quotes
-                          if quote.session_date.isoformat() not in sealed_sessions]
 
     def replay(variant_bars, variant_snapshots, variant_quotes, cfg):
         return replay_ibr(
