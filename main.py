@@ -120,6 +120,26 @@ def _wait_for_position(provider, symbol: str, qty: Decimal | None,
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
 
+def _wait_for_flat_broker(provider, timeout: float):
+    """Wait for Alpaca's position and open-order views to agree on flat."""
+    deadline = time.monotonic() + timeout
+    while True:
+        positions = provider.positions()
+        open_orders = provider.orders(status="open")
+        if not positions and not open_orders:
+            return positions, open_orders
+        if time.monotonic() >= deadline:
+            position_summary = [
+                f"{position.symbol}:{position.qty}" for position in positions]
+            order_summary = [
+                f"{order.client_order_id or order.id}:{order.status}"
+                for order in open_orders]
+            raise TimeoutError(
+                f"broker did not reconcile flat within {timeout:g}s; "
+                f"positions={position_summary}, open_orders={order_summary}")
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
 def _paper_smoke_cleanup(provider, symbol: str, timeout: float) -> dict:
     result = {"cancel_requested": False, "close_requested": False,
               "flat": False, "open_orders": None, "errors": []}
@@ -138,8 +158,7 @@ def _paper_smoke_cleanup(provider, symbol: str, timeout: float) -> dict:
             result["close_requested"] = order is not None
             if order is not None:
                 _wait_for_order(provider, recovery_id, held.qty, timeout)
-        positions = _wait_for_position(provider, symbol, None, timeout)
-        open_orders = provider.orders(status="open")
+        positions, open_orders = _wait_for_flat_broker(provider, timeout)
         result["open_orders"] = len(open_orders)
         result["flat"] = not positions and not open_orders
     except Exception as exc:  # noqa: BLE001
@@ -252,6 +271,8 @@ def cmd_paper_smoke(args, cfg) -> int:
     provider = None
     cleanup_allowed = False
     lock_handle = None
+    entry = None
+    exit_order = None
     try:
         state.configure_runtime("paper")
         lock_handle = state.acquire_run_lock()
@@ -284,24 +305,19 @@ def cmd_paper_smoke(args, cfg) -> int:
 
         qty = Decimal("1")
         entry_id = f"smoke-open-{uuid.uuid4().hex[:20]}"
-        provider.submit_order(OrderRequest(
+        entry = provider.submit_order(OrderRequest(
             symbol=symbol, qty=qty, side="buy", type="market",
             time_in_force="day", client_order_id=entry_id))
         entry = _wait_for_order(provider, entry_id, qty, args.timeout)
         _wait_for_position(provider, symbol, qty, args.timeout)
 
         exit_id = f"smoke-close-{uuid.uuid4().hex[:20]}"
-        submitted_exit = provider.close_position(
+        exit_order = provider.close_position(
             symbol, qty=qty, client_order_id=exit_id)
-        if submitted_exit is None:
+        if exit_order is None:
             raise RuntimeError("broker position disappeared before close submission")
         exit_order = _wait_for_order(provider, exit_id, qty, args.timeout)
-        final_positions = _wait_for_position(
-            provider, symbol, None, args.timeout)
-        final_orders = provider.orders(status="open")
-        if final_positions or final_orders:
-            raise RuntimeError(
-                "paper smoke reconciliation found residual broker state")
+        _wait_for_flat_broker(provider, args.timeout)
         print(_dump_yaml({
             "schema": "paper-order-smoke.v1",
             "status": "ok",
@@ -320,6 +336,10 @@ def cmd_paper_smoke(args, cfg) -> int:
     except Exception as exc:  # noqa: BLE001
         result = {"schema": "paper-order-smoke.v1", "status": "failed",
                   "error": str(exc), "symbol": symbol}
+        if entry is not None:
+            result["entry"] = entry
+        if exit_order is not None:
+            result["exit"] = exit_order
         if provider is not None and cleanup_allowed:
             result["cleanup"] = _paper_smoke_cleanup(
                 provider, symbol, args.timeout)

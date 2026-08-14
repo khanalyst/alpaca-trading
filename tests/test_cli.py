@@ -48,11 +48,14 @@ class _SmokeProvider:
     mode = "paper"
     paper = True
 
-    def __init__(self, *, market_open=True, fail_first_close=False):
+    def __init__(self, *, market_open=True, fail_first_close=False,
+                 stale_open_after_exit=False):
         self.market_open = market_open
         self.fail_first_close = fail_first_close
+        self.stale_open_after_exit = stale_open_after_exit
         self.close_calls = 0
         self.cancel_calls = 0
+        self.open_order_checks = 0
         self.positions_live = []
         self.orders_by_client_id = {}
         self.requests = []
@@ -74,6 +77,15 @@ class _SmokeProvider:
             order = self.orders_by_client_id.get(client_order_id)
             return [order] if order is not None else []
         if status == "open":
+            self.open_order_checks += 1
+            if (self.stale_open_after_exit and len(self.requests) >= 2 and
+                    self.open_order_checks == 2):
+                filled = self.orders_by_client_id[
+                    self.requests[-1].client_order_id]
+                return [Order(
+                    filled.id, filled.symbol, filled.qty, filled.side,
+                    "accepted", filled.type, filled.time_in_force,
+                    client_order_id=filled.client_order_id)]
             return []
         return list(self.orders_by_client_id.values())
 
@@ -266,6 +278,19 @@ class CliSafetyTests(unittest.TestCase):
         self.assertEqual(provider.positions(), [])
         self.assertTrue("flat: true" in error.getvalue() or
                         '"flat": true' in error.getvalue())
+
+    def test_paper_smoke_waits_for_stale_open_order_view_to_clear(self):
+        provider = _SmokeProvider(stale_open_after_exit=True)
+        cfg = {"mode": "paper", "broker": {
+            "paper": True, "allow_live": False}}
+        args = SimpleNamespace(symbol="SPY", timeout=1.0, confirm="PAPER")
+        with patch.object(main, "_provider", return_value=provider), \
+                patch.object(main.time, "sleep", return_value=None), \
+                redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            code = main.cmd_paper_smoke(args, cfg)
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(provider.open_order_checks, 3)
+        self.assertEqual(provider.positions(), [])
 
     def test_paper_smoke_never_mutates_preexisting_exposure(self):
         provider = _SmokeProvider()
