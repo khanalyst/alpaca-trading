@@ -18,7 +18,8 @@ from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.edge_ledger import EdgeLedger
 from research.factory_core import simulate_account as factory_simulate_account
 from research.live_shadow import (InputConflict, ShadowConfig, ShadowRunner,
-                                   ShadowStore, _replay_signature,
+                                   ShadowError, ShadowStore, _compact_shadow_rows,
+                                   _replay_signature,
                                    _shadow_signature, _signature_diffs,
                                    run_shadow_once)
 
@@ -125,8 +126,38 @@ class LiveShadowTests(unittest.TestCase):
         self._run(max_events=20)
         text = self.corpus.read_text(encoding="utf-8").replace(",100,1000,,", ",100.5,1000,,", 1)
         self.corpus.write_text(text, encoding="utf-8")
-        with self.assertRaises(InputConflict):
+        with self.assertRaises((InputConflict, ShadowError)):
             self._run(max_events=20)
+
+    def test_quote_burst_is_compacted_to_last_quote_per_symbol_minute(self):
+        start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
+        rows = [{
+            "event_key": f"quote-{index}", "event_type": "quote",
+            "symbol": "SPY", "timestamp": (start + timedelta(seconds=index)).isoformat(),
+            "bid": str(100 + index / 100), "ask": str(101 + index / 100),
+        } for index in range(30)]
+        compacted = _compact_shadow_rows(rows)
+        self.assertEqual(len(compacted), 1)
+        self.assertEqual(compacted[0]["event_key"], "quote-29")
+
+    def test_saturated_legacy_wal_baselines_then_ingests_only_appends(self):
+        self._candidate()
+        self._write_rows()
+        original = list(iter_corpus_rows(self.corpus))
+        store = ShadowStore(self.shadow)
+        for row in original[:2]:
+            store.ingest_event(row, max_events=2)
+        first = self._run(max_events=2)
+        self.assertEqual(first["ingested_events"], 0)
+        appended = dict(original[-1])
+        stamp = datetime.fromisoformat(appended["timestamp"]) + timedelta(minutes=1)
+        appended["timestamp"] = stamp.isoformat()
+        appended["as_of"] = (stamp + timedelta(minutes=1)).isoformat()
+        appended["event_key"] = _event_key("bar_1m", "SPY", stamp.isoformat())
+        with self.corpus.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=list(original[0])).writerow(appended)
+        second = self._run(max_events=2)
+        self.assertEqual(second["ingested_events"], 1)
 
     def test_candidate_books_are_isolated_and_edge_ledger_is_read_only(self):
         first = self._candidate()

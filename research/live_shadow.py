@@ -11,11 +11,13 @@ is fabricated when a safe exit cannot be reconstructed.
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import contextmanager
 import dataclasses
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -28,7 +30,7 @@ from agent.contracts.ibr import generate_ibr_signal
 from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate_rule_spec
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
-from deploy.recorder import iter_corpus_rows
+from deploy.recorder import corpus_partitions
 from research.costs import ReplayPolicy
 from research.edge_discovery_core import _effective_ibr_config
 from research.edge_discovery_core import _null_reference_rows, null_control_account
@@ -247,6 +249,78 @@ def _normalize_row(row: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
     return raw, event
 
 
+def _corpus_sources(path: Path) -> list[Path]:
+    sources = [path] if path.is_file() and path.stat().st_size else []
+    sources.extend(corpus_partitions(path))
+    return sources
+
+
+def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
+    """Read only complete CSV rows appended after a durable byte offset."""
+    size = source.stat().st_size
+    if size < offset:
+        raise ShadowError(f"shadow corpus source shrank: {source}")
+    if size == offset:
+        return [], offset
+    with source.open("rb") as handle:
+        header = handle.readline().decode("utf-8")
+        try:
+            fieldnames = next(csv.reader([header]))
+        except (csv.Error, StopIteration) as exc:
+            raise ShadowError(f"shadow corpus source has invalid header: {source}") from exc
+        handle.seek(offset)
+        payload = handle.read(size - offset)
+    if payload and not payload.endswith(b"\n"):
+        boundary = payload.rfind(b"\n")
+        if boundary < 0:
+            return [], offset
+        payload = payload[:boundary + 1]
+    consumed = offset + len(payload)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ShadowError(f"shadow corpus source is not UTF-8: {source}") from exc
+    if offset == 0:
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        fields = set(reader.fieldnames or ())
+        required = {"event_key", "event_type", "symbol", "timestamp"}
+        if not required.issubset(fields):
+            raise ShadowError(f"shadow corpus source has invalid header: {source}")
+    else:
+        reader = csv.DictReader(io.StringIO(text, newline=""), fieldnames=fieldnames)
+    rows = []
+    for row in reader:
+        if None in row:
+            raise ShadowError(f"shadow corpus source has malformed CSV: {source}")
+        rows.append(row)
+    return rows, consumed
+
+
+def _compact_shadow_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Keep all bars/options and the final quote per symbol/minute."""
+    retained: list[dict] = []
+    quotes: dict[tuple[str, str], tuple[datetime, dict]] = {}
+    for raw in rows:
+        row = dict(raw)
+        event_type = str(row.get("event_type") or "").strip().lower()
+        if event_type != "quote":
+            retained.append(row)
+            continue
+        stamp = _timestamp(row.get("timestamp"))
+        if stamp is None:
+            retained.append(row)  # normal validation emits the hard failure
+            continue
+        minute = stamp.replace(second=0, microsecond=0).isoformat()
+        key = (str(row.get("symbol") or ""), minute)
+        previous = quotes.get(key)
+        if previous is None or stamp >= previous[0]:
+            quotes[key] = (stamp, row)
+    retained.extend(item[1] for item in quotes.values())
+    retained.sort(key=lambda row: (str(row.get("timestamp") or ""),
+                                   str(row.get("event_key") or "")))
+    return retained
+
+
 @dataclass(frozen=True)
 class ShadowConfig:
     """Bounded paths and resource limits for one shadow process."""
@@ -412,9 +486,6 @@ class ShadowStore:
         symbol = str(payload.get("symbol") or getattr(event, "symbol", ""))
         event_type = str(payload.get("event_type") or "").lower()
         with self._connection() as db:
-            count = int(db.execute("SELECT count(*) FROM events").fetchone()[0])
-            if count >= int(max_events):
-                raise ShadowError(f"shadow event bound {max_events} exceeded")
             db.execute("""INSERT INTO events
                 (event_key,digest,event_json,event_type,symbol,timestamp,as_of,inserted_at)
                 VALUES(?,?,?,?,?,?,?,?)""",
@@ -430,6 +501,32 @@ class ShadowStore:
                         updated_at=excluded.updated_at""",
                     (event_key, timestamp.isoformat(), digest, time.time()))
         return event_key, True
+
+    def event_count(self) -> int:
+        with self._connection() as db:
+            return int(db.execute("SELECT count(*) FROM events").fetchone()[0])
+
+    def source_offsets(self) -> dict[str, int] | None:
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key='corpus_source_offsets'").fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ShadowError("shadow corpus offsets are invalid") from exc
+        if not isinstance(value, dict) or any(
+                not isinstance(key, str) or isinstance(offset, bool) or
+                not isinstance(offset, int) or offset < 0
+                for key, offset in value.items()):
+            raise ShadowError("shadow corpus offsets are invalid")
+        return value
+
+    def save_source_offsets(self, offsets: Mapping[str, int]) -> None:
+        payload = _json({str(key): int(value) for key, value in offsets.items()})
+        with self._connection() as db:
+            db.execute("""INSERT INTO meta(key,value) VALUES('corpus_source_offsets',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (payload,))
 
     def upsert_candidate(self, candidate: Mapping[str, Any]) -> None:
         config = candidate.get("config")
@@ -1181,7 +1278,29 @@ class ShadowRunner:
             self.store.upsert_candidate(candidate)
         ingested = 0
         conflicts = 0
-        for raw in iter_corpus_rows(self.config.corpus_path):
+        sources = _corpus_sources(self.config.corpus_path)
+        offsets = self.store.source_offsets()
+        if offsets is None:
+            # A pre-upgrade WAL already at the old total-event ceiling has
+            # consumed historical evidence. Baseline at the current committed
+            # ends instead of replaying a multi-million-row recorder catch-up.
+            offsets = ({str(source.resolve()): source.stat().st_size
+                        for source in sources}
+                       if self.store.event_count() >= self.config.max_events
+                       else {})
+            self.store.save_source_offsets(offsets)
+        pending: list[dict] = []
+        next_offsets = dict(offsets)
+        for source in sources:
+            key = str(source.resolve())
+            rows, consumed = _read_corpus_append(source, offsets.get(key, 0))
+            pending.extend(rows)
+            next_offsets[key] = consumed
+        selected = _compact_shadow_rows(pending)
+        if len(selected) > self.config.max_events:
+            raise ShadowError(
+                f"shadow event batch bound {self.config.max_events} exceeded")
+        for raw in selected:
             try:
                 _, added = self.store.ingest_event(raw, max_events=self.config.max_events)
             except InputConflict:
@@ -1189,6 +1308,7 @@ class ShadowRunner:
                 raise
             if added:
                 ingested += 1
+        self.store.save_source_offsets(next_offsets)
         events, bars, quotes, options = self._load_events()
         # Process one local session at a time.  A completed replay closes that
         # session's virtual books before the next session is evaluated, which

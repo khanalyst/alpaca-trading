@@ -111,6 +111,15 @@ runtime signal/setup/risk path; completed sessions compare semantic shadow
 signatures with factory/IBR replay. The lane cannot submit orders or mutate
 broker/runtime state.
 
+Shadow consumes recorder partitions from durable byte offsets rather than
+rescanning the historical corpus on every poll. High-frequency equity quotes
+are compacted to the final quote per symbol/minute before entering the shadow
+WAL; bars and option snapshots remain lossless. When upgrading a legacy WAL
+that already reached the old 20,000-event ceiling, ShadowRunner preserves its
+existing evidence, baselines the current recorder file ends, and resumes only
+from subsequently committed rows. This is intentionally forward-only: a large
+recorder recovery is research input, not a synthetic live-shadow window.
+
 The scheduled research cycle invokes `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a no-op. The consumer
 mounts the same `shadow-data` volume read-only at `/app/shadow` and is the only
