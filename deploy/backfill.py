@@ -47,10 +47,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent.alpaca_session import AlpacaError, normalize_calendar_day  # noqa: E402
+from agent.alpaca_sdk import _canonical_feed  # noqa: E402
 from agent.instruments import validate_equity_symbol  # noqa: E402
 from deploy.recorder import (  # noqa: E402
     NEW_YORK,
     _append_partitions,
+    _corpus_data_feed,
+    _load_index,
     _partition_path,
     _save_index,
     _scan_corpus,
@@ -192,9 +195,21 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
     if not 1 <= int(days) <= MAX_BACKFILL_DAYS:
         raise BackfillError(f"days must be between 1 and {MAX_BACKFILL_DAYS}")
     now = now or datetime.now(timezone.utc)
-    resolved_feed = str(feed if feed is not None else
-                        getattr(provider, "data_feed", None) or _feed()
-                        ).strip().lower() or "iex"
+    try:
+        resolved_feed = _canonical_feed(
+            feed if feed is not None else
+            getattr(provider, "data_feed", None) or _feed())
+    except ValueError as exc:
+        raise BackfillError(str(exc)) from exc
+    index = _load_index(output)
+    existing_feed = (str(index.get("data_feed") or "").strip().lower()
+                     if index is not None else "")
+    if not existing_feed and corpus_partitions(output):
+        existing_feed = _corpus_data_feed(output) or ""
+    if existing_feed and existing_feed != resolved_feed:
+        raise BackfillError(
+            f"recorder data feed changed from {existing_feed} to "
+            f"{resolved_feed}; use a separate corpus")
     end = last_completed_session(now)
     start = end - timedelta(days=int(days) - 1)
     sessions = completed_sessions(provider, start, end)

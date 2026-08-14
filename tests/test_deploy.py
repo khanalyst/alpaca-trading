@@ -43,11 +43,15 @@ def setUpModule() -> None:                                     # noqa: N802
     # Keep legacy recorder fakes on one request; chunking itself has dedicated
     # tests with a deliberately small window.
     os.environ["ALPACA_RECORDER_FETCH_WINDOW_MINUTES"] = "1000000"
+    os.environ["ALPACA_RECORDER_BAR_GAP_MINUTES"] = "5"
+    os.environ["ALPACA_RECORDER_STRICT_BAR_FEEDS"] = ""
 
 
 def tearDownModule() -> None:                                  # noqa: N802
     for name in ("ALPACA_RESEARCH_REPORT_DIR", "ALPACA_RESEARCH_PROOF_DIR",
-                 "ALPACA_RECORDER_FETCH_WINDOW_MINUTES"):
+                 "ALPACA_RECORDER_FETCH_WINDOW_MINUTES",
+                 "ALPACA_RECORDER_BAR_GAP_MINUTES",
+                 "ALPACA_RECORDER_STRICT_BAR_FEEDS"):
         os.environ.pop(name, None)
     if _ARTIFACTS is not None:
         _ARTIFACTS.cleanup()
@@ -100,6 +104,23 @@ class _QuoteChunkFake:
         timestamp = end - timedelta(seconds=1)
         return {"SPY": [SimpleNamespace(
             timestamp=timestamp, bid=100, ask=101, last=100.5)]}
+
+
+class _SparseFeedFake:
+    def __init__(self, feed):
+        self.data_feed = feed
+        self.seen = []
+
+    def bars(self, symbols, *, start, end, feed, **kwargs):
+        self.seen.append(("bars", start, end, feed))
+        return {}
+
+    def quotes(self, symbols, *, start, end, feed):
+        self.seen.append(("quotes", start, end, feed))
+        timestamp = end - timedelta(seconds=1)
+        return {symbol: [SimpleNamespace(
+            timestamp=timestamp, bid=100, ask=101, last=100.5)]
+            for symbol in symbols}
 
 
 class _MissingQuoteTimestampFake(_MarketFake):
@@ -744,6 +765,105 @@ class DeployTests(unittest.TestCase):
             self.assertTrue(all(end - start <= timedelta(minutes=30)
                                 for _kind, start, end in windows))
 
+    def test_sparse_iex_gap_advances_and_is_exposed_as_coverage(self):
+        fixed_now = datetime(2026, 8, 13, 16, 0, tzinfo=timezone.utc)
+        bar_stamp = fixed_now - timedelta(hours=1, minutes=13)
+        quote_stamp = fixed_now - timedelta(hours=1, minutes=5)
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+        def row(event_type, stamp):
+            value = {field: "" for field in recorder.FIELDS}
+            value.update({
+                "event_key": recorder._event_key(
+                    event_type, "DIA", stamp.isoformat()),
+                "observed_at": stamp.isoformat(), "provider": "alpaca",
+                "feed": "iex", "event_type": event_type, "symbol": "DIA",
+                "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
+            })
+            if event_type == "bar_1m":
+                value.update({"open": "100", "high": "101", "low": "99",
+                              "close": "100.5", "volume": "10"})
+            else:
+                value.update({"bid": "100", "ask": "101", "last": "100.5"})
+            return value
+
+        fake = _SparseFeedFake("iex")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            recorder._append_partitions(
+                path, [row("bar_1m", bar_stamp), row("quote", quote_stamp)])
+            recorder._save_index(path, recorder._scan_corpus(path))
+
+            with patch.object(recorder, "datetime", FrozenDatetime):
+                self.assertEqual(recorder.record_once(fake, ["DIA"], path), 1)
+
+            index = recorder._load_index(path)
+            coverage = index["bar_coverage"]["DIA"]
+            self.assertEqual(index["data_feed"], "iex")
+            self.assertEqual(coverage["feed"], "iex")
+            self.assertEqual(coverage["policy"], "observe")
+            self.assertEqual(coverage["status"], "gap_observed")
+            self.assertEqual(coverage["last_bar"], bar_stamp.isoformat())
+            self.assertEqual(coverage["gap_observations"], 1)
+            self.assertGreater(coverage["max_gap_seconds"], 5 * 60)
+
+            index_path = root / recorder.INDEX_NAME
+            result = health.recorder(
+                root, max_age=1, now=index_path.stat().st_mtime)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["coverage_status"], "gap_observed")
+            self.assertEqual(result["bar_gap_symbols"], ["DIA"])
+            self.assertEqual(result["bar_coverage"]["DIA"]["policy"], "observe")
+
+    def test_strict_feed_gap_fails_before_mutating_the_corpus(self):
+        fixed_now = datetime(2026, 8, 13, 16, 0, tzinfo=timezone.utc)
+        bar_stamp = fixed_now - timedelta(hours=1, minutes=13)
+        quote_stamp = fixed_now - timedelta(hours=1, minutes=5)
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+        rows = []
+        for event_type, stamp in (("bar_1m", bar_stamp), ("quote", quote_stamp)):
+            row = {field: "" for field in recorder.FIELDS}
+            row.update({
+                "event_key": recorder._event_key(
+                    event_type, "DIA", stamp.isoformat()),
+                "observed_at": stamp.isoformat(), "provider": "alpaca",
+                "feed": "sip", "event_type": event_type, "symbol": "DIA",
+                "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
+                "open": "100", "high": "101", "low": "99",
+                "close": "100.5", "volume": "10", "bid": "100",
+                "ask": "101", "last": "100.5",
+            })
+            rows.append(row)
+
+        fake = _SparseFeedFake("sip")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            recorder._append_partitions(path, rows)
+            recorder._save_index(path, recorder._scan_corpus(path))
+            before_rows = list(recorder.iter_corpus_rows(path))
+            index_path = root / recorder.INDEX_NAME
+            before_index = index_path.read_text(encoding="utf-8")
+
+            with patch.dict(os.environ, {
+                    "ALPACA_RECORDER_STRICT_BAR_FEEDS": "sip"}), \
+                    patch.object(recorder, "datetime", FrozenDatetime):
+                with self.assertRaisesRegex(RuntimeError, "continuity gap for DIA"):
+                    recorder.record_once(fake, ["DIA"], path)
+
+            self.assertEqual(list(recorder.iter_corpus_rows(path)), before_rows)
+            self.assertEqual(index_path.read_text(encoding="utf-8"), before_index)
+
     def test_recorder_scan_retains_only_recent_keys(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "market.csv"
@@ -839,18 +959,84 @@ class DeployTests(unittest.TestCase):
                 recorder.record_once(fake, ["SPY"], path)
             self.assertEqual(fake.seen, [])
 
-    def test_recorder_detects_intraday_bar_continuity_gap(self):
+    def test_recorder_observes_or_rejects_intraday_gap_by_policy(self):
         previous = datetime(2026, 8, 3, 13, 30, tzinfo=timezone.utc)
         current = previous + timedelta(hours=2)
         rows = [{"event_type": "bar_1m", "symbol": "SPY",
                  "timestamp": current.isoformat()}]
+        evidence = recorder._verify_bar_continuity(
+            rows, {"SPY": previous}, current, ["SPY"],
+            feed="iex", policy="observe")
+        self.assertEqual(evidence["SPY"]["status"], "gap_observed")
+        self.assertEqual(evidence["SPY"]["window_gap_count"], 1)
         with self.assertRaisesRegex(RuntimeError, "continuity gap"):
             recorder._verify_bar_continuity(
-                rows, {"SPY": previous}, current, ["SPY"])
-        recorder._verify_bar_continuity(
+                rows, {"SPY": previous}, current, ["SPY"],
+                feed="sip", policy="strict")
+        adjacent = recorder._verify_bar_continuity(
             [{"event_type": "bar_1m", "symbol": "SPY",
               "timestamp": (previous + timedelta(minutes=1)).isoformat()}],
-            {"SPY": previous}, previous + timedelta(minutes=1), ["SPY"])
+            {"SPY": previous}, previous + timedelta(minutes=1), ["SPY"],
+            feed="sip", policy="strict")
+        self.assertEqual(adjacent["SPY"]["status"], "covered")
+
+    def test_recorder_loads_precoverage_v1_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=2)
+            recorder._append_partitions(path, rows)
+            index = recorder._scan_corpus(path)
+            index.pop("bar_coverage")
+            index.pop("data_feed")
+            (root / recorder.INDEX_NAME).write_text(
+                json.dumps(index), encoding="utf-8")
+
+            loaded = recorder._load_index(path)
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["bar_coverage"], {})
+            self.assertIsNone(loaded["data_feed"])
+
+            fake = _SparseFeedFake("sip")
+            with self.assertRaisesRegex(RuntimeError,
+                                        "data feed changed from iex to sip"):
+                recorder.record_once(fake, ["SPY"], path)
+            self.assertEqual(fake.seen, [])
+
+    def test_precoverage_index_rejects_a_mixed_feed_corpus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "market.csv"
+            rows = _corpus_rows(sessions=1, per_session=2)
+            mixed = dict(rows[-1])
+            mixed_stamp = datetime.fromisoformat(mixed["timestamp"]) + timedelta(
+                minutes=10)
+            mixed.update({
+                "event_key": recorder._event_key(
+                    "bar_1m", "SPY", mixed_stamp.isoformat()),
+                "feed": "sip", "timestamp": mixed_stamp.isoformat(),
+                "as_of": mixed_stamp.isoformat(),
+            })
+            recorder._append_partitions(path, [*rows, mixed])
+            index = {
+                "schema": recorder.INDEX_SCHEMA,
+                "watermark": mixed_stamp.isoformat(),
+                "latest_bars": {"SPY": mixed_stamp.isoformat()},
+                "recent_keys": {
+                    row["event_key"]: row["timestamp"] for row in [*rows, mixed]
+                },
+                "option_pins": {},
+                "partitions": recorder._partition_sizes(path),
+            }
+            (root / recorder.INDEX_NAME).write_text(
+                json.dumps(index), encoding="utf-8")
+
+            fake = _SparseFeedFake("sip")
+            with self.assertRaisesRegex(RuntimeError,
+                                        "mixes equity data feeds"):
+                recorder.record_once(fake, ["SPY"], path)
+            self.assertEqual(fake.seen, [])
 
     def test_recorder_partitions_by_session_and_migrates_a_legacy_corpus(self):
         fake = _MarketFake()

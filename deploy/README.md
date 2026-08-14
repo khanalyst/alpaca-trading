@@ -43,11 +43,12 @@ the lock.
 The recorder writes its mixed bars/quotes/options corpus partitioned by New
 York session date under `runtime/research/recorded/sessions/market-<date>.csv`,
 with a sidecar `.recorder-index.json` holding the watermark, the per-symbol last
-bar, a fifteen-minute dedup window and the option contracts held open for
-continued sampling. A cycle costs O(new rows); the index is verified against
-partition sizes on load and rebuilt from the partitions when they disagree. The
-rebuild retains only the bounded dedup window; use the explicit audit command
-when a full historical duplicate check is required:
+bar and bounded coverage evidence, the corpus equity feed, a fifteen-minute
+dedup window and the option contracts held open for continued sampling. A cycle
+costs O(new rows); the index is verified against partition sizes on load and
+rebuilt from the partitions when they disagree. The rebuild retains only the
+bounded dedup window; use the explicit audit command when a full historical
+duplicate check is required:
 
 ```sh
 docker compose run --rm --no-deps recorder \
@@ -63,9 +64,19 @@ beside the corpus as `market.csv.migrated`.
 Option sampling takes `ALPACA_RECORDER_OPTION_LIMIT` contracts per side per
 sample (default 10, capped at 25) and keeps every contract it has sampled in
 the sample for `ALPACA_RECORDER_OPTION_HOLD_MINUTES` (default 180) so a trade
-opened on a contract still has quotes at its exit. Continuity gaps are judged
-against the Alpaca calendar, cached per fetch window, so holidays and early
-closes are quiet and a genuine intraday hole still fails closed.
+opened on a contract still has quotes at its exit.
+
+Bar coverage is judged against the cached Alpaca calendar, so holidays and
+early closes remain quiet. An intraday gap larger than
+`ALPACA_RECORDER_BAR_GAP_MINUTES` (default 5) is recorded per symbol under
+`bar_coverage` in the index and exposed by recorder health as
+`coverage_status`, `bar_gap_symbols`, and `bar_gap_observations`. It does not
+stop recording by default: missing trade bars can be legitimate feed coverage,
+and research applies adjacency checks only where a replay depends on them.
+Set `ALPACA_RECORDER_STRICT_BAR_FEEDS` to a comma-separated feed list (or `*`)
+to make those observations fail closed for explicitly governed feeds. The
+recorder refuses to change equity feeds inside an existing corpus because event
+identity and per-symbol continuity must not cross feed provenance.
 
 The research profile is disabled by default. `deploy/research-cycle.sh`
 discovers and routes the corpus automatically, concatenating partitions in

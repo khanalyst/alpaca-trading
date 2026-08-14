@@ -386,26 +386,33 @@ docker compose logs --tail=100 recorder
 **Expected:** `recorded N Alpaca rows to ...` roughly once a minute during
 market hours, and the recorder's health turning healthy.
 
-Outside market hours the recorder is quiet — this is normal. Continuity is
-judged against the Alpaca calendar, so holidays and early closes are silent; a
-gap inside a real session fails closed rather than being recorded as a hole.
+Outside market hours the recorder is quiet — this is normal. Coverage is judged
+against the Alpaca calendar, so holidays and early closes are silent. Intraday
+bar gaps are retained as per-symbol index and health evidence rather than being
+treated as automatic corpus corruption; replay gates still refuse a gap where
+the strategy actually needs adjacent bars.
 
 The recorder writes one append-only partition per New York session date under
 `runtime/research/recorded/sessions/`, with a sidecar `.recorder-index.json`
 holding the watermark and dedup state.
 
-Two environment variables bound option sampling, both with working defaults:
+Recorder controls have working defaults:
 
 - `ALPACA_RECORDER_OPTION_LIMIT` — contracts sampled per side per cycle
   (default 10, hard-capped at 25);
 - `ALPACA_RECORDER_OPTION_HOLD_MINUTES` — how long an already sampled contract
   keeps being sampled (default 180), so a trade opened on a contract still has
-  quotes at its exit.
+  quotes at its exit;
+- `ALPACA_RECORDER_BAR_GAP_MINUTES` — the intraday gap threshold recorded in
+  coverage evidence (default 5);
+- `ALPACA_RECORDER_STRICT_BAR_FEEDS` — optional comma-separated feeds whose
+  observed gaps must stop the recorder; blank keeps coverage observational.
 
-Raising either increases quote volume and disk use substantially. Compose
-forwards both from your shell (or from a deployment environment file), so
+Raising the option limit or hold window increases quote volume and disk use
+substantially. Compose forwards all recorder controls from your shell (or from
+a deployment environment file), so
 `ALPACA_RECORDER_OPTION_LIMIT=20 docker compose up -d recorder` is enough to
-change them. The research lane forwards its own tuning variables the same way —
+change one. The research lane forwards its own tuning variables the same way —
 `ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`,
 `ALPACA_FACTORY_WORKERS`, `ALPACA_FACTORY_MIN_TRADES`,
 `ALPACA_FACTORY_MIN_SESSIONS`, `ALPACA_FACTORY_ALPHA`,
@@ -802,7 +809,7 @@ place.
 | Authentication fails | Live keys in the paper file, or unentitled feed | Recheck step 5. |
 | `docker compose config` errors | Missing export | Re-run step 8. |
 | Watchdog says `acted` | It flattened a stale trader's positions | Reconcile per OPERATIONS.md before restarting. |
-| Recorder logs a continuity gap | A real hole inside a session | Investigate; do not delete the corpus to silence it. |
+| Recorder health lists `bar_gap_symbols` | Sparse feed coverage or a real hole inside a session | Compare the exact index gap with the provider; let research adjacency gates decide usability. Do not delete the corpus. |
 | Dashboard shows "proved but untradeable" > 0 | Edges proved under a different `execution_mode` | Expected after a profile change; harmless. |
 | LLM proposals never appear in the report | No provider key, or proposals rejected | Check step 6; the report shows rejection reasons. |
 

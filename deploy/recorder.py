@@ -8,10 +8,11 @@ fresh but empty dataset.
 
 Storage is partitioned by New York session date under ``sessions/`` next to the
 nominal dataset path, with a durable sidecar index holding the watermark, the
-per-symbol last bar, a time-bounded dedup window and the option contracts held
-open for continued sampling. A cycle therefore costs O(new rows) instead of
-rescanning the corpus. The index is a cache with a corruption check: partition
-sizes are verified on load and a mismatch rebuilds it from the partitions.
+per-symbol last bar and coverage evidence, a time-bounded dedup window and the
+option contracts held open for continued sampling. A cycle therefore costs
+O(new rows) instead of rescanning the corpus. The index is a cache with a
+corruption check: partition sizes are verified on load and a mismatch rebuilds
+it from the partitions.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent.alpaca_provider import AlpacaProvider  # noqa: E402
+from agent.alpaca_sdk import _canonical_feed  # noqa: E402
 from agent.alpaca_session import (  # noqa: E402
     AlpacaError,
     normalize_calendar_day,
@@ -112,7 +114,16 @@ PARTITION_DIR = "sessions"
 # merely unlikely.
 DEDUP_HORIZON = timedelta(minutes=15)
 DEFAULT_FETCH_WINDOW_MINUTES = 15
+DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
+
+
+def _canonical_data_feed(value: object) -> str:
+    try:
+        return _canonical_feed(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"unsupported recorder equity data feed {value!r}") from exc
 
 
 def _session_date(value: datetime) -> date:
@@ -178,13 +189,23 @@ def _scan_corpus(output: Path) -> dict:
     """
     watermark: datetime | None = None
     latest_bars: dict[str, str] = {}
-    for _row, _key, event, symbol, parsed in _validated_corpus_rows(output):
+    data_feeds: set[str] = set()
+    for row, _key, event, symbol, parsed in _validated_corpus_rows(output):
         if watermark is None or parsed > watermark:
             watermark = parsed
+        if event in {"bar", "bar_1m", "quote"}:
+            feed = str(row.get("feed") or "").strip().lower()
+            if feed:
+                data_feeds.add(_canonical_data_feed(feed))
         if event in {"bar", "bar_1m"}:
             previous = latest_bars.get(symbol)
             if previous is None or parsed.isoformat() > previous:
                 latest_bars[symbol] = parsed.isoformat()
+
+    if len(data_feeds) > 1:
+        raise RuntimeError(
+            "recorder corpus mixes equity data feeds: " +
+            ", ".join(sorted(data_feeds)))
 
     recent_keys: dict[str, str] = {}
     if watermark is not None:
@@ -199,7 +220,9 @@ def _scan_corpus(output: Path) -> dict:
     index = {"schema": INDEX_SCHEMA,
              "watermark": watermark.isoformat() if watermark else None,
              "latest_bars": latest_bars, "recent_keys": recent_keys,
-             "option_pins": {}, "partitions": _partition_sizes(output)}
+             "option_pins": {}, "bar_coverage": {},
+             "data_feed": next(iter(data_feeds), None),
+             "partitions": _partition_sizes(output)}
     return _prune_index(index)
 
 
@@ -250,6 +273,8 @@ def _partition_sizes(output: Path) -> dict[str, int]:
 
 def _prune_index(index: dict) -> dict:
     """Drop dedup keys and option pins that fell out of their bounded window."""
+    index.setdefault("bar_coverage", {})
+    index.setdefault("data_feed", None)
     watermark = _timestamp(index.get("watermark"))
     if watermark is not None:
         floor = (watermark - DEDUP_HORIZON).isoformat()
@@ -272,6 +297,21 @@ def _load_index(output: Path) -> dict | None:
     for name in ("latest_bars", "recent_keys", "option_pins", "partitions"):
         if not isinstance(index.get(name), dict):
             return None
+    coverage = index.get("bar_coverage")
+    if coverage is None:  # backward-compatible additive recorder-index.v1 field
+        index["bar_coverage"] = {}
+    elif not isinstance(coverage, dict):
+        return None
+    data_feed = index.get("data_feed")
+    if data_feed is not None and not isinstance(data_feed, str):
+        return None
+    if isinstance(data_feed, str) and data_feed.strip():
+        try:
+            index["data_feed"] = _canonical_data_feed(data_feed)
+        except RuntimeError:
+            return None
+    else:
+        index["data_feed"] = None
     # A cycle appends rows and then rewrites the index; a crash between the two
     # leaves the index short. Byte sizes catch exactly that and force a rebuild.
     if index["partitions"] != _partition_sizes(output):
@@ -305,6 +345,22 @@ def _existing_state(output: Path) -> tuple[set[str], datetime | None, dict[str, 
 def _existing_keys(output: Path) -> set[str]:
     """Every durable key. Operational inspection only; a cycle never calls it."""
     return {str(row.get("event_key") or "") for row in iter_corpus_rows(output)}
+
+
+def _corpus_data_feed(output: Path) -> str | None:
+    """Stream a pre-coverage corpus once to recover unambiguous feed identity."""
+    feeds: set[str] = set()
+    for row in iter_corpus_rows(output):
+        event = str(row.get("event_type") or "").strip().lower()
+        feed = str(row.get("feed") or "").strip()
+        if event not in {"bar", "bar_1m", "quote"} or not feed:
+            continue
+        feeds.add(_canonical_data_feed(feed))
+        if len(feeds) > 1:
+            raise RuntimeError(
+                "recorder corpus mixes equity data feeds: " +
+                ", ".join(sorted(feeds)))
+    return next(iter(feeds), None)
 
 
 class CalendarCache:
@@ -364,13 +420,15 @@ class CalendarCache:
 
 
 def _regular_session_gap(previous: datetime, current: datetime,
-                         calendar: CalendarCache | None = None) -> bool:
+                         calendar: CalendarCache | None = None,
+                         maximum: timedelta = timedelta(
+                             minutes=DEFAULT_BAR_GAP_MINUTES)) -> bool:
     """Is the hole between two bars a real gap inside a scheduled session?"""
     before = previous.astimezone(NEW_YORK)
     after = current.astimezone(NEW_YORK)
     if before.date() != after.date():
         return False
-    if current - previous <= timedelta(minutes=5):
+    if current - previous <= maximum:
         return False
     if calendar is not None and calendar.known(before.date()):
         session = calendar.session(before.date())
@@ -391,7 +449,13 @@ def _regular_session_gap(previous: datetime, current: datetime,
 
 def _verify_bar_continuity(rows: list[dict], latest_bars: dict[str, datetime],
                            now: datetime, symbols: list[str],
-                           calendar: CalendarCache | None = None) -> None:
+                           calendar: CalendarCache | None = None, *,
+                           feed: str = "unknown", policy: str = "strict",
+                           maximum: timedelta = timedelta(
+                               minutes=DEFAULT_BAR_GAP_MINUTES)) -> dict[str, dict]:
+    """Return bounded coverage evidence and reject gaps only in strict mode."""
+    if policy not in {"observe", "strict"}:
+        raise ValueError("recorder bar continuity policy must be observe or strict")
     by_symbol: dict[str, list[datetime]] = {symbol: [] for symbol in symbols}
     for row in rows:
         if row.get("event_type") != "bar_1m":
@@ -400,19 +464,111 @@ def _verify_bar_continuity(rows: list[dict], latest_bars: dict[str, datetime],
         parsed = _timestamp(row.get("timestamp"))
         if parsed is not None:
             by_symbol.setdefault(symbol, []).append(parsed)
+    evidence: dict[str, dict] = {}
+    first_gap: str | None = None
     for symbol in symbols:
         previous = latest_bars.get(symbol)
+        fresh = sorted({
+            item for item in by_symbol.get(symbol, ())
+            if previous is None or item > previous
+        })
+        gaps: list[tuple[datetime, datetime]] = []
+        latest = previous
         if previous is None:
-            continue
-        fresh = sorted({item for item in by_symbol.get(symbol, ()) if item > previous})
-        if not fresh:
-            if _regular_session_gap(previous, now, calendar):
-                raise RuntimeError(f"recorder bar continuity gap for {symbol}")
-            continue
-        for current in fresh:
-            if _regular_session_gap(previous, current, calendar):
-                raise RuntimeError(f"recorder bar continuity gap for {symbol}")
-            previous = current
+            latest = fresh[-1] if fresh else None
+        elif not fresh:
+            if _regular_session_gap(previous, now, calendar, maximum):
+                gaps.append((previous, now))
+        else:
+            for current in fresh:
+                if _regular_session_gap(previous, current, calendar, maximum):
+                    gaps.append((previous, current))
+                previous = current
+            latest = previous
+
+        last_gap = gaps[-1] if gaps else None
+        window_max = max(
+            (int((end - start).total_seconds()) for start, end in gaps),
+            default=0)
+        status = ("gap_observed" if gaps else
+                  "covered" if latest is not None else "unobserved")
+        evidence[symbol] = {
+            "feed": str(feed),
+            "policy": policy,
+            "status": status,
+            "checked_through": now.isoformat(),
+            "last_bar": latest.isoformat() if latest is not None else None,
+            "gap_threshold_seconds": int(maximum.total_seconds()),
+            "window_bars": len(fresh),
+            "window_gap_count": len(gaps),
+            "window_max_gap_seconds": window_max,
+            "last_gap_start": last_gap[0].isoformat() if last_gap else None,
+            "last_gap_end": last_gap[1].isoformat() if last_gap else None,
+            "last_gap_seconds": (
+                int((last_gap[1] - last_gap[0]).total_seconds())
+                if last_gap else None),
+        }
+        if gaps and first_gap is None:
+            first_gap = symbol
+
+    if policy == "strict" and first_gap is not None:
+        raise RuntimeError(f"recorder bar continuity gap for {first_gap}")
+    return evidence
+
+
+def _coverage_count(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _update_bar_coverage(index: dict, observations: dict[str, dict],
+                         observed_at: datetime) -> None:
+    """Merge one window into bounded per-symbol coverage counters."""
+    coverage = index.setdefault("bar_coverage", {})
+    for symbol, observation in observations.items():
+        previous = coverage.get(symbol)
+        if not isinstance(previous, dict):
+            previous = {}
+        window_bars = _coverage_count(observation.get("window_bars"))
+        window_gaps = _coverage_count(observation.get("window_gap_count"))
+        cumulative_gaps = _coverage_count(
+            previous.get("gap_observations")) + window_gaps
+        merged = {
+            "feed": observation.get("feed"),
+            "policy": observation.get("policy"),
+            "status": ("gap_observed" if cumulative_gaps else
+                       observation.get("status")),
+            "checked_through": observation.get("checked_through"),
+            "observed_at": observed_at.isoformat(),
+            "last_bar": observation.get("last_bar"),
+            "gap_threshold_seconds": observation.get("gap_threshold_seconds"),
+            "windows_observed": _coverage_count(
+                previous.get("windows_observed")) + 1,
+            "bars_observed": _coverage_count(
+                previous.get("bars_observed")) + window_bars,
+            "gap_observations": cumulative_gaps,
+            "last_window_bars": window_bars,
+            "last_window_gap_count": window_gaps,
+            "last_window_max_gap_seconds": _coverage_count(
+                observation.get("window_max_gap_seconds")),
+            "max_gap_seconds": max(
+                _coverage_count(previous.get("max_gap_seconds")),
+                _coverage_count(observation.get("window_max_gap_seconds"))),
+            "last_gap_start": previous.get("last_gap_start"),
+            "last_gap_end": previous.get("last_gap_end"),
+            "last_gap_seconds": previous.get("last_gap_seconds"),
+            "last_gap_observed_at": previous.get("last_gap_observed_at"),
+        }
+        if window_gaps:
+            merged.update({
+                "last_gap_start": observation.get("last_gap_start"),
+                "last_gap_end": observation.get("last_gap_end"),
+                "last_gap_seconds": observation.get("last_gap_seconds"),
+                "last_gap_observed_at": observed_at.isoformat(),
+            })
+        coverage[symbol] = merged
 
 
 def _migrate_header(output: Path) -> None:
@@ -544,6 +700,54 @@ def _fetch_window_minutes() -> int:
     return value
 
 
+def _bar_gap_minutes() -> int:
+    raw = os.getenv("ALPACA_RECORDER_BAR_GAP_MINUTES",
+                    str(DEFAULT_BAR_GAP_MINUTES))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "ALPACA_RECORDER_BAR_GAP_MINUTES must be a positive integer"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            "ALPACA_RECORDER_BAR_GAP_MINUTES must be a positive integer")
+    return value
+
+
+def _strict_bar_feeds() -> frozenset[str]:
+    raw = os.getenv("ALPACA_RECORDER_STRICT_BAR_FEEDS", "").strip().lower()
+    if not raw or raw == "none":
+        return frozenset()
+    feeds = set()
+    for value in raw.split(","):
+        feed = value.strip().replace("-", "_")
+        if not feed:
+            raise RuntimeError(
+                "ALPACA_RECORDER_STRICT_BAR_FEEDS must contain only "
+                "iex, sip, delayed_sip, or *")
+        if feed != "*":
+            try:
+                feed = _canonical_data_feed(feed)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "ALPACA_RECORDER_STRICT_BAR_FEEDS must contain only "
+                    "iex, sip, delayed_sip, or *") from exc
+        feeds.add(feed)
+    return frozenset(feeds)
+
+
+def _bar_gap_policy(feed: str) -> str:
+    strict = _strict_bar_feeds()
+    return "strict" if "*" in strict or feed in strict else "observe"
+
+
+def _resolved_feed(provider, feed: str | None, config: dict | None) -> str:
+    value = (feed if feed is not None else
+             getattr(provider, "data_feed", None) or _feed(config))
+    return _canonical_data_feed(value)
+
+
 def _ingest_chunk(output: Path, index: dict, seen: set[str],
                   watermark: datetime | None,
                   latest_bars: dict[str, datetime], pins: dict,
@@ -551,9 +755,14 @@ def _ingest_chunk(output: Path, index: dict, seen: set[str],
                   window_end: datetime, observed_at: datetime,
                   option_hold: timedelta,
                   horizon: datetime | None,
-                  calendar: CalendarCache | None):
+                  calendar: CalendarCache | None, *, feed: str,
+                  bar_gap_policy: str,
+                  bar_gap_maximum: timedelta):
     """Validate and durably append one bounded provider response."""
-    _verify_bar_continuity(rows, latest_bars, window_end, symbols, calendar)
+    coverage = _verify_bar_continuity(
+        rows, latest_bars, window_end, symbols, calendar, feed=feed,
+        policy=bar_gap_policy, maximum=bar_gap_maximum)
+    _update_bar_coverage(index, coverage, observed_at)
     unique_rows: list[dict] = []
     for row in rows:
         parsed = _timestamp(row.get("timestamp"))
@@ -615,6 +824,20 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     _corpus_root(output).mkdir(parents=True, exist_ok=True)
     migrate_corpus(output)
     index = _load_index(output) or _scan_corpus(output)
+    resolved_feed = _resolved_feed(provider, feed, config)
+    indexed_feed = str(index.get("data_feed") or "").strip().lower()
+    if not indexed_feed and (index.get("partitions") or
+                             (output.exists() and output.stat().st_size)):
+        indexed_feed = _corpus_data_feed(output) or ""
+        if indexed_feed:
+            index["data_feed"] = indexed_feed
+    if indexed_feed and indexed_feed != resolved_feed:
+        raise RuntimeError(
+            f"recorder data feed changed from {indexed_feed} to {resolved_feed}; "
+            "use a separate corpus")
+    index["data_feed"] = resolved_feed
+    bar_gap_policy = _bar_gap_policy(resolved_feed)
+    bar_gap_maximum = timedelta(minutes=_bar_gap_minutes())
     seen = set(index["recent_keys"])
     watermark = _timestamp(index.get("watermark"))
     latest_bars = {symbol: parsed for symbol, parsed in
@@ -639,13 +862,15 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     while True:
         window_end = min(cursor + window, now)
         rows = list(_rows(
-            provider, symbols, window_end, feed=feed, config=config,
+            provider, symbols, window_end, feed=resolved_feed, config=config,
             include_options=bool(include_options), option_limit=option_limit,
             start=cursor, option_pins=frozenset(pins), observed_at=now))
         total_rows += len(rows)
         index, seen, watermark, latest_bars, pins, unique = _ingest_chunk(
             output, index, seen, watermark, latest_bars, pins, rows, symbols,
-            window_end, now, option_hold, horizon, calendar)
+            window_end, now, option_hold, horizon, calendar,
+            feed=resolved_feed, bar_gap_policy=bar_gap_policy,
+            bar_gap_maximum=bar_gap_maximum)
         total_unique += unique
         if window_end >= now:
             break

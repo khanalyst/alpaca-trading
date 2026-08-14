@@ -302,13 +302,40 @@ class BoundaryTests(unittest.TestCase):
                          now=FRIDAY_EVENING)
 
     def test_the_requested_feed_reaches_every_request(self):
-        provider = FakeProvider(bars_per_session=1)
+        for requested, expected in (("sip", "sip"),
+                                    ("delayed", "delayed_sip")):
+            provider = FakeProvider(bars_per_session=1)
+            with self.subTest(feed=requested), \
+                    tempfile.TemporaryDirectory() as directory:
+                output = _corpus(directory)
+                backfill(provider, ["SPY"], output, days=3,
+                         feed=requested, now=FRIDAY_EVENING)
+                self.assertTrue(provider.bar_windows)
+                self.assertEqual(
+                    {window[2] for window in provider.bar_windows}, {expected})
+                self.assertEqual(
+                    {row["feed"] for row in iter_corpus_rows(output)},
+                    {expected})
+                self.assertEqual(_load_index(output)["data_feed"], expected)
+
+    def test_backfill_refuses_a_feed_change_before_mutating_the_corpus(self):
         with tempfile.TemporaryDirectory() as directory:
-            backfill(provider, ["SPY"], _corpus(directory), days=3,
-                     feed="sip", now=FRIDAY_EVENING)
-            self.assertTrue(provider.bar_windows)
-            self.assertEqual({window[2] for window in provider.bar_windows},
-                             {"sip"})
+            output = _corpus(directory)
+            backfill(FakeProvider(bars_per_session=1), ["SPY"], output,
+                     days=3, feed="iex", now=FRIDAY_EVENING)
+            before = {path.name: path.read_bytes()
+                      for path in corpus_partitions(output)}
+            provider = FakeProvider(bars_per_session=1)
+
+            with self.assertRaisesRegex(
+                    BackfillError, "data feed changed from iex to sip"):
+                backfill(provider, ["SPY"], output, days=3, feed="sip",
+                         now=FRIDAY_EVENING, overwrite=True)
+
+            self.assertEqual(provider.calendar_calls, 0)
+            self.assertEqual(
+                {path.name: path.read_bytes()
+                 for path in corpus_partitions(output)}, before)
 
 
 if __name__ == "__main__":

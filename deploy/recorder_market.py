@@ -13,6 +13,7 @@ import os
 from datetime import date, datetime, timedelta
 
 from agent.alpaca_provider import AlpacaProvider
+from agent.alpaca_sdk import _canonical_feed
 from agent.instruments import validate_equity_symbol, validate_option_symbol
 
 
@@ -56,7 +57,7 @@ def _feed(config: dict | None = None) -> str:
         data = {}
     value = (os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
              or broker.get("data_feed") or data.get("feed") or "iex")
-    return str(value).strip().lower() or "iex"
+    return _canonical_feed(value)
 
 
 def _options_feed(config: dict | None = None) -> str:
@@ -324,8 +325,9 @@ def _rows(provider: AlpacaProvider, symbols: list[str], now: datetime,
         raise ValueError("recorder start must be an aware timestamp at or before now")
     # The provider owns environment/config precedence and canonicalization.
     # ``feed`` remains an explicit test seam; production callers leave it unset.
-    feed = str(feed if feed is not None else
-               getattr(provider, "data_feed", None) or _feed()).strip().lower() or "iex"
+    feed = _canonical_feed(
+        feed if feed is not None else
+        getattr(provider, "data_feed", None) or _feed())
     symbols = [validate_equity_symbol(symbol) for symbol in symbols]
     bars = _call_market_data(provider.bars, symbols, start=start, end=now,
                               feed=feed)

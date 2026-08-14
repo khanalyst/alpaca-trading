@@ -91,6 +91,30 @@ def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
     # is authoritative; nested files must not mask a stale recorder.
     index_path = path / ".recorder-index.json"
     index_write = index_path.stat().st_mtime if index_path.is_file() else None
+    index = _read_json(index_path)
+    raw_coverage = index.get("bar_coverage")
+    coverage = ({str(symbol): dict(value)
+                 for symbol, value in raw_coverage.items()
+                 if isinstance(value, dict)}
+                if isinstance(raw_coverage, dict) else {})
+    gap_symbols = sorted(
+        symbol for symbol, value in coverage.items()
+        if value.get("status") == "gap_observed")
+    unobserved = sorted(
+        symbol for symbol, value in coverage.items()
+        if value.get("status") == "unobserved")
+    gap_observations = 0
+    for value in coverage.values():
+        try:
+            gap_observations += max(0, int(value.get("gap_observations") or 0))
+        except (TypeError, ValueError):
+            continue
+    coverage_status = (
+        "gap_observed" if gap_symbols else
+        "unobserved" if unobserved else
+        "covered" if coverage else
+        "unknown"
+    )
     writes = [timestamp for timestamp in (latest_csv, index_write)
               if timestamp is not None]
     latest = max(writes, default=None)
@@ -104,6 +128,12 @@ def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "latest_write_ts": latest,
         "latest_csv_write_ts": latest_csv,
         "index_write_ts": index_write,
+        "data_feed": index.get("data_feed"),
+        "coverage_status": coverage_status,
+        "bar_gap_symbols": gap_symbols,
+        "bar_unobserved_symbols": unobserved,
+        "bar_gap_observations": gap_observations,
+        "bar_coverage": coverage,
     }
 
 
