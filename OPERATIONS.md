@@ -10,7 +10,7 @@ cleanup, and force-flat before the close. Overnight positions are an incident,
 not a supported state.
 
 The read-only dashboard on `http://127.0.0.1:8080` is the fastest way to see
-all of this at once: demo trials and what has earned a promotion, pinned
+all of this at once: paper-account trials and what has earned a promotion, pinned
 promotions and any pin that cannot trade, every fill attributed to the strategy
 and variant that placed it, what research learned and what each proposal built
 on, and the configuration audit trail. It cannot change anything — `POST`
@@ -260,7 +260,7 @@ recorder's first live cycle resumes from a completed session boundary.
 ## Promoting an edge
 
 Promotion is the one step nothing automatic performs. The system runs proved
-edges on the demo account, judges them on their real fills, and hands you a
+edges on the same Alpaca paper account, judges them on their real fills, and hands you a
 shortlist; deciding is yours.
 
 **1. See what has earned it.**
@@ -317,9 +317,9 @@ not lifecycle, and they still stop trading.
 or the older `selection_mode: specific`. Everything in
 "Mode guard and live preflight" still applies.
 
-## Trials on the demo account
+## Trials on the paper account
 
-An edge that is proved but not pinned trades the demo account so its evidence
+An edge that is proved but not pinned trades the same Alpaca paper account so its evidence
 stops being a replay. `research.trial` in `config.yaml` sets the window and the
 floor:
 

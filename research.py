@@ -383,7 +383,7 @@ def _pinned(config: dict) -> list[tuple[str, str]]:
 
 
 def cmd_edge_trials(args: argparse.Namespace) -> int:
-    """Judge each demo-account trial, and park the ones below their floor.
+    """Judge each paper-account trial, and park the ones below their floor.
 
     ``--dry-run`` reports the same verdicts without changing a lifecycle, so an
     operator can see what a review would do before letting it do it.

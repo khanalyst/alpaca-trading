@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 try:
     from deploy import dashboard, health, recorder, scheduler, scheduler_output
+    from deploy import shadow as shadow_service
 except ModuleNotFoundError as exc:  # dependency-independent local test runs
     if exc.name == "yaml":
         raise unittest.SkipTest("PyYAML is supplied by the deployment lockfile")
@@ -352,6 +353,9 @@ class DeployTests(unittest.TestCase):
         self.assertIn("- /app/shadow/shadow.sqlite3", shadow)
         self.assertIn("depends_on:", shadow)
         self.assertIn("shadow-init:", shadow)
+        self.assertIn("--health-file", shadow)
+        self.assertIn("deploy/health.py", shadow)
+        self.assertIn('"shadow"', shadow)
         shadow_init = text.split("  shadow-init:", 1)[1].split("  shadow:", 1)[0]
         self.assertIn('user: "0:0"', shadow_init)
         self.assertIn("chown 10001:10001 /app/shadow", shadow_init)
@@ -600,6 +604,36 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(payload["schema"], "research-cycle.v1")
             self.assertEqual(payload["status"], "no_data")
             self.assertEqual(payload["exit_code"], 2)
+            self.assertIn('"schema":"research-llm.v1"', result.stderr)
+            self.assertIn('"status":"disabled"', result.stderr)
+
+    def test_research_cycle_fails_fast_when_enabled_llm_has_no_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            config.write_text(json.dumps({
+                "mode": "paper",
+                "broker": {"paper": True, "allow_live": False},
+                "research": {"strategy_llm": {
+                    "enabled": True, "provider": "openai", "model": "gpt-5",
+                }},
+            }), encoding="utf-8")
+            dataset = root / "empty.jsonl"
+            dataset.write_text("\n", encoding="utf-8")
+            env = dict(
+                os.environ, PYTHON=sys.executable,
+                ALPACA_AGENT_CONFIG=str(config),
+                ALPACA_RESEARCH_DATASET=str(dataset),
+                ALPACA_RESEARCH_LLM_SECRETS_FILE="/dev/null")
+            env.pop("OPENAI_API_KEY", None)
+            result = subprocess.run(
+                ["deploy/research-cycle.sh"],
+                cwd=Path(__file__).resolve().parents[1], env=env,
+                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("OPENAI_API_KEY is unavailable", payload["reason"])
 
     def test_scheduler_preserves_research_cycle_statuses_in_health_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -648,6 +682,79 @@ class DeployTests(unittest.TestCase):
                 "status": "no_data", "updated_ts": now,
                 "last_exit_code": 2}), encoding="utf-8")
             self.assertFalse(health.research(path, 60, now=now)["ok"])
+
+    def test_running_research_is_judged_independently_of_previous_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            path.write_text(json.dumps({
+                "status": "running", "updated_ts": 100,
+                "deadline_ts": 200, "last_exit_code": 2,
+            }), encoding="utf-8")
+            result = health.research(path, 60, now=100)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["previous_cycle_degraded"])
+        self.assertEqual(result["last_exit_code"], 2)
+
+    def test_waiting_scheduler_is_judged_independently_of_previous_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            path.write_text(json.dumps({
+                "status": "waiting", "updated_ts": 100,
+                "last_exit_code": 2, "cycle_status": "no_data",
+                "next_run_ts": 200,
+            }), encoding="utf-8")
+            result = health.research(path, 60, now=100)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["waiting_after_no_data"])
+            self.assertTrue(result["previous_cycle_degraded"])
+
+            path.write_text(json.dumps({
+                "status": "waiting", "updated_ts": 100,
+                "last_exit_code": 1, "cycle_status": "failed",
+                "next_run_ts": 200,
+            }), encoding="utf-8")
+            result = health.research(path, 60, now=100)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["waiting_after_no_data"])
+        self.assertTrue(result["previous_cycle_degraded"])
+
+    def test_shadow_health_requires_a_fresh_successful_poll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shadow.json"
+            path.write_text(json.dumps({
+                "status": "running", "updated_ts": 100,
+                "candidates": 2, "events": 10, "decisions": 3,
+            }), encoding="utf-8")
+            self.assertTrue(health.shadow(path, 60, now=100)["ok"])
+            path.write_text(json.dumps({
+                "status": "degraded", "updated_ts": 100,
+                "last_error": "ShadowError: test",
+            }), encoding="utf-8")
+            degraded = health.shadow(path, 60, now=100)
+        self.assertFalse(degraded["ok"])
+        self.assertEqual(degraded["last_error"], "ShadowError: test")
+
+    def test_shadow_once_publishes_an_atomic_health_record(self):
+        class Runner:
+            def __init__(self, _config):
+                pass
+
+            def run_once(self):
+                return {"candidates": 1, "events": 4, "decisions": 2,
+                        "ingested_events": 1,
+                        "quarantine_through_session": "2026-08-14"}
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                shadow_service, "ShadowRunner", Runner):
+            health_path = Path(directory) / "health.json"
+            code = shadow_service.main([
+                "--once", "--shadow-db", str(Path(directory) / "shadow.db"),
+                "--health-file", str(health_path)])
+            payload = json.loads(health_path.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["schema"], "shadow-health.v1")
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["ingested_events"], 1)
 
     def test_research_cycle_sends_recorded_options_to_autonomous_discovery(self):
         expiry = (datetime.now(timezone.utc).date() + timedelta(days=30)).isoformat()
@@ -1339,6 +1446,29 @@ class DeployTests(unittest.TestCase):
             result = health.trader(path, max_age=30, now=100)
             self.assertTrue(result["ok"])
 
+    def test_health_distinguishes_edge_gate_from_operator_pause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heartbeat.json"
+            path.write_text(json.dumps({
+                "status": "paused", "updated_ts": 100,
+                "reason": "validated_edge_required",
+            }), encoding="utf-8")
+            result = health.trader(path, max_age=30, now=100)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["edge_gate_pause"])
+            self.assertFalse(result["operator_pause"])
+            self.assertEqual(result["classification"],
+                             "validated_edge_required")
+
+            path.write_text(json.dumps({
+                "status": "paused", "updated_ts": 100,
+                "reason": "operator_resume_ready",
+            }), encoding="utf-8")
+            result = health.trader(path, max_age=30, now=100)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["edge_gate_pause"])
+        self.assertTrue(result["operator_pause"])
+
     def test_recorder_health_uses_fresh_index_when_corpus_is_stale(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1418,6 +1548,7 @@ class DeployTests(unittest.TestCase):
         self.assertIn("d.research.untradeable_proved_edges", dashboard.HTML)
         self.assertIn("cycle outcome", dashboard.HTML)
         self.assertIn("Execution journal", dashboard.HTML)
+        self.assertIn("Paper-account trials", dashboard.HTML)
         self.assertNotIn("d.research_feed_version", dashboard.HTML)
         self.assertNotIn("d.research.optional", dashboard.HTML)
         self.assertNotIn("d.trader.heartbeat.research_available", dashboard.HTML)
@@ -1426,7 +1557,7 @@ class DeployTests(unittest.TestCase):
         """Every question the operator asked has a surface that answers it."""
         for marker in (
                 # Which edge is earning a promotion, and what to paste.
-                "d.trial", "Demo trials", "Promotable", "config_snippet",
+                "d.trial", "Paper-account trials", "Promotable", "config_snippet",
                 # What was pinned, and whether it can actually trade.
                 "d.promotions", "Pinned promotions", "Pinned but NOT trading",
                 "notify only",
@@ -1476,6 +1607,49 @@ class DeployTests(unittest.TestCase):
             view = dashboard._journal_view(Path(directory) / "absent.db")
         self.assertFalse(view["available"])
         self.assertEqual(view["trades"], [])
+
+    def test_dashboard_read_only_wal_falls_back_only_without_pending_wal(self):
+        class Connection:
+            def __init__(self, broken=False):
+                self.broken = broken
+                self.closed = False
+                self.row_factory = None
+
+            def execute(self, statement):
+                if self.broken and statement.startswith("SELECT 1"):
+                    raise sqlite3.OperationalError("unable to open database file")
+                return self
+
+            def fetchone(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.db"
+            journal.touch()
+            broken, fallback = Connection(True), Connection()
+            calls = []
+
+            def connect(database, **_kwargs):
+                calls.append(database)
+                return broken if len(calls) == 1 else fallback
+
+            with patch.object(dashboard.sqlite3, "connect", side_effect=connect):
+                opened = dashboard._ro_connect(journal)
+            self.assertIs(opened, fallback)
+            self.assertTrue(broken.closed)
+            self.assertIn("immutable=1", calls[1])
+            opened.close()
+
+            journal.with_name("journal.db-wal").write_bytes(b"pending")
+            calls.clear()
+            broken = Connection(True)
+            with patch.object(dashboard.sqlite3, "connect", return_value=broken):
+                with self.assertRaises(sqlite3.OperationalError):
+                    dashboard._ro_connect(journal)
+            self.assertTrue(broken.closed)
 
     def test_dashboard_surfaces_the_config_audit_trail(self):
         import copy as copier

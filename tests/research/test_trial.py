@@ -1,4 +1,4 @@
-"""The demo-account trial lane, and the boundary it must not cross.
+"""The paper-account trial lane, and the boundary it must not cross.
 
 Backtests say what would have worked; only a live paper book says what does.
 These tests pin three things: that a trial window is judged on a real sample

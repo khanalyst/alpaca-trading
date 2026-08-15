@@ -1,12 +1,13 @@
-"""The demo-account trial lane: live paper evidence that feeds back into search.
+"""The paper-account trial lane: live paper evidence that feeds back into search.
 
 Backtests answer "would this have worked". Only a live paper book answers "does
 this work now", and until this existed that answer went nowhere: paper outcomes
 drove the demotion guards and were never read by the thing that proposes what
 to try next.
 
-A trial is the window in which an auto-lane edge trades the demo account and
-its real results are collected. When the window closes, the trial is judged
+A trial is the window in which an auto-lane edge trades the same Alpaca paper
+account as the runtime and its real results are collected. When the window
+closes, the trial is judged
 against an explicit floor. An edge that clears it keeps trading and becomes a
 *promotable* candidate — something the operator may pin into configuration, a
 decision this module never makes. An edge that misses it is parked, and the

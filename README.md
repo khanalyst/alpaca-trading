@@ -150,7 +150,7 @@ Four states, and only one transition a machine cannot make.
 | --- | --- | --- |
 | **Research** — hypotheses, variants, gates | the factory | yes, continuously |
 | **Proved** — `validated`/`champion` plus a live-shadow marker | the gates and live ingestion | yes, on evidence |
-| **Trial** — trading the demo account, outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
+| **Trial** — trading the same Alpaca paper account, with outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
 | **Pinned** — an id you wrote into `config.yaml` | **you only** | **no.** Guards still run and still report; they raise an alert and leave it in place |
 
 Promotion is the one step that is never automatic. When an edge clears its
@@ -286,7 +286,7 @@ quarantines mismatch/incomplete rows. It compares semantic runtime-shadow
 signatures with factory/IBR replay and has no order or broker authority.
 
 The read-only dashboard (`http://127.0.0.1:8080`) is the detailed reporting
-surface. Beyond trader health it shows: demo trials with each edge's live
+surface. Beyond trader health it shows: paper-account trials with each edge's live
 record against its floor; promotable edges with the config block to paste;
 pinned promotions and any pin that cannot currently trade; every recorded fill
 attributed to the strategy and variant that placed it, plus a per-variant
@@ -339,12 +339,12 @@ Set `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER=true`, and the
 selected `ALPACA_DATA_FEED`/`ALPACA_OPTIONS_FEED` in `.env`. `check` is the
 authenticated preflight by default; `check --offline` validates local
 configuration only and is not a trading preflight. Unit tests use fakes and do
-not need credentials. The checked config enables the bounded research
-discovery and replacement adapters with model `gpt-5`; they read optional
-provider credentials only from the separate
-`ALPACA_RESEARCH_LLM_SECRETS_FILE`. Missing or invalid LLM output leaves a
-pending replacement or falls back to deterministic discovery; it never retires
-a family or authorizes trading. Runtime
+not need credentials. The checked config uses deterministic research. Bounded
+model-assisted discovery and replacement can be enabled with model `gpt-5`;
+they read provider credentials only from the separate
+`ALPACA_RESEARCH_LLM_SECRETS_FILE`. Enabling the model lane without the matching
+provider key fails the research cycle before discovery. Invalid model output
+leaves a pending replacement; it never retires a family or authorizes trading. Runtime
 decision LLM use remains disabled (`llm.enabled: false`). The default stock
 feed is IEX. Long options remain subject to liquidity and contract checks.
 Research studies only the vehicle the configured execution profile can trade

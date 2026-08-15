@@ -140,10 +140,11 @@ paper runtime lock, an open market, and an initially flat account, then buys
 and closes one share and proves the account is flat. Orders are day-only;
 startup cleanup cancels working
 orders and flattens residuals, and the session policy force-flats before the
-regular NY close. The checked research config enables bounded `gpt-5` strategy
-replacement, using credentials only from optional
-`ALPACA_RESEARCH_LLM_SECRETS_FILE`; invalid or missing output leaves a pending
-replacement. LLM discovery/replacement/tuning use full-schema structured
+regular NY close. The checked research config uses deterministic strategy
+discovery. Bounded model-assisted replacement can be enabled with credentials
+only from `ALPACA_RESEARCH_LLM_SECRETS_FILE`; enabling it without the matching
+provider key fails the research cycle before discovery. LLM
+discovery/replacement/tuning use full-schema structured
 contracts, a per-run call budget and authentication circuit, and record
 per-attempt evidence. Runtime decision LLM use remains disabled. The trader opens
 entries only when the SQLite ledger has a vehicle-local `validated` or
@@ -163,7 +164,10 @@ when they read it. `research-progress.v1` records expose the current bounded
 phase through scheduler health and the dashboard without changing gate or
 promotion semantics.
 
-For Compose, set `ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of the
+Model-assisted research is disabled in the shipped paper configuration so an
+empty Compose secret can never masquerade as an authenticated provider. To
+enable it, set `research.strategy_llm.enabled=true` and set
+`ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of the
 separate research-provider dotenv file. It is mounted read-only as
 `/run/secrets/research_llm_credentials`; broker credentials are not mounted
 into the research service.

@@ -8,6 +8,10 @@ python_bin="${PYTHON:-python}"
 if ! command -v "$python_bin" >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   python_bin=python3
 fi
+agent_config="${ALPACA_AGENT_CONFIG:-$repo_root/config.yaml}"
+if [[ "$agent_config" != /* ]]; then
+  agent_config="$repo_root/$agent_config"
+fi
 
 # ``research.py`` emits detailed proof/result JSON itself. Keep those lines on
 # their original streams and add one terminal record for the scheduler.
@@ -106,6 +110,43 @@ load_llm_secrets() {
 }
 
 load_llm_secrets
+
+# Enabling model-assisted research is an explicit operational contract.  Do
+# not let an empty/default /dev/null secret silently open an authentication
+# circuit and make a deterministic cycle look model-assisted.  Deterministic
+# research remains available by setting research.strategy_llm.enabled=false.
+llm_provider="$($python_bin - "$agent_config" <<'PY'
+import sys
+
+from agent.config import load_config
+
+config = load_config(sys.argv[1])
+research = config.get("research") if isinstance(config, dict) else {}
+llm = research.get("strategy_llm") if isinstance(research, dict) else {}
+if not isinstance(llm, dict) or not llm.get("enabled"):
+    print("disabled")
+else:
+    print(str(llm.get("provider") or "openai").strip().lower())
+PY
+)"
+case "$llm_provider" in
+  disabled)
+    echo '{"schema":"research-llm.v1","status":"disabled","reason":"configuration"}' >&2
+    ;;
+  openai)
+    [ -n "${OPENAI_API_KEY:-}" ] || \
+      finish "failed" "strategy LLM is enabled but OPENAI_API_KEY is unavailable" 3
+    echo '{"schema":"research-llm.v1","status":"ready","provider":"openai"}' >&2
+    ;;
+  anthropic)
+    [ -n "${ANTHROPIC_API_KEY:-}" ] || \
+      finish "failed" "strategy LLM is enabled but ANTHROPIC_API_KEY is unavailable" 3
+    echo '{"schema":"research-llm.v1","status":"ready","provider":"anthropic"}' >&2
+    ;;
+  *)
+    finish "failed" "strategy LLM provider is unsupported" 3
+    ;;
+esac
 dataset="${ALPACA_RESEARCH_DATASET:-}"
 recorded_root="${ALPACA_RECORDED_DATASET_ROOT:-$repo_root/runtime/research/recorded}"
 if [[ "$recorded_root" != /* ]]; then
@@ -267,11 +308,6 @@ shadow_db="${ALPACA_SHADOW_DB:-$repo_root/runtime/research/shadow.sqlite3}"
 if [[ "$shadow_db" != /* ]]; then
   shadow_db="$repo_root/$shadow_db"
 fi
-agent_config="${ALPACA_AGENT_CONFIG:-$repo_root/config.yaml}"
-if [[ "$agent_config" != /* ]]; then
-  agent_config="$repo_root/$agent_config"
-fi
-
 # Calibration is read-only and advisory.  A missing/thin journal or an
 # optimistic finding must never promote, demote, or mutate a broker account;
 # emit the result for operators and continue the offline cycle.
@@ -397,7 +433,7 @@ if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then
   finish "failed" "no research vehicle resolved from the agent config" 3
 fi
 
-# Judge the demo-account trials before proposing anything new, so a trial that
+# Judge the paper-account trials before proposing anything new, so a trial that
 # just finished below its floor is already a recorded lesson by the time this
 # cycle's tuning reads its history. A parked edge exits 3, which is an
 # operator-visible outcome, not a failure.

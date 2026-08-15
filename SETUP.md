@@ -182,9 +182,9 @@ The LLM's job here is narrow and worth understanding before you enable it:
 - It **cannot** write code, place an order, or shorten the evidence path. Its
   proposals enter the ledger as `queued` and must pass exactly the same gates a
   deterministic hypothesis faces.
-- If you skip this step, discovery falls back to a deterministic search over
-  the same grammar. The system works; it just explores in a fixed order rather
-  than an informed one.
+- If you skip this step, keep `research.strategy_llm.enabled: false`; discovery
+  uses deterministic search over the same grammar. Enabling the model lane
+  without its provider key fails the research cycle before discovery.
 
 Create a **separate** provider-only secret — Alpaca credentials must never
 appear in it:
@@ -207,8 +207,9 @@ ANTHROPIC_API_KEY=<research-provider-key>
 ```
 
 The model is set in `config.yaml` under `research.strategy_llm.model` and
-defaults to `gpt-5`. Set `research.strategy_llm.provider` to `anthropic` if you
-supplied an Anthropic key.
+defaults to `gpt-5`. Set `research.strategy_llm.enabled` to `true` only after
+the provider secret is installed. Set `research.strategy_llm.provider` to
+`anthropic` if you supplied an Anthropic key.
 
 Treat a custom provider base URL as a secret-bearing outbound destination.
 `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` receives the provider key and bounded

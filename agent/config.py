@@ -83,9 +83,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                          "near_duplicate_distance": 0.001},
         "proof": {"directory": "research/results/edges", "webhook_url": "",
                   "webhook_timeout_seconds": 10},
-        # The demo-account trial window.  An auto-lane edge trades paper for
-        # this long before its live record is judged; a pinned edge is never
-        # judged here at all.
+        # The paper-account trial window. An auto-lane edge trades the same
+        # Alpaca paper account for this long before its live record is judged;
+        # a pinned edge is never judged here at all.
         "trial": {"enabled": True, "min_sessions": 20, "min_trades": 20,
                   "min_mean_r": 0.0, "min_total_r": 0.0},
     },

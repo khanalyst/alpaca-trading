@@ -84,11 +84,42 @@ def _safe_state(path: Path) -> dict:
 
 
 def _ro_connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only=ON")
-    connection.execute("PRAGMA busy_timeout=2000")
-    return connection
+    """Open a journal without requiring writes beside a WAL-mode database.
+
+    SQLite normally creates ``-shm`` state when the database header says WAL,
+    even for a ``mode=ro`` connection.  The dashboard deliberately receives a
+    read-only volume, so a fully checkpointed journal with no remaining WAL
+    sidecar otherwise fails with ``unable to open database file``.  In that
+    exact case an immutable connection is safe: there is no uncheckpointed WAL
+    to ignore.  If a non-empty WAL exists, fail closed instead of presenting a
+    stale main-database snapshot.
+    """
+
+    def opened(uri: str) -> sqlite3.Connection:
+        connection = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=2000")
+            # Connection creation is lazy. Force the first schema read here so
+            # a read-only WAL/SHM failure is handled before returning the handle.
+            connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        except Exception:
+            connection.close()
+            raise
+        return connection
+
+    try:
+        return opened(f"file:{path}?mode=ro")
+    except sqlite3.OperationalError:
+        wal = path.with_name(f"{path.name}-wal")
+        try:
+            wal_pending = wal.is_file() and wal.stat().st_size > 0
+        except OSError:
+            wal_pending = True
+        if wal_pending:
+            raise
+        return opened(f"file:{path}?mode=ro&immutable=1")
 
 
 def _tables(connection: sqlite3.Connection) -> set[str]:
@@ -447,7 +478,7 @@ def _learning(path: Path, limit: int = 60) -> dict:
 
 
 def _trial_view(config: dict, edge_path: Path) -> dict:
-    """Demo-account trials: what is still running, and what has earned a pin.
+    """Paper-account trials: what is running and what has earned a pin.
 
     The promotable list is the hand-off: it names the variant and its edge,
     shows what it actually returned on the book, and carries the exact config
@@ -506,11 +537,31 @@ def _promotions(config: dict, edge_path: Path) -> dict:
 
 def _config_audit(journal: Path) -> dict:
     """The configuration versions this runtime has operated under."""
+    if not journal.is_file():
+        return {"available": False, "versions": []}
     try:
-        from agent.governance import config_history
-
-        history = config_history(journal, limit=25)
-    except Exception:                                      # noqa: BLE001
+        with closing(_ro_connect(journal)) as connection:
+            if "config_versions" not in _tables(connection):
+                return {"available": False, "versions": []}
+            rows = connection.execute(
+                """SELECT config_version_id, previous_version_id, mode, source,
+                          actor, diff_json, created_at
+                   FROM config_versions
+                   ORDER BY created_at DESC, config_version_id DESC LIMIT 25"""
+            ).fetchall()
+        history = []
+        for row in rows:
+            item = dict(row)
+            diff = json.loads(item.pop("diff_json")) or []
+            if not isinstance(diff, list):
+                raise ValueError("config audit diff must be a list")
+            item["diff"] = diff
+            item["changed_paths"] = [
+                str(entry["path"]) for entry in diff
+                if isinstance(entry, dict) and "path" in entry
+            ]
+            history.append(item)
+    except (OSError, sqlite3.Error, ValueError, TypeError):
         return {"available": False, "versions": []}
     return {"available": bool(history),
             "current": history[0]["config_version_id"] if history else None,
@@ -696,11 +747,11 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
 
  const tr=d.trial||{};
- c=card('Demo trials — which edge is earning a promotion',true);
- if(!tr.available){c.append(el('p','No trial data yet. Trials appear once a proved edge starts trading the demo account.','muted'))}
+ c=card('Paper-account trials — which edge is earning a promotion',true);
+ if(!tr.available){c.append(el('p','No trial data yet. Trials use the same Alpaca paper account once an edge is proved.','muted'))}
  else{const p=tr.policy||{};c.append(el('p','Trial window: '+p.min_sessions+' sessions and '+p.min_trades+' trades, then judged against total R > '+p.min_total_r+' and mean R > '+p.min_mean_r+'.','muted'));
   table(c,tr.reviews||[],['state','action','family','vehicle','variant_id','sessions','trades','total_r','mean_r','pinned'])}
- c=card('Promotable — positive on the demo account',true);
+ c=card('Promotable — positive on the paper account',true);
  const pr=(tr.promotable)||[];
  if(!pr.length){c.append(el('p','Nothing has cleared its trial floor yet. Promotion is never automatic.','muted'))}
  else{table(c,pr,['variant_id','family','vehicle','sessions','trades','total_r','mean_r','win_rate','net_pnl','return_pct','already_pinned']);
@@ -724,7 +775,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  const lr=d.learning||{};
  c=card('What research learned',true);
  if(!lr.available){c.append(el('p','No recorded reasons yet.','muted'))}
- else{const s=lr.summary||{};row(c,'reasons recorded',s.recorded);row(c,'graded against a gate',s.graded);row(c,'built on an earlier lesson',s.built_on_a_prior_lesson);row(c,'from live demo trials',s.from_live_trials);row(c,'authored by the model',s.llm_authored);
+ else{const s=lr.summary||{};row(c,'reasons recorded',s.recorded);row(c,'graded against a gate',s.graded);row(c,'built on an earlier lesson',s.built_on_a_prior_lesson);row(c,'from live paper trials',s.from_live_trials);row(c,'authored by the model',s.llm_authored);
   table(c,(lr.lessons||[]).slice(0,40),['verdict','kind','proposed_by','family','reason','built_on','changed','heldout_delta'])}
 
  const ca=d.config_audit||{};

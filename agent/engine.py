@@ -45,8 +45,6 @@ class Engine(ExecutionLifecycleMixin, RuntimeControlMixin, StartupEdgePolicyMixi
         self.cfg = cfg
         broker = cfg.get("broker", {}) if isinstance(cfg, Mapping) else {}
         self.mode = str(cfg.get("mode", "paper")).lower()
-        if self.mode == "demo":
-            self.mode = "paper"
         if self.mode not in {"paper", "live"}:
             raise AlpacaError("mode must be paper or live")
         expected_paper = self.mode == "paper"

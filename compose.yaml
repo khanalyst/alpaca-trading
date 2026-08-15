@@ -258,11 +258,19 @@ services:
       - /app/runtime/research/edge_lab.sqlite3
       - --shadow-db
       - /app/shadow/shadow.sqlite3
+      - --health-file
+      - /app/shadow/health.json
       - --interval
       - ${ALPACA_SHADOW_INTERVAL_SECONDS:-60}
     volumes:
       - runtime-data:/app/runtime:ro
       - shadow-data:/app/shadow
+    healthcheck:
+      test: ["CMD", "python", "deploy/health.py", "shadow", "--path", "/app/shadow/health.json", "--max-age", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 3m
     cpus: "0.50"
     mem_limit: 768m
     pids_limit: 128

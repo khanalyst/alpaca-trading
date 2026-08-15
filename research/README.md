@@ -405,11 +405,11 @@ attempts before it is reported, because a "trend" drawn from one is worse than
 no trend. Nothing in the digest is derived from a held-out, sealed, or
 later-forward observation, so sharing it adds no information about unseen data.
 
-## The demo-account trial lane
+## The paper-account trial lane
 
 `research.trial` closes the loop between the book and the search.
 
-A proved edge that is not pinned trades the demo account, and its real fills
+A proved edge that is not pinned trades the same Alpaca paper account, and its real fills
 accumulate as `paper_outcomes`, each carrying the exact passing shadow
 `proof_run_id` that authorized entry. After the trial window —
 `research.trial` config, default 20 sessions and 20 trades — that proof epoch
@@ -459,11 +459,12 @@ compared with itself. The root remains a real candidate in the family and
 cycle-global Benjamini–Hochberg denominators, so it consumes multiplicity like
 any mutation.
 
-The checked config enables these adapters with OpenAI `gpt-5`. They are
-optional and read provider keys only from `ALPACA_RESEARCH_LLM_SECRETS_FILE`,
-never from the broker secret file. Missing, invalid, or rejected model output
-records a pending replacement or falls back to deterministic discovery; it
-cannot retire a family prematurely. Successful proof produces a deterministic,
+The checked config uses deterministic discovery. These adapters can be enabled
+with OpenAI `gpt-5` and read provider keys only from
+`ALPACA_RESEARCH_LLM_SECRETS_FILE`, never from the broker secret file. An
+enabled adapter without its provider key fails before discovery; invalid or
+rejected model output records a pending replacement and cannot retire a family
+prematurely. Successful proof produces a deterministic,
 content-addressed finding. `research.proof.webhook_url` may send that finding
 to an HTTPS webhook without changing the durable artifact.
 

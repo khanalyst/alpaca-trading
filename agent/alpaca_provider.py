@@ -145,8 +145,6 @@ class AlpacaProvider(AlpacaMarketDataMixin):
                  session: AlpacaSession | None = None, **clients: Any) -> None:
         cfg = dict(config or {})
         mode = str(cfg.get("mode") or cfg.get("broker", {}).get("mode") or "paper").lower()
-        if mode == "demo":
-            mode = "paper"
         if mode not in {"paper", "live"}:
             raise PaperModeError("mode must be paper or live")
         broker = cfg.get("broker") if isinstance(cfg.get("broker"), Mapping) else {}

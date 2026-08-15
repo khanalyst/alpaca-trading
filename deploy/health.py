@@ -55,9 +55,19 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         marker in reason.lower()
         for marker in ("flatten", "residual", "incomplete", "failed", "error", "unavailable")
     )
-    operator_pause = status in {"paused", "pausing"} and not residual_risk
+    edge_gate_pause = (
+        status == "paused"
+        and reason == "validated_edge_required"
+        and not residual_risk
+    )
+    operator_pause = (
+        status in {"paused", "pausing"}
+        and not residual_risk
+        and not edge_gate_pause
+    )
     classification = (
         "degraded_residual_risk" if residual_risk else
+        "validated_edge_required" if edge_gate_pause else
         "operator_pause" if operator_pause else
         "healthy"
     )
@@ -78,6 +88,7 @@ def trader(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "classification": classification,
         "pause_class": classification,
         "operator_pause": operator_pause,
+        "edge_gate_pause": edge_gate_pause,
         "residual_risk": residual_risk,
         "alert": residual_risk,
         "alert_kind": alert_kind,
@@ -149,9 +160,21 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         hung = status == "running" and deadline is not None and current > float(deadline)
     except (TypeError, ValueError):
         hung = status == "running"
+    scheduler_operational = status in {"waiting", "running"}
+    previous_cycle_degraded = last_exit not in {None, 0}
+    waiting_after_no_data = (
+        status == "waiting"
+        and str(heartbeat.get("cycle_status") or "").lower() == "no_data"
+        and last_exit == 2
+    )
+    # In both ``waiting`` and ``running``, ``last_exit_code`` describes the
+    # previous completed cycle rather than the scheduler process now being
+    # probed.  Preserve that result in the response, but judge current
+    # scheduler liveness on its own fresh heartbeat/deadline.  Terminal states
+    # still inherit the completed result.
     ok = fresh and not hung and status in {
         "waiting", "running", "completed", "completed_no_edge"} and (
-        last_exit in {None, 0})
+        scheduler_operational or not previous_cycle_degraded)
     return {
         "ok": ok,
         "component": "research",
@@ -162,12 +185,36 @@ def research(path: Path, max_age: float, *, now: float | None = None) -> dict:
         "started_ts": heartbeat.get("started_ts"),
         "completed_ts": heartbeat.get("completed_ts"),
         "last_exit_code": last_exit,
+        "previous_cycle_degraded": previous_cycle_degraded,
+        "waiting_after_no_data": waiting_after_no_data,
         "next_run_ts": heartbeat.get("next_run_ts"),
         "structured_failures": heartbeat.get("structured_failures") or [],
         # Keep the health response bounded even if an operator hand-edits a
         # status file; scheduler-produced values already satisfy this schema.
         "research_progress": structured_research_progress(
             heartbeat.get("research_progress")),
+    }
+
+
+def shadow(path: Path, max_age: float, *, now: float | None = None) -> dict:
+    """Health of the broker-free forward shadow polling loop."""
+    heartbeat = _read_json(path)
+    status = str(heartbeat.get("status") or "missing")
+    fresh = _fresh(heartbeat.get("updated_ts"), max_age, now)
+    raw_error = heartbeat.get("last_error")
+    last_error = (str(raw_error)[:500] if raw_error not in {None, ""} else None)
+    return {
+        "ok": fresh and status == "running",
+        "component": "shadow",
+        "status": status,
+        "fresh": fresh,
+        "last_error": last_error,
+        "candidates": heartbeat.get("candidates"),
+        "events": heartbeat.get("events"),
+        "decisions": heartbeat.get("decisions"),
+        "ingested_events": heartbeat.get("ingested_events"),
+        "quarantine_through_session": heartbeat.get(
+            "quarantine_through_session"),
     }
 
 
@@ -237,6 +284,10 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--path", default="runtime/health/research.json")
     item.add_argument("--max-age", type=float, default=180)
 
+    item = sub.add_parser("shadow")
+    item.add_argument("--path", default="runtime/research/shadow-health.json")
+    item.add_argument("--max-age", type=float, default=180)
+
     item = sub.add_parser("watchdog")
     item.add_argument("--path", default="runtime/health/watchdog.json")
     item.add_argument("--max-age", type=float, default=180)
@@ -256,6 +307,8 @@ def main() -> int:
             result = recorder(Path(args.path), args.max_age)
         elif args.component == "research":
             result = research(Path(args.path), args.max_age)
+        elif args.component == "shadow":
+            result = shadow(Path(args.path), args.max_age)
         elif args.component == "watchdog":
             result = watchdog(Path(args.path), args.max_age)
         else:

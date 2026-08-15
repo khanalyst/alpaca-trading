@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
+import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,6 +26,8 @@ def parser() -> argparse.ArgumentParser:
                    default=Path("runtime/research/edge_lab.sqlite3"))
     p.add_argument("--shadow-db", type=Path,
                    default=Path("runtime/research/shadow.sqlite3"))
+    p.add_argument("--health-file", type=Path,
+                   help="durable polling heartbeat (defaults beside shadow DB)")
     p.add_argument("--interval", type=float, default=60.0)
     p.add_argument("--once", action="store_true",
                    help="run one bounded ingest/evaluation cycle and exit")
@@ -33,6 +38,30 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def _write_health(path: Path, status: str, **detail) -> dict:
+    """Atomically publish one bounded shadow-loop heartbeat."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "shadow-health.v1", "status": str(status),
+        "updated_ts": time.time(), "pid": os.getpid(), **detail,
+    }
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     config = ShadowConfig(
@@ -41,12 +70,20 @@ def main(argv: list[str] | None = None) -> int:
         max_decisions=args.max_decisions, retention_days=args.retention_days,
         poll_seconds=args.interval)
     runner = ShadowRunner(config)
+    health_file = args.health_file or args.shadow_db.with_name("shadow-health.json")
     while True:
         try:
             result = runner.run_once()
+            safe_result = {key: result.get(key) for key in (
+                "candidates", "events", "decisions", "ingested_events",
+                "conflicts", "invalid_events", "skipped_recovery_bytes",
+                "quarantine_through_session") if key in result}
+            _write_health(health_file, "running", last_error=None, **safe_result)
             print(json.dumps(result, sort_keys=True), flush=True)
         except Exception as exc:
-            print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), flush=True)
+            error = f"{type(exc).__name__}: {exc}"
+            _write_health(health_file, "degraded", last_error=error[:500])
+            print(json.dumps({"error": error}), flush=True)
             if args.once:
                 return 1
         if args.once:

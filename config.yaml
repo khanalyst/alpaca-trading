@@ -68,7 +68,7 @@
     "backtest_bar_fallback": true,
     "champion_min_confidence": 0.95,
     "strategy_llm": {
-      "enabled": true,
+      "enabled": false,
       "provider": "openai",
       "model": "gpt-5",
       "max_attempts": 2,
