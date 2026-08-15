@@ -9,7 +9,11 @@ from unittest.mock import patch
 
 from research.edge_ledger import EdgeLedger
 from research.live_shadow import ShadowStore
-from research.live_shadow_ingest import ShadowIngestConfig, ingest_shadow
+from research.factory_ledger import FactoryLedger
+from research.live_shadow_ingest import (
+    MAX_CONFIRMATORY_ITERATIONS, ShadowIngestConfig, _confirmatory_iterations,
+    ingest_shadow,
+)
 
 from tests.research.test_edge_discovery import _persist_gate
 
@@ -90,6 +94,15 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(row["status"], "validated")
         runs = self.ledger.runs(cid, lane="shadow")
         self.assertEqual(len(runs), 1)
+        online = runs[0]["metrics"]["gate"]["verified_gate"]["online_fdr"]
+        self.assertTrue(online["required"])
+        self.assertTrue(online["tested"])
+        self.assertTrue(online["decision"])
+        state = FactoryLedger(self.edge_path).fdr_state(
+            "shadow-confirmation-v2:equity")
+        self.assertEqual(state["tests"], 1)
+        self.assertAlmostEqual(state["decisions"][0]["p_value"],
+                               online["p_value"])
         evidence = self.ledger.evidence(cid)
         self.assertTrue(any(item["kind"] == "shadow_ingestion" for item in evidence))
         self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 8)
@@ -113,6 +126,34 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(ingest_shadow(config)["ingested"], 1)
         self.assertEqual(ingest_shadow(config)["ingested"], 0)
         self.assertEqual(len(self.ledger.runs(cid, lane="shadow")), 1)
+
+    def test_online_fdr_records_global_q_not_selected_raw_p(self):
+        cid = self.candidate["candidate_id"]
+        sibling = self.ledger.register_candidate(
+            "ibr.range.45", strategy_id="ibr", vehicle="equity",
+            hypothesis="diagnostic sibling",
+            config={"strategy": {"id": "ibr"}})
+        sibling_id = sibling["candidate_id"]
+        _persist_gate(self.ledger, sibling_id, "backtest")
+        self.ledger.transition(sibling_id, "backtest_passed",
+                               reason="backtest proof")
+
+        self._rows(cid, [2.0] * 8)
+        self._rows(sibling_id, [2.0, -2.0] * 4)
+        self._rows(self.baseline["candidate_id"], [0.0] * 8)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 8)
+        self._rows(f"shadow:null:{sibling_id}", [-1.0] * 8)
+
+        result = ingest_shadow(ShadowIngestConfig(
+            self.edge_path, self.shadow_path, min_trades=1, min_sessions=1))
+        self.assertEqual(result["ingested"], 1)
+        run = self.ledger.runs(cid, lane="shadow")[0]
+        envelope = run["metrics"]["gate"]["verified_gate"]
+        raw_p = envelope["statistics"]["p_value"]
+        global_q = envelope["statistics"]["q_value"]
+        online_p = envelope["online_fdr"]["p_value"]
+        self.assertGreater(global_q, raw_p)
+        self.assertAlmostEqual(online_p, global_q)
 
     def test_only_strictly_newer_sessions_advance_the_boundary(self):
         cid = self.candidate["candidate_id"]
@@ -237,21 +278,32 @@ class LiveShadowIngestTests(unittest.TestCase):
             "ready": {"candidate_id": "ready", "status": "prepared", "raw_p": .001,
                       "family": "rule:x", "preflight_ready": True},
         }
-        def fake_one(candidate_id, *, dry=False, correction=None):
-            calls.append((candidate_id, dry, correction or {}))
+        def fake_one(candidate_id, *, dry=False, correction=None,
+                     test_iterations=20_000):
+            calls.append((candidate_id, dry, correction or {}, test_iterations))
             if dry:
                 return dict(prepared[candidate_id])
             return {"candidate_id": candidate_id, "ingested": bool((correction or {}).get("selected"))}
         ingestor._candidate_ids = lambda: candidate_ids
         ingestor._one = fake_one
         result = ingestor.ingest()
-        selected = [item for cid, dry, item in calls if not dry and item.get("selected")]
+        selected = [item for cid, dry, item, iterations in calls
+                    if not dry and item.get("selected")]
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["global"]["significant"], True)
+        self.assertAlmostEqual(selected[0]["global"]["p_adjusted"], .0015)
+        self.assertGreater(selected[0]["global"]["p_adjusted"],
+                           prepared["ready"]["raw_p"])
         self.assertEqual(result["ingested"], 1)
         by_id = {row["candidate_id"]: row for row in result["candidates"]}
         self.assertFalse(by_id["marginal"]["ingested"])
         self.assertTrue(by_id["ready"]["ingested"])
+
+    def test_confirmatory_resolution_scales_with_batch_and_fails_bounded(self):
+        self.assertEqual(_confirmatory_iterations(.025, 1), 20_000)
+        self.assertEqual(_confirmatory_iterations(.0001, 3), 30_000)
+        self.assertGreater(
+            _confirmatory_iterations(1e-8, 3), MAX_CONFIRMATORY_ITERATIONS)
 
 
 if __name__ == "__main__":  # pragma: no cover

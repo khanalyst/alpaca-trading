@@ -36,7 +36,7 @@ from .edge_discovery_core import (corpus_slice, null_control_account,
                                   validate_worker_projection)
 from .factory_ledger import (
     ACTIVE_HYPOTHESIS_STATES, FACTORY_SCHEMA, FACTORY_STATUSES, FactoryError,
-    FactoryLedger, experiment_identity, experiment_provenance,
+    FactoryLedger, deferred_fdr, experiment_identity, experiment_provenance,
 )
 from .gates import (chronological_split, heldout_separation,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
@@ -1051,10 +1051,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                     if str(row.get("session_date") or "") in held_sessions]
     null_test = (test if is_root else
                  matched_cluster_test(heldout, null_heldout, vehicle=vehicle))
-    null_control = {"kind": "randomized_entry_null", "matched": null_test["matched"],
+    null_control = {**null_test, "kind": "randomized_entry_null",
                     "available": bool(null_test["available"]),
-                    "mean_delta": null_test["mean_delta"],
-                    "mean_delta_lcb": null_test["mean_delta_lcb"],
                     "p_value": float(null_test["p_value"])}
     walk_forward = walk_forward_report(
         heldout, base_heldout, vehicle=vehicle, folds=folds,
@@ -1695,10 +1693,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                                              "scope": "cycle_global"}
             gate["confidence"] = 1.0 - float(overall["p_adjusted"])
 
-    # The final window is a genuine post-selection test: rank on development
-    # evidence, correct the entire cycle, consume one cumulative online test,
-    # and only then open one sealed window for one candidate.  Every other
-    # variant remains useful diagnostic evidence but cannot authorize a proof.
+    # Rank only development-eligible candidates, then open one sealed window.
+    # Cumulative alpha is deliberately not spent on historical or offline
+    # forward evidence: the one confirmatory online test belongs to the later,
+    # strictly-new parity-matched live-shadow boundary.
     def _selection_rank(item: tuple[Mapping, Mapping, Mapping]) -> tuple:
         owner, variant, gate = item
         overall = gate["global_multiple_tests"]
@@ -1711,25 +1709,22 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             int(owner["hypothesis"]["slot"]), str(variant["variant_id"]),
         )
 
-    ranked = sorted(variant_rows, key=_selection_rank)
+    ranked = sorted(
+        (item for item in variant_rows
+         if item[2].get("development_passes_without_family") and
+         item[2]["multiple_tests"].get("significant") and
+         item[2]["global_multiple_tests"].get("significant")),
+        key=_selection_rank)
     selected_test = ranked[0] if ranked else None
     selected_test_key = (None if selected_test is None else
                          f"{selected_test[0]['hypothesis']['hypothesis_id']}:"
                          f"{selected_test[1]['variant_id']}")
-    selected_p = (1.0 if selected_test is None else
-                  float(selected_test[2]["global_multiple_tests"].get(
-                      "p_adjusted", 1.0)))
-    cumulative = factory.record_fdr_decision(
-        f"strategy_factory:{vehicle}",
-        f"{identity['identity_hash']}:post_selection", selected_p, alpha=alpha)
-    qualification_target = None
-    if selected_test is not None:
-        family = selected_test[2]["multiple_tests"]
-        overall = selected_test[2]["global_multiple_tests"]
-        if (selected_test[2].get("development_passes_without_family") and
-                family.get("significant") and overall.get("significant") and
-                cumulative.get("decision")):
-            qualification_target = selected_test
+    confirmatory_scope = f"shadow-confirmation-v2:{vehicle}"
+    cumulative = deferred_fdr(
+        confirmatory_scope,
+        (f"{identity['identity_hash']}:{selected_test_key}:live-shadow"
+         if selected_test_key else f"{identity['identity_hash']}:no-selection"))
+    qualification_target = selected_test
 
     qualification_key = None
     qualification_report: dict[str, Any] | None = None
@@ -1797,12 +1792,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             **gate["checks_without_family"],
             "family_fdr_significant": bool(family["significant"]),
             "global_fdr_significant": bool(overall["significant"]),
-            "cumulative_fdr_significant": bool(selected and
-                                               cumulative.get("decision")),
+            "cumulative_fdr_significant": bool(
+                selected and cumulative.get("required") is False and
+                cumulative.get("status") == "deferred_to_live_shadow"),
         }
         gate["cumulative_multiple_tests"] = (
             dict(cumulative) if key == selected_test_key else
-            {"scope": f"strategy_factory:{vehicle}", "tested": False,
+            {"scope": confirmatory_scope, "tested": False,
              "decision": False, "selected_test_id": selected_test_key})
         gate["post_selection"] = {
             "selected_test_id": selected_test_key,
@@ -2285,7 +2281,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             "cumulative_fdr": cumulative,
         },
         "cumulative_fdr_state": factory.fdr_state(
-            f"strategy_factory:{vehicle}"),
+            confirmatory_scope),
         "champion": ({key: champion.get(key) for key in
                       ("candidate_id", "variant_id", "strategy_id", "vehicle", "status")}
                      if champion else None),

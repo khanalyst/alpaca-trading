@@ -544,7 +544,9 @@ Mismatch or incomplete rows are quarantined. Ingestion opens that WAL
 read-only, requires strictly newer sessions, prior qualification, complete
 parity, and matching source/config/code/provenance/replay/gate hashes; family
 and global BH plus durable online FDR must pass before an immutable live marker
-is appended. Manual/offline promotion cannot bypass it.
+is appended. Historical and offline-forward selection explicitly defers this
+cumulative test; it cannot consume the budget or authorize deployment. Manual/
+offline promotion cannot bypass it.
 
 ### How much data a first proof actually needs
 

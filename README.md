@@ -59,9 +59,11 @@ signature (including v1/v2 no-op aliases), while a variant id with an adequate
 recorded failure is suppressed exactly; underpowered results remain eligible.
 A candidate must clear structural trade/session floors, matched controls,
 absolute after-cost profitability, falsification, fixed-rule rolling-origin
-stability, and family-local, cycle-global, and cumulative online false-discovery
-correction. A family can legitimately pass its local test but fail the global
-one; only the global result can authorize cross-family selection.
+stability, and family-local plus cycle-global false-discovery correction. A
+family can legitimately pass its local test but fail the global one; only the
+global result can authorize cross-family selection. Historical and offline
+forward screens do not spend cumulative alpha. The one durable online-FDR test
+is reserved for the later parity-matched live-shadow tail.
 
 The final qualification sessions are sealed before the workers run. After
 development ranking and correction preselect one candidate, that candidate

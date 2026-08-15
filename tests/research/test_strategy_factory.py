@@ -394,6 +394,8 @@ class StrategyFactoryTests(unittest.TestCase):
         self.assertIsNone(target["run_id"])
         self.assertFalse(target["gate"]["post_selection"][
             "qualification_consumed"])
+        self.assertIsNone(result["post_selection"]["selected_test_id"])
+        self.assertEqual(result["cumulative_fdr_state"]["tests"], 0)
         self.assertFalse(result["worker_failures"])
 
     def test_rule_grammar_is_bounded_and_content_addressed(self):

@@ -26,6 +26,7 @@ from research.gates import (
     structural_floor, verified_gate_envelope, walk_forward_report,
 )
 from research.costs import SQLiteQuoteIndex, quote_fill
+from research.factory_ledger import FactoryLedger
 
 
 def _gate_evidence(heldout, *, alpha=.05):
@@ -1292,9 +1293,12 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
 
     def test_the_gate_reports_a_null_control_and_a_sealed_window(self):
         with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "edge.sqlite3"
             result = self._discover(
                 _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
                 directory)
+            fdr_state = FactoryLedger(database).fdr_state(
+                "shadow-confirmation-v2:equity")
         gate = result["variants"][0]["gate"]
         for name in ("null_control_available", "null_control_delta_positive",
                      "qualification_net_positive", "qualification_delta_positive"):
@@ -1311,6 +1315,10 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         self.assertEqual(envelope["null_control"], gate["null_control"])
         self.assertEqual(envelope["qualification"], gate["qualification"])
         self.assertEqual(envelope["walk_forward"], gate["walk_forward"])
+        self.assertFalse(envelope["online_fdr"]["required"])
+        self.assertEqual(envelope["online_fdr"]["status"],
+                         "deferred_to_live_shadow")
+        self.assertEqual(fdr_state["tests"], 0)
 
     def test_the_sealed_window_never_reaches_selection_or_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

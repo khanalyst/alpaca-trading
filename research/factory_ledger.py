@@ -28,10 +28,36 @@ LESSON_KINDS = {"tuning", "discovery", "replacement", "rotation", "reseed",
                 # produced by real fills rather than a replay.
                 "trial"}
 LESSON_SOURCES = {"llm", "deterministic", "live_paper"}
+FDR_METHOD = "lord_balanced_v2"
 
 
 class FactoryError(ValueError):
     """Raised when a factory operation cannot preserve research boundaries."""
+
+
+def _fdr_gamma(index: int) -> float:
+    """Balanced telescoping allocation weights whose infinite sum is one."""
+    if index <= 0:
+        return 0.0
+    return 1.0 / (int(index) * (int(index) + 1))
+
+
+def _fdr_allocation(decisions: list[Mapping[str, Any]], alpha: float) -> tuple[int, float]:
+    """Return the next LORD-style allocation without mutating the ledger."""
+    test_index = len(decisions) + 1
+    allocated = float(alpha) * _fdr_gamma(test_index)
+    for discovery_index, row in enumerate(decisions, start=1):
+        if bool(row["decision"]):
+            allocated += float(alpha) * _fdr_gamma(test_index - discovery_index)
+    return test_index, min(float(alpha), allocated)
+
+
+def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
+    """Describe an offline proof whose cumulative test is reserved for live shadow."""
+    return {"scope": str(scope), "test_id": str(test_id), "required": False,
+            "tested": False, "status": "deferred_to_live_shadow",
+            "decision": False, "cumulative": True,
+            "method": "deferred_confirmatory_v2"}
 
 
 def _real(value: Any) -> float | None:
@@ -756,43 +782,45 @@ class FactoryLedger:
                 canonical_json(recorded), datetime.now().timestamp(),
             ))
 
+    def next_fdr_allocation(self, scope: str, *, alpha: float = .05) -> dict[str, Any]:
+        """Preview the next durable allocation without spending it."""
+        nominal = float(alpha)
+        if not 0 < nominal <= 1:
+            raise FactoryError("alpha must be in (0,1]")
+        resolved_scope = str(scope)
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT decision FROM factory_fdr WHERE scope=? "
+                "ORDER BY created_at,decision_id", (resolved_scope,)).fetchall()
+        test_index, allocated = _fdr_allocation(list(rows), nominal)
+        return {"scope": resolved_scope, "alpha": nominal,
+                "allocated_alpha": allocated, "tests": test_index,
+                "cumulative": True, "method": FDR_METHOD, "preview": True}
+
     def record_fdr_decision(self, scope: str, test_id: str, p_value: float,
                             *, alpha: float = .05) -> dict[str, Any]:
-        """Persist one cumulative LORD-style online-FDR decision.
+        """Persist one balanced cumulative LORD-style online-FDR decision.
 
-        The first preselected test receives 75% of nominal alpha.  The
-        remaining base wealth follows a telescoping tail, and each discovery
-        starts one identical reward stream.  This keeps autonomous search
-        accountable without making the first ordinary 3% result impossible.
+        Only independent confirmatory callers should spend this allocation.
+        Development and offline-forward screens deliberately defer cumulative
+        testing to the strictly newer live-shadow boundary.
         """
         p = float(p_value); nominal = float(alpha)
         if not 0 <= p <= 1 or not 0 < nominal <= 1:
             raise FactoryError("p_value must be in [0,1] and alpha in (0,1]")
         scope, test_id = str(scope), str(test_id)
         with closing(_connect(self.path)) as db, db:
-            existing = db.execute(
-                "SELECT * FROM factory_fdr WHERE scope=? AND test_id=?",
-                (scope, test_id)).fetchone()
-            if existing:
-                return dict(existing) | {"decision": bool(existing["decision"])}
             rows = db.execute(
-                "SELECT decision FROM factory_fdr WHERE scope=? "
+                "SELECT * FROM factory_fdr WHERE scope=? "
                 "ORDER BY created_at,decision_id", (scope,)).fetchall()
-            test_index = len(rows) + 1
-
-            def gamma(index: int) -> float:
-                if index <= 0:
-                    return 0.0
-                if index == 1:
-                    return .75
-                tail = index - 1
-                return .25 / (tail * (tail + 1))
-
-            allocated = nominal * gamma(test_index)
-            for discovery_index, row in enumerate(rows, start=1):
-                if bool(row["decision"]):
-                    allocated += nominal * gamma(test_index - discovery_index)
-            allocated = min(nominal, allocated)
+            for existing_index, existing in enumerate(rows, start=1):
+                if str(existing["test_id"]) == test_id:
+                    return dict(existing) | {
+                        "decision": bool(existing["decision"]),
+                        "tests": existing_index, "cumulative": True,
+                        "method": FDR_METHOD,
+                    }
+            test_index, allocated = _fdr_allocation(list(rows), nominal)
             decision = bool(p <= allocated)
             db.execute("INSERT INTO factory_fdr VALUES(?,?,?,?,?,?,?,?)", (
                 uuid.uuid4().hex, scope, test_id, p, nominal, allocated,
@@ -800,7 +828,7 @@ class FactoryLedger:
         return {"scope": scope, "test_id": test_id, "p_value": p,
                 "alpha": nominal, "allocated_alpha": allocated,
                 "decision": decision, "tests": test_index,
-                "cumulative": True, "method": "lord_telescoping_v1"}
+                "cumulative": True, "method": FDR_METHOD}
 
     # Explicit aliases are the integration seam for strategy_factory callers.
     online_fdr = record_fdr_decision
@@ -830,7 +858,8 @@ class FactoryLedger:
 
 __all__ = [
     "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_IDENTITY_SCHEMA", "FACTORY_STATUSES",
-    "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
+    "FDR_METHOD", "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
+    "deferred_fdr",
     "experiment_identity",
     "experiment_provenance",
 ]

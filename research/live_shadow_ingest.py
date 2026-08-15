@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -22,7 +23,7 @@ from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
 from .gates import verify_gate_envelope
 from .live_shadow import ShadowError, ShadowStore
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
-from .factory_ledger import FactoryLedger
+from .factory_ledger import FDR_METHOD, FactoryLedger
 from .stats import benjamini_hochberg
 
 
@@ -30,6 +31,22 @@ INGEST_SCHEMA = "shadow-ingest.v1"
 DEFAULT_MIN_TRADES = 100
 DEFAULT_MIN_SESSIONS = 10
 DEFAULT_ALPHA = 0.05
+DEFAULT_CONFIRMATORY_ITERATIONS = 20_000
+MAX_CONFIRMATORY_ITERATIONS = 2_000_000
+CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v2"
+
+
+def _confirmatory_scope(vehicle: str) -> str:
+    return f"{CONFIRMATORY_SCOPE_VERSION}:{vehicle}"
+
+
+def _confirmatory_iterations(allocated_alpha: float, batch_size: int) -> int:
+    """Resolve a BH-adjusted p-value below the next online allocation."""
+    allocated = float(allocated_alpha)
+    if not math.isfinite(allocated) or allocated <= 0:
+        raise ValueError("confirmatory allocation must be positive and finite")
+    required = int(math.ceil(max(1, int(batch_size)) / allocated))
+    return max(DEFAULT_CONFIRMATORY_ITERATIONS, required)
 
 
 def _json(value: Any) -> str:
@@ -255,7 +272,8 @@ class ShadowIngestor:
         return f"{candidate.get('strategy_id', 'unknown')}:{parts[1] if len(parts) > 1 else variant}"
 
     def _one(self, candidate_id: str, *, correction: Mapping[str, Any] | None = None,
-             dry: bool = False) -> dict[str, Any]:
+             dry: bool = False,
+             test_iterations: int = DEFAULT_CONFIRMATORY_ITERATIONS) -> dict[str, Any]:
         if self.store is None:
             return {"candidate_id": candidate_id, "status": "no_shadow_db",
                     "ingested": False}
@@ -334,7 +352,8 @@ class ShadowIngestor:
                 min_trades=self.config.min_trades,
                 min_sessions=self.config.min_sessions,
                 alpha=float(self.config.alpha), shadow=True,
-                null_rows=null_rows, qualification=qualification)
+                null_rows=null_rows, qualification=qualification,
+                test_iterations=test_iterations)
             gate = _strengthen_gate(gate, baseline_rows, vehicle=vehicle)
             # A live ingestion is a new statistical test.  Its p-value comes
             # from this exact replay, never from the prior offline gate.
@@ -346,7 +365,8 @@ class ShadowIngestor:
                         "preflight_ready": preflight_ready,
                         "preflight_checks": preflight_checks,
                         "family": self._family(candidate), "boundary": boundary,
-                        "sessions": available}
+                        "sessions": available,
+                        "test_iterations": int(test_iterations)}
             correction = dict(correction or {})
             family_data = correction.get("family") if isinstance(correction, Mapping) else None
             global_data = correction.get("global") if isinstance(correction, Mapping) else None
@@ -355,20 +375,24 @@ class ShadowIngestor:
                 "family_size": 1}
             global_data = global_data if isinstance(global_data, Mapping) else family_data
             selected = bool(correction.get("selected"))
+            q_value = float(global_data.get("p_adjusted", 1.0))
+            family_q = float(family_data.get("p_adjusted", 1.0))
             if selected:
                 online = FactoryLedger(self.config.edge_db).record_fdr_decision(
-                    f"shadow-ingest:{vehicle}",
-                    f"{candidate_id}:{_digest(source)}", p_value,
+                    _confirmatory_scope(vehicle),
+                    f"{candidate_id}:{_digest(source)}", q_value,
                     alpha=float(self.config.alpha))
+                online = {**online, "required": True, "tested": True,
+                          "test_iterations": int(test_iterations),
+                          "minimum_raw_p": 1.0 / (int(test_iterations) + 1)}
             else:
-                online = {"scope": f"shadow-ingest:{vehicle}",
+                online = {"scope": _confirmatory_scope(vehicle),
                           "test_id": f"diagnostic:{candidate_id}:{_digest(source)}",
                           "p_value": p_value, "alpha": float(self.config.alpha),
                           "allocated_alpha": 0.0, "decision": False,
-                          "tests": 0, "cumulative": True,
-                          "method": "lord_telescoping_v1"}
-            q_value = float(global_data.get("p_adjusted", 1.0))
-            family_q = float(family_data.get("p_adjusted", 1.0))
+                          "required": True, "tested": False,
+                          "tests": 0, "cumulative": True, "method": FDR_METHOD,
+                          "test_iterations": int(test_iterations)}
             family = {"p": gate["candidate_p_raw"],
                       "p_adjusted": family_q,
                       "significant": bool(family_data.get("significant")),
@@ -488,7 +512,35 @@ class ShadowIngestor:
 
     def ingest(self) -> dict[str, Any]:
         candidate_ids = self._candidate_ids()
-        prepared = [self._one(candidate_id, dry=True) for candidate_id in candidate_ids]
+        candidate_records = [self.ledger.candidate(candidate_id)
+                             for candidate_id in candidate_ids]
+        vehicles = sorted({str(row.get("vehicle")) for row in candidate_records
+                           if isinstance(row, Mapping) and row.get("vehicle") in VEHICLES})
+        allocation_previews = {
+            vehicle: FactoryLedger(self.config.edge_db).next_fdr_allocation(
+                _confirmatory_scope(vehicle), alpha=float(self.config.alpha))
+            for vehicle in vehicles
+        }
+        smallest_allocation = min(
+            (float(item["allocated_alpha"]) for item in allocation_previews.values()),
+            default=float(self.config.alpha))
+        test_iterations = _confirmatory_iterations(
+            smallest_allocation, max(1, len(candidate_ids)))
+        if test_iterations > MAX_CONFIRMATORY_ITERATIONS:
+            rows = [{"candidate_id": candidate_id,
+                     "status": "confirmatory_resolution_exhausted",
+                     "ingested": False, "required_iterations": test_iterations,
+                     "max_iterations": MAX_CONFIRMATORY_ITERATIONS}
+                    for candidate_id in candidate_ids]
+            return {"schema": INGEST_SCHEMA, "candidates": rows, "ingested": 0,
+                    "no_op": len(rows), "confirmatory": {
+                        "scope_version": CONFIRMATORY_SCOPE_VERSION,
+                        "allocation_previews": allocation_previews,
+                        "required_iterations": test_iterations,
+                        "resolution_exhausted": True}}
+        prepared = [self._one(candidate_id, dry=True,
+                              test_iterations=test_iterations)
+                    for candidate_id in candidate_ids]
         eligible = [row for row in prepared if row.get("status") == "prepared"]
         # Correct the current batch twice: first within each independent rule
         # family, then globally across every family/vehicle tested this cycle.
@@ -525,10 +577,15 @@ class ShadowIngestor:
                 "family": family_results.get(cid, {}),
                 "global": global_results.get(cid, {}),
                 "selected": cid == selected_id,
-            }))
+            }, test_iterations=test_iterations))
         return {"schema": INGEST_SCHEMA, "candidates": rows,
                 "ingested": sum(1 for row in rows if row.get("ingested")),
-                "no_op": sum(1 for row in rows if not row.get("ingested"))}
+                "no_op": sum(1 for row in rows if not row.get("ingested")),
+                "confirmatory": {
+                    "scope_version": CONFIRMATORY_SCOPE_VERSION,
+                    "allocation_previews": allocation_previews,
+                    "test_iterations": test_iterations,
+                    "resolution_exhausted": False}}
 
 
 def ingest_shadow(config: ShadowIngestConfig) -> dict[str, Any]:

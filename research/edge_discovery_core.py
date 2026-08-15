@@ -752,7 +752,8 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                    actual_control: bool = True,
                    control_kind: str = "matched_actual_baseline",
                    null_rows: Sequence[Mapping] = (),
-                   qualification: Mapping | None = None) -> dict:
+                   qualification: Mapping | None = None,
+                   test_iterations: int = 20_000) -> dict:
     """Evaluate one chronological backtest or a genuinely new shadow sample.
 
     A backtest is split into fit/held-out partitions.  A shadow evaluation is
@@ -789,7 +790,8 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     delta_fit = (matched_cluster_test(fit, base_fit, vehicle=vehicle) if not shadow else
                  {"available": True, "actual_control": True, "matched": 0,
                   "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
-    delta_held = matched_cluster_test(heldout, base_heldout, vehicle=vehicle)
+    delta_held = matched_cluster_test(
+        heldout, base_heldout, vehicle=vehicle, iterations=test_iterations)
     delta_fit["actual_control"] = bool(actual_control)
     delta_held["actual_control"] = bool(actual_control)
     placebo = deterministic_placebo_deltas(
@@ -812,12 +814,10 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     heldout_sessions = {str(row.get("session_date") or "") for row in heldout}
     null_heldout = [row for row in null_rows
                     if str(row.get("session_date") or "") in heldout_sessions]
-    null_test = matched_cluster_test(heldout, null_heldout, vehicle=vehicle)
-    null_control = {"kind": "randomized_entry_null",
-                    "matched": null_test["matched"],
+    null_test = matched_cluster_test(
+        heldout, null_heldout, vehicle=vehicle, iterations=test_iterations)
+    null_control = {**null_test, "kind": "randomized_entry_null",
                     "available": bool(null_test["available"]),
-                    "mean_delta": null_test["mean_delta"],
-                    "mean_delta_lcb": null_test["mean_delta_lcb"],
                     "p_value": float(null_test["p_value"])}
     final = dict(qualification or {
         "available": False, "sessions": [], "net_positive": False,
@@ -889,10 +889,15 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
                    candidate_id: str | None = None) -> dict:
     online = dict(online_fdr or {})
     global_data = dict(global_fdr or family)
+    cumulative_passes = bool(
+        online.get("decision") is True or
+        (online.get("required") is False and
+         online.get("status") == "deferred_to_live_shadow" and
+         online.get("tested") is False))
     checks = {**gate["checks_without_family"],
               "family_fdr_significant": bool(family.get("significant", False)),
               "global_fdr_significant": bool(global_data.get("significant", False)),
-              "cumulative_fdr_significant": bool(online.get("decision"))}
+              "cumulative_fdr_significant": cumulative_passes}
     passes = bool(gate["passes_without_family"] and all(checks.values()))
     gate["multiple_tests"] = {"candidate": dict(family),
                               "global": dict(global_data),

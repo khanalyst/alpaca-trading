@@ -504,9 +504,15 @@ rolling-origin rule is fixed across folds. Proof verification compares each
 flag with its own q-value; only the global decision
 can authorize cross-family selection.
 
-Post-selection consumes one durable cumulative online-FDR allocation per
-vehicle scope. Its LORD-style state is persisted in the factory ledger across
-cycles, so a new cycle cannot reset the allocated alpha or discovery history.
+Offline post-selection does not consume cumulative alpha. It records an
+explicit, non-authorizing deferral after family and global BH, then uses the
+sealed window only for qualification. The strictly newer parity-matched
+live-shadow tail receives the one durable cumulative online-FDR test per
+vehicle scope. Its balanced LORD-style state is persisted in the factory
+ledger across cycles, so a new cycle cannot reset allocated alpha or discovery
+history. The base allocation is `alpha / (n(n+1))`; each prior discovery starts
+the same telescoping reward stream. This preserves an infinite testing horizon
+without allowing offline candidate churn to exhaust it.
 
 `research.edge_ledger_store` owns the SQLite schema and hashing primitives.
 `research.edge_ledger_proof` owns verified-gate persistence and re-verification.
@@ -558,6 +564,10 @@ ingest-shadow` opens its WAL read-only, requires complete parity matches and
 prior qualification plus source/config/code/provenance/replay/gate hashes,
 applies family and global BH with durable online FDR, and only then appends an
 immutable `lane=shadow` proof that may transition a candidate to `validated`.
+The ingester previews the next allocation without writing it and increases
+Monte Carlo resolution enough for the batch-adjusted p-value grid to cross that
+allocation. A two-million-draw cap turns an unresolvable test into an explicit
+no-op rather than a false failure or spent decision.
 
 Retirement guards every deployed candidate, not only the champion, because
 `all_proved` selection trades one validated candidate per family. Two

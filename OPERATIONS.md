@@ -408,8 +408,9 @@ Offline historical/forward replay may persist only a `lane=shadow` candidate
 status; it never authorizes runtime entries. Validation requires
 fit and held-out structural floors, matched controls, placebo/falsification,
 fixed-rule rolling-origin forward stability, family-local
-and cycle-global FDR, and a durable verified gate. Post-selection also consumes
-durable cumulative online-FDR state across cycles. A family pass
+and cycle-global FDR, and a durable verified gate. Offline post-selection
+records an explicit cumulative-FDR deferral rather than spending alpha on data
+that cannot authorize deployment. A family pass
 with a global failure is a normal marginal result and cannot authorize
 selection. Final qualification evidence binds its declared sessions, bounded
 candidate/baseline observations, and content digests so it can be recomputed.
@@ -452,8 +453,11 @@ accepts only strictly newer,
 complete, parity-matched rows with prior qualification and matching
 source/config/code/provenance/replay/gate hashes; family and global BH plus
 durable online-FDR are applied before an immutable `lane=shadow` proof and
-live-ingestion marker are appended. A failed/mismatched/incomplete tail leaves
-the candidate unchanged and ineligible.
+live-ingestion marker are appended. The confirmatory p-value resolution scales
+to the next allocation; if the bounded simulation cap cannot resolve it, the
+ingester reports `confirmatory_resolution_exhausted` without spending alpha or
+advancing a boundary. A failed/mismatched/incomplete tail likewise leaves the
+candidate unchanged and ineligible.
 
 Research studies only the vehicle this deployment can trade. A trader runs one
 execution profile, so proving an option edge in a `shares` deployment produces

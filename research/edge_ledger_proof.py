@@ -526,6 +526,12 @@ class EdgeLedgerProofMixin:
         gate = gate_payload.get("gate")
         if not isinstance(gate, Mapping) or gate_hash != gate.get("content_hash"):
             return False
+        online = gate.get("online_fdr")
+        if (not isinstance(online, Mapping) or
+                online.get("required", True) is False or
+                online.get("tested", True) is not True or
+                online.get("decision") is not True):
+            return False
         return (
             isinstance(evidence_source, Mapping)
             and dict(evidence_source) == dict(source)

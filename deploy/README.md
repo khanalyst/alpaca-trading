@@ -185,15 +185,17 @@ validation and the Engine constructor. The authenticated live preflight also
 requires `pattern_day_trader=true`.
 Research lifecycle gates include fit/held-out structural floors, matched
 controls, placebo/falsification, fixed-rule rolling-origin stability,
-family-local/cycle-global FDR and cumulative online-FDR state, sealed
-qualification source binding (one preselected candidate alone consumes the
-window), and durable verification. Offline historical/forward replay may leave
-a candidate at `shadow` only and never authorizes runtime. Research-side `edge
+family-local/cycle-global FDR, sealed qualification source binding (one
+preselected candidate alone consumes the window), and durable verification.
+Offline historical/forward replay defers cumulative online FDR, may leave a
+candidate at `shadow` only, and never authorizes runtime. Research-side `edge
 ingest-shadow` opens the shadow WAL read-only, requires strictly newer complete
 parity-matched rows, prior qualification, source/config/code/provenance/replay/
 gate hashes, family/global BH plus durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
-incomplete shadow data advances no boundary and is reconsidered. Legacy
+incomplete shadow data advances no boundary and is reconsidered. Confirmatory
+simulation resolution scales to the next online allocation and stops without
+spending at its bounded cap. Legacy
 validated/champion rows without the marker can be evaluated/migrated but remain
 ineligible until a new authorized live proof. Retirement requires adequate terminal negative
 evidence for every intended variant; a valid bounded LLM replacement is

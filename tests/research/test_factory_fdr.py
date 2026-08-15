@@ -1,0 +1,61 @@
+"""Durable confirmatory false-discovery budget tests."""
+
+from pathlib import Path
+import tempfile
+import unittest
+
+from research.factory_ledger import FDR_METHOD, FactoryLedger, deferred_fdr
+
+
+class FactoryFdrTests(unittest.TestCase):
+    def test_balanced_allocations_are_previewed_without_being_spent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            scope = "shadow-confirmation-v2:equity"
+
+            first = ledger.next_fdr_allocation(scope)
+            self.assertEqual(first["method"], FDR_METHOD)
+            self.assertEqual(first["tests"], 1)
+            self.assertAlmostEqual(first["allocated_alpha"], .025)
+            self.assertEqual(ledger.fdr_state(scope)["tests"], 0)
+
+            expected = (.025, .05 / 6, .05 / 12, .05 / 20)
+            for index, allocation in enumerate(expected, start=1):
+                preview = ledger.next_fdr_allocation(scope)
+                self.assertEqual(preview["tests"], index)
+                self.assertAlmostEqual(preview["allocated_alpha"], allocation)
+                recorded = ledger.record_fdr_decision(
+                    scope, f"failed-{index}", 1.0)
+                self.assertEqual(recorded["tests"], index)
+                self.assertAlmostEqual(recorded["allocated_alpha"], allocation)
+                self.assertFalse(recorded["decision"])
+
+    def test_discovery_reward_and_duplicate_test_are_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            scope = "shadow-confirmation-v2:equity"
+            first = ledger.record_fdr_decision(scope, "proof-a", .001)
+            self.assertTrue(first["decision"])
+
+            # The second base allocation is alpha/6 and the first discovery
+            # starts a fresh alpha/2 reward stream.
+            preview = ledger.next_fdr_allocation(scope)
+            self.assertAlmostEqual(preview["allocated_alpha"], .05 / 6 + .025)
+            duplicate = ledger.record_fdr_decision(scope, "proof-a", .9)
+            self.assertEqual(duplicate["tests"], 1)
+            self.assertEqual(duplicate["p_value"], .001)
+            self.assertTrue(duplicate["decision"])
+            self.assertEqual(ledger.fdr_state(scope)["tests"], 1)
+
+    def test_offline_deferral_is_explicit_and_non_authorizing(self):
+        record = deferred_fdr("shadow-confirmation-v2:equity", "candidate-a")
+        self.assertFalse(record["required"])
+        self.assertFalse(record["tested"])
+        self.assertFalse(record["decision"])
+        self.assertEqual(record["status"], "deferred_to_live_shadow")
+        self.assertNotIn("p_value", record)
+        self.assertNotIn("allocated_alpha", record)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

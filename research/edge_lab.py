@@ -392,32 +392,25 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
 
-    ranked_ids = sorted(gates, key=lambda variant_id: (
-        0 if gates[variant_id].get("development_passes_without_family") else 1,
+    ranked_ids = sorted((
+        variant_id for variant_id in gates
+        if gates[variant_id].get("development_passes_without_family") and
+        corrected.get(variant_id, {}).get("significant")), key=lambda variant_id: (
         float(corrected.get(variant_id, {}).get("p_adjusted", 1.0)),
         -float(gates[variant_id].get("heldout_delta_lcb") or float("-inf")),
         -float((gates[variant_id].get("heldout_performance") or {}).get(
             "net_pnl", 0.0)),
         variant_id))
     selected_test_id = ranked_ids[0] if ranked_ids else None
-    selected_q = (1.0 if selected_test_id is None else float(
-        corrected.get(selected_test_id, {}).get("p_adjusted", 1.0)))
-    # Imported lazily: factory_ledger exposes the shared durable online-FDR
-    # store and itself imports this module for legacy facade symbols.
-    from .factory_ledger import FactoryLedger
-    cumulative = FactoryLedger(db_path).record_fdr_decision(
-        f"edge_discovery:{vehicle}",
-        f"{data_hash}:{lane}:"
-        f"{hash_config({key: value.as_dict() for key, value in sorted(mode_policies.items())})}:post_selection",
-        selected_q, alpha=alpha)
-    qualification_target = None
-    if selected_test_id is not None:
-        selected_gate = gates[selected_test_id]
-        selected_family = corrected.get(selected_test_id, {})
-        if (selected_gate.get("development_passes_without_family") and
-                selected_family.get("significant") and
-                cumulative.get("decision")):
-            qualification_target = selected_test_id
+    # Imported lazily because factory_ledger imports this module's public
+    # facades. Historical discovery defers cumulative testing to live shadow.
+    from .factory_ledger import deferred_fdr
+    confirmatory_scope = f"shadow-confirmation-v2:{vehicle}"
+    cumulative = deferred_fdr(
+        confirmatory_scope,
+        (f"{data_hash}:{lane}:{selected_test_id}:live-shadow"
+         if selected_test_id else f"{data_hash}:{lane}:no-selection"))
+    qualification_target = selected_test_id
 
     if qualification_target is not None and sealed_window.session_dates:
         window_bars = sealed_window.release(

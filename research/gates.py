@@ -327,13 +327,16 @@ def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
 
 def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
                          vehicle: str, seed: int = 20260728,
-                         confidence: float = LOWER_BOUND_CONFIDENCE) -> dict:
+                         confidence: float = LOWER_BOUND_CONFIDENCE,
+                         iterations: int = 20_000) -> dict:
     """Test matched opportunity deltas with deterministic session clustering."""
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+        raise ValueError("iterations must be a positive integer")
     pairs = matched_pairs(candidate, baseline, vehicle=vehicle)
     triples = [(stamp, delta, 0.0) for stamp, delta
                in zip(pairs["timestamps"], pairs["deltas"])]
     result = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS,
-                                       seed=seed)
+                                       iterations=iterations, seed=seed)
     bound = cluster_bootstrap_lower_bound(
         pairs["deltas"], pairs["clusters"], confidence=confidence)
     result["matched"] = pairs["matched"]
@@ -833,11 +836,20 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     derived["family_fdr_significant"] = float(stats["family_q_value"]) <= float(alpha)
     derived["global_fdr_significant"] = float(q_value) <= float(alpha)
     online = dict(online_fdr or {})
+    online_required = online.get("required", True) is not False
     online_p = online.get("p_value")
     online_alpha = online.get("allocated_alpha")
-    derived["cumulative_fdr_significant"] = bool(
-        online.get("decision") is True and online_p is not None and
-        online_alpha is not None and float(online_p) <= float(online_alpha))
+    if online_required:
+        derived["cumulative_fdr_significant"] = bool(
+            online.get("decision") is True and online_p is not None and
+            online_alpha is not None and float(online_p) <= float(online_alpha))
+    else:
+        # Historical and offline-forward proofs are screens, not deployments.
+        # They may defer the one cumulative test to the strictly newer,
+        # parity-matched live-shadow boundary, but must say so explicitly.
+        derived["cumulative_fdr_significant"] = bool(
+            online.get("status") == "deferred_to_live_shadow" and
+            online.get("tested") is False and online.get("decision") is False)
     qual = dict(qualification or {})
     derived["qualification_available"] = bool(qual.get("available"))
     derived["qualification_net_positive"] = bool(
@@ -1044,13 +1056,21 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             if not isinstance(online, Mapping):
                 return False
             if envelope.get("passes"):
-                allocated = float(online.get("allocated_alpha"))
-                online_p = float(online.get("p_value"))
-                if (online.get("decision") is not True or
-                        not math.isfinite(allocated) or allocated <= 0 or
-                        not math.isfinite(online_p) or online_p > allocated or
-                        not _close_number(online_p, global_q)):
-                    return False
+                if online.get("required", True) is False:
+                    if (online.get("status") != "deferred_to_live_shadow" or
+                            online.get("tested") is not False or
+                            online.get("decision") is not False or
+                            online.get("p_value") is not None or
+                            online.get("allocated_alpha") is not None):
+                        return False
+                else:
+                    allocated = float(online.get("allocated_alpha"))
+                    online_p = float(online.get("p_value"))
+                    if (online.get("decision") is not True or
+                            not math.isfinite(allocated) or allocated <= 0 or
+                            not math.isfinite(online_p) or online_p > allocated or
+                            not _close_number(online_p, global_q)):
+                        return False
             # Rebuild the code-owned decision flags from the persisted source
             # evidence.  Callers may add stricter custom vetoes, but they may
             # not override a required gate flag or detach it from the report
@@ -1083,22 +1103,28 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         if envelope.get("passes"):
             if not isinstance(statistics, Mapping):
                 return False
-            expected_control = matched_cluster_test(
-                sources_held, baseline_held, vehicle=vehicle)
             control = envelope.get("control") or {}
+            control_iterations = int(control.get("resamples") or 20_000)
+            expected_control = matched_cluster_test(
+                sources_held, baseline_held, vehicle=vehicle,
+                iterations=control_iterations)
             for key in ("matched", "mean_delta", "mean_delta_lcb", "p_value"):
                 if not _close_number(expected_control.get(key), control.get(key)):
                     return False
             if envelope.get("lane") == "backtest":
-                expected_fit_control = matched_cluster_test(
-                    sources_fit, baseline_fit, vehicle=vehicle)
                 fit_control = envelope.get("fit_control") or {}
+                fit_iterations = int(fit_control.get("resamples") or 20_000)
+                expected_fit_control = matched_cluster_test(
+                    sources_fit, baseline_fit, vehicle=vehicle,
+                    iterations=fit_iterations)
                 for key in ("matched", "mean_delta", "p_value"):
                     if not _close_number(expected_fit_control.get(key),
                                          fit_control.get(key)):
                         return False
+            null_iterations = int(null_control.get("resamples") or 20_000)
             expected_null = matched_cluster_test(
-                sources_held, null_source, vehicle=vehicle)
+                sources_held, null_source, vehicle=vehicle,
+                iterations=null_iterations)
             for key in ("matched", "mean_delta", "mean_delta_lcb", "p_value"):
                 if not _close_number(expected_null.get(key), null_control.get(key)):
                     return False
