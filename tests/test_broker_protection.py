@@ -300,6 +300,7 @@ class BrokerProtectionTests(ProtectionHarness):
         row["option_chain"] = [{
             "symbol": "SPY260821C00600000", "underlying_symbol": "SPY",
             "type": "call", "bid": 1.9, "ask": 2.0,
+            "timestamp": self.NOW,
             "volume": 10, "open_interest": 100, "multiplier": 100,
         }]
         request, _ = self.engine._risk_order(

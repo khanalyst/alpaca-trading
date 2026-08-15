@@ -55,12 +55,23 @@ emitted and the model is never adjusted automatically.
 the strict 30-second market-data age, option DTE (default 7–60), option spread
 and liquidity checks, latest-entry and force-flat times, and portfolio limits
 (concurrent positions, position notional, gross exposure, open risk, and daily
-loss). Research cannot relax these constraints while simulating.
+loss). Research cannot relax these option, timing, or risk constraints while
+simulating.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
 missing or partial opening range is `no trade`, not an imputed range. A missing
 immediate next bar is also `no trade`; stale signals are never carried across
 an outage.
+
+Market-data strictness is lane-specific. The validated research-only setting
+`research.backtest_bar_fallback` defaults to `true`: historical backtest lanes
+may price a missing equity quote at a bar boundary from the bar, using the
+shared conservative spread/slippage/fee model, and record `quote` versus `bar`
+as the fill source. Forward-shadow, live-shadow, and paper lanes remain strict
+and require a fresh executable quote. Direct replay APIs default to strict;
+only a lane orchestrator or the standalone `backtest-ibr` command opts into
+historical fallback. A passing backtest is evidence for the next gate, never
+authorization to trade paper.
 
 ## Evidence
 
@@ -143,7 +154,8 @@ trade/evidence rows. The autonomous lane first evaluates the initial corpus as
 a backtest, then accepts only a later, unseen session tail for offline
 forward-shadow evidence. Passing gates advance `candidate` ->
 `backtest_passed` -> `shadow` only; runtime entries stay blocked because
-offline replay cannot authorize deployment. The broker-free ShadowRunner
+backtest or offline forward-shadow evidence cannot authorize paper deployment.
+The broker-free ShadowRunner
 evaluates eligible candidates in isolated virtual books from recorder events,
 creates exact-session candidate/root-baseline/randomized-null replays, and
 quarantines mismatch/incomplete rows. Research-side `edge ingest-shadow` opens

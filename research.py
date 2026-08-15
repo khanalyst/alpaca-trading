@@ -18,7 +18,7 @@ if str(REPO) not in sys.path:
 
 from research.calibration import json_report as calibration_report
 from research.costs import (CostModel, DEFAULT_FEE_BPS, DEFAULT_SLIPPAGE_BPS,
-                            DEFAULT_SPREAD_BPS, SQLiteQuoteIndex)
+                            DEFAULT_SPREAD_BPS, ReplayPolicy, SQLiteQuoteIndex)
 from research.ibr import IBRConfig, replay_ibr, replay_ibr_vehicles
 from research.edge_lab import (EdgeLedger, DEFAULT_DB_PATH, discover,
                                init_ledger)
@@ -72,6 +72,8 @@ def _config(args: argparse.Namespace) -> IBRConfig:
         costs=CostModel(spread_bps=args.spread_bps,
                         slippage_bps=args.slippage_bps,
                         fee_bps=args.fee_bps),
+        policy=ReplayPolicy(strict_market_data=bool(
+            getattr(args, "strict_market_data", False))),
         force_flat=args.force_flat,
     )
 
@@ -128,6 +130,8 @@ def _add_cost_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--slippage-bps", type=float, default=DEFAULT_SLIPPAGE_BPS)
     parser.add_argument("--fee-bps", type=float, default=DEFAULT_FEE_BPS)
     parser.add_argument("--force-flat", type=_time, default=_time("15:55"))
+    parser.add_argument("--strict-market-data", action="store_true",
+                        help="require executable quotes for every boundary fill")
 
 
 def _quotes(args: argparse.Namespace):
@@ -485,7 +489,9 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
         args.data, db_path=_db(args), vehicle=args.vehicle, lane=args.lane,
         config=config, variants_path=args.variants,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
-        alpha=args.alpha)
+        alpha=args.alpha,
+        backtest_bar_fallback=bool((agent_config.get("research") or {}).get(
+            "backtest_bar_fallback", True)))
     _emit_proofs(args, result, agent_config)
     stalled = _report_unevaluable(
         result, [item.get("gate") for item in result.get("variants", [])
@@ -553,7 +559,9 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         runtime_config=runtime_config,
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
         worker_data=getattr(args, "worker_data", None),
-        progress_callback=_research_progress)
+        progress_callback=_research_progress,
+        backtest_bar_fallback=bool((agent_config.get("research") or {}).get(
+            "backtest_bar_fallback", True)))
     proofs = _emit_proofs(args, result, agent_config)
     # Archive the narrative every cycle, not only when an edge proves out. A
     # cycle that found nothing is exactly the one an operator needs to read,

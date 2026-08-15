@@ -17,7 +17,7 @@ model that expects a cost the runtime would reject fails closed here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 import math
 from pathlib import Path
@@ -168,6 +168,26 @@ class ReplayPolicy:
             # research result -- see ``fill_source_summary``.
             strict_market_data=_strict_market_data(execution),
         )
+
+
+def replay_policy_for_mode(policy: ReplayPolicy, mode: str, *,
+                           backtest_bar_fallback: bool = False) -> ReplayPolicy:
+    """Derive the policy allowed for one offline research lane.
+
+    Backtests may explicitly replay historical bars without executable quotes;
+    shadow replay is always point-in-time strict because it is the evidence
+    that gates live-shadow authorization.  Direct replay callers retain their
+    existing policy and do not pass through this helper.
+    """
+    if not isinstance(policy, ReplayPolicy):
+        raise CostError("policy must be a ReplayPolicy")
+    lane = str(mode).strip().lower()
+    if lane not in {"backtest", "shadow"}:
+        raise CostError("mode must be backtest or shadow")
+    if not isinstance(backtest_bar_fallback, bool):
+        raise CostError("backtest_bar_fallback must be true or false")
+    strict = lane == "shadow" or not (lane == "backtest" and backtest_bar_fallback)
+    return replace(policy, strict_market_data=strict)
 
 
 def _strict_market_data(execution: Mapping) -> bool:
@@ -588,5 +608,6 @@ __all__ = [
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS", "ReplayPolicy",
+    "replay_policy_for_mode",
     "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes", "quote_fill",
 ]

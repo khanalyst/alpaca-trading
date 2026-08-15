@@ -70,15 +70,28 @@ Equity and single-leg long-option vehicles are independent result books. Call
 no pooled P&L field. Option replay requires timestamped option snapshots and
 uses their contract multiplier.
 
+Market-data strictness is lane-specific. Direct replay APIs default to strict
+`ReplayPolicy` behavior and require a fresh executable equity quote at each
+boundary that needs one. Historical backtest lanes use the validated,
+research-only `research.backtest_bar_fallback` setting (default `true`): when a
+boundary has no equity quote, the bar may supply the reference, the shared
+conservative spread/slippage/fee model still prices the fill, and the result
+records whether `quote` or `bar` supplied it. Forward-shadow, broker-free
+live-shadow, and paper remain strict and require fresh executable quotes.
+Backtest evidence never authorizes paper.
+
 The command-line surface is intentionally small:
 
 ```bash
 python research.py validate-data bars.jsonl --provider alpaca --feed sip
 python research.py backtest-ibr bars.jsonl --vehicle equity
+python research.py backtest-ibr bars.jsonl --vehicle equity --strict-market-data
 ```
 
-Both commands are offline and read JSONL only. They never download data, call
-an exchange, place orders, or modify trading state.
+`backtest-ibr` defaults to historical bar fallback; `--strict-market-data`
+opts into strict diagnostics. Both commands are offline and read JSONL only.
+They never download data, call an exchange, place orders, or modify trading
+state.
 
 ## Costs and fill calibration
 
@@ -95,10 +108,11 @@ model expecting a cost the runtime would refuse to submit fails closed rather
 than simulating fills that could never happen. Sourcing an expected slippage
 from the cap is as wrong as ignoring the cap.
 
-Quote-driven fills need the quote rows to reach the lane. `research.edge_lab`
+Quote-driven fills need the quote rows to reach a strict lane. `research.edge_lab`
 and `research.strategy_factory` are handed the complete mixed corpus by
 `deploy/research-cycle.sh`, so a scheduled cycle prices a boundary fill from a
-recorded quote where one exists and records the source on the trade. The
+recorded quote where one exists and records the source on the trade. Historical
+backtests may use the research-only bar fallback described above; the
 bar-only, quote-only and option-only views the script derives alongside it are
 used to decide which vehicle lanes to run and to feed the standalone
 `backtest-ibr` invocation, which receives the quotes explicitly.

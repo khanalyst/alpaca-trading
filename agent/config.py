@@ -74,6 +74,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "llm": {"enabled": False, "provider": "openai", "model": "", "temperature": 0.2, "max_tokens": 2000, "timeout_seconds": 10.0},
     "research": {
         "enabled": True, "require_validated_variant": True,
+        "backtest_bar_fallback": True,
         "champion_min_confidence": 0.95,
         "strategy_llm": {"enabled": True, "provider": "openai", "model": "gpt-5",
                          "max_attempts": 1, "timeout_seconds": 30,
@@ -293,10 +294,12 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     llm["timeout_seconds"] = _num(llm, "timeout_seconds", "llm", .1, 120, 10)
     out["llm"] = llm
     research = _map(out.get("research"), "research")
-    _unknown(research, {"enabled", "require_validated_variant", "champion_min_confidence", "db_path", "strategy_llm", "proof", "trial"}, "research")
+    _unknown(research, {"enabled", "require_validated_variant", "backtest_bar_fallback", "champion_min_confidence", "db_path", "strategy_llm", "proof", "trial"}, "research")
     research["enabled"] = _bool(research, "enabled", "research", True)
     research["require_validated_variant"] = _bool(
         research, "require_validated_variant", "research", True)
+    research["backtest_bar_fallback"] = _bool(
+        research, "backtest_bar_fallback", "research", True)
     research["champion_min_confidence"] = _num(
         research, "champion_min_confidence", "research", 0, 1, .95)
     if research.get("db_path") is not None and not isinstance(research["db_path"], str):

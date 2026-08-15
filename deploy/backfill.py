@@ -25,12 +25,14 @@ Three boundaries keep it honest:
   snapshots with quote-age semantics that a historical endpoint cannot
   reconstruct, so inventing them would fabricate the one thing option research
   depends on.  The option lane still needs recorded sessions.
-* Quotes are opt-in (``--quotes``) and are not optional evidence.  Strict
-  replay -- the default, and everything the equity gates assume -- refuses to
-  price a fill it has no recorded quote for, so a bars-only corpus executes no
-  trades whatsoever.  Backfill quotes, or set ``execution.strict_market_data``
-  to false and accept bar prints marked up by the modelled half-spread, which
-  the proof then records as such under ``fill_quality``.
+* Quotes are opt-in (``--quotes``).  Historical backtest lanes default to the
+  research-only ``research.backtest_bar_fallback: true`` policy, so a missing
+  equity quote at a bar boundary may be priced from that bar through the
+  shared conservative spread/slippage/fee model; the proof records the fill
+  source.  Forward-shadow, live-shadow, and paper remain strict and require
+  fresh executable quotes, so backfill quotes for those lanes.  Set
+  ``research.backtest_bar_fallback: false`` when a historical backtest must
+  produce strict diagnostics.
 """
 
 from __future__ import annotations
@@ -273,10 +275,10 @@ def parser() -> argparse.ArgumentParser:
                    help=f"calendar days back from the last completed session "
                         f"(max {MAX_BACKFILL_DAYS})")
     p.add_argument("--quotes", action="store_true",
-                   help="also backfill quotes; far larger, and required unless "
-                        "execution.strict_market_data is false. Strict replay "
-                        "(the default) refuses to price a fill with no recorded "
-                        "quote, so a bars-only corpus executes no trades at all")
+                   help="also backfill quotes; far larger, and required by "
+                        "strict forward/live-shadow and paper lanes. Historical "
+                        "backtests use research.backtest_bar_fallback (default "
+                        "true) for missing equity boundary quotes")
     p.add_argument("--overwrite", action="store_true",
                    help="rewrite sessions that already have a partition")
     return p

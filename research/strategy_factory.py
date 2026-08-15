@@ -25,7 +25,7 @@ from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V1, RULE_SCHEMA_V2,
                                   rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
 from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
-                    index_quotes, quote_fill)
+                    index_quotes, quote_fill, replay_policy_for_mode)
 from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
@@ -985,6 +985,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             })
         sessions = sorted({_session(bar) for bar in bars})
         return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
+                "policy": policy,
                 "evaluation_start": sessions[0] if sessions else None,
                 "evaluation_end": sessions[-1] if sessions else None,
                 "variants": sorted(variants, key=lambda item: item["variant_id"]),
@@ -1184,7 +1185,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 runtime_config: Mapping[str, Any] | None = None,
                 proposal_adapter: RuleProposalAdapter | None = None,
                 worker_data: str | Path | None = None,
-                progress_callback: Any | None = None) -> dict:
+                progress_callback: Any | None = None,
+                backtest_bar_fallback: bool = False) -> dict:
     """Run one cycle and always release its parent-owned quote index."""
     resources: list[SQLiteQuoteIndex] = []
     try:
@@ -1197,7 +1199,8 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
             rotation_budget=rotation_budget, strategy_llm=strategy_llm,
             costs=costs, runtime_config=runtime_config,
             proposal_adapter=proposal_adapter, worker_data=worker_data,
-            progress_callback=progress_callback, _resources=resources)
+            progress_callback=progress_callback,
+            backtest_bar_fallback=backtest_bar_fallback, _resources=resources)
     finally:
         for resource in reversed(resources):
             resource.close()
@@ -1218,6 +1221,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 proposal_adapter: RuleProposalAdapter | None = None,
                 worker_data: str | Path | None = None,
                 progress_callback: Any | None = None,
+                backtest_bar_fallback: bool = False,
                 _resources: list[SQLiteQuoteIndex]) -> dict:
     """Run one autonomous cycle and persist every account, diagnosis and edge."""
     if vehicle not in {"equity", "option"}:
@@ -1238,6 +1242,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError(
             f"rotation stays bounded: max_rotations<={MAX_ROTATIONS}, "
             f"rotation_budget<={ROTATION_BUDGET}")
+    if not isinstance(backtest_bar_fallback, bool):
+        raise FactoryError("backtest_bar_fallback must be true or false")
     worker_data_path = None
     if worker_data is not None:
         if not isinstance(data, (str, Path)):
@@ -1253,6 +1259,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             raise FactoryError("worker_data must be a non-empty JSONL file")
     model = costs or CostModel()
     policy = ReplayPolicy.from_config(runtime_config)
+    backtest_policy = replay_policy_for_mode(
+        policy, "backtest", backtest_bar_fallback=backtest_bar_fallback)
+    shadow_policy = replay_policy_for_mode(
+        policy, "shadow", backtest_bar_fallback=backtest_bar_fallback)
     llm_config = dict(strategy_llm or {})
     llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
     llm_enabled = bool(llm_config.get("enabled", False))
@@ -1320,7 +1330,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "max_generations": int(max_generations),
         "max_rotations": int(max_rotations),
         "rotation_budget": int(rotation_budget),
-        "costs": model.as_dict(), "replay_policy": policy.as_dict(),
+        "costs": model.as_dict(),
+        "replay_policy": policy.as_dict(),
+        "replay_policies": {"backtest": backtest_policy.as_dict(),
+                             "shadow": shadow_policy.as_dict()},
+        "backtest_bar_fallback": backtest_bar_fallback,
         "gate": gate_assumptions, "strategy_llm": llm_assumptions,
     }
     identity_hashes = provenance_hash(
@@ -1330,6 +1344,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         dataset=raw_rows, config=experiment_config,
         code=identity_hashes["code_hash"], cost=model.as_dict(),
         risk=policy.as_dict(), gate=gate_assumptions)
+    experiment_provenance_body["replay_policies"] = {
+        "backtest": backtest_policy.as_dict(),
+        "shadow": shadow_policy.as_dict(),
+    }
+    experiment_provenance_body["backtest_bar_fallback"] = backtest_bar_fallback
     experiment_provenance_body["code_hash"] = identity_hashes["code_hash"]
     identity = experiment_identity(
         dataset_hash=dataset_hash, vehicle=vehicle,
@@ -1439,7 +1458,9 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         task = {
             "hypothesis": hypothesis, "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
-            "starting_cash": starting_cash, "costs": model, "policy": policy,
+            "starting_cash": starting_cash, "costs": model,
+            "policy": (shadow_policy if mode == "shadow" else backtest_policy),
+            "backtest_bar_fallback": backtest_bar_fallback,
         }
         if corpus_source is None:
             task.update({
@@ -1715,6 +1736,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     if qualification_target is not None:
         selected_worker, selected_variant, _selected_gate = qualification_target
         hypothesis_id = str(selected_worker["hypothesis"]["hypothesis_id"])
+        selected_policy = selected_worker.get("policy", policy)
         sealed, sealed_snapshots, sealed_quotes = sealed_windows.get(
             hypothesis_id, (None, [], []))
         qualification_bars = (sealed.release(
@@ -1727,7 +1749,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 selected_worker["hypothesis"]["rule_spec"], vehicle=vehicle,
                 account_id=f"qualification:control:{hypothesis_id}",
                 starting_cash=starting_cash, costs=model, quotes=sealed_quotes,
-                policy=policy)["rows"]
+                policy=selected_policy)["rows"]
             root_variant_id = rule_variant_id(
                 selected_worker["hypothesis"]["rule_spec"])
             baseline_rows = control_rows
@@ -1738,14 +1760,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     reference_rows=control_rows,
                     account_id=f"qualification:null:{hypothesis_id}",
                     starting_cash=starting_cash, costs=model,
-                    quotes=sealed_quotes, policy=policy)["rows"]
+                    quotes=sealed_quotes, policy=selected_policy)["rows"]
             candidate_rows = simulate_account(
                 qualification_bars, sealed_snapshots,
                 selected_variant["rule_spec"], vehicle=vehicle,
                 account_id=(f"qualification:{hypothesis_id}:"
                             f"{selected_variant['variant_id']}"),
                 starting_cash=starting_cash, costs=model, quotes=sealed_quotes,
-                policy=policy)["rows"]
+                policy=selected_policy)["rows"]
             qualification_report = _qualification_report(
                 candidate_rows, baseline_rows, vehicle=vehicle,
                 sessions=sessions, candidate_id=selected_variant["variant_id"],
@@ -1753,7 +1775,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             qualification_key = selected_test_key
 
     partitions: dict[str, tuple[list, list]] = {}
-    run_contexts: dict[str, tuple[dict, dict]] = {}
+    run_contexts: dict[str, tuple[dict, dict, dict]] = {}
     for worker, variant, gate in variant_rows:
         key = f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}"
         selected = key == qualification_key and qualification_report is not None
@@ -1798,12 +1820,22 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         config = {"strategy": {"id": "rule", "version": "v1",
                                 "variant_id": variant["variant_id"],
                                 "rule_spec": variant["rule_spec"]}}
+        worker_policy = worker.get(
+            "policy", shadow_policy if worker["mode"] == "shadow" else backtest_policy)
+        run_config = {**config, "replay_policy": worker_policy.as_dict(),
+                      "replay_mode": worker["mode"],
+                      "backtest_bar_fallback": backtest_bar_fallback}
         run_provenance = {
             "factory": FACTORY_SCHEMA,
             "experiment_identity": identity["identity_hash"],
             "hypothesis_id": worker["hypothesis"]["hypothesis_id"],
             "variant_id": variant["variant_id"],
-            "costs": model.as_dict(), "replay_policy": policy.as_dict(),
+            "costs": model.as_dict(),
+            "replay_policy": worker_policy.as_dict(),
+            "replay_mode": worker["mode"],
+            "backtest_bar_fallback": backtest_bar_fallback,
+            "replay_policies": {"backtest": backtest_policy.as_dict(),
+                                 "shadow": shadow_policy.as_dict()},
             "gate": gate_assumptions,
             "cumulative_fdr": (dict(cumulative)
                                if key == selected_test_key else None),
@@ -1824,7 +1856,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             null_control=gate["null_control"],
             online_fdr=(cumulative if key == selected_test_key else {}),
             provenance=provenance_hash(
-                dataset=raw_rows, config=config, code=Path(__file__),
+                dataset=raw_rows, config=run_config, code=Path(__file__),
                 provenance=run_provenance),
             candidate_id=variant["variant_id"],
             performance={"heldout_delta": gate["test"].get("mean_delta"),
@@ -1837,7 +1869,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         gate["gate_hash"] = envelope["content_hash"]
         gate["failed_checks"] = sorted(
             name for name, ok in envelope["checks"].items() if ok is False)
-        run_contexts[variant["account"]["account_id"]] = (config, run_provenance)
+        run_contexts[variant["account"]["account_id"]] = (
+            config, run_config, run_provenance)
         partitions[variant["account"]["account_id"]] = (fit, heldout)
 
     def _lesson_outcome(gate: Mapping[str, Any]) -> dict:
@@ -1901,7 +1934,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             # against it.  That pairing is what later prompts read back.
             _grade(str(hypothesis["hypothesis_id"]), variant["variant_id"],
                    "tuning", gate)
-            config, run_provenance = run_contexts[
+            config, run_config, run_provenance = run_contexts[
                 variant["account"]["account_id"]]
             try:
                 candidate = edge.register_candidate(
@@ -1943,7 +1976,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 fit, held = partitions[variant["account"]["account_id"]]
                 run = edge.append_run(
                     candidate["candidate_id"], lane=worker["mode"], vehicle=vehicle,
-                    dataset=raw_rows, config=config, code=Path(__file__),
+                    dataset=raw_rows, config=run_config, code=Path(__file__),
                     provenance=run_provenance,
                     fit=fit, heldout=held,
                     metrics={"gate": gate, "account": {k: v for k, v in variant["account"].items()

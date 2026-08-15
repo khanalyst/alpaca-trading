@@ -19,6 +19,7 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 import hashlib
 import io
 import json
+from dataclasses import replace
 import math
 from pathlib import Path
 import sqlite3
@@ -875,7 +876,7 @@ def _read_factory_rule_roots(path: Path) -> dict[str, dict[str, Any]]:
 
 def _policy(config: Mapping[str, Any]) -> ReplayPolicy:
     try:
-        return ReplayPolicy.from_config(config)
+        return replace(ReplayPolicy.from_config(config), strict_market_data=True)
     except Exception:
         return ReplayPolicy()
 

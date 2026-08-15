@@ -560,12 +560,13 @@ class DeployTests(unittest.TestCase):
                 summaries[label] = _cycle_payloads(result.stdout, "vehicle")[0]
             # The routed quotes are the executable price at the fill instant,
             # so a corpus carrying them must not replay like the bars alone.
-            # Strict replay does not fabricate an executable fill from a bar
-            # when the recorded point-in-time quote is absent.
+            # Historical research may explicitly use the conservative bar
+            # fallback when quotes are absent, but its fill economics must
+            # remain distinguishable from recorded point-in-time quotes.
             self.assertEqual(summaries["quotes"]["trades"], 1)
-            self.assertEqual(summaries["bars_only"]["trades"], 0)
-            self.assertGreater(summaries["quotes"]["net_pnl"],
-                               summaries["bars_only"]["net_pnl"])
+            self.assertEqual(summaries["bars_only"]["trades"], 1)
+            self.assertNotEqual(summaries["quotes"]["net_pnl"],
+                                summaries["bars_only"]["net_pnl"])
 
     def test_research_cycle_reads_a_partitioned_corpus_window(self):
         with tempfile.TemporaryDirectory() as directory:

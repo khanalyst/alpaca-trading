@@ -423,7 +423,8 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
 
 
 def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
-                          *, close_confirmed: bool = True) -> tuple[IBRConfig, dict]:
+                          *, close_confirmed: bool = True,
+                          policy: ReplayPolicy | None = None) -> tuple[IBRConfig, dict]:
     """Build the replay config used by every variant from one immutable base."""
     source = dict(base or {})
     strategy = dict(source.get("strategy") or {})
@@ -458,7 +459,7 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
         costs=costs,
         close_confirmed=bool(close_confirmed),
         timezone=str((source.get("session") or {}).get("timezone", "America/New_York")),
-        policy=ReplayPolicy.from_config(source),
+        policy=(ReplayPolicy.from_config(source) if policy is None else policy),
     )
     effective = dict(source)
     effective["strategy"] = strategy

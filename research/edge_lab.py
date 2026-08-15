@@ -22,7 +22,7 @@ from .gates import (
     performance_floor, qualification_report, sample_counts, seal_final_window,
     structural_floor, verified_gate_envelope, walk_forward_report,
 )
-from .costs import CostModel
+from .costs import CostModel, ReplayPolicy, replay_policy_for_mode
 from .ibr import IBRConfig, replay_ibr
 from .market_data import (
     OptionSnapshot, UnderlyingBar, normalize_option_snapshot,
@@ -120,20 +120,23 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
 def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFAULT_DB_PATH,
              vehicle: str = "equity", lane: str = "auto", config: Mapping | None = None,
              variants_path: str | Path | None = None, min_trades: int = 100,
-             min_sessions: int = 10, alpha: float = .05) -> dict:
+             min_sessions: int = 10, alpha: float = .05,
+             backtest_bar_fallback: bool = False) -> dict:
     """Run every bounded IBR variant on one normalized corpus.
 
     ``backtest`` writes only the fit/held-out replay and can advance a fresh
     candidate to ``backtest_passed``.  ``shadow`` requires an existing
     backtest-passed candidate and consumes only sessions strictly later than
     the latest persisted boundary.  ``auto`` chooses backtest for fresh arms
-    and the same forward-only tail for already-qualified arms.  No result is
-    invented for a missing trade or quote.
+    and the same forward-only tail for already-qualified arms.  Missing quotes
+    remain unpriceable except in the explicit historical bar-fallback lane.
     """
     if vehicle not in VEHICLES:
         raise DiscoveryError("vehicle must be equity or option")
     if lane not in {"auto", "backtest", "shadow"}:
         raise DiscoveryError("lane must be auto, backtest, or shadow")
+    if not isinstance(backtest_bar_fallback, bool):
+        raise DiscoveryError("backtest_bar_fallback must be true or false")
     # These values are policy inputs, not harmless replay hints.  Reject bools,
     # fractional counts, non-finite values and out-of-range alpha before any
     # corpus is sealed or a candidate is registered.
@@ -192,22 +195,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     base_results: dict[str, list[dict]] = {}
     null_results: dict[str, list[dict]] = {}
     effective_configs: dict[str, dict] = {}
+    run_configs: dict[str, dict] = {}
     configs: dict[str, object] = {}
+    runtime_policy = ReplayPolicy.from_config(config)
     for variant in selected:
         cfg, effective = _effective_ibr_config(config, variant.overrides)
-        result = replay(development_bars, development_snapshots, development_quotes, cfg)
-        base_results[variant.variant_id] = _opportunity_rows(
-            result, development_bars, vehicle)
-        # Beating the config a variant was derived from is not beating chance.
-        # The null keeps this variant's own sessions, symbols, directions and
-        # stop distances, and moves only the entry bar.
-        null_results[variant.variant_id] = null_control_account(
-            development_bars, list(development_snapshots.values()),
-            _null_spec(cfg), vehicle=vehicle,
-            reference_rows=_null_reference_rows(result, development_bars, vehicle),
-            account_id=f"ibr:{vehicle}:{variant.variant_id}",
-            costs=cfg.costs, quotes=development_quotes,
-            fixed_quantity=cfg.quantity)["rows"]
         effective_configs[variant.variant_id] = effective
         configs[variant.variant_id] = cfg
 
@@ -246,7 +238,6 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                     f"candidate {variant.variant_id!r} is {record.get('status')!r}; "
                     "shadow requires backtest_passed or later")
 
-    baseline_rows = base_results[baseline_variant.variant_id]
     baseline_boundary = latest_boundary(existing.get(baseline_variant.variant_id))
     baseline_mode = "shadow" if (
         lane == "shadow" or (lane == "auto" and baseline_boundary is not None)
@@ -263,13 +254,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         return [dict(row) for row in rows
                 if str(row.get("session_date") or "") > str(boundary)]
 
-    baseline_eval = tail(baseline_rows, baseline_boundary) if baseline_mode == "shadow" else baseline_rows
     baseline_window_rows: list[dict] = []
-    unseen_sealed_sessions = [
-        session for session in sealed_window.session_dates
-        if baseline_boundary is None or session > baseline_boundary]
-    if lane == "shadow" and not baseline_eval and not unseen_sealed_sessions:
-        raise DiscoveryError("shadow corpus contains no unseen sessions after the persisted boundary")
 
     def final_window(rows: Sequence[Mapping], control: Sequence[Mapping], *,
                      candidate_id: str, preselected: bool) -> dict:
@@ -303,10 +288,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             mode = "backtest"
         modes[variant.variant_id] = mode
         boundary = latest_boundary(record)
-        rows = (tail(base_results[variant.variant_id], boundary)
-                if mode == "shadow" else
-                ([] if mode == "skip" else base_results[variant.variant_id]))
-        eval_rows[variant.variant_id] = rows
+        eval_rows[variant.variant_id] = []
         window_rows[variant.variant_id] = []
         window_reports[variant.variant_id] = {
             "available": False, "sessions": [], "net_positive": False,
@@ -314,10 +296,78 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             "post_selection": {"preselected": False,
                                 "candidate_id": variant.variant_id},
         }
+        # Replay rows are populated below after the mode-specific policy is
+        # selected; this keeps auto-lane backtests and shadows from sharing a
+        # permissive/strict pricing decision accidentally.
+
+    # Select the mode-specific replay policy only after auto-lane modes are
+    # known. Candidate registration retains the stable strict config above;
+    # mode-specific policy belongs to the replay run and its provenance.
+    mode_policies: dict[str, ReplayPolicy] = {}
+    for variant in selected:
+        variant_id = variant.variant_id
+        mode = (baseline_mode if variant_id == baseline_variant.variant_id
+                else modes.get(variant_id, "backtest"))
+        mode_policy = replay_policy_for_mode(
+            runtime_policy, "shadow" if mode == "shadow" else "backtest",
+            backtest_bar_fallback=backtest_bar_fallback)
+        mode_policies[variant_id] = mode_policy
+        cfg, effective = _effective_ibr_config(
+            config, variant.overrides, policy=mode_policy)
+        configs[variant_id] = cfg
+        run_configs[variant_id] = {
+            **effective_configs[variant_id],
+            "replay_policy": mode_policy.as_dict(),
+            "replay_mode": mode,
+        }
+        if mode == "skip":
+            base_results[variant_id] = []
+            null_results[variant_id] = []
+            continue
+        result = replay(development_bars, development_snapshots,
+                        development_quotes, cfg)
+        base_results[variant_id] = _opportunity_rows(
+            result, development_bars, vehicle)
+        null_results[variant_id] = null_control_account(
+            development_bars, list(development_snapshots.values()),
+            _null_spec(cfg), vehicle=vehicle,
+            reference_rows=_null_reference_rows(result, development_bars, vehicle),
+            account_id=f"ibr:{vehicle}:{variant_id}", costs=cfg.costs,
+            quotes=development_quotes, fixed_quantity=cfg.quantity,
+            policy=mode_policy)["rows"]
+
+        boundary = latest_boundary(existing.get(variant_id))
+        eval_rows[variant_id] = (tail(base_results[variant_id], boundary)
+                                 if mode == "shadow" else base_results[variant_id])
+
+    # A mixed auto cycle can contain fresh backtests and forward shadows. Each
+    # candidate must be compared with a baseline replayed under its own mode
+    # policy, not with whichever policy the baseline arm happened to use.
+    baseline_by_mode: dict[str, list[dict]] = {}
+    for mode in {"backtest", "shadow"}:
+        mode_policy = replay_policy_for_mode(
+            runtime_policy, mode, backtest_bar_fallback=backtest_bar_fallback)
+        baseline_cfg, _ = _effective_ibr_config(
+            config, baseline_variant.overrides, policy=mode_policy)
+        baseline_result = replay(development_bars, development_snapshots,
+                                 development_quotes, baseline_cfg)
+        baseline_by_mode[mode] = _opportunity_rows(
+            baseline_result, development_bars, vehicle)
+
+    baseline_rows = base_results[baseline_variant.variant_id]
+    baseline_eval = (tail(baseline_rows, baseline_boundary)
+                     if baseline_mode == "shadow" else baseline_rows)
+    unseen_sealed_sessions = [
+        session for session in sealed_window.session_dates
+        if baseline_boundary is None or session > baseline_boundary]
+    if lane == "shadow" and not baseline_eval and not unseen_sealed_sessions:
+        raise DiscoveryError("shadow corpus contains no unseen sessions after the persisted boundary")
+    for variant in candidates:
+        boundary = latest_boundary(existing.get(variant.variant_id))
         has_unseen_sealed = any(
             boundary is None or session > boundary
             for session in sealed_window.session_dates)
-        if lane == "shadow" and not rows and not has_unseen_sealed:
+        if lane == "shadow" and not eval_rows[variant.variant_id] and not has_unseen_sealed:
             raise DiscoveryError(
                 f"shadow corpus contains no unseen sessions for {variant.variant_id!r}")
 
@@ -328,14 +378,17 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         mode = modes[variant.variant_id]
         if mode == "skip":
             continue
+        candidate_baseline = (baseline_eval if mode == baseline_mode else
+                              tail(baseline_by_mode[mode], baseline_boundary)
+                              if mode == "shadow" else baseline_by_mode[mode])
         gates[variant.variant_id] = _strengthen_gate(
             _discover_gate(
-                eval_rows[variant.variant_id], baseline_eval,
+                eval_rows[variant.variant_id], candidate_baseline,
                 vehicle=vehicle, min_trades=min_trades,
                 min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow"),
                 null_rows=null_results[variant.variant_id],
                 qualification=window_reports[variant.variant_id]),
-            baseline_eval, vehicle=vehicle)
+            candidate_baseline, vehicle=vehicle)
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
 
@@ -354,7 +407,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     from .factory_ledger import FactoryLedger
     cumulative = FactoryLedger(db_path).record_fdr_decision(
         f"edge_discovery:{vehicle}",
-        f"{data_hash}:{lane}:post_selection", selected_q, alpha=alpha)
+        f"{data_hash}:{lane}:"
+        f"{hash_config({key: value.as_dict() for key, value in sorted(mode_policies.items())})}:post_selection",
+        selected_q, alpha=alpha)
     qualification_target = None
     if selected_test_id is not None:
         selected_gate = gates[selected_test_id]
@@ -367,9 +422,15 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     if qualification_target is not None and sealed_window.session_dates:
         window_bars = sealed_window.release(
             reason=f"post-selection qualification {qualification_target}")
+        qualification_mode = modes[qualification_target]
+        qualification_policy = replay_policy_for_mode(
+            runtime_policy, "shadow" if qualification_mode == "shadow" else "backtest",
+            backtest_bar_fallback=backtest_bar_fallback)
+        qualification_baseline_cfg, _ = _effective_ibr_config(
+            config, baseline_variant.overrides, policy=qualification_policy)
         baseline_all = _opportunity_rows(
             replay(window_bars, sealed_snapshots, sealed_quotes,
-                   configs[baseline_variant.variant_id]),
+                   qualification_baseline_cfg),
             window_bars, vehicle)
         variant_cfg = configs[qualification_target]
         candidate_all = _opportunity_rows(
@@ -414,6 +475,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                                                      "significant": False})
         run_provenance = {
             "lane": lane, "vehicle": vehicle,
+            "replay_mode": modes[variant.variant_id],
+            "replay_policy": mode_policies[variant.variant_id].as_dict(),
+            "backtest_bar_fallback": backtest_bar_fallback,
             "selected_test_id": selected_test_id,
             "qualified_test_id": qualification_target,
             "cumulative_fdr": (dict(cumulative)
@@ -424,7 +488,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             gate, lane=modes[variant.variant_id], family=family,
             online_fdr=(cumulative if variant.variant_id == selected_test_id else {}),
             provenance=provenance_hash(
-                dataset=raw_rows, config=effective_configs[variant.variant_id],
+                dataset=raw_rows, config=run_configs[variant.variant_id],
                 code=code_path, provenance=run_provenance),
             candidate_id=variant.variant_id)
     forward_success = any(
@@ -464,10 +528,13 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         online_fdr={},
         provenance=provenance_hash(
             dataset=raw_rows,
-            config=effective_configs[baseline_variant.variant_id],
+            config=run_configs[baseline_variant.variant_id],
             code=code_path,
             provenance={"lane": lane, "vehicle": vehicle,
-                        "role": "baseline", "selected_test_id": selected_test_id}),
+                        "role": "baseline", "replay_mode": baseline_mode,
+                        "replay_policy": mode_policies[baseline_variant.variant_id].as_dict(),
+                        "backtest_bar_fallback": backtest_bar_fallback,
+                        "selected_test_id": selected_test_id}),
         candidate_id=baseline_variant.variant_id)
     baseline_run = None
     baseline_adequate = _adequate(baseline_gate)
@@ -488,8 +555,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             baseline_fit, baseline_held = chronological_split(baseline_eval, fit_fraction=.7)
         baseline_run = ledger.append_run(
             baseline_record["candidate_id"], lane=baseline_mode, vehicle=vehicle,
-            dataset=raw_rows, config=effective_configs[baseline_variant.variant_id], code=code_path,
-            provenance={"lane": lane, "vehicle": vehicle, "role": "baseline"},
+            dataset=raw_rows, config=run_configs[baseline_variant.variant_id], code=code_path,
+            provenance={"lane": lane, "vehicle": vehicle,
+                        "role": "baseline", "replay_mode": baseline_mode,
+                        "replay_policy": mode_policies[baseline_variant.variant_id].as_dict(),
+                        "backtest_bar_fallback": backtest_bar_fallback},
             fit=baseline_fit, heldout=baseline_held,
             metrics={"gate": baseline_gate, "role": "baseline"})
         for row in baseline_eval:
@@ -570,7 +640,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 fit_rows, heldout_rows = chronological_split(rows, fit_fraction=.7)
             run = ledger.append_run(
                 record["candidate_id"], lane=mode, vehicle=vehicle, dataset=raw_rows,
-                config=effective_configs[variant.variant_id], code=code_path,
+                config=run_configs[variant.variant_id], code=code_path,
                 provenance=run_provenances[variant.variant_id],
                 fit=fit_rows, heldout=heldout_rows,
                 metrics={"gate": gate, "confidence": 1.0 - family.get("p_adjusted", 1.0),
