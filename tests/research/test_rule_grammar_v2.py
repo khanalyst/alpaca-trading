@@ -18,10 +18,13 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
-    DEFAULT_RULE_SPEC, MAX_CONFIRMATIONS, RULE_FAMILIES, RULE_SCHEMA_V1,
+    DEFAULT_RULE_SPEC, MAX_CONFIRMATIONS, MIN_STOP_DISTANCE_BPS, RULE_FAMILIES,
+    RULE_SCHEMA_V1,
     RULE_SCHEMA_V2, SIDES, CONFIRMATIONS, RuleSpecError, evaluate_rule_signal,
     rule_variant_id, setup_evidence, validate_rule_spec,
 )
+from research.costs import CostModel
+from research.gates import MIN_RISK_UNIT_COST_RATIO
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -277,6 +280,44 @@ class SessionAnchoredFamilyTests(unittest.TestCase):
                     "entry_after_minutes": 15, "entry_before_minutes": 300,
                     "confirmations": ["trend"], "max_atr_bps": 900.0})
                 evaluate_rule_signal(rows, widened)
+
+
+class RiskUnitFloorTests(unittest.TestCase):
+    """The planned stop must clear the cost of the round trip that pays it.
+
+    A one-minute ATR is a few basis points, so ``stop_atr`` at its default
+    multiplies a number far smaller than the ~9 bps a round trip costs.  The
+    floor, not the multiplier, is what keeps the arithmetic solvable, and it
+    has to bind for every family rather than for the ones a fixture happens to
+    exercise.
+    """
+
+    @staticmethod
+    def _template(family):
+        from research.factory_core import family_template
+        return validate_rule_spec(family_template(family))
+
+    def test_a_quiet_tape_is_floored_not_left_at_the_atr(self):
+        # Bars this calm carry an ATR worth well under the floor, so every
+        # family that signals must still plan at least MIN_STOP_DISTANCE_BPS.
+        rows = ohlc_bars(80, lambda index: .0004, volume=SURGE)
+        signalled = 0
+        for family in RULE_FAMILIES:
+            signal = evaluate_rule_signal(rows, self._template(family))
+            if signal is None:
+                continue
+            signalled += 1
+            with self.subTest(family=family):
+                floor = signal["entry_price"] * (MIN_STOP_DISTANCE_BPS / 10_000)
+                self.assertGreaterEqual(signal["stop_distance"] + 1e-12, floor)
+        self.assertGreater(signalled, 0, "no family signalled on this tape")
+
+    def test_the_floor_is_worth_at_least_three_round_trips(self):
+        # The gate refuses a risk unit below three round trips, so a contract
+        # floor beneath that would plan trades the gate can only ever reject.
+        self.assertGreaterEqual(
+            MIN_STOP_DISTANCE_BPS,
+            MIN_RISK_UNIT_COST_RATIO * CostModel().round_trip_bps())
 
 
 class V2EvaluationTests(unittest.TestCase):

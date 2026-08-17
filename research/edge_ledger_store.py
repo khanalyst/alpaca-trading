@@ -35,9 +35,16 @@ SCHEMA_VERSION = 3
 # of it and is quarantined rather than deleted: the rows remain auditable, they
 # simply cannot promote anything.
 #
+# Epoch 3 raises the planned risk unit above the cost of trading it.  The
+# minimum stop distance moved from 5 bps to 30 bps and the gates now refuse a
+# result whose risk unit is worth less than three round trips, so epoch 2 rows
+# describe fills whose stop was smaller than the spread and slippage paid to
+# take them.  Those rows re-hash and recompute exactly as recorded; what
+# changed is that the protocol no longer accepts that economics.
+#
 # Bump this whenever a replay or gate change invalidates previously recorded
 # runs.  Runs are stamped at ``append_run``; a run with no stamp is epoch 1.
-REPLAY_ENGINE_EPOCH = 2
+REPLAY_ENGINE_EPOCH = 3
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 

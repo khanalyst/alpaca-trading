@@ -74,9 +74,15 @@ guarded step at the very end.
 3. Generate a paper API key and secret.
 4. Save both immediately in a password manager. **The secret is shown once.**
 5. Note which data feed your account is entitled to. This project defaults to
-   `iex` for stocks and `indicative` for options — both available on the free
-   tier. Use `sip` or `opra` only if your account actually has them; requesting
-   an unentitled feed fails at the first authenticated call.
+   `sip` for stocks and `opra` for options, because research measured on a
+   partial feed is measuring a different market than the one the runtime
+   trades: IEX carries a small single-venue share of consolidated volume, and
+   indicative option quotes are not executable. **Both require a paid
+   entitlement, and requesting an unentitled feed fails at the first
+   authenticated call.** If your account is on the free tier, set
+   `ALPACA_DATA_FEED=iex` and `ALPACA_OPTIONS_FEED=indicative` and read every
+   proof accordingly — the volume-based confirmations and the option fills in
+   particular.
 6. Do not configure crypto. This repository accepts US equity/ETF underlyings
    and listed OCC option contracts only, and rejects everything else.
 

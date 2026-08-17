@@ -173,9 +173,13 @@ class OptionExitToleranceTests(unittest.TestCase):
     def test_stale_exit_is_rejected_explicitly(self):
         bars = _rising_session()
         quoted = [_snap(minute) for minute in range(1, 40)]
+        # The gap has to bracket the exit bar to make its quote stale.  The
+        # contract's MIN_STOP_DISTANCE_BPS floor widens the risk unit, so the
+        # 2R target on this rising session is now reached at minute 21 rather
+        # than inside the old 16-18 window.
         gapped = [snap for snap in quoted
-                  if not OPEN + timedelta(minutes=16) <= snap.timestamp
-                  <= OPEN + timedelta(minutes=18)]
+                  if not OPEN + timedelta(minutes=20) <= snap.timestamp
+                  <= OPEN + timedelta(minutes=22)]
         fresh_book = simulate_account(bars, quoted, SPEC, vehicle="option",
                                       account_id="fresh")
         stale_book = simulate_account(bars, gapped, SPEC, vehicle="option",
@@ -191,7 +195,9 @@ class OptionExitToleranceTests(unittest.TestCase):
     def test_realistic_gapped_corpus_rejects_stale_quotes_explicitly(self):
         # Ten sessions of one-minute bars; on five of them the recorder drops
         # the pinned contract for three minutes around the exit, on three it
-        # loses the contract entirely after the entry.
+        # loses the contract entirely after the entry.  The exit lands at
+        # minute 21 because the contract floors the risk unit at
+        # MIN_STOP_DISTANCE_BPS, so the skipped cycles bracket that bar.
         bars: list[UnderlyingBar] = []
         snaps: list[OptionSnapshot] = []
         for day_index in range(10):
@@ -209,7 +215,7 @@ class OptionExitToleranceTests(unittest.TestCase):
             for minute in range(1, 40):
                 if day_index < 3 and minute > 12:
                     continue                      # contract lost for the session
-                if 3 <= day_index < 8 and 16 <= minute <= 18:
+                if 3 <= day_index < 8 and 20 <= minute <= 22:
                     continue                      # three skipped recorder cycles
                 ts = OPEN + timedelta(minutes=offset + minute)
                 snaps.append(OptionSnapshot(

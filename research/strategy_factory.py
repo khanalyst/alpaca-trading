@@ -46,6 +46,7 @@ from .gates import (chronological_split, heldout_separation,
                     RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
                     qualification_report as _qualification_report,
+                    risk_unit_report,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
@@ -1062,7 +1063,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
           null_rows: Sequence[Mapping] = (),
           is_root: bool = False,
           qualification: Mapping | None = None,
-          folds: int = 3) -> dict:
+          folds: int = 3,
+          cost_model: CostModel | None = None) -> dict:
     # Roots are hypotheses, not mutations. Compare their exact rule to an
     # independent randomized-entry null; descendants retain the root-relative
     # baseline so a parameter effect remains attributable to that family.
@@ -1136,6 +1138,9 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "post_selection": {"preselected": False, "candidate_id": None},
     })
     lcb = test.get("mean_delta_lcb")
+    risk_unit = risk_unit_report(
+        heldout, vehicle=vehicle,
+        round_trip_bps=(cost_model or CostModel()).round_trip_bps())
     checks = {
         "fit_structurally_adequate": bool(fit_floor["adequate"]),
         "heldout_structurally_adequate": bool(held_floor["adequate"]),
@@ -1162,6 +1167,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                                            final.get("net_positive")),
         "qualification_delta_positive": bool(final.get("available") and
                                              final.get("delta_positive")),
+        "risk_unit_adequate": bool(risk_unit["adequate"]),
     }
     development_checks = {
         name: value for name, value in checks.items()
@@ -1183,7 +1189,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "heldout_performance": absolute,
         "fit_trades": sample_counts(fit, vehicle=vehicle)["trades"],
         "heldout_trades": sample_counts(heldout, vehicle=vehicle)["trades"],
-        "heldout_delta_lcb": lcb,
+        "heldout_delta_lcb": lcb, "risk_unit": risk_unit,
         "max_drawdown": max_drawdown_of(ordered), "test": test,
         "fit_test": fit_test, "control": {**test, "kind": (
             "randomized_entry_root_null" if is_root else "matched_root_baseline")},
@@ -1759,7 +1765,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                          is_root=(variant["variant_id"] == rule_variant_id(
                              worker["hypothesis"]["rule_spec"])),
                          null_rows=(worker.get("null_rows") or {}).get(
-                             variant["variant_id"], []))
+                             variant["variant_id"], []),
+                         cost_model=model)
             variant_rows.append((worker, variant, gate))
             aggregation_done += 1
             _progress("aggregating", aggregation_done, aggregation_total)

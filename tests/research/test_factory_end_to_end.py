@@ -43,10 +43,13 @@ ROOT_VARIANT = rule_variant_id(ROOT_SPEC)
 WINNING_VARIANT = rule_variant_id(WINNING_SPEC)
 FIRST_COORDINATE_SPEC = validate_rule_spec({**ROOT_SPEC, "threshold_bps": 4.0})
 FIRST_COORDINATE_VARIANT = rule_variant_id(FIRST_COORDINATE_SPEC)
-# Six bps of spread and fifteen of slippage: still inside the runtime's own
-# rejection caps, so this is a fill the trader would accept, not an impossible
-# one chosen to guarantee the failure.
-WORSE_COSTS = CostModel(spread_bps=12.0, slippage_bps=25.0, fee_bps=1.0)
+# Six bps of half-spread and forty-four of slippage puts the entry cost at
+# exactly the runtime's 50 bps rejection cap: the worst fill the trader would
+# still submit, not an impossible one chosen to guarantee the failure.  It has
+# to reach the cap because the corpus now carries a risk unit worth 30 bps and
+# a 2.5R target worth ~75 bps; a cheaper adverse model no longer outruns the
+# edge, which is the point of flooring the risk unit in the first place.
+WORSE_COSTS = CostModel(spread_bps=12.0, slippage_bps=44.0, fee_bps=1.0)
 
 
 def _wobble(symbol: str, day: int) -> float:
@@ -74,10 +77,15 @@ def _session_closes(symbol: str, day: int) -> tuple[list[float], list[int]]:
         volumes.append(1000)
     closes.append(100.85 + drift)
     volumes.append(6000)
-    for step in (.20, .40, .60):
+    # The run has to clear a 2.5R target measured off a risk unit the contract
+    # floors at MIN_STOP_DISTANCE_BPS (30 bps, ~.30 here), so the breakout must
+    # be worth ~.76 rather than the ~.23 a 5 bps floor used to demand.  A
+    # corpus whose move cannot pay its own stop is the very thing the risk-unit
+    # gate now rejects, so the fixture carries a move that can.
+    for step in (.40, .80, 1.20):
         closes.append(100.85 + drift + step)
         volumes.append(3000)
-    price = 101.45 + drift
+    price = 102.05 + drift
     for _ in range(15):
         price -= .10
         closes.append(price)

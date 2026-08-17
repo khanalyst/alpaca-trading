@@ -36,9 +36,9 @@ services:
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
       ALPACA_RECORDER_OPTION_LIMIT: ${ALPACA_RECORDER_OPTION_LIMIT:-10}
       ALPACA_RECORDER_OPTION_HOLD_MINUTES: ${ALPACA_RECORDER_OPTION_HOLD_MINUTES:-180}
       ALPACA_RECORDER_FETCH_WINDOW_MINUTES: ${ALPACA_RECORDER_FETCH_WINDOW_MINUTES:-15}
@@ -74,9 +74,9 @@ services:
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -122,9 +122,9 @@ services:
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -168,9 +168,9 @@ services:
     environment:
       ALPACA_PAPER: "true"
       ALPACA_RESEARCH_LLM_SECRETS_FILE: /run/secrets/research_llm_credentials
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
       ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
       ALPACA_RESEARCH_BACKTEST: ${ALPACA_RESEARCH_BACKTEST:-1}
       ALPACA_FACTORY_ENABLED: ${ALPACA_FACTORY_ENABLED:-1}
@@ -284,7 +284,7 @@ services:
     command: ["python", "deploy/dashboard.py", "--host", "0.0.0.0", "--port", "8080"]
     environment:
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
       ALPACA_EDGE_DB: ${ALPACA_EDGE_DB:-runtime/research/edge_lab.sqlite3}
     ports:
       - "127.0.0.1:${ALPACA_DASHBOARD_PORT:-8080}:8080"

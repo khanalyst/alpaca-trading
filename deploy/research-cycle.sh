@@ -267,7 +267,7 @@ if [ ! -s "$validated_input" ] || ! grep -q '[^[:space:]]' "$validated_input"; t
   finish "no_data" "recorded dataset contains no rows" 2
 fi
 
-feed="${ALPACA_DATA_FEED:-${ALPACA_STOCK_FEED:-iex}}"
+feed="${ALPACA_DATA_FEED:-${ALPACA_STOCK_FEED:-sip}}"
 emit_progress "validation" 0 1 "steps" "both"
 set +e
 "$python_bin" "$repo_root/research.py" validate-data "$validated_input" \

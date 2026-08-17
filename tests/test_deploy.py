@@ -263,7 +263,13 @@ def _run_research_cycle(dataset: Path | str, root: Path, **env):
     return subprocess.run(
         ["deploy/research-cycle.sh"],
         cwd=Path(__file__).resolve().parents[1],
-        env=dict(os.environ, PYTHON=sys.executable,
+        # The shipped config enables the bounded strategy LLM, and the cycle
+        # deliberately refuses to start without a credential for it.  These
+        # cases exercise cycle mechanics, not the credential contract, which
+        # keeps its own test below.  No call is made: the corpora here are too
+        # small to reach a tuning or replacement request.
+        env=dict(os.environ, OPENAI_API_KEY="test-key-not-called",
+                 PYTHON=sys.executable,
                  ALPACA_RESEARCH_DATASET=str(dataset),
                  ALPACA_FACTORY_ENABLED="0",
                  ALPACA_EDGE_DB=str(root / "edge.sqlite3"), **env),
@@ -474,7 +480,8 @@ class DeployTests(unittest.TestCase):
             dataset = root / "market.csv"
             edge_db = root / "edge.sqlite3"
             dataset.write_text(csv_text, encoding="utf-8")
-            env = dict(os.environ, PYTHON=sys.executable,
+            env = dict(os.environ, OPENAI_API_KEY="test-key-not-called",
+                       PYTHON=sys.executable,
                        ALPACA_RESEARCH_DATASET=str(dataset),
                        ALPACA_EDGE_DB=str(edge_db))
             result = subprocess.run(
@@ -596,7 +603,8 @@ class DeployTests(unittest.TestCase):
             result = subprocess.run(
                 ["deploy/research-cycle.sh"],
                 cwd=Path(__file__).resolve().parents[1],
-                env=dict(os.environ, PYTHON=sys.executable,
+                env=dict(os.environ, OPENAI_API_KEY="test-key-not-called",
+                         PYTHON=sys.executable,
                          ALPACA_RESEARCH_DATASET=str(dataset)),
                 capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 2, result.stderr)
@@ -605,7 +613,7 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(payload["status"], "no_data")
             self.assertEqual(payload["exit_code"], 2)
             self.assertIn('"schema":"research-llm.v1"', result.stderr)
-            self.assertIn('"status":"disabled"', result.stderr)
+            self.assertIn('"status":"ready"', result.stderr)
 
     def test_research_cycle_fails_fast_when_enabled_llm_has_no_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -789,7 +797,8 @@ class DeployTests(unittest.TestCase):
             dataset.write_text(csv_buffer.getvalue(), encoding="utf-8")
             # The checked config trades shares, so the option lane runs only
             # when it is asked for; a trader cannot deploy option evidence.
-            env = dict(os.environ, PYTHON=sys.executable,
+            env = dict(os.environ, OPENAI_API_KEY="test-key-not-called",
+                       PYTHON=sys.executable,
                        ALPACA_RESEARCH_DATASET=str(dataset),
                        ALPACA_EDGE_DB=str(edge_db),
                        ALPACA_RESEARCH_VEHICLES="all")
@@ -830,7 +839,8 @@ class DeployTests(unittest.TestCase):
                  "bid_size": 10, "ask_size": 11, "volume": 100,
                  "open_interest": 200, "underlying_price": 100},
             )) + "\n", encoding="utf-8")
-            env = dict(os.environ, PYTHON=sys.executable,
+            env = dict(os.environ, OPENAI_API_KEY="test-key-not-called",
+                       PYTHON=sys.executable,
                        ALPACA_RESEARCH_DATASET=str(dataset),
                        ALPACA_EDGE_DB=str(edge_db))
             env.pop("ALPACA_RESEARCH_VEHICLES", None)

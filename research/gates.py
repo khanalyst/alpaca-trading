@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
-from statistics import mean
+from statistics import mean, median
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -45,6 +45,11 @@ GATE_REQUIRED_CHECKS = frozenset({
 })
 CLUSTER_SECONDS = 86_400
 LOWER_BOUND_CONFIDENCE = .95
+# How many round trips of cost the planned risk unit must be worth before a
+# result is allowed to authorize anything.  Below roughly this multiple the
+# break-even hit rate leaves the range any directional intraday rule can
+# reach, so a "profitable" held-out sample is measuring luck, not edge.
+MIN_RISK_UNIT_COST_RATIO = 3.0
 # Qualification observations are source evidence carried outside the run's
 # fit/held-out rows.  Keep both storage and verification bounded so a malformed
 # recorder row cannot inflate a proof envelope without limit.
@@ -779,6 +784,54 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str) -> dict:
     }
 
 
+def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
+                     round_trip_bps: float,
+                     min_ratio: float = MIN_RISK_UNIT_COST_RATIO) -> dict:
+    """Whether the planned risk unit is large enough to survive its own costs.
+
+    Every other check here asks whether a rule beat something.  This one asks
+    the prior question: whether the trade's arithmetic can close at all.  A
+    stop worth less than a round trip needs a hit rate no directional intraday
+    rule reaches, so a held-out sample that looks profitable at that size is
+    reporting noise that has not yet paid its costs.
+
+    The ratio is meaningful for stop-based equity risk only.  A long option
+    risks the whole premium, which is never a handful of basis points, so the
+    option vehicle reports ``applicable: False`` and does not veto.
+    """
+    local = [row for row in rows
+             if row.get("vehicle", vehicle) == vehicle and row.get("no_trade") is not True]
+    cost = float(round_trip_bps)
+    base = {"vehicle": vehicle, "round_trip_bps": cost,
+            "min_ratio": float(min_ratio), "trades": len(local)}
+    if vehicle != "equity":
+        return {**base, "applicable": False, "available": False,
+                "adequate": True, "median_ratio": None, "min_observed_ratio": None}
+    ratios: list[float] = []
+    for row in local:
+        entry = row.get("plan_entry")
+        if entry is None:
+            entry = row.get("entry_price", row.get("entry_reference"))
+        stop = row.get("stop_price")
+        try:
+            entry_value, stop_value = abs(float(entry)), float(stop)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(entry_value) or not math.isfinite(stop_value) or entry_value <= 0:
+            continue
+        ratios.append((abs(entry_value - stop_value) / entry_value * 10_000.0) / cost
+                      if cost > 0 else math.inf)
+    if not ratios:
+        # No priced risk unit is not a pass.  An equity result that cannot
+        # state its own risk size cannot show it is worth its costs.
+        return {**base, "applicable": True, "available": False,
+                "adequate": False, "median_ratio": None, "min_observed_ratio": None}
+    middle = float(median(ratios))
+    return {**base, "applicable": True, "available": True,
+            "median_ratio": middle, "min_observed_ratio": float(min(ratios)),
+            "adequate": middle >= float(min_ratio)}
+
+
 def unevaluable_reason(gates: Iterable[Mapping]) -> str | None:
     """Why a run tested nothing, when that is a data problem not a result.
 
@@ -1346,7 +1399,7 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
 
 __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
     "GATE_REQUIRED_CHECKS", "fill_source_summary", "floor_feasibility",
-           "unevaluable_reason",
+           "unevaluable_reason", "MIN_RISK_UNIT_COST_RATIO", "risk_unit_report",
     "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
            "QUALIFICATION_MAX_BYTES", "QUALIFICATION_MAX_ROWS",
            "SealedWindowError", "chronological_split",

@@ -20,8 +20,8 @@ from .gates import (
     chronological_split, deterministic_placebo_deltas, falsification_gate,
     expectancy_rejection_report, heldout_separation, matched_cluster_test,
     max_drawdown_of, paired_delta, performance_floor, qualification_report,
-    sample_counts, seal_final_window, structural_floor, verified_gate_envelope,
-    walk_forward_report,
+    risk_unit_report, sample_counts, seal_final_window, structural_floor,
+    verified_gate_envelope, walk_forward_report,
 )
 from .costs import CostModel, ReplayPolicy, replay_policy_for_mode
 from .ibr import IBRConfig, replay_ibr
@@ -99,12 +99,14 @@ def _classification(gate: Mapping) -> str:
     return "adequate_inconclusive"
 
 
-def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -> dict:
+def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str,
+                     cost_model: CostModel | None = None) -> dict:
     """Add absolute profitability, lower-bound and walk-forward requirements.
 
     Beating a control is necessary but not sufficient: an accepted variant
     must also make money after costs on unseen sessions, keep a positive lower
-    confidence bound, and hold up across a majority of rolling-origin folds.
+    confidence bound, hold up across a majority of rolling-origin folds, and
+    plan a risk unit large enough for those costs to be survivable.
     """
     heldout = gate["_heldout_rows"]
     sessions = {str(row.get("session_date") or "") for row in heldout}
@@ -126,6 +128,9 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
         list(item.get("test_sessions") or ()) for item in negative_folds]
     rejection["multi_window_negative"] = len(negative_folds) >= 2
     bound = gate["heldout_paired_baseline"].get("mean_delta_lcb")
+    risk_unit = risk_unit_report(
+        heldout, vehicle=vehicle,
+        round_trip_bps=(cost_model or CostModel()).round_trip_bps())
     gate["checks_without_family"].update({
         "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
         "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
@@ -133,6 +138,7 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
         "walk_forward_majority_positive": bool(walk["available"] and
                                                walk["majority_positive"]),
         "walk_forward_adequate": bool(walk.get("adequate")),
+        "risk_unit_adequate": bool(risk_unit["adequate"]),
     })
     development_checks = {
         name: value for name, value in gate["checks_without_family"].items()
@@ -151,6 +157,7 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
     gate["walk_forward"] = walk
     gate["retirement_evidence"] = rejection
     gate["heldout_delta_lcb"] = bound
+    gate["risk_unit"] = risk_unit
     return gate
 
 
@@ -425,7 +432,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                 min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow"),
                 null_rows=null_results[variant.variant_id],
                 qualification=window_reports[variant.variant_id]),
-            candidate_baseline, vehicle=vehicle)
+            candidate_baseline, vehicle=vehicle,
+            cost_model=configs[variant.variant_id].costs)
     corrected = benjamini_hochberg(
         {variant_id: gate["candidate_p_raw"] for variant_id, gate in gates.items()}, alpha=alpha)
 
@@ -548,7 +556,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             control_kind="synthetic_zero_reference",
             null_rows=null_results[baseline_variant.variant_id],
             qualification=baseline_window),
-        baseline_zero, vehicle=vehicle)
+        baseline_zero, vehicle=vehicle,
+        cost_model=configs[baseline_variant.variant_id].costs)
     _finalize_gate(
         baseline_gate, lane=baseline_mode,
         family={"p": baseline_gate["candidate_p_raw"],

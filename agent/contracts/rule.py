@@ -48,6 +48,17 @@ CONFIRMATIONS = ("none", "trend", "volume", "volatility")
 SIDES = ("both", "long", "short")
 BAR_SECONDS = 60.0
 
+# Smallest stop distance a signal may plan, in basis points of entry price.
+#
+# The risk unit has to be large relative to what a round trip costs, or the
+# arithmetic cannot close regardless of how good the signal is.  The shared
+# cost model's conservative round trip is 2 x (spread/2 + slippage + fee) =
+# 9 bps, so a 5 bps floor made cost ~1.8x the entire risk unit and demanded a
+# ~87% hit rate at 2R to break even.  This floor keeps the planned risk unit
+# at roughly the same 3x multiple of round-trip cost that
+# ``research.gates.risk_unit_report`` independently enforces at the gate.
+MIN_STOP_DISTANCE_BPS = 30.0
+
 DEFAULT_RULE_SPEC: dict[str, Any] = {
     "schema": RULE_SCHEMA,
     "family": "momentum_continuation",
@@ -60,6 +71,12 @@ DEFAULT_RULE_SPEC: dict[str, Any] = {
     "zscore": 1.25,
     "volume_multiplier": 1.25,
     "atr_period": 14,
+    # Deliberately unchanged.  ``DEFAULT_RULE_SPEC`` is the normalization
+    # target for every omitted field, so editing a value here re-hashes the
+    # content-addressed id of every spec that omits it and orphans the ledger
+    # rows already recorded under the old id.  The economics are fixed by
+    # ``MIN_STOP_DISTANCE_BPS`` instead, which binds every spec — including
+    # this default — without touching variant identity.
     "stop_atr": 1.0,
     "target_r": 2.0,
     "max_hold_bars": 90,
@@ -759,7 +776,8 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
     # spec that passes here in research passes here at runtime.
     if not _within_volatility_band(spec, atr, close):
         return None
-    distance = max(atr * spec["stop_atr"], close * .0005)
+    distance = max(atr * spec["stop_atr"],
+                   close * (MIN_STOP_DISTANCE_BPS / 10_000.0))
     stop = close - distance if direction == "long" else close + distance
     target = close + distance * spec["target_r"] if direction == "long" else close - distance * spec["target_r"]
     stamp = _timestamp(current)
@@ -819,6 +837,7 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
 
 __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
+    "MIN_STOP_DISTANCE_BPS",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
            "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",

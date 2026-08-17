@@ -48,6 +48,11 @@ class LiveShadowIngestTests(unittest.TestCase):
                    # candidate, baseline, and null books therefore pair on
                    # the exact same observation.
                    "opportunity_id": f"equity:SPY:{session}",
+                   # A real shadow trade carries the risk unit it planned, and
+                   # the gate refuses an equity result that cannot state one.
+                   # 100 bps of stop against ~9 bps of round trip is an
+                   # ordinary, comfortably adequate ratio.
+                   "entry_price": 100.0, "stop_price": 99.0,
                    "net_pnl": float(value), "return_value": float(value)}
             digest = f"source:{cid}:{session}"
             replay = f"replay:{cid}:{session}"
@@ -67,8 +72,9 @@ class LiveShadowIngestTests(unittest.TestCase):
     def _row(self, cid, day, value, *, status="match"):
         session = f"2024-02-{day:02d}"
         row = {"vehicle": "equity", "symbol": "SPY", "session_date": session,
-               "opportunity_id": f"equity:SPY:{session}", "net_pnl": float(value),
-               "return_value": float(value)}
+               "opportunity_id": f"equity:SPY:{session}",
+               "entry_price": 100.0, "stop_price": 99.0,
+               "net_pnl": float(value), "return_value": float(value)}
         replay = f"replay:{cid}:{session}"
         self.store.replay_diff(
             candidate_id=cid, session_date=session,

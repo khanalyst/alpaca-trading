@@ -3,8 +3,8 @@
   "broker": {
     "paper": true,
     "allow_live": false,
-    "data_feed": "iex",
-    "options_feed": "indicative"
+    "data_feed": "sip",
+    "options_feed": "opra"
   },
   "session": {
     "timezone": "America/New_York",
@@ -68,7 +68,7 @@
     "backtest_bar_fallback": true,
     "champion_min_confidence": 0.95,
     "strategy_llm": {
-      "enabled": false,
+      "enabled": true,
       "provider": "openai",
       "model": "gpt-5",
       "max_attempts": 2,

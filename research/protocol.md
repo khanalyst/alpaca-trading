@@ -40,6 +40,24 @@ Every replay must establish the following invariants:
 - equity and single-leg long-option books have separate samples, costs, and
   P&L; multi-leg and short option structures are outside the protocol.
 
+A planned risk unit must be worth at least
+`research/gates.py::MIN_RISK_UNIT_COST_RATIO` (3) round trips of the shared
+cost model, measured as the median over a run's held-out equity trades by
+`risk_unit_report` and enforced as the `risk_unit_adequate` gate check. Below
+that multiple the break-even hit rate leaves the range a directional intraday
+rule can reach, so a held-out sample that looks profitable is reporting noise
+that has not yet paid its costs. An equity result that cannot state a risk unit
+at all fails the check rather than skipping it. The option vehicle is not
+applicable and does not veto: a long option risks the whole premium, which is
+never a handful of basis points. The same invariant is enforced at the signal,
+where `agent/contracts/rule.py::MIN_STOP_DISTANCE_BPS` (30 bps) floors every
+planned stop regardless of `stop_atr` and `atr_period` — a one-minute ATR is a
+few basis points, so without the floor the multiplier alone plans stops smaller
+than the spread and slippage paid to take them. The floor binds behaviour, not
+identity: `DEFAULT_RULE_SPEC` is the normalization target for omitted fields,
+so its values are frozen and a stored spec keeps its content-addressed
+`variant_id`.
+
 `research/costs.py` owns the single expected-cost model and the fill
 arithmetic every lane spends it through; no lane carries its own
 spread/slippage/fee numbers. Its parameters come from one `costs` config
@@ -339,9 +357,15 @@ signatures for parity; only the research consumer can append the authorization
 marker.
 
 The checked research config enables the bounded strategy LLM with model
-`gpt-5`. It reads only the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing
-or invalid credentials/output leave a pending replacement and cannot trigger
-premature retirement. Good edges produce deterministic content-addressed
+`gpt-5`. Enabling it is an explicit operational contract: `research-cycle.sh`
+refuses to start a cycle that claims to be model-assisted without a credential
+for it, so a deployment without `OPENAI_API_KEY` fails closed with
+`strategy LLM is enabled but OPENAI_API_KEY is unavailable` rather than
+silently running deterministically. Set `research.strategy_llm.enabled=false`
+to run the deterministic lane instead. Within a cycle the adapter reads only
+the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing or invalid
+credentials/output leave a pending replacement and cannot trigger premature
+retirement. Good edges produce deterministic content-addressed
 edge proof reports under `research/results/edges/`, with an optional HTTPS
 webhook notification. Scheduled cycles report
 `completed`, `completed_no_edge`, `no_data`, or `failed`; no status bypasses the

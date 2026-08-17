@@ -269,6 +269,17 @@ class CostModel:
         """Cost of one execution; an executable quote already includes spread."""
         return self.slippage_bps if executable_quote else self.entry_cost_bps
 
+    def round_trip_bps(self, *, executable_quote: bool = False) -> float:
+        """Both sides of one trade, including notional fees, in basis points.
+
+        This is the number a planned risk unit has to be large against.  The
+        default (bar-priced) form is deliberately the conservative one: a gate
+        that sized risk against the cheaper executable-quote round trip would
+        approve rules the bar-fallback lane cannot actually pay for.
+        """
+        return 2.0 * (self.per_side_bps(executable_quote=executable_quote) +
+                      self.fee_bps)
+
     def execution_price(self, reference: float, direction: str, *, entry: bool,
                         executable_quote: bool = False) -> float:
         """Move an execution reference adversely by one side's cost."""

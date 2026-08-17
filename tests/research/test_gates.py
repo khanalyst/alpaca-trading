@@ -7,7 +7,8 @@ from research.gates import (
     deterministic_placebo_deltas, falsification_gate, matched_cluster_test,
     expectancy_rejection_report, paired_delta, performance_floor,
     placebo_null_distribution,
-    qualification_report, recompute_gate_statistics, seal_final_window, structural_floor,
+    qualification_report, recompute_gate_statistics, risk_unit_report,
+    seal_final_window, structural_floor,
     verified_gate_envelope, verify_gate_envelope, walk_forward_report,
 )
 
@@ -326,6 +327,58 @@ class EvidenceGateTests(unittest.TestCase):
              "other-b": .9, "other-c": .9, "other-d": .9}, alpha=.05)
         self.assertTrue(family["target"]["significant"])
         self.assertFalse(global_["target"]["significant"])
+
+
+class RiskUnitGateTests(unittest.TestCase):
+    """A stop worth less than the round trip cannot be traded profitably."""
+
+    @staticmethod
+    def _row(entry, stop, **extra):
+        return {"vehicle": "equity", "symbol": "SPY",
+                "session_date": "2024-01-02", "net_pnl": 1.0,
+                "entry_price": entry, "stop_price": stop, **extra}
+
+    def test_a_risk_unit_worth_three_round_trips_is_adequate(self):
+        # 100 bps of stop against a 9 bps round trip.
+        report = risk_unit_report([self._row(100.0, 99.0)],
+                                  vehicle="equity", round_trip_bps=9.0)
+        self.assertTrue(report["adequate"])
+        self.assertTrue(report["available"])
+        self.assertAlmostEqual(report["median_ratio"], 100.0 / 9.0, places=9)
+
+    def test_a_stop_smaller_than_its_costs_is_refused(self):
+        # The 5 bps floor this gate exists to catch: cost is 1.8x the stop, so
+        # a 2R target needs a hit rate no directional rule reaches.
+        report = risk_unit_report([self._row(100.0, 99.95)],
+                                  vehicle="equity", round_trip_bps=9.0)
+        self.assertFalse(report["adequate"])
+        self.assertLess(report["median_ratio"], 1.0)
+
+    def test_the_median_decides_so_one_wide_stop_cannot_carry_a_sample(self):
+        rows = [self._row(100.0, 99.95) for _ in range(9)]
+        rows.append(self._row(100.0, 90.0))
+        report = risk_unit_report(rows, vehicle="equity", round_trip_bps=9.0)
+        self.assertFalse(report["adequate"])
+
+    def test_an_equity_result_with_no_priced_risk_unit_is_not_a_pass(self):
+        rows = [{"vehicle": "equity", "session_date": "2024-01-02",
+                 "net_pnl": 1.0}]
+        report = risk_unit_report(rows, vehicle="equity", round_trip_bps=9.0)
+        self.assertFalse(report["adequate"])
+        self.assertFalse(report["available"])
+
+    def test_no_trade_rows_are_not_risk_units(self):
+        rows = [self._row(100.0, 99.0),
+                {"vehicle": "equity", "session_date": "2024-01-03",
+                 "net_pnl": 0.0, "no_trade": True}]
+        report = risk_unit_report(rows, vehicle="equity", round_trip_bps=9.0)
+        self.assertEqual(report["trades"], 1)
+        self.assertTrue(report["adequate"])
+
+    def test_options_do_not_veto_because_the_premium_is_the_risk_unit(self):
+        report = risk_unit_report([], vehicle="option", round_trip_bps=9.0)
+        self.assertFalse(report["applicable"])
+        self.assertTrue(report["adequate"])
 
 
 if __name__ == "__main__":
