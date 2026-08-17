@@ -27,6 +27,9 @@ from .stats import (
 
 
 GATE_ENVELOPE_SCHEMA = "verified-research-gate.v2"
+RETIREMENT_CONFIDENCE = .95
+RETIREMENT_MIN_SESSIONS = 30
+RETIREMENT_MIN_USEFUL_R = .05
 GATE_REQUIRED_CHECKS = frozenset({
     "actual_control_available", "fit_delta_positive",
     "heldout_delta_positive", "heldout_p_significant",
@@ -246,6 +249,65 @@ def performance_floor(rows: Iterable[Mapping], *, vehicle: str,
         "net_pnl_positive": bool(trades > 0 and net > float(min_net_pnl)),
         "expectancy_positive": bool(expectancy is not None and
                                     expectancy > float(min_expectancy)),
+    }
+
+
+def expectancy_rejection_report(
+        rows: Iterable[Mapping], *, vehicle: str,
+        minimum_useful_r: float = RETIREMENT_MIN_USEFUL_R,
+        confidence: float = RETIREMENT_CONFIDENCE,
+        min_sessions: int = RETIREMENT_MIN_SESSIONS) -> dict:
+    """Test whether a useful after-cost expectancy has been ruled out.
+
+    Promotion asks whether the lower bound is positive.  Retirement is the
+    opposite scientific question: whether the *upper* bound is already below
+    a preregistered minimum economically useful edge.  Whole sessions are
+    resampled so correlated intraday trades never masquerade as independent
+    evidence.  R multiples are preferred; legacy rows without a risk anchor
+    remain auditable in P&L units against a zero minimum.
+    """
+    selected = [row for row in rows
+                if row.get("vehicle", vehicle) == vehicle and
+                row.get("no_trade") is not True]
+    r_values: list[float] = []
+    r_complete = bool(selected)
+    for row in selected:
+        try:
+            value = float(row.get("r_multiple"))
+        except (TypeError, ValueError, OverflowError):
+            r_complete = False
+            break
+        if not math.isfinite(value):
+            r_complete = False
+            break
+        r_values.append(value)
+    unit = "r_multiple" if r_complete else "net_pnl"
+    values = (r_values if r_complete else
+              [float(row.get("net_pnl", 0.0)) for row in selected])
+    clusters = [str(row.get("cluster") or _session_key(row)) for row in selected]
+    bound = cluster_bootstrap_lower_bound(
+        values, clusters, confidence=float(confidence))
+    threshold = float(minimum_useful_r) if r_complete else 0.0
+    upper = bound.get("upper_bound")
+    session_count = len({cluster for cluster in clusters if cluster})
+    sufficient = bool(bound.get("available") and
+                      session_count >= int(min_sessions))
+    rejects = bool(sufficient and upper is not None and
+                   float(upper) <= threshold)
+    return {
+        "method": "cluster_bootstrap_upper_equivalence_bound",
+        "unit": unit,
+        "minimum_useful_expectancy": threshold,
+        "confidence": float(confidence),
+        "mean": bound.get("mean"),
+        "upper_bound": upper,
+        "lower_bound": bound.get("lower_bound"),
+        "trades": len(values),
+        "sessions": session_count,
+        "sessions_required": int(min_sessions),
+        "sample_sufficient": sufficient,
+        "rejects_minimum_useful_edge": rejects,
+        "bootstrap": bound,
     }
 
 
@@ -775,6 +837,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            performance: Mapping | None = None,
                            family_q_value: float | None = None,
                            walk_forward: Mapping | None = None,
+                           retirement: Mapping | None = None,
                            qualification: Mapping | None = None,
                            null_control: Mapping | None = None,
                            fit_control: Mapping | None = None,
@@ -901,6 +964,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "falsification": dict(falsification),
         "separation": dict(separation),
         "walk_forward": dict(walk_forward or {}),
+        "retirement": dict(retirement or {}),
         "qualification": dict(qualification or {}),
         "null_control": dict(null_control or {}),
         "online_fdr": online,
@@ -1037,6 +1101,26 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                     return False
             except (TypeError, ValueError, OverflowError):
                 return False
+        retirement = envelope.get("retirement")
+        if retirement is not None:
+            if not isinstance(retirement, Mapping):
+                return False
+            if retirement:
+                expected_retirement = expectancy_rejection_report(
+                    sources_held, vehicle=vehicle)
+                walk = envelope.get("walk_forward") or {}
+                negative_folds = [item for item in walk.get("results", ())
+                                  if item.get("adequate") and
+                                  float(item.get("net_pnl", 0.0)) <= 0.0]
+                expected_retirement["negative_forward_folds"] = len(
+                    negative_folds)
+                expected_retirement["independent_negative_windows"] = [
+                    list(item.get("test_sessions") or ())
+                    for item in negative_folds]
+                expected_retirement["multi_window_negative"] = (
+                    len(negative_folds) >= 2)
+                if dict(retirement) != expected_retirement:
+                    return False
         statistics = envelope.get("statistics")
         if isinstance(statistics, Mapping) and isinstance(checks, Mapping):
             alpha = float(statistics.get("alpha"))
@@ -1091,6 +1175,7 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 checks=checks, passes=bool(envelope.get("passes")),
                 performance=performance,
                 walk_forward=envelope.get("walk_forward") or {},
+                retirement=envelope.get("retirement") or {},
                 qualification=qualification,
                 null_control=envelope.get("null_control") or {},
                 online_fdr=online,
@@ -1268,6 +1353,8 @@ __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
            "deterministic_placebo_deltas", "falsification_gate",
            "heldout_separation", "matched_cluster_test", "matched_pairs",
            "max_drawdown_of", "paired_delta", "performance_floor",
+           "expectancy_rejection_report", "RETIREMENT_CONFIDENCE",
+           "RETIREMENT_MIN_SESSIONS", "RETIREMENT_MIN_USEFUL_R",
            "placebo_null_distribution", "placebo_ratio", "qualification_report",
            "recompute_gate_statistics", "sample_counts", "seal_final_window",
            "structural_floor", "verified_gate_envelope", "verify_gate_envelope",

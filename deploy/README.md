@@ -13,7 +13,7 @@ is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and session observations (paper by default) | `runtime-data` |
 | `trader` | Exactly one intraday loop in one configured execution profile and broker reconciliation | `runtime-data`, `research-cache` |
-| `research` (profile `research`) | Scheduled seven-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
+| `research` (profile `research`) | Scheduled eleven-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
 | `watchdog` | Independent stale-trader flatten; cancel and close only, never entries | `runtime-data` |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 | `shadow` (profile `shadow`) | Broker-free incremental shadow evaluation and semantic replay parity; no broker authority | Read-only recorder/EdgeLedger mounts, isolated shadow WAL |
@@ -87,8 +87,8 @@ normalized JSONL. Start it with
 at `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate broker
 state. Paper `selection_mode: all_proved` runs one best proven variant per
-independent family under one global risk book. Defaults are seven logical
-strategy slots over eleven bounded rule families and four isolated variant
+independent family under one global risk book. Defaults are eleven logical
+strategy slots over all eleven bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
 Capacity is configurable through the
 `ALPACA_FACTORY_*` environment variables.
@@ -197,8 +197,9 @@ incomplete shadow data advances no boundary and is reconsidered. Confirmatory
 simulation resolution scales to the next online allocation and stops without
 spending at its bounded cap. Legacy
 validated/champion rows without the marker can be evaluated/migrated but remain
-ineligible until a new authorized live proof. Retirement requires adequate terminal negative
-evidence for every intended variant; a valid bounded LLM replacement is
+ineligible until a new authorized live proof. Retirement requires a powered
+upper-bound rejection across multiple negative windows for every bounded
+variant; a valid bounded LLM replacement is
 registered before retirement when enabled, and demoted candidates can re-prove
 on a newer shadow run. Scheduler
 terminal statuses are `completed`, `completed_no_edge`, `no_data`, and

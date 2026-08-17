@@ -245,6 +245,7 @@ class FactoryLedger:
                     lesson_id TEXT NOT NULL REFERENCES factory_lessons(lesson_id),
                     passed INTEGER NOT NULL,
                     underpowered INTEGER NOT NULL,
+                    classification TEXT NOT NULL,
                     heldout_delta REAL,
                     heldout_net_pnl REAL,
                     q_value REAL,
@@ -314,6 +315,15 @@ class FactoryLedger:
             if columns and "parent_lesson_id" not in columns:
                 db.execute("ALTER TABLE factory_lessons "
                            "ADD COLUMN parent_lesson_id TEXT")
+            outcome_columns = {str(row["name"]) for row in
+                               db.execute("PRAGMA table_info(factory_lesson_outcomes)")}
+            if outcome_columns and "classification" not in outcome_columns:
+                # Historical adequate non-passes did not carry the upper-bound
+                # evidence needed to distinguish rejection from uncertainty.
+                # Retest them instead of upgrading them into terminal failures.
+                db.execute(
+                    "ALTER TABLE factory_lesson_outcomes ADD COLUMN "
+                    "classification TEXT NOT NULL DEFAULT 'legacy_unclassified'")
             db.execute("""CREATE TABLE IF NOT EXISTS factory_fdr (
                 decision_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
                 test_id TEXT NOT NULL, p_value REAL NOT NULL,
@@ -430,6 +440,12 @@ class FactoryLedger:
             if not (net <= 0.0 and expectancy <= 0.0):
                 raise FactoryError(
                     "hypothesis retirement requires terminal negative performance evidence")
+            retirement = envelope.get("retirement") or {}
+            if (retirement.get("rejects_minimum_useful_edge") is not True or
+                    retirement.get("multi_window_negative") is not True):
+                raise FactoryError(
+                    "hypothesis retirement requires a powered upper-bound "
+                    "rejection across multiple negative windows")
             gate_hashes.append(str(envelope["content_hash"]))
         detail = {**dict(payload or {}), "cycle_id": cycle_id,
                   "expected_variants": int(expected_variants),
@@ -578,10 +594,11 @@ class FactoryLedger:
 
     def failed_variant_ids(self, *, vehicle: str,
                            family: str | None = None) -> set[str]:
-        """Variants a graded lesson already recorded as an adequate failure.
+        """Variants whose powered evidence rejected a useful edge.
 
-        Re-proposing one is not a new experiment: it is the same experiment,
-        and its answer is already in the ledger.
+        A merely adequate non-pass can still be positive or statistically
+        inconclusive. Only an explicit upper-bound rejection closes a parameter
+        point; legacy, underpowered and inconclusive results remain retestable.
         """
         parameters: list[Any] = [vehicle]
         clause = ""
@@ -592,7 +609,8 @@ class FactoryLedger:
             rows = db.execute(
                 """SELECT DISTINCT l.variant_id FROM factory_lessons l
                    JOIN factory_lesson_outcomes o ON o.lesson_id=l.lesson_id
-                   WHERE l.vehicle=? AND o.passed=0 AND o.underpowered=0"""
+                   WHERE l.vehicle=?
+                     AND o.classification='adequate_negative_rejection'"""
                 + clause, parameters).fetchall()
         return {str(row["variant_id"]) for row in rows}
 
@@ -615,11 +633,18 @@ class FactoryLedger:
             if db.execute("SELECT 1 FROM factory_lesson_outcomes WHERE lesson_id=?",
                           (lesson_id,)).fetchone() is not None:
                 return lesson_id
-            db.execute("INSERT INTO factory_lesson_outcomes VALUES(?,?,?,?,?,?,?,?,?,?)", (
+            classification = str(outcome.get("classification") or (
+                "proved" if outcome.get("passed") else
+                "underpowered" if outcome.get("underpowered") else
+                "adequate_inconclusive"))
+            db.execute("""INSERT INTO factory_lesson_outcomes (
+                    outcome_id,lesson_id,passed,underpowered,classification,
+                    heldout_delta,heldout_net_pnl,q_value,failed_checks_json,
+                    gate_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
                 uuid.uuid4().hex, lesson_id,
                 1 if outcome.get("passed") else 0,
                 1 if outcome.get("underpowered") else 0,
-                _real(outcome.get("heldout_delta")),
+                classification, _real(outcome.get("heldout_delta")),
                 _real(outcome.get("heldout_net_pnl")),
                 _real(outcome.get("q_value")),
                 canonical_json(list(outcome.get("failed_checks") or [])),
@@ -645,7 +670,8 @@ class FactoryLedger:
         parameters.append(max(1, int(limit)))
         with closing(_connect(self.path)) as db:
             rows = db.execute(
-                """SELECT l.*, o.passed, o.underpowered, o.heldout_delta,
+                """SELECT l.*, o.passed, o.underpowered, o.classification,
+                          o.heldout_delta,
                           o.heldout_net_pnl, o.q_value, o.failed_checks_json,
                           o.gate_hash, o.outcome_id
                    FROM factory_lessons l
@@ -663,13 +689,14 @@ class FactoryLedger:
             item["outcome"] = ({
                 "passed": bool(item["passed"]),
                 "underpowered": bool(item["underpowered"]),
+                "classification": item["classification"],
                 "heldout_delta": item["heldout_delta"],
                 "heldout_net_pnl": item["heldout_net_pnl"],
                 "q_value": item["q_value"],
                 "failed_checks": json.loads(failed) if failed else [],
                 "gate_hash": item["gate_hash"],
             } if graded else None)
-            for key in ("passed", "underpowered", "heldout_delta",
+            for key in ("passed", "underpowered", "classification", "heldout_delta",
                         "heldout_net_pnl", "q_value", "gate_hash"):
                 item.pop(key, None)
             output.append(item)

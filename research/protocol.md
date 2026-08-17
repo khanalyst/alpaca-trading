@@ -204,8 +204,9 @@ the resulting gate afterwards. Both records are append-only and the grade is
 written once. A model-authored proposal made against a non-empty history must
 additionally cite the graded lesson it reasoned from; the citation is resolved
 against the ledger and stored, and an unresolvable one is refused. A parameter
-set a graded lesson already recorded as an adequate failure may not be
-re-proposed; an underpowered result is not such a record. The graded pairs may
+set is closed only when a graded lesson records a powered upper-bound rejection
+of the minimum useful edge; an underpowered or adequate-but-inconclusive result
+is not such a record. The graded pairs may
 be fed back into later proposals; because they describe only completed,
 already-corrected evaluations, doing so adds no information about unseen data.
 Multiple-test correction is what prices the search, so a tuned variant counts
@@ -213,13 +214,24 @@ against the same family-local and cycle-global false-discovery budget as a
 mutated one.
 
 Variant identity is de-duplicated by a family-specific executable semantic
-signature, including the v1/v2 no-op alias. A graded adequate failure suppresses
-only that exact failed variant id; underpowered outcomes do not suppress a
-future attempt and do not close the family.
+signature, including the v1/v2 no-op alias. A graded
+`adequate_negative_rejection` suppresses only that exact failed variant id;
+underpowered and inconclusive outcomes do not suppress a future attempt and do
+not close the family.
+
+Refinement follows a fixed sequence. Coordinate phase changes exactly one
+executable field per child. Interaction phase begins only after every bounded
+coordinate point is closed and combines exactly two of the strongest measured
+one-field values. A final unchanged replay confirms the conclusion before a
+replacement is allowed. Model tuning is schema-validated against the same
+one-field/two-field rule; it cannot hide a bundle of changes inside a reason.
 Multiple-test correction covers every variant evaluated in the cycle. A
-replacement hypothesis may be generated only after the root family has an
-adequate trade/session sample and no variant passes; underpowered data must not
-cause autonomous hypothesis churn.
+replacement hypothesis may be generated only after the root family has at
+least 100 executed trades in each fit/held-out partition, at least 30 held-out
+sessions, a 95% clustered upper bound no greater than the 0.05R minimum useful
+edge, and at least two adequate negative forward windows for every bounded
+point; underpowered or inconclusive data must not cause autonomous hypothesis
+churn.
 
 Each transition requires a chronological fit/held-out boundary, fit and
 held-out structural floors for trades/sessions/clusters, matched baseline
@@ -296,9 +308,10 @@ deletion — the rows stay readable and the lifecycle history stays intact — s
 re-deriving under the current engine is the only route back to a deployable
 proof. The constant is raised whenever a replay or gate change invalidates
 evidence recorded before it.
-Underpowered data is not failure. Retirement is permitted only after every
-intended variant has adequate terminal negative evidence and fails; an enabled
-LLM lane must first register a valid bounded replacement. A demoted candidate
+Underpowered or inconclusive data is not failure. Retirement is permitted only
+after every bounded point and the confirmation carry a powered upper-bound
+rejection across multiple negative windows; an enabled LLM lane must first
+register a valid bounded replacement. A demoted candidate
 may re-prove on a newer shadow run, starting a new evidence epoch. Drawdown is
 persisted and used to rank otherwise qualified champions conservatively.
 

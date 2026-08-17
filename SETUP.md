@@ -29,7 +29,7 @@ fed and readable so that silence is informative rather than worrying.
 | **Rule spec** | The edge itself, stored as *data* in a fixed grammar — never code. The LLM can only emit these. |
 | **Family** | The kind of signal (opening-range breakout, mean reversion, VWAP reversion, …). There are 11. |
 | **Variant** | One family with specific numbers — a 15-minute range instead of 20, a 2.0R target instead of 1.5R. |
-| **Slot** | One of 7 logical research slots; each isolated book is processed by one bounded worker. |
+| **Slot** | One of 11 logical research slots; each isolated book is processed by one bounded worker. |
 | **Generation** | How many times a slot's hypothesis has been replaced after failing. |
 | **Backtest lane** | First test, on the corpus split into fit and held-out parts. |
 | **Offline shadow lane** | Forward replay on sessions recorded *strictly after* the backtest; it may leave a candidate at `shadow` but never authorizes runtime. |
@@ -576,6 +576,17 @@ the arithmetic above assumes every session produces trades, which no strategy
 does. **Treat "about fifty trading sessions before a first proof is even
 possible" as a floor on patience, not a schedule.** This is why step 10 and a
 wider `universe.symbols` matter so much.
+
+Those are development/promotion floors. Complete statistical rejection is
+stricter: each variant also needs at least 30 held-out sessions, a 95%
+session-clustered upper bound at or below 0.05R, and at least two adequate
+negative rolling-forward windows. Until then the report says `underpowered` or
+`adequate_negative_inconclusive`; it does not call the edge disproved.
+
+Live shadow requires at least 150 trades across 30 complete, parity-matched
+sessions. A proved paper edge is reviewed only after 100 live trades across 30
+sessions. These defaults make rejection and deployment decisions span market
+sessions rather than a handful of fills.
 
 ## 14. Read the reports
 

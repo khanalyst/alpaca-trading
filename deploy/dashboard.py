@@ -424,12 +424,20 @@ def _learning(path: Path, limit: int = 60) -> dict:
                 return empty
             columns = {str(row["name"]) for row in
                        connection.execute("PRAGMA table_info(factory_lessons)")}
+            outcome_columns = {str(row["name"]) for row in
+                               connection.execute(
+                                   "PRAGMA table_info(factory_lesson_outcomes)")}
             parent = ("l.parent_lesson_id" if "parent_lesson_id" in columns
                       else "NULL AS parent_lesson_id")
+            classification = ("o.classification" if
+                              "classification" in outcome_columns else
+                              "CASE WHEN o.passed=1 THEN 'proved' "
+                              "WHEN o.underpowered=1 THEN 'underpowered' "
+                              "ELSE 'legacy_unclassified' END AS classification")
             rows = connection.execute(
                 f"""SELECT l.lesson_id, {parent}, l.vehicle, l.family, l.kind,
                            l.source, l.reason, l.variant_id, l.changed_json,
-                           l.created_at, o.passed, o.underpowered,
+                           l.created_at, o.passed, o.underpowered, {classification},
                            o.heldout_delta, o.q_value, o.outcome_id
                     FROM factory_lessons l
                     LEFT JOIN factory_lesson_outcomes o
@@ -454,9 +462,7 @@ def _learning(path: Path, limit: int = 60) -> dict:
                 f"{key} {value.get('from')}→{value.get('to')}"
                 if isinstance(value, dict) and "from" in value else f"{key}={value}"
                 for key, value in sorted(changed.items())),
-            "verdict": (None if not graded else
-                        "passed" if item["passed"] else
-                        "underpowered" if item["underpowered"] else "failed"),
+            "verdict": None if not graded else item["classification"],
             "heldout_delta": item["heldout_delta"],
             "built_on": reasons.get(str(item["parent_lesson_id"] or "")),
             "when": item["created_at"],

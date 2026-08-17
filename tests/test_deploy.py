@@ -804,7 +804,7 @@ class DeployTests(unittest.TestCase):
                 vehicles = dict(db.execute(
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
-            self.assertEqual(vehicles, {"equity": 7, "option": 7})
+            self.assertEqual(vehicles, {"equity": 11, "option": 11})
 
     def test_research_cycle_studies_only_the_tradeable_vehicle_by_default(self):
         """Option evidence a shares trader can never deploy is not produced."""
@@ -843,7 +843,7 @@ class DeployTests(unittest.TestCase):
                 vehicles = dict(db.execute(
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
-            self.assertEqual(vehicles, {"equity": 7})
+            self.assertEqual(vehicles, {"equity": 11})
 
     def test_dashboard_tradeable_vehicle_matches_the_runtime_resolver(self):
         from agent.edge import runtime_vehicle

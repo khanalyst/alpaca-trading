@@ -376,7 +376,7 @@ run_factory() {
     --data "$validated_input" --worker-data "$replay_input" \
     --vehicle "$vehicle" --db "$edge_db" \
     --agent-config "$agent_config" \
-    --strategies "${ALPACA_FACTORY_STRATEGIES:-7}" \
+    --strategies "${ALPACA_FACTORY_STRATEGIES:-11}" \
     --variants "${ALPACA_FACTORY_VARIANTS:-4}" \
     --workers "${ALPACA_FACTORY_WORKERS:-2}" \
     --starting-cash "${ALPACA_FACTORY_STARTING_CASH:-100000}" \
@@ -408,8 +408,8 @@ run_shadow_ingest() {
   set +e
   "$python_bin" "$repo_root/research.py" edge ingest-shadow \
     --vehicle "$vehicle" --db "$edge_db" --shadow-db "$shadow_db" \
-    --min-trades "${ALPACA_FACTORY_MIN_TRADES:-100}" \
-    --min-sessions "${ALPACA_FACTORY_MIN_SESSIONS:-10}" \
+    --min-trades "${ALPACA_SHADOW_MIN_TRADES:-150}" \
+    --min-sessions "${ALPACA_SHADOW_MIN_SESSIONS:-30}" \
     --alpha "${ALPACA_FACTORY_ALPHA:-0.05}"
   local status=$?
   set -e
@@ -494,4 +494,4 @@ if [ "$cycle_unevaluable" -eq 1 ] && [ "$cycle_no_edge" -eq 0 ]; then
 fi
 cycle_no_edge=1
 emit_progress "completed" 1 1 "cycles" "both"
-finish "completed_no_edge" "no edge or proof passed the research gates" 0
+finish "completed_no_edge" "no candidate was proved; review adequate-negative, underpowered, and untested classifications" 0

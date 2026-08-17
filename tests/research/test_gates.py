@@ -5,7 +5,8 @@ import unittest
 from research.gates import (
     AcceptanceFloor, SealedWindowError, chronological_split,
     deterministic_placebo_deltas, falsification_gate, matched_cluster_test,
-    paired_delta, performance_floor, placebo_null_distribution,
+    expectancy_rejection_report, paired_delta, performance_floor,
+    placebo_null_distribution,
     qualification_report, recompute_gate_statistics, seal_final_window, structural_floor,
     verified_gate_envelope, verify_gate_envelope, walk_forward_report,
 )
@@ -147,6 +148,77 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertFalse(report["expectancy_positive"])
         self.assertTrue(performance_floor(
             _rows(6, net=2.0), vehicle="equity")["expectancy_positive"])
+
+    def test_retirement_requires_a_powered_upper_bound_rejection(self):
+        def retirement_rows(count, value):
+            return [
+                {"vehicle": "equity", "symbol": "SPY",
+                 "session_date": (f"2026-{1 + index // 28:02d}-"
+                                  f"{1 + index % 28:02d}"),
+                 "opportunity_id": f"trade-{index}", "net_pnl": value * 100,
+                 "risk_usd": 100.0, "r_multiple": value}
+                for index in range(count)
+            ]
+
+        rejected = expectancy_rejection_report(
+            retirement_rows(30, -0.1), vehicle="equity")
+        self.assertTrue(rejected["sample_sufficient"])
+        self.assertTrue(rejected["rejects_minimum_useful_edge"])
+        self.assertEqual(rejected["unit"], "r_multiple")
+        self.assertLessEqual(rejected["upper_bound"], 0.05)
+
+        thin = expectancy_rejection_report(
+            retirement_rows(29, -0.1), vehicle="equity")
+        self.assertFalse(thin["sample_sufficient"])
+        self.assertFalse(thin["rejects_minimum_useful_edge"])
+
+        still_plausible = expectancy_rejection_report(
+            retirement_rows(30, 0.1), vehicle="equity")
+        self.assertFalse(still_plausible["rejects_minimum_useful_edge"])
+
+    def test_retirement_evidence_is_bound_to_verified_heldout_rows(self):
+        heldout = [
+            {**row, "r_multiple": -0.1, "risk_usd": 10.0}
+            for row in _rows(30, net=-1.0)
+        ]
+        baseline = _rows(30, net=0.0, prefix="baseline")
+        walk = walk_forward_report(
+            heldout, baseline, vehicle="equity", folds=3)
+        retirement = expectancy_rejection_report(heldout, vehicle="equity")
+        negative = [item for item in walk["results"]
+                    if item.get("adequate") and item.get("net_pnl", 0.0) <= 0.0]
+        retirement.update({
+            "negative_forward_folds": len(negative),
+            "independent_negative_windows": [
+                list(item.get("test_sessions") or ()) for item in negative],
+            "multi_window_negative": len(negative) >= 2,
+        })
+        control = matched_cluster_test(heldout, baseline, vehicle="equity")
+        envelope = verified_gate_envelope(
+            lane="shadow", vehicle="equity", fit=[], heldout=heldout,
+            heldout_baseline=baseline,
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                required=False),
+            heldout_floor=structural_floor(
+                heldout, vehicle="equity", min_trades=1, min_sessions=1),
+            control=control, p_value=control["p_value"], q_value=1.0,
+            alpha=.05, falsification={"passes": False},
+            separation={"passes": True}, checks={"falsification": False},
+            passes=False, walk_forward=walk, retirement=retirement,
+            performance={"heldout_net_pnl": -30.0,
+                         "heldout_expectancy": -1.0,
+                         "max_drawdown": 30.0})
+        self.assertTrue(verify_gate_envelope(envelope))
+
+        tampered = copy.deepcopy(envelope)
+        tampered["retirement"]["upper_bound"] = 99.0
+        from research.gates import _content_hash
+        tampered["content_hash"] = _content_hash({
+            key: value for key, value in tampered.items()
+            if key != "content_hash"
+        })
+        self.assertFalse(verify_gate_envelope(tampered))
 
     def test_walk_forward_requires_a_majority_of_positive_folds(self):
         baseline = _rows(8, net=0.0, prefix="root")

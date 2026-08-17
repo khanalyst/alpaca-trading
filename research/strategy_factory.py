@@ -39,8 +39,11 @@ from .factory_ledger import (
     FactoryLedger, deferred_fdr, experiment_identity, experiment_provenance,
 )
 from .gates import (chronological_split, heldout_separation,
+                    expectancy_rejection_report,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
                     performance_floor, placebo_null_distribution,
+                    RETIREMENT_CONFIDENCE, RETIREMENT_MIN_SESSIONS,
+                    RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
                     qualification_report as _qualification_report,
                     sample_counts, seal_final_window,
@@ -54,9 +57,9 @@ from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
     _session, _simulate_trade, _thesis, _visible, diagnose, discovery_hypothesis,
-    initial_hypotheses, mutate_from_diagnosis, mutate_with_reasons,
-    mutation_reason, replacement_hypothesis, simulate_account, spec_delta,
-    template_hypothesis,
+    coordinate_mutation_pool, initial_hypotheses, interaction_mutation_pool,
+    mutate_from_diagnosis, mutate_with_reasons, mutation_reason,
+    replacement_hypothesis, simulate_account, spec_delta, template_hypothesis,
 )
 
 
@@ -179,9 +182,10 @@ def _trim_lessons(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
             "tried": row.get("changed") or {},
             "reason": row.get("reason"),
             "proposed_by": row.get("source"),
-            "verdict": ("passed" if outcome.get("passed") else
-                        "underpowered" if outcome.get("underpowered") else
-                        "failed"),
+            "verdict": (outcome.get("classification") or
+                        ("passed" if outcome.get("passed") else
+                         "underpowered" if outcome.get("underpowered") else
+                         "inconclusive")),
             "heldout_delta": outcome.get("heldout_delta"),
             "failed_checks": list(outcome.get("failed_checks") or [])[:4],
         })
@@ -292,6 +296,32 @@ def _lesson_brief(factory: FactoryLedger, *, vehicle: str,
     return _trim_lessons(rows)
 
 
+def _refinement_history(factory: FactoryLedger, *, vehicle: str,
+                        hypothesis_id: str, limit: int = 512) -> list[dict]:
+    """Return the full measured coordinate history used for interactions.
+
+    The model prompt stays deliberately small, but selecting which good
+    one-field values to preserve must not forget an early winner merely because
+    it fell outside the eight-row prompt brief.
+    """
+    try:
+        rows = factory.lessons(
+            vehicle=vehicle, hypothesis_id=hypothesis_id,
+            graded_only=True, limit=max(1, int(limit)))
+    except (sqlite3.Error, ValueError, KeyError):
+        return []
+    history = []
+    for row in rows:
+        outcome = row.get("outcome") or {}
+        history.append({
+            "id": str(row.get("lesson_id") or "")[:LESSON_REF_CHARS],
+            "changed": row.get("changed") or {},
+            "heldout_delta": outcome.get("heldout_delta"),
+            "classification": outcome.get("classification"),
+        })
+    return history
+
+
 def shared_learning(factory: FactoryLedger, *, vehicle: str,
                     limit: int = SHARED_LEARNING_SAMPLE) -> dict:
     """What every strategy has learned, aggregated across all of them.
@@ -300,7 +330,7 @@ def shared_learning(factory: FactoryLedger, *, vehicle: str,
     research learns is not about one idea at all — that widening a stop tends
     to help across families, that a live paper trial has never yet agreed with
     a replay, that one direction of change keeps failing everywhere.  Sharing
-    that is what lets a slot benefit from the other six.
+    that is what lets a slot benefit from the other ten.
 
     It is deliberately an aggregate of *outcomes*, never of market data: each
     entry is a parameter name, how often changing it in a given direction
@@ -504,7 +534,9 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     lessons: Sequence[Mapping[str, Any]] = (),
                     already_failed: frozenset[str] = frozenset(),
                     shared: Mapping[str, Any] | None = None,
-                    existing_specs: Sequence[Mapping[str, Any]] = ()
+                    existing_specs: Sequence[Mapping[str, Any]] = (),
+                    refinement_lessons: Sequence[Mapping[str, Any]] = (),
+                    refinement_state: dict[str, Any] | None = None,
                     ) -> tuple[list[TunedVariant], ProposalResult | None]:
     """Choose this hypothesis's variants, each with the reason it was chosen.
 
@@ -512,8 +544,8 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     randomized-entry null and consumes the same cycle-wide multiplicity as
     every mutation; it is not a free self-control that can never pass.
 
-    With the LLM lane off this is exactly the previous deterministic mutation,
-    unchanged spec-for-spec.  With it on, the model may propose the remaining
+    With the LLM lane off this walks the deterministic coordinate, interaction,
+    and confirmation phases. With it on, the model may propose the remaining
     variants from the diagnosis *and the graded outcomes of earlier reasons*,
     and anything it does not supply — or supplies as a duplicate, as a repeat
     of a recorded failure, or without citing what it learned from — is topped
@@ -523,14 +555,38 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     root = validate_rule_spec(hypothesis["rule_spec"])
     failed = set(already_failed)
     near_distance = _near_duplicate_distance(config)
-    if not llm_enabled:
+    coordinate = coordinate_mutation_pool(root, diagnostic)
+    remaining_coordinate = [item for item in coordinate
+                            if not _failed_variant(item[0], failed)]
+    interactions = interaction_mutation_pool(
+        root, refinement_lessons if refinement_lessons else lessons)
+    remaining_interactions = [item for item in interactions
+                               if not _failed_variant(item[0], failed)]
+    if remaining_coordinate:
+        phase = "coordinate"
+        pool = remaining_coordinate
+    elif remaining_interactions:
+        phase = "interaction"
+        pool = remaining_interactions
+    else:
+        # A final unchanged replay is a confirmation stage, not another search
+        # point.  It lets the retirement rule demand a fresh gate after every
+        # bounded coordinate and interaction candidate has been consumed.
+        phase = "confirmatory"
+        pool = [(root, "Unchanged confirmatory replay after the bounded "
+                       "coordinate and interaction neighborhoods were exhausted.")]
+    if refinement_state is not None:
+        refinement_state.update({
+            "phase": phase,
+            "coordinate_total": len(coordinate),
+            "coordinate_remaining_before": len(remaining_coordinate),
+            "interaction_total": len(interactions),
+            "interaction_remaining_before": len(remaining_interactions),
+            "pool_variant_ids": [rule_variant_id(item[0]) for item in pool],
+        })
+    if not llm_enabled or phase == "confirmatory":
         return ([TunedVariant(spec, reason, "deterministic", None)
-                 for spec, reason in mutate_with_reasons(root, diagnostic, MAX_VARIANTS)
-                 if not _failed_variant(spec, failed)][:int(count)],
-                None)
-    # A wider deterministic pool than ``count`` so that topping up still has
-    # unused candidates left after the model's proposals claim some ids.
-    pool = mutate_with_reasons(root, diagnostic, MAX_VARIANTS)
+                 for spec, reason in pool[:int(count)]], None)
     selected = _adapter(config, adapter)
     tune = getattr(selected, "tune", None)
     proposal: ProposalResult | None = None
@@ -539,7 +595,9 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
         # proposal — never a failed cycle.
         # The diagnosis says how this hypothesis failed; the shared digest says
         # what every other slot has found out about the same parameters.
-        diagnosis = dict(diagnostic)
+        diagnosis = {**dict(diagnostic), "refinement_phase": phase,
+                     "coordinate_candidates_remaining": len(remaining_coordinate),
+                     "interaction_candidates_remaining": len(remaining_interactions)}
         if shared and shared.get("graded_attempts"):
             diagnosis["shared_learning"] = dict(shared)
         proposal = (tune(vehicle=vehicle, slot=int(hypothesis["slot"]),
@@ -554,9 +612,11 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                                   error=f"{type(exc).__name__}: provider tuning unavailable")
     chosen: list[TunedVariant] = []
     seen: set[str] = set()
-    if not _failed_variant(root, failed):
-        chosen.append(TunedVariant(root, pool[0][1], "deterministic", None))
-        _mark_variant(root, seen)
+    deterministic_seed = pool[0] if pool else None
+    if deterministic_seed is not None:
+        chosen.append(TunedVariant(
+            deterministic_seed[0], deterministic_seed[1], "deterministic", None))
+        _mark_variant(deterministic_seed[0], seen)
     if (proposal is not None and proposal.success and
             isinstance(proposal.variants, (list, tuple))):
         for entry in proposal.variants:
@@ -572,7 +632,7 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                 variant_id = canonical_id
                 _tuning_reason_check(
                     str(entry.get("reason") or ""), root, normalized_entry,
-                    diagnostic, lessons)
+                    {**dict(diagnostic), "refinement_phase": phase}, lessons)
             except (TypeError, ValueError, KeyError):
                 continue
             # Re-proposing a parameter set a graded lesson already recorded as
@@ -595,7 +655,7 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
             _mark_variant(normalized_entry, seen)
             chosen.append(TunedVariant(normalized_entry, str(entry.get("reason") or "provider tuning"),
                                        "llm", entry.get("builds_on")))
-    for spec, reason in pool[1:]:
+    for spec, reason in pool:
         if len(chosen) >= int(count):
             break
         if _failed_variant(spec, failed) or _variant_seen(spec, seen):
@@ -786,7 +846,7 @@ def _ensure_slots(factory: FactoryLedger, edge: EdgeLedger, *, vehicle: str,
         if previous is None:
             # Genesis. The template is the fallback, not the only option: an
             # empty slot is exactly where a discovery proposal is most useful,
-            # and seeding every deployment from the same seven templates would
+            # and seeding every deployment from the same templates would
             # make "the LLM discovers edges" false on the very first cycle.
             seed = template_hypothesis(slot, vehicle=vehicle)
             source = "template"
@@ -985,6 +1045,7 @@ def _worker(payload: Mapping[str, Any]) -> dict:
             })
         sessions = sorted({_session(bar) for bar in bars})
         return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
+                "refinement": dict(payload.get("refinement") or {}),
                 "policy": policy,
                 "evaluation_start": sessions[0] if sessions else None,
                 "evaluation_end": sessions[-1] if sessions else None,
@@ -1061,6 +1122,14 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         # held-out partition. Requiring the full aggregate floor in every fold
         # would make the gate mathematically unreachable for ordinary corpora.
         min_test_trades=max(1, int(min_trades) // max(2, int(folds) * 2)))
+    rejection = expectancy_rejection_report(heldout, vehicle=vehicle)
+    negative_folds = [item for item in walk_forward.get("results", ())
+                      if item.get("adequate") and
+                      float(item.get("net_pnl", 0.0)) <= 0.0]
+    rejection["negative_forward_folds"] = len(negative_folds)
+    rejection["independent_negative_windows"] = [
+        list(item.get("test_sessions") or ()) for item in negative_folds]
+    rejection["multi_window_negative"] = len(negative_folds) >= 2
     final = dict(qualification or {
         "available": False, "sessions": [], "net_positive": False,
         "delta_positive": False,
@@ -1119,6 +1188,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "fit_test": fit_test, "control": {**test, "kind": (
             "randomized_entry_root_null" if is_root else "matched_root_baseline")},
         "null_control": null_control, "walk_forward": walk_forward,
+        "retirement_evidence": rejection,
         "qualification": final,
         "falsification": falsification, "heldout_separation": separation,
         "checks_without_family": checks,
@@ -1131,11 +1201,15 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
 
 
 def _terminal_negative(local: Sequence[tuple[Mapping, Mapping]]) -> bool:
-    """Only adequately powered, absolutely negative results may retire a slot."""
+    """Only powered equivalence evidence across multiple windows may retire."""
     if not local:
         return False
     for _, gate in local:
         if not (gate.get("sample_adequate") and gate.get("heldout_sample_adequate")):
+            return False
+        rejection = gate.get("retirement_evidence") or {}
+        if (rejection.get("rejects_minimum_useful_edge") is not True or
+                rejection.get("multi_window_negative") is not True):
             return False
         net = gate.get("heldout_net_pnl")
         expectancy = gate.get("heldout_expectancy")
@@ -1149,6 +1223,24 @@ def _terminal_negative(local: Sequence[tuple[Mapping, Mapping]]) -> bool:
         except (TypeError, ValueError):
             return False
     return True
+
+
+def _gate_classification(gate: Mapping[str, Any]) -> str:
+    """Name the scientific verdict without collapsing absence into failure."""
+    if gate.get("passes") is True:
+        return "proved"
+    if not (gate.get("sample_adequate") and gate.get("heldout_sample_adequate")):
+        return "underpowered"
+    try:
+        negative = (float(gate.get("heldout_net_pnl")) <= 0.0 and
+                    float(gate.get("heldout_expectancy")) <= 0.0)
+    except (TypeError, ValueError, OverflowError):
+        negative = False
+    if negative:
+        return ("adequate_negative_rejection" if
+                _terminal_negative([({}, gate)]) else
+                "adequate_negative_inconclusive")
+    return "adequate_inconclusive"
 
 
 def _existing_specs(edge: EdgeLedger, hypothesis_id: str, vehicle: str) -> list[dict]:
@@ -1313,6 +1405,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "min_trades": int(min_trades), "min_sessions": int(min_sessions),
         "alpha": float(alpha), "qualification_fraction": .2,
         "walk_forward_folds": 3,
+        "retirement_confidence": RETIREMENT_CONFIDENCE,
+        "retirement_min_sessions": RETIREMENT_MIN_SESSIONS,
+        "retirement_min_useful_r": RETIREMENT_MIN_USEFUL_R,
+        "refinement_policy": "coordinate_then_bounded_interactions_v1",
     }
     llm_assumptions = {
         key: llm_config.get(key) for key in (
@@ -1564,17 +1660,24 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     continue
                 task["diagnostic"] = diagnostic
                 family = str(hypothesis["family"])
+                family_lessons = _lesson_brief(
+                    factory, vehicle=vehicle, family=family)
+                refinement_lessons = _refinement_history(
+                    factory, vehicle=vehicle, hypothesis_id=hypothesis_id)
+                refinement: dict[str, Any] = {}
                 chosen, tuning = _tuned_variants(
                     hypothesis, diagnostic,
                     count=int(variants_per_strategy), vehicle=vehicle,
                     llm_enabled=llm_enabled, config=llm_config,
                     adapter=llm_adapter,
-                    lessons=_lesson_brief(factory, vehicle=vehicle,
-                                          family=family),
+                    lessons=family_lessons,
+                    refinement_lessons=refinement_lessons,
                     already_failed=_failed_variants(factory, vehicle=vehicle,
                                                     family=family),
                     shared=shared,
-                    existing_specs=existing_specs)
+                    existing_specs=existing_specs,
+                    refinement_state=refinement)
+                task["refinement"] = refinement
                 if tuning is not None:
                     entry = {"hypothesis_id": hypothesis_id,
                              "slot": int(hypothesis["slot"]),
@@ -1848,6 +1951,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             falsification=gate["falsification"],
             separation=gate["heldout_separation"], checks=checks,
             passes=gate["passes"], walk_forward=gate["walk_forward"],
+            retirement=gate.get("retirement_evidence"),
             qualification=gate["qualification"],
             null_control=gate["null_control"],
             online_fdr=(cumulative if key == selected_test_key else {}),
@@ -1876,6 +1980,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             "passed": bool(gate.get("passes")),
             "underpowered": not (gate.get("sample_adequate") and
                                  gate.get("heldout_sample_adequate")),
+            "classification": _gate_classification(gate),
             "heldout_delta": (gate.get("test") or {}).get("mean_delta"),
             "heldout_net_pnl": gate.get("heldout_net_pnl"),
             "q_value": (statistics.get("p_adjusted")
@@ -1924,7 +2029,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     variant["variant_id"], (None, None))
             result = {**variant, "evaluation_start": worker["evaluation_start"],
                       "evaluation_end": worker["evaluation_end"], "mode": worker["mode"],
-                      "gate": gate, "reason": reason, "proposed_by": origin}
+                      "gate": gate, "reason": reason, "proposed_by": origin,
+                      "classification": _gate_classification(gate)}
             factory.add_account(cycle_id, hypothesis["hypothesis_id"], result)
             # The reason was fixed before this gate existed; now it is graded
             # against it.  That pairing is what later prompts read back.
@@ -2016,12 +2122,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                                  "failed_checks": gate.get("failed_checks") or []},)
             summaries.append({
                 "hypothesis_id": hypothesis["hypothesis_id"],
+                "family": hypothesis["family"],
                 "candidate_id": candidate["candidate_id"],
                 "variant_id": variant["variant_id"], "mode": worker["mode"],
                 "evaluation_start": worker["evaluation_start"],
                 "evaluation_end": worker["evaluation_end"],
                 "account_id": variant["account"]["account_id"],
                 "worker_pid": variant["worker_pid"], "gate": gate,
+                "classification": _gate_classification(gate),
                 "status": (edge.candidate(candidate["candidate_id"]) or {}).get("status"),
                 "run_id": run.get("run_id") if run else None,
             })
@@ -2051,9 +2159,28 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             # ingestion marks the hypothesis validated.  The next factory
             # cycle then sees the validated hypothesis as inactive and
             # deterministically reseeds the slot in _ensure_slots.
+        elif (all_intended_adequate and _terminal_negative(local) and
+              str((worker.get("refinement") or {}).get(
+                  "phase") or "confirmatory") != "confirmatory"):
+            refinement = dict(worker.get("refinement") or {})
+            phase = str(refinement.get("phase") or "coordinate")
+            tested_ids = {str(item[0]["variant_id"]) for item in local}
+            remaining = [item for item in refinement.get("pool_variant_ids", ())
+                         if str(item) not in tested_ids]
+            factory.event(
+                hypothesis["hypothesis_id"],
+                hypothesis.get("status", "testing"),
+                (f"{phase} refinement batch was terminally negative; "
+                 "the bounded neighborhood continues before replacement"),
+                {**refinement, "tested_variant_ids": sorted(tested_ids),
+                 "remaining_in_phase_after": len(remaining),
+                 "replacement_eligible": False})
         elif all_intended_adequate and _terminal_negative(local):
+            # The best near-miss is the least negative/highest-P&L result, not
+            # the result with the largest absolute loss.  Replacement and its
+            # lesson should preserve what worked best in the exhausted lineage.
             aggregate = max((item[0]["diagnostic"] for item in local),
-                            key=lambda value: abs(float(value.get("net_pnl", 0.0))))
+                            key=lambda value: float(value.get("net_pnl", float("-inf"))))
             proposal = None
             replacement_error = None
             # Each rotation and each reseed grants the slot one further
@@ -2244,6 +2371,17 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         budget = getattr(llm_adapter, "_budget_evidence", None)
         if callable(budget):
             budget_evidence = dict(budget())
+    classification_counts: dict[str, int] = {}
+    for row in summaries:
+        name = str(row.get("classification") or "unknown")
+        classification_counts[name] = classification_counts.get(name, 0) + 1
+    registered_families = sorted({str(item.get("family")) for item in
+                                  factory.hypotheses(vehicle=vehicle)
+                                  if item.get("family")})
+    explored_families = sorted({str(item.get("family")) for item in summaries
+                                if item.get("family")})
+    untested_families = [item for item in RULE_FAMILIES
+                         if item not in explored_families]
     result = {
         "schema": FACTORY_SCHEMA,
         "status": ("partial_worker_failure" if worker_failures else
@@ -2257,6 +2395,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "worker_pids": sorted({row["worker_pid"] for row in summaries}),
         "strategies": len(worker_results), "variants": len(summaries),
         "accounts": len(summaries), "results": summaries,
+        "verdict": {
+            "candidate_proved": bool(classification_counts.get("proved")),
+            "classifications": classification_counts,
+            "families_explored": explored_families,
+            "families_registered": registered_families,
+            "families_untested": untested_families,
+            "interpretation": (
+                "candidate_proved" if classification_counts.get("proved") else
+                "no_candidate_proved"),
+        },
         "replacements": replacements, "rotations": rotations,
         # Slots reseeded after proving an edge, slots seeded for the first
         # time, and slots revived because they had lost their hypothesis.

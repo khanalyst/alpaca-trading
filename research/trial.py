@@ -35,8 +35,8 @@ TRIAL_SCHEMA = "paper-trial.v1"
 # Defaults chosen to need a real sample before acting.  A trial that concludes
 # from four trades is measuring noise, and parking an edge on noise costs more
 # search than it saves.
-DEFAULT_MIN_SESSIONS = 20
-DEFAULT_MIN_TRADES = 20
+DEFAULT_MIN_SESSIONS = 30
+DEFAULT_MIN_TRADES = 100
 DEFAULT_MIN_MEAN_R = 0.0
 DEFAULT_MIN_TOTAL_R = 0.0
 

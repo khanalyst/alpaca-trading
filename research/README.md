@@ -25,7 +25,7 @@ corpus, appended into one partition per New York session date under
 partitions in session order (`ALPACA_RESEARCH_SESSION_WINDOW` limits it to the
 most recent N), validates the result, and routes the vehicle-local discovery
 lanes from it.
-It also invokes `research.strategy_factory`, which evaluates seven logical
+It also invokes `research.strategy_factory`, which evaluates eleven logical
 strategy slots over the finite catalog of eleven rule families by default.
 Seven is slot/worker capacity, not the number of families. Each generated
 variant owns an isolated simulated account processed by one bounded worker; no
@@ -176,9 +176,10 @@ separately for `equity` and `option` vehicles. Gates require chronological
 held-out data, fit/held-out trade and session structural floors, matched
 controls, cluster-aware randomisation, family-local and cycle-global FDR,
 sealed qualification observations/digests, and placebo/falsification.
-Underpowered data is not failure. Retirement is allowed only after all
-intended variants have adequate terminal negative evidence and fail; a valid
-bounded LLM replacement must be registered first when that lane is enabled.
+Underpowered or inconclusive data is not failure. Retirement is allowed only
+after all bounded coordinate/interaction points and the final confirmation
+carry a powered upper-bound rejection across multiple negative windows; a
+valid bounded LLM replacement must be registered first when that lane is enabled.
 Drawdown is
 measured and used in conservative champion ranking. Normal operation needs no
 manual promotion; the `edge promote` CLI is only for explicit, audited controls
@@ -262,9 +263,12 @@ proved-but-untradeable edges rather than letting them accumulate silently.
 On a fresh corpus, each worker diagnoses its baseline only from the
 chronological fit partition, creates bounded variants based on the observed
 failure mode, and evaluates those variants on untouched held-out sessions.
-Every variant has a separate simulated cash/equity account. A family is
-retired only when all intended variants are adequately powered and fail; if
-LLM replacement is enabled, a valid bounded proposal is registered first. A
+Every variant has a separate simulated cash/equity account. Coordinate
+refinement changes exactly one executable field at a time. After all such
+points are measured, at most two measured fields are combined in a bounded
+interaction phase, followed by one unchanged confirmation. A family is retired
+only when every point explicitly rejects a useful edge with adequate powered
+evidence; if LLM replacement is enabled, a valid bounded proposal is registered first. A
 missing or invalid LLM proposal leaves the family pending replacement, not
 retired. Insufficient data is not treated as failure. Backtest winners must
 still pass strictly later forward data before runtime can select them.
@@ -372,7 +376,7 @@ property of the system instead:
    refused; so is one citing an id that was never supplied, which would be a
    fabricated citation.
 2. **Do not re-run a settled experiment.** A variant whose parameters a graded
-   lesson already recorded as an adequate failure is dropped, and the
+   lesson already recorded as a powered negative rejection is dropped, and the
    deterministic table tops the slot back up. *Underpowered* is not a failure,
    so a thin sample never closes a door.
 3. **Keep the chain.** The citation is resolved to a real lesson id and stored
@@ -384,9 +388,9 @@ That is the whole loop: propose with a reason and a citation, evaluate under
 unchanged gates, grade the reason, and hand the grade forward.
 
 Across all discovery lanes, executable variants are de-duplicated by a
-family-specific semantic signature, including v1/v2 no-op aliases. A graded
-adequate failure suppresses only its exact failed variant id; underpowered
-results remain eligible.
+family-specific semantic signature, including v1/v2 no-op aliases. Only a
+graded `adequate_negative_rejection` suppresses its exact variant id;
+underpowered and adequate-but-inconclusive results remain eligible.
 
 ### Learning shared across every strategy
 
@@ -412,7 +416,7 @@ later-forward observation, so sharing it adds no information about unseen data.
 A proved edge that is not pinned trades the same Alpaca paper account, and its real fills
 accumulate as `paper_outcomes`, each carrying the exact passing shadow
 `proof_run_id` that authorized entry. After the trial window —
-`research.trial` config, default 20 sessions and 20 trades — that proof epoch
+`research.trial` config, default 30 sessions and 100 trades — that proof epoch
 is judged against an explicit floor (total R and mean R both positive by
 default):
 
@@ -477,8 +481,10 @@ per-run call-count guard rather than spend accounting; provider-side quotas
 remain an operational control.
 
 The scheduled cycle reports `completed`, `completed_no_edge`, `no_data`, or
-`failed`. `completed_no_edge` means the input was valid but no candidate passed
-the gates; `no_data` means the input was unavailable or empty. Neither status
+`failed`. `completed_no_edge` means the input was valid but no candidate was
+proved; the report separates `adequate_negative_rejection`,
+`adequate_negative_inconclusive`, `adequate_inconclusive`, `underpowered`, and
+families not yet tested. `no_data` means the input was unavailable or empty. Neither status
 permits bypassing the runtime edge gate.
 
 Before validation, the scheduled cycle builds temporary normalized views and
@@ -489,7 +495,7 @@ coverage/refusal gates; every other malformed row remains a hard validation
 failure.
 
 ```bash
-python research.py factory run --data market.jsonl --strategies 7 --variants 4 --workers 7
+python research.py factory run --data market.jsonl --strategies 11 --variants 4 --workers 2
 python research.py factory status
 python research.py factory report [--slot N] [--format text|markdown|json] [--write]
 ```

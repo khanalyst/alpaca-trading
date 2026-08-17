@@ -99,6 +99,12 @@ designing.  You cannot introduce a new signal, indicator or data source, and a
 reply that tries to is rejected outright.  Changing which idea is being tested
 is a different job, done elsewhere.
 
+EXPERIMENT PHASE.  The request names a refinement_phase.  In "coordinate"
+phase every returned variant must change exactly ONE field, so its effect is
+attributable and a useful value can be retained.  In "interaction" phase it
+must change exactly TWO fields whose one-field lessons were already measured.
+Never bundle extra changes.  Confirmatory replays are performed without you.
+
 WHAT YOU MUST LEARN FROM.  You are given the diagnosis of how the root failed
 on fit data only, and the graded lessons from earlier attempts: each lesson's
 id, what was tried, the reason given, and what the gates then said.  Every
@@ -257,17 +263,25 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
                if root.get(key) != normalized.get(key)]
     if not changed:
         raise ValueError("tuning reason has no changed field to justify")
+    phase = str(diagnosis.get("refinement_phase") or "coordinate")
+    expected = 2 if phase == "interaction" else 1
+    if len(changed) != expected:
+        raise ValueError(
+            f"{phase} tuning must change exactly {expected} field(s); "
+            f"changed {len(changed)}: {', '.join(changed)}")
     text = reason.lower()
-    field_cues: set[str] = set()
+    missing_cues: list[str] = []
     for key in changed:
-        field_cues.add(key.lower())
-        field_cues.add(key.lower().replace("_", " "))
+        field_cues = {key.lower(), key.lower().replace("_", " ")}
         field_cues.update(part.lower() for part in key.split("_")
                           if len(part) >= 4 and part.lower() not in {
                               "before", "after"})
-    if not any(cue in text for cue in field_cues):
+        if not any(cue in text for cue in field_cues):
+            missing_cues.append(key)
+    if missing_cues:
         raise ValueError(
-            "tuning reason must name a changed field: " + ", ".join(changed))
+            "tuning reason must name every changed field: " +
+            ", ".join(missing_cues))
     if lessons:
         # A cited id proves which lesson was selected; the prose must still
         # acknowledge that evidence rather than being an ungrounded guess.

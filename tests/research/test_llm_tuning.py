@@ -19,8 +19,9 @@ import unittest
 from agent.contracts.rule import (rule_variant_id, validate_rule_spec)
 from research.edge_lab import EdgeLedger
 from research.factory_core import (
-    MAX_VARIANTS, _REASON_LIMIT, family_template, initial_hypotheses,
-    mutate_from_diagnosis, mutate_with_reasons, mutation_reason, spec_delta,
+    MAX_VARIANTS, _REASON_LIMIT, coordinate_mutation_pool, family_template,
+    initial_hypotheses, mutate_from_diagnosis, mutate_with_reasons,
+    mutation_reason, spec_delta,
 )
 from research.factory_ledger import FactoryError, FactoryLedger
 from research.llm_strategy import (
@@ -88,6 +89,26 @@ class TuningContractTests(unittest.TestCase):
         result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=1)
         self.assertFalse(result.success)
         self.assertIn("family", result.error)
+
+    def test_coordinate_tuning_rejects_a_bundled_change(self):
+        bundled = {**ROOT, "threshold_bps": 40.0, "target_r": 1.5}
+        adapter = _adapter(_reply((
+            bundled, "Raised threshold and lowered target R together.")))
+        result = adapter.tune(
+            "equity", 0, ROOT,
+            {**DIAGNOSIS, "refinement_phase": "coordinate"}, count=1)
+        self.assertFalse(result.success)
+        self.assertIn("exactly 1 field", result.error)
+
+    def test_interaction_tuning_accepts_exactly_two_named_fields(self):
+        interaction = {**ROOT, "threshold_bps": 40.0, "target_r": 1.5}
+        adapter = _adapter(_reply((
+            interaction,
+            "Combined the measured threshold and target R coordinate gains.")))
+        result = adapter.tune(
+            "equity", 0, ROOT,
+            {**DIAGNOSIS, "refinement_phase": "interaction"}, count=1)
+        self.assertTrue(result.success, result.error)
 
     def test_tuning_may_not_widen_the_grammar(self):
         """v2 unlocks whole predicate categories the root never expressed.
@@ -340,14 +361,17 @@ class CitedLearningTests(unittest.TestCase):
             self.assertEqual(chain[second], first)
             self.assertIsNone(chain[first])
 
-    def test_failed_variant_ids_excludes_underpowered_and_passing(self):
-        """Underpowered is not an answer, so it is not a closed door."""
+    def test_failed_variant_ids_only_closes_explicit_powered_rejections(self):
+        """Uncertainty is not an answer, so it is not a closed door."""
         with tempfile.TemporaryDirectory() as directory:
             factory, _edge = _ledgers(directory)
             hypothesis = initial_hypotheses(1)[0]
             factory.register(hypothesis)
             outcomes = {
-                "failed": {"passed": False, "underpowered": False},
+                "failed": {"passed": False, "underpowered": False,
+                           "classification": "adequate_negative_rejection"},
+                "inconclusive": {"passed": False, "underpowered": False,
+                                 "classification": "adequate_inconclusive"},
                 "thin": {"passed": False, "underpowered": True},
                 "won": {"passed": True, "underpowered": False},
             }
@@ -441,10 +465,48 @@ class VariantSelectionTests(unittest.TestCase):
         self.assertEqual([spec for spec, _r in variants],
                          mutate_from_diagnosis(ROOT, DIAGNOSIS, 4))
 
-    def test_a_sweep_fill_says_it_had_no_diagnosis_behind_it(self):
-        reasons = [reason for _s, reason in
-                   mutate_with_reasons(ROOT, DIAGNOSIS, MAX_VARIANTS)]
-        self.assertTrue(any("no diagnosis behind it" in item for item in reasons))
+    def test_coordinate_pool_is_complete_and_every_child_changes_one_field(self):
+        pool = coordinate_mutation_pool(ROOT, DIAGNOSIS)
+        self.assertGreater(len(pool), MAX_VARIANTS)
+        self.assertEqual(pool[0][0], ROOT)
+        for spec, reason in pool[1:]:
+            delta = spec_delta(ROOT, spec)
+            self.assertEqual(len(delta), 1)
+            self.assertIn(next(iter(delta)), reason)
+
+    def test_refinement_exhausts_coordinates_then_interactions_then_confirms(self):
+        coordinate = coordinate_mutation_pool(ROOT, DIAGNOSIS)
+        coordinate_ids = frozenset(rule_variant_id(spec) for spec, _ in coordinate)
+        lessons = [
+            {"id": "threshold", "tried": {
+                "threshold_bps": {"from": ROOT["threshold_bps"], "to": 40.0}},
+             "heldout_delta": -0.1},
+            {"id": "target", "tried": {
+                "target_r": {"from": ROOT["target_r"], "to": 1.5}},
+             "heldout_delta": -0.2},
+        ]
+        interaction_state = {}
+        interactions, _ = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
+            vehicle="equity", llm_enabled=False, config={}, adapter=None,
+            lessons=lessons, already_failed=coordinate_ids,
+            refinement_state=interaction_state)
+        self.assertEqual(interaction_state["phase"], "interaction")
+        self.assertTrue(interactions)
+        self.assertTrue(all(len(spec_delta(ROOT, item.rule_spec)) == 2
+                            for item in interactions))
+
+        confirm_state = {}
+        confirmed, _ = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
+            vehicle="equity", llm_enabled=False, config={}, adapter=None,
+            lessons=lessons,
+            already_failed=frozenset({
+                *coordinate_ids,
+                *(rule_variant_id(item.rule_spec) for item in interactions),
+            }), refinement_state=confirm_state)
+        self.assertEqual(confirm_state["phase"], "confirmatory")
+        self.assertEqual([item.rule_spec for item in confirmed], [ROOT])
 
     def test_the_reason_limit_matches_the_adapters(self):
         """The core states the bound without importing the optional adapter."""
@@ -650,11 +712,11 @@ class FeedbackLoopTests(unittest.TestCase):
 
 
 class SharedLearningTests(unittest.TestCase):
-    """One slot's search should benefit from the other six.
+    """One slot's search should benefit from the other ten.
 
     A per-family brief can only say what happened to one idea. Some of what
     research learns is not about one idea at all, and sharing that is what
-    stops seven slots rediscovering the same thing seven times.
+    stops eleven slots rediscovering the same thing eleven times.
     """
 
     def _graded(self, factory, hypothesis, *, family, changes, passed,

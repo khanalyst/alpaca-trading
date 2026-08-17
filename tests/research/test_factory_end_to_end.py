@@ -33,14 +33,16 @@ SYMBOLS = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH")
 # across eight symbols is 112 trades, clearing both floors without slack to
 # spare.
 SESSIONS = 56
-# Slot 0 of the shipped catalog.  The factory diagnoses this on fit data and,
-# finding no failure, proposes `target_r * 1.25` as its first variant.
+# Slot 0 of the shipped catalog. The refinement protocol keeps the root and
+# changes exactly one coordinate in the second arm.
 ROOT_SPEC = validate_rule_spec({
     "family": "opening_range_breakout", "range_minutes": 15,
     "threshold_bps": 5.0, "confirmation": "volume"})
 WINNING_SPEC = validate_rule_spec({**ROOT_SPEC, "target_r": 2.5})
 ROOT_VARIANT = rule_variant_id(ROOT_SPEC)
 WINNING_VARIANT = rule_variant_id(WINNING_SPEC)
+FIRST_COORDINATE_SPEC = validate_rule_spec({**ROOT_SPEC, "threshold_bps": 4.0})
+FIRST_COORDINATE_VARIANT = rule_variant_id(FIRST_COORDINATE_SPEC)
 # Six bps of spread and fifteen of slippage: still inside the runtime's own
 # rejection caps, so this is a fill the trader would accept, not an impossible
 # one chosen to guarantee the failure.
@@ -150,7 +152,8 @@ class EarnedGatePassTests(unittest.TestCase):
     def test_a_replayed_edge_earns_a_passing_backtest_gate(self):
         self.assertEqual(self.result["status"], "complete")
         rows = self._by_variant(self.result)
-        self.assertEqual(sorted(rows), sorted([ROOT_VARIANT, WINNING_VARIANT]))
+        self.assertEqual(
+            sorted(rows), sorted([ROOT_VARIANT, FIRST_COORDINATE_VARIANT]))
         # Selection is made once on development evidence.  In this corpus the
         # simpler root has the stronger lower confidence bound, so the final
         # window is spent on it and the mutation remains diagnostic.

@@ -50,13 +50,14 @@ flowchart LR
 
 ### How edge discovery works
 
-The strategy factory normally runs seven logical research slots. Each slot
-holds one hypothesis and evaluates four isolated-account variants drawn from
-the finite catalog of eleven bounded rule families. It diagnoses only
-chronological fit data, then judges the variants on untouched held-out data.
+The strategy factory normally runs eleven logical research slots, so a fresh
+cycle can cover every bounded rule family. Each slot holds one hypothesis and
+evaluates four isolated-account variants. It diagnoses only chronological fit
+data, then judges the variants on untouched held-out data.
 Candidates are de-duplicated by their family-specific executable semantic
-signature (including v1/v2 no-op aliases), while a variant id with an adequate
-recorded failure is suppressed exactly; underpowered results remain eligible.
+signature (including v1/v2 no-op aliases). A variant is suppressed only after
+a powered upper-bound rejection; underpowered and adequate-but-inconclusive
+results remain eligible for more evidence.
 A candidate must clear structural trade/session floors, matched controls,
 absolute after-cost profitability, falsification, fixed-rule rolling-origin
 stability, and family-local plus cycle-global false-discovery correction. A
@@ -79,10 +80,20 @@ can become `validated` or `champion`. An underpowered, mismatched, or incomplete
 shadow cycle advances no durable boundary, so those sessions are reconsidered
 when enough data exists instead of being silently consumed.
 
+Within a hypothesis, refinement first changes exactly one executable field at
+a time. Only after that coordinate neighborhood is measured can it combine two
+of the best one-field values; a final unchanged confirmation follows before the
+family can be replaced. Model-tuned proposals are held to the same one-field or
+two-field contract, so a useful entry, exit, filter, or payoff parameter is not
+discarded inside an unexplained bundle.
+
 When a slot proves an edge, the proved rule is frozen and the slot is reseeded
 with a new hypothesis so research capacity does not shrink. Retirement requires
-adequate terminal negative evidence for every intended variant (and a valid
-bounded replacement when enabled); a demoted candidate may re-prove on a newer
+at least 100 executed trades in both fit and held-out partitions, at least 30
+held-out sessions, a 95% clustered upper bound at or below the 0.05R minimum
+useful edge, and at least two negative forward windows for every tested point.
+A valid bounded replacement is registered first when enabled; a demoted
+candidate may re-prove on a newer
 shadow run and starts a new evidence epoch. Paper
 `selection_mode: all_proved` can then select one strongest proved variant per
 independent family under one global risk book and correlation cap. Live paper
@@ -272,9 +283,8 @@ which is written one append-only partition per New York session date under
 concatenates those partitions in session order.
 `ALPACA_RESEARCH_SESSION_WINDOW` limits it to the most recent N sessions and
 `ALPACA_RESEARCH_DATASET` overrides the source with normalized JSONL. By default
-each cycle schedules seven logical strategy slots and four isolated accounts per
-strategy. Each isolated book is processed by one bounded worker; the slot count
-is capacity, not the number of rule families. Its
+each cycle schedules eleven logical strategy slots and four isolated accounts
+per strategy. Each isolated book is processed by one bounded worker. Its
 edge-lab and factory lineage are kept in the SQLite ledger
 at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
 status, latest re-verified passing edges, per-edge live paper results, edge

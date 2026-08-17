@@ -333,11 +333,14 @@ class EdgeLedger(EdgeLedgerProofMixin):
             terminal_negative = bool(
                 heldout_net is not None and heldout_net <= 0.0 and
                 heldout_expectancy is not None and heldout_expectancy <= 0.0)
+            retirement = gate.get("retirement") or {}
             if (gate.get("passes") is not False or not structurally_adequate or
-                    not terminal_negative):
+                    not terminal_negative or
+                    retirement.get("rejects_minimum_useful_edge") is not True or
+                    retirement.get("multi_window_negative") is not True):
                 raise ValueError(
                     "retirement requires latest adequate, terminally negative "
-                    "failed verified gate evidence")
+                    "powered upper-bound rejection across multiple windows")
         now = _utc()
         event_type = "safety_demotion" if to_status == "demoted" else "lifecycle_transition"
         with closing(_connect(self.path)) as db, db:

@@ -22,6 +22,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Mapping, Sequence
 
+from agent.contracts.rule import RULE_FAMILIES
 from .edge_ledger_store import DEFAULT_DB_PATH, VEHICLES
 
 REPORT_SCHEMA = "factory-report.v1"
@@ -124,6 +125,11 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         "is_root": bool(gate.get("is_root")),
         "null_control": gate.get("null_control"),
         "passes": bool(gate.get("passes")),
+        "classification": record.get("classification") or (
+            "proved" if gate.get("passes") else
+            "underpowered" if not (gate.get("sample_adequate") and
+                                    gate.get("heldout_sample_adequate")) else
+            "adequate_inconclusive"),
         "underpowered": not (gate.get("sample_adequate") and
                              gate.get("heldout_sample_adequate")),
         "failed_checks": _failed_checks(gate),
@@ -342,14 +348,23 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
         if {"factory_lessons", "factory_lesson_outcomes"}.issubset(tables):
             parent_columns = {str(item["name"]) for item in
                               db.execute("PRAGMA table_info(factory_lessons)")}
+            outcome_columns = {str(item["name"]) for item in
+                               db.execute(
+                                   "PRAGMA table_info(factory_lesson_outcomes)")}
             parent = ("l.parent_lesson_id" if "parent_lesson_id" in parent_columns
                       else "NULL AS parent_lesson_id")
+            classification = ("o.classification" if
+                              "classification" in outcome_columns else
+                              "CASE WHEN o.passed=1 THEN 'proved' "
+                              "WHEN o.underpowered=1 THEN 'underpowered' "
+                              "ELSE 'legacy_unclassified' END AS classification")
             reasons: dict[str, str] = {}
             for row in db.execute(
                     f"""SELECT l.lesson_id, {parent}, l.vehicle, l.family,
                               l.kind, l.source, l.reason, l.evidence_json,
                               l.changed_json, l.variant_id, l.created_at,
-                              o.passed, o.underpowered, o.heldout_delta,
+                              o.passed, o.underpowered, {classification},
+                              o.heldout_delta,
                               o.q_value, o.failed_checks_json, o.outcome_id
                        FROM factory_lessons l
                        LEFT JOIN factory_lesson_outcomes o
@@ -369,10 +384,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                     "changed": _loads(row["changed_json"]) or {},
                     "evidence": _loads(row["evidence_json"]) or {},
                     "graded": graded,
-                    "verdict": (None if not graded else
-                                "passed" if row["passed"] else
-                                "underpowered" if row["underpowered"] else
-                                "failed"),
+                    "verdict": None if not graded else row["classification"],
                     "heldout_delta": _number(row["heldout_delta"]),
                     "q_value": _number(row["q_value"]),
                     "failed_checks": [
@@ -435,6 +447,9 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                              for rows in slots.values() for entry in rows
                              for row in entry["variants"])]
         graded = [item for item in local_lessons if item["graded"]]
+        tested_families = {str(item["family"])
+                           for rows in slots.values() for item in rows
+                           if item["variants"]}
         report_vehicles.append({
             "vehicle": name,
             "summary": {
@@ -444,9 +459,19 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "variants_tested": sum(len(item["variants"])
                                        for rows in slots.values()
                                        for item in rows),
-                "families_explored": sorted({str(item["family"])
-                                             for item in local}),
+                "families_explored": sorted(tested_families),
+                "families_untested": [family for family in RULE_FAMILIES
+                                      if family not in tested_families],
                 "proved_variants": [row["variant_id"] for row in proved],
+                "classifications": {
+                    label: sum(1 for rows in slots.values() for item in rows
+                               for row in item["variants"]
+                               if row.get("classification") == label)
+                    for label in (
+                        "proved", "adequate_negative_rejection",
+                        "adequate_negative_inconclusive",
+                        "adequate_inconclusive", "underpowered")
+                },
                 "retired_hypotheses": sum(
                     1 for rows in slots.values() for item in rows
                     if item["outcome"]["kind"] in {"retired", "rotated"}),
@@ -530,6 +555,10 @@ def render_text(report: Mapping[str, Any]) -> str:
             f" | hypotheses {summary['hypotheses']}"
             f" | variants tested {summary['variants_tested']}")
         add(f"  families explored: {', '.join(summary['families_explored'])}")
+        add("  families not yet tested: " +
+            (", ".join(summary.get("families_untested", ())) or "none"))
+        add("  verdict classes: " +
+            json.dumps(summary.get("classifications", {}), sort_keys=True))
         add(f"  hypotheses proposed by the LLM: {summary['llm_seeded_hypotheses']}"
             f" ({summary['llm_proposals_rejected']} proposal(s) refused)")
         add(f"  hypotheses retired/rotated: {summary['retired_hypotheses']}")
@@ -650,6 +679,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"- Slots: {summary['slots']} ({summary['active_slots']} still searching)",
                 f"- Hypotheses: {summary['hypotheses']}, variants tested: {summary['variants_tested']}",
                 f"- Families explored: {', '.join(summary['families_explored'])}",
+                f"- Families not yet tested: "
+                f"{', '.join(summary.get('families_untested', ())) or 'none'}",
+                f"- Verdict classes: {json.dumps(summary.get('classifications', {}), sort_keys=True)}",
                 f"- Proposed by the LLM: {summary['llm_seeded_hypotheses']}"
                 f" ({summary['llm_proposals_rejected']} refused)",
                 f"- Retired or rotated: {summary['retired_hypotheses']}",

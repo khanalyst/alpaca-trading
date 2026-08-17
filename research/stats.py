@@ -130,7 +130,7 @@ def sign_flip_null_statistics(deltas, clusters, *, draws: int = DEFAULT_NULL_DRA
 def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
                                   draws: int = DEFAULT_BOOTSTRAP_DRAWS,
                                   seed: int | None = None) -> dict:
-    """Bootstrap a one-sided lower bound on the mean delta over whole clusters.
+    """Bootstrap one-sided bounds on the mean over whole clusters.
 
     Clusters, not observations, are resampled: intraday deltas inside one
     session are not independent and must move together.
@@ -154,7 +154,8 @@ def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
                         if seed is None else seed)
     if not keys or total == 0:
         return {"method": "cluster_bootstrap", "available": False,
-                "lower_bound": None, "mean": None, "clusters": 0,
+                "lower_bound": None, "upper_bound": None,
+                "mean": None, "clusters": 0,
                 "observations": 0, "draws": 0, "seed": resolved_seed,
                 "confidence": float(confidence)}
     rng = random.Random(resolved_seed)
@@ -171,8 +172,11 @@ def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
     means.sort()
     index = int(math.floor((1.0 - float(confidence)) * resamples))
     index = min(max(index, 0), resamples - 1)
+    upper_index = int(math.ceil(float(confidence) * resamples)) - 1
+    upper_index = min(max(upper_index, 0), resamples - 1)
     return {"method": "cluster_bootstrap", "available": True,
             "lower_bound": means[index],
+            "upper_bound": means[upper_index],
             "mean": sum(sum(grouped[key]) for key in keys) / total,
             "clusters": size, "observations": total, "draws": resamples,
             "seed": resolved_seed, "confidence": float(confidence)}

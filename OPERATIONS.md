@@ -395,9 +395,9 @@ recorder's mixed bars/quotes/options corpus under
 recent N session partitions), runs the autonomous strategy factory
 plus the explicit IBR baseline, scores shares and single-leg long-option
 vehicles separately, and writes evidence. Each variant has its own simulated
-cash/equity account; default capacity is seven logical strategy slots and four
-variants per strategy, drawn from a catalog of eleven rule families (seven is
-slot/worker capacity, not family count). Each isolated book is processed by one
+cash/equity account; default capacity is eleven logical strategy slots and four
+variants per strategy, covering the catalog of eleven rule families on a fresh
+ledger. Each isolated book is processed by one
 bounded worker. Paper `selection_mode: all_proved` keeps one best
 proven variant per independent family under one global risk book. The edge
 ledger is
@@ -418,9 +418,14 @@ Underpowered data is not a failure: a shadow worker advances no durable
 boundary until all intended variants are adequately powered, so the tail is
 reconsidered on a later cycle. The sealed qualification window is released
 once by one preselected candidate alone; other variants remain diagnostic.
-Retirement requires adequate terminal negative evidence for every intended
-variant, and a valid bounded LLM replacement is registered first when that lane
-is enabled. Demoted candidates may re-prove on a newer shadow run. Paper
+Refinement is coordinate-first: every initial child changes exactly one
+executable field. Bounded two-field interactions are formed only from the best
+measured coordinate lessons, followed by an unchanged confirmation. Retirement
+then requires the normal 100-trade fit and held-out floors, at least 30 held-out
+sessions, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
+and at least two negative forward windows for every point. A valid bounded LLM
+replacement is registered first when that lane is enabled. Demoted candidates
+may re-prove on a newer shadow run. Paper
 outcomes are appended for forward monitoring, scoped to their authorizing proof epoch, and may demote a
 deployed edge. Only the broker-free ShadowRunner plus research-side `edge
 ingest-shadow` can append a complete parity-matched live proof and advance
@@ -501,7 +506,7 @@ lifecycle state.
 Inspect raw lineage rows and isolated-account counts with
 `python research.py factory status`. Tune bounded capacity with
 `ALPACA_FACTORY_STRATEGIES`, `ALPACA_FACTORY_VARIANTS`, and
-`ALPACA_FACTORY_WORKERS`; hard validation caps these at 16, 8, and 16.
+`ALPACA_FACTORY_WORKERS`; hard validation caps these at 11, 8, and 16.
 
 See how each deployed edge is performing on live paper outcomes:
 

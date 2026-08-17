@@ -18,9 +18,10 @@ from .edge_ledger import (
 )
 from .gates import (
     chronological_split, deterministic_placebo_deltas, falsification_gate,
-    heldout_separation, matched_cluster_test, max_drawdown_of, paired_delta,
-    performance_floor, qualification_report, sample_counts, seal_final_window,
-    structural_floor, verified_gate_envelope, walk_forward_report,
+    expectancy_rejection_report, heldout_separation, matched_cluster_test,
+    max_drawdown_of, paired_delta, performance_floor, qualification_report,
+    sample_counts, seal_final_window, structural_floor, verified_gate_envelope,
+    walk_forward_report,
 )
 from .costs import CostModel, ReplayPolicy, replay_policy_for_mode
 from .ibr import IBRConfig, replay_ibr
@@ -71,6 +72,33 @@ def _adequate(gate: Mapping) -> bool:
                 (gate.get("qualification") or {}).get("available"))
 
 
+def _development_adequate(gate: Mapping) -> bool:
+    """Whether the reusable development evidence met its structural floors."""
+    return bool(gate.get("fit_floor", {}).get("adequate") and
+                gate.get("heldout_floor", {}).get("adequate") and
+                (gate.get("walk_forward") or {}).get("available") and
+                (gate.get("walk_forward") or {}).get("adequate"))
+
+
+def _classification(gate: Mapping) -> str:
+    if gate.get("passes") is True:
+        return "proved"
+    if not _development_adequate(gate):
+        return "underpowered"
+    absolute = gate.get("heldout_performance") or {}
+    try:
+        if (float(absolute.get("net_pnl")) <= 0.0 and
+                float(absolute.get("expectancy")) <= 0.0):
+            rejection = gate.get("retirement_evidence") or {}
+            return ("adequate_negative_rejection" if
+                    rejection.get("rejects_minimum_useful_edge") is True and
+                    rejection.get("multi_window_negative") is True else
+                    "adequate_negative_inconclusive")
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return "adequate_inconclusive"
+
+
 def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -> dict:
     """Add absolute profitability, lower-bound and walk-forward requirements.
 
@@ -89,6 +117,14 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
         heldout, base_heldout, vehicle=vehicle, folds=folds,
         min_test_sessions=max(1, int(minimums.get("sessions", 1)) // folds),
         min_test_trades=max(1, int(minimums.get("trades", 1)) // (folds * 2)))
+    rejection = expectancy_rejection_report(heldout, vehicle=vehicle)
+    negative_folds = [item for item in walk.get("results", ())
+                      if item.get("adequate") and
+                      float(item.get("net_pnl", 0.0)) <= 0.0]
+    rejection["negative_forward_folds"] = len(negative_folds)
+    rejection["independent_negative_windows"] = [
+        list(item.get("test_sessions") or ()) for item in negative_folds]
+    rejection["multi_window_negative"] = len(negative_folds) >= 2
     bound = gate["heldout_paired_baseline"].get("mean_delta_lcb")
     gate["checks_without_family"].update({
         "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
@@ -113,6 +149,7 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
         float(gate["paired_baseline"]["mean_delta"]) > 0)
     gate["heldout_performance"] = absolute
     gate["walk_forward"] = walk
+    gate["retirement_evidence"] = rejection
     gate["heldout_delta_lcb"] = bound
     return gate
 
@@ -530,7 +567,10 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                         "selected_test_id": selected_test_id}),
         candidate_id=baseline_variant.variant_id)
     baseline_run = None
-    baseline_adequate = _adequate(baseline_gate)
+    # A control arm is never post-selection qualified, so its reusable
+    # development run must not be labelled underpowered merely because the
+    # candidate-only qualification field is intentionally unavailable.
+    baseline_adequate = _development_adequate(baseline_gate)
     if baseline_eval and not baseline_adequate:
         ledger.append_event(
             candidate_id=baseline_record["candidate_id"],
@@ -576,6 +616,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                             "status": record.get("status", "retired"),
                             "gate": None, "shadow_gate": None,
                             "run_id": None, "shadow_run_id": None,
+                            "classification": "not_retested",
                             "mode": mode, "unseen_sessions": None})
             continue
         gate = gates[variant.variant_id]
@@ -584,11 +625,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         selected_for_proof = bool(
             variant.variant_id == qualification_target and
             (gate.get("qualification") or {}).get("available"))
-        development_adequate = bool(
-            gate.get("fit_floor", {}).get("adequate") and
-            gate.get("heldout_floor", {}).get("adequate") and
-            (gate.get("walk_forward") or {}).get("available") and
-            (gate.get("walk_forward") or {}).get("adequate"))
+        development_adequate = _development_adequate(gate)
         run = None
         shadow_run = None
         status = record.get("status", "candidate")
@@ -667,7 +704,11 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         absolute = gate.get("heldout_performance") or {}
         terminal_negative = bool(
             adequate and float(absolute.get("net_pnl", 0.0)) <= 0.0 and
-            float(absolute.get("expectancy", 0.0)) <= 0.0)
+            float(absolute.get("expectancy", 0.0)) <= 0.0 and
+            (gate.get("retirement_evidence") or {}).get(
+                "rejects_minimum_useful_edge") is True and
+            (gate.get("retirement_evidence") or {}).get(
+                "multi_window_negative") is True)
         if (selected_for_proof and terminal_negative and not gate["passes"] and
                 status not in {"retired", "demoted"}):
             target = "demoted" if status in {"shadow", "validated", "champion"} else "retired"
@@ -680,13 +721,25 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                         "shadow_gate": gate if mode == "shadow" else None,
                         "run_id": run["run_id"] if run else None,
                         "shadow_run_id": shadow_run["run_id"] if shadow_run else None,
+                        "classification": _classification(gate),
                         "mode": mode,
                         "unseen_sessions": (
                             consumed_sessions(rows, window_rows[variant.variant_id])
                             if mode == "shadow" else None)})
     champion = ledger.select_champion(vehicle=vehicle) if lane in {"auto", "shadow"} else None
+    classifications: dict[str, int] = {}
+    for item in results:
+        name = str(item.get("classification") or "unknown")
+        classifications[name] = classifications.get(name, 0) + 1
     return {"vehicle": vehicle, "lane": lane, "dataset_hash": data_hash,
             "variants": results, "family_correction": corrected,
+            "verdict": {
+                "candidate_proved": bool(classifications.get("proved")),
+                "classifications": classifications,
+                "interpretation": (
+                    "candidate_proved" if classifications.get("proved") else
+                    "no_candidate_proved"),
+            },
             "post_selection": {"selected_test_id": selected_test_id,
                                "qualified_test_id": qualification_target,
                                "cumulative_fdr": cumulative},

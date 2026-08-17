@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 
 from agent.contracts.rule import (
     RULE_FAMILIES, RULE_SCHEMA_V2, SESSION_MINUTES, evaluate_rule_signal,
-    feature_window_bars, hold_deadline, rule_variant_id, validate_rule_spec,
+    feature_window_bars, hold_deadline, rule_semantic_signature,
+    rule_variant_id, validate_rule_spec,
 )
 from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
 from .edge_ledger import content_hash
@@ -42,9 +43,9 @@ NOTIONAL_CAP_PCT = 25.0
 FRESH_OPTION_QUOTE_SECONDS = 30.0
 MAX_OPTION_QUOTE_STALENESS_SECONDS = 30.0
 
-DEFAULT_STRATEGIES = 7
+DEFAULT_STRATEGIES = len(RULE_FAMILIES)
 DEFAULT_VARIANTS = 4
-MAX_STRATEGIES = 7
+MAX_STRATEGIES = len(RULE_FAMILIES)
 MAX_VARIANTS = 8
 
 
@@ -800,88 +801,181 @@ def mutate_from_diagnosis(spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
     return [item[0] for item in mutate_with_reasons(spec, diagnostic, count)]
 
 
+_COORDINATE_FIELDS = (
+    "threshold_bps", "target_r", "stop_atr", "max_hold_bars",
+    "lookback", "slow_lookback", "range_minutes", "zscore",
+    "volume_multiplier", "compression_bps", "atr_period", "side",
+    "confirmation", "entry_after_minutes", "entry_before_minutes",
+    "min_atr_bps", "max_atr_bps", "confirmations",
+)
+_FAILURE_FIELD_PRIORITY = {
+    "insufficient_signals": (
+        "threshold_bps", "confirmation", "lookback", "range_minutes",
+        "zscore", "volume_multiplier", "entry_before_minutes"),
+    "negative_expectancy": (
+        "threshold_bps", "target_r", "stop_atr", "max_hold_bars",
+        "confirmation", "side"),
+    "poor_payoff": (
+        "target_r", "stop_atr", "max_hold_bars", "threshold_bps"),
+    "low_win_rate": (
+        "target_r", "threshold_bps", "max_hold_bars", "confirmation"),
+    "excess_drawdown": (
+        "stop_atr", "max_hold_bars", "side", "threshold_bps",
+        "confirmation"),
+}
+_ZERO_AXIS_STEPS = {
+    "threshold_bps": (5.0, 10.0),
+    "min_atr_bps": (5.0, 15.0),
+    "entry_after_minutes": (30, 60),
+}
+
+
+def _coordinate_values(root: Mapping[str, Any], field: str) -> list[Any]:
+    """Return two bounded directions for one executable field.
+
+    Validation remains the source of truth for bounds.  This helper merely
+    proposes neighboring values; invalid boundary points are discarded by the
+    same rule validator used for every other authored strategy.
+    """
+    value = root.get(field)
+    if field == "side":
+        return [item for item in ("both", "long", "short") if item != value]
+    if field == "confirmation":
+        return [item for item in ("none", "trend", "volume", "volatility")
+                if item != value]
+    if field == "confirmations":
+        current = list(value or ())
+        values: list[list[str]] = []
+        if current:
+            for item in current:
+                values.append([entry for entry in current if entry != item])
+        for item in ("trend", "volume", "volatility"):
+            if item not in current:
+                values.append([*current, item])
+        return values
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return []
+    if field in _ZERO_AXIS_STEPS and float(value) == 0.0:
+        return list(_ZERO_AXIS_STEPS[field])
+    if field == "entry_before_minutes" and int(value) >= SESSION_MINUTES:
+        return [max(1, int(value) - 60), max(1, int(value) - 30)]
+    if isinstance(value, int):
+        step = max(1, int(round(abs(value) * .2)))
+        return [value - step, value + step]
+    step = max(.25, abs(float(value)) * .2)
+    return [float(value) - step, float(value) + step]
+
+
+def coordinate_mutation_pool(
+        spec: Mapping[str, Any], diagnostic: Mapping[str, Any]
+        ) -> list[tuple[dict, str]]:
+    """Return the complete deterministic one-factor neighborhood.
+
+    Every child differs from the root in exactly one executable field.  The
+    pool is intentionally larger than one worker batch: later cycles can skip
+    graded failures and continue through the remaining axes before the
+    hypothesis is eligible for interaction tests or replacement.
+    """
+    root = validate_rule_spec(spec)
+    failure = str(diagnostic.get("primary_failure") or "none")
+    priority = list(_FAILURE_FIELD_PRIORITY.get(failure, ()))
+    fields = [*priority, *(item for item in _COORDINATE_FIELDS
+                           if item not in priority)]
+    root_signature = rule_semantic_signature(root)
+    seen = {rule_variant_id(root)}
+    variants: list[tuple[dict, str]] = [
+        (root, mutation_reason(root, root, diagnostic))]
+    for field in fields:
+        if field not in root:
+            continue
+        for value in _coordinate_values(root, field):
+            try:
+                candidate = _safe_variant(root, **{field: value})
+            except (TypeError, ValueError):
+                continue
+            variant_id = rule_variant_id(candidate)
+            if (variant_id in seen or
+                    rule_semantic_signature(candidate) == root_signature):
+                continue
+            delta = spec_delta(root, candidate)
+            if len(delta) != 1:
+                continue
+            seen.add(variant_id)
+            variants.append((candidate,
+                             mutation_reason(root, candidate, diagnostic)))
+    return variants
+
+
+def interaction_mutation_pool(
+        spec: Mapping[str, Any], lessons: Sequence[Mapping[str, Any]], *,
+        limit: int = 12) -> list[tuple[dict, str]]:
+    """Combine only the strongest previously measured one-factor changes.
+
+    Interaction search is unavailable until coordinate lessons exist.  It
+    pairs distinct fields, keeps each authored value exactly as measured, and
+    never changes family or grammar.  The result therefore preserves the good
+    parts of the best near-misses without opening an unconstrained grid.
+    """
+    root = validate_rule_spec(spec)
+    ranked: list[tuple[float, str, Any, str]] = []
+    for lesson in lessons:
+        changed = lesson.get("tried") or lesson.get("changed") or {}
+        if not isinstance(changed, Mapping) or len(changed) != 1:
+            continue
+        field, change = next(iter(changed.items()))
+        if field in {"family", "schema"} or not isinstance(change, Mapping):
+            continue
+        if "to" not in change:
+            continue
+        try:
+            score = float(lesson.get("heldout_delta"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(score):
+            continue
+        ranked.append((score, str(field), change["to"],
+                       str(lesson.get("id") or lesson.get("lesson_id") or "")))
+    # Retain one best measured value per field.  Positive relative improvements
+    # rank first, while the closest negative near-misses remain usable when no
+    # coordinate helped enough on its own.
+    best: dict[str, tuple[float, Any, str]] = {}
+    for score, field, value, lesson_id in sorted(
+            ranked, key=lambda item: (-item[0], item[1], str(item[2]))):
+        best.setdefault(field, (score, value, lesson_id))
+    selected = sorted(best.items(), key=lambda item: (-item[1][0], item[0]))[:6]
+    root_signature = rule_semantic_signature(root)
+    seen = {rule_variant_id(root)}
+    variants: list[tuple[dict, str]] = []
+    for left_index, (left, (_ls, left_value, left_lesson)) in enumerate(selected):
+        for right, (_rs, right_value, right_lesson) in selected[left_index + 1:]:
+            try:
+                candidate = _safe_variant(
+                    root, **{left: left_value, right: right_value})
+            except (TypeError, ValueError):
+                continue
+            variant_id = rule_variant_id(candidate)
+            if (variant_id in seen or
+                    rule_semantic_signature(candidate) == root_signature or
+                    len(spec_delta(root, candidate)) != 2):
+                continue
+            seen.add(variant_id)
+            reason = (
+                f"Bounded interaction after coordinate evidence: {left} from "
+                f"lesson {left_lesson or 'recorded'}; {right} from lesson "
+                f"{right_lesson or 'recorded'}.")[:_REASON_LIMIT]
+            variants.append((candidate, reason))
+            if len(variants) >= max(0, int(limit)):
+                return variants
+    return variants
+
+
 def mutate_with_reasons(spec: Mapping[str, Any], diagnostic: Mapping[str, Any],
                         count: int = DEFAULT_VARIANTS
                         ) -> list[tuple[dict, str]]:
-    """Bounded variants from an explicit failure diagnosis, each with its reason."""
+    """First batch of the bounded one-factor neighborhood."""
     if not 2 <= int(count) <= MAX_VARIANTS:
         raise FactoryError(f"variants must be between 2 and {MAX_VARIANTS}")
-    root = validate_rule_spec(spec)
-    failure = str(diagnostic.get("primary_failure") or "none")
-    changes: list[dict] = []
-    if failure == "insufficient_signals":
-        changes = [
-            {"threshold_bps": max(0.0, root["threshold_bps"] * .65),
-             "zscore": max(.25, root["zscore"] * .8), "confirmation": "none"},
-            {"lookback": max(3, root["lookback"] - 3),
-             "slow_lookback": max(root["lookback"] + 2, root["slow_lookback"] - 5)},
-            {"volume_multiplier": max(.25, root["volume_multiplier"] * .8),
-             "range_minutes": max(3, root["range_minutes"] - 5)},
-        ]
-    elif failure in {"negative_expectancy", "poor_payoff"}:
-        changes = [
-            {"threshold_bps": min(500.0, root["threshold_bps"] * 1.35 + 1),
-             "confirmation": "trend"},
-            {"target_r": max(.25, root["target_r"] * .8),
-             "stop_atr": min(10.0, root["stop_atr"] * 1.15)},
-            {"volume_multiplier": min(10.0, root["volume_multiplier"] * 1.25),
-             "confirmation": "volume"},
-        ]
-    elif failure == "low_win_rate":
-        changes = [
-            {"target_r": max(.25, root["target_r"] * .7)},
-            {"threshold_bps": min(500.0, root["threshold_bps"] * 1.5 + 1),
-             "confirmation": "trend"},
-            {"max_hold_bars": max(1, int(root["max_hold_bars"] * .65)),
-             "confirmation": "volume"},
-        ]
-    elif failure == "excess_drawdown":
-        changes = [
-            {"threshold_bps": min(500.0, root["threshold_bps"] * 1.5 + 1),
-             "confirmation": "trend"},
-            {"stop_atr": max(.2, root["stop_atr"] * .8),
-             "max_hold_bars": max(1, int(root["max_hold_bars"] * .7))},
-            {"side": "long", "confirmation": "volume"},
-        ]
-    else:
-        changes = [
-            {"target_r": min(10.0, root["target_r"] * 1.25)},
-            {"threshold_bps": min(500.0, root["threshold_bps"] + 5),
-             "confirmation": "trend"},
-            {"lookback": min(120, root["lookback"] + 5),
-             "slow_lookback": min(240, max(root["slow_lookback"] + 8,
-                                             root["lookback"] + 6))},
-        ]
-    variants: list[tuple[dict, str]] = [
-        (root, mutation_reason(root, root, diagnostic))]
-    seen = {rule_variant_id(root)}
-    for change in changes:
-        if len(variants) >= int(count):
-            break
-        try:
-            candidate = _safe_variant(root, **change)
-        except ValueError:
-            continue
-        if rule_variant_id(candidate) not in seen:
-            seen.add(rule_variant_id(candidate))
-            variants.append((candidate, mutation_reason(root, candidate, diagnostic)))
-    attempt = 0
-    while len(variants) < int(count) and attempt < 64:
-        attempt += 1
-        lookback = 3 + ((int(root["lookback"]) - 3 + attempt) % 118)
-        candidate = _safe_variant(
-            root,
-            lookback=lookback,
-            slow_lookback=max(lookback + 2,
-                              min(240, int(root["slow_lookback"]) + attempt)),
-            threshold_bps=(float(root["threshold_bps"]) + attempt * 7.0) % 500.0,
-            target_r=.25 + ((float(root["target_r"]) - .25 + attempt * .25) % 9.75),
-        )
-        if rule_variant_id(candidate) not in seen:
-            seen.add(rule_variant_id(candidate))
-            variants.append((candidate,
-                             mutation_reason(root, candidate, diagnostic,
-                                             swept=True)))
+    variants = coordinate_mutation_pool(spec, diagnostic)[:int(count)]
     if len(variants) != int(count):
         raise FactoryError("could not form the requested number of unique variants")
     return variants
@@ -915,8 +1009,8 @@ MAX_DISCOVERY_ATTEMPTS = (
 def discovery_spec(index: int, *, family: str) -> dict[str, Any]:
     """Return the deterministic *index*-th conditional variant of a family.
 
-    The ladder dimensions have pairwise-coprime lengths (5, 5, 4, 7 against a
-    7-family rotation) so consecutive indices vary several axes at once rather
+    The ladder dimensions have mixed lengths (5, 5, 4, 7 against an 11-family
+    rotation) so consecutive indices vary several axes at once rather
     than sweeping one and repeating.
     """
 

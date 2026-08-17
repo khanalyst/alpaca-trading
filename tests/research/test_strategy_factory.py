@@ -59,13 +59,22 @@ def fake_adequate_worker(payload):
     hypothesis = payload["hypothesis"]
     if int(hypothesis["slot"]) == 0:
         time.sleep(.02)
-    specs = mutate_from_diagnosis(
-        hypothesis["rule_spec"], {"primary_failure": "negative_expectancy"},
-        int(payload["variants_per_strategy"]))
-    # Twenty sessions: the held-out partition must be large enough to support
-    # rolling-origin folds, otherwise the variant is under-powered rather than
-    # adequately failed and the family is never eligible for replacement.
-    sessions = [f"2026-01-{day:02d}" for day in range(5, 25)]
+    # Use the orchestrator-selected specs. Reconstructing the old first batch
+    # here would hide refinement progression and replay duplicate identities.
+    specs = [validate_rule_spec(item) for item in payload["specs"]]
+    # The terminal-negative protocol requires at least 30 held-out sessions.
+    # With the factory's 70/30 split, 120 sessions leave 36 held out and three
+    # adequately sized, independently negative walk-forward windows.
+    sessions = [
+        (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=index))
+        .date().isoformat()
+        for index in range(120)
+    ]
+    replay_sessions = sorted({
+        (row.timestamp.date().isoformat() if hasattr(row, "timestamp") else
+         str(row["timestamp"])[:10])
+        for row in payload.get("bars", ())
+    })
     control_rows = [
         {"vehicle": payload["vehicle"], "symbol": "SPY", "session_date": session,
          "opportunity_id": f"control:{session}", "net_pnl": 0.0,
@@ -76,11 +85,13 @@ def fake_adequate_worker(payload):
     for spec in specs:
         variant_id = rule_variant_id(spec)
         rows = [{**row, "opportunity_id": f"{variant_id}:{row['session_date']}",
-                 "net_pnl": -1.0, "return_value": -.00001}
+                 "net_pnl": -1.0, "return_value": -.00001,
+                 "risk_usd": 10.0, "r_multiple": -0.1}
                 for row in control_rows]
         variants.append({
             "variant_id": variant_id, "rule_spec": spec, "vehicle": payload["vehicle"],
-            "account": {"account_id": f"account:{hypothesis['hypothesis_id']}:{variant_id}",
+            "account": {"account_id": (f"account:{hypothesis['hypothesis_id']}:"
+                                        f"{variant_id}:{uuid.uuid4().hex[:8]}"),
                         "starting_cash": payload["starting_cash"],
                         "ending_equity": payload["starting_cash"] - len(rows),
                         "realized_pnl": -float(len(rows)), "max_drawdown": float(len(rows)),
@@ -90,7 +101,11 @@ def fake_adequate_worker(payload):
         })
     return {"hypothesis": hypothesis, "mode": payload["mode"],
             "diagnostic": {"primary_failure": "negative_expectancy", "net_pnl": -6},
-            "evaluation_start": sessions[0], "evaluation_end": sessions[-1],
+            # This fixture isolates replacement lifecycle behavior. Dedicated
+            # tests exercise coordinate -> interaction -> confirmation.
+            "refinement": {"phase": "confirmatory"},
+            "evaluation_start": replay_sessions[0] if replay_sessions else sessions[0],
+            "evaluation_end": replay_sessions[-1] if replay_sessions else sessions[-1],
             "variants": list(reversed(variants)), "control_rows": control_rows,
             "expected_variants": len(specs), "worker_pid": int(hypothesis["slot"]) + 100}
 
@@ -407,13 +422,13 @@ class StrategyFactoryTests(unittest.TestCase):
         with self.assertRaises(RuleSpecError):
             validate_rule_spec({"family": "invented_alpha"})
 
-    def test_initial_catalog_has_seven_distinct_hypotheses(self):
+    def test_initial_catalog_covers_all_eleven_rule_families(self):
         hypotheses = initial_hypotheses()
-        self.assertEqual(len(hypotheses), 7)
-        self.assertEqual(len({item.family for item in hypotheses}), 7)
-        self.assertEqual(len({item.hypothesis_id for item in hypotheses}), 7)
-        with self.assertRaisesRegex(FactoryError, "between 1 and 7"):
-            initial_hypotheses(8)
+        self.assertEqual(len(hypotheses), 11)
+        self.assertEqual(len({item.family for item in hypotheses}), 11)
+        self.assertEqual(len({item.hypothesis_id for item in hypotheses}), 11)
+        with self.assertRaisesRegex(FactoryError, "between 1 and 11"):
+            initial_hypotheses(12)
 
     def test_diagnosis_drives_bounded_mutations(self):
         root = initial_hypotheses(1)[0].rule_spec
@@ -462,7 +477,7 @@ class StrategyFactoryTests(unittest.TestCase):
                 sorted((row["hypothesis_id"], row["variant_id"])
                        for row in result["results"]))
             self.assertEqual(len(result["replacements"]), 2)
-            self.assertTrue(all(item["not_before"] == "2026-01-24"
+            self.assertTrue(all(item["not_before"] == "2026-01-14"
                                 for item in result["replacements"]))
 
         with tempfile.TemporaryDirectory() as directory, \
@@ -658,7 +673,7 @@ class StrategyFactoryTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "retirement requires"):
                 ledger.event(parent["hypothesis_id"], "retired", "manual")
 
-    def test_default_seven_strategy_shape_runs_fourteen_isolated_arms(self):
+    def test_configured_seven_strategy_shape_runs_fourteen_isolated_arms(self):
         with tempfile.TemporaryDirectory() as directory:
             result = run_factory(
                 losing_breakouts(3), db_path=Path(directory) / "edge.sqlite3",
