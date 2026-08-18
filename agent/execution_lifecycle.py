@@ -24,6 +24,7 @@ _TERMINAL_ORDER_STATUSES = {
 _PROTECTIVE_TERMINAL_STATUSES = _TERMINAL_ORDER_STATUSES | {
     "done", "closed", "done_for_day",
 }
+_OPTION_PROFILES = frozenset({"option", "options"})
 
 
 _EDGE_OUTBOX_WARN = 500
@@ -114,7 +115,12 @@ def _option_trade(trade: Any) -> bool:
     the lost-protection condition that a half-dead equity bracket is.
     """
     return (isinstance(trade, Mapping) and
-            str(trade.get("execution_profile", "")).lower() == "options")
+            str(trade.get("execution_profile", "")).lower() in _OPTION_PROFILES)
+
+
+def _option_profile(profile: Any) -> bool:
+    """Whether an execution profile uses the single-leg option semantics."""
+    return str(profile or "").lower() in _OPTION_PROFILES
 
 
 def _value(obj: Any, name: str, default=None):
@@ -124,6 +130,75 @@ def _value(obj: Any, name: str, default=None):
 
 
 class ExecutionLifecycleMixin:
+    def _risk_telemetry(self, plan: Mapping, profile: str,
+                        requested_qty: float | None, planned_qty: float | None,
+                        multiplier: float, filled_qty: float,
+                        fill_price: float | None) -> tuple[float | None, float | None,
+                                                          float | None, float | None]:
+        """Return intended/delivered risk and delivery telemetry.
+
+        ``intended`` is captured from the immutable sizing plan at the
+        requested quantity.  ``delivered`` is recomputed from cumulative
+        broker fills, using stop distance for shares and premium paid times
+        contract multiplier for options.  Missing legacy plan/price fields
+        fall back to quantity-proportional values so old state remains
+        observable without changing admission or sizing behavior.
+        """
+        plan = plan if isinstance(plan, Mapping) else {}
+        profile_key = str(profile or "shares").lower()
+        requested = self._number(requested_qty)
+        planned = self._number(planned_qty) or requested
+        multiplier = abs(self._number(multiplier) or 1.0)
+
+        intended = self._number(plan.get("risk_usd"))
+        if intended is not None and requested and planned and planned > 0:
+            # A plan's risk is normally already sized to the request.  Scale
+            # only when the durable planned/requested quantities differ.
+            intended *= requested / planned
+        if intended is None:
+            entry = (self._number(plan.get("entry_price")) or
+                     self._number(plan.get("entry_reference")) or
+                     self._number(plan.get("reference_price")))
+            if _option_profile(profile_key):
+                option = plan.get("option") if isinstance(plan.get("option"), Mapping) else {}
+                premium = (self._number(option.get("debit")) or entry)
+                if premium is not None and requested and requested > 0:
+                    intended = abs(premium) * requested * multiplier
+            else:
+                stop = self._number(plan.get("underlying_stop_price"))
+                if stop is None:
+                    stop = self._number(plan.get("stop_price"))
+                if entry is not None and stop is not None and requested and requested > 0:
+                    intended = abs(entry - stop) * requested * multiplier
+
+        filled = max(0.0, self._number(filled_qty) or 0.0)
+        delivered: float | None = 0.0 if filled <= 0 else None
+        price = self._number(fill_price)
+        if filled > 0 and price is not None and price == price and abs(price) != float("inf"):
+            if _option_profile(profile_key):
+                delivered = abs(price) * filled * multiplier
+            else:
+                stop = self._number(plan.get("underlying_stop_price"))
+                if stop is None:
+                    stop = self._number(plan.get("stop_price"))
+                if stop is not None:
+                    delivered = abs(price - stop) * filled * multiplier
+        if delivered is None and intended is not None and planned and planned > 0:
+            delivered = intended * (filled / planned)
+        if delivered is not None:
+            delivered = round(delivered, 12)
+        if intended is not None:
+            intended = round(intended, 12)
+        ratio = (delivered / intended if delivered is not None and intended and intended > 0
+                 else (0.0 if delivered is not None and intended == 0 else None))
+        shortfall = (max(0.0, intended - delivered)
+                     if intended is not None and delivered is not None else None)
+        if ratio is not None:
+            ratio = round(ratio, 12)
+        if shortfall is not None:
+            shortfall = round(shortfall, 12)
+        return intended, delivered, ratio, shortfall
+
     def _client_order_pending(self, client_order_id: str | None) -> bool:
         if not client_order_id:
             return False
@@ -145,14 +220,14 @@ class ExecutionLifecycleMixin:
             filled_qty = float(request.qty)
         fill_price = self._number(getattr(order, "filled_avg_price", None))
         profile = str(risk_plan.get("execution_profile", "shares") or "shares").lower()
-        vehicle = "option" if profile in {"option", "options"} else "equity"
+        vehicle = "option" if _option_profile(profile) else "equity"
         option = risk_plan.get("option") if isinstance(risk_plan.get("option"), Mapping) else {}
         # These are plan-time values, not reconstructed from any observed
         # fill.  Options are priced in their own premium unit; the underlying
         # entry price is retained separately on the active trade.
         reference = (risk_plan.get("reference_price")
                      or risk_plan.get("entry_reference")
-                     or (option.get("debit") if profile == "options" else None)
+                     or (option.get("debit") if _option_profile(profile) else None)
                      or risk_plan.get("entry_price"))
         planned_qty = self._number(risk_plan.get("planned_qty"))
         if planned_qty is None:
@@ -161,6 +236,14 @@ class ExecutionLifecycleMixin:
         market_price = (self._number(risk_plan.get("market_price"))
                         or self._number(risk_plan.get("mid_price")))
         mid_price = self._number(risk_plan.get("mid_price"))
+        option_multiplier = (risk_plan.get("option", {}).get("multiplier")
+                             if isinstance(risk_plan.get("option"), Mapping)
+                             else None)
+        multiplier = (self._number(risk_plan.get("contract_multiplier")) or
+                      self._number(option_multiplier) or 1.0)
+        intended_risk, delivered_risk, risk_ratio, risk_shortfall = \
+            self._risk_telemetry(risk_plan, profile, requested_qty, planned_qty,
+                                 multiplier, filled_qty, fill_price)
         order_state = {
             "order_id": order_id, "symbol": symbol, "status": status,
             "client_order_id": request.client_order_id, "qty": str(request.qty),
@@ -176,6 +259,11 @@ class ExecutionLifecycleMixin:
             "exit_reference": self._number(risk_plan.get("exit_reference")),
             "market_price": market_price, "mid_price": mid_price,
             "requested_qty": requested_qty, "planned_qty": planned_qty,
+            "risk_usd": delivered_risk,
+            "intended_risk_usd": intended_risk,
+            "delivered_risk_usd": delivered_risk,
+            "risk_delivery_ratio": risk_ratio,
+            "risk_shortfall_usd": risk_shortfall,
             "protective_legs": _protective_legs(getattr(order, "legs", ())),
             "risk_plan": _plain(risk_plan), "fill_logged": False,
             "logged_filled_qty": 0.0, "logged_filled_avg_price": None,
@@ -188,6 +276,7 @@ class ExecutionLifecycleMixin:
                     current, order_state, filled_qty, fill_price)
             return current
         current = state.update_state(update)
+        persisted_order = current.get("orders", {}).get(order_id, order_state)
         state.log_order(order, request, action="submit", run_id=self.run_id,
                         runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                         setup_id=risk_plan.get("setup_id"),
@@ -202,7 +291,12 @@ class ExecutionLifecycleMixin:
                         fill_fraction=(filled_qty / requested_qty
                                        if requested_qty and requested_qty > 0 else None),
                         filled_fraction=(filled_qty / requested_qty
-                                         if requested_qty and requested_qty > 0 else None))
+                                         if requested_qty and requested_qty > 0 else None),
+                        risk_usd=persisted_order.get("risk_usd"),
+                        intended_risk_usd=persisted_order.get("intended_risk_usd"),
+                        delivered_risk_usd=persisted_order.get("delivered_risk_usd"),
+                        risk_delivery_ratio=persisted_order.get("risk_delivery_ratio"),
+                        risk_shortfall_usd=persisted_order.get("risk_shortfall_usd"))
         self._event("order_submitted", {"symbol": request.symbol, "qty": str(request.qty),
                                          "status": status, "filled_qty": filled_qty,
                                          "client_order_id": request.client_order_id,
@@ -217,8 +311,8 @@ class ExecutionLifecycleMixin:
         plan = order_state.get("risk_plan", {})
         plan = plan if isinstance(plan, Mapping) else {}
         symbol = str(order_state.get("symbol", "")).upper()
-        profile = str(plan.get("execution_profile", "shares"))
-        vehicle = "option" if profile.lower() in {"option", "options"} else "equity"
+        profile = str(plan.get("execution_profile", "shares")).lower()
+        vehicle = "option" if _option_profile(profile) else "equity"
         underlying = str(plan.get("underlying_symbol") or
                          (symbol if profile == "shares" else "")).upper()
         direction = str(plan.get("direction") or
@@ -226,7 +320,7 @@ class ExecutionLifecycleMixin:
         instrument_entry = fill_price
         if instrument_entry is None:
             instrument_entry = self._number(
-                plan.get("option", {}).get("debit") if profile == "options" and
+                plan.get("option", {}).get("debit") if _option_profile(profile) and
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         existing = current.get("active_trades", {}).get(symbol, {})
         existing = existing if isinstance(existing, Mapping) else {}
@@ -243,7 +337,7 @@ class ExecutionLifecycleMixin:
             fill_price = self._number(existing.get("entry_price"))
         if fill_price is None:
             fill_price = self._number(
-                plan.get("option", {}).get("debit") if profile == "options" and
+                plan.get("option", {}).get("debit") if _option_profile(profile) and
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         instrument_entry = fill_price
 
@@ -263,17 +357,19 @@ class ExecutionLifecycleMixin:
             if implied == implied and abs(implied) != float("inf"):
                 incremental_price = implied
 
-        multiplier = self._number(plan.get("contract_multiplier"))
+        option = plan.get("option") if isinstance(plan.get("option"), Mapping) else {}
+        option_multiplier = option.get("multiplier")
+        multiplier = (self._number(plan.get("contract_multiplier")) or
+                      self._number(option_multiplier))
         multiplier = abs(multiplier) if multiplier is not None and multiplier > 0 else 1.0
         requested_qty = (self._number(order_state.get("requested_qty"))
                          or self._number(order_state.get("qty"))
                          or self._number(plan.get("planned_qty")))
         planned_qty = (self._number(order_state.get("planned_qty"))
                        or requested_qty)
-        option = plan.get("option") if isinstance(plan.get("option"), Mapping) else {}
         entry_reference = (self._number(plan.get("entry_reference"))
                            or self._number(plan.get("reference_price"))
-                           or (self._number(option.get("debit")) if profile == "options" else None)
+                           or (self._number(option.get("debit")) if _option_profile(profile) else None)
                            or self._number(plan.get("entry_price")))
         market_price = (self._number(plan.get("market_price"))
                         or self._number(plan.get("mid_price")))
@@ -291,7 +387,7 @@ class ExecutionLifecycleMixin:
             risk = None
             if price is not None and price == price and abs(price) != float("inf"):
                 notional = abs(price) * quantity * multiplier
-                if profile == "options":
+                if _option_profile(profile):
                     # A long option's defined opening risk is the debit paid.
                     risk = notional
                 else:
@@ -310,6 +406,30 @@ class ExecutionLifecycleMixin:
                     round(risk, 12) if risk is not None else None)
 
         cumulative_notional, cumulative_risk = economics(filled_qty, fill_price)
+        intended_risk, delivered_risk, risk_ratio, risk_shortfall = \
+            self._risk_telemetry(plan, profile, requested_qty, planned_qty,
+                                 multiplier, filled_qty, fill_price)
+        if delivered_risk is None:
+            delivered_risk = cumulative_risk
+            if intended_risk is not None and delivered_risk is not None:
+                risk_ratio = (delivered_risk / intended_risk
+                              if intended_risk > 0 else 0.0)
+                risk_shortfall = max(0.0, intended_risk - delivered_risk)
+        if delivered_risk is not None:
+            delivered_risk = round(delivered_risk, 12)
+        if risk_ratio is not None:
+            risk_ratio = round(risk_ratio, 12)
+        if risk_shortfall is not None:
+            risk_shortfall = round(risk_shortfall, 12)
+        # ``risk_usd`` historically represented the cumulative open-position
+        # risk. Keep it as a compatibility alias for delivered risk.
+        order_state.update({
+            "risk_usd": delivered_risk,
+            "intended_risk_usd": intended_risk,
+            "delivered_risk_usd": delivered_risk,
+            "risk_delivery_ratio": risk_ratio,
+            "risk_shortfall_usd": risk_shortfall,
+        })
         trade = {
             "symbol": symbol, "underlying_symbol": underlying,
             "execution_profile": profile, "vehicle": vehicle,
@@ -335,13 +455,17 @@ class ExecutionLifecycleMixin:
             "max_hold_bars": plan.get("max_hold_bars", existing.get("max_hold_bars")),
             "hold_deadline_ts": plan.get("hold_deadline_ts",
                                          existing.get("hold_deadline_ts")),
-            "risk_usd": cumulative_risk,
+            "risk_usd": delivered_risk,
+            "intended_risk_usd": intended_risk,
+            "delivered_risk_usd": delivered_risk,
+            "risk_delivery_ratio": risk_ratio,
+            "risk_shortfall_usd": risk_shortfall,
             "notional": cumulative_notional, "variant_id": plan.get("variant_id"),
             "candidate_id": plan.get("candidate_id"),
             "proof_run_id": plan.get("proof_run_id"),
             "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
             "strategy_version": plan.get("strategy_version", self.cfg.get("strategy", {}).get("version")),
-            "contract_multiplier": plan.get("contract_multiplier", 1),
+            "contract_multiplier": multiplier,
         }
         # The broker-resident bracket legs are the position's real protection.
         # Keep the ids observed at submission; a later reconciliation refreshes
@@ -384,6 +508,10 @@ class ExecutionLifecycleMixin:
                                if requested_qty and requested_qty > 0 else None),
                 filled_fraction=(filled_qty / requested_qty
                                  if requested_qty and requested_qty > 0 else None),
+                intended_risk_usd=intended_risk,
+                delivered_risk_usd=delivered_risk,
+                risk_delivery_ratio=risk_ratio,
+                risk_shortfall_usd=risk_shortfall,
                 runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                 run_id=self.run_id)
             order_state["fill_logged"] = True
@@ -718,7 +846,7 @@ class ExecutionLifecycleMixin:
                           now: datetime) -> float | None:
         """Return the underlying price used by both stock and option exits."""
         profile = str(trade.get("execution_profile", "shares")).lower()
-        if profile != "options":
+        if not _option_profile(profile):
             direct = self._number(_value(position, "current_price",
                                          _value(position, "price", None)))
             if direct is not None and direct > 0:
@@ -986,17 +1114,21 @@ class ExecutionLifecycleMixin:
                 status = old_status
             if fill_price is None or broker_filled_qty < saved_filled_qty:
                 fill_price = saved_fill_price or fill_price
+            fill_growth = filled_qty > saved_filled_qty
             saved.update({"status": status, "filled_qty": filled_qty,
                           "filled_avg_price": fill_price, "not_found_count": 0,
                           "updated_ts": time.time()})
             logged_qty = self._number(saved.get("logged_filled_qty")) or 0.0
+            logged_avg = self._number(saved.get("logged_filled_avg_price"))
+            avg_changed = (fill_price is not None and
+                           (logged_avg is None or abs(fill_price - logged_avg) > 1e-12))
             if (filled_qty > 0 and saved.get("risk_plan") and
-                    (not saved.get("fill_logged") or filled_qty > logged_qty)):
+                    (not saved.get("fill_logged") or filled_qty > logged_qty or avg_changed)):
                 # Some broker snapshots expose filled_qty before updating the
                 # order status.  Durable quantity growth is enough evidence
                 # to protect and journal the incremental fill.
                 self._activate_filled_trade(current, saved, filled_qty, fill_price)
-            if status != old_status:
+            if status != old_status or fill_growth or avg_changed:
                 evidence_plan = saved.get("risk_plan") if isinstance(
                     saved.get("risk_plan"), Mapping) else {}
                 evidence_profile = str(saved.get(
@@ -1004,7 +1136,7 @@ class ExecutionLifecycleMixin:
                     evidence_plan.get("execution_profile", "shares")) or "shares").lower()
                 evidence_vehicle = str(saved.get(
                     "vehicle",
-                    "option" if evidence_profile in {"option", "options"} else "equity"))
+                    "option" if _option_profile(evidence_profile) else "equity"))
                 evidence_requested = (self._number(saved.get("requested_qty"))
                                       or self._number(saved.get("qty")))
                 evidence_planned = (self._number(saved.get("planned_qty"))
@@ -1027,7 +1159,12 @@ class ExecutionLifecycleMixin:
                     fill_fraction=(filled_qty / evidence_requested
                                    if evidence_requested and evidence_requested > 0 else None),
                     filled_fraction=(filled_qty / evidence_requested
-                                     if evidence_requested and evidence_requested > 0 else None))
+                                     if evidence_requested and evidence_requested > 0 else None),
+                    risk_usd=saved.get("risk_usd"),
+                    intended_risk_usd=saved.get("intended_risk_usd"),
+                    delivered_risk_usd=saved.get("delivered_risk_usd"),
+                    risk_delivery_ratio=saved.get("risk_delivery_ratio"),
+                    risk_shortfall_usd=saved.get("risk_shortfall_usd"))
 
         pending_by_symbol: dict[str, list[dict]] = {}
         for saved in order_state.values():
@@ -1084,7 +1221,11 @@ class ExecutionLifecycleMixin:
                 # unprotected; the same cycle's monitor closes it fail-closed.
                 item = {"symbol": symbol, "underlying_symbol": symbol,
                         "execution_profile": "unknown", "opened_at": time.time(),
-                        "status": "unprotected", "risk_usd": 0.0}
+                        "status": "unprotected", "risk_usd": 0.0,
+                        "intended_risk_usd": None,
+                        "delivered_risk_usd": 0.0,
+                        "risk_delivery_ratio": None,
+                        "risk_shortfall_usd": None}
                 prior_attempts = [
                     self._number(saved.get("attempt", saved.get("closing_attempt")))
                     for saved in order_state.values()
@@ -1280,7 +1421,7 @@ class ExecutionLifecycleMixin:
         realized_value = self._number(realized)
         if not variant_id or realized_value is None:
             return
-        vehicle = "option" if str(trade.get("execution_profile")) == "options" else "equity"
+        vehicle = "option" if _option_profile(trade.get("execution_profile")) else "equity"
         risk_usd = self._number(trade.get("risk_usd"))
         opened = self._number(trade.get("opened_at")) or time.time()
         outcome = {

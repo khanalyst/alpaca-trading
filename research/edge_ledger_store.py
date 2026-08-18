@@ -37,12 +37,17 @@ SCHEMA_VERSION = 3
 #
 # Bump this whenever a replay or gate change invalidates previously recorded
 # runs.  Runs are stamped at ``append_run``; a run with no stamp is epoch 1.
-# Epoch 3 additionally enforces economics gates (the 30 bps stop floor,
+# Epoch 3 additionally enforced economics gates (the 30 bps stop floor,
 # recomputable round-trip risk-unit coverage, quote-only proof quality, and
-# adequately powered qualification evidence).  Existing rows remain readable
-# and are quarantined by the eligibility checks until replayed under this
-# generation.
-REPLAY_ENGINE_EPOCH = 3
+# adequately powered qualification evidence).  Epoch 4 changes material
+# replay semantics again: point-in-time availability is bounded by the latest
+# of event timestamp, source ``as_of``, and ``observed_at``; authorizing
+# statistics exclude non-executable fallback rows; vehicle-specific cost
+# selection/provenance and raw-p FDR accounting are persisted; and runtime
+# assumptions include a stressed-cost abstention boundary.  Existing rows
+# remain readable and are quarantined by eligibility checks until replayed
+# under this generation.
+REPLAY_ENGINE_EPOCH = 4
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 

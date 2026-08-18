@@ -31,7 +31,8 @@ from research.llm_strategy import (
 )
 import research.gates as gates
 import research.strategy_factory as factory_module
-from research.strategy_factory import _lesson_brief, _tuned_variants, run_factory
+from research.strategy_factory import (_lesson_brief, _sanitize_fit_selection,
+                                        _tuned_variants, run_factory)
 
 from .test_strategy_factory import losing_breakouts
 
@@ -754,6 +755,83 @@ class FeedbackLoopTests(unittest.TestCase):
                 db.execute("DROP TABLE factory_lesson_outcomes")
                 db.execute("DROP TABLE factory_lessons")
             self.assertEqual(_lesson_brief(factory, vehicle="equity"), [])
+
+
+class FitSelectionSanitizerTests(unittest.TestCase):
+    """Only fit aggregates may cross from the factory into a model seam."""
+
+    def test_recursive_projection_drops_post_selection_and_raw_fields(self):
+        unsafe = {
+            **DIAGNOSIS,
+            "p_value": .001,
+            "q_value": .002,
+            "heldout": [{"net_pnl": 9999}],
+            "fit_diagnostics": {
+                "scope": "fit_only",
+                "eligible_prefix": {"eligible": 4, "heldout": 99},
+                "gate": {"passes": True},
+                "raw_rows": [{"close": 1}],
+            },
+        }
+        projected = _sanitize_fit_selection(
+            unsafe, context="diagnostic", label="diagnosis")
+        encoded = json.dumps(projected, sort_keys=True)
+        for token in ("p_value", "q_value", "heldout", "gate", "passes",
+                      "raw_rows", "close"):
+            self.assertNotIn(token, encoded)
+        self.assertEqual(projected["fit_diagnostics"]["eligible_prefix"]["eligible"], 4)
+
+    def test_unsafe_lesson_fields_do_not_reach_tuner_or_change_choices(self):
+        captured = []
+
+        class Recorder:
+            def tune(inner, *, diagnosis, lessons, **_kwargs):
+                captured.append((diagnosis, lessons))
+                return ProposalResult(False, error="recording only")
+
+        coordinate = coordinate_mutation_pool(ROOT, DIAGNOSIS)
+        failed = frozenset(rule_variant_id(spec) for spec, _ in coordinate)
+        lessons = [{
+            "id": "a1b2c3d4e5f6",
+            "tried": {"threshold_bps": {"from": 5.0, "to": 6.0}},
+            "heldout_delta": 999.0,
+            "q_value": .001,
+            "failed_checks": ["heldout_delta_positive"],
+            "raw_rows": [{"close": 1}],
+            "verdict": "passed",
+        }, {
+            "id": "0f1e2d3c4b5a",
+            "tried": {"target_r": {"from": 2.0, "to": 2.2}},
+            "heldout_delta": -999.0,
+            "q_value": .99,
+            "failed_checks": ["heldout_delta_positive"],
+            "raw_rows": [{"close": 2}],
+            "verdict": "failed",
+        }]
+        baseline, _ = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=3,
+            vehicle="equity", llm_enabled=True, config={"model": "test"},
+            adapter=Recorder(), lessons=lessons, already_failed=failed)
+        # A second call is deliberately given adversarial values.  The same
+        # bounded interaction coordinate must be selected because held-out
+        # fields are not part of the model-selection projection.
+        adversarial = [{**lessons[0], "heldout_delta": -999.0,
+                        "p_value": .99, "passes": False},
+                       {**lessons[1], "heldout_delta": 999.0,
+                        "p_value": .001, "passes": True}]
+        changed, _ = _tuned_variants(
+            {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=3,
+            vehicle="equity", llm_enabled=True, config={"model": "test"},
+            adapter=Recorder(), lessons=adversarial, already_failed=failed)
+        self.assertEqual([item.rule_spec for item in baseline],
+                         [item.rule_spec for item in changed])
+        diagnosis, seen_lessons = captured[-1]
+        encoded = json.dumps({"diagnosis": diagnosis, "lessons": seen_lessons},
+                             sort_keys=True)
+        for token in ("heldout", "q_value", "p_value", "failed_checks",
+                      "raw_rows", "passes"):
+            self.assertNotIn(token, encoded)
+        self.assertEqual(seen_lessons[0]["verdict"], "passed")
 
 
 class SharedLearningTests(unittest.TestCase):

@@ -20,7 +20,8 @@ from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
 
 RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
-                          option_has_liquidity)
+                          option_has_liquidity, record_available_at,
+                          record_is_available)
 
 
 class ReplayError(ValueError):
@@ -137,6 +138,16 @@ class IBRTrade:
     entry_bar_provider: str | None = None
     exit_bar_feed: str | None = None
     exit_bar_provider: str | None = None
+    # The underlying anchor used to select/size the vehicle.  For options this
+    # is the snapshot/SIP spot, not the option premium in ``entry_reference``;
+    # retaining it lets null/reference controls stay executable when the entry
+    # bar's OHLC was observed after the decision boundary.
+    underlying_entry: float | None = None
+    # The signal's market timestamp remains ``signal_timestamp``.  A delayed
+    # recorder event may only become actionable later; retain that causal
+    # decision boundary separately so runtime/shadow comparisons do not
+    # silently pretend the signal was known at bar close.
+    decision_timestamp: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -224,9 +235,7 @@ def _session_start(day: date, cfg: IBRConfig, zone: ZoneInfo) -> datetime:
 
 def _visible(record: object, event_time: datetime) -> bool:
     """A value is usable only when its source was available by that instant."""
-    identity = getattr(record, "identity", None)
-    as_of = getattr(identity, "as_of", None)
-    return as_of is not None and as_of <= event_time
+    return record_is_available(record, event_time)
 
 
 def _validate_bars(bars: Sequence[UnderlyingBar], cfg: IBRConfig) -> list[UnderlyingBar]:
@@ -264,7 +273,9 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      exit_feed: str | None = None,
                      entry_provider: str | None = None,
                      exit_provider: str | None = None,
-                     planned_risk_per_unit: float | None = None) -> IBRTrade:
+                     planned_risk_per_unit: float | None = None,
+                     decision_timestamp: datetime | None = None,
+                     underlying_entry: float | None = None) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
     # P&L even when the underlying direction is short.
@@ -326,6 +337,9 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         signal_bar_feed=signal.feed, signal_bar_provider=signal.provider,
         entry_bar_feed=entry_bar.feed, entry_bar_provider=entry_bar.provider,
         exit_bar_feed=exit_bar.feed, exit_bar_provider=exit_bar.provider,
+        decision_timestamp=decision_timestamp,
+        underlying_entry=(float(underlying_entry)
+                          if underlying_entry is not None else None),
     )
 
 
@@ -377,7 +391,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # neighbouring session merely because its timestamp does.
     range_bars = [b for b in bars if b.identity.session_date == day
                   and start <= _local(b.timestamp, zone) < range_end
-                  and b.end <= range_end and _visible(b, b.end)]
+                  and b.end <= range_end
+                  and record_available_at(b) is not None]
     # A complete range is mandatory.  Missing bars must not make an apparent
     # edge by shrinking the range.
     expected = cfg.range_minutes
@@ -419,29 +434,48 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     if signal_idx + 1 >= len(post):
         return refuse("breakout_on_final_bar")
     signal = post[signal_idx]
-    entry_bar = post[signal_idx + 1]
-    if entry_bar.timestamp != signal.end:
-        # "Next bar" means the immediate following one-minute bar; carrying a
-        # signal across an outage would turn a stale breakout into an entry.
-        return refuse("entry_bar_not_adjacent")
-    # The hold window is the consecutive run beginning at the entry.  Every
-    # exit below — level, gap, and force-flat alike — is resolved inside it, so
-    # a position is never carried across a data outage and a later recorded
-    # minute is never treated as adjacent to the bar before the gap.
+    next_bar = post[signal_idx + 1]
+    if next_bar.timestamp != signal.end:
+        # Preserve the next-bar contract when the signal is actionable at the
+        # boundary.  If the signal was observed later, the causal entry can
+        # move to the first complete bar at/after that observation instead of
+        # manufacturing a fill from the stale next-bar OHLC.
+        signal_ready_values = [signal.end, *[record_available_at(item)
+                               for item in [*range_bars, signal]
+                               if record_available_at(item) is not None]]
+        signal_ready = max(signal_ready_values, default=None)
+        if signal_ready is None or signal_ready <= signal.end:
+            return refuse("entry_bar_not_adjacent")
+    else:
+        signal_ready_values = [signal.end, *[record_available_at(item)
+                               for item in [*range_bars, signal]
+                               if record_available_at(item) is not None]]
+        signal_ready = max(signal_ready_values, default=None)
+        if signal_ready is None:
+            return refuse("breakout_not_visible")
+    boundary = signal.end
+    entry_at = boundary if signal_ready <= boundary else signal_ready
+    # Do not inspect the next bar's OHLC when the completed signal was only
+    # observed after that bar opened.  The first full bar at/after entry_at is
+    # the provenance/exit bar; quote-backed execution can still enter at the
+    # exact observation instant between bar boundaries.
+    entry_index = next((i for i, bar in enumerate(post[signal_idx + 1:],
+                                                  signal_idx + 1)
+                        if bar.timestamp >= entry_at), None)
+    if entry_index is None:
+        return refuse("no_entry_bar_after_signal")
+    entry_bar = post[entry_index]
+    if (cfg.policy.latest_entry_time is not None and
+            _local(entry_at, zone).time() > cfg.policy.latest_entry_time):
+        return refuse("past_latest_entry_time")
+    # The hold window begins at the first full bar whose timestamp is not
+    # earlier than the causal entry instant.  A delayed signal therefore does
+    # not read the already-open next bar's high/low/close as if it were known.
     hold = [entry_bar]
-    for bar in post[signal_idx + 2:]:
+    for bar in post[entry_index + 1:]:
         if bar.timestamp != hold[-1].end:
             break
         hold.append(bar)
-    # The completed breakout must be visible by its close.  The next bar's
-    # *open* is the boundary observation; the completed bar record itself is
-    # naturally not published until its end. Executable pricing below still
-    # requires a point-in-time quote at the boundary.
-    if not _visible(signal, signal.end):
-        return refuse("breakout_not_visible")
-    if (cfg.policy.latest_entry_time is not None and
-            _local(entry_bar.timestamp, zone).time() > cfg.policy.latest_entry_time):
-        return refuse("past_latest_entry_time")
     long_break = (buffer_long(signal) if cfg.close_confirmed else signal.high > high)
     short_break = (buffer_short(signal) if cfg.close_confirmed else signal.low < low)
     # If one completed bar breaks both sides, stop-first tie semantics choose
@@ -449,7 +483,12 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     direction = "long" if long_break and not short_break else "short"
     if long_break and short_break:
         direction = "long" if (high - signal.open) <= (signal.open - low) else "short"
-    underlying_entry = entry_bar.open
+    # Recorder bars carry completed OHLC and are commonly observed at their
+    # close.  Only a boundary-visible bar may supply its opening print;
+    # strict quote-backed execution can instead use the quote as the boundary
+    # underlying anchor without consuming delayed OHLC.
+    entry_bar_visible = _visible(entry_bar, entry_bar.timestamp)
+    underlying_entry = float(entry_bar.open) if entry_bar_visible else None
     entry_ref = underlying_entry
     entry_source = BAR
     # Option snapshots are selected at/before the entry bar.  A caller may pass
@@ -467,27 +506,33 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         # instant is the real executable price; the bar open is a trade print
         # that has to be marked up by the modelled spread instead.
         quoted = quote_fill_record(
-            quotes, symbol=symbol, at=entry_bar.timestamp,
+            quotes, symbol=symbol, at=entry_at,
             side="buy" if direction == "long" else "sell",
             max_age_seconds=cfg.policy.max_market_data_age_seconds,
             session_date=day)
         if quoted is not None:
+            # A boundary quote is independent executable evidence.  Use it as
+            # the underlying anchor too, so a completed recorder bar observed
+            # after its open cannot leak its OHLC into strict replay.
+            underlying_entry = quoted.price
             entry_ref, entry_source = quoted.price, QUOTE
             entry_feed, entry_provider = quoted.feed, quoted.provider
             entry_quote_age_seconds = max(
-                0.0, (entry_bar.timestamp - quoted.timestamp).total_seconds())
+                0.0, (entry_at - quoted.timestamp).total_seconds())
         elif cfg.policy.strict_market_data:
             return refuse("no_quote_at_entry")
+        elif not entry_bar_visible:
+            return refuse("entry_bar_not_visible")
     if vehicle == "option":
         option_policy = cfg.policy
         if option_snapshots is None:
             return refuse("no_option_snapshots")
         wanted_right = "call" if direction == "long" else "put"
         eligible = [s for s in option_snapshots.values()
-                    if s.timestamp <= entry_bar.timestamp
-                    and _visible(s, entry_bar.timestamp)
+                    if s.timestamp <= entry_at
+                    and _visible(s, entry_at)
                     and s.session_date == day and s.ask > 0 and s.bid > 0
-                    and entry_bar.timestamp.timestamp() - s.timestamp.timestamp() <=
+                    and entry_at.timestamp() - s.timestamp.timestamp() <=
                         option_policy.max_market_data_age_seconds
                     and str(s.contract.underlying).upper() == str(symbol).upper()
                     and max(1, option_policy.options_min_dte) <= (s.contract.expiration - day).days <=
@@ -503,6 +548,19 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         spot = next((item.underlying_price for item in sorted(
             eligible, key=lambda item: (item.timestamp, item.contract.symbol), reverse=True)
             if item.underlying_price), underlying_entry)
+        if spot is None or spot <= 0:
+            # A delayed signal cannot use the stale next-bar OHLC as an
+            # underlying spot proxy.  Use an independently observed fresh SIP
+            # quote at the causal entry boundary when the option snapshot did
+            # not carry spot itself.
+            spot_quote = quote_fill_record(
+                quotes, symbol=symbol, at=entry_at,
+                side="buy" if direction == "long" else "sell",
+                max_age_seconds=cfg.policy.max_market_data_age_seconds,
+                session_date=day)
+            if spot_quote is None:
+                return refuse("entry_bar_not_visible")
+            underlying_entry = spot = spot_quote.price
         snap = min(eligible, key=lambda item: (
             abs(float(item.contract.strike) - float(spot)),
             (item.ask - item.bid) / ((item.ask + item.bid) / 2.0),
@@ -511,12 +569,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         contract = snap.contract
         selected_contract = contract
         entry_ref = snap.ask
+        if snap.underlying_price and snap.underlying_price > 0:
+            underlying_entry = float(snap.underlying_price)
+        elif underlying_entry is None:
+            return refuse("entry_bar_not_visible")
         if entry_ref <= 0:
             return refuse("option_entry_ask_not_positive")
         multiplier = snap.contract.multiplier
         entry_source = QUOTE
         entry_quote_age_seconds = max(
-            0.0, (entry_bar.timestamp - snap.timestamp).total_seconds())
+            0.0, (entry_at - snap.timestamp).total_seconds())
         entry_feed = str(snap.identity.feed)
         entry_provider = str(snap.identity.provider)
     # The runtime derives both levels from the completed breakout bar's close,
@@ -593,9 +655,10 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     for bar in hold:
         if _local(bar.timestamp, zone) >= close_at:
             break
-        if not _visible(bar, bar.end):
-            # An exit cannot use an as-yet-unavailable candle.  Continue to a
-            # later visible bar; force-flat below still requires visibility.
+        if record_available_at(bar) is None:
+            # A completed post-entry candle may be observed after its market
+            # end.  It is still valid resting-order outcome evidence once the
+            # full record exists; only the pre-entry bar is excluded above.
             continue
         # A gap through a level is filled at the bar open, not at an
         # impossible stop/target price.
@@ -626,6 +689,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     reason=reason, tie=False, gap=True, cfg=cfg,
                                     multiplier=multiplier, stop_price=stop,
                                     target_price=target, entry_source=entry_source,
+                                    entry_timestamp=entry_at,
+                                    decision_timestamp=signal_ready,
+                                    underlying_entry=underlying_entry,
                                     exit_source=exit_source,
                                     entry_quote_age_seconds=entry_quote_age_seconds,
                                     exit_quote_age_seconds=exit_quote_age_seconds,
@@ -653,6 +719,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     cfg=cfg, multiplier=multiplier,
                                     stop_price=stop, target_price=target,
                                     entry_source=entry_source,
+                                    entry_timestamp=entry_at,
+                                    decision_timestamp=signal_ready,
+                                    underlying_entry=underlying_entry,
                                     exit_source=(QUOTE if vehicle == "option" else BAR),
                                     entry_quote_age_seconds=entry_quote_age_seconds,
                                     exit_quote_age_seconds=exit_quote_age_seconds,
@@ -669,7 +738,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         exit_ref, exit_source, exit_feed, exit_provider = boundary_exit(
             last.open, last.timestamp)
     else:
-        candidates = [b for b in hold if b.end <= close_at and _visible(b, b.end)]
+        candidates = [b for b in hold if b.end <= close_at and
+                      record_available_at(b) is not None]
         if not candidates:
             return refuse("no_visible_bar_before_force_flat")
         last = candidates[-1]
@@ -690,6 +760,9 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             reason="force_flat", tie=False, gap=False, cfg=cfg,
                             multiplier=multiplier, stop_price=stop,
                             target_price=target, entry_source=entry_source,
+                            entry_timestamp=entry_at,
+                            decision_timestamp=signal_ready,
+                            underlying_entry=underlying_entry,
                             exit_source=(QUOTE if vehicle == "option" else exit_source),
                             entry_quote_age_seconds=entry_quote_age_seconds,
                             exit_quote_age_seconds=exit_quote_age_seconds,

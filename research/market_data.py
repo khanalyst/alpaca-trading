@@ -200,6 +200,43 @@ def _identity(payload: Mapping[str, Any], *, provider: str | None = None,
     )
 
 
+def record_available_at(record: Any) -> datetime | None:
+    """Return the earliest instant a normalized record is usable.
+
+    A provider event is available only after its market timestamp, provider
+    ``as_of`` timestamp, and local observation/ingestion timestamp have all
+    occurred.  Normalizers populate ``observed_at`` from the event timestamp
+    for legacy payloads that omit it, so this rule remains backwards
+    compatible while preventing delayed records from leaking into replay.
+
+    ``None`` is returned for malformed/non-normalized records.  Callers should
+    treat that as unavailable rather than guessing a timestamp.
+    """
+    identity = getattr(record, "identity", None)
+    event = getattr(record, "timestamp", None)
+    if event is None:
+        event = getattr(record, "ts", None)
+    as_of = getattr(identity, "as_of", None)
+    observed = getattr(identity, "observed_at", None)
+    values = (event, as_of, observed)
+    if any(not isinstance(value, datetime) or value.tzinfo is None or
+           value.utcoffset() is None for value in values):
+        return None
+    try:
+        return max(value.astimezone(UTC) for value in values)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def record_is_available(record: Any, cutoff: datetime) -> bool:
+    """Return whether a normalized record is available at ``cutoff``."""
+    if (not isinstance(cutoff, datetime) or cutoff.tzinfo is None or
+            cutoff.utcoffset() is None):
+        return False
+    available = record_available_at(record)
+    return available is not None and available <= cutoff.astimezone(UTC)
+
+
 @dataclass(frozen=True)
 class UnderlyingBar:
     symbol: str
@@ -287,6 +324,10 @@ class UnderlyingBar:
         return self.identity.as_of_ts
 
     @property
+    def observed_at(self) -> datetime:
+        return self.identity.observed_at
+
+    @property
     def timezone(self) -> str:
         return self.identity.timezone
 
@@ -361,6 +402,10 @@ class QuoteSnapshot:
     @property
     def as_of_ts(self) -> float:
         return self.identity.as_of_ts
+
+    @property
+    def observed_at(self) -> datetime:
+        return self.identity.observed_at
 
 
 @dataclass(frozen=True)
@@ -459,6 +504,10 @@ class OptionSnapshot:
     @property
     def as_of_ts(self) -> float:
         return self.identity.as_of_ts
+
+    @property
+    def observed_at(self) -> datetime:
+        return self.identity.observed_at
 
 
 def option_has_liquidity(snapshot: Any) -> bool:
@@ -605,5 +654,6 @@ __all__ = [
     "QuoteSnapshot", "UnderlyingBar", "normalize_option_contract",
     "normalize_option_snapshot", "normalize_quote",
     "normalize_underlying_bar", "option_has_liquidity",
-    "parse_timestamp", "NEW_YORK", "UTC",
+    "parse_timestamp", "record_available_at", "record_is_available",
+    "NEW_YORK", "UTC",
 ]

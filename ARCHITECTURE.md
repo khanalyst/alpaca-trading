@@ -139,13 +139,23 @@ broker status.
 
 The bounded rule grammar carries `max_hold_bars`, so a validated strategy has a
 time exit as well as a stop and a target. `agent.contracts.rule.hold_deadline`
-is the single definition of that exit: given the entry bar's opening timestamp
-(the bar after the signal bar) it returns the close of the last permitted bar,
-clamped to the session force-flat time. Both the research simulator
+is the single definition of that exit: given the causal entry timestamp (the
+signal's decision/observation time, or the immediate next-bar boundary when it
+was already actionable) it returns the close of the last permitted bar, clamped
+to the session force-flat time. Both the research simulator
 (`research.edge_discovery_core`, `research.factory_core`) and the live runtime
 (`agent.strategy` when building the setup plan) call it, so a strategy
 validated with an N-bar time exit runs with that same time exit rather than an
 approximation of it.
+
+The executable exit grammar is fixed to the ATR-derived bracket (including the
+30 bps minimum stop floor), configured R target, and bar-cap time exit. The
+factory's fit-only diagnostics expose signal eligibility, 30-bps floor binding,
+planned exits, configured/stressed economics, clustered power, behavioral alias
+fingerprints, and intended-versus-delivered risk for operator review. Planned
+signal/exit geometry may be counted as quote-required measurement when delayed
+pricing is unavailable; it remains non-authorizing. Diagnostics never expand
+the exit grammar or authorize a candidate.
 
 The runtime persists the resulting `hold_deadline_ts` on the trade, so the exit
 survives a restart. `agent.execution_lifecycle` fires the `max_hold` close from
@@ -246,6 +256,10 @@ The risk engine:
 - applies the runtime `ReplayPolicy` in research: strict 30-second market/quote
   freshness, latest-entry and force-flat cutoffs, and portfolio limits for
   concurrent positions, position notional, gross exposure, and open risk;
+- applies the configured stressed-cost scenario before submission and abstains
+  when its cost-to-risk ratio exceeds the limit, persisting scenario/cost/ratio
+  telemetry; execution lifecycle also records intended, delivered, and
+  shortfall risk for each fill; and
 - treats explicit malformed values as errors rather than falling back to a
   default; and
 - emits a durable plan whose entry/stop/target/risk/notional fields are the
@@ -300,21 +314,32 @@ trader separately.
 ### Normalized observations
 
 `research.market_data` defines point-in-time `UnderlyingBar`, `QuoteSnapshot`,
-`OptionContract`, and `OptionSnapshot` records. Normalization rejects naive or
-future timestamps, malformed OHLC/quotes, invalid provider/feed identity, and
-out-of-scope instruments. Session grouping uses `America/New_York` after
-timezone conversion.
+`OptionContract`, and `OptionSnapshot` records. Availability is bounded by the
+latest event timestamp, `as_of`, and `observed_at`; normalization rejects naive
+or future timestamps, `as_of > observed_at`, malformed OHLC/quotes, invalid
+provider/feed identity, and out-of-scope instruments. Session grouping uses
+`America/New_York` after timezone conversion. The shipped
+`execution.strict_market_data` default is `true`. Required records become
+actionable at the maximum of event timestamp, `as_of`, and `observed_at`;
+delayed bars can signal when observed, and execution enters at that
+decision/observation time using fresh SIP/OPRA evidence. Delayed full OHLC
+never backfills an earlier entry, partial pre-entry ranges are excluded, and
+historical bar fallback remains diagnostic and is excluded from authorizing
+statistics.
 
 ### Explicit IBR path
 
 `research.ibr` implements the initial-balance-range reference strategy. It
 requires contiguous completed opening-range bars, detects a breakout only
-after bar close, enters at the next bar open, applies gap-aware fills,
+after bar close, enters at the causal decision/observation time (the next-bar
+boundary when immediately actionable), applies gap-aware fills,
 resolves same-bar stop/target ties against the strategy, fills exit gaps at
 the gap open, prices boundary fills from recorded quotes where they exist,
 charges spread, slippage and fees through the shared cost model, and closes
 before the session boundary. Equity and option
-vehicles have separate books.
+vehicles have separate books. `cost_model_for_vehicle` applies any explicit
+vehicle schedule with recorded provenance; the shipped fallback is 4 bps
+spread, 6 bps slippage, and the configured per-side fees.
 
 `research.edge_discovery_core` owns deterministic corpus loading, effective
 IBR configuration, opportunity materialization, the randomized-entry null
@@ -362,8 +387,9 @@ index with the recorder's own scan — which is also the validator, so a repeate
 key or malformed row fails at write time rather than downstream. Three
 boundaries keep the result trustworthy: only completed sessions are written, so
 the recorder's continuity check never meets a mid-session hole; `as_of` is the
-bar's own open, so the completed-bar visibility rule applies unchanged; and
-options are never fabricated, because their quote-age semantics cannot be
+bar's completed one-minute boundary, while delayed observations are handled at
+their actionable availability time without backfilling an earlier entry; and options are never
+fabricated, because their quote-age semantics cannot be
 reconstructed from a historical endpoint. Backfill is resumable — a session
 with an existing partition is skipped — so re-running is a no-op.
 
@@ -374,11 +400,13 @@ universe width as well as history depth.
 ### Research scope
 
 A trader process runs one execution profile, so an edge proved in the other
-vehicle is evidence it can never deploy. `agent.edge.research_vehicles` resolves
-the profile to a vehicle and the nightly cycle studies only that, with
-`ALPACA_RESEARCH_VEHICLES` as an explicit override. The dashboard counts proved
-edges outside the tradeable vehicle so evidence stranded by a profile change is
-reported rather than silently unusable.
+vehicle is evidence it can never deploy. `agent.edge.research_vehicles` keeps
+the scheduled cycle on the equity lane by default, independently of the
+trader's execution profile. `ALPACA_RESEARCH_VEHICLES=all` is an explicit
+override that runs the equity and option lanes independently, with calibration
+and authorization kept per vehicle. The dashboard counts proved edges outside
+the tradeable vehicle so evidence stranded by a profile change is reported
+rather than silently unusable.
 
 ### Slot lifecycle
 
@@ -513,6 +541,17 @@ ledger across cycles, so a new cycle cannot reset allocated alpha or discovery
 history. The base allocation is `alpha / (n(n+1))`; each prior discovery starts
 the same telescoping reward stream. This preserves an infinite testing horizon
 without allowing offline candidate churn to exhaust it.
+
+Live-shadow ingestion splits each complete tail into older chronological
+selection sessions and a newer disjoint confirmatory window. BH selection uses
+only the former; the selected candidate is recomputed on the latter and only
+that raw confirmatory p-value is sent to LORD. Same-tail v3 evidence remains
+auditable but is quarantined under replay epoch 4. The current
+`REPLAY_ENGINE_EPOCH` is 4: older runs remain readable for audit, cannot validate
+or authorize runtime, and must be re-derived under epoch 4 to become eligible;
+future epochs are quarantined by the same exact-equality check. A current-epoch
+run seals one immutable verified gate proof; re-derivation appends a new proof
+instead of rewriting the old run.
 
 `research.edge_ledger_store` owns the SQLite schema and hashing primitives.
 `research.edge_ledger_proof` owns verified-gate persistence and re-verification.

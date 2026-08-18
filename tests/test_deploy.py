@@ -826,6 +826,7 @@ class DeployTests(unittest.TestCase):
                 dataset, root, ALPACA_RESEARCH_VEHICLES="all",
                 ALPACA_FACTORY_ENABLED="1")
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn('"vehicle": "equity"', result.stdout)
             self.assertIn('"vehicle": "option"', result.stdout)
             self.assertTrue(edge_db.is_file())
             with closing(sqlite3.connect(edge_db)) as db:
@@ -834,8 +835,8 @@ class DeployTests(unittest.TestCase):
                 ).fetchall())
             self.assertEqual(vehicles, {"equity": 11, "option": 11})
 
-    def test_research_cycle_studies_both_executable_vehicles_by_default(self):
-        """The scheduled research profile covers both executable vehicles."""
+    def test_research_cycle_studies_equity_only_by_default(self):
+        """The scheduled profile stays on the runtime's equity lane by default."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "market.jsonl"
@@ -865,7 +866,7 @@ class DeployTests(unittest.TestCase):
                 vehicles = dict(db.execute(
                     "SELECT vehicle, COUNT(*) FROM factory_hypotheses GROUP BY vehicle"
                 ).fetchall())
-            self.assertEqual(vehicles, {"equity": 11, "option": 11})
+            self.assertEqual(vehicles, {"equity": 11})
 
     def test_dashboard_tradeable_vehicle_matches_the_runtime_resolver(self):
         from agent.edge import runtime_vehicle

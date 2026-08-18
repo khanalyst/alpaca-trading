@@ -102,8 +102,10 @@ class FactoryWorkerViewTests(unittest.TestCase):
                               side_effect=observe_open):
                 replay_result = self._run(
                     full, worker_data=replay, db=root / "replay.sqlite3")
-            self.assertEqual(len(open_calls), 2,
-                             "diagnosis and evaluation should share read-only opens")
+            self.assertEqual(len(open_calls), 3,
+                             "diagnosis, fit probe, and evaluation use read-only opens")
+            self.assertEqual(len({descriptor.path for descriptor in open_calls}), 1,
+                             "fit probe reuses the finalized index rather than rebuilding/rescanning")
             self.assertTrue(seen_sources)
             self.assertTrue(all(source.resolve() == replay.resolve()
                                 for source in seen_sources))

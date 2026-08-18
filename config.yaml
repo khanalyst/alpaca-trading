@@ -45,7 +45,9 @@
     "max_position_notional_pct": 25.0,
     "options_min_dte": 7,
     "options_max_dte": 60,
-    "options_max_spread_pct": 10.0
+    "options_max_spread_pct": 10.0,
+    "stressed_cost_scenario_bps": 25.0,
+    "max_stressed_cost_to_risk_ratio": 1.0
   },
   "execution": {
     "order_type": "market",
@@ -53,7 +55,8 @@
     "client_order_id_prefix": "edge",
     "max_slippage_bps": 50,
     "max_market_data_age_seconds": 30,
-    "max_spread_bps": 100
+    "max_spread_bps": 100,
+    "strict_market_data": true
   },
   "costs": {
     "spread_bps": 4.0,

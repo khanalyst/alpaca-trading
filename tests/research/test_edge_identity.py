@@ -51,6 +51,20 @@ class CandidateIdentityTests(unittest.TestCase):
         self.assertIn("risk", candidate)
         self.assertIn("execution", candidate)
 
+    def test_explicit_vehicle_schedule_changes_candidate_identity(self):
+        flat = validate_config({})
+        scheduled = validate_config({"costs": {
+            "vehicles": {"option": {"spread_bps": 9.0}},
+        }})
+        legacy = candidate_assumptions(
+            flat, vehicle="option", strategy_id="ibr", variant_id="ibr.baseline")
+        candidate = candidate_assumptions(
+            scheduled, vehicle="option", strategy_id="ibr",
+            variant_id="ibr.baseline")
+        self.assertNotEqual(content_hash(legacy), content_hash(candidate))
+        self.assertNotIn("vehicles", legacy["costs"])
+        self.assertEqual(candidate["costs"]["vehicles"]["option"]["spread_bps"], 9.0)
+
 
 if __name__ == "__main__":
     unittest.main()

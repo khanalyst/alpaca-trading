@@ -19,8 +19,10 @@ from typing import Any, Mapping, Sequence
 
 from agent.contracts.rule import hold_deadline
 from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
-                    SQLiteQuoteIndexDescriptor, index_quotes, quote_fill)
-from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
+                    SQLiteQuoteIndexDescriptor, index_quotes, quote_fill,
+                    quote_fill_record)
+from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
+                          record_available_at, record_is_available)
 from .stats import stable_seed
 
 MIN_PROMOTION_CLUSTERS = 30
@@ -100,6 +102,15 @@ def max_drawdown_of(*args, **kwargs):
 
 def sample_counts(*args, **kwargs):
     return _facade_dependency("sample_counts")(*args, **kwargs)
+
+
+def authorization_projection(*args, **kwargs):
+    return _facade_dependency("authorization_projection")(*args, **kwargs)
+
+
+def _projection_summary(projection: Mapping[str, Any]) -> dict:
+    return {key: projection.get(key) for key in (
+        "schema", "vehicle", "strict", "counts", "reasons", "excluded")}
 
 
 def verified_gate_envelope(*args, **kwargs):
@@ -501,7 +512,8 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
 
 
 def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
-                          *, close_confirmed: bool = True,
+                          *, vehicle: str = "equity",
+                          close_confirmed: bool = True,
                           policy: ReplayPolicy | None = None) -> tuple[IBRConfig, dict]:
     """Build the replay config used by every variant from one immutable base."""
     source = dict(base or {})
@@ -525,8 +537,9 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
             node[parts[-1]] = value
     # One cost model for every lane.  `execution.max_slippage_bps` is a
     # rejection cap, not an expectation: it bounds the model rather than
-    # supplying it.
-    costs = CostModel.from_config(source)
+    # supplying it.  The vehicle is part of the replay boundary, so an
+    # option-only schedule can never silently fall back to the flat model.
+    costs = CostModel.from_config(source, vehicle=vehicle)
     cfg = IBRConfig(
         range_minutes=int(strategy.get("range_minutes", 15)),
         stop_pct=float(strategy.get("stop_pct", .003)),
@@ -543,7 +556,26 @@ def _effective_ibr_config(base: Mapping | None, overrides: Mapping,
     effective["strategy"] = strategy
     effective["replay"] = {"close_confirmed": cfg.close_confirmed,
                             "range_stop": cfg.range_stop}
-    effective["costs"] = costs.as_dict()
+    # Persist the selected model at the top level (the effective replay
+    # economics) while retaining the complete normalized schedule.  The
+    # latter belongs to candidate identity: changing an option-only override
+    # must invalidate option proofs even when an equity replay is unchanged.
+    effective_costs = costs.as_dict()
+    raw_costs = source.get("costs")
+    if isinstance(raw_costs, Mapping) and isinstance(raw_costs.get("vehicles"), Mapping):
+        fields = ("spread_bps", "slippage_bps", "fee_bps",
+                  "option_fee_per_contract_side", "provenance")
+        effective_costs = {key: effective_costs[key]
+                           for key in fields if key in effective_costs}
+        schedule: dict[str, dict] = {}
+        for name in sorted(raw_costs["vehicles"], key=str):
+            scheduled = CostModel.from_config(source, vehicle=str(name))
+            schedule[str(name)] = {
+                key: getattr(scheduled, key)
+                for key in fields if hasattr(scheduled, key)
+            }
+        effective_costs["vehicles"] = schedule
+    effective["costs"] = effective_costs
     return cfg, effective
 
 
@@ -652,29 +684,89 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                                   "reference trade lacks null-control geometry"))
             continue
         entry_index = rng.randrange(1, len(session_bars) - 1)
+        source_entry_bar = session_bars[entry_index]
+        source_ready = record_available_at(source_entry_bar)
+        if source_ready is None:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "entry_bar_not_visible"))
+            continue
+        entry_at = max(source_entry_bar.timestamp, source_ready)
+        entry_index = next((probe for probe in range(entry_index, len(session_bars))
+                            if session_bars[probe].timestamp >= entry_at), None)
+        if entry_index is None:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "entry_bar_not_visible"))
+            continue
         entry_bar = session_bars[entry_index]
-        # The entry bar's open is the boundary observation; its completed
-        # record must be available by the bar end, just as the primary replay
-        # lane models it.  Strict policy still requires a fresh executable
-        # quote below, while the bar's later OHLC never prices the entry.
-        if not _visible(entry_bar, entry_bar.end):
-            rows.append(_null_row(symbol, day, opportunity, vehicle))
+        # A completed recorder bar is normally observed at its end.  A fresh
+        # executable boundary quote can authorize a strict entry without
+        # consuming that delayed OHLC; permissive bar fallback still requires
+        # the opening record itself to be visible at its timestamp.
+        entry_bar_visible = record_is_available(entry_bar, entry_bar.timestamp)
+        entry_underlying = (float(entry_bar.open)
+                            if entry_bar_visible else None)
+        entry_ref = entry_underlying
+        entry_source = BAR
+        entry_feed = entry_provider = None
+        entry_age = 0.0
+        entry_snap = None
+        if vehicle == "equity":
+            side = "buy" if direction == "long" else "sell"
+            quoted = quote_fill_record(
+                quote_index, symbol=symbol, at=entry_at, side=side,
+                max_age_seconds=policy.max_market_data_age_seconds,
+                session_date=entry_bar.session_date)
+            if quoted is not None:
+                entry_underlying = quoted.price
+                entry_ref, entry_source = quoted.price, QUOTE
+                entry_feed, entry_provider = quoted.feed, quoted.provider
+                entry_age = max(0.0, (entry_at -
+                                      quoted.timestamp).total_seconds())
+            elif policy.strict_market_data:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "no fresh equity quote at entry"))
+                continue
+            elif not entry_bar_visible:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "entry_bar_not_visible"))
+                continue
+        elif vehicle == "option":
+            entry_snap = _option_at(
+                snapshots, symbol=symbol, day=entry_bar.session_date,
+                direction=direction, cutoff=entry_at, policy=policy)
+            if entry_snap is None:
+                rows.append(_null_row(symbol, day, opportunity, vehicle))
+                continue
+            if entry_snap.underlying_price and entry_snap.underlying_price > 0:
+                entry_underlying = float(entry_snap.underlying_price)
+            elif entry_underlying is None:
+                rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                      "entry_bar_not_visible"))
+                continue
+            entry_ref = entry_snap.ask
+            entry_source = QUOTE
+            entry_feed, entry_provider = (str(entry_snap.identity.feed),
+                                          str(entry_snap.identity.provider))
+            entry_age = max(0.0, (entry_at -
+                                  entry_snap.timestamp).total_seconds())
+        if entry_underlying is None:
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "entry_bar_not_visible"))
             continue
         if (policy.latest_entry_time is not None and
-                entry_bar.timestamp.astimezone(ZoneInfo("America/New_York")).time() >
+                entry_at.astimezone(ZoneInfo("America/New_York")).time() >
                 policy.latest_entry_time):
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "latest entry boundary"))
             continue
-        entry_underlying = float(entry_bar.open)
         stop = (entry_underlying - distance if direction == "long" else
                 entry_underlying + distance)
         target = (entry_underlying + distance * float(spec["target_r"])
                   if direction == "long" else
                   entry_underlying - distance * float(spec["target_r"]))
-        deadline = hold_deadline(entry_bar.timestamp, spec)
+        deadline = hold_deadline(entry_at, spec)
         if policy.force_flat_time is not None:
-            force_flat = entry_bar.timestamp.astimezone(
+            force_flat = entry_at.astimezone(
                 ZoneInfo("America/New_York")).replace(
                     hour=policy.force_flat_time.hour,
                     minute=policy.force_flat_time.minute,
@@ -687,11 +779,23 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 break
             last_index = probe
         exit_bar = session_bars[last_index]
+        # If the randomized position has no later bar, its close would be the
+        # first completed-bar OHLC consumed as an exit mark.  A delayed entry
+        # record is not available even at that close boundary, so do not leak
+        # its eventual close into the null account.
+        if (exit_bar is entry_bar and
+                not record_is_available(entry_bar, entry_bar.end)):
+            rows.append(_null_row(symbol, day, opportunity, vehicle,
+                                  "entry_bar_not_visible"))
+            continue
         exit_ref = float(exit_bar.close)
         exit_at = exit_bar.end
         boundary_exit = True
-        for bar in session_bars[entry_index + 1:last_index + 1]:
-            if not _visible(bar, bar.end):
+        for bar in session_bars[entry_index:last_index + 1]:
+            if record_available_at(bar) is None:
+                # A resting null exit may consume a delayed completed bar once
+                # its full record is observed; only bars before entry are
+                # excluded by the availability-time entry resolver.
                 continue
             if direction == "long":
                 gap_stop, gap_target = bar.open <= stop, bar.open >= target
@@ -709,48 +813,46 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                 exit_ref = stop if hit_stop else target
                 exit_bar, exit_at, boundary_exit = bar, bar.end, False
                 break
-        entry_ref = entry_underlying
-        entry_source = exit_source = BAR
+        exit_source = BAR
+        exit_feed = exit_provider = None
+        exit_age = 0.0
         multiplier = 1
         risk_per_unit = distance
         if vehicle == "equity":
-            side = "buy" if direction == "long" else "sell"
-            quoted = quote_fill(
-                quote_index, symbol=symbol, at=entry_bar.timestamp, side=side,
+            # Intrabar exits have no observable trigger instant.  Use the
+            # exiting bar's opening quote (the last point-in-time observation
+            # available before its high/low is inspected), rather than
+            # manufacturing a bar fallback or looking past the trigger.
+            exit_quote_at = exit_at if boundary_exit else exit_bar.timestamp
+            quoted_exit = quote_fill_record(
+                quote_index, symbol=symbol, at=exit_quote_at,
+                side="sell" if direction == "long" else "buy",
                 max_age_seconds=policy.max_market_data_age_seconds,
                 session_date=entry_bar.session_date)
-            if quoted is not None:
-                entry_ref, entry_source = quoted, QUOTE
-            elif policy.strict_market_data:
-                rows.append(_null_row(symbol, day, opportunity, vehicle,
-                                      "no fresh equity quote at entry"))
-                continue
-            quoted_exit = (quote_fill(
-                           quote_index, symbol=symbol, at=exit_at,
-                           side="sell" if direction == "long" else "buy",
-                           max_age_seconds=policy.max_market_data_age_seconds,
-                           session_date=entry_bar.session_date)
-                       if boundary_exit else None)
             if quoted_exit is not None:
-                exit_ref, exit_source = quoted_exit, QUOTE
+                exit_ref, exit_source = quoted_exit.price, QUOTE
+                exit_feed, exit_provider = quoted_exit.feed, quoted_exit.provider
+                exit_age = max(0.0, (exit_quote_at -
+                                    quoted_exit.timestamp).total_seconds())
             elif policy.strict_market_data and boundary_exit:
                 rows.append(_null_row(symbol, day, opportunity, vehicle,
                                       "no fresh equity quote at exit"))
                 continue
         if vehicle == "option":
-            entry_snap = _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
-                                    direction=direction, cutoff=entry_bar.timestamp,
-                                    policy=policy)
-            exit_snap = (None if entry_snap is None else
-                         _option_at(snapshots, symbol=symbol, day=entry_bar.session_date,
-                                    direction=direction, cutoff=exit_at,
-                                    contract_symbol=entry_snap.contract.symbol,
-                                    policy=policy))
-            if entry_snap is None or exit_snap is None:
+            assert entry_snap is not None
+            exit_snap = _option_at(
+                         snapshots, symbol=symbol, day=entry_bar.session_date,
+                         direction=direction, cutoff=exit_at,
+                         contract_symbol=entry_snap.contract.symbol,
+                         policy=policy)
+            if exit_snap is None:
                 rows.append(_null_row(symbol, day, opportunity, vehicle))
                 continue
-            entry_ref = entry_snap.ask
             exit_ref = exit_snap.bid
+            exit_feed = str(exit_snap.identity.feed)
+            exit_provider = str(exit_snap.identity.provider)
+            exit_age = max(0.0, (exit_at -
+                                 exit_snap.timestamp).total_seconds())
             multiplier = entry_snap.contract.multiplier
             risk_per_unit = entry_ref * multiplier
         if fixed_quantity is not None:
@@ -792,7 +894,15 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "exit_price": exit_price, "gross_pnl": gross, "costs": fees,
                      "net_pnl": net,
                      "return_value": net / before if before > 0 else 0.0,
-                     "no_trade": False})
+                     "no_trade": False,
+                     "entry_fill_source": entry_source,
+                     "exit_fill_source": exit_source,
+                     "entry_quote_age_seconds": entry_age,
+                     "exit_quote_age_seconds": exit_age,
+                     "entry_feed": entry_feed,
+                     "exit_feed": exit_feed,
+                     "entry_provider": entry_provider,
+                     "exit_provider": exit_provider})
     executed = [row for row in rows if row.get("no_trade") is not True]
     return {"account_id": account_id, "starting_cash": float(starting_cash),
             "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
@@ -808,16 +918,53 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) ->
     is read back from the bars rather than re-derived from the trade.
     """
     zone = ZoneInfo("America/New_York")
-    opens = {(bar.symbol, bar.timestamp): float(bar.open) for bar in bars}
+    bars_by_key = {(bar.symbol, bar.timestamp): bar for bar in bars}
     sessions = sorted({(bar.symbol, bar.timestamp.astimezone(zone).date()) for bar in bars})
     by_session = {(trade.symbol, trade.session_date): trade for trade in result.trades}
     rows: list[dict] = []
     for symbol, day in sessions:
         trade = by_session.get((symbol, day))
+        entry_bar = None
+        if trade is not None:
+            entry_at = trade.entry_timestamp
+            if not isinstance(entry_at, datetime):
+                try:
+                    entry_at = datetime.fromisoformat(str(entry_at))
+                except (TypeError, ValueError):
+                    entry_at = None
+            entry_bar = (None if entry_at is None else
+                         bars_by_key.get((trade.symbol, entry_at)))
+            if entry_bar is None:
+                # Delayed signal decisions can occur between bar boundaries;
+                # the first full bar at/after the causal entry is the only
+                # OHLC record eligible for bar fallback/exit provenance.
+                candidates = [bar for (sym, _), bar in bars_by_key.items()
+                              if sym == trade.symbol
+                              and bar.session_date == trade.session_date
+                              and entry_at is not None
+                              and bar.timestamp >= entry_at]
+                if candidates:
+                    entry_bar = min(candidates, key=lambda bar: bar.timestamp)
+        bar_visible = (entry_bar is not None and
+                       record_is_available(entry_bar, entry_bar.timestamp))
+        # Strict replay may have priced a delayed bar from a fresh boundary
+        # quote/snapshot.  Prefer the persisted underlying anchor for both
+        # vehicles; the option ``entry_reference`` is its premium and cannot
+        # serve as the null's underlying stop geometry.
+        persisted_anchor = (None if trade is None else
+                            getattr(trade, "underlying_entry", None))
+        quote_anchor = (trade is not None and vehicle == "equity" and
+                        str(getattr(trade, "entry_fill_source", "")) == QUOTE)
+        executable = (trade is not None and
+                      (bar_visible or quote_anchor or persisted_anchor is not None))
         row = {"vehicle": vehicle, "symbol": symbol, "session_date": day.isoformat(),
-               "no_trade": trade is None}
-        anchor = None if trade is None else opens.get((trade.symbol, trade.entry_timestamp))
-        if trade is not None and anchor is not None:
+               "no_trade": not executable}
+        anchor = None
+        if executable:
+            anchor = (float(persisted_anchor) if persisted_anchor is not None else
+                      float(entry_bar.open) if bar_visible else
+                      float(trade.entry_reference))
+        if executable and anchor is not None:
             row.update({"direction": trade.direction, "underlying_entry": anchor,
                         "stop_price": float(trade.stop_price)})
         rows.append(row)
@@ -839,21 +986,54 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     deliberately no in-sample fit partition to accidentally reuse for a
     lifecycle transition.
     """
+    # Preserve every replay row for the envelope, but perform all authorizing
+    # calculations on one strict, quality-audited projection.  Candidate,
+    # baseline, and randomized null arms use the exact same boundary.
+    candidate_raw = [dict(row) for row in candidate]
+    baseline_raw = [dict(row) for row in baseline]
+    null_raw = [dict(row) for row in null_rows]
+    candidate_projection = authorization_projection(candidate_raw, vehicle=vehicle,
+                                                    strict=True)
+    baseline_projection = authorization_projection(baseline_raw, vehicle=vehicle,
+                                                   strict=True)
+    null_projection = authorization_projection(null_raw, vehicle=vehicle,
+                                                strict=True)
+    candidate = candidate_projection["eligible"]
+    baseline = baseline_projection["eligible"]
+    null_rows = null_projection["eligible"]
+    ordered_raw = sorted(candidate_raw, key=lambda row: (
+        str(row.get("session_date", "")), str(row.get("entry_timestamp", ""))))
+    base_ordered_raw = sorted(baseline_raw, key=lambda row: (
+        str(row.get("session_date", "")), str(row.get("entry_timestamp", ""))))
     ordered = sorted(candidate, key=lambda row: (str(row.get("session_date", "")),
                                                   str(row.get("entry_timestamp", ""))))
     base_ordered = sorted(baseline, key=lambda row: (str(row.get("session_date", "")),
                                                       str(row.get("entry_timestamp", ""))))
     if shadow:
+        raw_fit, raw_heldout = [], ordered_raw
+        raw_base_fit, raw_base_heldout = [], base_ordered_raw
         fit, heldout = [], ordered
         base_fit, base_heldout = [], base_ordered
     else:
-        fit, heldout = chronological_split(ordered, fit_fraction=.7)
-        fit_sessions = {str(row.get("session_date") or "") for row in fit}
-        held_sessions = {str(row.get("session_date") or "") for row in heldout}
+        raw_fit, raw_heldout = chronological_split(ordered_raw, fit_fraction=.7)
+        raw_fit_sessions = {str(row.get("session_date") or "") for row in raw_fit}
+        raw_held_sessions = {str(row.get("session_date") or "") for row in raw_heldout}
+        fit = [row for row in ordered
+               if str(row.get("session_date") or "") in raw_fit_sessions]
+        heldout = [row for row in ordered
+                   if str(row.get("session_date") or "") in raw_held_sessions]
+        raw_base_fit = [row for row in base_ordered_raw
+                        if str(row.get("session_date") or "") in raw_fit_sessions]
+        raw_base_heldout = [row for row in base_ordered_raw
+                            if str(row.get("session_date") or "") in raw_held_sessions]
+        fit_sessions = raw_fit_sessions
+        held_sessions = raw_held_sessions
         base_fit = [row for row in base_ordered
                     if str(row.get("session_date") or "") in fit_sessions]
         base_heldout = [row for row in base_ordered
                        if str(row.get("session_date") or "") in held_sessions]
+    fit_sessions = {str(row.get("session_date") or "") for row in raw_fit}
+    held_sessions = {str(row.get("session_date") or "") for row in raw_heldout}
     fit_floor = structural_floor(
         fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
         min_clusters=MIN_PROMOTION_CLUSTERS, required=not shadow)
@@ -959,7 +1139,20 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
             "_fit_rows": fit, "_heldout_rows": heldout,
             "_fit_baseline_rows": base_fit,
             "_heldout_baseline_rows": base_heldout,
-            "_null_rows": null_heldout}
+            "_null_rows": null_heldout,
+            # Raw rows are retained for diagnostics/proof payloads; the
+            # underscored rows above are the only authorizing projection.
+            "_fit_raw_rows": [dict(row) for row in raw_fit],
+            "_heldout_raw_rows": [dict(row) for row in raw_heldout],
+            "_fit_baseline_raw_rows": [dict(row) for row in raw_base_fit],
+            "_heldout_baseline_raw_rows": [dict(row) for row in raw_base_heldout],
+            "_null_raw_rows": [dict(row) for row in null_raw
+                               if str(row.get("session_date") or "") in held_sessions],
+            "authorization_projection": {
+                "candidate": _projection_summary(candidate_projection),
+                "baseline": _projection_summary(baseline_projection),
+                "null": _projection_summary(null_projection),
+            }}
 
 
 def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
@@ -990,6 +1183,11 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
     fit_baseline = gate.pop("_fit_baseline_rows", [])
     heldout_baseline = gate.pop("_heldout_baseline_rows", [])
     null_source = gate.pop("_null_rows", [])
+    fit_raw = gate.pop("_fit_raw_rows", fit)
+    heldout_raw = gate.pop("_heldout_raw_rows", heldout)
+    fit_baseline_raw = gate.pop("_fit_baseline_raw_rows", fit_baseline)
+    heldout_baseline_raw = gate.pop("_heldout_baseline_raw_rows", heldout_baseline)
+    null_raw = gate.pop("_null_raw_rows", null_source)
     # Only report what this gate actually computed: an absent statistic must
     # stay absent rather than be persisted as a null the proof then has to
     # reproduce.
@@ -1005,6 +1203,10 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
         lane=lane, vehicle=gate["vehicle"], fit=fit, heldout=heldout,
         fit_baseline=fit_baseline, heldout_baseline=heldout_baseline,
         null_source=null_source,
+        fit_raw=fit_raw, heldout_raw=heldout_raw,
+        fit_baseline_raw=fit_baseline_raw,
+        heldout_baseline_raw=heldout_baseline_raw,
+        null_raw=null_raw,
         fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
         fit_control=gate["fit_paired_baseline"], control=gate["control"],
         p_value=gate["candidate_p_raw"],
@@ -1031,4 +1233,5 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
 __all__ = ["DiscoveryError", "corpus_partitions", "corpus_slice",
            "_read_discovery_rows", "_effective_ibr_config",
            "_opportunity_rows", "_null_reference_rows", "_discover_gate",
-           "_finalize_gate", "MIN_PROMOTION_CLUSTERS"]
+           "_finalize_gate", "authorization_projection",
+           "MIN_PROMOTION_CLUSTERS"]

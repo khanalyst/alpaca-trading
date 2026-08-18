@@ -26,7 +26,8 @@ from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
 from .gates import max_drawdown_of
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
-                          option_has_liquidity)
+                          option_has_liquidity, record_available_at,
+                          record_is_available)
 
 
 # `risk.max_position_notional_pct` in the checked runtime config.  Research
@@ -146,8 +147,7 @@ def _session(row: UnderlyingBar) -> str:
 
 
 def _visible(row: Any, cutoff: datetime) -> bool:
-    identity = getattr(row, "identity", None)
-    return bool(identity is not None and identity.as_of <= cutoff)
+    return record_is_available(row, cutoff)
 
 
 def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
@@ -205,7 +205,9 @@ def _option_liquid(snapshot: OptionSnapshot) -> bool:
 
 
 def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
-              direction: str, reason: str, *, contract: str | None = None) -> dict:
+              direction: str, reason: str, *, contract: str | None = None,
+              decision_timestamp: datetime | None = None,
+              entry_timestamp: datetime | None = None) -> dict:
     """Mark a real signal that has no honest fill price.
 
     Returning ``None`` here would make the observation indistinguishable from a
@@ -219,7 +221,8 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
             "entry_bar_feed": entry_bar.feed,
             "entry_bar_provider": entry_bar.provider,
             "signal_timestamp": signal_bar.end.isoformat(),
-            "entry_timestamp": entry_bar.timestamp.isoformat()}
+            "decision_timestamp": ((decision_timestamp or signal_bar.end).isoformat()),
+            "entry_timestamp": ((entry_timestamp or entry_bar.timestamp).isoformat())}
 
 
 def _coerce_policy(policy: ReplayPolicy | Mapping[str, Any] | None) -> ReplayPolicy:
@@ -296,13 +299,6 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     window = feature_window_bars(spec)
     for index in range(1, len(session_bars) - 1):
         signal_bar = session_bars[index]
-        # Every feature prefix is point-in-time visible at the signal cutoff;
-        # checking only the latest candle lets a corrected historical bar leak
-        # into an otherwise valid-looking signal.
-        if not _visible(signal_bar, signal_bar.end) or not all(
-                _visible(item, signal_bar.end)
-                for item in session_bars[:index + 1]):
-            continue
         # The bars a signal is computed from must be consecutive: a gap inside
         # the feature window stretches a fixed lookback across an outage and
         # silently evaluates a different statistic than the spec names.
@@ -314,22 +310,100 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         if signal is None:
             continue
         entry_bar = session_bars[index + 1]
-        # "Next bar" means the immediate following one-minute bar.  Carrying a
-        # signal across an outage would turn a stale breakout into an entry.
-        if entry_bar.timestamp != signal_bar.end:
+        available = [record_available_at(item)
+                     for item in session_bars[feature_start:index + 1]
+                     if record_available_at(item) is not None]
+        signal_ready = max([signal_bar.end, *available], default=None)
+        if signal_ready is None:
             continue
+        boundary = signal_bar.end
+        entry_at = boundary if signal_ready <= boundary else signal_ready
+        # Keep the immediate next-bar contract when the signal was actionable
+        # at the boundary.  A delayed signal can legitimately enter on the
+        # first full bar after an outage because its decision did not exist at
+        # the missing next-bar boundary.
+        if entry_bar.timestamp != boundary and signal_ready <= boundary:
+            continue
+        entry_index = next((probe for probe in range(index + 1, len(session_bars))
+                            if session_bars[probe].timestamp >= entry_at), None)
+        if entry_index is None:
+            continue
+        entry_bar = session_bars[entry_index]
         # The completed bar record is not visible until its end, but its open
         # is the boundary observation used for next-bar entry.  Never consume
         # the entry bar's high/low/close before that bar ends; executable entry
         # pricing below still requires a point-in-time quote at this boundary.
-        local_entry = entry_bar.timestamp.astimezone(ZoneInfo("America/New_York"))
+        local_entry = entry_at.astimezone(ZoneInfo("America/New_York"))
         if (resolved_policy.latest_entry_time is not None and
                 local_entry.time() > resolved_policy.latest_entry_time):
             continue
-        if not _at_or_before_force_flat(entry_bar.timestamp, resolved_policy):
+        if not _at_or_before_force_flat(entry_at, resolved_policy):
             continue
         direction = signal["direction"]
-        entry_underlying = float(entry_bar.open)
+        # A completed recorder bar is normally observed at its end, so it
+        # cannot authorize the opening print at the entry boundary.  A fresh
+        # executable quote is an independent boundary observation and is used
+        # as the fill/underlying anchor when available.  Bar fallback remains
+        # explicit and therefore requires the bar itself to be visible at its
+        # timestamp; delayed OHLC never becomes an entry by hindsight.
+        entry_bar_visible = _visible(entry_bar, entry_bar.timestamp)
+        entry_underlying: float | None = (
+            float(entry_bar.open) if entry_bar_visible else None)
+        entry_ref: float | None = entry_underlying
+        entry_source = BAR
+        entry_feed = entry_provider = None
+        entry_age = 0.0
+        entry_snap: OptionSnapshot | None = None
+        if vehicle == "equity":
+            quoted = quote_fill_record(
+                quotes, symbol=signal_bar.symbol, at=entry_at,
+                side="buy" if direction == "long" else "sell",
+                max_age_seconds=resolved_policy.max_market_data_age_seconds,
+                session_date=signal_bar.session_date)
+            if quoted is not None:
+                entry_underlying = quoted.price
+                entry_ref, entry_source = quoted.price, QUOTE
+                entry_feed, entry_provider = quoted.feed, quoted.provider
+                entry_age = max(
+                    0.0, (entry_at - quoted.timestamp).total_seconds())
+            elif resolved_policy.strict_market_data:
+                return _unpriced(signal_bar, entry_bar,
+                                 signal_bar.session_date, direction,
+                                 "no fresh equity quote at entry",
+                                 decision_timestamp=signal_ready,
+                                 entry_timestamp=entry_at)
+            elif not entry_bar_visible:
+                continue
+        elif vehicle == "option":
+            entry_snap = _option_at(
+                snapshots, symbol=signal_bar.symbol,
+                day=signal_bar.session_date, direction=direction,
+                cutoff=entry_at, policy=resolved_policy)
+            if entry_snap is None:
+                return _unpriced(signal_bar, entry_bar, signal_bar.session_date,
+                                 direction, "no option quote within staleness bound at entry",
+                                 decision_timestamp=signal_ready,
+                                 entry_timestamp=entry_at)
+            # OPRA carries the underlying spot used to select the contract.
+            # If that point-in-time spot is absent, only a boundary-visible bar
+            # may supply the fallback; a delayed bar's open is never consumed.
+            if entry_snap.underlying_price and entry_snap.underlying_price > 0:
+                entry_underlying = float(entry_snap.underlying_price)
+            elif entry_bar_visible:
+                entry_underlying = float(entry_bar.open)
+            else:
+                return _unpriced(signal_bar, entry_bar, signal_bar.session_date,
+                                 direction, "entry_bar_not_visible",
+                                 decision_timestamp=signal_ready,
+                                 entry_timestamp=entry_at)
+            entry_ref = entry_snap.ask
+            entry_source = QUOTE
+            entry_feed = str(entry_snap.identity.feed)
+            entry_provider = str(entry_snap.identity.provider)
+            entry_age = max(
+                0.0, (entry_at - entry_snap.timestamp).total_seconds())
+        if entry_underlying is None or entry_ref is None:
+            continue
         distance = float(signal["stop_distance"])
         # The runtime submits the bracket legs with the entry order, before any
         # fill exists, so the only anchor it can use is the signal bar's close.
@@ -343,9 +417,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # risked once the entry gapped.
         real_risk = max(0.0, entry_underlying - stop if direction == "long"
                         else stop - entry_underlying)
-        deadline = hold_deadline(entry_bar.timestamp, spec)
-        last_index = index + 1
-        for probe in range(index + 2, len(session_bars)):
+        deadline = hold_deadline(entry_at, spec)
+        last_index = entry_index
+        for probe in range(entry_index + 1, len(session_bars)):
             # The hold never crosses an outage.  Treating the next recorded
             # minute as adjacent would let a stop or target "trigger" on a bar
             # the position could not have been carried into; the position is
@@ -398,8 +472,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # the signal itself still only saw bars[:index+1].  The intrabar
             # path is unknowable either way, so the established stop-wins-ties
             # rule resolves it against the strategy here too.
-            for bar in session_bars[index + 1:last_index + 1]:
-                if not _visible(bar, bar.end):
+            for bar in session_bars[entry_index:last_index + 1]:
+                if record_available_at(bar) is None:
+                    # Resting exits consume completed OHLC once the record is
+                    # observed, even when observation trails market end.
                     continue
                 if direction == "long":
                     gap_stop, gap_target = bar.open <= stop, bar.open >= target
@@ -432,29 +508,10 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         day = signal_bar.session_date
         multiplier = 1
         contract = None
-        entry_ref = entry_underlying
-        entry_source = exit_source = BAR
-        entry_feed = exit_feed = None
-        entry_provider = exit_provider = None
-        entry_age = exit_age = 0.0
+        exit_source = BAR
+        exit_feed = exit_provider = None
+        exit_age = 0.0
         if vehicle == "equity":
-            # A fill that lands on a bar boundary has a real instant, so a
-            # recorded quote is its executable price.  A level-triggered exit
-            # inside a bar has no such instant and keeps the bar's level.
-            side = "buy" if direction == "long" else "sell"
-            quoted = quote_fill_record(
-                quotes, symbol=signal_bar.symbol, at=entry_bar.timestamp,
-                side=side,
-                max_age_seconds=resolved_policy.max_market_data_age_seconds,
-                session_date=day)
-            if quoted is not None:
-                entry_ref, entry_source = quoted.price, QUOTE
-                entry_feed, entry_provider = quoted.feed, quoted.provider
-                entry_age = max(
-                    0.0, (entry_bar.timestamp - quoted.timestamp).total_seconds())
-            elif resolved_policy.strict_market_data:
-                return _unpriced(signal_bar, entry_bar, day, direction,
-                                 "no fresh equity quote at entry")
             if reason == "time" or gapped or exit_gapped:
                 quoted_exit = quote_fill_record(
                     quotes, symbol=signal_bar.symbol, at=pricing_cutoff,
@@ -468,15 +525,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                         0.0, (pricing_cutoff - quoted_exit.timestamp).total_seconds())
                 elif resolved_policy.strict_market_data:
                     return _unpriced(signal_bar, entry_bar, day, direction,
-                                     "no fresh equity quote at exit")
+                                     "no fresh equity quote at exit",
+                                     decision_timestamp=signal_ready,
+                                     entry_timestamp=entry_at)
         entry_option_feed = exit_option_feed = None
         if vehicle == "option":
-            entry_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
-                                    direction=direction, cutoff=entry_bar.timestamp,
-                                    policy=resolved_policy)
-            if entry_snap is None:
-                return _unpriced(signal_bar, entry_bar, day, direction,
-                                 "no option quote within staleness bound at entry")
+            assert entry_snap is not None
             exit_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
                                    direction=direction,
                                    cutoff=(pricing_cutoff if
@@ -487,7 +541,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             if exit_snap is None:
                 return _unpriced(signal_bar, entry_bar, day, direction,
                                  "entry contract stopped being quoted before exit",
-                                 contract=entry_snap.contract.symbol)
+                                 contract=entry_snap.contract.symbol,
+                                 decision_timestamp=signal_ready,
+                                 entry_timestamp=entry_at)
             contract = entry_snap.contract.symbol
             entry_option_feed = str(entry_snap.contract.feed).lower()
             exit_option_feed = str(exit_snap.contract.feed).lower()
@@ -495,20 +551,19 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             exit_feed = str(exit_snap.identity.feed)
             entry_provider = str(entry_snap.identity.provider)
             exit_provider = str(exit_snap.identity.provider)
-            entry_ref = entry_snap.ask
             exit_ref = exit_snap.bid
-            entry_source = exit_source = QUOTE
+            exit_source = QUOTE
             multiplier = entry_snap.contract.multiplier
             # A snapshot inside the exit bar but after a level-triggered instant
             # is not stale, it is simply the bar's quote; only genuinely older
             # quotes carry an age.
-            entry_age = max(0.0, (entry_bar.timestamp - entry_snap.timestamp).total_seconds())
             exit_age = max(0.0, (pricing_cutoff - exit_snap.timestamp).total_seconds())
         return {
             "vehicle": vehicle, "symbol": signal_bar.symbol,
             "session_date": day.isoformat(), "direction": direction,
             "signal_timestamp": signal_bar.end.isoformat(),
-            "entry_timestamp": entry_bar.timestamp.isoformat(),
+            "decision_timestamp": signal_ready.isoformat(),
+            "entry_timestamp": entry_at.isoformat(),
             # A gap exit happens at the bar open; an intrabar level exit is
             # conservatively represented at the completed bar cutoff used for
             # its bar-level price.  Never imply a quote after the trigger.
@@ -565,7 +620,7 @@ def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime) -> float 
     visible, so its close/high/low can never leak into an earlier mark.
     """
     for row in reversed(rows):
-        if row.timestamp == cutoff:
+        if row.timestamp == cutoff and _visible(row, cutoff):
             return float(row.open)
         if row.end <= cutoff and _visible(row, row.end):
             return float(row.close)

@@ -103,11 +103,12 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
         if index == 17:
             opened = round(101.70 + _wobble(symbol, day), 4)
         stamp = opening + timedelta(minutes=index)
-        end = stamp + timedelta(minutes=1)
         rows.append({
             "kind": "bar", "provider": "test", "feed": "sip", "symbol": symbol,
-            "timestamp": stamp.isoformat(), "as_of": end.isoformat(),
-            "observed_at": end.isoformat(), "open": round(opened, 4),
+            "timestamp": stamp.isoformat(),
+            "as_of": (stamp + timedelta(minutes=1)).isoformat(),
+            "observed_at": (stamp + timedelta(minutes=1)).isoformat(),
+            "open": round(opened, 4),
             "high": round(max(opened, close) + .02, 4),
             "low": round(min(opened, close) - .02, 4),
             "close": round(close, 4), "volume": volume,

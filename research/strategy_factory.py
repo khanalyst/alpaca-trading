@@ -20,7 +20,8 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 from agent.contracts.rule import (RULE_FAMILIES, RULE_SCHEMA_V1, RULE_SCHEMA_V2,
-                                  V2_DEFAULT_EXTENSIONS, hold_deadline,
+                                  V2_DEFAULT_EXTENSIONS, EXECUTABLE_RULE_FIELDS,
+                                  hold_deadline,
                                   rule_semantic_distance,
                                   rule_semantic_signature, rule_variant_id,
                                   validate_rule_spec)
@@ -43,6 +44,7 @@ from .gates import (chronological_split, heldout_separation,
                     expectancy_rejection_report,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
                     performance_floor, placebo_null_distribution,
+                    authorization_projection,
                     RETIREMENT_CONFIDENCE, RETIREMENT_MIN_SESSIONS,
                     RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
@@ -55,6 +57,8 @@ from .llm_strategy import (DISCOVERY_SCHEMA, LESSON_REF_CHARS, PROPOSAL_SCHEMA,
                            TUNING_SCHEMA, ProposalResult, RuleProposalAdapter,
                            _tuning_reason_check)
 from .stats import benjamini_hochberg, stable_seed
+from .fit_diagnostics import (collapse_behavior_aliases,
+                               measure_fit_diagnostics)
 from .factory_core import (
     DEFAULT_STRATEGIES, DEFAULT_VARIANTS, MAX_STRATEGIES, MAX_VARIANTS,
     NOTIONAL_CAP_PCT, StrategyHypothesis, _falsification, _hypothesis_id, _option_at, _safe_variant,
@@ -101,6 +105,222 @@ SHARED_LEARNING_MIN_ATTEMPTS = 3
 # produced; the root is an ordinary null-tested candidate and consumes
 # multiplicity alongside its mutations.
 HYPOTHESIS_LESSON_KINDS = ("discovery", "reseed", "replacement", "rotation")
+
+
+# The model may help order a bounded fit search, but it must not see evidence
+# that can authorize a candidate.  Keep this boundary here (rather than in a
+# provider implementation) because injected adapters are a supported testing
+# seam and every provider must receive the same projection.  The projection
+# is intentionally a whitelist: unknown fields are discarded instead of
+# becoming a future path for raw rows or post-selection gate evidence.
+_FIT_SELECTION_DENY_KEYS = frozenset({
+    "p_value", "pvalue", "q_value", "qvalue", "heldout", "sealed",
+    "qualification", "passes", "pass", "failed_checks", "gate",
+    "gate_hash", "sample_adequate", "heldout_sample_adequate",
+    "underpowered", "outcome", "statistics", "checks", "performance",
+    "raw", "raw_rows", "rows", "trade_rows", "market_rows", "market_data",
+    "ohlcv", "observations", "observation_rows", "source_rows", "fit_rows",
+    "heldout_rows", "sealed_rows", "authorization", "authorizing", "source",
+})
+_FIT_SELECTION_DENY_PARTS = frozenset({
+    "pvalue", "qvalue", "heldout", "sealed", "qualification", "gate",
+    "raw", "rows", "ohlcv", "market", "observation", "authorization",
+})
+
+# Root diagnosis and the compact fit-diagnostics schema are deliberately
+# enumerated.  Rule-field names under ``tried``/``changed`` are the one
+# dynamic exception: they are still constrained to the audited grammar.
+_FIT_SELECTION_ROOT_KEYS = frozenset({
+    "primary_failure", "failure_mode", "trades", "sessions", "net_pnl",
+    "expectancy", "win_rate", "profit_factor", "max_drawdown", "stop_rate",
+    "target_rate", "fit_diagnostics", "refinement_phase",
+    "coordinate_candidates_remaining", "interaction_candidates_remaining",
+    "shared_learning", "lessons", "already_failed_variant_ids",
+    "tried_families", "last_diagnosis", "slot", "reason", "previous_family",
+    "proved_families", "available_families", "already_seeded_this_cycle",
+})
+_FIT_DIAGNOSTIC_KEYS = frozenset({
+    "schema", "scope", "variant_id", "eligible_prefix", "first_signal",
+    "atr_bps", "floor_30bps", "planned", "vehicle", "cost_to_risk",
+    "risk", "exits", "exit_grammar", "mde_power", "behavior_fingerprint",
+    "30bps_floor_binding", "planned_effective", "cost_to_risk_stressed",
+})
+_FIT_SELECTION_AGGREGATE_KEYS = frozenset({
+    "eligible", "total", "rate", "needed_prefix_bars", "signals",
+    "eligible_sessions", "session_rate", "prefix_rate", "session_count",
+    "count", "min", "p25", "median", "p75", "max", "mean", "unit",
+    "bps", "binding", "stop_distance", "target_distance", "target_r",
+    "hold_bars", "configured", "stressed", "total_cost", "mean_cost",
+    "cost_to_risk_ratio", "eligible_rows", "intended", "delivered",
+    "delivered_to_intended", "trades", "reasons", "reason_rates", "ties",
+    "tie_rate", "entry_gaps", "entry_gap_rate", "exit_gaps", "exit_gap_rate",
+    "bracket", "target", "hold_cap", "diagnostic_only", "effect_unit",
+    "cluster_unit", "available", "reason", "entry", "full", "entry_alias_key",
+    "full_alias_key", "signal_count", "planned_vector_count", "authorizing",
+})
+_FIT_SELECTION_LESSON_KEYS = frozenset({
+    "id", "family", "tried", "changed", "fit_delta", "reason",
+    "proposed_by", "verdict",
+})
+_FIT_SELECTION_SHARED_KEYS = frozenset({
+    "graded_attempts", "parameters", "families", "live_trials",
+})
+_FIT_SELECTION_SHARED_PARAMETER_KEYS = frozenset({
+    "parameter", "direction", "attempts", "passed",
+})
+_FIT_SELECTION_SHARED_FAMILY_KEYS = frozenset({
+    "family", "attempts", "passed",
+})
+_FIT_SELECTION_TRIAL_KEYS = frozenset({"run", "failed"})
+_FIT_SELECTION_DELTA_KEYS = frozenset({"from", "to"})
+_FIT_SELECTION_RULE_KEYS = frozenset(
+    str(name) for name in (*EXECUTABLE_RULE_FIELDS,
+                           *V2_DEFAULT_EXTENSIONS.keys()))
+
+
+def _selection_key(raw_key: Any) -> str:
+    """Normalize a context key for the fit-selection projection."""
+    return str(raw_key).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _selection_denied(key: str) -> bool:
+    normalized = _selection_key(key)
+    if normalized in _FIT_SELECTION_DENY_KEYS:
+        return True
+    parts = frozenset(part for part in normalized.split("_") if part)
+    return bool(parts & _FIT_SELECTION_DENY_PARTS)
+
+
+def _sanitize_fit_selection(value: Any, *, label: str = "diagnosis",
+                            context: str = "root") -> Any:
+    """Project model-selection context to finite, fit-only aggregate fields.
+
+    This is a lossy projection by design.  It drops unknown or unsafe keys,
+    including recursively nested raw rows and post-selection gate evidence,
+    while retaining the compact summaries and lesson coordinates needed to
+    order the already bounded search.  Scalars are copied only when finite;
+    malformed values are omitted rather than aborting a research cycle.
+    """
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, (list, tuple)):
+        child_context = context
+        if context == "lessons":
+            child_context = "lesson"
+        elif context == "shared_parameters":
+            child_context = "shared_parameter"
+        elif context == "shared_families":
+            child_context = "shared_family"
+        return [item for item in (
+            _sanitize_fit_selection(item, label=f"{label}[{index}]",
+                                    context=child_context)
+            for index, item in enumerate(value)) if item is not None]
+    if not isinstance(value, Mapping):
+        return None
+
+    if context == "root":
+        allowed = _FIT_SELECTION_ROOT_KEYS
+    elif context == "diagnostic":
+        allowed = _FIT_SELECTION_ROOT_KEYS
+    elif context == "fit_diagnostics":
+        allowed = _FIT_DIAGNOSTIC_KEYS
+    elif context in {"aggregate", "eligible_prefix", "first_signal",
+                     "quantiles", "cost_summary", "risk", "exits",
+                     "exit_grammar", "mde_power", "behavior_fingerprint"}:
+        allowed = _FIT_SELECTION_AGGREGATE_KEYS
+    elif context == "lesson":
+        allowed = _FIT_SELECTION_LESSON_KEYS
+    elif context == "shared_learning":
+        allowed = _FIT_SELECTION_SHARED_KEYS
+    elif context == "shared_parameter":
+        allowed = _FIT_SELECTION_SHARED_PARAMETER_KEYS
+    elif context == "shared_family":
+        allowed = _FIT_SELECTION_SHARED_FAMILY_KEYS
+    elif context == "live_trials":
+        allowed = _FIT_SELECTION_TRIAL_KEYS
+    elif context == "delta":
+        allowed = _FIT_SELECTION_DELTA_KEYS
+    elif context in {"context", "discovery_context"}:
+        allowed = (_FIT_SELECTION_ROOT_KEYS | frozenset({
+            "tried_families", "proved_families", "available_families",
+            "already_seeded_this_cycle", "last_diagnosis", "lessons",
+            "shared_learning", "previous_family", "reason", "slot",
+            "family",
+        }))
+    else:
+        allowed = _FIT_SELECTION_AGGREGATE_KEYS
+
+    result: dict[str, Any] = {}
+    for raw_key, item in value.items():
+        key = _selection_key(raw_key)
+        if _selection_denied(key):
+            continue
+        # ``tried`` and ``changed`` are coordinate maps, so their keys are
+        # dynamic but must still name an executable rule parameter.
+        if context in {"tried", "changed"}:
+            if key not in _FIT_SELECTION_RULE_KEYS:
+                continue
+            child_context = "delta"
+        else:
+            if key not in allowed:
+                continue
+            if key in {"fit_diagnostics"}:
+                child_context = "fit_diagnostics"
+            elif key in {"last_diagnosis"}:
+                child_context = "diagnostic"
+            elif key in {"lessons"}:
+                child_context = "lessons"
+            elif key in {"shared_learning"}:
+                child_context = "shared_learning"
+            elif key in {"parameters"} and context == "shared_learning":
+                child_context = "shared_parameters"
+            elif key in {"families"} and context == "shared_learning":
+                child_context = "shared_families"
+            elif key == "live_trials" and context == "shared_learning":
+                child_context = "live_trials"
+            elif key in {"tried", "changed"} and context == "lesson":
+                child_context = key
+            elif context == "fit_diagnostics" or key in {
+                    "eligible_prefix", "first_signal", "atr_bps", "floor_30bps",
+                    "planned", "cost_to_risk", "risk", "exits", "exit_grammar",
+                    "mde_power", "behavior_fingerprint", "configured", "stressed",
+                    "intended", "delivered", "delivered_to_intended",
+                    "reason_rates"}:
+                child_context = "aggregate"
+            else:
+                child_context = context
+        cleaned = _sanitize_fit_selection(item, label=f"{label}.{key}",
+                                           context=child_context)
+        if cleaned is not None:
+            result[key] = cleaned
+    return result
+
+
+def _interaction_lessons(lessons: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Make coordinate interaction ordering independent of held-out fields.
+
+    The legacy interaction helper consumes a ``heldout_delta`` score to rank
+    one-factor lessons.  That score is intentionally absent from the model
+    projection; use a fit-only score when available and a stable neutral
+    value otherwise.  Thus an injected post-selection field cannot change
+    which bounded pair is selected, while the existing interaction search
+    remains available for ledgers written before fit scores were recorded.
+    """
+    result: list[dict] = []
+    for item in lessons:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        if "fit_delta" in row:
+            row["heldout_delta"] = row["fit_delta"]
+        elif row.get("tried") or row.get("changed"):
+            row["heldout_delta"] = 0.0
+        result.append(row)
+    return result
 
 
 def _slot_rotations(factory: FactoryLedger, vehicle: str, slot: int) -> int:
@@ -155,7 +375,8 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
         "available_families": list(RULE_FAMILIES),
     }
     if diagnostic:
-        context["last_diagnosis"] = dict(diagnostic)
+        context["last_diagnosis"] = _sanitize_fit_selection(
+            diagnostic, label="last_diagnosis", context="diagnostic")
     # Slots are seeded one after another inside a single cycle.  Without this
     # every slot of a fresh ledger receives an identical brief, so a model that
     # answers consistently returns the same hypothesis every time and all but
@@ -167,11 +388,13 @@ def _discovery_context(*, slot: int, reason: str, previous: Mapping[str, Any],
             {"slot": int(item["slot"]), "family": str(item["family"])}
             for item in seeded_this_cycle]
     if lessons:
-        context["lessons"] = list(lessons)
+        context["lessons"] = _sanitize_fit_selection(
+            list(lessons), label="lessons", context="lessons")
     # What every slot has learned, not only this one.  A fresh slot has no
     # history of its own and this is the only evidence it can reason from.
     if shared and shared.get("graded_attempts"):
-        context["shared_learning"] = dict(shared)
+        context["shared_learning"] = _sanitize_fit_selection(
+            shared, label="shared_learning", context="shared_learning")
     return context
 
 
@@ -451,8 +674,10 @@ def _seed_slot(previous: Mapping[str, Any], *, generation: int,
             # no proposal — not a failed research cycle. Seeding must always
             # produce a hypothesis, so any provider trouble degrades to the
             # deterministic ladder rather than stopping the night's work.
-            proposal = (discover(vehicle=vehicle, slot=slot,
-                                 context=dict(context))
+            proposal = (discover(
+                vehicle=vehicle, slot=slot,
+                context=_sanitize_fit_selection(
+                    context, label="context", context="discovery_context"))
                         if callable(discover) else None)
             if proposal is not None and not isinstance(proposal, ProposalResult):
                 proposal = ProposalResult(False, schema=DISCOVERY_SCHEMA,
@@ -560,13 +785,24 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
     than a mutated one: both are content-addressed and both face every gate.
     """
     root = validate_rule_spec(hypothesis["rule_spec"])
+    safe_diagnostic = _sanitize_fit_selection(
+        diagnostic, label="diagnosis", context="diagnostic")
+    safe_lessons = _sanitize_fit_selection(
+        list(lessons), label="lessons", context="lessons")
+    safe_refinement_lessons = _sanitize_fit_selection(
+        list(refinement_lessons), label="refinement_lessons", context="lessons")
+    safe_shared = (_sanitize_fit_selection(
+        shared, label="shared_learning", context="shared_learning")
+        if isinstance(shared, Mapping) else shared)
     failed = set(already_failed)
     near_distance = _near_duplicate_distance(config)
-    coordinate = coordinate_mutation_pool(root, diagnostic)
+    coordinate = coordinate_mutation_pool(root, safe_diagnostic)
     remaining_coordinate = [item for item in coordinate
                             if not _failed_variant(item[0], failed)]
+    interaction_source = (safe_refinement_lessons
+                          if safe_refinement_lessons else safe_lessons)
     interactions = interaction_mutation_pool(
-        root, refinement_lessons if refinement_lessons else lessons)
+        root, _interaction_lessons(interaction_source))
     remaining_interactions = [item for item in interactions
                                if not _failed_variant(item[0], failed)]
     if remaining_coordinate:
@@ -602,14 +838,14 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
         # proposal — never a failed cycle.
         # The diagnosis says how this hypothesis failed; the shared digest says
         # what every other slot has found out about the same parameters.
-        diagnosis = {**dict(diagnostic), "refinement_phase": phase,
+        diagnosis = {**dict(safe_diagnostic), "refinement_phase": phase,
                      "coordinate_candidates_remaining": len(remaining_coordinate),
                      "interaction_candidates_remaining": len(remaining_interactions)}
-        if shared and shared.get("graded_attempts"):
-            diagnosis["shared_learning"] = dict(shared)
+        if safe_shared and safe_shared.get("graded_attempts"):
+            diagnosis["shared_learning"] = dict(safe_shared)
         proposal = (tune(vehicle=vehicle, slot=int(hypothesis["slot"]),
                          rule_spec=root, diagnosis=diagnosis,
-                         count=max(1, int(count) - 1), lessons=list(lessons))
+                         count=max(1, int(count) - 1), lessons=list(safe_lessons))
                     if callable(tune) else None)
         if proposal is not None and not isinstance(proposal, ProposalResult):
             proposal = ProposalResult(False, schema=TUNING_SCHEMA,
@@ -640,7 +876,8 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                 variant_id = canonical_id
                 _tuning_reason_check(
                     str(entry.get("reason") or ""), root, normalized_entry,
-                    {**dict(diagnostic), "refinement_phase": phase}, lessons)
+                    {**dict(safe_diagnostic), "refinement_phase": phase},
+                    safe_lessons)
             except (TypeError, ValueError, KeyError):
                 continue
             # The model may choose among the same finite neighborhood the
@@ -700,8 +937,12 @@ def _llm_replacement(previous: Mapping[str, Any], diagnostic: Mapping[str, Any],
         max_response_bytes=int(config.get("max_response_bytes", 16_384)),
         max_total_calls=int(config.get("max_total_calls", 64)),
     )
-    enriched = dict(diagnostic)
-    enriched["lessons"] = list(lessons)
+    safe_diagnostic = _sanitize_fit_selection(
+        diagnostic, label="diagnosis", context="diagnostic")
+    safe_lessons = _sanitize_fit_selection(
+        list(lessons), label="lessons", context="lessons")
+    enriched = dict(safe_diagnostic)
+    enriched["lessons"] = list(safe_lessons)
     enriched["already_failed_variant_ids"] = sorted(str(item) for item in failed_variant_ids)
     enriched["tried_families"] = sorted(str(item) for item in tried_families)
     try:
@@ -790,7 +1031,8 @@ def _record_seed_lesson(factory: FactoryLedger, seed: Any, *, vehicle: str,
             reason=_seed_reason(source, seed, proposal),
             changed={"family": seed.family,
                      "rule_schema": seed.rule_spec["schema"]},
-            diagnosis=dict(diagnostic or {}),
+            diagnosis=_sanitize_fit_selection(
+                dict(diagnostic or {}), label="diagnosis", context="diagnostic"),
             evidence=dict(proposal.evidence) if proposal is not None else {})
     except (FactoryError, KeyError, sqlite3.Error):
         # A lesson is an annotation on work that already happened.  Failing to
@@ -1005,10 +1247,48 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
             starting_cash=starting_cash, costs=payload["costs"], quotes=quotes,
             policy=payload.get("policy"),
         )
+        fit_diagnostics = measure_fit_diagnostics(
+            fit_bars, hypothesis["rule_spec"],
+            account_rows=root_account["rows"], costs=payload["costs"],
+            vehicle=vehicle)
         return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
-                "diagnostic": diagnose(root_account["rows"],
-                                       starting_cash=starting_cash),
+                "diagnostic": {
+                    **diagnose(root_account["rows"], starting_cash=starting_cash),
+                    "fit_diagnostics": fit_diagnostics,
+                },
                 "worker_pid": os.getpid()}
+    finally:
+        _close_task_quotes(quotes)
+
+
+def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
+    """Measure candidate behavior on fit bars before full worker replay.
+
+    This stage intentionally returns summaries and fingerprints only.  It has
+    no held-out/sealed rows and cannot authorize a candidate.
+    """
+    bars, snapshots, quotes = _task_corpus(payload)
+    try:
+        sessions = sorted({_session(bar) for bar in bars})
+        cut = (max(1, min(len(sessions) - 1, int(len(sessions) * .7)))
+               if len(sessions) > 1 else len(sessions))
+        fit_sessions = set(sessions[:cut])
+        fit_bars = [bar for bar in bars if _session(bar) in fit_sessions]
+        hypothesis = dict(payload["hypothesis"])
+        output: dict[str, dict] = {}
+        for raw_spec in payload.get("specs", ()):
+            spec = validate_rule_spec(raw_spec)
+            variant_id = rule_variant_id(spec)
+            account = simulate_account(
+                fit_bars, snapshots, spec, vehicle=str(payload["vehicle"]),
+                account_id=f"fit-diagnostic:{hypothesis['hypothesis_id']}:{variant_id}",
+                starting_cash=float(payload["starting_cash"]), costs=payload["costs"],
+                quotes=quotes, policy=payload.get("policy"))
+            output[variant_id] = measure_fit_diagnostics(
+                fit_bars, spec, account_rows=account["rows"],
+                costs=payload["costs"], vehicle=str(payload["vehicle"]))
+        return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
+                "fit_diagnostics": output, "worker_pid": os.getpid()}
     finally:
         _close_task_quotes(quotes)
 
@@ -1050,12 +1330,23 @@ def _worker(payload: Mapping[str, Any]) -> dict:
                 policy=policy)["rows"]
             variants.append({
                 "variant_id": variant_id, "rule_spec": spec, "vehicle": vehicle,
-                "account": account, "diagnostic": diagnose(account["rows"], starting_cash=starting_cash),
+                "account": account,
+                "diagnostic": {
+                    **diagnose(account["rows"], starting_cash=starting_cash),
+                    "fit_diagnostics": dict(
+                        (payload.get("fit_diagnostics") or {}).get(variant_id) or {}),
+                },
                 "worker_pid": os.getpid(),
             })
         sessions = sorted({_session(bar) for bar in bars})
         return {"hypothesis": hypothesis, "mode": mode, "diagnostic": diagnostic,
                 "refinement": dict(payload.get("refinement") or {}),
+                "fit_diagnostics": dict(payload.get("fit_diagnostics") or {}),
+                "behavior_aliases": dict(payload.get("behavior_aliases") or {}),
+                "excluded_behavior_aliases": list(
+                    payload.get("excluded_behavior_aliases") or ()),
+                "proposed_behavior_aliases": list(
+                    payload.get("proposed_behavior_aliases") or ()),
                 "policy": policy,
                 "evaluation_start": sessions[0] if sessions else None,
                 "evaluation_end": sessions[-1] if sessions else None,
@@ -1073,6 +1364,25 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
           is_root: bool = False,
           qualification: Mapping | None = None,
           folds: int = 3) -> dict:
+    raw_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
+    raw_baseline = [dict(row) for row in baseline if isinstance(row, Mapping)]
+    raw_null = [dict(row) for row in null_rows if isinstance(row, Mapping)]
+    fill_fields = {"entry_fill_source", "exit_fill_source", "entry_feed",
+                   "exit_feed", "entry_provider", "exit_provider",
+                   "entry_quote_age_seconds", "exit_quote_age_seconds",
+                   "entry_option_feed", "exit_option_feed"}
+    strict_projection = any(fill_fields.intersection(row) for row in
+                            [*raw_rows, *raw_baseline, *raw_null])
+    row_projection = authorization_projection(raw_rows, vehicle=vehicle,
+                                              strict=strict_projection)
+    baseline_projection = authorization_projection(raw_baseline, vehicle=vehicle,
+                                                   strict=strict_projection)
+    null_projection = authorization_projection(raw_null, vehicle=vehicle,
+                                               strict=strict_projection)
+    rows = row_projection["eligible"]
+    baseline = baseline_projection["eligible"]
+    null_rows = null_projection["eligible"]
+    comparison_baseline_raw = raw_null if is_root and raw_null else raw_baseline
     # Roots are hypotheses, not mutations. Compare their exact rule to an
     # independent randomized-entry null; descendants retain the root-relative
     # baseline so a parameter effect remains attributable to that family.
@@ -1081,12 +1391,25 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                                              str(row.get("entry_timestamp", ""))))
     base_ordered = sorted(comparison_baseline, key=lambda row: (str(row.get("session_date", "")),
                                                                   str(row.get("entry_timestamp", ""))))
+    ordered_raw = sorted(raw_rows, key=lambda row: (str(row.get("session_date", "")),
+                                                     str(row.get("entry_timestamp", ""))))
+    base_ordered_raw = sorted(comparison_baseline_raw,
+                              key=lambda row: (str(row.get("session_date", "")),
+                                               str(row.get("entry_timestamp", ""))))
     if mode == "shadow":
         fit, heldout, base_fit, base_heldout = [], ordered, [], base_ordered
+        raw_fit, raw_heldout = [], ordered_raw
+        raw_base_fit, raw_base_heldout = [], base_ordered_raw
     else:
-        fit, heldout = chronological_split(ordered, fit_fraction=.7)
-        fit_sessions = {str(row.get("session_date") or "") for row in fit}
-        held_sessions = {str(row.get("session_date") or "") for row in heldout}
+        raw_fit, raw_heldout = chronological_split(ordered_raw, fit_fraction=.7)
+        fit_sessions = {str(row.get("session_date") or "") for row in raw_fit}
+        held_sessions = {str(row.get("session_date") or "") for row in raw_heldout}
+        fit = [row for row in ordered if str(row.get("session_date") or "") in fit_sessions]
+        heldout = [row for row in ordered if str(row.get("session_date") or "") in held_sessions]
+        raw_base_fit = [row for row in base_ordered_raw
+                        if str(row.get("session_date") or "") in fit_sessions]
+        raw_base_heldout = [row for row in base_ordered_raw
+                            if str(row.get("session_date") or "") in held_sessions]
         base_fit = [row for row in base_ordered
                     if str(row.get("session_date") or "") in fit_sessions]
         base_heldout = [row for row in base_ordered
@@ -1219,6 +1542,21 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "_fit_baseline_rows": base_fit,
         "_heldout_baseline_rows": base_heldout,
         "_null_rows": null_heldout,
+        "_fit_raw_rows": [dict(row) for row in raw_fit],
+        "_heldout_raw_rows": [dict(row) for row in raw_heldout],
+        "_fit_baseline_raw_rows": [dict(row) for row in raw_base_fit],
+        "_heldout_baseline_raw_rows": [dict(row) for row in raw_base_heldout],
+        "_null_raw_rows": [dict(row) for row in raw_null
+                           if str(row.get("session_date") or "") in
+                           {str(item.get("session_date") or "") for item in raw_heldout}],
+        "authorization_projection": {
+            "candidate": {key: row_projection.get(key) for key in
+                           ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
+            "baseline": {key: baseline_projection.get(key) for key in
+                         ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
+            "null": {key: null_projection.get(key) for key in
+                      ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
+        },
     }
 
 
@@ -1376,20 +1714,49 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             raise FactoryError("worker_data must be a non-empty JSONL file")
     # The envelope, replay workers, and provenance must all use one identical
     # cost schedule. When a caller does not pass an explicit model, derive it
-    # from the validated runtime config rather than silently reverting to the
-    # default spread/slippage schedule.
-    model = costs if costs is not None else CostModel.from_config(runtime_config)
+    # from the validated runtime config for this vehicle rather than silently
+    # reverting to the flat spread/slippage schedule.
+    model = (costs if costs is not None else
+             CostModel.from_config(runtime_config, vehicle=vehicle))
+    # Keep the selected effective model in the replay/effective config while
+    # retaining every normalized vehicle schedule in the identity source. The
+    # latter ensures changing only option economics invalidates option proofs
+    # and factory-cycle identities without changing equity replay economics.
+    cost_fields = ("spread_bps", "slippage_bps", "fee_bps",
+                   "option_fee_per_contract_side", "provenance")
+    identity_costs = {key: getattr(model, key) for key in cost_fields}
+    runtime_costs = ((runtime_config or {}).get("costs")
+                     if isinstance(runtime_config, Mapping) else None)
+    if isinstance(runtime_costs, Mapping) and isinstance(runtime_costs.get("vehicles"), Mapping):
+        identity_costs["vehicles"] = {
+            str(name): {
+                key: getattr(
+                    CostModel.from_config(runtime_config, vehicle=str(name)), key)
+                for key in cost_fields
+            }
+            for name in sorted(runtime_costs["vehicles"], key=str)
+        }
     # The explicit model is the replay economics actually used by workers.
     # Feed it into the identity envelope so a caller-provided calibration (or
     # the module's conservative default) cannot be hidden behind the shipped
     # runtime-config costs when a candidate is persisted.
     identity_runtime_config = dict(runtime_config or {})
-    identity_runtime_config["costs"] = model.as_dict()
+    identity_runtime_config["costs"] = identity_costs
     policy = ReplayPolicy.from_config(runtime_config)
     backtest_policy = replay_policy_for_mode(
         policy, "backtest", backtest_bar_fallback=backtest_bar_fallback)
     shadow_policy = replay_policy_for_mode(
         policy, "shadow", backtest_bar_fallback=backtest_bar_fallback)
+    # A validated runtime config carries sizing, exposure, and stress
+    # controls that are not represented by ReplayPolicy (notably the stressed
+    # cost scenario and its risk ratio).  Bind that normalized block to the
+    # factory-cycle identity whenever supplied.  Keeping the old policy-only
+    # identity for callers that omit runtime risk preserves legacy fixtures.
+    configured_risk = (runtime_config.get("risk")
+                       if isinstance(runtime_config, Mapping) else None)
+    risk_assumptions = None
+    if isinstance(configured_risk, Mapping) and configured_risk:
+        risk_assumptions = {**policy.as_dict(), **dict(configured_risk)}
     llm_config = dict(strategy_llm or {})
     llm_config.setdefault("near_duplicate_distance", NEAR_DUPLICATE_DISTANCE)
     llm_enabled = bool(llm_config.get("enabled", False))
@@ -1462,20 +1829,23 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         "max_generations": int(max_generations),
         "max_rotations": int(max_rotations),
         "rotation_budget": int(rotation_budget),
-        "costs": model.as_dict(),
+        "costs": identity_costs,
         "replay_policy": policy.as_dict(),
         "replay_policies": {"backtest": backtest_policy.as_dict(),
                              "shadow": shadow_policy.as_dict()},
         "backtest_bar_fallback": backtest_bar_fallback,
         "gate": gate_assumptions, "strategy_llm": llm_assumptions,
     }
+    if risk_assumptions is not None:
+        experiment_config["risk"] = risk_assumptions
     identity_hashes = provenance_hash(
         dataset=raw_rows, config=experiment_config, code=Path(__file__),
         provenance={"factory": FACTORY_SCHEMA, "experiment": experiment_config})
     experiment_provenance_body = experiment_provenance(
         dataset=raw_rows, config=experiment_config,
         code=identity_hashes["code_hash"], cost=model.as_dict(),
-        risk=policy.as_dict(), gate=gate_assumptions)
+        risk=(risk_assumptions if risk_assumptions is not None
+              else policy.as_dict()), gate=gate_assumptions)
     experiment_provenance_body["replay_policies"] = {
         "backtest": backtest_policy.as_dict(),
         "shadow": shadow_policy.as_dict(),
@@ -1486,7 +1856,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         dataset_hash=dataset_hash, vehicle=vehicle,
         code_hash=identity_hashes["code_hash"],
         config_hash=identity_hashes["config_hash"], cost=model.as_dict(),
-        risk=policy.as_dict(), gate=gate_assumptions,
+        risk=(risk_assumptions if risk_assumptions is not None
+              else policy.as_dict()), gate=gate_assumptions,
         provenance=experiment_provenance_body)
     factory = FactoryLedger(db_path)
     duplicate = factory.existing_cycle(dataset_hash, vehicle, identity)
@@ -1777,6 +2148,70 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                     pass
             scheduled.append(task)
 
+        # Before any full replay or multiple-testing correction, measure each
+        # backtest candidate on the same fit prefix used for diagnosis.  Full
+        # behavioral aliases receive a deterministic canonical review member;
+        # every intended member remains scheduled, including zero-signal
+        # aliases, because fit fingerprints cannot authorize exclusion.  The
+        # compact summaries are persisted on the testing event below and never
+        # contain fit trade rows.
+        fit_probe_tasks = [task for task in scheduled
+                           if task["mode"] == "backtest" and task.get("specs")]
+        fit_probe_results: dict[str, dict] = {}
+        if fit_probe_tasks:
+            futures = {pool.submit(_fit_variants_worker, task): task
+                       for task in fit_probe_tasks}
+            for future in as_completed(futures):
+                task = futures[future]
+                hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
+                try:
+                    result = future.result()
+                    fit_probe_results[hypothesis_id] = dict(
+                        result.get("fit_diagnostics") or {})
+                except Exception as exc:
+                    # Diagnostics are non-authorizing enrichment.  A failed
+                    # probe must not turn a valid replay into a failure or
+                    # silently remove a candidate.
+                    task["fit_diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+        for task in scheduled:
+            if task["mode"] != "backtest":
+                continue
+            hypothesis_id = str(task["hypothesis"]["hypothesis_id"])
+            diagnostics_by_variant = fit_probe_results.get(hypothesis_id)
+            if not diagnostics_by_variant:
+                continue
+            records = [{"rule_spec": spec,
+                        "variant_id": rule_variant_id(spec),
+                        "source": proposals.get(hypothesis_id, {}).get(
+                            rule_variant_id(spec), (None, ""))[1]}
+                       for spec in task.get("specs", ())]
+            aliases = collapse_behavior_aliases(
+                records, diagnostics=diagnostics_by_variant)
+            task["fit_diagnostics"] = diagnostics_by_variant
+            task["behavior_aliases"] = {
+                key: aliases.get(key)
+                for key in ("entry_aliases", "full_aliases",
+                            "parameter_collapse", "signals_present",
+                            "dedup_status", "requires_operator_review",
+                            "intended_variant_count", "kept_variant_count")}
+            # Measurement-first: retain every intended variant in replay and
+            # BH.  Alias groups are a proposed canonicalization for operator
+            # review only; no fit fingerprint can erase held-out divergence.
+            task["excluded_behavior_aliases"] = []
+            task["proposed_behavior_aliases"] = list(
+                aliases.get("proposed_exclusions") or ())
+            task["specs"] = [item["rule_spec"] if isinstance(item, Mapping)
+                              and isinstance(item.get("rule_spec"), Mapping)
+                              else item for item in aliases["kept"]]
+            factory.event(
+                hypothesis_id, "testing",
+                "fit diagnostics completed before full replay",
+                {"fit_diagnostics": diagnostics_by_variant,
+                 "behavior_aliases": task["behavior_aliases"],
+                 "excluded_behavior_aliases": [],
+                 "proposed_behavior_aliases": task[
+                     "proposed_behavior_aliases"]})
+
         # Phase two: replay every chosen variant in its own isolated account.
         futures = {pool.submit(_worker, task): task for task in scheduled}
         _progress("evaluating", 0, len(scheduled))
@@ -1890,7 +2325,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     selected_test_key = (None if selected_test is None else
                          f"{selected_test[0]['hypothesis']['hypothesis_id']}:"
                          f"{selected_test[1]['variant_id']}")
-    confirmatory_scope = f"shadow-confirmation-v2:{vehicle}"
+    confirmatory_scope = f"shadow-confirmation-v4:{vehicle}"
     cumulative = deferred_fdr(
         confirmatory_scope,
         (f"{identity['identity_hash']}:{selected_test_key}:live-shadow"
@@ -2002,6 +2437,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         fit_baseline = gate.pop("_fit_baseline_rows", [])
         heldout_baseline = gate.pop("_heldout_baseline_rows", [])
         null_source = gate.pop("_null_rows", [])
+        fit_raw = gate.pop("_fit_raw_rows", fit)
+        heldout_raw = gate.pop("_heldout_raw_rows", heldout)
+        fit_baseline_raw = gate.pop("_fit_baseline_raw_rows", fit_baseline)
+        heldout_baseline_raw = gate.pop("_heldout_baseline_raw_rows", heldout_baseline)
+        null_raw = gate.pop("_null_raw_rows", null_source)
         # Candidate identity is the complete validated runtime assumptions
         # with this rule applied.  Replay mode/policy belongs only in the
         # provenance body below, so backtest and shadow share one hash.
@@ -2031,6 +2471,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             lane=worker["mode"], vehicle=vehicle, fit=fit, heldout=heldout,
             fit_baseline=fit_baseline, heldout_baseline=heldout_baseline,
             null_source=null_source,
+            fit_raw=fit_raw, heldout_raw=heldout_raw,
+            fit_baseline_raw=fit_baseline_raw,
+            heldout_baseline_raw=heldout_baseline_raw,
+            null_raw=null_raw,
             fit_floor=gate["fit_floor"], heldout_floor=gate["heldout_floor"],
             fit_control=gate["fit_test"], control=gate["control"],
             p_value=gate["p_raw"],
@@ -2222,6 +2666,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 "evaluation_end": worker["evaluation_end"],
                 "account_id": variant["account"]["account_id"],
                 "worker_pid": variant["worker_pid"], "gate": gate,
+                "fit_diagnostics": (variant.get("diagnostic") or {}).get(
+                    "fit_diagnostics"),
+                "behavior_aliases": dict(worker.get("behavior_aliases") or {}),
+                "excluded_behavior_aliases": list(
+                    worker.get("excluded_behavior_aliases") or ()),
+                "proposed_behavior_aliases": list(
+                    worker.get("proposed_behavior_aliases") or ()),
                 "classification": _gate_classification(gate),
                 "status": (edge.candidate(candidate["candidate_id"]) or {}).get("status"),
                 "run_id": run.get("run_id") if run else None,

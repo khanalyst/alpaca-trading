@@ -69,12 +69,17 @@ def candidate_assumptions(
         # CostModel.as_dict() also exposes rejection-cap diagnostics.  Those
         # are represented by the validated execution block, not the runtime
         # costs schema, so keep only the economic schedule here.
+        cost_keys = ("spread_bps", "slippage_bps", "fee_bps",
+                     "option_fee_per_contract_side", "provenance")
         source["costs"] = {
             key: deepcopy(costs_source[key])
-            for key in ("spread_bps", "slippage_bps", "fee_bps",
-                        "option_fee_per_contract_side", "provenance")
-            if key in costs_source
+            for key in cost_keys if key in costs_source
         }
+        # An explicitly configured vehicle schedule is part of the immutable
+        # proof assumptions.  It is intentionally absent from this projection
+        # for legacy flat configs, preserving their historical hashes exactly.
+        if "vehicles" in costs_source:
+            source["costs"]["vehicles"] = deepcopy(costs_source["vehicles"])
     strategy = dict(source.get("strategy") or {})
     strategy["id"] = str(strategy_id)
     strategy["variant_id"] = str(variant_id)

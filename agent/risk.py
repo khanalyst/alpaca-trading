@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 from collections.abc import Mapping
 
 from .instruments import validate_equity_symbol, validate_option_symbol
+from research.costs import CostError, stressed_cost_usd
 
 from .risk_inputs import (
     _OCC_OPTION_RE,
@@ -113,6 +114,69 @@ class RiskEngine:
         maximum = int(_num(self.r.get("options_max_dte"), 45) or 45)
         spread_pct = _num(self.r.get("options_max_spread_pct"), 10.0) or 10.0
         return minimum, maximum, spread_pct
+
+    @staticmethod
+    def _stressed_cost_settings(cfg: Mapping | None) -> tuple[float | None, float | None]:
+        """Read the runtime stress controls without coercing malformed input."""
+        source = cfg if isinstance(cfg, Mapping) else {}
+        risk = source.get("risk", source)
+        if not isinstance(risk, Mapping):
+            return None, None
+        scenario = _num(risk.get("stressed_cost_scenario_bps"), None)
+        limit = _num(risk.get("max_stressed_cost_to_risk_ratio"), None)
+        if scenario is None:
+            scenario = 25.0 if "stressed_cost_scenario_bps" not in risk else None
+        if limit is None:
+            limit = 1.0 if "max_stressed_cost_to_risk_ratio" not in risk else None
+        if scenario not in {9.0, 15.0, 25.0, 50.0}:
+            scenario = None
+        if limit is not None and (not math.isfinite(limit) or limit < 0):
+            limit = None
+        return scenario, limit
+
+    def check_stressed_cost(self, plan: Mapping,
+                            cfg: Mapping | None = None) -> tuple[dict | None, str | None]:
+        """Veto plans whose preregistered stressed cost exceeds intended risk.
+
+        The returned copy carries only telemetry needed by lifecycle/journal;
+        no stop or target values are changed.  A malformed plan, config, or
+        cost schedule fails closed with a stable explicit reason.
+        """
+        source = cfg if isinstance(cfg, Mapping) else self.cfg
+        scenario, limit = self._stressed_cost_settings(source)
+        if scenario is None or limit is None:
+            return None, "stressed_cost_invalid"
+        vehicle = ("option" if str(plan.get("execution_profile", "shares")).lower()
+                   in {"option", "options", "defined_risk_options", "options_defined_risk"}
+                   else "equity")
+        notional = _num(plan.get("notional"), None)
+        risk_usd = _num(plan.get("risk_usd"), None)
+        quantity_key = "contracts" if vehicle == "option" else "shares"
+        quantity = _num(plan.get(quantity_key), None)
+        if (notional is None or notional <= 0 or risk_usd is None or
+                risk_usd <= 0 or quantity is None or quantity <= 0):
+            return None, "stressed_cost_invalid"
+        try:
+            stressed = stressed_cost_usd(
+                notional, scenario, vehicle=vehicle, quantity=quantity,
+                config=source)
+            ratio = stressed / risk_usd
+        except (CostError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None, "stressed_cost_invalid"
+        if not math.isfinite(stressed) or not math.isfinite(ratio):
+            return None, "stressed_cost_invalid"
+        if ratio > limit:
+            return None, "stressed_cost_risk_limit"
+        enriched = dict(plan)
+        enriched.update({
+            "vehicle": vehicle,
+            "stressed_cost_vehicle": vehicle,
+            "stressed_cost_scenario_bps": float(scenario),
+            "stressed_cost_usd": float(stressed),
+            "stressed_cost_to_risk_ratio": float(ratio),
+            "max_stressed_cost_to_risk_ratio": float(limit),
+        })
+        return enriched, None
 
     def select_option_contract(self, candidates, direction: str,
                                now: float | None = None,
@@ -447,7 +511,8 @@ class RiskEngine:
                  entry_feedback: Mapping | None = None,
                  entry_failures: Mapping | None = None,
                  active_trades: Mapping | None = None,
-                 now: float | None = None):
+                 now: float | None = None,
+                 cost_cfg: Mapping | None = None):
         try:
             now_value = _evaluation_timestamp(now)
         except ValueError as exc:
@@ -504,6 +569,8 @@ class RiskEngine:
             budget = self._risk_usd(equity, decision)
         except ValueError as exc:
             return None, str(exc)
+        if not math.isfinite(float(budget)) or budget <= 0:
+            return None, "stressed_cost_invalid"
         try:
             if profile in {"shares", "stock", "etf", "stock_etf", "stock_etf_shares"}:
                 sized = self.size_shares(equity=equity, entry_price=entry, stop_distance=distance, symbol_data=market, risk_usd=budget)
@@ -556,6 +623,9 @@ class RiskEngine:
                      "max_hold_bars": decision.get("max_hold_bars"),
                      "hold_deadline_ts": decision.get("hold_deadline_ts"),
                      "underlying_stop_price": stop, "underlying_target_price": target})
+        plan, cost_reason = self.check_stressed_cost(plan, cfg=cost_cfg)
+        if plan is None:
+            return None, cost_reason
         return plan, None
 
 

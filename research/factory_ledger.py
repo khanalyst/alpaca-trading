@@ -28,7 +28,23 @@ LESSON_KINDS = {"tuning", "discovery", "replacement", "rotation", "reseed",
                 # produced by real fills rather than a replay.
                 "trial"}
 LESSON_SOURCES = {"llm", "deterministic", "live_paper"}
-FDR_METHOD = "lord_balanced_v2"
+# v3 records the raw confirmatory p-value supplied to LORD.  The previous
+# method spent the BH/global q-value, which is an adaptive selection summary
+# rather than the confirmatory statistic.  Existing rows remain readable and
+# are intentionally isolated by the live-shadow v3 scope.
+FDR_METHOD = "lord_balanced_raw_p_v3"
+LEGACY_FDR_METHOD = "lord_balanced_v2"
+
+
+def _fdr_semantics(scope: str) -> tuple[str, str]:
+    """Return the method and p-value kind encoded by a durable scope.
+
+    Scope versioning keeps legacy q-spending rows auditable without allowing
+    the new raw-p sequence to inherit their alpha/discovery history.
+    """
+    if str(scope).startswith("shadow-confirmation-v2:"):
+        return LEGACY_FDR_METHOD, "legacy_q"
+    return FDR_METHOD, "raw_confirmatory"
 
 
 class FactoryError(ValueError):
@@ -57,7 +73,8 @@ def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
     return {"scope": str(scope), "test_id": str(test_id), "required": False,
             "tested": False, "status": "deferred_to_live_shadow",
             "decision": False, "cumulative": True,
-            "method": "deferred_confirmatory_v2"}
+            "method": "deferred_confirmatory_raw_p_v3",
+            "p_value_kind": "raw_confirmatory"}
 
 
 def _real(value: Any) -> float | None:
@@ -962,13 +979,19 @@ class FactoryLedger:
                 "SELECT decision FROM factory_fdr WHERE scope=? "
                 "ORDER BY created_at,decision_id", (resolved_scope,)).fetchall()
         test_index, allocated = _fdr_allocation(list(rows), nominal)
+        method, p_kind = _fdr_semantics(resolved_scope)
         return {"scope": resolved_scope, "alpha": nominal,
                 "allocated_alpha": allocated, "tests": test_index,
-                "cumulative": True, "method": FDR_METHOD, "preview": True}
+                "cumulative": True, "method": method,
+                "p_value_kind": p_kind, "preview": True}
 
     def record_fdr_decision(self, scope: str, test_id: str, p_value: float,
                             *, alpha: float = .05) -> dict[str, Any]:
         """Persist one balanced cumulative LORD-style online-FDR decision.
+
+        For v3 live-shadow scopes, ``p_value`` is the raw confirmatory
+        statistic.  Family/global BH q-values are candidate-selection
+        summaries and must not be passed here.
 
         Only independent confirmatory callers should spend this allocation.
         Development and offline-forward screens deliberately defer cumulative
@@ -978,6 +1001,7 @@ class FactoryLedger:
         if not 0 <= p <= 1 or not 0 < nominal <= 1:
             raise FactoryError("p_value must be in [0,1] and alpha in (0,1]")
         scope, test_id = str(scope), str(test_id)
+        method, p_kind = _fdr_semantics(scope)
         with closing(_connect(self.path)) as db, db:
             rows = db.execute(
                 "SELECT * FROM factory_fdr WHERE scope=? "
@@ -987,7 +1011,8 @@ class FactoryLedger:
                     return dict(existing) | {
                         "decision": bool(existing["decision"]),
                         "tests": existing_index, "cumulative": True,
-                        "method": FDR_METHOD,
+                        "method": method,
+                        "p_value_kind": p_kind,
                     }
             test_index, allocated = _fdr_allocation(list(rows), nominal)
             decision = bool(p <= allocated)
@@ -997,7 +1022,8 @@ class FactoryLedger:
         return {"scope": scope, "test_id": test_id, "p_value": p,
                 "alpha": nominal, "allocated_alpha": allocated,
                 "decision": decision, "tests": test_index,
-                "cumulative": True, "method": FDR_METHOD}
+                "cumulative": True, "method": method,
+                "p_value_kind": p_kind}
 
     # Explicit aliases are the integration seam for strategy_factory callers.
     online_fdr = record_fdr_decision
@@ -1007,9 +1033,11 @@ class FactoryLedger:
         with closing(_connect(self.path)) as db:
             rows = db.execute("SELECT * FROM factory_fdr WHERE scope=? ORDER BY created_at,decision_id",
                               (str(scope),)).fetchall()
+        method, p_kind = _fdr_semantics(str(scope))
         return {"scope": str(scope), "cumulative": True, "tests": len(rows),
                 "alpha_spent": sum(float(row["allocated_alpha"]) for row in rows),
                 "discoveries": sum(int(row["decision"]) for row in rows),
+                "method": method, "p_value_kind": p_kind,
                 "decisions": [dict(row) for row in rows]}
 
     online_fdr_state = fdr_state
@@ -1027,7 +1055,7 @@ class FactoryLedger:
 
 __all__ = [
     "ACTIVE_HYPOTHESIS_STATES", "FACTORY_SCHEMA", "FACTORY_IDENTITY_SCHEMA", "FACTORY_STATUSES",
-    "FDR_METHOD", "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
+    "FDR_METHOD", "LEGACY_FDR_METHOD", "LESSON_KINDS", "LESSON_SOURCES", "FactoryError", "FactoryLedger",
     "deferred_fdr",
     "experiment_identity",
     "experiment_provenance",

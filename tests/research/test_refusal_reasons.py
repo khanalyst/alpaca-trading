@@ -29,7 +29,10 @@ def _bar(minute: int, open_: float, high: float, low: float, close: float):
     complete = (ts + timedelta(minutes=1)).isoformat()
     return normalize_underlying_bar(
         {"kind": "bar", "symbol": "SPY", "timestamp": ts.isoformat(),
-         "as_of": complete, "observed_at": complete, "open": open_, "high": high,
+         # Mechanics/refusal fixture exposes opening prints at the boundary;
+         # delayed recorder bars are covered by dedicated temporal tests.
+         "as_of": ts, "observed_at": ts,
+         "open": open_, "high": high,
          "low": low, "close": close, "volume": 1000},
         provider="alpaca", feed="iex")
 

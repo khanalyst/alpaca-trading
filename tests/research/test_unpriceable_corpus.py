@@ -201,7 +201,10 @@ class RealReplayReproductionTests(unittest.TestCase):
                         rows.append({
                             "kind": "bar", "provider": "test", "feed": "iex",
                             "symbol": symbol, "timestamp": start.isoformat(),
-                            "as_of": end.isoformat(), "observed_at": end.isoformat(),
+                            # Mechanics corpus: opening prints are visible at
+                            # their boundaries; delayed recorder bars have
+                            # separate temporal acceptance coverage.
+                            "as_of": start.isoformat(), "observed_at": start.isoformat(),
                             "open": round(previous, 4),
                             "high": round(max(previous, close) + .02, 4),
                             "low": round(min(previous, close) - .02, 4),

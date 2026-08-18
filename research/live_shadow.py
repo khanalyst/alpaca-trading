@@ -32,13 +32,13 @@ from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
 from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
-from research.costs import ReplayPolicy, replay_policy_for_session
+from research.costs import (ReplayPolicy, cost_model_for_vehicle,
+                             replay_policy_for_session)
 from research.edge_discovery_core import _effective_ibr_config, _opportunity_rows
 from research.edge_discovery_core import _null_reference_rows, null_control_account
 from research.edge_lab import _null_spec
 from research.factory_core import simulate_account
 from research.ibr import IBRConfig, replay_ibr
-from research.costs import CostModel
 from research.market_data import (
     NormalizationError,
     normalize_option_snapshot,
@@ -241,8 +241,12 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
     execution_profile = str(plan.get("execution_profile") or
                             risk_plan.get("execution_profile") or "shares").lower()
     signal_ts = _finite(plan.get("signal_ts", signal.get("signal_ts")))
-    entry_ts = None
-    if signal_ts is not None:
+    decision_ts = plan.get("decision_timestamp", signal.get("decision_timestamp"))
+    entry_ts = plan.get("entry_timestamp", signal.get("entry_timestamp"))
+    if entry_ts is None and decision_ts is not None:
+        entry_ts = decision_ts
+    if entry_ts is None and signal_ts is not None:
+        # Legacy shadow payloads predate explicit causal timestamps.
         entry_ts = (datetime.fromtimestamp(signal_ts, UTC) +
                     timedelta(seconds=60)).isoformat()
     return {
@@ -251,7 +255,8 @@ def _shadow_signature(row: Mapping[str, Any]) -> dict[str, Any] | None:
         "direction": str(plan.get("direction") or signal.get("direction") or ""),
         "setup_type": str(plan.get("setup_type") or signal.get("setup_type") or ""),
         "signal_ts": _iso_time(datetime.fromtimestamp(signal_ts, UTC).isoformat()) if signal_ts is not None else None,
-        "entry_ts": entry_ts,
+        "decision_ts": _iso_time(decision_ts),
+        "entry_ts": _iso_time(entry_ts),
         "stop_price": _number_or_none(plan.get("stop_price", signal.get("stop_price"))),
         "target_price": _number_or_none(plan.get("target_price", signal.get("target_price"))),
         "stop_distance": _number_or_none(plan.get("stop_distance", signal.get("stop_distance"))),
@@ -271,6 +276,10 @@ def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
     if row.get("no_trade") is True:
         return None
     signal_ts = row.get("signal_timestamp")
+    # Legacy rows have no causal decision field; preserve that absence so
+    # their stored signatures remain comparable.  New factory/IBR rows carry
+    # the explicit decision timestamp.
+    decision_ts = row.get("decision_timestamp")
     entry_ts = row.get("entry_timestamp")
     direction = str(row.get("direction") or "")
     stop = _number_or_none(row.get("stop_price"))
@@ -290,6 +299,7 @@ def _replay_signature(row: Mapping[str, Any], *, vehicle: str,
         "direction": direction,
         "setup_type": setup_type,
         "signal_ts": _iso_time(signal_ts),
+        "decision_ts": _iso_time(decision_ts),
         "entry_ts": _iso_time(entry_ts),
         "stop_price": stop,
         "target_price": target,
@@ -306,7 +316,7 @@ def _signature_diffs(expected: Sequence[Mapping[str, Any]],
                     observed: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return deterministic, field-level differences between semantic rows."""
     key_fields = ("symbol", "session_date", "direction", "setup_type")
-    compare_fields = ("signal_ts", "entry_ts", "stop_price", "target_price",
+    compare_fields = ("signal_ts", "decision_ts", "entry_ts", "stop_price", "target_price",
                       "stop_distance", "range_high", "range_low", "target_r",
                       "vehicle", "profile")
     left = sorted((dict(item) for item in expected),
@@ -1182,6 +1192,14 @@ class ShadowRunner:
                 "variant_id": candidate.get("variant_id"), "signal": signal}
         if signal is None:
             return "no_trade", "no signal", base, None
+        # Runtime decisions are made when the completed feature prefix is
+        # actually observed.  Persist that causal instant and use it as the
+        # entry boundary; replay compares these fields rather than deriving a
+        # synthetic next-bar timestamp from the market event alone.
+        signal = dict(signal)
+        signal["decision_timestamp"] = event_at.isoformat()
+        signal["entry_timestamp"] = event_at.isoformat()
+        base["signal"] = signal
         quote = self._latest_quote(quotes.get(symbol, ()), event_at)
         snap: dict[str, Any] = {"price": _finite(event.get("close")) or _finite(event.get("open")),
                                 "close": _finite(event.get("close")),
@@ -1232,6 +1250,9 @@ class ShadowRunner:
             return "reject", f"setup exception: {type(exc).__name__}", base, None
         if plan is None:
             return "reject", why or "setup rejected", base | {"snapshot": snap}, None
+        plan = dict(plan)
+        plan["decision_timestamp"] = event_at.isoformat()
+        plan["entry_timestamp"] = event_at.isoformat()
         # A candidate's virtual book is isolated and feeds only that
         # candidate's portfolio admission.  Plans are immutable observations;
         # no fills, mark-to-market, or fabricated P&L is introduced here.
@@ -1368,24 +1389,25 @@ class ShadowRunner:
             normalized_options = [_normalize_row(row)[1]
                                  for row in in_session_options]
             replay_policy = _session_policy(cfg, calendar_close)
+            candidate_vehicle = str(candidate.get("vehicle") or "equity")
             if str(candidate.get("strategy_id")) == "ibr":
                 replay_cfg, _ = _effective_ibr_config(
-                    cfg, {}, close_confirmed=True, policy=replay_policy)
+                    cfg, {}, vehicle=candidate_vehicle,
+                    close_confirmed=True, policy=replay_policy)
                 option_index = _option_snapshot_index(normalized_options)
                 result = replay_ibr(normalized_bars, config=replay_cfg,
-                                    vehicle=str(candidate.get("vehicle") or "equity"),
+                                    vehicle=candidate_vehicle,
                                     option_snapshots=option_index,
                                     quotes=normalized_quotes)
                 trades = [_plain(trade) for trade in result.trades]
                 evidence_rows = _opportunity_rows(
-                    result, normalized_bars,
-                    str(candidate.get("vehicle") or "equity"))
+                    result, normalized_bars, candidate_vehicle)
                 realized_pnl = sum(_finite(trade.get("net_pnl")) or 0.0
                                    for trade in trades)
                 ending_cash = starting_cash + realized_pnl
                 replay_signatures = [signature for trade in trades
                                      if (signature := _replay_signature(
-                                         trade, vehicle=str(candidate.get("vehicle") or "equity"),
+                                         trade, vehicle=candidate_vehicle,
                                          strategy_id="ibr", target_r=replay_cfg.target_r)) is not None]
                 details.update(complete=complete, trade_count=len(trades),
                                opportunity_count=len(evidence_rows), trades=trades,
@@ -1397,7 +1419,7 @@ class ShadowRunner:
                 try:
                     null_account = null_control_account(
                         normalized_bars, normalized_options, _null_spec(replay_cfg),
-                        vehicle=str(candidate.get("vehicle") or "equity"),
+                        vehicle=candidate_vehicle,
                         reference_rows=_null_reference_rows(
                             result, normalized_bars,
                             str(candidate.get("vehicle") or "equity")),
@@ -1421,10 +1443,11 @@ class ShadowRunner:
                 policy = replay_policy
                 account = simulate_account(
                     normalized_bars, normalized_options,
-                    spec, vehicle=str(candidate.get("vehicle") or "equity"),
+                    spec, vehicle=candidate_vehicle,
                     account_id=f"shadow:{candidate_id}:{session}",
                     starting_cash=float(self.config.equity),
                     risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
+                    costs=cost_model_for_vehicle(cfg, candidate_vehicle),
                     quotes=normalized_quotes, policy=policy)
                 rows = list(account.get("rows") or [])
                 evidence_rows = rows
@@ -1435,7 +1458,7 @@ class ShadowRunner:
                     realized_pnl = ending_cash - starting_cash
                 replay_signatures = [signature for trade in rows
                                      if (signature := _replay_signature(
-                                         trade, vehicle=str(candidate.get("vehicle") or "equity"),
+                                         trade, vehicle=candidate_vehicle,
                                          strategy_id="rule", target_r=float(spec.get("target_r", 2.0)),
                                          setup_type=f"rule_{spec.get('family', 'signal')}")) is not None]
                 details.update(complete=complete, trade_count=len(replay_signatures),
@@ -1443,12 +1466,13 @@ class ShadowRunner:
                 try:
                     null_account = null_control_account(
                         normalized_bars, normalized_options, spec,
-                        vehicle=str(candidate.get("vehicle") or "equity"),
+                        vehicle=candidate_vehicle,
                         reference_rows=rows,
                         account_id=f"shadow:null:{candidate_id}:{session}",
                         starting_cash=float(self.config.equity),
                         risk_pct=float((cfg.get("risk") or {}).get("risk_per_trade_pct", .5)),
-                        costs=CostModel.from_config(cfg), quotes=normalized_quotes,
+                        costs=cost_model_for_vehicle(cfg, candidate_vehicle),
+                        quotes=normalized_quotes,
                         policy=policy)
                     null_rows = list(null_account.get("rows") or [])
                     details["null_control"] = True

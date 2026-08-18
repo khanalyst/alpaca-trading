@@ -35,10 +35,26 @@ _CLI_SPEC.loader.exec_module(research_cli)
 
 
 def bars_only(rows):
-    """Drop executable quotes while retaining the exact source bars."""
-    return [row for row in rows
-            if str(row.get("kind", "bar")).lower() not in
-            {"quote", "equity_quote", "underlying_quote"}]
+    """Return a boundary-visible bars-only corpus for this lane suite.
+
+    ``edge_corpus`` intentionally models recorder output: its bars become
+    observable at the bar end.  The tests below exercise the documented,
+    mechanics-only backtest bar fallback instead, so copy each retained bar
+    and expose it at its own timestamp.  Recorder-style delayed bars remain
+    covered by the separate entry-visibility tests and are not changed here.
+    """
+    visible = []
+    for row in rows:
+        if str(row.get("kind", "bar")).lower() in {
+                "quote", "equity_quote", "underlying_quote"}:
+            continue
+        boundary = dict(row)
+        timestamp = boundary.get("timestamp")
+        if timestamp is not None:
+            boundary["as_of"] = timestamp
+            boundary["observed_at"] = timestamp
+        visible.append(boundary)
+    return visible
 
 
 def floor_trades(result):
@@ -194,7 +210,21 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
 
     def test_strict_default_refuses_bars_only_but_explicit_backtest_fallback_prices(self):
         self.assertEqual(floor_trades(self.strict), 0)
-        self.assertGreater(floor_trades(self.backtest), 0)
+        # Bar fallback remains visible as replay diagnostics, but contributes
+        # zero authorizing trades to structural floors and every downstream
+        # inference.
+        self.assertEqual(floor_trades(self.backtest), 0)
+        fallback_gates = [row.get("gate") or {}
+                          for row in self.backtest.get("results", ())]
+        self.assertTrue(any(
+            int(((gate.get("verified_gate") or {}).get("fill_quality") or {}
+                 ).get("fit", {}).get("executed", 0)) > 0
+            for gate in fallback_gates))
+        self.assertTrue(any(
+            int((((gate.get("verified_gate") or {}).get(
+                "authorization_projection") or {}).get("fit", {})
+                .get("counts", {}).get("eligible", 0))) == 0
+            for gate in fallback_gates))
         self.assertTrue(all(row["mode"] == "backtest"
                             for row in self.backtest["results"]))
 
@@ -224,9 +254,23 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
         self.assertEqual(max(
             int((row.get("gate") or {}).get("floor", {}).get("trades", 0))
             for row in strict["variants"]), 0)
-        self.assertGreater(max(
+        # Explicit bar fallback remains available as a diagnostic replay, but
+        # the authorization-quality projection excludes those bar-priced rows
+        # from every structural/performance floor.
+        self.assertEqual(max(
             int((row.get("gate") or {}).get("floor", {}).get("trades", 0))
             for row in fallback["variants"]), 0)
+        fallback_gates = [row.get("gate") or {}
+                          for row in fallback["variants"]]
+        self.assertTrue(any(
+            int(((gate.get("verified_gate") or {}).get("fill_quality") or {}
+                 ).get("fit", {}).get("executed", 0)) > 0
+            for gate in fallback_gates))
+        self.assertTrue(any(
+            int((((gate.get("verified_gate") or {}).get(
+                "authorization_projection") or {}).get("fit", {})
+                .get("counts", {}).get("eligible", 0))) == 0
+            for gate in fallback_gates))
 
     def test_backtest_fallback_does_not_relax_a_forward_shadow(self):
         shadow_rows = [row for row in self.shadow["results"]

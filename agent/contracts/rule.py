@@ -796,6 +796,50 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
     }
 
 
+def evaluate_rule_signal_metadata(rows: Sequence[Any],
+                                 value: Mapping[str, Any]) -> dict | None:
+    """Return non-authorizing metadata for one evaluated signal.
+
+    This deliberately delegates signal authorization to
+    :func:`evaluate_rule_signal`; the additional fields are an observability
+    surface for fit diagnostics only.  They expose the ATR and the derived
+    30-bps floor decision without changing the authored rule or runtime
+    signal contract.
+    """
+    signal = evaluate_rule_signal(rows, value)
+    if signal is None:
+        return None
+    spec = validate_rule_spec(value)
+    bars = list(rows)
+    close = float(signal.get("entry_price") or 0.0)
+    atr = _atr(bars, spec["atr_period"])
+    atr_bps = (float(atr) / close * 10_000.0
+               if atr is not None and close > 0 else None)
+    authored_distance = (float(atr) * float(spec["stop_atr"])
+                         if atr is not None else None)
+    floor_distance = close * MIN_STOP_DISTANCE_FRACTION if close > 0 else None
+    return {
+        **signal,
+        "atr": atr,
+        "atr_bps": atr_bps,
+        "authored_stop_distance": authored_distance,
+        "floor_distance": floor_distance,
+        "floor_binding": bool(
+            authored_distance is not None and floor_distance is not None and
+            floor_distance >= authored_distance),
+        "planned_stop_distance": signal.get("stop_distance"),
+        "planned_target_distance": (
+            abs(float(signal["target_price"]) - close)
+            if signal.get("target_price") is not None else None),
+        "planned_hold_bars": spec.get("max_hold_bars"),
+    }
+
+
+# Friendly diagnostic spelling retained as a compatibility alias.  Neither
+# helper participates in runtime authorization or order placement.
+rule_signal_metadata = evaluate_rule_signal_metadata
+
+
 def generate_rule_signal(symbol: str, bars: Sequence[Any], *, config: Mapping[str, Any],
                          now: datetime | None = None) -> dict | None:
     strategy = config.get("strategy", config) if isinstance(config, Mapping) else {}
@@ -837,7 +881,8 @@ __all__ = [
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",
            "feature_window_bars", "rule_semantic_signature",
            "rule_semantic_distance", "rule_spec_json_schema",
-    "RuleSpecError", "evaluate_rule_signal",
+    "RuleSpecError", "evaluate_rule_signal", "evaluate_rule_signal_metadata",
+    "rule_signal_metadata",
     "generate_rule_signal", "hold_deadline", "rule_spec_hash",
     "rule_variant_id", "setup_evidence", "validate_rule_spec",
 ]

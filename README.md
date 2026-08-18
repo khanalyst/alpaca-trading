@@ -66,6 +66,13 @@ global result can authorize cross-family selection. Historical and offline
 forward screens do not spend cumulative alpha. The one durable online-FDR test
 is reserved for the later parity-matched live-shadow tail.
 
+The exit grammar remains fixed: an ATR-derived bracket (with the 30 bps minimum
+stop floor), configured R target, and bounded bar-cap time exit. Factory
+fit-only measurement reports eligible prefixes/first signals, 30-bps floor
+binding, planned exits, configured/stressed economics, power,
+delivered-versus-intended risk, and behavioral aliases for operator review; it
+is diagnostic only, does not expand exits, and cannot authorize a candidate.
+
 The authorizing floors are immutable: backtest/factory evidence requires 100
 trades and 30 complete sessions/clusters; the sealed qualification window
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
@@ -90,6 +97,12 @@ by `edge ingest-shadow` as a complete parity-matched proof before the candidate
 can become `validated` or `champion`. An underpowered, mismatched, or incomplete
 shadow cycle advances no durable boundary, so those sessions are reconsidered
 when enough data exists instead of being silently consumed.
+
+The v4 live-shadow scope is independent and chronological: each complete tail
+is split into an older selection window and a newer disjoint confirmatory
+window. Batch BH uses selection p-values; only the selected candidate's raw
+confirmatory p-value is sent to LORD. Same-tail v3 scopes remain audit-only and
+cannot authorize.
 
 Within a hypothesis, refinement first changes exactly one executable field at
 a time. Only after that coordinate neighborhood is measured can it combine two
@@ -134,11 +147,20 @@ replay requires the exact Alpaca calendar boundary for each session, including
 early closes; it never promotes a missing day to a fixed 16:00 close. Entries
 outside the session are rejected, orders are day-only, and positions are
 force-closed before the broker calendar close. Research replay receives the
-same runtime `ReplayPolicy`: strict 30-second market/quote freshness, configured
+same runtime `ReplayPolicy`: `execution.strict_market_data` defaults to `true`,
+with strict 30-second market/quote freshness, configured
 DTE (default 7–60), option spread and liquidity checks, latest-entry and
 force-flat cutoffs, and portfolio/risk limits (position count/notional,
 gross/open risk, and daily loss) are all enforced rather than relaxed for
-simulation. Authorizing fills retain provider/feed/age/source for both legs:
+simulation. Point-in-time required records become actionable at the maximum of
+their event timestamp, `as_of`, and `observed_at`. A delayed recorder bar can
+signal when it is observed; execution enters at that decision/observation time
+using fresh SIP (equity) or OPRA (option) evidence. Delayed full OHLC never
+backfills an earlier entry, and partial pre-entry bar ranges are excluded.
+Fit diagnostics may still count planned signal/exit geometry as
+quote-required, non-authorizing measurement. Historical bar fallback remains
+diagnostic and cannot authorize proof.
+Authorizing fills retain provider/feed/age/source for both legs:
 SIP for equity entry and exit, OPRA for option entry and exit, each no older
 than 30 seconds. Bar-only, partial-feed, or stale legs cannot authorize proof.
 
@@ -173,15 +195,22 @@ unattended research.
 
 ### Costs and authorization checks
 
-The shipped expected-cost model is 4 bps spread, 6 bps adverse slippage, and
-0.5 bps per-side notional fee, plus a 0.65 currency-unit listed-option fee per
-contract per side. Proofs also persist preregistered all-in stress scenarios of
+The shared vehicle-specific cost model uses explicit `costs.vehicles.equity` or
+`.option` schedules when configured (with provenance); otherwise the shipped
+defaults are 4 bps spread, 6 bps adverse slippage, and 0.5 bps per-side
+notional fee, plus a 0.65 currency-unit listed-option fee per contract per side.
+Proofs also persist preregistered all-in stress scenarios of
 9, 15, 25, and 50 bps; the 25 bps scenario is the required authorization
 check, while the others are diagnostics. Runtime rejection caps are separate
 from expected costs.
 
 `research.py calibrate` reads the journal without mutation and checks entry and
-exit fills independently. Shadow authorization fails closed when the journal is
+exit fills independently per vehicle; equity and option calibration is never
+pooled. Runtime risk applies the configured stressed-cost scenario (25 bps by
+default) and abstains when `stressed_cost_to_risk_ratio` exceeds
+`max_stressed_cost_to_risk_ratio`; intended,
+delivered, ratio, and shortfall telemetry are persisted with orders and fills.
+Shadow authorization fails closed when the journal is
 missing or stale, the sample is insufficient, costs are optimistic, a terminal
 fill is materially underfilled (<80% of requested quantity), or the
 partial-cancel rate exceeds 20%. Offline discovery and factory diagnostics may
@@ -396,9 +425,11 @@ separate secret is absent, unreadable, or keyless. Provider credentials are
 read only from `ALPACA_RESEARCH_LLM_SECRET_FILE`; invalid model output leaves a
 pending replacement and never retires a family or authorizes trading.
 Runtime decision LLM use is hard-off in the paper trader. The default trader
-remains paper-only with the `shares` execution profile; options research is
-evidence only and does not enable options execution. `ALPACA_RESEARCH_VEHICLES=all`
-is the default and researches both equity and option vehicles. Seed months of
+remains paper-only with the `shares` execution profile; scheduled research
+therefore runs the equity vehicle only by default. Set
+`ALPACA_RESEARCH_VEHICLES=all` explicitly to run equity and option research
+independently; each vehicle keeps its own calibration and authorization
+evidence, and option research does not enable option execution. Seed months of
 history in one command instead of waiting for the recorder to accumulate it:
 
 For the plain supported Compose deployment, first provide both credential
@@ -439,12 +470,15 @@ evidence gate, not a startup error.
 Backtest/factory evidence requires 100 trades plus 30 complete sessions/clusters;
 sealed qualification requires 100 trades plus 30 complete sessions/clusters;
 and the parity-matched shadow tail requires 150 trades plus 30 complete
-sessions. Replay epoch 3 additionally requires a 30 bps minimum stop distance
-for both rule and IBR paths, a recomputable risk unit that covers round-trip
-cost, and executable SIP/OPRA quote/snapshot fill-quality evidence on both legs
-within 30 seconds rather than bar-only fallback. Runs from older replay epochs
-remain auditable but are quarantined and cannot validate or authorize the trader
-until replayed under epoch 3.
+sessions. Replay epoch 4 retains the epoch-3 economics gates and additionally
+requires latest-of-event/as-of/observed-at point-in-time availability,
+executable-row-only authorizing statistics, vehicle-specific cost
+selection/provenance, raw confirmatory p-values for FDR, and a stressed-cost
+runtime abstention boundary. Runs from older replay epochs remain auditable but
+are quarantined and cannot validate or authorize the trader until replayed under
+epoch 4. Authorization requires exact equality with current epoch 4; future
+epochs are audit-only too. Each current-epoch run seals one immutable verified
+gate proof, and re-derivation appends a new proof rather than rewriting history.
 
 For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow

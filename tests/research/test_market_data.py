@@ -12,6 +12,8 @@ from research.market_data import (
     normalize_quote,
     normalize_underlying_bar,
     parse_timestamp,
+    record_available_at,
+    record_is_available,
 )
 
 
@@ -72,6 +74,26 @@ class MarketDataNormalizationTests(unittest.TestCase):
         payload["ask"] = 499
         with self.assertRaises(NormalizationError):
             normalize_quote(payload)
+
+    def test_availability_waits_for_observation_and_legacy_defaults_to_event(self):
+        payload = {
+            "symbol": "SPY", "timestamp": "2024-01-02T14:30:00Z",
+            "as_of": "2024-01-02T14:30:00Z",
+            "observed_at": "2024-01-02T14:31:00Z",
+            "bid": 500, "ask": 500.01,
+            "provider": "alpaca", "feed": "sip",
+        }
+        delayed = normalize_quote(payload)
+        early = datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc)
+        observed = datetime(2024, 1, 2, 14, 31, tzinfo=timezone.utc)
+        self.assertEqual(record_available_at(delayed), observed)
+        self.assertFalse(record_is_available(delayed, early))
+        self.assertTrue(record_is_available(delayed, observed))
+
+        legacy = normalize_quote({key: value for key, value in payload.items()
+                                  if key != "observed_at"})
+        self.assertEqual(record_available_at(legacy), early)
+        self.assertTrue(record_is_available(legacy, early))
 
     def test_option_contract_normalizes_right_and_multiplier(self):
         contract = normalize_option_contract({

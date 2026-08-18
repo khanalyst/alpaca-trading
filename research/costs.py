@@ -25,13 +25,18 @@ import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-# A quoted spread of ~2 bps covers a one- to two-cent book on the configured
-# ETF universe including its less liquid members, not only the tightest name.
-DEFAULT_SPREAD_BPS = 2.0
+from .market_data import record_is_available
+
+# The shipped runtime schedule assumes a conservative quoted spread for the
+# configured ETF universe, including its less liquid members, not only the
+# tightest name.
+DEFAULT_SPREAD_BPS = 4.0
 # A marketable entry and a broker-resident stop leg both execute through the
 # book at whatever is resting when they arrive; a triggered stop in a moving
-# market pays materially more than half the quoted spread.
-DEFAULT_SLIPPAGE_BPS = 3.0
+# market pays materially more than half the quoted spread.  Keep this aligned
+# with the shipped runtime schedule so direct replay/API callers are not more
+# optimistic than configured runs.
+DEFAULT_SLIPPAGE_BPS = 6.0
 # Regulatory and exchange fees on notional, charged on both sides.
 DEFAULT_FEE_BPS = 0.5
 # Conservative listed-option broker/exchange fee floor per contract per side.
@@ -41,6 +46,10 @@ DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE = 0.65
 # Mirrors the checked `execution` block; these are caps, never expectations.
 RUNTIME_MAX_SPREAD_BPS = 100.0
 RUNTIME_MAX_SLIPPAGE_BPS = 50.0
+# These are the preregistered all-in cost shocks used by the research gate.
+# Runtime may select one of these scenarios, but must not invent a new stress
+# level that has no corresponding research evidence.
+COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
 
 CONFIG_BLOCK = "costs"
 
@@ -441,35 +450,80 @@ class CostModel:
                 "provenance": self.provenance}
 
     @classmethod
-    def from_config(cls, config: Mapping | None) -> CostModel:
+    def from_config(cls, config: Mapping | None, *, vehicle: str | None = None) -> CostModel:
         """Build from the single ``costs`` block, capped by ``execution``.
 
         The caps are read from the same ``execution`` block the trader
         validates, so tightening the runtime's tolerance is immediately a
         research constraint rather than a number somebody remembers to copy.
+
+        ``vehicle`` selects an optional nested schedule under
+        ``costs.vehicles``.  A selected schedule is an override, not a second
+        schema: omitted fields inherit the normalized flat schedule (including
+        its provenance) and the same execution rejection caps always apply.
+        Leaving ``vehicle`` unset retains the historical flat-config behavior.
         """
+        if vehicle is not None and vehicle not in {"equity", "option"}:
+            raise CostError("vehicle must be equity or option")
         source = dict(config or {})
         block = source.get(CONFIG_BLOCK) or {}
         if not isinstance(block, Mapping):
             raise CostError(f"{CONFIG_BLOCK} must be a mapping")
-        unknown = sorted(set(block) - {"spread_bps", "slippage_bps", "fee_bps",
-                                       "option_fee_per_contract_side",
-                                       "option_fee_per_contract", "provenance"})
+        cost_fields = {"spread_bps", "slippage_bps", "fee_bps",
+                       "option_fee_per_contract_side",
+                       "option_fee_per_contract", "provenance"}
+        unknown = sorted(set(block) - cost_fields - {"vehicles"}, key=str)
         if unknown:
             raise CostError(f"{CONFIG_BLOCK} has unknown field(s): {', '.join(unknown)}")
         execution = source.get("execution") or {}
         if not isinstance(execution, Mapping):
             raise CostError("execution must be a mapping")
+        selected = dict(block)
+        vehicles = block.get("vehicles")
+        if "vehicles" in block:
+            if not isinstance(vehicles, Mapping):
+                raise CostError(f"{CONFIG_BLOCK}.vehicles must be a mapping")
+            unknown_vehicles = sorted(
+                set(vehicles) - {"equity", "option"}, key=str)
+            if unknown_vehicles:
+                raise CostError(
+                    f"{CONFIG_BLOCK}.vehicles has unknown vehicle(s): "
+                    f"{', '.join(unknown_vehicles)}")
+            for name, override in vehicles.items():
+                if not isinstance(override, Mapping):
+                    raise CostError(
+                        f"{CONFIG_BLOCK}.vehicles.{name} must be a mapping")
+                override_unknown = sorted(set(override) - cost_fields, key=str)
+                if override_unknown:
+                    raise CostError(
+                        f"{CONFIG_BLOCK}.vehicles.{name} has unknown field(s): "
+                        f"{', '.join(override_unknown)}")
+                # Validate every declared schedule, including one not selected
+                # by this call, so malformed configuration cannot hide behind
+                # the flat/default resolver path.
+                inherited = dict(block)
+                inherited.pop("vehicles", None)
+                inherited.update(dict(override))
+                try:
+                    cls.from_config({CONFIG_BLOCK: inherited,
+                                     "execution": execution})
+                except CostError as exc:
+                    raise CostError(
+                        f"{CONFIG_BLOCK}.vehicles.{name}: {exc}") from exc
+            if vehicle is not None and vehicle in vehicles:
+                selected.update(dict(vehicles[vehicle]))
+        selected.pop("vehicles", None)
         return cls(
-            spread_bps=block.get("spread_bps", DEFAULT_SPREAD_BPS),
-            slippage_bps=block.get("slippage_bps", DEFAULT_SLIPPAGE_BPS),
-            fee_bps=block.get("fee_bps", DEFAULT_FEE_BPS),
-            option_fee_per_contract_side=block.get(
+            spread_bps=selected.get("spread_bps", DEFAULT_SPREAD_BPS),
+            slippage_bps=selected.get("slippage_bps", DEFAULT_SLIPPAGE_BPS),
+            fee_bps=selected.get("fee_bps", DEFAULT_FEE_BPS),
+            option_fee_per_contract_side=selected.get(
                 "option_fee_per_contract_side", DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE),
-            option_fee_per_contract=block.get("option_fee_per_contract"),
+            option_fee_per_contract=selected.get("option_fee_per_contract"),
             max_spread_bps=execution.get("max_spread_bps", RUNTIME_MAX_SPREAD_BPS),
             max_slippage_bps=execution.get("max_slippage_bps", RUNTIME_MAX_SLIPPAGE_BPS),
-            provenance=str(block.get("provenance", "default" if not block else "config")),
+            provenance=str(selected.get(
+                "provenance", "default" if not block else "config")),
         )
 
 
@@ -515,19 +569,73 @@ def _quote_fill_from_record(quote: Any, *, side: str) -> QuoteFill | None:
     return QuoteFill(price, timestamp, as_of, provider, feed)
 
 
-def _cost_model_for_vehicle(costs: Any, vehicle: str) -> CostModel:
+def cost_model_for_vehicle(costs: Any, vehicle: str) -> CostModel:
     """Resolve a shared model or a vehicle-keyed model mapping."""
+    if vehicle not in {"equity", "option"}:
+        raise CostError("vehicle must be equity or option")
     if costs is None:
         return CostModel()
     if isinstance(costs, CostModel):
         return costs
     if isinstance(costs, Mapping):
+        # A runtime config or a normalized costs block carries its schedule
+        # under ``costs``.  Resolve it through the canonical parser so nested
+        # overrides inherit the flat values and execution caps.
+        if CONFIG_BLOCK in costs or "execution" in costs:
+            return CostModel.from_config(costs, vehicle=vehicle)
+        if "vehicles" in costs:
+            return CostModel.from_config({CONFIG_BLOCK: costs}, vehicle=vehicle)
         selected = costs.get(vehicle, costs.get("default", costs))
         if isinstance(selected, CostModel):
             return selected
         if isinstance(selected, Mapping):
             return CostModel.from_dict(selected)
     raise CostError("costs must be a CostModel or vehicle-keyed mapping")
+
+
+def stressed_cost_usd(planned_notional: float, scenario_bps: float, *,
+                      vehicle: str, quantity: float = 1.0,
+                      costs: Any = None, config: Mapping | None = None) -> float:
+    """Return the deterministic all-in stressed entry cost for a plan.
+
+    This deliberately matches :func:`research.gates.cost_stress_report`:
+    planned/entry notional is charged at the selected scenario in basis
+    points, and listed options additionally pay two per-contract fees for the
+    entry and exit sides.  ``costs``/``config`` are resolved through the
+    vehicle-aware :class:`CostModel` parser so nested runtime schedules cannot
+    accidentally use the equity fee for an option plan.
+    """
+    if vehicle not in {"equity", "option"}:
+        raise CostError("vehicle must be equity or option")
+    try:
+        notional = float(planned_notional)
+        scenario = float(scenario_bps)
+        qty = float(quantity)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CostError("stressed cost inputs must be numeric") from exc
+    if (not math.isfinite(notional) or not math.isfinite(scenario) or
+            not math.isfinite(qty)):
+        raise CostError("stressed cost inputs must be finite")
+    if notional < 0 or scenario < 0 or qty < 0:
+        raise CostError("stressed cost inputs must be non-negative")
+    model = cost_model_for_vehicle(
+        costs if costs is not None else config, vehicle)
+    stressed = abs(notional) * scenario / 10_000.0
+    if vehicle == "option":
+        stressed += abs(qty) * 2.0 * model.option_fee_per_contract_side
+    if not math.isfinite(stressed):
+        raise CostError("stressed cost is not finite")
+    return float(stressed)
+
+
+# Concise aliases make the helper convenient for callers while retaining one
+# implementation and one arithmetic contract.
+stress_cost_usd = stressed_cost_usd
+stressed_cost = stressed_cost_usd
+
+
+# Kept as a private alias for callers that imported the pre-existing helper.
+_cost_model_for_vehicle = cost_model_for_vehicle
 
 
 def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
@@ -545,16 +653,8 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
     if not isinstance(vehicle, str) or vehicle not in {"equity", "option"}:
         raise CostError("vehicle must be equity or option")
     if config is not None and costs is None:
-        configured = config.get(CONFIG_BLOCK) if isinstance(config, Mapping) else None
-        if isinstance(configured, Mapping) and vehicle in configured and \
-                isinstance(configured.get(vehicle), Mapping):
-            # Reports are vehicle-local even when a caller carries separate
-            # equity/option schedules in one configuration envelope.
-            costs = CostModel.from_config({
-                **dict(config), CONFIG_BLOCK: configured[vehicle]})
-        else:
-            costs = CostModel.from_config(config)
-    model = _cost_model_for_vehicle(costs, vehicle)
+        costs = CostModel.from_config(config, vehicle=vehicle)
+    model = cost_model_for_vehicle(costs, vehicle)
     coverage = float(min_cost_coverage)
     if not math.isfinite(coverage) or coverage < 0:
         raise CostError("min_cost_coverage must be finite and non-negative")
@@ -563,6 +663,7 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
     executed = [row for row in local if row.get("no_trade") is not True]
     observations: list[dict[str, Any]] = []
     failures: list[str] = []
+    failure_reasons: dict[str, str] = {}
     total_risk = 0.0
     total_cost = 0.0
     for index, row in enumerate(executed):
@@ -602,6 +703,7 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
         # never satisfy an authorizing risk-unit report.  Options deliberately
         # follow their existing OPRA gate and are not subject to this SIP rule.
         equity_provenance = True
+        provenance_reason: str | None = None
         if vehicle == "equity":
             def _sip_leg(leg: str) -> bool:
                 source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
@@ -609,11 +711,58 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
                 provider = str(row.get(f"{leg}_provider") or "").strip()
                 return source == QUOTE and feed == "sip" and bool(provider)
             equity_provenance = _sip_leg("entry") and _sip_leg("exit")
+            if not equity_provenance:
+                provenance_reason = "equity legs require SIP quote provenance"
+        elif vehicle == "option":
+            # Option evidence authorizes only an executable OPRA quote on both
+            # legs, observed no more than one recorder cycle (30 seconds) ago.
+            # Missing, stale, indicative, or bar-derived evidence remains
+            # useful diagnostically but cannot make the risk-unit report pass.
+            for leg in ("entry", "exit"):
+                source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
+                if source != QUOTE:
+                    provenance_reason = (
+                        f"option {leg} leg is not an executable quote fill")
+                    break
+                feed = str(row.get(
+                    f"{leg}_feed", row.get(f"{leg}_option_feed")) or "").strip().lower()
+                if feed != "opra":
+                    provenance_reason = (
+                        f"option {leg} leg requires OPRA quote provenance")
+                    break
+                provider = str(row.get(f"{leg}_provider") or "").strip()
+                if not provider:
+                    provenance_reason = (
+                        f"option {leg} leg requires a non-empty quote provider")
+                    break
+                raw_age = row.get(
+                    f"{leg}_quote_age_seconds",
+                    row.get(f"{leg}_option_quote_age_seconds"))
+                try:
+                    age = float(raw_age)
+                except (TypeError, ValueError, OverflowError):
+                    age = float("nan")
+                if not math.isfinite(age) or age < 0 or age > 30.0:
+                    provenance_reason = (
+                        f"option {leg} quote age must be finite and <= 30 seconds")
+                    break
+            equity_provenance = provenance_reason is None
         adequate = bool(
             risk is not None and cost is not None and risk > 0 and
             cost >= 0 and risk >= cost * coverage and equity_provenance)
         if not adequate:
-            failures.append(str(row.get("opportunity_id", index)))
+            opportunity_id = str(row.get("opportunity_id", index))
+            failures.append(opportunity_id)
+            if provenance_reason is not None:
+                failure_reasons[opportunity_id] = provenance_reason
+            elif risk is None:
+                failure_reasons[opportunity_id] = "missing or invalid risk unit"
+            elif cost is None:
+                failure_reasons[opportunity_id] = "missing or invalid round-trip cost"
+            elif risk < cost * coverage:
+                failure_reasons[opportunity_id] = "risk unit does not cover configured cost"
+            else:
+                failure_reasons[opportunity_id] = "risk unit is not positive"
         if risk is not None and math.isfinite(risk):
             total_risk += max(0.0, risk)
         if cost is not None and math.isfinite(cost):
@@ -623,6 +772,8 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
             "risk_usd": risk, "round_trip_cost": cost,
             "cost_coverage": (risk / cost if cost and risk is not None else None),
             "adequate": adequate,
+            "failure_reason": (None if adequate else failure_reasons.get(
+                str(row.get("opportunity_id", index)))),
         })
     # An empty set cannot authorize anything.  It remains a valid diagnostic
     # report so old evidence is readable and explicitly underpowered.
@@ -644,6 +795,11 @@ def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
         "round_trip_cost_usd": (total_cost / len(executed) if executed else None),
         "cost_to_risk_ratio": (total_cost / total_risk if total_risk > 0 else None),
         "failed_opportunities": failures,
+        "failure_reasons": failure_reasons,
+        "adequacy_reason": (None if adequate else (
+            "all executed rows satisfy cost coverage and provenance"
+            if executed and not failures else
+            (next(iter(failure_reasons.values()), "no executed rows")))),
         "observations": observations,
         "adequate": adequate,
     }
@@ -664,6 +820,10 @@ class SQLiteQuoteIndexDescriptor:
     symbols: tuple[tuple[str, int], ...]
     count: int
     max_session_date: str | None
+    # Version 1 indexes predate the local observation timestamp.  The field is
+    # optional so descriptors serialized by older workers remain loadable;
+    # the reader still inspects the SQLite schema before selecting columns.
+    schema_version: int = 2
 
 
 class SQLiteQuoteIndex:
@@ -677,6 +837,7 @@ class SQLiteQuoteIndex:
     """
 
     _BATCH_SIZE = 10_000
+    _SCHEMA_VERSION = 2
 
     def __init__(self, directory: str | Path | None = None):
         import sqlite3
@@ -699,6 +860,7 @@ class SQLiteQuoteIndex:
                 symbol_id INTEGER NOT NULL,
                 timestamp REAL NOT NULL,
                 as_of REAL NOT NULL,
+                observed_at REAL NOT NULL,
                 bid REAL NOT NULL,
                 ask REAL NOT NULL,
                 provider TEXT NOT NULL,
@@ -708,8 +870,9 @@ class SQLiteQuoteIndex:
                 PRIMARY KEY (symbol_id, timestamp, sequence)
             ) WITHOUT ROWID
         """)
+        self._has_observed_at = True
         self._symbols: dict[str, int] = {}
-        self._pending: list[tuple[int, float, float, float, float, str, str, int, int]] = []
+        self._pending: list[tuple[int, float, float, float, float, float, str, str, int, int]] = []
         self._sequence = 0
         self._count = 0
         self._max_session_day: int | None = None
@@ -736,6 +899,17 @@ class SQLiteQuoteIndex:
         obj._db = sqlite3.connect(
             f"file:{path.as_posix()}?mode=ro", uri=True, timeout=30)
         obj._read_only = True
+        # Version 1 quote indexes have no local observation column.  Detect
+        # the actual table shape rather than trusting the descriptor alone so
+        # descriptors emitted before schema versioning remain auditable.
+        columns = {str(row[1]) for row in obj._db.execute(
+            "PRAGMA table_info(quotes)")}
+        if not columns:
+            obj._db.close()
+            raise CostError("quote index is missing its quotes table")
+        obj._has_observed_at = (
+            "observed_at" in columns and
+            int(getattr(descriptor, "schema_version", cls._SCHEMA_VERSION)) >= 2)
         obj._symbols = dict(descriptor.symbols)
         obj._pending = []
         obj._sequence = 0
@@ -758,6 +932,7 @@ class SQLiteQuoteIndex:
             count=self._count,
             max_session_date=(None if self.max_session_date is None
                               else self.max_session_date.isoformat()),
+            schema_version=(self._SCHEMA_VERSION if self._has_observed_at else 1),
         )
 
     def add(self, quote: Any) -> None:
@@ -772,13 +947,14 @@ class SQLiteQuoteIndex:
             self._symbols[symbol] = symbol_id
         timestamp = float(quote.timestamp.timestamp())
         as_of = float(quote.identity.as_of.timestamp())
+        observed_at = float(quote.identity.observed_at.timestamp())
         provider = str(quote.identity.provider).strip()
         feed = str(quote.identity.feed).strip()
         if not provider or not feed:
             raise CostError("quote provider and feed are required")
         session_day = int(quote.session_date.toordinal())
         self._pending.append((
-            symbol_id, timestamp, as_of, float(quote.bid), float(quote.ask),
+            symbol_id, timestamp, as_of, observed_at, float(quote.bid), float(quote.ask),
             provider, feed, session_day, self._sequence,
         ))
         self._sequence += 1
@@ -794,7 +970,7 @@ class SQLiteQuoteIndex:
         if self._read_only:
             raise RuntimeError("read-only quote index cannot write")
         self._db.executemany(
-            "INSERT INTO quotes VALUES (?,?,?,?,?,?,?,?,?)", self._pending)
+            "INSERT INTO quotes VALUES (?,?,?,?,?,?,?,?,?,?)", self._pending)
         self._db.commit()
         self._pending.clear()
 
@@ -827,21 +1003,23 @@ class SQLiteQuoteIndex:
         limit = 30.0 if max_age_seconds is None else float(max_age_seconds)
         session_day = (None if session_date is None else
                        int(session_date.toordinal()))
+        observed_column = "observed_at" if self._has_observed_at else "as_of"
         cursor = self._db.execute(
-            """SELECT timestamp, as_of, bid, ask, provider, feed, session_day
+            f"""SELECT timestamp, as_of, {observed_column} AS observed_at,
+                        bid, ask, provider, feed, session_day
                  FROM quotes
                 WHERE symbol_id=? AND timestamp<=?
                 ORDER BY timestamp DESC, sequence DESC""",
             (symbol_id, at_ts),
         )
-        for timestamp, as_of, bid, ask, provider, feed, row_session_day in cursor:
+        for timestamp, as_of, observed_at, bid, ask, provider, feed, row_session_day in cursor:
             age = at_ts - float(timestamp)
             if age > limit:
                 # Rows are newest first, so all remaining rows are stale.
                 break
             if session_day is not None and int(row_session_day) != session_day:
                 continue
-            if float(as_of) > at_ts:
+            if max(float(timestamp), float(as_of), float(observed_at)) > at_ts:
                 continue
             price = float(ask if side == "buy" else bid)
             if not math.isfinite(price) or price <= 0:
@@ -933,7 +1111,7 @@ def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | 
         if quote.timestamp > at:
             break
         identity = getattr(quote, "identity", None)
-        if identity is None or identity.as_of > at:
+        if identity is None or not record_is_available(quote, at):
             continue
         if session_date is not None and getattr(quote, "session_date", None) != session_date:
             continue
@@ -951,10 +1129,12 @@ __all__ = [
     "BAR", "CONFIG_BLOCK", "CostError", "CostModel", "DEFAULT_FEE_BPS",
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
-    "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS", "ReplayPolicy",
+    "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",
+    "COST_STRESS_SCENARIOS_BPS", "ReplayPolicy",
     "replay_policy_for_mode", "replay_policy_for_session",
     "replay_policy_for_bars", "derive_session_replay_policy",
-    "risk_unit_report",
+    "cost_model_for_vehicle", "stressed_cost_usd", "stress_cost_usd",
+    "stressed_cost", "risk_unit_report",
     "QuoteFill", "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes",
     "quote_fill", "quote_fill_record",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import time
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -39,9 +40,15 @@ def _bool(block: Mapping[str, Any], key: str, path: str, default=None) -> bool:
 
 def _num(block: Mapping[str, Any], key: str, path: str, lo: float, hi: float, default=None) -> float:
     value = block.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not lo <= float(value) <= hi:
+    valid = not isinstance(value, bool) and isinstance(value, (int, float))
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+        number = 0.0
+    if not valid or not math.isfinite(number) or not lo <= number <= hi:
         raise ConfigError(f"{path}.{key} must be a number between {lo:g} and {hi:g}")
-    return float(value)
+    return number
 
 
 def _int(block: Mapping[str, Any], key: str, path: str, lo: int, hi: int, default=None) -> int:
@@ -70,8 +77,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "require_exact_calendar": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
     "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
     "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
-    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0},
-    "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100},
+    "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0, "stressed_cost_scenario_bps": 25.0, "max_stressed_cost_to_risk_ratio": 1.0},
+    "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100, "strict_market_data": True},
     "costs": {"spread_bps": 4.0, "slippage_bps": 6.0, "fee_bps": 0.5,
               "option_fee_per_contract_side": 0.65,
               "provenance": "shipped_conservative_v1_plus_25bps_stress"},
@@ -281,7 +288,7 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     out["strategy"] = strategy
 
     risk = _map(out.get("risk"), "risk")
-    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_gross_exposure_pct", "min_confidence"}, "risk")
+    _unknown(risk, {"risk_per_trade_pct", "daily_loss_limit_pct", "max_open_risk_pct", "max_total_open_risk_pct", "max_concurrent_positions", "max_position_notional_pct", "options_min_dte", "options_max_dte", "options_max_spread_pct", "max_gross_exposure_pct", "min_confidence", "stressed_cost_scenario_bps", "max_stressed_cost_to_risk_ratio"}, "risk")
     risk["risk_per_trade_pct"] = _num(risk, "risk_per_trade_pct", "risk", .001, 100, .5)
     risk["daily_loss_limit_pct"] = _num(risk, "daily_loss_limit_pct", "risk", .01, 100, 2)
     risk["max_open_risk_pct"] = _num(risk, "max_open_risk_pct", "risk", .01, 100, 2)
@@ -293,10 +300,17 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         raise ConfigError("risk.options_min_dte cannot exceed options_max_dte")
     risk["options_max_spread_pct"] = _num(risk, "options_max_spread_pct", "risk", 0, 100, 10)
     risk["min_confidence"] = _num(risk, "min_confidence", "risk", 0, 1, 0)
+    risk["stressed_cost_scenario_bps"] = _num(
+        risk, "stressed_cost_scenario_bps", "risk", 0, float("inf"), 25)
+    if risk["stressed_cost_scenario_bps"] not in {9.0, 15.0, 25.0, 50.0}:
+        raise ConfigError(
+            "risk.stressed_cost_scenario_bps must be one of 9, 15, 25, or 50")
+    risk["max_stressed_cost_to_risk_ratio"] = _num(
+        risk, "max_stressed_cost_to_risk_ratio", "risk", 0, float("inf"), 1)
     out["risk"] = risk
 
     execution = _map(out.get("execution"), "execution")
-    _unknown(execution, {"order_type", "time_in_force", "client_order_id_prefix", "max_slippage_bps", "max_market_data_age_seconds", "max_spread_bps"}, "execution")
+    _unknown(execution, {"order_type", "time_in_force", "client_order_id_prefix", "max_slippage_bps", "max_market_data_age_seconds", "max_spread_bps", "strict_market_data"}, "execution")
     if execution.get("order_type", "market") not in {"market", "limit"}:
         raise ConfigError("execution.order_type must be market or limit")
     if execution.get("time_in_force", "day") != "day":
@@ -310,6 +324,8 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     execution["max_market_data_age_seconds"] = _num(
         execution, "max_market_data_age_seconds", "execution", 1, 30, 30)
     execution["max_spread_bps"] = _num(execution, "max_spread_bps", "execution", 0, 10_000, 100)
+    execution["strict_market_data"] = _bool(
+        execution, "strict_market_data", "execution", True)
     out["execution"] = execution
 
     costs = out.get("costs")
@@ -338,6 +354,36 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
                             "option_fee_per_contract_side":
                                 model.option_fee_per_contract_side,
                             "provenance": model.provenance}
+        # Vehicle schedules are strictly optional.  Preserve the historical
+        # flat output byte-for-byte when no nested block was supplied; when a
+        # block is present, persist each explicitly named override as its
+        # complete, normalized effective schedule.  Missing fields inherit
+        # the flat/default schedule through CostModel.from_config.
+        explicit_vehicles = (explicit_costs.get("vehicles")
+                             if isinstance(explicit_costs, Mapping) else None)
+        if explicit_vehicles is not None:
+            if not isinstance(explicit_vehicles, Mapping):
+                # CostModel.from_config normally raises this first, but keep
+                # the config boundary's exception type and path stable if the
+                # implementation is changed later.
+                raise ConfigError("costs.vehicles must be a mapping")
+            normalized_vehicles: dict[str, dict[str, Any]] = {}
+            for vehicle in sorted(explicit_vehicles, key=str):
+                try:
+                    vehicle_model = CostModel.from_config(
+                        {"costs": model_costs, "execution": execution},
+                        vehicle=str(vehicle))
+                except CostError as exc:
+                    raise ConfigError(f"costs: {exc}") from exc
+                normalized_vehicles[str(vehicle)] = {
+                    "spread_bps": vehicle_model.spread_bps,
+                    "slippage_bps": vehicle_model.slippage_bps,
+                    "fee_bps": vehicle_model.fee_bps,
+                    "option_fee_per_contract_side":
+                        vehicle_model.option_fee_per_contract_side,
+                    "provenance": vehicle_model.provenance,
+                }
+            normalized_costs["vehicles"] = normalized_vehicles
         out["costs"] = normalized_costs
 
     llm = _map(out.get("llm"), "llm")

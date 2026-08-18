@@ -561,14 +561,12 @@ if [[ "$shadow_db" != /* ]]; then
 fi
 # Calibration is read-only and applies only at the promotion boundary. Keep
 # discovery/factory diagnostic even when paper evidence is absent or thin, but
-# never let shadow ingestion proceed without a fresh, explicitly authorized
-# calibration report.
-calibration_checked=0
+# never let a vehicle's shadow lane proceed without a fresh, explicitly
+# authorized calibration report for that same vehicle.
 calibration_authorized=0
 calibration_reason="not_checked"
 run_calibration() {
-  [ "$calibration_checked" -eq 0 ] || return 0
-  calibration_checked=1
+  local vehicle="$1"
   calibration_authorized=0
   calibration_reason="disabled"
   if [ "${ALPACA_RESEARCH_CALIBRATION_ENABLED:-1}" != "1" ]; then
@@ -598,13 +596,26 @@ run_calibration() {
       calibration_config="$repo_root/$calibration_config"
     fi
     "$python_bin" "$repo_root/research.py" calibrate "$journal" \
-      --config "$calibration_config" >"$calibration_output_file"
+      --config "$calibration_config" --vehicle "$vehicle" >"$calibration_output_file"
   else
-    "$python_bin" "$repo_root/research.py" calibrate "$journal" >"$calibration_output_file"
+    "$python_bin" "$repo_root/research.py" calibrate "$journal" \
+      --vehicle "$vehicle" >"$calibration_output_file"
   fi
   local status=$?
   set -e
-  local calibration_report="${ALPACA_RESEARCH_CALIBRATION_REPORT:-$repo_root/runtime/research/calibration-latest.json}"
+  local configured_calibration_report="${ALPACA_RESEARCH_CALIBRATION_REPORT:-}"
+  local calibration_report
+  if [ -z "$configured_calibration_report" ]; then
+    calibration_report="$repo_root/runtime/research/calibration-${vehicle}-latest.json"
+  elif [[ "$configured_calibration_report" == *%s* ]]; then
+    # A %s placeholder is the explicit multi-vehicle path contract.
+    calibration_report="$(printf "$configured_calibration_report" "$vehicle")"
+  elif [ "$vehicle" = "equity" ]; then
+    # Preserve the historical custom equity path for existing deployments.
+    calibration_report="$configured_calibration_report"
+  else
+    calibration_report="${configured_calibration_report%.json}-${vehicle}.json"
+  fi
   if [[ "$calibration_report" != /* ]]; then
     calibration_report="$repo_root/$calibration_report"
   fi
@@ -613,7 +624,7 @@ run_calibration() {
   # report generation time, and the freshness threshold used for promotion.
   local normalized_report
   set +e
-  normalized_report="$($python_bin - "$calibration_output_file" "$journal" "$max_age" "$status" <<'PY'
+  normalized_report="$($python_bin - "$calibration_output_file" "$journal" "$max_age" "$status" "$vehicle" <<'PY'
 import json
 import math
 import os
@@ -621,7 +632,7 @@ import sys
 import time
 from pathlib import Path
 
-output_path, journal_path, max_age_raw, command_status = sys.argv[1:]
+output_path, journal_path, max_age_raw, command_status, expected_vehicle = sys.argv[1:]
 now = time.time()
 report = {}
 reason = None
@@ -649,6 +660,9 @@ except OSError:
 if reason is None and journal_mtime is None:
     reason = "journal_unavailable"
 auth = str(report.get("authorization_verdict") or "").strip().lower()
+report_vehicle = str(report.get("vehicle") or report.get("vehicle_filter") or "").strip().lower()
+if reason is None and report_vehicle and report_vehicle != expected_vehicle:
+    reason = "vehicle_mismatch"
 auth_code = report.get("authorization_exit_code")
 if reason is None and str(command_status) != "0" and auth not in {
         "veto_optimistic_cost", "veto_underfilled_execution", "insufficient_data"}:
@@ -662,6 +676,8 @@ if reason is None and not valid_auth_code:
 if reason is None and journal_age is not None and journal_age > max_age:
     reason = "stale_journal"
 report.setdefault("schema", 2)
+report["vehicle"] = expected_vehicle
+report["vehicle_filter"] = expected_vehicle
 report["calibration_status"] = "authorized" if reason is None else "blocked"
 report["authorization_reason"] = "authorized" if reason is None else reason
 report["authorization_exit_code"] = 0 if reason is None else 2
@@ -675,7 +691,7 @@ report["provenance"] = {
 print(json.dumps(report, sort_keys=True, allow_nan=False))
 raise SystemExit(0 if reason is None else 2)
 PY
-)"
+  )"
   local report_status=$?
   set -e
   local report_persisted=0
@@ -778,7 +794,7 @@ run_shadow_ingest() {
   local vehicle="$1"
   [ "${ALPACA_SHADOW_INGEST_ENABLED:-1}" = "1" ] || return 0
   emit_progress "shadow_ingest" 0 1 "steps" "$vehicle"
-  run_calibration
+  run_calibration "$vehicle"
   if [ "$calibration_authorized" -ne 1 ]; then
     cycle_outcomes+=("$vehicle:shadow-ingest:blocked:$calibration_reason")
     echo "{\"schema\":\"research-shadow-authorization.v1\",\"status\":\"blocked\",\"vehicle\":\"$vehicle\",\"reason\":\"$calibration_reason\"}" >&2
@@ -801,13 +817,13 @@ run_shadow_ingest() {
   emit_progress "shadow_ingest" 1 1 "steps" "$vehicle"
 }
 
-# The scheduled research profile studies both executable vehicles. Deployment
-# still gates runtime entries to the one validated vehicle selected by the
-# trader profile; ALPACA_RESEARCH_VEHICLES can narrow this deliberately.
+# The scheduled research profile follows the deployed equity vehicle by
+# default. ALPACA_RESEARCH_VEHICLES can explicitly select option or all/both
+# when those lanes are intentionally enabled.
 set +e
 vehicles="$("$python_bin" "$repo_root/research.py" vehicles \
   --agent-config "$agent_config" \
-  --vehicles "${ALPACA_RESEARCH_VEHICLES:-all}")"
+  --vehicles "${ALPACA_RESEARCH_VEHICLES:-equity}")"
 vehicle_status=$?
 set -e
 if [ "$vehicle_status" -ne 0 ] || [ -z "$vehicles" ]; then

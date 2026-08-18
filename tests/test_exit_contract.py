@@ -68,11 +68,14 @@ def _payloads(closes, opens=None, ranges=None):
         if override is not None:
             high, low = max(high, float(override[0])), min(low, float(override[1]))
         timestamp = BASE + timedelta(minutes=index)
-        end = timestamp + timedelta(minutes=1)
         rows.append({
             "kind": "bar", "provider": "test", "feed": "sip", "symbol": "SPY",
-            "timestamp": timestamp.isoformat(), "as_of": end.isoformat(),
-            "observed_at": end.isoformat(), "open": opened,
+            "timestamp": timestamp.isoformat(),
+            # Mechanics-only fixture: the source exposes the opening print at
+            # the boundary, so bar fallback is intentionally admissible.
+            "as_of": timestamp.isoformat(),
+            "observed_at": timestamp.isoformat(),
+            "open": opened,
             "high": high, "low": low,
             "close": close, "volume": 1000,
         })

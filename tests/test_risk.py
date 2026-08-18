@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from agent.alpaca_domain import OptionContract, OptionSnapshot
+from agent.config import ConfigError, validate_config
 from agent import engine as engine_module
 from agent import risk as risk_module
 from agent import risk_inputs
 from agent.risk import RiskEngine, select_option_contract, size_shares
+from research.costs import stressed_cost_usd
 
 
 class RiskProfileTests(unittest.TestCase):
@@ -436,6 +438,64 @@ class RiskProfileTests(unittest.TestCase):
             {}, 0, now=0)
         self.assertIsNone(plan)
         self.assertIn("market freshness flag is invalid", why)
+
+    def test_stressed_cost_boundaries_and_telemetry(self):
+        decision = {"symbol": "SPY", "direction": "long", "entry_price": 100,
+                    "stop_price": 99, "target_price": 102}
+        # At this setup the plan is 50 shares / $5,000 notional / $50 risk,
+        # so the 25 bps stress is exactly a 0.25 ratio.
+        for limit, expected in ((0.250001, True), (0.25, True), (0.249999, False)):
+            cfg = {"risk": {**self.cfg["risk"],
+                             "stressed_cost_scenario_bps": 25,
+                             "max_stressed_cost_to_risk_ratio": limit},
+                   "execution": {}, "costs": {}}
+            plan, why = RiskEngine(cfg).vet_open(
+                decision, 10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+            self.assertEqual(plan is not None, expected)
+            if expected:
+                self.assertIsNone(why)
+                self.assertEqual(plan["stressed_cost_scenario_bps"], 25.0)
+                self.assertAlmostEqual(plan["stressed_cost_usd"], 12.5)
+                self.assertAlmostEqual(plan["stressed_cost_to_risk_ratio"], limit,
+                                       delta=2e-6)
+                self.assertEqual(plan["stressed_cost_vehicle"], "equity")
+            else:
+                self.assertEqual(why, "stressed_cost_risk_limit")
+
+    def test_stressed_cost_rejects_malformed_or_zero_intended_risk(self):
+        decision = {"symbol": "SPY", "direction": "long", "entry_price": 100,
+                    "stop_price": 99, "target_price": 102}
+        for key, value, reason in (
+                ("max_stressed_cost_to_risk_ratio", float("nan"), "stressed_cost_invalid"),
+                ("stressed_cost_scenario_bps", 10, "stressed_cost_invalid")):
+            cfg = {"risk": {**self.cfg["risk"], key: value}, "execution": {}, "costs": {}}
+            plan, why = RiskEngine(cfg).vet_open(
+                decision, 10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+            self.assertIsNone(plan)
+            self.assertEqual(why, reason)
+        zero_risk = {**decision, "risk_usd": 0}
+        plan, why = RiskEngine({"risk": {**self.cfg["risk"]}, "execution": {}, "costs": {}}).vet_open(
+            zero_risk, 10_000, [], {"SPY": {"price": 100}}, {}, 0, now=0)
+        self.assertIsNone(plan)
+        self.assertEqual(why, "stressed_cost_invalid")
+
+    def test_stressed_cost_helper_uses_vehicle_option_fee_override(self):
+        self.assertAlmostEqual(stressed_cost_usd(1_000, 25, vehicle="equity",
+                                                 config={"costs": {"option_fee_per_contract_side": 99}}), 2.5)
+        self.assertAlmostEqual(stressed_cost_usd(
+            200, 25, vehicle="option", quantity=2,
+            config={"costs": {"option_fee_per_contract_side": 2,
+                               "vehicles": {"option": {
+                                   "option_fee_per_contract_side": 3}}}}), 12.5)
+
+    def test_config_validates_stressed_cost_controls(self):
+        cfg = validate_config({})
+        self.assertEqual(cfg["risk"]["stressed_cost_scenario_bps"], 25.0)
+        self.assertEqual(cfg["risk"]["max_stressed_cost_to_risk_ratio"], 1.0)
+        with self.assertRaises(ConfigError):
+            validate_config({"risk": {"stressed_cost_scenario_bps": 10}})
+        with self.assertRaises(ConfigError):
+            validate_config({"risk": {"max_stressed_cost_to_risk_ratio": float("nan")}})
 
 
 if __name__ == "__main__":

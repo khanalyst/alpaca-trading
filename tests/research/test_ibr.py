@@ -78,6 +78,23 @@ class IBRReplayTests(unittest.TestCase):
         self.assertEqual(trade.signal_timestamp, trade.entry_timestamp)
         self.assertEqual(trade.exit_reason, "target")
 
+    def test_future_observed_breakout_enters_at_observation_time(self):
+        bars = bars_for_day()
+        signal = bars[30]
+        bars[30] = normalize_underlying_bar({
+            "symbol": "SPY", "timestamp": signal.timestamp.isoformat(),
+            "open": signal.open, "high": signal.high, "low": signal.low,
+            "close": signal.close, "volume": signal.volume,
+            "provider": "alpaca", "feed": "sip",
+            "observed_at": (signal.end + timedelta(minutes=1)).isoformat(),
+        })
+        result = replay_ibr(bars, config=permissive_config(
+            stop_pct=.01, target_pct=.02, costs=FREE))
+        self.assertEqual(len(result.trades), 1)
+        trade = result.trades[0]
+        self.assertEqual(trade.decision_timestamp, signal.end + timedelta(minutes=1))
+        self.assertEqual(trade.entry_timestamp, signal.end + timedelta(minutes=1))
+
     def test_same_bar_stop_and_target_is_stop_first(self):
         bars = bars_for_day()
         # Replace post-entry bar with one spanning both levels.

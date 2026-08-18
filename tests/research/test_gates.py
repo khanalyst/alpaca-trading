@@ -51,6 +51,37 @@ class EvidenceGateTests(unittest.TestCase):
                     [self._equity_quote_row(**changes)],
                     vehicle="equity")["adequate"])
 
+    def test_authorization_projection_is_symmetric_across_candidate_and_baseline(self):
+        from research.gates import authorization_projection
+        good = self._equity_quote_row()
+        bar = {**good, "opportunity_id": "bar", "entry_fill_source": "bar",
+               "exit_fill_source": "bar"}
+        refused = {**good, "opportunity_id": "refused", "no_trade": True}
+        candidate = authorization_projection([good, bar, refused], vehicle="equity")
+        baseline = authorization_projection([good, bar, refused], vehicle="equity")
+        self.assertEqual(candidate["counts"], {"raw": 3, "eligible": 1, "excluded": 2})
+        self.assertEqual(candidate["counts"], baseline["counts"])
+        self.assertEqual(candidate["reasons"], {
+            "no_trade": 1, "non_authorizing_fill_source": 1})
+
+    def test_qualification_excludes_no_trade_and_bar_fallback_rows(self):
+        from research.gates import qualification_report
+        good = self._equity_quote_row()
+        rows = [good,
+                {**good, "opportunity_id": "bar", "entry_fill_source": "bar",
+                 "exit_fill_source": "bar", "session_date": "2026-01-03"},
+                {**good, "opportunity_id": "none", "no_trade": True,
+                 "session_date": "2026-01-04"}]
+        baseline = [{**row, "net_pnl": 0.0} for row in rows]
+        report = qualification_report(
+            rows, baseline, vehicle="equity",
+            sessions=["2026-01-02", "2026-01-03", "2026-01-04"],
+            min_trades=1, min_sessions=1, min_clusters=1)
+        self.assertEqual(report["trades"], 1)
+        self.assertEqual(report["sessions"], ["2026-01-02"])
+        self.assertEqual(report["authorization_projection"]["candidate"]["counts"],
+                         {"raw": 3, "eligible": 1, "excluded": 2})
+
     def test_opra_option_rows_satisfy_fill_and_risk_evidence(self):
         rows = [{
             "vehicle": "option", "symbol": "SPY",
@@ -60,7 +91,8 @@ class EvidenceGateTests(unittest.TestCase):
             "risk_usd": 200.0, "entry_fill_source": "quote",
             "exit_fill_source": "quote", "entry_quote_age_seconds": 0.0,
             "exit_quote_age_seconds": 0.0, "entry_feed": "opra",
-            "exit_feed": "opra",
+            "exit_feed": "opra", "entry_provider": "alpaca",
+            "exit_provider": "alpaca",
         }]
         from research.gates import fill_source_summary
         self.assertTrue(fill_source_summary(rows, vehicle="option")["adequate"])
@@ -413,6 +445,39 @@ class EvidenceGateTests(unittest.TestCase):
         tampered["content_hash"] = _content_hash(
             {key: value for key, value in tampered.items()
              if key != "content_hash"})
+        self.assertFalse(verify_gate_envelope(tampered))
+
+    def test_non_passing_source_tampering_fails_after_resigning(self):
+        """Diagnostic v2 envelopes remain bound to their source rows.
+
+        A failed/underpowered decision is still audit evidence.  Recomputing
+        only the outer content hash must not make a changed held-out outcome
+        verify successfully just because the envelope was not authorizing.
+        """
+        candidate = _rows(2, net=1.0)
+        baseline = _rows(2, net=0.0, prefix="baseline")
+        control = matched_cluster_test(candidate, baseline, vehicle="equity")
+        envelope = verified_gate_envelope(
+            lane="shadow", vehicle="equity", fit=[], heldout=candidate,
+            heldout_baseline=baseline,
+            fit_floor=structural_floor(
+                [], vehicle="equity", min_trades=0, min_sessions=0,
+                required=False),
+            heldout_floor=structural_floor(
+                candidate, vehicle="equity", min_trades=1, min_sessions=1),
+            control=control, p_value=control["p_value"], q_value=1.0,
+            alpha=.05, falsification={"passes": False},
+            separation={"passes": True},
+            checks={"falsification": False}, passes=False)
+        self.assertFalse(envelope["passes"])
+        self.assertTrue(verify_gate_envelope(envelope))
+
+        tampered = copy.deepcopy(envelope)
+        tampered["heldout_source"][1]["net_pnl"] = 99.0
+        from research.gates import _content_hash
+        tampered["content_hash"] = _content_hash({
+            key: value for key, value in tampered.items()
+            if key != "content_hash"})
         self.assertFalse(verify_gate_envelope(tampered))
 
     def test_family_fdr_can_pass_while_global_fdr_fails(self):

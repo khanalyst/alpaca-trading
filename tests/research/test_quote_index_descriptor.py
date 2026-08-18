@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from deploy.research_dataset import build_views
-from research.costs import SQLiteQuoteIndex, quote_fill
+from research.costs import (SQLiteQuoteIndex, SQLiteQuoteIndexDescriptor,
+                             quote_fill)
 from research.edge_discovery_core import DiscoveryError
 import research.gates as gates
 import research.strategy_factory as factory_module
@@ -28,6 +30,46 @@ def _quote(minute: int, bid: float, ask: float, *, as_of_minute: int | None = No
 
 
 class QuoteIndexDescriptorTests(unittest.TestCase):
+    def test_read_only_descriptor_opens_legacy_schema_without_observed_at(self):
+        # Version-1 indexes predate local observation metadata.  They remain
+        # auditable by treating the old as_of column as observed_at.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quotes.sqlite3"
+            db = sqlite3.connect(path)
+            try:
+                db.execute("""
+                    CREATE TABLE quotes (
+                        symbol_id INTEGER NOT NULL,
+                        timestamp REAL NOT NULL,
+                        as_of REAL NOT NULL,
+                        bid REAL NOT NULL,
+                        ask REAL NOT NULL,
+                        provider TEXT NOT NULL,
+                        feed TEXT NOT NULL,
+                        session_day INTEGER NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        PRIMARY KEY (symbol_id, timestamp, sequence)
+                    ) WITHOUT ROWID
+                """)
+                db.execute(
+                    "INSERT INTO quotes VALUES (?,?,?,?,?,?,?,?,?)",
+                    (1, BASE.timestamp(), BASE.timestamp(), 100.0, 100.1,
+                     "test", "sip", BASE.date().toordinal(), 0),
+                )
+                db.commit()
+            finally:
+                db.close()
+            descriptor = SQLiteQuoteIndexDescriptor(
+                path=str(path), symbols=(("SPY", 1),), count=1,
+                max_session_date=BASE.date().isoformat(), schema_version=1)
+            child = SQLiteQuoteIndex.open_read_only(descriptor)
+            try:
+                self.assertEqual(
+                    quote_fill(child, symbol="SPY", at=BASE, side="buy"), 100.1)
+                self.assertEqual(child.descriptor().schema_version, 1)
+            finally:
+                child.close()
+
     def test_read_only_descriptor_matches_tie_and_rejects_delayed_as_of(self):
         parent = SQLiteQuoteIndex()
         try:

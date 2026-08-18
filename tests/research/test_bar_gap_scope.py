@@ -48,8 +48,10 @@ def _rows(drop_bar: int | None = None) -> list[dict]:
         end = stamp + timedelta(minutes=1)
         rows.append({
             "kind": "bar", "provider": "test", "feed": "sip", "symbol": "AAA",
-            "timestamp": stamp.isoformat(), "as_of": end.isoformat(),
-            "observed_at": end.isoformat(), "open": round(previous, 4),
+            # Mechanics-only bar source: opening prints are visible at their
+            # boundaries; delayed recorder bars are covered separately.
+            "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
+            "observed_at": stamp.isoformat(), "open": round(previous, 4),
             "high": round(max(previous, close) + .02, 4),
             "low": round(min(previous, close) - .02, 4),
             "close": round(close, 4), "volume": volume,

@@ -689,7 +689,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
     with closing(sqlite3.connect(journal)) as db:
-        report = calibration_report(db, CostModel.from_config(config))
+        report = calibration_report(db, CostModel.from_config(config),
+                                    vehicle=getattr(args, "vehicle", None))
     print(json.dumps(report, sort_keys=True, allow_nan=False))
     return 2 if report["verdict"] == "optimistic" else 0
 
@@ -885,6 +886,8 @@ def build_parser() -> argparse.ArgumentParser:
         "calibrate", help="compare modelled fill costs against journaled fills")
     calibrate.add_argument("journal")
     calibrate.add_argument("--config", default=None)
+    calibrate.add_argument("--vehicle", choices=("equity", "option"), default=None,
+                           help="scope the report to one vehicle (recommended for authorization)")
     calibrate.set_defaults(func=cmd_calibrate)
     factory = sub.add_parser("factory", help="parallel autonomous strategy factory")
     factory_sub = factory.add_subparsers(dest="factory_command", required=True)

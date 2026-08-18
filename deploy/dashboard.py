@@ -36,6 +36,8 @@ SAFE_STATE_FIELDS = (
 SAFE_TRADE_FIELDS = (
     "symbol", "direction", "qty", "entry_price", "opened_at", "setup_type",
     "strategy_id", "strategy_version", "stop_loss_pct", "take_profit_pct",
+    "intended_risk_usd", "delivered_risk_usd", "risk_delivery_ratio",
+    "risk_shortfall_usd",
 )
 _CACHE: dict[str, tuple[float, object]] = {}
 _CACHE_LOCK = threading.Lock()
@@ -332,11 +334,24 @@ def _trades(connection: sqlite3.Connection, limit: int = 200) -> list[dict]:
     happened" but not "which of my edges did this", which is the question that
     decides whether an edge is worth promoting.
     """
+    columns = {str(row[1]) for row in
+               connection.execute("PRAGMA table_info(trades)").fetchall()}
+    # The dashboard can be mounted against a read-only legacy runtime before
+    # the next trader startup performs SQLite migrations.  Preserve the
+    # stable response shape by selecting NULL for telemetry columns absent in
+    # that deployment-era schema.
+    def field(name: str) -> str:
+        return name if name in columns else f"NULL AS {name}"
+
     rows = connection.execute(
-        """SELECT ts, symbol, side, action, qty, price, notional,
-                  realized_pnl_usd, risk_usd, pnl_pct, fill_status, setup_type,
-                  strategy_id, strategy_version, variant_id, runtime_mode,
-                  exit_policy, close_trigger
+        f"""SELECT ts, symbol, side, action, qty, price, notional,
+                  {field('realized_pnl_usd')}, {field('risk_usd')},
+                  {field('intended_risk_usd')}, {field('delivered_risk_usd')},
+                  {field('risk_delivery_ratio')}, {field('risk_shortfall_usd')},
+                  {field('pnl_pct')}, {field('fill_status')}, {field('setup_type')},
+                  {field('strategy_id')}, {field('strategy_version')},
+                  {field('variant_id')}, {field('runtime_mode')},
+                  {field('exit_policy')}, {field('close_trigger')}
            FROM trades ORDER BY ts DESC, id DESC LIMIT ?""",
         (max(1, int(limit)),)).fetchall()
     trades = []
@@ -750,7 +765,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  c=card('Research');row(c,'service mode',d.research.service_optional?'on demand':'continuous');row(c,'ledger available',d.research.available,good(d.research.available));row(c,'edge ledger',d.edge.status,good(d.edge.available));row(c,'candidates',d.edge.candidates);row(c,'proved edges',(d.edge.proved_edges||[]).length);row(c,'vehicles',JSON.stringify(d.edge.by_vehicle||{}));row(c,'lifecycle',JSON.stringify(d.edge.by_status||{}));row(c,'factory hypotheses',(d.edge.factory||{}).hypotheses);row(c,'isolated simulations',(d.edge.factory||{}).accounts);row(c,'factory cycles',(d.edge.factory||{}).cycles);row(c,'tradeable vehicle',d.research.tradeable_vehicle);row(c,'proved but untradeable',d.research.untradeable_proved_edges,d.research.untradeable_proved_edges?'warn':'ok');c.append(el('p',d.research.note||'No research status.','muted'));
  c=card('Proved edges — evidence at promotion',true);table(c,d.edge.proved_edges||[],['status','vehicle','strategy_id','variant_id','confidence','candidate_id','gate_hash']);
  c=card('Live paper results by edge',true);const lp=d.edge.live_paper||[];if(!lp.length){c.append(el('p','No paper outcomes recorded yet. Results appear once a deployed edge closes its first trade.','muted'))}else{table(c,lp,['status','vehicle','variant_id','outcomes','sessions','last_session','total_r','mean_r','win_rate','net_pnl','rolling_r','guard'])};
- c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','opened_at','setup_type']);
+ c=card('Active positions',true);table(c,d.trader.state.active_trades||[],['symbol','direction','qty','entry_price','intended_risk_usd','delivered_risk_usd','risk_delivery_ratio','risk_shortfall_usd','opened_at','setup_type']);
 
  const tr=d.trial||{};
  c=card('Paper-account trials — which edge is earning a promotion',true);
@@ -776,7 +791,7 @@ async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'
  if(!(jr.by_variant||[]).length){c.append(el('p','No fills recorded yet.','muted'))}
  else{table(c,jr.by_variant,['strategy_id','variant_id','trades','symbols','total_r','mean_r','win_rate','realized_pnl_usd'])}
  c=card('Recent trades, attributed',true);
- table(c,(jr.trades||[]).slice(0,60),['when','symbol','side','action','qty','price','realized_pnl_usd','r_multiple','strategy_id','variant_id','setup_type','close_trigger']);
+ table(c,(jr.trades||[]).slice(0,60),['when','symbol','side','action','qty','price','intended_risk_usd','delivered_risk_usd','risk_delivery_ratio','risk_shortfall_usd','realized_pnl_usd','r_multiple','strategy_id','variant_id','setup_type','close_trigger']);
 
  const lr=d.learning||{};
  c=card('What research learned',true);

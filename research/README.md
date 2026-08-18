@@ -7,14 +7,17 @@ structures are not supported. Data adapters
 normalize their payloads through `research.market_data` before any analysis.
 Every normalized event
 records its provider, feed, schema, session date/timezone, observation time,
-and the as-of timestamp used by the analysis.  Naive timestamps, future
-as-of values, invalid quotes, and malformed OHLC values fail closed.
+and the as-of timestamp used by the analysis. Availability is bounded by the
+latest of event timestamp, `as_of`, and `observed_at`; `as_of > observed_at`,
+naive timestamps, future values, invalid quotes, and malformed OHLC values fail
+closed.
 
 The shipped paper deployment defaults to SIP equity data and OPRA option data;
 both entitlements are required for autonomous research and executable option
 evidence. The trader's runtime execution profile remains `shares`, with live
-trading disabled. Research still evaluates both vehicles by default
-(`ALPACA_RESEARCH_VEHICLES=all`): option research is evidence generation, not
+trading disabled. Scheduled research follows the deployed equity/shares lane by
+default (`ALPACA_RESEARCH_VEHICLES=equity`). Set the variable to `option` or
+`all` for an explicit opt-in; option research is evidence generation, not
 permission to execute options. Compose starts the recorder, scheduled research,
 broker-free shadow, watchdog, trader, and dashboard with one plain
 `docker compose up -d` command; systemd uses the same defaults.
@@ -54,12 +57,16 @@ closed when a required floor cannot be supported. Widen history and/or
 `universe.symbols`, never lower a floor.
 
 Qualification is powered at a minimum of 100 trades, 30 complete sessions, and
-30 session-level clusters. Replay epoch 3 additionally requires a 30 bps
-minimum stop distance for both rule and IBR paths, a recomputable risk unit
-that covers round-trip cost, and executable quote/snapshot fill-quality
-evidence rather than bar-only fallback. Evidence from older replay epochs
-remains auditable but is quarantined and cannot validate, champion, or authorize
-the paper trader until replayed under epoch 3.
+30 session-level clusters. Replay epoch 4 retains the epoch-3 economics gates
+and additionally requires latest-of-event/as-of/observed-at point-in-time
+availability, executable-row-only authorizing statistics, vehicle-specific
+cost selection/provenance, raw confirmatory p-values for FDR, and a stressed-
+cost runtime abstention boundary. Evidence from older replay epochs remains
+auditable but is quarantined and cannot validate, champion, or authorize the
+paper trader until replayed under epoch 4. Authorization requires exact epoch
+equality with current epoch 4; future epochs are audit-only as well. A verified
+current-epoch gate is sealed immutably per run, and re-derivation appends a new
+proof instead of rewriting prior evidence.
 
 The default session timezone is `America/New_York`. Production replay requires
 the exact Alpaca calendar session bounds for every session, including early
@@ -76,7 +83,11 @@ timestamp.
 1. Require a complete, contiguous range of completed one-minute bars from the
    configured US session open.
 2. Detect a breakout only after a range bar has closed.
-3. Enter at the immediate next bar's open; a missing next bar yields no trade.
+3. Make the signal actionable at the maximum availability time of the required
+   records (`timestamp`, `as_of`, and `observed_at`). A delayed recorder bar
+   may signal when observed; enter at that decision/observation time using a
+   fresh SIP/OPRA quote. Delayed full OHLC never backfills an earlier entry, and
+   partial pre-entry ranges are excluded.
 4. Apply gap-aware fills and stop-first ties when a candle touches both stop
    and target. A bar that opens beyond the stop or target fills at that open,
    on exit as well as on entry, not at a level the market never traded again.
@@ -94,8 +105,9 @@ Equity and single-leg long-option vehicles are independent result books. Call
 no pooled P&L field. Option replay requires timestamped option snapshots and
 uses their contract multiplier.
 
-Market-data strictness is lane-specific. Direct replay APIs default to strict
-`ReplayPolicy` behavior and require a fresh executable equity quote at each
+Market-data strictness is lane-specific. The shipped
+`execution.strict_market_data` default is `true`; direct replay APIs default to
+strict `ReplayPolicy` behavior and require a fresh executable equity quote at each
 boundary that needs one. Historical backtest lanes use the validated,
 research-only `research.backtest_bar_fallback` setting (default `true`): when a
 boundary has no equity quote, the bar may supply the reference, the shared
@@ -109,7 +121,9 @@ equity entry and exit legs must carry Alpaca SIP quote provenance, and option
 entry and exit legs must carry OPRA quote provenance. Every leg records provider,
 feed, quote timestamp/age, and fill source; both legs must be executable and no
 older than 30 seconds. Bar-only, missing, partial-feed, or stale legs remain
-diagnostic and cannot authorize a proof.
+diagnostic and cannot authorize a proof. Fit diagnostics may count planned
+signal/exit geometry as a quote-required, non-authorizing measurement when
+executable pricing is absent.
 
 The command-line surface is intentionally small:
 
@@ -129,18 +143,24 @@ state.
 `research.costs.CostModel` is the single expected-cost model: every lane --
 IBR replay, edge discovery, and the strategy factory -- prices its fills
 through it, and none carries its own spread/slippage/fee numbers or its own
-arithmetic. The shipped `costs` block is 4 bps spread, 6 bps adverse
-slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit option fee
-per contract per side. These are expected costs, not rejection caps.
+arithmetic. `cost_model_for_vehicle` selects optional `costs.vehicles.equity`
+or `.option` overrides and persists their provenance; absent an override, the
+shipped defaults are 4 bps spread, 6 bps adverse slippage, 0.5 bps per-side
+notional fee, and a 0.65 currency-unit option fee per contract per side. These
+are expected costs, not rejection caps.
 
 Every proof also persists the preregistered all-in stress scenarios of 9, 15,
 25, and 50 bps. The 25 bps scenario is the authorization requirement; the
 other scenarios remain diagnostics. A stress result that is missing, negative,
 or not positive at 25 bps cannot authorize a candidate.
 
-The runtime's `execution.max_slippage_bps` and `max_spread_bps` are rejection
-caps, not expectations. They are read into the same model and bound it: a
-model expecting a cost the runtime would refuse to submit fails closed rather
+The runtime's stressed-cost risk check abstains before order submission when
+the configured 25 bps scenario (or another preregistered 9/15/50 bps choice)
+exceeds its allowed cost-to-risk ratio, and persists the scenario, cost, ratio,
+and vehicle telemetry. The runtime's `execution.max_slippage_bps` and
+`max_spread_bps` are rejection caps, not expectations. They are read into the
+same model and bound it: a model expecting a cost the runtime would refuse to
+submit fails closed rather
 than simulating fills that could never happen. Sourcing an expected slippage
 from the cap is as wrong as ignoring the cap.
 
@@ -154,7 +174,8 @@ used to decide which vehicle lanes to run and to feed the standalone
 `backtest-ibr` invocation, which receives the quotes explicitly.
 
 ```bash
-python research.py calibrate runtime/paper/journal.db
+python research.py calibrate runtime/paper/journal.db --vehicle equity
+# Use --vehicle option for the independent option calibration lane.
 ```
 
 `research.calibration` reads the runtime journal read-only and reports adverse
@@ -163,7 +184,11 @@ cost in basis points, model bias, runtime-cap overruns, and a verdict of
 runtime mode, vehicle, execution profile, and by both entry and exit when
 references are present; partial fills use the plan/reference fields rather than
 their realized notional, and missing references remain unreferenced. Equity and
-options are never pooled. Calibration is an authorization gate: missing, stale,
+options are never pooled. Pass `--vehicle` (or the API's `vehicle=` argument)
+for an explicit per-vehicle report; the report records its filter and available
+journal vehicles. Scheduled shadow authorization always computes and checks the
+matching vehicle report, so a mixed journal cannot authorize the other lane.
+Calibration is an authorization gate: missing, stale,
 or insufficient evidence, an optimistic cost verdict, a terminal material
 underfill (<80% of requested quantity), or a partial-cancel rate above 20%
 returns a veto and non-zero status. The scheduled cycle still records offline
@@ -267,6 +292,10 @@ DB is a no-op. Ingestion opens the WAL read-only and requires strictly newer,
 complete parity-matched rows, prior qualification, source/config/code/
 provenance/replay/gate hashes, family/global BH, and durable online FDR before
 appending the immutable `lane=shadow` proof and live marker.
+Epoch-4 ingestion splits each tail into older chronological selection sessions
+and a newer disjoint confirmatory window; BH uses the selection p-values, and
+only the selected candidate's raw confirmatory p-value reaches LORD. Same-tail
+v3 scopes remain audit-only and cannot authorize.
 
 ## Autonomous strategy factory
 
@@ -317,10 +346,11 @@ reports `seeded`, `revived`, `reseeds`, and `active_slots` separately —
 `revived` is the one that says something had gone wrong — so idle capacity is
 visible rather than silent.
 
-Research defaults to both vehicles. `research.py vehicles` reports the selected
-set, and `ALPACA_RESEARCH_VEHICLES` may narrow it to a comma-separated subset;
-the shipped Compose and systemd paths set it to `all`. The trader still runs one
-runtime execution profile, `shares`, so proving an option edge is useful
+Research defaults to the deployed vehicle (`equity`). `research.py vehicles`
+reports the selected set, and `ALPACA_RESEARCH_VEHICLES` may explicitly select
+`equity`, `option`, `all`, or a comma-separated subset; the shipped Compose and
+systemd paths set it to `equity`. The trader still runs one runtime execution
+profile, `shares`, so proving an option edge is useful
 research evidence but never switches the trader to options or authorizes an
 options order. Select the `options` execution profile separately, on paper,
 only after its OPRA evidence and controls have been reviewed.
@@ -337,6 +367,14 @@ evidence; if LLM replacement is enabled, a valid bounded proposal is registered 
 missing or invalid LLM proposal leaves the family pending replacement, not
 retired. Insufficient data is not treated as failure. Backtest winners must
 still pass strictly later forward data before runtime can select them.
+
+Before full variant replay, `research.fit_diagnostics` records fit-only
+eligible-prefix and first-signal rates, ATR and 30-bps-floor binding, planned
+stop/target/hold distributions, configured/stressed cost-to-risk, intended
+versus delivered risk, exit reason/tie/gap counts, clustered MDE/power, and
+behavioral alias fingerprints. The exit grammar stays fixed (ATR-floor bracket,
+configured R target, and bar cap); these measurements are operator-review
+diagnostics only and never authorize or expand a candidate.
 
 A worker is given a corpus descriptor — the session window it needs — rather
 than a copy of the corpus, and re-reads that window itself. The predicates are

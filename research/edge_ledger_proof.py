@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from contextlib import closing
 import json
 from typing import Mapping
@@ -33,7 +34,11 @@ def run_engine_epoch_current(run: Mapping) -> bool:
     back to ``validated``.
     """
     from .edge_ledger_store import REPLAY_ENGINE_EPOCH
-    return run_engine_epoch(run) >= int(REPLAY_ENGINE_EPOCH)
+    # Evidence from a future engine is just as unverifiable as evidence from
+    # an old engine: its semantics may have changed in ways this verifier does
+    # not understand yet.  Keep it readable for audit, but require an exact
+    # epoch match before authorization.
+    return run_engine_epoch(run) == int(REPLAY_ENGINE_EPOCH)
 
 
 def _facade_helper(name: str):
@@ -90,6 +95,105 @@ def _close(left, right, *, tolerance: float = 1e-9) -> bool:
         1.0, abs(float(left)), abs(float(right)))
 
 
+def _trade_rows_match(source, durable) -> bool:
+    """Compare raw source rows with durable payloads as an unordered multiset.
+
+    ``append_trade`` stores the caller's payload verbatim, so the source rows
+    in a verified envelope must be the same rows that were persisted.  The
+    only tolerated asymmetry is the optional ``r_multiple`` field: the edge
+    discovery drift reference may attach that auxiliary metric while writing
+    a trade after the gate source was built.  If the source carries that key,
+    it remains fully bound and must match exactly.
+
+    Grouping on canonical JSON with that one auxiliary key removed makes the
+    comparison deterministic without relying on insertion order or random
+    SQLite trade IDs, while counters preserve duplicate rows.
+    """
+    try:
+        source_rows = [dict(row) for row in source]
+        durable_rows = [dict(row) for row in durable]
+    except (TypeError, ValueError):
+        return False
+    if len(source_rows) != len(durable_rows):
+        return False
+
+    source_groups = defaultdict(list)
+    durable_groups = defaultdict(list)
+    try:
+        for row in source_rows:
+            group = {key: value for key, value in row.items()
+                     if key != "r_multiple"}
+            source_groups[_json(group)].append((_json(row), "r_multiple" in row))
+        for row in durable_rows:
+            group = {key: value for key, value in row.items()
+                     if key != "r_multiple"}
+            durable_groups[_json(group)].append((_json(row), "r_multiple" in row))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if set(source_groups) != set(durable_groups):
+        return False
+
+    for group, source_items in source_groups.items():
+        durable_items = durable_groups[group]
+        # Source rows that explicitly carry r_multiple are bound to its exact
+        # value.  Rows without it may match the same durable row with the
+        # optional auxiliary metric attached during persistence.
+        source_exact = Counter(token for token, has_r in source_items if has_r)
+        durable_exact = Counter(token for token, _ in durable_items)
+        for token, count in source_exact.items():
+            if durable_exact[token] < count:
+                return False
+            durable_exact[token] -= count
+        source_without_aux = len(source_items) - sum(source_exact.values())
+        durable_remaining = sum(durable_exact.values())
+        if source_without_aux != durable_remaining:
+            return False
+    return True
+
+
+def _durable_trade_columns_match(item, payload: Mapping, run: Mapping) -> bool:
+    """Ensure indexed trade columns still describe their JSON payload."""
+    if item["candidate_id"] != run.get("candidate_id"):
+        return False
+    payload_candidate = payload.get("candidate_id")
+    if payload_candidate is not None and str(payload_candidate) != str(
+            item["candidate_id"]):
+        return False
+    if str(item["vehicle"]) != str(run.get("vehicle")):
+        return False
+
+    payload_vehicle = payload.get("vehicle", run.get("vehicle"))
+    if str(payload_vehicle) != str(item["vehicle"]):
+        return False
+    payload_session = payload.get("session_date")
+    if payload_session is None and payload.get("entry_timestamp") is not None:
+        payload_session = str(payload.get("entry_timestamp"))[:10]
+    if payload_session is not None and str(payload_session) != str(item["session_date"]):
+        return False
+    payload_opportunity = payload.get("opportunity_id")
+    if payload_opportunity is None:
+        payload_opportunity = payload.get("entry_timestamp")
+    if payload_opportunity is not None and str(payload_opportunity) != str(
+            item["opportunity_id"]):
+        return False
+    for name in ("entry_timestamp", "exit_timestamp"):
+        if payload.get(name) != item[name]:
+            return False
+
+    payload_net = _finite_number(payload.get("net_pnl", 0.0))
+    durable_net = _finite_number(item["net_pnl"])
+    if payload_net is None or durable_net is None or not _close(payload_net, durable_net):
+        return False
+    payload_return = payload.get("return_value")
+    durable_return = item["return_value"]
+    if payload_return is None or durable_return is None:
+        return payload_return is None and durable_return is None
+    payload_return = _finite_number(payload_return)
+    durable_return = _finite_number(durable_return)
+    return (payload_return is not None and durable_return is not None and
+            _close(payload_return, durable_return))
+
+
 class EdgeLedgerProofMixin:
     """Mixin containing durable gate-proof and eligibility operations."""
 
@@ -131,9 +235,63 @@ class EdgeLedgerProofMixin:
     def _gate_envelope_error(self, run: Mapping, envelope: Mapping) -> str | None:
         if envelope.get("lane") != run.get("lane") or envelope.get("vehicle") != run.get("vehicle"):
             return "verified gate lane/vehicle does not match the persisted run"
+        # V2 source-backed proofs must identify the immutable run candidate.
+        # During the historical transition producers used the candidate's
+        # stable variant id before the UUID-backed ledger record existed, so
+        # accept exactly that alias as well; arbitrary/missing identities are
+        # never allowed to cross candidate boundaries.
+        source_backed_v2 = (
+            envelope.get("schema") == "verified-research-gate.v2" and
+            isinstance(envelope.get("fit_source"), list) and
+            isinstance(envelope.get("heldout_source"), list))
+        allowed_candidate_ids: set[str] = set()
+        if source_backed_v2:
+            candidate = self.candidate(run.get("candidate_id"))
+            if not isinstance(candidate, Mapping):
+                return "verified gate candidate record is missing"
+            allowed_candidate_ids = {
+                str(run.get("candidate_id")), str(candidate.get("variant_id"))}
+            envelope_candidate_id = envelope.get("candidate_id")
+            if (not isinstance(envelope_candidate_id, str) or
+                    envelope_candidate_id not in allowed_candidate_ids):
+                return "verified gate candidate identity does not match persisted run"
+            qualification = envelope.get("qualification")
+            if isinstance(qualification, Mapping) and "post_selection" in qualification:
+                post = qualification.get("post_selection")
+                if not isinstance(post, Mapping):
+                    return "verified gate qualification candidate identity is invalid"
+                post_candidate_id = post.get("candidate_id")
+                if (post.get("preselected") is True or
+                        post_candidate_id is not None):
+                    if (not isinstance(post_candidate_id, str) or
+                            post_candidate_id not in allowed_candidate_ids or
+                            post_candidate_id != envelope_candidate_id):
+                        return "verified gate qualification candidate identity does not match"
+            # Factory and live-shadow runs persist the complete gate under
+            # metrics.  When that immutable reference is present, it is the
+            # candidate-bound proof origin and a re-signed envelope cannot be
+            # transplanted by merely changing candidate_id and its hash.
+            metrics = run.get("metrics")
+            recorded_gate = metrics.get("gate") if isinstance(metrics, Mapping) else None
+            recorded_envelope = None
+            if isinstance(recorded_gate, Mapping):
+                recorded_envelope = recorded_gate.get("verified_gate")
+                if (not isinstance(recorded_envelope, Mapping) and
+                        recorded_gate.get("schema") == "verified-research-gate.v2"):
+                    recorded_envelope = recorded_gate
+            if isinstance(recorded_envelope, Mapping):
+                if recorded_envelope.get("content_hash") != envelope.get("content_hash"):
+                    return "verified gate envelope does not match immutable run proof"
+            if source_backed_v2 and run_engine_epoch_current(run):
+                if (not isinstance(recorded_envelope, Mapping) or
+                        recorded_envelope.get("content_hash") != envelope.get(
+                            "content_hash")):
+                    return "verified gate immutable run proof is missing or inconsistent"
         with closing(_connect(self.path)) as db:
             durable = db.execute(
-                "SELECT payload_json FROM trades WHERE run_id=? ORDER BY session_date,trade_id",
+                "SELECT candidate_id,vehicle,session_date,opportunity_id,"
+                "entry_timestamp,exit_timestamp,net_pnl,return_value,payload_json "
+                "FROM trades WHERE run_id=? ORDER BY session_date,trade_id",
                 (run["run_id"],)).fetchall()
         rows = []
         for item in durable:
@@ -143,6 +301,8 @@ class EdgeLedgerProofMixin:
                 return "persisted trade payload is invalid"
             if not isinstance(payload, Mapping):
                 return "persisted trade payload is invalid"
+            if not _durable_trade_columns_match(item, payload, run):
+                return "persisted trade scalar columns do not match payload"
             rows.append(payload)
         if run["lane"] == "shadow":
             fit_rows, heldout_rows = [], rows
@@ -172,6 +332,17 @@ class EdgeLedgerProofMixin:
                 sample_counts(source_fit, vehicle=run["vehicle"]) != actual["fit"] or
                 sample_counts(source_held, vehicle=run["vehicle"]) != actual["heldout"]):
             return "verified gate source evidence is missing or does not match persisted trades"
+        if (not _trade_rows_match(source_fit, fit_rows) or
+                not _trade_rows_match(source_held, heldout_rows)):
+            return "verified gate source rows do not match persisted trades"
+        if run.get("lane") == "shadow":
+            metrics = run.get("metrics")
+            shadow_source = (metrics.get("shadow_source")
+                             if isinstance(metrics, Mapping) else None)
+            if shadow_source is not None:
+                if (not isinstance(shadow_source, Mapping) or
+                        shadow_source.get("candidate_id") != run.get("candidate_id")):
+                    return "verified gate shadow source candidate identity does not match persisted run"
         floors = envelope.get("floors")
         if not isinstance(floors, Mapping):
             return "verified gate floor report is missing"
@@ -493,6 +664,49 @@ class EdgeLedgerProofMixin:
                 source.get("schema") != "shadow-ingest.v1" or
                 not source.get("candidate_id") or not source.get("sessions")):
             return False
+        # Epoch-4 live-shadow authorization has an explicit adaptive-selection
+        # boundary.  Legacy v3/same-tail records remain readable, but without
+        # these independently verifiable windows they cannot authorize.
+        if source.get("independent_confirmatory") is not True or \
+                source.get("disjoint_sessions") is not True or \
+                source.get("session_disjoint") is not True:
+            return False
+        selection = source.get("selection")
+        confirmatory = source.get("confirmatory")
+        selection_sessions = source.get("selection_sessions")
+        confirmatory_sessions = source.get("confirmatory_sessions")
+        if (not isinstance(selection, Mapping) or
+                not isinstance(confirmatory, Mapping) or
+                not isinstance(selection_sessions, list) or
+                not isinstance(confirmatory_sessions, list) or
+                not selection_sessions or not confirmatory_sessions or
+                any(not isinstance(item, str) or not item for item in
+                    [*selection_sessions, *confirmatory_sessions]) or
+                len(set(selection_sessions)) != len(selection_sessions) or
+                len(set(confirmatory_sessions)) != len(confirmatory_sessions) or
+                set(selection_sessions).intersection(confirmatory_sessions) or
+                max(selection_sessions) >= min(confirmatory_sessions)):
+            return False
+        if (selection.get("sessions") != selection_sessions or
+                confirmatory.get("sessions") != confirmatory_sessions or
+                source.get("selection_session_digest") != content_hash(selection_sessions) or
+                source.get("confirmatory_session_digest") != content_hash(confirmatory_sessions) or
+                source.get("p_value_source") != "live_shadow_confirmatory_gate" or
+                selection.get("session_digest") != content_hash(selection_sessions) or
+                confirmatory.get("session_digest") != content_hash(confirmatory_sessions) or
+                selection.get("p_value_source") != "selection_window_gate" or
+                confirmatory.get("p_value_source") != "live_shadow_confirmatory_gate"):
+            return False
+        for item in (selection, confirmatory):
+            if any(not isinstance(item.get(key), str) or not item.get(key)
+                   for key in ("rows_digest", "baseline_rows_digest", "null_rows_digest")):
+                return False
+        all_sessions = [item.get("session_date") for item in source.get("sessions", ())
+                        if isinstance(item, Mapping)]
+        if (set(all_sessions) != set([*selection_sessions, *confirmatory_sessions]) or
+                len(all_sessions) != len([*selection_sessions, *confirmatory_sessions]) or
+                set(selection_sessions).intersection(confirmatory_sessions)):
+            return False
         replay_digests = metrics.get("replay_digests") if isinstance(metrics, Mapping) else None
         expected_replays = [item.get("replay_digest") for item in source.get("sessions", ())
                             if isinstance(item, Mapping)]
@@ -530,7 +744,171 @@ class EdgeLedgerProofMixin:
         if (not isinstance(online, Mapping) or
                 online.get("required", True) is False or
                 online.get("tested", True) is not True or
-                online.get("decision") is not True):
+                online.get("decision") is not True or
+                online.get("scope") !=
+                    f"shadow-confirmation-v4:{run.get('vehicle')}"):
+            return False
+        # Rebuild the adaptive selection statistic from persisted selection
+        # rows.  Session/row digests are checked first, then the exact gate
+        # computation and the complete batch BH inputs/results are replayed;
+        # a consistently rewritten digest cannot authorize by itself.
+        selection_candidate = selection.get("candidate_source")
+        selection_baseline = selection.get("baseline_source")
+        selection_null = selection.get("null_source")
+        if (not isinstance(selection_candidate, list) or
+                not isinstance(selection_baseline, list) or
+                not isinstance(selection_null, list) or
+                selection.get("rows_digest") != content_hash(selection_candidate) or
+                selection.get("baseline_rows_digest") != content_hash(selection_baseline) or
+                selection.get("null_rows_digest") != content_hash(selection_null)):
+            return False
+        selection_sessions_from_rows = {
+            str(item.get("session_date") or "") for item in selection_candidate
+            if isinstance(item, Mapping) and item.get("session_date")
+        }
+        if selection_sessions_from_rows != set(selection_sessions):
+            return False
+        for arm_rows in (selection_baseline, selection_null):
+            arm_sessions = {
+                str(item.get("session_date") or "") for item in arm_rows
+                if isinstance(item, Mapping) and item.get("session_date")
+            }
+            if arm_sessions != set(selection_sessions):
+                return False
+        minimums = selection.get("minimums")
+        if (not isinstance(minimums, Mapping) or
+                any(not isinstance(minimums.get(key), int) or
+                    isinstance(minimums.get(key), bool) or minimums.get(key) < 1
+                    for key in ("trades", "sessions"))):
+            return False
+        try:
+            from .edge_discovery_core import _discover_gate
+            from .edge_lab import _strengthen_gate
+            selection_gate = _discover_gate(
+                selection_candidate, selection_baseline,
+                vehicle=str(run.get("vehicle") or ""),
+                min_trades=int(minimums["trades"]),
+                min_sessions=int(minimums["sessions"]),
+                alpha=float(selection.get("alpha")), shadow=True,
+                null_rows=selection_null,
+                qualification=gate.get("qualification"),
+                test_iterations=int(selection.get("test_iterations", 20_000)))
+            selection_gate = _strengthen_gate(
+                selection_gate, selection_baseline,
+                vehicle=str(run.get("vehicle") or ""))
+        except (TypeError, ValueError, OverflowError, KeyError):
+            return False
+        if selection_gate.get("candidate_p_raw") != selection.get("raw_p_value"):
+            return False
+        batch = selection.get("bh")
+        if not isinstance(batch, Mapping):
+            return False
+        try:
+            from .stats import benjamini_hochberg
+            family_values = batch.get("family_values")
+            family_results = batch.get("family_results")
+            global_values = batch.get("global_values")
+            global_results = batch.get("global_results")
+            if (not isinstance(family_values, Mapping) or
+                    not isinstance(family_results, Mapping) or
+                    not isinstance(global_values, Mapping) or
+                    not isinstance(global_results, Mapping)):
+                return False
+            expected_family = {}
+            for family_name, values in family_values.items():
+                if not isinstance(values, Mapping):
+                    return False
+                expected_family.update(benjamini_hochberg(
+                    {str(key): float(value) for key, value in values.items()},
+                    alpha=float(selection.get("alpha"))))
+            expected_global = benjamini_hochberg(
+                {str(key): float(value) for key, value in global_values.items()},
+                alpha=float(selection.get("alpha")))
+            if dict(expected_family) != dict(family_results) or \
+                    dict(expected_global) != dict(global_results):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        provenance = gate.get("provenance")
+        if (not isinstance(provenance, Mapping) or
+                provenance.get("independent_confirmatory") is not True or
+                provenance.get("disjoint_sessions") is not True or
+                provenance.get("session_disjoint") is not True or
+                provenance.get("selection_sessions") != selection_sessions or
+                provenance.get("confirmatory_sessions") != confirmatory_sessions or
+                provenance.get("selection_session_digest") !=
+                    content_hash(selection_sessions) or
+                provenance.get("confirmatory_session_digest") !=
+                    content_hash(confirmatory_sessions) or
+                provenance.get("p_value_source") !=
+                    "live_shadow_confirmatory_gate" or
+                "selection_raw_p_value" not in provenance or
+                "confirmatory_raw_p_value" not in provenance or
+                provenance.get("selection_raw_p_value") !=
+                    source.get("selection", {}).get("raw_p_value") or
+                provenance.get("confirmatory_raw_p_value") !=
+                    source.get("confirmatory", {}).get("raw_p_value")):
+            return False
+        if (online.get("independent_confirmatory") is not True or
+                online.get("disjoint_sessions") is not True or
+                online.get("session_disjoint") is not True or
+                online.get("selection_sessions") != selection_sessions or
+                online.get("confirmatory_sessions") != confirmatory_sessions or
+                online.get("selection_session_digest") !=
+                    content_hash(selection_sessions) or
+                online.get("confirmatory_session_digest") !=
+                    content_hash(confirmatory_sessions) or
+                online.get("p_value_source") !=
+                    "live_shadow_confirmatory_gate" or
+                "selection_raw_p_value" not in online or
+                online.get("selection_raw_p_value") !=
+                    source.get("selection", {}).get("raw_p_value") or
+                online.get("confirmatory_raw_p_value") !=
+                    source.get("confirmatory", {}).get("raw_p_value") or
+                online.get("confirmatory_raw_p_value") != online.get("p_value") or
+                online.get("raw_p_value") != online.get("confirmatory_raw_p_value")):
+            return False
+        # The persisted confirmatory gate source is the authorizing p-value
+        # source.  A selection digest alone is never sufficient to authorize.
+        confirm_source = gate.get("heldout_source")
+        if (not isinstance(confirm_source, list) or
+                confirmatory.get("rows_digest") != content_hash(confirm_source) or
+                confirmatory.get("baseline_rows_digest") != content_hash(
+                    gate.get("heldout_baseline_source") or []) or
+                confirmatory.get("null_rows_digest") != content_hash(
+                    gate.get("null_source") or [])):
+            return False
+        statistics = gate.get("statistics")
+        candidate_id = str(source.get("candidate_id") or "")
+        family_result = family_results.get(candidate_id)
+        global_result = global_results.get(candidate_id)
+        if (not isinstance(statistics, Mapping) or
+                statistics.get("p_value") != online.get("confirmatory_raw_p_value") or
+                not isinstance(family_result, Mapping) or
+                not isinstance(global_result, Mapping) or
+                family_result.get("p") != online.get("selection_raw_p_value") or
+                family_result.get("p_adjusted") != online.get("family_q_value") or
+                global_result.get("p_adjusted") != online.get("global_q_value")):
+            return False
+        run_provenance = payload.get("run_provenance")
+        if (not isinstance(run_provenance, Mapping) or
+                run_provenance.get("independent_confirmatory") is not True or
+                run_provenance.get("disjoint_sessions") is not True or
+                run_provenance.get("session_disjoint") is not True or
+                run_provenance.get("selection_sessions") != selection_sessions or
+                run_provenance.get("confirmatory_sessions") != confirmatory_sessions or
+                run_provenance.get("selection_session_digest") !=
+                    content_hash(selection_sessions) or
+                run_provenance.get("confirmatory_session_digest") !=
+                    content_hash(confirmatory_sessions) or
+                run_provenance.get("p_value_source") !=
+                    "live_shadow_confirmatory_gate" or
+                "selection_raw_p_value" not in run_provenance or
+                "confirmatory_raw_p_value" not in run_provenance or
+                run_provenance.get("selection_raw_p_value") !=
+                    online.get("selection_raw_p_value") or
+                run_provenance.get("confirmatory_raw_p_value") !=
+                    online.get("confirmatory_raw_p_value")):
             return False
         return (
             isinstance(evidence_source, Mapping)

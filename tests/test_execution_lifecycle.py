@@ -401,6 +401,52 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual(rows, [(2.0, 100.0, 200.0, 2.0),
                                 (3.0, 102.0, 306.0, 9.0)])
 
+    def test_singular_option_profile_uses_premium_risk_and_option_edge_vehicle(self):
+        """Legacy ``option`` aliases must follow options semantics end-to-end."""
+        self._bind_engine(profile="options", runtime_name="runtime-option-alias")
+        symbol = "SPY260821C00600000"
+        request = OrderRequest(symbol, Decimal("1"), "buy",
+                               client_order_id="entry-option-alias",
+                               position_intent="buy_to_open")
+        entry = self.provider.submit_order(request)
+        plan = {
+            "execution_profile": "option", "direction": "long",
+            "entry_price": 101.5, "stop_price": 99,
+            "underlying_stop_price": 99, "underlying_target_price": 105,
+            "underlying_symbol": "SPY", "contract_multiplier": 100,
+            "option": {"symbol": symbol, "debit": 1.5, "multiplier": 100},
+            # Deliberately contradictory legacy risk: treating this as an
+            # equity stop-distance would produce 9,750 instead of premium
+            # risk 150.
+            "risk_usd": 9750, "notional": 150,
+            "setup_id": "entry-option-alias", "setup_type": "ibr",
+            "variant_id": "option-alias-variant", "candidate_id": "option-candidate",
+        }
+        self.engine._record_open_order(request, entry, plan)
+        self.provider.set_order(entry.id, status="filled", filled_qty=1,
+                                filled_avg_price=1.5)
+        self.provider.positions_live = [Position(
+            symbol, Decimal("1"), "long", avg_entry_price=Decimal("1.5"),
+            current_price=Decimal("1.6"),
+        )]
+        self.engine.reconcile()
+
+        trade = state.load_state()["active_trades"][symbol]
+        self.assertEqual(trade["vehicle"], "option")
+        self.assertEqual(trade["entry_reference"], 1.5)
+        self.assertEqual(trade["risk_usd"], 150.0)
+        self.assertEqual(trade["delivered_risk_usd"], 150.0)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            row = db.execute(
+                "SELECT risk_usd, intended_risk_usd, delivered_risk_usd "
+                "FROM trades WHERE action='open'").fetchone()
+        self.assertEqual(row, (150.0, 9750.0, 150.0))
+
+        self.engine._record_edge_outcome(trade, 15.0, 10.0, 1.65)
+        outcome = self.engine._pending_edge_outcomes[-1]["outcome"]
+        self.assertEqual(outcome["vehicle"], "option")
+        self.assertEqual(outcome["risk_usd"], 150.0)
+
     def test_unprotected_position_stays_unprotected_and_fail_closed_close_dedupes(self):
         self._bind_engine(runtime_name="runtime-unprotected")
         self.provider.positions_live = [Position(

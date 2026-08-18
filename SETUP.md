@@ -259,27 +259,34 @@ never lower the floor. Keep them US equity/ETF symbols.
 - `shares` trades proved equity variants;
 - `options` selects single-leg long listed options for proved option variants.
 
-The trader remains on the `shares` profile by default. Research is vehicle
-complete by default (`ALPACA_RESEARCH_VEHICLES=all`), so it evaluates equity
-and option evidence independently even while runtime execution stays on
-`shares`. Option research is evidence generation, not permission to submit
-option orders; selecting `options` is a separate, paper-only runtime decision
-after OPRA evidence and controls are reviewed.
+The trader remains on the `shares` profile by default, and scheduled research
+therefore evaluates equity only. Set `ALPACA_RESEARCH_VEHICLES=all` explicitly
+to run equity and option evidence independently; each vehicle keeps separate
+calibration and authorization evidence. Option research is evidence
+generation, not permission to submit option orders; selecting `options` is a
+separate, paper-only runtime decision after OPRA evidence and controls are
+reviewed.
 
-`validate_config` reads one top-level `costs` block
-(`spread_bps`, `slippage_bps`, `fee_bps`, and the option fee) for every research
-lane. The shipped values are 4 bps spread, 6 bps adverse slippage, 0.5 bps
-per-side notional fee, and a 0.65 currency-unit option fee per contract per
-side. These are expectations, not rejection caps, and the `execution` block
+`validate_config` reads one `costs` block for every research lane. Optional
+`costs.vehicles.equity` and `.option` overrides are selected independently and
+carry provenance; absent overrides, the shipped values are 4 bps spread, 6 bps
+adverse slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit
+option fee per contract per side. These are expectations, not rejection caps,
+and the `execution` block
 bounds them: a model whose expected half-spread plus slippage exceeds
 `execution.max_slippage_bps`, or whose expected spread exceeds
 `execution.max_spread_bps`, fails validation rather than simulating fills the
 runtime would refuse to submit. Preregistered all-in stress scenarios are 9,
-15, 25, and 50 bps; 25 bps is the authorization requirement. `python
-research.py calibrate` (see OPERATIONS.md) is an authorization check against
+15, 25, and 50 bps; 25 bps is the authorization requirement. Runtime risk
+abstains before submission when the configured stressed cost exceeds its
+cost-to-risk limit and records scenario/cost/ratio telemetry.
+`execution.strict_market_data` defaults to `true`; `python research.py calibrate`
+(see OPERATIONS.md) is an authorization check against
 real entry and exit fills, including terminal underfill/partial-cancel evidence.
-Missing, stale, or insufficient calibration blocks shadow authorization while
-leaving offline discovery/factory diagnostics available.
+Calibration remains stratified by vehicle and is never pooled when the
+explicit `ALPACA_RESEARCH_VEHICLES=all` override runs both lanes. Missing,
+stale, or insufficient calibration blocks shadow authorization while leaving
+offline discovery/factory diagnostics available.
 
 ## 8. Export deployment paths and validate Compose
 
@@ -555,12 +562,19 @@ and global BH plus durable online FDR must pass before an immutable live marker
 is appended. Historical and offline-forward selection explicitly defers this
 cumulative test; it cannot consume the budget or authorize deployment. Manual/
 offline promotion cannot bypass it.
+Epoch-4 ingestion uses independent chronological selection and confirmatory
+windows: BH uses selection p-values, only the selected candidate's raw
+confirmatory p reaches LORD, and same-tail v3 scopes remain audit-only.
 
-Authorizing fill quality is point-in-time and provenance-bound: equity entry and
-exit legs must use SIP quotes, option entry and exit legs must use OPRA quotes,
-and every leg must retain provider, feed, source, and quote age no older than
-30 seconds. Bar-only, partial-feed, missing, or stale legs remain diagnostic and
-cannot authorize a proof.
+Authorizing fill quality is point-in-time and provenance-bound: required records
+become actionable at the maximum of event timestamp, `as_of`, and `observed_at`.
+A delayed recorder bar may signal when observed; execution enters at that
+decision/observation time using fresh SIP (equity) or OPRA (option) evidence.
+Delayed full OHLC never backfills an earlier entry, and partial pre-entry bar
+ranges are excluded. Historical bar-fallback rows, partial-feed, missing, or
+stale legs remain diagnostic and cannot authorize a proof. Fit diagnostics may
+count planned signal/exit geometry as quote-required, non-authorizing
+measurement.
 
 ### How much data a first proof actually needs
 
@@ -614,12 +628,22 @@ negative rolling-forward windows. Until then the report says `underpowered` or
 
 Live shadow requires at least 150 trades across 30 complete, parity-matched
 sessions. A separate paper trial is reviewed only after its configured 100
-trades across 30 sessions. Replay epoch 3 additionally requires a stop of at
-least 30 bps for both the rule and IBR paths, a recomputable risk unit that
-covers round-trip costs, and executable quote/snapshot fill-quality evidence;
-older-epoch evidence is quarantined until replayed. These defaults make
+trades across 30 sessions. Replay epoch 4 retains the epoch-3 economics gates
+and additionally requires latest-of-event/as-of/observed-at point-in-time
+availability, executable-row-only authorizing statistics, vehicle-specific cost
+selection/provenance, raw confirmatory p-values for FDR, and a stressed-cost
+runtime abstention boundary; older-epoch evidence is quarantined until
+replayed. Exact equality with current epoch 4 is required; future epochs are
+audit-only too. Each current-epoch run seals one immutable verified gate proof,
+and re-derivation appends a new proof instead of rewriting history. These defaults make
 rejection and deployment decisions span market sessions rather than a handful
 of fills.
+
+The rule exit grammar remains fixed to the 30-bps-floor ATR bracket, configured
+R target, and bar-cap time exit. Fit-only diagnostics report first-signal and
+floor-binding rates, planned exits, configured/stressed economics, power,
+behavioral aliases, and intended versus delivered risk for operator review; they
+do not expand exits or authorize proof.
 
 ## 14. Read the reports
 
@@ -886,7 +910,7 @@ place.
 | `docker compose config` errors | Missing export | Re-run step 8. |
 | Watchdog says `acted` | It flattened a stale trader's positions | Reconcile per OPERATIONS.md before restarting. |
 | Recorder health lists `bar_gap_symbols` | Sparse feed coverage or a real hole inside a session | Compare the exact index gap with the provider; let research adjacency gates decide usability. Do not delete the corpus. |
-| Dashboard shows "proved but untradeable" > 0 | Research evaluates both vehicles while runtime execution is `shares` | Expected for option evidence; select the paper `options` profile only after reviewing controls. |
+| Dashboard shows "proved but untradeable" > 0 | Explicit `ALPACA_RESEARCH_VEHICLES=all` produced option evidence while runtime execution is `shares` | Expected for the opt-in option lane; select the paper `options` profile only after reviewing controls. |
 | LLM proposals never appear in the report | The required research provider secret is absent/unreadable, or proposals were rejected | Check the separately mounted `research-llm.env` from step 6 and the report's rejection reasons; the cycle fails closed before discovery when the secret is invalid. |
 
 ---

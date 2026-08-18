@@ -2,10 +2,13 @@
 
 The recorder/shadow process is intentionally not a lifecycle authority.  This
 module is the research-side write boundary: it opens the shadow WAL read-only,
-requires a complete same-session replay (including the paired control and null
-sources), rebuilds the existing verified-gate envelope, and only then appends
-an immutable ``lane='shadow'`` run to EdgeLedger.  A missing, mismatched, or
-already-consumed session is a no-op.
+requires a complete replay tail (including the paired control and null
+sources), splits it into disjoint chronological selection and confirmatory
+windows, rebuilds the existing verified-gate envelope, and only then appends
+an immutable ``lane='shadow'`` run to EdgeLedger. Batch family/global BH
+q-values select the candidate; the v4 LORD scope uses the raw-p v3 method and
+receives only the newer confirmatory gate's raw p-value. A missing, mismatched,
+or already-consumed session is a no-op.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from typing import Any, Mapping, Sequence
 from .edge_discovery_core import _discover_gate, _finalize_gate
 from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
-from .gates import verify_gate_envelope, validate_protocol_floor
+from .gates import sample_counts, verify_gate_envelope, validate_protocol_floor
 from .live_shadow import ShadowError, ShadowStore
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from .factory_ledger import FDR_METHOD, FactoryLedger
@@ -33,7 +36,16 @@ DEFAULT_MIN_SESSIONS = 30
 DEFAULT_ALPHA = 0.05
 DEFAULT_CONFIRMATORY_ITERATIONS = 20_000
 MAX_CONFIRMATORY_ITERATIONS = 2_000_000
-CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v2"
+# Selection rows are retained so the adaptive p and BH inputs can be
+# re-verified from durable evidence. Keep this audit payload bounded; a larger
+# tail is a diagnostic/no-op and must be replayed in smaller chronological
+# cycles rather than silently truncating the selection source.
+MAX_SELECTION_SOURCE_ROWS = 100_000
+# v4 starts a fresh durable LORD sequence.  The prior v2 sequence spent
+# family/global BH q-values; those rows remain readable for audit but must not
+# be reused for raw-p confirmatory spending.
+CONFIRMATORY_SCOPE_VERSION = "shadow-confirmation-v4"
+CONFIRMATORY_P_VALUE_SOURCE = "live_shadow_confirmatory_gate"
 
 
 def _confirmatory_scope(vehicle: str) -> str:
@@ -58,6 +70,36 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _confirmatory_test_id(candidate_id: str, source: Mapping[str, Any]) -> str:
+    """Build the crash-safe v4 FDR idempotency key.
+
+    Resolution, alpha, p-values, and BH metadata may legitimately differ when
+    a process retries the same uncommitted tail.  Only the candidate lineage
+    and the immutable chronological/session evidence identify the hypothesis
+    being spent, so keep those fields explicit and exclude all computation
+    results from this key.
+    """
+    selection = source.get("selection")
+    confirmatory = source.get("confirmatory")
+    if not isinstance(selection, Mapping) or not isinstance(confirmatory, Mapping):
+        raise ValueError("confirmatory source windows are required for FDR identity")
+    immutable = {
+        "candidate_id": str(candidate_id),
+        "selection_session_digest": source.get("selection_session_digest"),
+        "confirmatory_session_digest": source.get("confirmatory_session_digest"),
+        "selection_rows_digest": selection.get("rows_digest"),
+        "selection_baseline_rows_digest": selection.get("baseline_rows_digest"),
+        "selection_null_rows_digest": selection.get("null_rows_digest"),
+        "confirmatory_rows_digest": confirmatory.get("rows_digest"),
+        "confirmatory_baseline_rows_digest": confirmatory.get("baseline_rows_digest"),
+        "confirmatory_null_rows_digest": confirmatory.get("null_rows_digest"),
+    }
+    if any(not isinstance(value, str) or not value
+           for key, value in immutable.items() if key != "candidate_id"):
+        raise ValueError("confirmatory source digests are required for FDR identity")
+    return f"{candidate_id}:{_digest(immutable)}"
+
+
 def _config(candidate: Mapping[str, Any]) -> dict[str, Any]:
     value = candidate.get("config")
     if value is None and isinstance(candidate.get("config_json"), str):
@@ -70,6 +112,38 @@ def _config(candidate: Mapping[str, Any]) -> dict[str, Any]:
 
 def _session(value: Any) -> str:
     return str(value or "")
+
+
+def _split_sessions(sessions: Sequence[str], min_sessions: int) -> tuple[list[str], list[str]]:
+    """Split a complete chronological tail into disjoint windows.
+
+    The split is deliberately deterministic and happens before any gate or
+    p-value is computed.  The extra session in an odd-sized tail belongs to
+    the confirmatory half, so the final boundary remains the newest consumed
+    session.
+    """
+    ordered = sorted({_session(item) for item in sessions if _session(item)})
+    required = max(1, int(min_sessions))
+    if len(ordered) < 2 * required:
+        return [], []
+    cut = len(ordered) // 2
+    selection, confirmatory = ordered[:cut], ordered[cut:]
+    if len(selection) < required or len(confirmatory) < required:
+        return [], []
+    return selection, confirmatory
+
+
+def _window_counts(rows: Sequence[Mapping[str, Any]], vehicle: str) -> dict[str, int]:
+    counts = sample_counts(rows, vehicle=vehicle)
+    return {key: int(counts.get(key, 0)) for key in
+            ("trades", "sessions", "clusters")}
+
+
+def _window_ready(rows: Sequence[Mapping[str, Any]], *, vehicle: str,
+                  min_trades: int, min_sessions: int) -> tuple[bool, dict[str, int]]:
+    counts = _window_counts(rows, vehicle)
+    return bool(counts["trades"] >= int(min_trades) and
+                counts["sessions"] >= int(min_sessions)), counts
 
 
 def _latest_boundary(ledger: EdgeLedger, candidate_id: str) -> str | None:
@@ -300,6 +374,21 @@ class ShadowIngestor:
         if not available:
             return {"candidate_id": candidate_id, "status": "no_new_session",
                     "ingested": False, "boundary": boundary}
+        selection_sessions, confirmatory_sessions = _split_sessions(
+            available, self.config.min_sessions)
+        if not selection_sessions or not confirmatory_sessions:
+            return {
+                "candidate_id": candidate_id,
+                "status": "underpowered_confirmatory_split",
+                "reason": ("complete live-shadow tail must contain at least "
+                           "two independently adequate session windows"),
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "selection_sessions": selection_sessions,
+                "confirmatory_sessions": confirmatory_sessions,
+                "online_allocation_spent": False,
+            }
         # One incomplete/mismatched session blocks the complete tail.  This is
         # deliberately stricter than selecting only the currently matching
         # subset, which would advance a boundary past data still being replayed.
@@ -324,17 +413,103 @@ class ShadowIngestor:
             return {"candidate_id": candidate_id, "status": "null_incomplete",
                     "reason": reason, "ingested": False, "boundary": boundary}
 
+        def partition(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict], list[dict]]:
+            selected = set(selection_sessions)
+            confirmed = set(confirmatory_sessions)
+            return ([dict(row) for row in rows
+                     if _session(row.get("session_date")) in selected],
+                    [dict(row) for row in rows
+                     if _session(row.get("session_date")) in confirmed])
+
+        selection_rows, confirmatory_rows = partition(rows)
+        selection_baseline_rows, confirmatory_baseline_rows = partition(baseline_rows)
+        selection_null_rows, confirmatory_null_rows = partition(null_rows)
+        if (len(selection_rows) + len(selection_baseline_rows) +
+                len(selection_null_rows) > MAX_SELECTION_SOURCE_ROWS):
+            return {
+                "candidate_id": candidate_id,
+                "status": "selection_evidence_too_large",
+                "reason": ("durable selection evidence exceeds the bounded "
+                           f"{MAX_SELECTION_SOURCE_ROWS}-row limit"),
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "selection_sessions": selection_sessions,
+                "confirmatory_sessions": confirmatory_sessions,
+                "online_allocation_spent": False,
+            }
+        window_checks: dict[str, dict[str, Any]] = {}
+        for name, arms in (
+                ("selection", (selection_rows, selection_baseline_rows,
+                               selection_null_rows)),
+                ("confirmatory", (confirmatory_rows, confirmatory_baseline_rows,
+                                   confirmatory_null_rows))):
+            arm_checks: dict[str, Any] = {}
+            for arm_name, arm_rows in zip(("candidate", "baseline", "null"), arms):
+                ready, counts = _window_ready(
+                    arm_rows, vehicle=vehicle,
+                    min_trades=self.config.min_trades,
+                    min_sessions=self.config.min_sessions)
+                arm_checks[arm_name] = {"ready": ready, "counts": counts}
+            arm_checks["ready"] = all(
+                bool(value.get("ready")) for key, value in arm_checks.items()
+                if key != "ready")
+            window_checks[name] = arm_checks
+        if not all(bool(item.get("ready")) for item in window_checks.values()):
+            return {
+                "candidate_id": candidate_id,
+                "status": "underpowered_confirmatory_window",
+                "reason": "selection and confirmatory windows must each meet structural minimums",
+                "ingested": False,
+                "boundary": boundary,
+                "sessions": available,
+                "selection_sessions": selection_sessions,
+                "confirmatory_sessions": confirmatory_sessions,
+                "window_checks": window_checks,
+                "online_allocation_spent": False,
+            }
+
         candidate_meta, _ = _meta_by_session(self.store, candidate_id, available, vehicle)
+        selection_session_digest = _digest(selection_sessions)
+        confirmatory_session_digest = _digest(confirmatory_sessions)
         source = {
             "schema": INGEST_SCHEMA,
             "candidate_id": candidate_id,
             "vehicle": vehicle,
+            "independent_confirmatory": True,
+            "disjoint_sessions": True,
+            "session_disjoint": True,
+            "selection_sessions": selection_sessions,
+            "confirmatory_sessions": confirmatory_sessions,
+            "selection_session_digest": selection_session_digest,
+            "confirmatory_session_digest": confirmatory_session_digest,
             "sessions": [
                 {key: candidate_meta[day].get(key) for key in (
                     "session_date", "source_digest", "shadow_digest",
                     "replay_digest", "account_id", "trade_count")}
                 for day in available
             ],
+            "selection": {
+                "sessions": selection_sessions,
+                "session_digest": selection_session_digest,
+                "rows_digest": _digest(selection_rows),
+                "baseline_rows_digest": _digest(selection_baseline_rows),
+                "null_rows_digest": _digest(selection_null_rows),
+                "p_value_source": "selection_window_gate",
+                "candidate_source": selection_rows,
+                "baseline_source": selection_baseline_rows,
+                "null_source": selection_null_rows,
+                "minimums": {"trades": int(self.config.min_trades),
+                              "sessions": int(self.config.min_sessions)},
+            },
+            "confirmatory": {
+                "sessions": confirmatory_sessions,
+                "session_digest": confirmatory_session_digest,
+                "rows_digest": _digest(confirmatory_rows),
+                "baseline_rows_digest": _digest(confirmatory_baseline_rows),
+                "null_rows_digest": _digest(confirmatory_null_rows),
+                "p_value_source": CONFIRMATORY_P_VALUE_SOURCE,
+            },
             "baseline": {"candidate_id": baseline_id,
                          "rows_digest": _digest(baseline_rows),
                          "role": "paired_root_control"},
@@ -348,53 +523,115 @@ class ShadowIngestor:
             return {"candidate_id": candidate_id, "status": "qualification_unavailable",
                     "ingested": False, "boundary": boundary}
         try:
-            gate = _discover_gate(
-                rows, baseline_rows, vehicle=vehicle,
+            # Selection is computed only on the older half.  Its raw p-value
+            # is the sole input to family/global BH; no confirmatory statistic
+            # is available at this stage.
+            selection_gate = _discover_gate(
+                selection_rows, selection_baseline_rows, vehicle=vehicle,
                 min_trades=self.config.min_trades,
                 min_sessions=self.config.min_sessions,
                 alpha=float(self.config.alpha), shadow=True,
-                null_rows=null_rows, qualification=qualification,
+                null_rows=selection_null_rows, qualification=qualification,
                 test_iterations=test_iterations)
-            gate = _strengthen_gate(gate, baseline_rows, vehicle=vehicle)
-            # A live ingestion is a new statistical test.  Its p-value comes
-            # from this exact replay, never from the prior offline gate.
-            p_value = float(gate.get("candidate_p_raw", 1.0))
-            preflight_ready, preflight_checks = _preflight_ready(gate)
+            selection_gate = _strengthen_gate(
+                selection_gate, selection_baseline_rows, vehicle=vehicle)
+            selection_p_value = float(selection_gate.get("candidate_p_raw", 1.0))
+            source["selection"]["raw_p_value"] = selection_p_value
+            preflight_ready, preflight_checks = _preflight_ready(selection_gate)
             if dry:
                 return {"candidate_id": candidate_id, "status": "prepared",
-                        "ingested": False, "raw_p": p_value,
+                        "ingested": False, "raw_p": selection_p_value,
                         "preflight_ready": preflight_ready,
                         "preflight_checks": preflight_checks,
                         "family": self._family(candidate), "boundary": boundary,
                         "sessions": available,
+                        "selection_sessions": selection_sessions,
+                        "confirmatory_sessions": confirmatory_sessions,
+                        "independent_confirmatory": True,
                         "test_iterations": int(test_iterations)}
             correction = dict(correction or {})
             family_data = correction.get("family") if isinstance(correction, Mapping) else None
             global_data = correction.get("global") if isinstance(correction, Mapping) else None
             family_data = family_data if isinstance(family_data, Mapping) else {
-                "p_adjusted": p_value, "significant": p_value <= float(self.config.alpha),
+                "p_adjusted": selection_p_value,
+                "significant": selection_p_value <= float(self.config.alpha),
                 "family_size": 1}
             global_data = global_data if isinstance(global_data, Mapping) else family_data
             selected = bool(correction.get("selected"))
             q_value = float(global_data.get("p_adjusted", 1.0))
             family_q = float(family_data.get("p_adjusted", 1.0))
-            if selected:
-                online = FactoryLedger(self.config.edge_db).record_fdr_decision(
-                    _confirmatory_scope(vehicle),
-                    f"{candidate_id}:{_digest(source)}", q_value,
-                    alpha=float(self.config.alpha))
-                online = {**online, "required": True, "tested": True,
-                          "test_iterations": int(test_iterations),
-                          "minimum_raw_p": 1.0 / (int(test_iterations) + 1)}
-            else:
-                online = {"scope": _confirmatory_scope(vehicle),
-                          "test_id": f"diagnostic:{candidate_id}:{_digest(source)}",
-                          "p_value": p_value, "alpha": float(self.config.alpha),
-                          "allocated_alpha": 0.0, "decision": False,
-                          "required": True, "tested": False,
-                          "tests": 0, "cumulative": True, "method": FDR_METHOD,
-                          "test_iterations": int(test_iterations)}
-            family = {"p": gate["candidate_p_raw"],
+            source["selection"]["alpha"] = float(self.config.alpha)
+            source["selection"]["test_iterations"] = int(test_iterations)
+            batch_bh = correction.get("bh")
+            if isinstance(batch_bh, Mapping):
+                source["selection"]["bh"] = dict(batch_bh)
+            # A non-selected candidate is diagnostic only.  In particular, do
+            # not compute a confirmatory gate or consume an online allocation.
+            if not selected:
+                return {"candidate_id": candidate_id,
+                        "status": "not_selected", "ingested": False,
+                        "boundary": boundary, "sessions": available,
+                        "selection_sessions": selection_sessions,
+                        "confirmatory_sessions": confirmatory_sessions,
+                        "selection_raw_p": selection_p_value,
+                        "family": dict(family_data),
+                        "global": dict(global_data),
+                        "preflight_ready": preflight_ready,
+                        "preflight_checks": preflight_checks,
+                        "independent_confirmatory": True,
+                        "online_allocation_spent": False}
+
+            # The selected candidate gets one and only one new gate on the
+            # disjoint newer half.  LORD receives this confirmatory raw p;
+            # selection p and BH q-values never enter the online ledger.
+            gate = _discover_gate(
+                confirmatory_rows, confirmatory_baseline_rows, vehicle=vehicle,
+                min_trades=self.config.min_trades,
+                min_sessions=self.config.min_sessions,
+                alpha=float(self.config.alpha), shadow=True,
+                null_rows=confirmatory_null_rows, qualification=qualification,
+                test_iterations=test_iterations)
+            gate = _strengthen_gate(gate, confirmatory_baseline_rows, vehicle=vehicle)
+            p_value = float(gate.get("candidate_p_raw", 1.0))
+            source["p_value_source"] = CONFIRMATORY_P_VALUE_SOURCE
+            source["confirmatory"]["raw_p_value"] = p_value
+            confirmatory_ready, confirmatory_checks = _preflight_ready(gate)
+            if not confirmatory_ready:
+                return {"candidate_id": candidate_id,
+                        "status": "underpowered_confirmatory_gate",
+                        "reason": "confirmatory gate failed structural preflight",
+                        "ingested": False, "boundary": boundary,
+                        "sessions": available,
+                        "selection_sessions": selection_sessions,
+                        "confirmatory_sessions": confirmatory_sessions,
+                        "selection_raw_p": selection_p_value,
+                        "confirmatory_raw_p": p_value,
+                        "preflight_ready": False,
+                        "preflight_checks": confirmatory_checks,
+                        "online_allocation_spent": False}
+            test_id = _confirmatory_test_id(candidate_id, source)
+            source["confirmatory"]["test_id"] = test_id
+            online = FactoryLedger(self.config.edge_db).record_fdr_decision(
+                _confirmatory_scope(vehicle),
+                test_id, p_value,
+                alpha=float(self.config.alpha))
+            online = {**online, "required": True, "tested": True,
+                      "raw_p_value": p_value,
+                      "p_value_source": CONFIRMATORY_P_VALUE_SOURCE,
+                      "family_q_value": family_q,
+                      "global_q_value": q_value,
+                      "selection_raw_p_value": selection_p_value,
+                      "confirmatory_raw_p_value": p_value,
+                      "selection_sessions": selection_sessions,
+                      "confirmatory_sessions": confirmatory_sessions,
+                      "selection_session_digest": selection_session_digest,
+                      "confirmatory_session_digest": confirmatory_session_digest,
+                      "independent_confirmatory": True,
+                      "disjoint_sessions": True,
+                      "session_disjoint": True,
+                      "test_iterations": int(test_iterations),
+                      "minimum_raw_p": 1.0 / (int(test_iterations) + 1)}
+            family = {"p": selection_p_value,
                       "p_adjusted": family_q,
                       "significant": bool(family_data.get("significant")),
                       "family_size": int(family_data.get("family_size", 1))}
@@ -403,6 +640,16 @@ class ShadowIngestor:
                 "vehicle": vehicle, "boundary": boundary,
                 "session_start": available[0], "session_end": available[-1],
                 "session_window": available, "source": source,
+                "selection_sessions": selection_sessions,
+                "confirmatory_sessions": confirmatory_sessions,
+                "selection_session_digest": selection_session_digest,
+                "confirmatory_session_digest": confirmatory_session_digest,
+                "independent_confirmatory": True,
+                "disjoint_sessions": True,
+                "session_disjoint": True,
+                "p_value_source": CONFIRMATORY_P_VALUE_SOURCE,
+                "selection_raw_p_value": selection_p_value,
+                "confirmatory_raw_p_value": p_value,
                 "replay_digests": [item["replay_digest"] for item in source["sessions"]],
                 "candidate_proof": {key: candidate.get(key) for key in (
                     "candidate_id", "dataset_hash", "config_hash",
@@ -421,6 +668,18 @@ class ShadowIngestor:
             hashes = provenance_hash(
                 dataset=source, config=_config(candidate), code=Path(__file__),
                 provenance=run_provenance)
+            hashes.update({
+                "independent_confirmatory": True,
+                "disjoint_sessions": True,
+                "session_disjoint": True,
+                "selection_sessions": selection_sessions,
+                "confirmatory_sessions": confirmatory_sessions,
+                "selection_session_digest": selection_session_digest,
+                "confirmatory_session_digest": confirmatory_session_digest,
+                "p_value_source": CONFIRMATORY_P_VALUE_SOURCE,
+                "selection_raw_p_value": selection_p_value,
+                "confirmatory_raw_p_value": p_value,
+            })
             _finalize_gate(
                 gate, lane="shadow", family=family, global_fdr=global_data,
                 online_fdr=online,
@@ -449,11 +708,19 @@ class ShadowIngestor:
         run = self.ledger.append_run(
             candidate_id, lane="shadow", vehicle=vehicle,
             dataset=source, config=_config(candidate), code=Path(__file__),
-            provenance=run_provenance, fit=[], heldout=rows,
+            # The authorizing run contains only the disjoint confirmatory
+            # window, matching the verified gate envelope.  Its heldout_end is
+            # still the newest session in the complete consumed tail.
+            provenance=run_provenance, fit=[], heldout=confirmatory_rows,
             metrics={"gate": gate, "shadow_source": source,
                      "replay_digests": list(replay_digests),
+                     "selection_sessions": selection_sessions,
+                     "confirmatory_sessions": confirmatory_sessions,
+                     "independent_confirmatory": True,
+                     "disjoint_sessions": True,
+                     "session_disjoint": True,
                      "prior_run_id": previous_run.get("run_id")}, run_id=run_id)
-        for index, row in enumerate(rows):
+        for index, row in enumerate(confirmatory_rows):
             self.ledger.append_trade(
                 run["run_id"], row,
                 trade_id=_digest({"run_id": run_id, "index": index,
@@ -464,6 +731,15 @@ class ShadowIngestor:
             "vehicle": vehicle, "source": source,
             "replay_digests": list(replay_digests),
             "session_window": available, "boundary_before": boundary,
+            "selection_sessions": selection_sessions,
+            "confirmatory_sessions": confirmatory_sessions,
+            "selection_session_digest": selection_session_digest,
+            "confirmatory_session_digest": confirmatory_session_digest,
+            "independent_confirmatory": True,
+            "disjoint_sessions": True,
+            "session_disjoint": True,
+            "p_value_source": CONFIRMATORY_P_VALUE_SOURCE,
+            "run_provenance": run_provenance,
             "prior_run_id": previous_run.get("run_id"),
             "prior_gate_hash": previous_gate.get("content_hash"),
             "candidate_proof": payload["run_provenance"]["candidate_proof"],
@@ -506,6 +782,8 @@ class ShadowIngestor:
                      "source": source})
         return {"candidate_id": candidate_id, "status": "ingested", "ingested": True,
                 "run_id": run_id, "sessions": available, "boundary": boundary,
+                "selection_sessions": selection_sessions,
+                "confirmatory_sessions": confirmatory_sessions,
                 "preflight_ready": preflight_ready,
                 "preflight_checks": preflight_checks,
                 "transitions": transitions, "gate_hash": envelope["content_hash"],
@@ -578,6 +856,12 @@ class ShadowIngestor:
                 "family": family_results.get(cid, {}),
                 "global": global_results.get(cid, {}),
                 "selected": cid == selected_id,
+                "bh": {
+                    "family_values": by_family,
+                    "family_results": family_results,
+                    "global_values": global_values,
+                    "global_results": global_results,
+                },
             }, test_iterations=test_iterations))
         return {"schema": INGEST_SCHEMA, "candidates": rows,
                 "ingested": sum(1 for row in rows if row.get("ingested")),
@@ -594,5 +878,5 @@ def ingest_shadow(config: ShadowIngestConfig) -> dict[str, Any]:
     return ShadowIngestor(config).ingest()
 
 
-__all__ = ["INGEST_SCHEMA", "ShadowIngestConfig", "ShadowIngestor",
-           "ingest_shadow"]
+__all__ = ["INGEST_SCHEMA", "MAX_SELECTION_SOURCE_ROWS",
+           "ShadowIngestConfig", "ShadowIngestor", "ingest_shadow"]

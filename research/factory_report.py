@@ -136,6 +136,11 @@ def _variant_row(record: Mapping[str, Any]) -> dict:
         "primary_failure": diagnosis.get("primary_failure"),
         "win_rate": _number(diagnosis.get("win_rate")),
         "profit_factor": _number(diagnosis.get("profit_factor")),
+        # Fit-only observability.  The persisted diagnostic is compact and
+        # deliberately contains no account trade rows or held-out data.
+        "fit_diagnostics": (diagnosis.get("fit_diagnostics")
+                             if isinstance(diagnosis.get("fit_diagnostics"), Mapping)
+                             else None),
         "gate_hash": gate.get("gate_hash"),
         # Why this variant was tried, and who decided to try it.  Fixed before
         # the gate beside it was computed, so the pair reads as a prediction
@@ -293,6 +298,29 @@ def _tuning_events(events: Sequence[Mapping[str, Any]]) -> list[dict]:
     return output
 
 
+def _fit_events(events: Sequence[Mapping[str, Any]]) -> dict:
+    """Return the latest fit alias audit without exposing raw observations."""
+    for event in reversed(events):
+        payload = event.get("payload") or {}
+        if not isinstance(payload, Mapping):
+            continue
+        if not (payload.get("fit_diagnostics") or
+                payload.get("excluded_behavior_aliases") or
+                payload.get("behavior_aliases")):
+            continue
+        diagnostics = payload.get("fit_diagnostics")
+        return {
+            "diagnostics": dict(diagnostics) if isinstance(diagnostics, Mapping) else {},
+            "behavior_aliases": dict(payload.get("behavior_aliases") or {}),
+            "excluded_behavior_aliases": list(
+                payload.get("excluded_behavior_aliases") or ()),
+            "proposed_behavior_aliases": list(
+                payload.get("proposed_behavior_aliases") or ()),
+        }
+    return {"diagnostics": {}, "behavior_aliases": {},
+            "excluded_behavior_aliases": [], "proposed_behavior_aliases": []}
+
+
 def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                  vehicle: str | None = None, slot: int | None = None) -> dict:
     """Assemble the full discovery narrative from the two ledgers."""
@@ -411,6 +439,7 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
             own = events.get(hypothesis_id, [])
             parent = events.get(str(item["parent_hypothesis_id"] or ""), [])
             variants = accounts.get(hypothesis_id, [])
+            fit_audit = _fit_events(own)
             for row in variants:
                 row["ledger_status"] = deployed.get(
                     (str(row["variant_id"]), name))
@@ -431,6 +460,12 @@ def build_report(db_path: str | Path = DEFAULT_DB_PATH, *,
                 "origin": _origin(own, parent, hypothesis_id,
                                   int(item["generation"])),
                 "variants": variants,
+                "fit_diagnostics": fit_audit["diagnostics"],
+                "behavior_aliases": fit_audit["behavior_aliases"],
+                "excluded_behavior_aliases": fit_audit[
+                    "excluded_behavior_aliases"],
+                "proposed_behavior_aliases": fit_audit[
+                    "proposed_behavior_aliases"],
                 "tuning": _tuning_events(own),
                 "variants_tested": len(variants),
                 "outcome": _outcome(own, str(item["status"] or "")),
@@ -622,6 +657,17 @@ def render_text(report: Mapping[str, Any]) -> str:
                     add(f"      LLM proposal rejected: {origin['llm_error']}")
                 if item["variants"]:
                     add(f"      variants tested: {item['variants_tested']}")
+                fit_diagnostics = item.get("fit_diagnostics") or {}
+                if fit_diagnostics:
+                    first = fit_diagnostics.get("first_signal") or {}
+                    aliases = item.get("behavior_aliases") or {}
+                    excluded = item.get("excluded_behavior_aliases") or []
+                    proposed = item.get("proposed_behavior_aliases") or []
+                    add(f"      fit first-signal rate {_fmt(first.get('rate'))}"
+                        f" | eligible-prefix rate {_fmt((fit_diagnostics.get('eligible_prefix') or {}).get('rate'))}")
+                    add(f"      fit behavior aliases {len(aliases.get('full_aliases') or ())}"
+                        f" | proposed canonicalization {len(proposed)}"
+                        f" | excluded before replay {len(excluded)}")
                 for variant in item["variants"]:
                     verdict = ("PASS" if variant["passes"] else
                                "underpowered" if variant["underpowered"] else "fail")
@@ -719,6 +765,18 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                             f" {variant['trades']} | {_fmt(variant['heldout_delta'])} |"
                             f" {_fmt(variant['heldout_delta_lcb'])} |"
                             f" {_fmt(variant['q_value'])} | {verdict} |")
+                fit_diagnostics = item.get("fit_diagnostics") or {}
+                if fit_diagnostics:
+                    first = fit_diagnostics.get("first_signal") or {}
+                    aliases = item.get("behavior_aliases") or {}
+                    excluded = item.get("excluded_behavior_aliases") or []
+                    proposed = item.get("proposed_behavior_aliases") or []
+                    out.append(
+                        f"- Fit first-signal rate: {_fmt(first.get('rate'))}; "
+                        f"eligible-prefix rate: {_fmt((fit_diagnostics.get('eligible_prefix') or {}).get('rate'))}; "
+                        f"full aliases: {len(aliases.get('full_aliases') or ())}; "
+                        f"proposed canonicalization: {len(proposed)}; "
+                        f"excluded before replay: {len(excluded)}")
                 outcome = item["outcome"]
                 out += ["", f"**Outcome:** {outcome['kind'].replace('_', ' ')}"
                             f" — {outcome.get('reason') or ''}"]

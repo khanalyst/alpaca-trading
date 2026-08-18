@@ -14,6 +14,7 @@ import sqlite3
 import unittest
 
 from agent.contracts.rule import validate_rule_spec
+from agent.config import ConfigError, validate_config
 from agent.risk import RiskEngine
 from research import calibration
 from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
@@ -21,7 +22,7 @@ from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
                             RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
                             SQLiteQuoteIndex, index_quotes, quote_fill,
-                            risk_unit_report)
+                            cost_model_for_vehicle, risk_unit_report)
 from research.edge_discovery_core import (DiscoveryError,
                                           _effective_ibr_config,
                                           _read_discovery_rows)
@@ -53,8 +54,11 @@ def _bars(closes, opens=None):
         end = timestamp + timedelta(minutes=1)
         rows.append(normalize_underlying_bar({
             "kind": "bar", "provider": "test", "feed": "sip", "symbol": "SPY",
-            "timestamp": timestamp.isoformat(), "as_of": end.isoformat(),
-            "observed_at": end.isoformat(), "open": opened,
+            # Mechanics-only fixture: model a source whose opening print is
+            # visible at the boundary; recorder-completed OHLC is tested
+            # separately with delayed observations.
+            "timestamp": timestamp.isoformat(), "as_of": timestamp.isoformat(),
+            "observed_at": timestamp.isoformat(), "open": opened,
             "high": max(opened, close) + .05, "low": min(opened, close) - .05,
             "close": close, "volume": 1000,
         }))
@@ -136,6 +140,68 @@ class CostModelTests(unittest.TestCase):
         # constraint rather than a number somebody remembers to copy.
         with self.assertRaises(CostError):
             CostModel.from_config({"execution": {"max_slippage_bps": 1}})
+
+    def test_vehicle_schedule_inherits_flat_values_and_caps(self):
+        config = validate_config({"costs": {
+            "spread_bps": 4.0, "slippage_bps": 5.0,
+            "vehicles": {"option": {"spread_bps": 8.0}},
+        }})
+        option = CostModel.from_config(config, vehicle="option")
+        equity = CostModel.from_config(config, vehicle="equity")
+        self.assertEqual(option.spread_bps, 8.0)
+        self.assertEqual(option.slippage_bps, 5.0)
+        self.assertEqual(option.provenance, "config")
+        self.assertEqual(option.max_slippage_bps,
+                         config["execution"]["max_slippage_bps"])
+        self.assertEqual(cost_model_for_vehicle(config["costs"], "option"), option)
+        self.assertEqual(equity.spread_bps, 4.0)
+
+    def test_vehicle_schedule_rejects_unknown_or_malformed_entries(self):
+        for costs in (
+                {"vehicles": {"crypto": {"spread_bps": 1}}},
+                {"vehicles": {"option": []}},
+                {"vehicles": []},
+                {"vehicles": {"option": {"bogus": 1}}}):
+            with self.subTest(costs=costs), self.assertRaises(ConfigError):
+                validate_config({"costs": costs})
+
+
+class OptionProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def _row(**changes):
+        row = {
+            "vehicle": "option", "opportunity_id": "option:1",
+            "no_trade": False, "entry_price": 2.0, "exit_price": 2.2,
+            "quantity": 1.0, "contract_multiplier": 100.0,
+            "risk_usd": 200.0, "entry_fill_source": QUOTE,
+            "exit_fill_source": QUOTE, "entry_feed": "opra",
+            "exit_feed": "opra", "entry_provider": "alpaca",
+            "exit_provider": "alpaca", "entry_quote_age_seconds": 0.0,
+            "exit_quote_age_seconds": 0.0,
+        }
+        row.update(changes)
+        return row
+
+    def test_option_requires_fresh_opra_quote_fills_on_both_legs(self):
+        free = CostModel(spread_bps=0, slippage_bps=0, fee_bps=0)
+        self.assertTrue(risk_unit_report(
+            [self._row()], vehicle="option", costs=free)["adequate"])
+        for changes in (
+                {"entry_fill_source": BAR},
+                {"exit_fill_source": BAR},
+                {"entry_feed": "indicative"},
+                {"exit_feed": "indicative"},
+                {"entry_provider": None},
+                {"exit_provider": ""},
+                {"entry_quote_age_seconds": 31.0},
+                {"exit_quote_age_seconds": float("nan")},
+                {"entry_quote_age_seconds": None}):
+            with self.subTest(changes=changes):
+                report = risk_unit_report(
+                    [self._row(**changes)], vehicle="option", costs=free)
+                self.assertFalse(report["adequate"])
+                self.assertTrue(report["failure_reasons"])
+                self.assertIn("option", report["adequacy_reason"])
 
 
 class EquityProvenanceTests(unittest.TestCase):
@@ -378,6 +444,20 @@ class QuoteDrivenFillTests(unittest.TestCase):
         self.assertIsNone(quote_fill(indexed, symbol="SPY",
                                      at=BASE + timedelta(minutes=4), side="buy"))
 
+    def test_a_quote_observed_after_its_event_is_not_used_until_observed(self):
+        delayed = normalize_quote({
+            "kind": "quote", "provider": "test", "feed": "sip", "symbol": "SPY",
+            "timestamp": BASE.isoformat(), "as_of": BASE.isoformat(),
+            "observed_at": (BASE + timedelta(minutes=1)).isoformat(),
+            "bid": 100.0, "ask": 100.1,
+        })
+        indexed = index_quotes([delayed])
+        self.assertIsNone(quote_fill(indexed, symbol="SPY", at=BASE,
+                                     side="buy", max_age_seconds=180))
+        self.assertEqual(quote_fill(indexed, symbol="SPY",
+                                    at=BASE + timedelta(minutes=1),
+                                    side="buy", max_age_seconds=180), 100.1)
+
     def test_absence_is_explicit_rather_than_an_invented_price(self):
         self.assertIsNone(quote_fill(None, symbol="SPY", at=BASE, side="buy"))
         self.assertIsNone(quote_fill(index_quotes([_quote(4, 100.0, 100.1)]),
@@ -405,6 +485,24 @@ class SQLiteQuoteIndexTests(unittest.TestCase):
             self.assertAlmostEqual(
                 quote_fill(index, symbol="SPY", at=at, side="buy",
                            max_age_seconds=90), 100.1, places=9)
+        finally:
+            index.close()
+
+    def test_observed_at_is_stored_and_enforced_by_disk_index(self):
+        delayed = normalize_quote({
+            "kind": "quote", "provider": "test", "feed": "sip", "symbol": "SPY",
+            "timestamp": BASE.isoformat(), "as_of": BASE.isoformat(),
+            "observed_at": (BASE + timedelta(minutes=1)).isoformat(),
+            "bid": 100.0, "ask": 100.1,
+        })
+        index = SQLiteQuoteIndex()
+        try:
+            index.add(delayed)
+            self.assertIsNone(quote_fill(index, symbol="SPY", at=BASE,
+                                         side="buy", max_age_seconds=180))
+            self.assertEqual(quote_fill(
+                index, symbol="SPY", at=BASE + timedelta(minutes=1),
+                side="buy", max_age_seconds=180), 100.1)
         finally:
             index.close()
 
@@ -544,13 +642,14 @@ class CalibrationTests(unittest.TestCase):
         return db
 
     def test_a_conservative_model_is_reported_as_conservative(self):
-        # Two bps paid against a four bps expectation.
+        # Two bps paid against an eight bps expectation (4 bps spread / 6 bps
+        # adverse slippage, with half the spread charged per side).
         db = self._journal([(100.02, 100.0, 10)] * calibration.MIN_FILLS)
         report = calibration.json_report(db)
         self.assertEqual(report["referenced_fills"], calibration.MIN_FILLS)
         self.assertAlmostEqual(report["observed_mean_bps"], 2.0, places=6)
-        self.assertAlmostEqual(report["expected_entry_cost_bps"], 4.0, places=6)
-        self.assertAlmostEqual(report["bias_bps"], 2.0, places=6)
+        self.assertAlmostEqual(report["expected_entry_cost_bps"], 8.0, places=6)
+        self.assertAlmostEqual(report["bias_bps"], 6.0, places=6)
         self.assertEqual(report["within_model_rate"], 1.0)
         self.assertEqual(report["over_runtime_cap"], 0)
         self.assertEqual(report["verdict"], "conservative")

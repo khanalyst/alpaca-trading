@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
 import ast
+import copy
 import json
 import os
 import inspect
@@ -94,6 +95,8 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                 rows.append({
                     "kind": "quote", "symbol": symbol,
                     "timestamp": timestamp.isoformat(),
+                    # Boundary quotes authorize entries even though the bar
+                    # record itself arrives at its completed-bar timestamp.
                     "as_of": timestamp.isoformat(),
                     "observed_at": timestamp.isoformat(),
                     # The target bar needs an executable SIP bid for the
@@ -104,6 +107,19 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                     "ask": (high if minute == 3 else open_) + shift + .01,
                     "provider": "alpaca", "feed": "sip",
                 })
+            # The 2R baseline can remain open after this compact four-minute
+            # fixture.  Supply its exact force-flat SIP quote so the baseline
+            # and randomized null stay in the authorizing-quality sample.
+            final_quote = session + timedelta(minutes=len(values))
+            rows.append({
+                "kind": "quote", "symbol": symbol,
+                "timestamp": final_quote.isoformat(),
+                "as_of": final_quote.isoformat(),
+                "observed_at": final_quote.isoformat(),
+                "bid": values[-1][3] + shift - .01,
+                "ask": values[-1][3] + shift + .01,
+                "provider": "alpaca", "feed": "sip",
+            })
             # The baseline (2R) remains open through this compact session and
             # is force-flat on the final completed bar.  Supply a distinct
             # quote at that exact bar-end boundary so strict replay records a
@@ -149,7 +165,11 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     # immutable 100-trade/30-cluster offline floor and the 150-trade shadow
     # floor while keeping this shared proof fixture compact.
     symbols = ("SPY", "QQQ", "IWM", "DIA", "AAPL")
-    session_count = 30
+    # Shadow fixtures model the production split: the final authorizing run
+    # carries 30 confirmatory sessions (150 trades), while 30 older sessions
+    # supply the adaptive selection p-value. Backtest fixtures retain the
+    # compact 30-session corpus.
+    session_count = 60 if lane == "shadow" else 30
     fit = [] if lane == "shadow" else [
         priced({"vehicle": "equity", "symbol": symbol,
                 "session_date": (datetime(2023, 12, 1, tzinfo=timezone.utc) +
@@ -168,12 +188,38 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     values = [score_values[index % len(score_values)] if passes else -1.0
               for index in range(session_count)]
     heldout_start = datetime(2024, 1, 3, tzinfo=timezone.utc)
-    heldout = [priced({
+    all_heldout = [priced({
         "vehicle": "equity", "symbol": symbol,
         "session_date": (heldout_start + timedelta(days=index)).date().isoformat(),
         "opportunity_id": f"{prefix}-held-{index}-{symbol}",
         "net_pnl": values[index],
     }) for index in range(session_count) for symbol in symbols]
+    heldout = list(all_heldout)
+    selection_sessions: list[str] = []
+    confirmatory_sessions: list[str] = []
+    selection_rows: list[dict] = []
+    if lane == "shadow":
+        all_sessions = sorted({row["session_date"] for row in all_heldout})
+        split = len(all_sessions) // 2
+        selection_sessions = all_sessions[:split]
+        confirmatory_sessions = all_sessions[split:]
+        selection_rows = [row for row in all_heldout
+                          if row["session_date"] in set(selection_sessions)]
+        heldout = [row for row in all_heldout
+                   if row["session_date"] in set(confirmatory_sessions)]
+    selection_baseline_rows = [
+        {**row, "net_pnl": 0.0,
+         "opportunity_id": f"baseline-selection-{index}"}
+        for index, row in enumerate(selection_rows)]
+    selection_null_rows = [
+        {**row, "net_pnl": 0.0,
+         "opportunity_id": f"null-selection-{index}"}
+        for index, row in enumerate(selection_rows)]
+    selection_p_value = None
+    if lane == "shadow":
+        selection_control = matched_cluster_test(
+            selection_rows, selection_baseline_rows, vehicle="equity")
+        selection_p_value = float(selection_control["p_value"])
     baseline = [{**row, "net_pnl": 0.0,
                  "opportunity_id": f"baseline-{index}"}
                 for index, row in enumerate(heldout)]
@@ -215,6 +261,19 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
     hashes = edge_ledger.provenance_hash(config=candidate_config)
+    if lane == "shadow":
+        hashes.update({
+            "independent_confirmatory": True,
+            "disjoint_sessions": True,
+            "session_disjoint": True,
+            "selection_sessions": selection_sessions,
+            "confirmatory_sessions": confirmatory_sessions,
+            "selection_session_digest": edge_ledger.content_hash(selection_sessions),
+            "confirmatory_session_digest": edge_ledger.content_hash(confirmatory_sessions),
+            "p_value_source": "live_shadow_confirmatory_gate",
+            "selection_raw_p_value": selection_p_value,
+            "confirmatory_raw_p_value": control["p_value"],
+        })
     checks = {"edge_positive": passes, "family_fdr_significant": passes,
               "global_fdr_significant": passes,
               "cumulative_fdr_significant": passes,
@@ -232,7 +291,10 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
         fit_floor=fit_floor, heldout_floor=held_floor,
         fit_control=fit_control,
         control={**control, "kind": "matched_actual_baseline"},
-        p_value=control["p_value"], q_value=.02 if passes else 1.0, alpha=.05,
+        p_value=control["p_value"],
+        q_value=(control["p_value"] if lane == "shadow" else
+                 (.02 if passes else 1.0)), alpha=.05,
+        family_q_value=(selection_p_value if lane == "shadow" else None),
         falsification=falsification,
         separation=separation, checks=checks, passes=passes,
         walk_forward=walk,
@@ -242,10 +304,33 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                       "mean_delta": control["mean_delta"],
                       "mean_delta_lcb": control["mean_delta_lcb"],
                       "p_value": control["p_value"]},
-        online_fdr={"scope": "test", "test_id": f"{candidate_id}:{lane}",
-                    "p_value": .02 if passes else 1.0,
+        online_fdr={"scope": "shadow-confirmation-v4:equity" if lane == "shadow" else "test",
+                    "test_id": f"{candidate_id}:{lane}",
+                    "p_value": (control["p_value"] if lane == "shadow" else
+                                (.02 if passes else 1.0)),
+                    "raw_p_value": (control["p_value"] if lane == "shadow" else
+                                    (.02 if passes else 1.0)),
+                    "confirmatory_raw_p_value": (control["p_value"] if lane == "shadow" else
+                                                  (.02 if passes else 1.0)),
+                    "selection_raw_p_value": (selection_p_value if lane == "shadow" else
+                                               (.02 if passes else 1.0)),
+                    "family_q_value": (selection_p_value if lane == "shadow" else
+                                       (.02 if passes else 1.0)),
+                    "global_q_value": (selection_p_value if lane == "shadow" else
+                                       (.02 if passes else 1.0)),
                     "allocated_alpha": .05,
-                    "decision": passes},
+                    "decision": passes,
+                    "required": True, "tested": True,
+                    "p_value_kind": "raw_confirmatory",
+                    "p_value_source": "live_shadow_confirmatory_gate",
+                    "independent_confirmatory": lane == "shadow",
+                    "disjoint_sessions": lane == "shadow",
+                    "session_disjoint": lane == "shadow",
+                    **({"selection_sessions": selection_sessions,
+                        "confirmatory_sessions": confirmatory_sessions,
+                        "selection_session_digest": edge_ledger.content_hash(selection_sessions),
+                        "confirmatory_session_digest": edge_ledger.content_hash(confirmatory_sessions)}
+                       if lane == "shadow" else {})},
         provenance=hashes, candidate_id=candidate_id,
         performance={"heldout_delta": control["mean_delta"],
                      "heldout_delta_lcb": control["mean_delta_lcb"],
@@ -254,17 +339,63 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                      "max_drawdown": max_drawdown_of(heldout)})
     live_source = None
     if lane == "shadow":
+        session_rows = {
+            day: next(row for row in all_heldout if row["session_date"] == day)
+            for day in [*selection_sessions, *confirmatory_sessions]
+        }
+        session_records = [{
+            "session_date": day,
+            "source_digest": f"source:{day}",
+            "shadow_digest": f"shadow:{day}",
+            "replay_digest": f"replay:{day}",
+            "account_id": f"account:{day}",
+            "trade_count": 5,
+        } for day in [*selection_sessions, *confirmatory_sessions]]
         live_source = {
             "schema": "shadow-ingest.v1", "candidate_id": candidate_id,
             "vehicle": "equity",
-            "sessions": [{
-                "session_date": row["session_date"],
-                "source_digest": f"source:{row['session_date']}",
-                "shadow_digest": f"shadow:{row['session_date']}",
-                "replay_digest": f"replay:{row['session_date']}",
-                "account_id": f"account:{row['session_date']}",
-                "trade_count": 1,
-            } for row in heldout],
+            "independent_confirmatory": True,
+            "disjoint_sessions": True,
+            "session_disjoint": True,
+            "selection_sessions": selection_sessions,
+            "confirmatory_sessions": confirmatory_sessions,
+            "selection_session_digest": edge_ledger.content_hash(selection_sessions),
+            "confirmatory_session_digest": edge_ledger.content_hash(confirmatory_sessions),
+            "p_value_source": "live_shadow_confirmatory_gate",
+            "sessions": session_records,
+            "selection": {
+                "sessions": selection_sessions,
+                "session_digest": edge_ledger.content_hash(selection_sessions),
+                "rows_digest": edge_ledger.content_hash(selection_rows),
+                "candidate_source": selection_rows,
+                "baseline_source": selection_baseline_rows,
+                "null_source": selection_null_rows,
+                "minimums": {"trades": 150, "sessions": 30},
+                "baseline_rows_digest": edge_ledger.content_hash(selection_baseline_rows),
+                "null_rows_digest": edge_ledger.content_hash(selection_null_rows),
+                "p_value_source": "selection_window_gate",
+                "raw_p_value": selection_p_value,
+                "alpha": .05, "test_iterations": 20_000,
+                "bh": {
+                    "family_values": {"fixture": {candidate_id: selection_p_value}},
+                    "family_results": {candidate_id: {
+                        "p": selection_p_value, "p_adjusted": selection_p_value,
+                        "significant": selection_p_value <= .05, "family_size": 1}},
+                    "global_values": {candidate_id: selection_p_value},
+                    "global_results": {candidate_id: {
+                        "p": selection_p_value, "p_adjusted": selection_p_value,
+                        "significant": selection_p_value <= .05, "family_size": 1}},
+                },
+            },
+            "confirmatory": {
+                "sessions": confirmatory_sessions,
+                "session_digest": edge_ledger.content_hash(confirmatory_sessions),
+                "rows_digest": edge_ledger.content_hash(heldout),
+                "baseline_rows_digest": edge_ledger.content_hash(baseline),
+                "null_rows_digest": edge_ledger.content_hash(baseline),
+                "p_value_source": "live_shadow_confirmatory_gate",
+                "raw_p_value": control["p_value"],
+            },
             "baseline": {"candidate_id": "fixture:baseline",
                          "rows_digest": edge_ledger.content_hash(baseline),
                          "role": "paired_root_control"},
@@ -275,7 +406,10 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     run = ledger.append_run(
         candidate_id, lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         config=candidate_config,
-        metrics={"gate": {"passes": not passes}, "confidence": 0.0,
+        metrics={"gate": {"passes": not passes,
+                           "verified_gate": envelope,
+                           "gate_hash": envelope["content_hash"]},
+                 "confidence": 0.0,
                  **({"shadow_source": live_source,
                     "replay_digests": [item["replay_digest"]
                                        for item in live_source["sessions"]]}
@@ -297,6 +431,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                  "vehicle": "equity", "source": live_source,
                  "replay_digests": [item["replay_digest"]
                                     for item in live_source["sessions"]],
+                 "run_provenance": hashes,
                  "gate_hash": envelope["content_hash"]},
                 run_id=run["run_id"])
     return run, envelope
@@ -796,11 +931,170 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             envelope["content_hash"] = content_hash({
                 key: item for key, item in envelope.items()
                 if key != "content_hash"})
+            # The current epoch seals a proof to the immutable run metrics.
+            # Rebuild the diagnostic run after changing its zero-match report
+            # so the fixture models a producer that sealed this envelope.
+            run = ledger.append_run(
+                candidate["candidate_id"], lane="backtest", vehicle="equity",
+                fit=envelope["fit_source"], heldout=envelope["heldout_source"],
+                metrics={"gate": {"verified_gate": envelope,
+                                   "gate_hash": envelope["content_hash"]}})
+            for row in [*envelope["fit_source"], *envelope["heldout_source"]]:
+                ledger.append_trade(run["run_id"], row)
             ledger.record_verified_gate(run["run_id"], envelope)
             proof = ledger.latest_verified_run(candidate["candidate_id"], lane="backtest")
             self.assertIsNotNone(proof)
             self.assertIsNone(proof["verified_gate"]["control"]["mean_delta"])
             self.assertIsNone(proof["verified_gate"]["performance"]["heldout_delta"])
+
+    def test_verified_gate_binds_exact_durable_trade_rows_not_just_counts(self):
+        """Same-count rows from another replay cannot borrow a gate proof."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", hypothesis="durable source binding", config={})
+            _, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+            source = [*envelope["fit_source"], *envelope["heldout_source"]]
+            altered = []
+            for index, row in enumerate(source):
+                copy = dict(row)
+                # Keep aggregate P&L and all floors unchanged while altering
+                # the durable payload in both partitions.
+                if index == 0:
+                    copy["net_pnl"] = float(copy["net_pnl"]) + 1.0
+                elif index == 1:
+                    copy["net_pnl"] = float(copy["net_pnl"]) - 1.0
+                elif index == len(envelope["fit_source"]):
+                    copy["net_pnl"] = float(copy["net_pnl"]) + 1.0
+                elif index == len(envelope["fit_source"]) + 1:
+                    copy["net_pnl"] = float(copy["net_pnl"]) - 1.0
+                elif index == len(envelope["fit_source"]) + 2:
+                    copy["opportunity_id"] = str(copy["opportunity_id"]) + "-forged"
+                altered.append(copy)
+            fit_count = len(envelope["fit_source"])
+            run = ledger.append_run(
+                candidate["candidate_id"], lane="backtest", vehicle="equity",
+                fit=altered[:fit_count], heldout=altered[fit_count:],
+                metrics={"gate": {"verified_gate": envelope,
+                                   "gate_hash": envelope["content_hash"]}})
+            for row in altered:
+                ledger.append_trade(run["run_id"], row)
+            with self.assertRaisesRegex(ValueError, "source rows"):
+                ledger.record_verified_gate(run["run_id"], envelope)
+            with closing(sqlite3.connect(ledger.path)) as db:
+                self.assertEqual(
+                    db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 0)
+
+    def test_verified_gate_binds_candidate_identity_and_shadow_source(self):
+        """UUID/variant aliases work, while missing or transplanted ids fail."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", hypothesis="candidate source binding", config={})
+
+            def rehash(value):
+                value["content_hash"] = content_hash({
+                    key: item for key, item in value.items()
+                    if key != "content_hash"})
+                return value
+
+            def append_gate_run(owner, gate, *, metrics=None):
+                fit = gate["fit_source"]
+                heldout = gate["heldout_source"]
+                run = ledger.append_run(
+                    owner["candidate_id"], lane=gate["lane"], vehicle="equity",
+                    fit=fit, heldout=heldout,
+                    metrics=metrics or {"gate": {
+                        "verified_gate": gate,
+                        "gate_hash": gate["content_hash"]}})
+                for row in [*fit, *heldout]:
+                    ledger.append_trade(run["run_id"], row)
+                return run
+
+            # The UUID is the current durable identity and remains valid.
+            run_uuid, envelope = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+            ledger.record_verified_gate(run_uuid["run_id"], envelope)
+
+            # Historical producers used the immutable variant id; it is the
+            # only compatibility alias accepted by the proof boundary.
+            _, variant_gate = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+            variant_gate = copy.deepcopy(variant_gate)
+            variant_gate["candidate_id"] = candidate["variant_id"]
+            variant_gate["qualification"]["post_selection"]["candidate_id"] = \
+                candidate["variant_id"]
+            variant_gate = rehash(variant_gate)
+            run_variant = append_gate_run(candidate, variant_gate)
+            ledger.record_verified_gate(run_variant["run_id"], variant_gate)
+
+            # A source-backed v2 envelope without either identity is invalid,
+            # even when its outer hash and all statistical evidence are valid.
+            _, missing_gate = _persist_gate(
+                ledger, candidate["candidate_id"], "backtest", record=False)
+            missing_gate = copy.deepcopy(missing_gate)
+            missing_gate["candidate_id"] = None
+            missing_gate = rehash(missing_gate)
+            run_missing = append_gate_run(candidate, missing_gate)
+            with self.assertRaisesRegex(ValueError, "candidate identity"):
+                ledger.record_verified_gate(run_missing["run_id"], missing_gate)
+
+            # A live-shadow run carries an independent source payload.  Its
+            # candidate identity is bound separately from the gate alias.
+            _, shadow_gate = _persist_gate(
+                ledger, candidate["candidate_id"], "shadow", record=False)
+            run_shadow = append_gate_run(
+                candidate, shadow_gate,
+                metrics={"gate": {"verified_gate": shadow_gate,
+                                   "gate_hash": shadow_gate["content_hash"]},
+                         "shadow_source": {"candidate_id": "forged-candidate"}})
+            with self.assertRaisesRegex(ValueError, "shadow source"):
+                ledger.record_verified_gate(run_shadow["run_id"], shadow_gate)
+
+            # The same-count evidence from a different candidate cannot be
+            # transplanted, even if its trade rows happen to be identical.
+            other = ledger.register_candidate(
+                "ibr.target.3r", hypothesis="other candidate", config={})
+            run_other = append_gate_run(
+                other, envelope,
+                metrics={"gate": {"verified_gate": envelope,
+                                   "gate_hash": envelope["content_hash"]}})
+            with self.assertRaisesRegex(ValueError, "candidate identity"):
+                ledger.record_verified_gate(run_other["run_id"], envelope)
+
+    def test_verified_gate_rejects_durable_trade_scalar_column_tampering(self):
+        """Indexed trade columns cannot diverge from their immutable payload."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
+            candidate = ledger.register_candidate(
+                "ibr.target.1_5r", hypothesis="scalar source binding", config={})
+            other = ledger.register_candidate(
+                "ibr.target.3r", hypothesis="other scalar source", config={})
+            mutations = {
+                "net_pnl": 99.0,
+                "session_date": "2099-01-01",
+                "opportunity_id": "forged-opportunity",
+                "candidate_id": other["candidate_id"],
+            }
+            for column, value in mutations.items():
+                with self.subTest(column=column):
+                    run, envelope = _persist_gate(
+                        ledger, candidate["candidate_id"], "backtest", record=False)
+                    with closing(sqlite3.connect(ledger.path)) as db, db:
+                        # The production schema is append-only.  Temporarily
+                        # disabling the guard models direct storage corruption
+                        # without weakening the real trigger.
+                        db.execute("DROP TRIGGER trades_no_update")
+                        db.execute(
+                            f"UPDATE trades SET {column}=? WHERE trade_id="
+                            "(SELECT trade_id FROM trades WHERE run_id=? LIMIT 1)",
+                            (value, run["run_id"]))
+                        db.execute(
+                            "CREATE TRIGGER trades_no_update BEFORE UPDATE ON trades "
+                            "BEGIN SELECT RAISE(ABORT, 'trades are immutable'); END")
+                    with self.assertRaisesRegex(ValueError, "scalar columns"):
+                        ledger.record_verified_gate(run["run_id"], envelope)
 
     def test_none_delta_is_rejected_for_contradictory_gate_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1321,13 +1615,23 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
     be the sole reason a variant fails.
     """
     winner = [(100, 101, 99, 100), (100, 102, 99, 102),
-              (102, 103, 101, 102), (102, 107, 101, 106)]
+              (102, 103, 101, 102),     # next-bar entry
+              # Gap through the 1.5R target at the executable bar boundary;
+              # the 2R baseline remains open and uses the final SIP quote.
+              (107, 107.5, 101, 107)]
+    # Keep the winner's decline above the 3-dollar stop so the 2R baseline
+    # reaches its force-flat boundary and can be priced by the final SIP
+    # quote.  The target variant has already exited at the opening gap.
     price = 106.0
     for _ in range(20):
-        winner.append((price, price + .05, price - .4, price - .35))
-        price -= .35
+        winner.append((price, price + .05, price - .3, price - .25))
+        price -= .25
     loser = [(100, 101, 99, 100), (100, 102, 99, 102),
-             (102, 103, 101, 102), (102, 102, 94, 95)]
+             (102, 103, 101, 102),
+             # Gap through the stop so both arms use the opening SIP quote;
+             # the candidate still loses, while qualification remains
+             # authorizable and therefore explicitly fails on performance.
+             (98, 102, 94, 95)]
     sealed_from = count - max(1, int(count * .2))
     rows: list[dict] = []
     for offset in range(count):
@@ -1354,6 +1658,16 @@ def _sessions_failing_the_sealed_tail(start: datetime, count: int,
                     "bid": open_ + shift - .01, "ask": open_ + shift + .01,
                     "provider": "alpaca", "feed": "sip",
                 })
+            final_quote = session + timedelta(minutes=len(values))
+            rows.append({
+                "kind": "quote", "symbol": symbol,
+                "timestamp": final_quote.isoformat(),
+                "as_of": final_quote.isoformat(),
+                "observed_at": final_quote.isoformat(),
+                "bid": values[-1][3] + shift - .01,
+                "ask": values[-1][3] + shift + .01,
+                "provider": "alpaca", "feed": "sip",
+            })
     return rows
 
 
@@ -1373,8 +1687,16 @@ def _drift_sessions(start: datetime, count: int,
             (100, 101, 99, 100),     # one-minute opening range
             (100, 102, 99, 102),     # confirmed breakout
             (102, 103, 101, 102),    # next-bar entry
-            (102, 107, 101, 106),    # 1.5R target, but not 2R
+            (107, 107.5, 101, 107),  # 1.5R gap, below 2R target
         ]
+        # Alternate a short post-gap give-back.  This makes the 1.5R arm
+        # beat its 2R force-flat baseline on enough held-out sessions while
+        # preserving mixed-sign cluster evidence against chance entries.
+        if offset % 2:
+            price = 107.0
+            for _ in range(20):
+                values.append((price, price + .05, price - .4, price - .35))
+                price -= .35
         for index, symbol in enumerate(symbols):
             shift = index * .01
             for minute, (open_, high, low, close) in enumerate(values):
@@ -1382,8 +1704,8 @@ def _drift_sessions(start: datetime, count: int,
                 rows.append({
                     "symbol": symbol,
                     "timestamp": timestamp.isoformat(),
-                    "as_of": (timestamp + timedelta(minutes=1)).isoformat(),
-                    "observed_at": (timestamp + timedelta(minutes=1)).isoformat(),
+                    "as_of": timestamp.isoformat(),
+                    "observed_at": timestamp.isoformat(),
                     "open": open_ + shift, "high": high + shift,
                     "low": low + shift, "close": close + shift,
                     "volume": 1, "provider": "alpaca", "feed": "sip",
@@ -1396,6 +1718,16 @@ def _drift_sessions(start: datetime, count: int,
                     "bid": open_ + shift - .01, "ask": open_ + shift + .01,
                     "provider": "alpaca", "feed": "sip",
                 })
+            final_quote = session + timedelta(minutes=len(values))
+            rows.append({
+                "kind": "quote", "symbol": symbol,
+                "timestamp": final_quote.isoformat(),
+                "as_of": final_quote.isoformat(),
+                "observed_at": final_quote.isoformat(),
+                "bid": values[-1][3] + shift - .01,
+                "ask": values[-1][3] + shift + .01,
+                "provider": "alpaca", "feed": "sip",
+            })
     return rows
 
 
@@ -1468,7 +1800,7 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
                 _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 20),
                 directory)
             fdr_state = FactoryLedger(database).fdr_state(
-                "shadow-confirmation-v2:equity")
+                "shadow-confirmation-v4:equity")
         gate = result["variants"][0]["gate"]
         for name in ("null_control_available", "null_control_delta_positive",
                      "qualification_net_positive", "qualification_delta_positive"):

@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import random
+from statistics import NormalDist
 
 
 PAIRED_SIGN_FLIP_NULL_ASSUMPTION = (
@@ -19,6 +20,7 @@ DEFAULT_NULL_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_DRAWS = 4_000
 DEFAULT_BREADTH_MIN_CLUSTERS = 2
 DEFAULT_BREADTH_MIN_SESSIONS = 3
+DEFAULT_CLUSTER_BLOCK_LENGTH = 5
 
 
 def stable_seed(value) -> int:
@@ -211,7 +213,8 @@ def moving_block_cluster_bootstrap_lower_bound(
         deltas, clusters, *, confidence: float = .95,
         draws: int = DEFAULT_BOOTSTRAP_DRAWS, block_length: int = 1,
         seed: int | None = None,
-        min_clusters: int = DEFAULT_BREADTH_MIN_CLUSTERS) -> dict:
+        min_clusters: int = DEFAULT_BREADTH_MIN_CLUSTERS,
+        include_replicates: bool = False) -> dict:
     """Return a seeded lower bound using a moving-block cluster bootstrap.
 
     ``clusters`` are expected in chronological order.  The first occurrence
@@ -225,7 +228,10 @@ def moving_block_cluster_bootstrap_lower_bound(
     unavailable.  This is deliberately conservative: one cluster cannot
     identify a sampling distribution, even when it contains many observations.
     All result metadata (including the resolved seed and requested draw count)
-    is returned so persisted evidence can be recomputed exactly.
+    is returned so persisted evidence can be recomputed exactly.  The optional
+    ``include_replicates`` flag exposes the sorted bootstrap means for
+    diagnostic power calculations; it is disabled by default to keep durable
+    gate payloads compact.
     """
     try:
         confidence_value = float(confidence)
@@ -303,17 +309,174 @@ def moving_block_cluster_bootstrap_lower_bound(
         pooled = sum(sum(grouped[key]) for key in selected)
         count = sum(len(grouped[key]) for key in selected)
         means.append(pooled / count if count else 0.0)
-
     means.sort()
     lower_index = int(math.floor((1.0 - confidence_value) * resamples))
     lower_index = min(max(lower_index, 0), resamples - 1)
     upper_index = int(math.ceil(confidence_value * resamples)) - 1
     upper_index = min(max(upper_index, 0), resamples - 1)
-    return {**common, "available": True,
-            "lower_bound": means[lower_index],
-            "upper_bound": means[upper_index],
-            "replicate_min": means[0], "replicate_max": means[-1],
+    result = {**common, "available": True,
+              "lower_bound": means[lower_index],
+              "upper_bound": means[upper_index],
+              "replicate_min": means[0], "replicate_max": means[-1],
+              }
+    if include_replicates:
+        # Kept opt-in because persisted confidence-bound envelopes only need
+        # summary quantiles; diagnostic power reports may inspect the exact
+        # deterministic replicate distribution.
+        result["replicate_means"] = list(means)
+    return result
+
+
+def clustered_mde_power_report(
+        deltas, clusters, *, target_effect: float = 0.05,
+        minimum_useful_edge: float | None = None,
+        alpha: float = 0.05, target_power: float = 0.80,
+        draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+        block_length: int = DEFAULT_CLUSTER_BLOCK_LENGTH,
+        seed: int | None = None,
+        min_clusters: int = DEFAULT_BREADTH_MIN_CLUSTERS,
+        effect_unit: str = "delta_per_observation",
+        cluster_unit: str = "session") -> dict:
+    """Return a deterministic, diagnostic clustered MDE/power estimate.
+
+    The estimate uses the same moving-block cluster bootstrap as the
+    confidence-bound gate.  Bootstrap means are centred to form a null
+    distribution, then shifted by ``target_effect`` to estimate one-sided
+    rejection power.  This report is explicitly diagnostic: it never changes
+    an acceptance check or an authorizing floor.  ``effect_unit`` describes
+    both the observed effect and MDE (for example ``r_multiple``), while
+    ``cluster_unit`` identifies the independent resampling unit (normally a
+    market session).
+    """
+    try:
+        effect = float(target_effect if minimum_useful_edge is None
+                       else minimum_useful_edge)
+        alpha_value = float(alpha)
+        power_target = float(target_power)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_effect, alpha, and target_power must be numeric") from exc
+    if not math.isfinite(effect):
+        raise ValueError("target_effect must be finite")
+    if not math.isfinite(alpha_value) or not 0.0 < alpha_value < 1.0:
+        raise ValueError("alpha must be between zero and one")
+    if not math.isfinite(power_target) or not 0.0 < power_target < 1.0:
+        raise ValueError("target_power must be between zero and one")
+    if not isinstance(effect_unit, str) or not effect_unit.strip():
+        raise ValueError("effect_unit must be a non-empty string")
+    if not isinstance(cluster_unit, str) or not cluster_unit.strip():
+        raise ValueError("cluster_unit must be a non-empty string")
+
+    # Keep the normalisation and deterministic seed exactly aligned with the
+    # moving-block confidence-bound implementation.  The helper below is
+    # intentionally local so the existing bound's public payload remains
+    # unchanged for legacy proofs.
+    grouped: dict[str, list[float]] = {}
+    order: list[str] = []
+    for delta, cluster in zip(deltas, clusters):
+        try:
+            value = float(delta)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        key = str(cluster)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(value)
+    observations = sum(len(grouped[key]) for key in order)
+    cluster_count = len(order)
+    try:
+        length = int(block_length)
+        minimum = max(1, int(min_clusters))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("block_length and min_clusters must be integers") from exc
+    if length <= 0:
+        raise ValueError("block_length must be a positive integer")
+    resamples = max(1, int(draws))
+    payload = {
+        "moving_block_bootstrap": [
+            {"cluster": key, "values": grouped[key]} for key in order],
+        "draws": resamples, "block_length": length,
+        "min_clusters": minimum,
+    }
+    resolved_seed = int(stable_seed(payload) if seed is None else seed)
+    observed_mean = (sum(sum(grouped[key]) for key in order) / observations
+                     if observations else None)
+    common = {
+        "schema": "clustered-mde-power.v1",
+        "method": "moving_block_cluster_bootstrap_mde_power",
+        "method_version": "moving_block_cluster_bootstrap_mde_power.v1",
+        "bootstrap_method": "moving_block",
+        "diagnostic_only": True,
+        "authorizing": False,
+        "available": False,
+        "reason": None,
+        "effect_unit": effect_unit.strip(),
+        "cluster_unit": cluster_unit.strip(),
+        "units": {"effect": effect_unit.strip(), "mde": effect_unit.strip(),
+                  "cluster": cluster_unit.strip()},
+        "observed_mean": observed_mean,
+        "target_effect": effect,
+        "target_power": power_target,
+        "alpha": alpha_value,
+        "clusters": cluster_count,
+        "observations": observations,
+        "draws": resamples,
+        "requested_draws": int(draws),
+        "block_length": length,
+        "seed": resolved_seed,
+        "minimum_clusters": minimum,
+        "mde": None,
+        "standard_error": None,
+        "estimated_power": None,
+        "power": None,
+    }
+    if observations == 0:
+        return {**common, "reason": "no_finite_observations", "draws": 0}
+    if cluster_count < minimum:
+        return {**common, "reason": "insufficient_clusters"}
+
+    bootstrap = moving_block_cluster_bootstrap_lower_bound(
+        [value for key in order for value in grouped[key]],
+        [key for key in order for _ in grouped[key]],
+        confidence=.95, draws=resamples, block_length=length,
+        seed=resolved_seed, min_clusters=minimum, include_replicates=True)
+    means = list(bootstrap.get("replicate_means") or ())
+    if not means:
+        return {**common, "reason": "bootstrap_unavailable"}
+    center = sum(means) / len(means)
+    variance = sum((value - center) ** 2 for value in means) / len(means)
+    standard_error = math.sqrt(max(0.0, variance))
+    normal = NormalDist()
+    critical = normal.inv_cdf(1.0 - alpha_value)
+    power_quantile = normal.inv_cdf(power_target)
+    mde = (critical + power_quantile) * standard_error
+    # Shift the centred bootstrap null by the target effect.  Counting draws
+    # against a one-sided normal critical boundary keeps the result entirely
+    # deterministic while retaining the cluster dependence in each draw.
+    null_draws = [value - center for value in means]
+    threshold = critical * standard_error
+    estimated_power = (sum(1 for value in null_draws
+                           if value + effect >= threshold) / len(null_draws)
+                       if standard_error > 1e-15 else
+                       (1.0 if effect > 0 else 0.0))
+    return {**common, "available": True, "standard_error": standard_error,
+            "mde": mde, "minimum_detectable_effect": mde,
+            "mde_effect": mde,
+            "estimated_power": estimated_power, "power": estimated_power,
+            "power_at_target": estimated_power,
+            "critical_value": critical, "bootstrap_mean": center,
+            "bootstrap_min": min(means), "bootstrap_max": max(means),
             "reason": None}
+
+
+# Short compatibility aliases for callers that use the conventional MDE
+# terminology.  They intentionally resolve to the same diagnostic-only
+# implementation and therefore carry identical method/version metadata.
+mde_power_report = clustered_mde_power_report
+clustered_mde_report = clustered_mde_power_report
+clustered_mde_power = clustered_mde_power_report
 
 
 def _breadth_value(row, keys):
@@ -626,8 +789,11 @@ def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
 
 __all__ = ["DEFAULT_BREADTH_MIN_CLUSTERS", "DEFAULT_BREADTH_MIN_SESSIONS",
            "DEFAULT_BOOTSTRAP_DRAWS", "DEFAULT_NULL_DRAWS",
+           "DEFAULT_CLUSTER_BLOCK_LENGTH",
            "benjamini_hochberg",
            "cluster_bootstrap_lower_bound", "cluster_contributions",
+           "clustered_mde_power_report", "clustered_mde_report",
+           "clustered_mde_power", "mde_power_report",
            "effective_breadth_report",
            "moving_block_cluster_bootstrap_lower_bound",
            "paired_cluster_sign_flip", "sign_flip_null_statistics",

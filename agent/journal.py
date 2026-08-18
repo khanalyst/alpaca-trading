@@ -10,6 +10,7 @@ whose runtime globals can be rebound by tests and long-running processes.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -49,7 +50,9 @@ _JOURNAL_TABLES = {
         reference_price REAL, entry_reference REAL, exit_reference REAL,
         market_price REAL, mid_price REAL, requested_qty REAL,
         planned_qty REAL, cumulative_filled_qty REAL, fill_fraction REAL,
-        filled_fraction REAL
+        filled_fraction REAL, risk_usd REAL, intended_risk_usd REAL,
+        delivered_risk_usd REAL, risk_delivery_ratio REAL,
+        risk_shortfall_usd REAL
     )""",
     "trades": """CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -68,7 +71,9 @@ _JOURNAL_TABLES = {
         execution_profile TEXT, vehicle TEXT, reference_price REAL,
         entry_reference REAL, exit_reference REAL, market_price REAL,
         mid_price REAL, requested_qty REAL, planned_qty REAL,
-        cumulative_filled_qty REAL, fill_fraction REAL, filled_fraction REAL
+        cumulative_filled_qty REAL, fill_fraction REAL, filled_fraction REAL,
+        intended_risk_usd REAL, delivered_risk_usd REAL,
+        risk_delivery_ratio REAL, risk_shortfall_usd REAL
     )""",
     "equity": """CREATE TABLE IF NOT EXISTS equity (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -136,6 +141,17 @@ def _resolve_connect(connect: Callable | None) -> Callable:
     return sqlite3.connect if connect is None else connect
 
 
+def _execute_with_lock_retry(db, statement: str, *, attempts: int = 20):
+    """Run a schema statement through brief SQLite lock contention."""
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return db.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt + 1 >= attempts:
+                raise
+            time.sleep(0.05)
+
+
 def initialize_journal(
     journal_file: str | Path,
     runtime: str | Path,
@@ -166,7 +182,7 @@ def initialize_journal(
             db.execute("PRAGMA busy_timeout=5000")
             _validate_existing_journal_schema(
                 db, runtime_scope, required_columns)
-            db.execute("PRAGMA journal_mode=WAL")
+            _execute_with_lock_retry(db, "PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
             for ddl in tables.values():
                 db.execute(ddl)
@@ -187,16 +203,24 @@ def initialize_journal(
                     "mid_price": "REAL", "requested_qty": "REAL",
                     "planned_qty": "REAL", "cumulative_filled_qty": "REAL",
                     "fill_fraction": "REAL", "filled_fraction": "REAL",
+                    "risk_usd": "REAL", "intended_risk_usd": "REAL",
+                    "delivered_risk_usd": "REAL",
+                    "risk_delivery_ratio": "REAL",
+                    "risk_shortfall_usd": "REAL",
                 },
                 "trades": {
                     "run_id": "TEXT", "cycle_id": "TEXT",
                     "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
+                    "risk_usd": "REAL",
                     "execution_profile": "TEXT", "vehicle": "TEXT",
                     "reference_price": "REAL", "entry_reference": "REAL",
                     "exit_reference": "REAL", "market_price": "REAL",
                     "mid_price": "REAL", "requested_qty": "REAL",
                     "planned_qty": "REAL", "cumulative_filled_qty": "REAL",
                     "fill_fraction": "REAL", "filled_fraction": "REAL",
+                    "intended_risk_usd": "REAL", "delivered_risk_usd": "REAL",
+                    "risk_delivery_ratio": "REAL",
+                    "risk_shortfall_usd": "REAL",
                 },
                 "equity": {
                     "run_id": "TEXT", "cycle_id": "TEXT",
@@ -211,8 +235,19 @@ def initialize_journal(
                 present = _journal_columns(db, table)
                 for name, typ in columns.items():
                     if name not in present:
-                        db.execute(
-                            f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+                        try:
+                            db.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+                        except sqlite3.OperationalError as exc:
+                            # Startup can race with another process migrating
+                            # the same mode-scoped database.  Re-probe after
+                            # SQLite's duplicate-column error and continue
+                            # only when that process completed this exact
+                            # migration; all other failures stay fail-closed.
+                            if "duplicate column name" not in str(exc).lower() or \
+                                    name not in _journal_columns(db, table):
+                                raise
+                        present.add(name)
             if "schema_meta" in tables:
                 db.execute(
                     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",

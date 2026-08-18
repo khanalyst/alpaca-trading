@@ -265,6 +265,17 @@ class ProtectionHarness(unittest.TestCase):
 class BrokerProtectionTests(ProtectionHarness):
     # 1. submit shape
 
+    def test_stressed_cost_veto_happens_before_order_submission(self):
+        self._bind_engine(runtime_name="runtime-stressed-cost-veto")
+        self.engine.cfg["risk"]["max_stressed_cost_to_risk_ratio"] = 0.0
+        events = []
+        self.engine._event = lambda kind, payload: events.append((kind, payload))
+        result = self._entry_request()
+        self.assertIsNone(result)
+        self.assertEqual(self.provider.submitted, [])
+        self.assertEqual(events[-1], ("risk_reject", {
+            "symbol": "SPY", "reason": "stressed_cost_risk_limit"}))
+
     def test_equity_entry_attaches_a_bracket_with_plan_stop_and_target(self):
         self._bind_engine(runtime_name="runtime-bracket")
         request, plan = self._entry_request()

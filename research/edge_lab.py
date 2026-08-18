@@ -21,6 +21,7 @@ from .gates import (
     expectancy_rejection_report, heldout_separation, matched_cluster_test,
     max_drawdown_of, paired_delta, performance_floor, qualification_report,
     sample_counts, seal_final_window, structural_floor, verified_gate_envelope,
+    authorization_projection,
     walk_forward_report, validate_protocol_floor,
     PROTOCOL_SHADOW_MIN_TRADES, PROTOCOL_SHADOW_MIN_SESSIONS,
 )
@@ -252,7 +253,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     configs: dict[str, object] = {}
     runtime_policy = ReplayPolicy.from_config(config)
     for variant in selected:
-        cfg, effective = _effective_ibr_config(config, variant.overrides)
+        cfg, effective = _effective_ibr_config(
+            config, variant.overrides, vehicle=vehicle)
         effective_configs[variant.variant_id] = candidate_assumptions(
             effective, vehicle=vehicle, strategy_id="ibr",
             variant_id=variant.variant_id)
@@ -392,7 +394,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             backtest_bar_fallback=backtest_bar_fallback)
         mode_policies[variant_id] = mode_policy
         cfg, effective = _effective_ibr_config(
-            config, variant.overrides, policy=mode_policy)
+            config, variant.overrides, vehicle=vehicle, policy=mode_policy)
         configs[variant_id] = cfg
         # Keep lane-specific policy in provenance only.  The immutable
         # candidate/run config is identical across backtest and shadow.
@@ -425,7 +427,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         mode_policy = replay_policy_for_mode(
             runtime_policy, mode, backtest_bar_fallback=backtest_bar_fallback)
         baseline_cfg, _ = _effective_ibr_config(
-            config, baseline_variant.overrides, policy=mode_policy)
+            config, baseline_variant.overrides, vehicle=vehicle,
+            policy=mode_policy)
         baseline_result = replay(development_bars, development_snapshots,
                                  development_quotes, baseline_cfg)
         baseline_by_mode[mode] = _opportunity_rows(
@@ -484,7 +487,7 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     # Imported lazily because factory_ledger imports this module's public
     # facades. Historical discovery defers cumulative testing to live shadow.
     from .factory_ledger import deferred_fdr
-    confirmatory_scope = f"shadow-confirmation-v2:{vehicle}"
+    confirmatory_scope = f"shadow-confirmation-v4:{vehicle}"
     cumulative = deferred_fdr(
         confirmatory_scope,
         (f"{data_hash}:{lane}:{selected_test_id}:live-shadow"
@@ -499,7 +502,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             runtime_policy, "shadow" if qualification_mode == "shadow" else "backtest",
             backtest_bar_fallback=backtest_bar_fallback)
         qualification_baseline_cfg, _ = _effective_ibr_config(
-            config, baseline_variant.overrides, policy=qualification_policy)
+            config, baseline_variant.overrides, vehicle=vehicle,
+            policy=qualification_policy)
         baseline_all = _opportunity_rows(
             replay(window_bars, sealed_snapshots, sealed_quotes,
                    qualification_baseline_cfg),

@@ -116,7 +116,10 @@ def persist_rule_gate(ledger, candidate_id, lane):
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
     symbols = ("SPY", "QQQ", "IWM", "DIA")
-    session_count = 40
+    # Shadow fixtures mirror the live boundary: forty older selection sessions
+    # and forty newer confirmatory sessions (160 confirmatory trades, clearing
+    # the strict 150-trade shadow floor).
+    session_count = 80 if lane == "shadow" else 40
 
     def row(symbol, session, opportunity, net_pnl):
         return {
@@ -135,18 +138,32 @@ def persist_rule_gate(ledger, candidate_id, lane):
         row(symbol, (datetime(2025, 11, 20) + timedelta(days=offset)).date().isoformat(),
             f"{lane}-fit-{offset}-{symbol}", 1.0)
         for offset in range(session_count) for symbol in symbols]
-    first_heldout = datetime(2026, 1, 6)
-    heldout = [
+    first_heldout = (datetime(2025, 11, 27) if lane == "shadow"
+                     else datetime(2026, 1, 6))
+    all_heldout = [
         row(symbol, (first_heldout + timedelta(days=offset)).date().isoformat(),
             f"{lane}-held-{offset}-{symbol}", 1.0)
         for offset in range(session_count) for symbol in symbols]
+    heldout = list(all_heldout)
+    selection_sessions: list[str] = []
+    confirmatory_sessions: list[str] = []
+    selection_rows: list[dict] = []
+    if lane == "shadow":
+        all_sessions = sorted({row["session_date"] for row in all_heldout})
+        split = len(all_sessions) // 2
+        selection_sessions, confirmatory_sessions = all_sessions[:split], all_sessions[split:]
+        selection_rows = [row for row in all_heldout
+                          if row["session_date"] in set(selection_sessions)]
+        heldout = [row for row in all_heldout
+                   if row["session_date"] in set(confirmatory_sessions)]
     baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
                 for index, row in enumerate(heldout)]
     fit_baseline = [{**row, "net_pnl": 0.0,
                      "opportunity_id": f"fit-base-{index}"}
                     for index, row in enumerate(fit)]
     fit_floor = structural_floor(
-        fit, vehicle="equity", min_trades=100, min_sessions=30,
+        fit, vehicle="equity",
+        min_trades=150 if lane == "shadow" else 100, min_sessions=30,
         min_clusters=30,
         required=lane != "shadow")
     held_floor = structural_floor(
@@ -170,6 +187,19 @@ def persist_rule_gate(ledger, candidate_id, lane):
         sessions=sorted({row["session_date"] for row in heldout}),
         candidate_id=candidate_id, preselected=True)
     hashes = provenance_hash(config=candidate_config)
+    if lane == "shadow":
+        hashes.update({
+            "independent_confirmatory": True,
+            "disjoint_sessions": True,
+            "session_disjoint": True,
+            "selection_sessions": selection_sessions,
+            "confirmatory_sessions": confirmatory_sessions,
+            "selection_session_digest": content_hash(selection_sessions),
+            "confirmatory_session_digest": content_hash(confirmatory_sessions),
+            "p_value_source": "live_shadow_confirmatory_gate",
+            "selection_raw_p_value": control["p_value"],
+            "confirmatory_raw_p_value": control["p_value"],
+        })
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_baseline=fit_baseline, heldout_baseline=baseline,
@@ -177,7 +207,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
         fit_floor=fit_floor, heldout_floor=held_floor,
         fit_control=fit_control,
         control={**control, "kind": "matched_root_baseline"},
-        p_value=control["p_value"], q_value=.01, alpha=.05,
+        p_value=control["p_value"], q_value=control["p_value"], alpha=.05,
         falsification=falsification, separation=separation,
         checks={"family_fdr_significant": True, "global_fdr_significant": True,
                 "cumulative_fdr_significant": True,
@@ -193,9 +223,25 @@ def persist_rule_gate(ledger, candidate_id, lane):
                       "mean_delta": control["mean_delta"],
                       "mean_delta_lcb": control["mean_delta_lcb"],
                       "p_value": control["p_value"]},
-        online_fdr={"scope": "test", "test_id": f"{candidate_id}:{lane}",
-                    "p_value": .01, "allocated_alpha": .05,
-                    "decision": True},
+        online_fdr={"scope": ("shadow-confirmation-v4:equity" if lane == "shadow"
+                              else "test"),
+                    "test_id": f"{candidate_id}:{lane}",
+                    "p_value": control["p_value"], "raw_p_value": control["p_value"],
+                    "selection_raw_p_value": control["p_value"],
+                    "confirmatory_raw_p_value": control["p_value"],
+                    "family_q_value": control["p_value"], "global_q_value": control["p_value"],
+                    "allocated_alpha": .05, "decision": True,
+                    "required": True, "tested": True,
+                    "p_value_kind": "raw_confirmatory",
+                    "p_value_source": "live_shadow_confirmatory_gate",
+                    "independent_confirmatory": lane == "shadow",
+                    "disjoint_sessions": lane == "shadow",
+                    "session_disjoint": lane == "shadow",
+                    **({"selection_sessions": selection_sessions,
+                        "confirmatory_sessions": confirmatory_sessions,
+                        "selection_session_digest": content_hash(selection_sessions),
+                        "confirmatory_session_digest": content_hash(confirmatory_sessions)}
+                       if lane == "shadow" else {})},
         provenance=hashes, candidate_id=candidate_id,
         performance={"heldout_delta": control["mean_delta"],
                      "heldout_delta_lcb": control["mean_delta_lcb"],
@@ -204,29 +250,87 @@ def persist_rule_gate(ledger, candidate_id, lane):
                      "max_drawdown": 0.0})
     run = ledger.append_run(candidate_id, lane=lane, fit=fit, heldout=heldout,
                             config=candidate_config,
-                            metrics={"gate": {"passes": True}, "confidence": .99,
+                            metrics={"gate": {"passes": True,
+                                               "verified_gate": gate,
+                                               "gate_hash": gate["content_hash"]},
+                                     "confidence": .99,
                                      "heldout_delta": 1.0, "max_drawdown": 0.0,
                                      "heldout_trades": len(heldout),
                                      **({"shadow_source": {
                                          "schema": "shadow-ingest.v1",
                                          "candidate_id": candidate_id,
                                          "vehicle": "equity",
+                                         "independent_confirmatory": True,
+                                         "disjoint_sessions": True,
+                                         "session_disjoint": True,
+                                         "selection_sessions": selection_sessions,
+                                         "confirmatory_sessions": confirmatory_sessions,
+                                         "selection_session_digest": content_hash(selection_sessions),
+                                         "confirmatory_session_digest": content_hash(confirmatory_sessions),
+                                         "p_value_source": "live_shadow_confirmatory_gate",
                                          "sessions": [{
-                                             "session_date": row["session_date"],
-                                             "source_digest": f"source:{row['session_date']}",
-                                             "shadow_digest": f"shadow:{row['session_date']}",
-                                             "replay_digest": f"replay:{row['session_date']}",
-                                             "account_id": f"account:{row['session_date']}",
-                                             "trade_count": 1,
-                                         } for row in heldout],
+                                             "session_date": day,
+                                             "source_digest": f"source:{day}",
+                                             "shadow_digest": f"shadow:{day}",
+                                             "replay_digest": f"replay:{day}",
+                                             "account_id": f"account:{day}",
+                                             "trade_count": 4,
+                                         } for day in [*selection_sessions,
+                                                       *confirmatory_sessions]],
+                                         "selection": {
+                                             "sessions": selection_sessions,
+                                             "session_digest": content_hash(selection_sessions),
+                                             "rows_digest": content_hash(selection_rows),
+                                             "candidate_source": selection_rows,
+                                             "baseline_source": [
+                                                 {**row, "net_pnl": 0.0,
+                                                  "opportunity_id": f"selection-base-{index}"}
+                                                 for index, row in enumerate(selection_rows)],
+                                             "null_source": [
+                                                 {**row, "net_pnl": 0.0,
+                                                  "opportunity_id": f"selection-null-{index}"}
+                                                 for index, row in enumerate(selection_rows)],
+                                             "minimums": {"trades": 150, "sessions": 30},
+                                             "baseline_rows_digest": content_hash([
+                                                 {**row, "net_pnl": 0.0,
+                                                  "opportunity_id": f"selection-base-{index}"}
+                                                 for index, row in enumerate(selection_rows)]),
+                                             "null_rows_digest": content_hash([
+                                                 {**row, "net_pnl": 0.0,
+                                                  "opportunity_id": f"selection-null-{index}"}
+                                                 for index, row in enumerate(selection_rows)]),
+                                             "p_value_source": "selection_window_gate",
+                                             "raw_p_value": control["p_value"],
+                                             "alpha": .05, "test_iterations": 20_000,
+                                             "bh": {
+                                                 "family_values": {"fixture": {candidate_id: control["p_value"]}},
+                                                 "family_results": {candidate_id: {
+                                                     "p": control["p_value"], "p_adjusted": control["p_value"],
+                                                     "significant": True, "family_size": 1}},
+                                                 "global_values": {candidate_id: control["p_value"]},
+                                                 "global_results": {candidate_id: {
+                                                     "p": control["p_value"], "p_adjusted": control["p_value"],
+                                                     "significant": True, "family_size": 1}},
+                                             },
+                                         },
+                                         "confirmatory": {
+                                             "sessions": confirmatory_sessions,
+                                             "session_digest": content_hash(confirmatory_sessions),
+                                             "rows_digest": content_hash(heldout),
+                                             "baseline_rows_digest": content_hash(baseline),
+                                             "null_rows_digest": content_hash(baseline),
+                                             "p_value_source": "live_shadow_confirmatory_gate",
+                                             "raw_p_value": control["p_value"],
+                                         },
                                          "baseline": {"candidate_id": "fixture:baseline",
                                                       "rows_digest": content_hash(baseline),
                                                       "role": "paired_root_control"},
                                          "null": {"candidate_id": "fixture:null",
                                                    "rows_digest": content_hash(baseline),
                                                    "role": "randomized_entry_null"},
-                                     }, "replay_digests": [f"replay:{row['session_date']}"
-                                                           for row in heldout]}
+                                     }, "replay_digests": [f"replay:{day}"
+                                                           for day in [*selection_sessions,
+                                                                       *confirmatory_sessions]]}
                                      if lane == "shadow" else {})})
     for row in [*fit, *heldout]:
         ledger.append_trade(run["run_id"], row)
@@ -238,6 +342,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
             {"schema": "shadow-ingest.v1", "candidate_id": candidate_id,
              "vehicle": "equity", "source": source,
              "replay_digests": [item["replay_digest"] for item in source["sessions"]],
+             "run_provenance": hashes,
              "gate_hash": gate["content_hash"]}, run_id=run["run_id"])
 
 

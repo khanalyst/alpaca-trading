@@ -4,7 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from research.factory_ledger import FDR_METHOD, FactoryLedger, deferred_fdr
+from research.factory_ledger import (
+    FDR_METHOD, LEGACY_FDR_METHOD, FactoryLedger, deferred_fdr)
 from research.factory_core import initial_hypotheses
 from research.factory_ledger import FactoryError
 
@@ -13,7 +14,7 @@ class FactoryFdrTests(unittest.TestCase):
     def test_balanced_allocations_are_previewed_without_being_spent(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
-            scope = "shadow-confirmation-v2:equity"
+            scope = "shadow-confirmation-v4:equity"
 
             first = ledger.next_fdr_allocation(scope)
             self.assertEqual(first["method"], FDR_METHOD)
@@ -35,7 +36,7 @@ class FactoryFdrTests(unittest.TestCase):
     def test_discovery_reward_and_duplicate_test_are_durable(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
-            scope = "shadow-confirmation-v2:equity"
+            scope = "shadow-confirmation-v4:equity"
             first = ledger.record_fdr_decision(scope, "proof-a", .001)
             self.assertTrue(first["decision"])
 
@@ -50,13 +51,24 @@ class FactoryFdrTests(unittest.TestCase):
             self.assertEqual(ledger.fdr_state(scope)["tests"], 1)
 
     def test_offline_deferral_is_explicit_and_non_authorizing(self):
-        record = deferred_fdr("shadow-confirmation-v2:equity", "candidate-a")
+        record = deferred_fdr("shadow-confirmation-v4:equity", "candidate-a")
         self.assertFalse(record["required"])
         self.assertFalse(record["tested"])
         self.assertFalse(record["decision"])
         self.assertEqual(record["status"], "deferred_to_live_shadow")
+        self.assertEqual(record["method"], "deferred_confirmatory_raw_p_v3")
+        self.assertEqual(record["p_value_kind"], "raw_confirmatory")
         self.assertNotIn("p_value", record)
         self.assertNotIn("allocated_alpha", record)
+
+    def test_legacy_scope_remains_auditable_without_being_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            scope = "shadow-confirmation-v2:equity"
+            preview = ledger.next_fdr_allocation(scope)
+            self.assertEqual(preview["method"], LEGACY_FDR_METHOD)
+            self.assertEqual(preview["p_value_kind"], "legacy_q")
+            self.assertEqual(ledger.fdr_state(scope)["tests"], 0)
 
     def test_qualification_claim_survives_restart_and_rejects_overlap(self):
         with tempfile.TemporaryDirectory() as directory:

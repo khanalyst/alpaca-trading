@@ -66,8 +66,13 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _rows(self, cid, values, *, status="match"):
-        sessions = [f"2024-04-{day:02d}" for day in range(1, 9)]
-        for session, value in zip(sessions, values):
+        # Live-shadow ingest now consumes an older selection half and a newer
+        # confirmatory half.  Keep this fixture at sixteen sessions so each
+        # half has enough exact clusters for the deterministic tests; short
+        # value patterns repeat across the complete tail.
+        sessions = [f"2024-04-{day:02d}" for day in range(1, 17)]
+        for index, session in enumerate(sessions):
+            value = values[index % len(values)]
             row = {"vehicle": "equity", "symbol": "SPY",
                    "session_date": session,
                    # Replay lanes use the stable symbol/session opportunity;
@@ -142,14 +147,73 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertTrue(online["required"])
         self.assertTrue(online["tested"])
         self.assertTrue(online["decision"])
+        source = runs[0]["metrics"]["shadow_source"]
+        self.assertTrue(source["independent_confirmatory"])
+        self.assertTrue(source["disjoint_sessions"])
+        self.assertEqual(set(source["selection_sessions"]).intersection(
+            source["confirmatory_sessions"]), set())
+        self.assertEqual(online["p_value_source"], "live_shadow_confirmatory_gate")
         state = FactoryLedger(self.edge_path).fdr_state(
-            "shadow-confirmation-v2:equity")
+            "shadow-confirmation-v4:equity")
         self.assertEqual(state["tests"], 1)
         self.assertAlmostEqual(state["decisions"][0]["p_value"],
                                online["p_value"])
         evidence = self.ledger.evidence(cid)
         self.assertTrue(any(item["kind"] == "shadow_ingestion" for item in evidence))
         self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 8)
+
+    def test_same_tail_or_tampered_window_digest_cannot_authorize(self):
+        cid, run_id = self._seed_live_run()
+        run = self.ledger.run(run_id)
+        source = run["metrics"]["shadow_source"]
+        # A same-tail record is readable but fails the disjointness boundary.
+        source["confirmatory_sessions"] = list(source["selection_sessions"])
+        self.assertFalse(self.ledger._live_shadow_authorized(run))
+
+        run = self.ledger.run(run_id)
+        source = run["metrics"]["shadow_source"]
+        source["selection_session_digest"] = "tampered"
+        self.assertFalse(self.ledger._live_shadow_authorized(run))
+
+    def test_tampered_persisted_selection_rows_cannot_authorize(self):
+        cid, run_id = self._seed_live_run()
+        with sqlite3.connect(self.edge_path) as db:
+            row = db.execute(
+                "SELECT metrics_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            metrics = json.loads(row[0])
+            metrics["shadow_source"]["selection"]["candidate_source"][0]["net_pnl"] = 999.0
+            db.execute("DROP TRIGGER runs_no_update")
+            db.execute("UPDATE runs SET metrics_json=? WHERE run_id=?", (
+                json.dumps(metrics, sort_keys=True, separators=(",", ":")), run_id))
+        self.assertFalse(self.ledger.eligibility(cid)["eligible"])
+
+    def test_insufficient_two_window_tail_spends_no_online_allocation(self):
+        cid = self.candidate["candidate_id"]
+        self._row(cid, 1, 2.0)
+        self._row(self.baseline["candidate_id"], 1, 0.0)
+        self._row(f"shadow:null:{cid}", 1, -1.0)
+        result = ingest_shadow(ShadowIngestConfig(
+            self.edge_path, self.shadow_path, min_trades=1, min_sessions=1))
+        self.assertEqual(result["ingested"], 0)
+        self.assertEqual(result["candidates"][0]["status"],
+                         "underpowered_confirmatory_split")
+        self.assertFalse(result["candidates"][0]["online_allocation_spent"])
+        self.assertEqual(FactoryLedger(self.edge_path).fdr_state(
+            "shadow-confirmation-v4:equity")["tests"], 0)
+
+    def test_v3_lord_state_is_readable_but_v4_starts_a_fresh_sequence(self):
+        FactoryLedger(self.edge_path).record_fdr_decision(
+            "shadow-confirmation-v3:equity", "legacy-same-tail", .001)
+        cid = self.candidate["candidate_id"]
+        self._rows(cid, [2.0] * 16)
+        self._rows(self.baseline["candidate_id"], [0.0] * 16)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 16)
+        result = ingest_shadow(ShadowIngestConfig(
+            self.edge_path, self.shadow_path, min_trades=1, min_sessions=1))
+        self.assertEqual(result["ingested"], 1, result)
+        ledger = FactoryLedger(self.edge_path)
+        self.assertEqual(ledger.fdr_state("shadow-confirmation-v3:equity")["tests"], 1)
+        self.assertEqual(ledger.fdr_state("shadow-confirmation-v4:equity")["tests"], 1)
 
     def test_mismatch_and_incomplete_tails_do_not_write(self):
         cid = self.candidate["candidate_id"]
@@ -171,7 +235,49 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(ingest_shadow(config)["ingested"], 0)
         self.assertEqual(len(self.ledger.runs(cid, lane="shadow")), 1)
 
-    def test_online_fdr_records_global_q_not_selected_raw_p(self):
+    def test_crash_retry_reuses_v4_fdr_decision_when_resolution_changes(self):
+        cid = self.candidate["candidate_id"]
+        self._rows(cid, [2.0] * 8)
+        self._rows(self.baseline["candidate_id"], [0.0] * 8)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 8)
+        config = ShadowIngestConfig(self.edge_path, self.shadow_path,
+                                    min_trades=1, min_sessions=1)
+
+        original_record = FactoryLedger.record_fdr_decision
+        crashed = {"value": False}
+
+        def record_then_crash(ledger, scope, test_id, p_value, *, alpha=.05):
+            result = original_record(ledger, scope, test_id, p_value,
+                                     alpha=alpha)
+            if str(scope) == "shadow-confirmation-v4:equity" and not crashed["value"]:
+                crashed["value"] = True
+                raise RuntimeError("simulated crash after FDR commit")
+            return result
+
+        with patch("research.live_shadow_ingest._confirmatory_iterations",
+                   side_effect=[20_000, 30_000]), \
+                patch.object(FactoryLedger, "record_fdr_decision",
+                             new=record_then_crash):
+            with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                ingest_shadow(config)
+            # The second call in this same retry sequence resolves at 30k.
+            result = ingest_shadow(config)
+
+        # The first attempt spent the 20k-resolution allocation but did not
+        # append its run.  The retry sees the discovery and therefore resolves
+        # at 30k; the immutable tail key must still reuse the one v4 row.
+        self.assertEqual(result["ingested"], 1, result)
+        state = FactoryLedger(self.edge_path).fdr_state(
+            "shadow-confirmation-v4:equity")
+        self.assertEqual(state["tests"], 1)
+        self.assertEqual(len(state["decisions"]), 1)
+        run = self.ledger.runs(cid, lane="shadow")[0]
+        online = run["metrics"]["gate"]["verified_gate"]["online_fdr"]
+        self.assertEqual(online["tests"], 1)
+        self.assertEqual(online["test_iterations"], 30_000)
+        self.assertTrue(self.ledger.eligibility(cid)["eligible"])
+
+    def test_online_fdr_records_raw_p_not_selected_global_q(self):
         cid = self.candidate["candidate_id"]
         sibling = self.ledger.register_candidate(
             "ibr.range.45", strategy_id="ibr", vehicle="equity",
@@ -197,7 +303,9 @@ class LiveShadowIngestTests(unittest.TestCase):
         global_q = envelope["statistics"]["q_value"]
         online_p = envelope["online_fdr"]["p_value"]
         self.assertGreater(global_q, raw_p)
-        self.assertAlmostEqual(online_p, global_q)
+        self.assertAlmostEqual(online_p, raw_p)
+        self.assertEqual(envelope["online_fdr"]["p_value_kind"],
+                         "raw_confirmatory")
 
     def test_only_strictly_newer_sessions_advance_the_boundary(self):
         cid = self.candidate["candidate_id"]

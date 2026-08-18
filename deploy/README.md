@@ -95,9 +95,11 @@ state. Paper `selection_mode: all_proved` runs one best proven variant per
 independent family under one global risk book. Defaults are eleven logical
 strategy slots over all eleven bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
-`ALPACA_RESEARCH_VEHICLES=all` is the default and deliberately evaluates both
-equity and option research vehicles, even though runtime execution remains the
-single `shares` profile. Capacity is configurable through the
+Scheduled research evaluates the equity vehicle only by default because runtime
+execution remains the single `shares` profile. Set
+`ALPACA_RESEARCH_VEHICLES=all` explicitly to evaluate both equity and option
+vehicles independently; their calibration and authorization evidence stays
+per vehicle. Capacity is configurable through the
 `ALPACA_FACTORY_*` environment variables.
 
 The shipped/default universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`,
@@ -113,13 +115,16 @@ inference uses a deterministic seeded moving-block day/session-cluster
 bootstrap.
 
 Research qualification requires at least 100 trades, 30 complete sessions, and
-30 session-level clusters. Epoch 3 also makes the economics gates explicit:
-every executable stop in both rule and IBR paths must be at least 30 bps,
-the recomputed risk unit must cover the configured round-trip cost, and fill
-quality must be backed by executable quote/snapshot evidence (not a bar-only
-fallback). Evidence from replay generations older than epoch 3 is quarantined
-for audit and cannot validate, champion, or authorize the paper trader until it
-is replayed under epoch 3.
+30 session-level clusters. Epoch 4 retains the epoch-3 economics gates and
+additionally requires latest-of-event/as-of/observed-at point-in-time
+availability, executable-row-only authorizing statistics, vehicle-specific cost
+selection/provenance, raw confirmatory p-values for FDR, and a stressed-cost
+runtime abstention boundary. Evidence from replay generations older than epoch
+4 is quarantined for audit and cannot validate, champion, or authorize the paper
+trader until it is replayed under epoch 4. Authorization requires exact equality
+with current epoch 4; future generations are audit-only too. A current-epoch
+run seals one immutable verified gate proof, and re-derivation appends a new
+proof instead of rewriting history.
 
 The plain supported startup also includes the broker-free shadow lane:
 `docker compose up -d` runs the short-lived `shadow-init` service to repair the
@@ -179,15 +184,33 @@ entries only when the SQLite ledger has a vehicle-local `validated` or
 carries the parity-matched live-ingestion marker.
 
 Authorizing fill quality retains provider/feed/source and quote age for both
-legs: SIP for equity entry and exit, OPRA for option entry and exit, each no
-older than 30 seconds. Bar-only, partial-feed, missing, or stale legs remain
-diagnostic and cannot authorize a proof. The shipped expected-cost model is
+legs: required records become actionable at the maximum of event timestamp,
+`as_of`, and `observed_at`. A delayed recorder bar may signal when observed;
+execution enters at that decision/observation time using fresh SIP (equity) or
+OPRA (option) evidence. Delayed full OHLC never backfills an earlier entry, and
+partial pre-entry bar ranges are excluded. SIP is required for equity entry and
+exit, OPRA for option entry and exit, each no older than 30 seconds.
+The shipped `execution.strict_market_data` default is `true`; historical bar
+fallback is an explicit diagnostic lane only.
+Bar-only, partial-feed, missing, or stale legs remain diagnostic and cannot
+authorize a proof. Optional `costs.vehicles.equity`/`.option` schedules are
+selected independently with provenance; absent overrides, the shipped model is
 4 bps spread, 6 bps slippage, 0.5 bps per-side fee, plus a 0.65 option fee per
 contract side. Preregistered stress scenarios are 9/15/25/50 bps; 25 bps is
-the authorization requirement. Missing, stale, or insufficient calibration,
-an optimistic cost result, terminal material underfill (<80%), or partial-cancel
+the authorization requirement. Runtime stressed-cost risk abstains when its
+cost-to-risk limit is exceeded and persists scenario/cost/ratio plus
+intended/delivered risk-delivery telemetry. Missing, stale, or insufficient
+calibration, an optimistic cost result, terminal material underfill (<80%), or
+partial-cancel
 rate above 20% blocks shadow authorization. Offline discovery/factory
-diagnostics remain available while that boundary is closed.
+diagnostics remain available while that boundary is closed. Fit diagnostics may
+count planned signal/exit geometry as quote-required, non-authorizing
+measurement.
+
+The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
+configured R target, and bar-cap time exit. Fit-only factory diagnostics expose
+signal-prefix/floor binding, planned exits, cost/risk, power, and behavior
+aliases for operator review; they are non-authorizing and do not expand exits.
 
 Research never rewrites the append-only recorder corpus. A temporary cycle view
 explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,
@@ -232,8 +255,11 @@ parity-matched rows, prior qualification, source/config/code/provenance/replay/
 gate hashes, family/global BH plus durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
 incomplete shadow data advances no boundary and is reconsidered. Confirmatory
-simulation resolution scales to the next online allocation and stops without
-spending at its bounded cap. Legacy
+v4 ingestion splits each tail into older chronological selection sessions and a
+newer disjoint confirmatory window; BH uses selection raw p-values, while only
+the selected candidate's raw confirmatory p-value reaches LORD. Same-tail v3
+rows remain auditable but quarantined. Simulation resolution scales to the next
+online allocation and stops without spending at its bounded cap. Legacy
 validated/champion rows without the marker can be evaluated/migrated but remain
 ineligible until a new authorized live proof. Retirement requires a powered
 upper-bound rejection across multiple negative windows for every bounded
@@ -260,9 +286,11 @@ outside Git and set `ALPACA_AGENT_SECRETS_FILE` only for the processes that
 need it. Copy `agent.env.example`, `research.env.example`, and
 `research-llm.env.example` to `/etc/alpaca-agent-trading/`, fill the Alpaca
 paper key/secret and the separate provider key, then set mode `0400` and owner
-`alpaca`. The research unit defaults to `ALPACA_RESEARCH_VEHICLES=all`, SIP,
-OPRA, and the provider path above; it fails closed if the provider file is not
-readable. Enable the full paper lane with:
+`alpaca`. The research unit defaults to the equity lane, SIP, OPRA, and the
+provider path above. Set `ALPACA_RESEARCH_VEHICLES=all` explicitly when both
+research vehicles are needed; their calibration remains independent. The unit
+fails closed if the provider file is not readable. Enable the full paper lane
+with:
 
 ```sh
 sudo systemctl daemon-reload

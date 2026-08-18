@@ -3,30 +3,37 @@
 The research boundary is normalized, point-in-time market data for US-listed
 equities/ETFs and listed OCC options only. Provider
 payloads are converted to `research.market_data` records before feature
-calculation or replay. An event is eligible only when its `as_of` timestamp is
-no later than its observation timestamp and no later than the decision cutoff.
-Records retain provider/feed identity and the New York session date used for
-grouping.
+calculation or replay. Required records become actionable only at the maximum
+of their market event timestamp, `as_of`, and `observed_at` timestamps. A
+delayed recorder bar can therefore signal when observed; execution enters at
+that decision/observation time using fresh SIP (equity) or OPRA (option)
+evidence. Delayed full OHLC never backfills an earlier entry, and partial
+pre-entry bar ranges are excluded. `as_of` may never be later than
+`observed_at`. Records retain provider/feed identity and the New York session
+date used for grouping.
 
 The shipped paper deployment requires SIP for equities and OPRA for options.
 Those are the defaults and the minimum entitlements for autonomous research
 and executable option evidence; a partial or non-executable feed cannot satisfy a
 research proof. The trader remains paper-only with live trading disabled and
-uses the `shares` runtime execution profile. Research is nevertheless
-vehicle-complete by default (`ALPACA_RESEARCH_VEHICLES=all`), so option research
-is evidence generation only and does not authorize options live execution.
+uses the `shares` runtime execution profile. Scheduled research follows the
+equity lane by default (`ALPACA_RESEARCH_VEHICLES=equity`); `option` or `all` is
+an explicit operator selection, with calibration and authorization evidence
+kept per vehicle. Option research is evidence generation only and does not
+authorize options live execution.
 Selecting the separate `options` execution profile is an explicit paper
 runtime decision after OPRA evidence and controls are reviewed.
 
 The immutable authorizing floors are: 100 trades plus 30 complete
 sessions/clusters for backtest/factory windows; 100 trades plus 30 complete
 sessions/clusters for the sealed qualification window; and 150 trades plus 30
-complete sessions for the parity-matched live-shadow tail. Replay epoch 3 adds
-the economics gates: a minimum 30 bps stop distance for both rule and IBR
-paths, a recomputable risk unit covering round-trip cost, and quote/snapshot
-fill-quality evidence rather than bar-only fallback. Evidence from older replay
+complete sessions for the parity-matched live-shadow tail. Replay epoch 4
+retains the epoch-3 economics gates and adds latest-of-event/as-of/observed-at
+point-in-time availability, executable-row-only authorizing statistics,
+vehicle-specific cost selection/provenance, raw confirmatory p-values for FDR,
+and a stressed-cost runtime abstention boundary. Evidence from older replay
 epochs remains readable for audit but is quarantined and cannot validate,
-champion, or authorize the paper trader until replayed under epoch 3.
+champion, or authorize the paper trader until replayed under epoch 4.
 
 Production replay requires exact Alpaca calendar metadata for every session,
 including early closes. Missing metadata is a refusal; no fixed 16:00 close is
@@ -50,8 +57,9 @@ Every replay must establish the following invariants:
   minute discards a large, non-random share of a real corpus;
 - same-bar stop/target ties resolve to the stop;
 - a gap through a level, on entry or exit, fills at the gap open;
-- a fill landing on a bar boundary uses a recorded quote at that instant when
-  one exists, and otherwise records that it fell back to the bar;
+- a fill landing on a bar boundary uses fresh executable quote evidence at the
+  causal decision/observation time when strict; a delayed full OHLC record never
+  backfills an earlier entry, and any bar fallback is explicitly diagnostic;
 - spread, slippage, and both-side fees are charged from one shared model;
 - an option leg is priced only from a quote no older than the strict 30-second
   freshness bound at the instant being priced; a signal whose contract has no such quote
@@ -70,9 +78,11 @@ Every replay must establish the following invariants:
 
 `research/costs.py` owns the single expected-cost model and the fill
 arithmetic every lane spends it through; no lane carries its own
-spread/slippage/fee numbers. The shipped `costs` block is 4 bps spread, 6 bps
-adverse slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit
-option fee per contract per side. The runtime's `execution.max_slippage_bps`
+spread/slippage/fee numbers. `cost_model_for_vehicle` selects an explicit
+`costs.vehicles.equity` or `.option` override when configured and records its
+provenance; otherwise the shipped schedule is 4 bps spread, 6 bps adverse
+slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit option fee
+per contract per side. The runtime's `execution.max_slippage_bps`
 and `max_spread_bps` are rejection caps, not expectations: they bound the
 model, and a model expecting a cost the runtime would refuse to submit fails
 closed. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
@@ -86,7 +96,9 @@ veto and non-zero status. Offline diagnostics may still run, but shadow
 authorization remains blocked. In-flight orders are excluded, and the model is
 never adjusted automatically.
 
-`ReplayPolicy.from_config` is the runtime policy source for replay. It carries
+`ReplayPolicy.from_config` is the runtime policy source for replay. The shipped
+`execution.strict_market_data` default is `true`; direct replay APIs are strict
+as well. The policy carries
 the strict 30-second market-data age, option DTE (default 7–60), option spread
 and liquidity checks, latest-entry and force-flat times, and portfolio limits
 (concurrent positions, position notional, gross exposure, open risk, and daily
@@ -100,9 +112,11 @@ symbol-by-session correlation/eigenvalue diagnostic only; it never increases N
 or replaces independent session clusters.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
-missing or partial opening range is `no trade`, not an imputed range. A missing
-immediate next bar is also `no trade`; stale signals are never carried across
-an outage.
+missing or partial opening range is `no trade`, not an imputed range. When the
+signal is actionable at the next-bar boundary, a missing immediate next bar is
+`no trade`; when recorder delay makes the signal actionable later, entry may
+move to the first complete bar at/after that decision time and requires fresh
+quote evidence. Stale signals are never carried across an outage.
 
 Market-data strictness is lane-specific. The validated research-only setting
 `research.backtest_bar_fallback` defaults to `true`: historical backtest lanes
@@ -226,6 +240,25 @@ diagnosis and the graded outcomes of *already completed* proposals, never a
 held-out, sealed, or later-forward observation. Each variant is evaluated in an
 isolated simulated account.
 
+Before variant replay, the factory records compact fit-only diagnostics: the
+eligible-prefix and first-signal rates, ATR-in-basis-points and 30-bps-floor
+binding, signal-anchored planned stop/target/hold distributions, configured
+and stressed cost-to-risk (9/15/25/50x) summaries, delivered versus intended
+risk, realized exit reasons/ties/gaps, and a diagnostic clustered MDE/power
+report whose effect and cluster units are explicit. The current fixed exit
+grammar (ATR-floor bracket, configured R target, and bar cap) is surfaced for
+operator review and never expanded by this measurement. Planned signal/exit
+geometry may be counted even when executable quote pricing is absent, but is
+marked quote-required and remains non-authorizing.
+
+The first-signal planned vectors also produce deterministic entry and full
+behavior fingerprints. When the fit contains a signal, full behavioral aliases
+produce a deterministic canonicalization proposal for operator review; all
+intended variants remain in worker replay and BH until that review. Zero-signal
+aliases remain visible, and the proposed alias/parameter-collapse summary is
+persisted without raw rows. These are diagnostics only and cannot authorize a
+candidate or read held-out/sealed sessions.
+
 No lane may extend the signal vocabulary. The families, confirmation filters,
 sides, permitted fields, and numeric bounds in `agent/contracts/rule.py` are
 closed sets, and the feature computation itself is code that research never
@@ -291,7 +324,21 @@ each decision flag with its own q-value.
 The post-selection test also consumes a durable cumulative online-FDR
 allocation. Its LORD-style state is stored per scope in the factory ledger and
 persists across cycles, so alpha allocation and discoveries are not reset by a
-new run.
+new run. LORD receives the raw confirmatory p-value; the family/global BH
+q-values select the candidate but are not spent as online p-values. Formal
+LORD validity still requires that confirmatory p-value to be based on evidence
+not reused for the adaptive selection step (the in-process replay remains
+diagnostic unless that independence boundary is established).
+
+Live-shadow ingestion establishes that boundary chronologically. Each complete
+new tail is split deterministically into an older selection window and a newer,
+disjoint confirmatory window; both windows must independently meet the configured
+trade/session floors before any online allocation is spent. Family and global BH
+use only the selection-window raw p-values. At most the selected, preflight-ready
+candidate is recomputed on the confirmatory window, and only that gate's raw p is
+sent to LORD. The source and provenance persist both session lists, their
+digests, the disjointness marker, and the confirmatory p-value source. Legacy
+same-tail v3 records remain auditable but cannot authorize under epoch 4.
 
 Beating a control is necessary but never sufficient. A variant must also show
 absolute after-cost profitability on unseen data (positive net P&L and
@@ -341,11 +388,13 @@ the raw held-out delta.
 
 Every run also records the replay generation it was measured under
 (`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
-and never accepted from a caller. The current generation is **epoch 3**. Epoch
-3 enforces the 30 bps stop floor, recomputable round-trip risk-unit coverage,
-quote/snapshot fill-quality, and powered qualification evidence in addition to
-the earlier point-in-time, portfolio, walk-forward, sealed-window, and
-multiplicity controls. A run from a superseded generation cannot authorize
+and never accepted from a caller. The current generation is **epoch 4**. Epoch
+4 retains the epoch-3 economics gates and additionally applies latest-of-
+event/as-of/observed-at point-in-time availability, excludes non-executable
+fallback rows from authorizing statistics, binds vehicle-specific cost
+selection/provenance, feeds raw confirmatory p-values to FDR accounting, and
+enforces the stressed-cost runtime abstention boundary. A run from a superseded
+generation cannot authorize
 `validated`, `champion`, or runtime eligibility, and
 `EdgeLedger.eligibility` names that quarantine rather than reporting a bare
 ineligibility. This is deliberately not a digest check: evidence measured under
@@ -354,7 +403,11 @@ recomputes, because the recorded rows are exactly what that engine produced.
 What changed is that those rows describe fills, quote ages, portfolio limits or
 multiplicity accounting the current protocol does not accept. Quarantine is not
 deletion — the rows stay readable and the lifecycle history stays intact — so
-re-deriving under epoch 3 is the only route back to a deployable proof. The
+re-deriving under epoch 4 is the only route back to a deployable proof. Epoch
+authorization requires exact equality with current epoch 4, so future as well as
+stale epochs remain audit-only. Each current-epoch run seals one immutable
+verified gate proof; re-derivation appends a new proof rather than rewriting
+history. The
 constant is raised whenever a replay or gate change invalidates evidence
 recorded before it.
 Underpowered or inconclusive data is not failure. Retirement is permitted only

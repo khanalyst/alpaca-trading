@@ -443,7 +443,7 @@ class MarketEntryRiskMixin:
             if isinstance(runtime.get("risk_day"), Mapping) else None
         plan, why = self.risk.vet_open(
             decision, equity, mapped_positions, {symbol: row}, {}, gross,
-            active_trades=active, now=now.timestamp())
+            active_trades=active, now=now.timestamp(), cost_cfg=edge_cfg)
         if plan is None:
             self._event("risk_reject", {"symbol": symbol, "reason": why})
             return None

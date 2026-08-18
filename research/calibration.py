@@ -18,7 +18,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Mapping, Sequence
 
-from .costs import CostModel
+from .costs import CostModel, cost_model_for_vehicle
 
 SCHEMA = 2
 MIN_FILLS = 20
@@ -44,6 +44,34 @@ _EVIDENCE_COLUMNS = {
     "requested_qty", "planned_qty", "cumulative_filled_qty", "fill_fraction",
     "filled_fraction",
 }
+
+
+def _vehicle(row: Mapping[str, Any]) -> str:
+    """Return the canonical vehicle identity carried by a journal row.
+
+    Older journals may have only ``execution_profile``.  Keep that
+    compatibility seam when applying a vehicle filter, while preserving the
+    same equity default used by :func:`_measure` for unlabelled rows.
+    """
+    value = str(row.get("vehicle") or "").strip().lower()
+    if value in {"options", "option"}:
+        return "option"
+    if value in {"equities", "equity", "shares", "stock"}:
+        return "equity"
+    profile = str(row.get("execution_profile") or "").strip().lower()
+    return "option" if profile in {"option", "options"} else "equity"
+
+
+def _vehicle_filter(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    aliases = {"options": "option", "equities": "equity", "shares": "equity",
+               "stock": "equity"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"equity", "option"}:
+        raise ValueError("vehicle must be equity or option")
+    return normalized
 
 
 def _finite(value: object) -> float | None:
@@ -324,16 +352,26 @@ def _order_metrics(measured: Sequence[Mapping[str, Any]], raw_count: int,
     }
 
 
-def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | None = None, *,
+def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | Mapping | None = None, *,
               runtime_mode: str | None = None, vehicle: str | None = None,
               execution_profile: str | None = None) -> dict[str, Any]:
-    model = costs or CostModel()
+    selected_vehicle = _vehicle_filter(vehicle)
+    # A vehicle-filtered authorization report must price itself with that
+    # vehicle's configured schedule.  An explicit CostModel remains
+    # authoritative; a full runtime config or vehicle mapping is resolved by
+    # the shared helper so nested option overrides cannot fall back to flat
+    # costs.
+    model = cost_model_for_vehicle(costs, selected_vehicle or "equity")
     selected = list(rows)
     if runtime_mode is not None:
         selected = [row for row in selected
                     if str(row.get("runtime_mode") or "unknown") == str(runtime_mode)]
-    if vehicle is not None:
-        selected = [row for row in selected if str(row.get("vehicle") or "") == str(vehicle)]
+    if selected_vehicle is not None:
+        # Filter using the same compatibility inference as measurement.  This
+        # prevents a profile-only legacy row from disappearing from an
+        # explicit vehicle report, while never allowing the other vehicle into
+        # its verdict.
+        selected = [row for row in selected if _vehicle(row) == selected_vehicle]
     if execution_profile is not None:
         selected = [row for row in selected
                     if str(row.get("execution_profile") or "") == str(execution_profile)]
@@ -341,6 +379,10 @@ def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | None = None,
     metrics = _order_metrics(measured, len(selected), unique_orders)
     report = _empty_report(model, len(selected), unique_orders,
                            max(0, unique_orders - len(measured)), metrics)
+    available_vehicles = sorted({_vehicle(row) for row in rows})
+    report.update({"vehicle": selected_vehicle,
+                   "vehicle_filter": selected_vehicle,
+                   "available_vehicles": available_vehicles})
     if not measured:
         report.update({"authorization_verdict": "insufficient_data",
                        # Calibration is advisory for offline research, but
@@ -435,8 +477,19 @@ def calibrate(rows: Sequence[Mapping[str, Any]], costs: CostModel | None = None,
     return report
 
 
-def json_report(db: sqlite3.Connection, costs: CostModel | None = None) -> dict[str, Any]:
-    return calibrate(load_execution_fills(db), costs)
+def json_report(db: sqlite3.Connection, costs: CostModel | Mapping | None = None, *,
+                runtime_mode: str | None = None,
+                vehicle: str | None = None,
+                execution_profile: str | None = None) -> dict[str, Any]:
+    """Return a journal calibration report, optionally scoped to one vehicle.
+
+    A mixed journal is diagnostic only.  Callers authorizing a lane should
+    always pass ``vehicle`` so the report's sample, verdict, and authorization
+    are derived exclusively from that vehicle's fills.
+    """
+    return calibrate(load_execution_fills(db), costs,
+                     runtime_mode=runtime_mode, vehicle=vehicle,
+                     execution_profile=execution_profile)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -444,6 +497,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("journal", type=Path)
     parser.add_argument("--config", type=Path, default=None,
                         help="JSON config carrying the costs/execution blocks")
+    parser.add_argument("--vehicle", choices=("equity", "option"), default=None,
+                        help="scope calibration to one vehicle (recommended for authorization)")
     return parser
 
 
@@ -464,7 +519,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     try:
         with closing(sqlite3.connect(args.journal)) as db:
-            report = json_report(db, CostModel.from_config(config))
+            report = json_report(
+                db,
+                CostModel.from_config(config, vehicle=args.vehicle),
+                vehicle=args.vehicle)
     except (OSError, sqlite3.Error) as exc:
         print(f"journal read failed: {exc}", file=sys.stderr)
         return 1

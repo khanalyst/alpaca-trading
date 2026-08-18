@@ -497,15 +497,20 @@ class LiveShadowTests(unittest.TestCase):
 
     def test_semantic_signature_can_match_and_reports_field_mismatch(self):
         payload = {"signal": {"direction": "long", "setup_type": "rule_opening_range_breakout",
-                               "signal_ts": 1767369600.0},
+                               "signal_ts": 1767369600.0,
+                               "decision_timestamp": "2026-01-02T16:00:00+00:00",
+                               "entry_timestamp": "2026-01-02T16:01:00+00:00"},
                    "setup_plan": {"direction": "long", "setup_type": "rule_opening_range_breakout",
                                   "signal_ts": 1767369600.0, "stop_price": 99,
                                   "target_price": 102, "stop_distance": 1,
-                                  "target_r": 2, "execution_profile": "shares"}}
+                                  "target_r": 2, "execution_profile": "shares",
+                                  "decision_timestamp": "2026-01-02T16:00:00+00:00",
+                                  "entry_timestamp": "2026-01-02T16:01:00+00:00"}}
         runtime = _shadow_signature({"kind": "open_incomplete", "symbol": "SPY",
                                      "session_date": "2026-01-02", "payload_json": json.dumps(payload)})
         replay = _replay_signature({"symbol": "SPY", "session_date": "2026-01-02",
                                     "direction": "long", "signal_timestamp": "2026-01-02T16:00:00+00:00",
+                                    "decision_timestamp": "2026-01-02T16:00:00+00:00",
                                     "entry_timestamp": "2026-01-02T16:01:00+00:00",
                                     "stop_price": 99, "target_price": 102,
                                     "stop_distance": 1}, vehicle="equity", strategy_id="rule",

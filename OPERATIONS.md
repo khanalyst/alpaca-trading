@@ -242,8 +242,8 @@ python deploy/backfill.py --days 180
 It writes the same normalized rows, the same one-partition-per-session layout,
 and the same sidecar index the recorder writes, so research cannot distinguish
 a backfilled session from a recorded one and no gate is weakened. Only
-*completed* sessions are written, `as_of` is the bar's own open exactly as the
-recorder records it, and the run is resumable: sessions that already have a
+*completed* sessions are written, `as_of` is the bar's completed one-minute
+boundary exactly as the recorder records it, and the run is resumable: sessions that already have a
 partition are skipped, so re-running is a no-op and an interrupted run
 continues. `--overwrite` replaces existing partitions, `--quotes` also
 backfills quotes (far larger, and rarely needed because replay prices boundary
@@ -436,17 +436,26 @@ once by one preselected candidate alone; other variants remain diagnostic.
 Refinement is coordinate-first: every initial child changes exactly one
 executable field. Bounded two-field interactions are formed only from the best
 measured coordinate lessons, followed by an unchanged confirmation. The
+executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
+configured R target, and bar-cap time exit. Fit-only diagnostics (prefix and
+first-signal rates, floor binding, planned exits, configured/stressed economics,
+power, behavioral aliases, and intended-versus-delivered risk) are
+operator-review telemetry only; they do not expand exits or authorize proof.
 immutable floors are 100 trades plus 30 complete sessions/clusters for
 backtest/factory evidence, 100 trades plus 30 complete sessions/clusters for
 the sealed qualification window, and 150 trades plus 30 complete sessions for
 the parity-matched live-shadow tail. Retirement then requires the same powered
 floors, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
-and at least two negative forward windows for every point. Replay epoch 3
-additionally requires a stop of at least 30 bps for both rule and IBR paths, a
-recomputable risk unit that covers round-trip cost, and executable
-quote/snapshot fill-quality evidence rather than bar-only fallback. Evidence
-from older epochs is retained for audit but quarantined until replayed under
-epoch 3. A valid bounded LLM replacement is registered first when that lane is
+and at least two negative forward windows for every point. Replay epoch 4
+retains the epoch-3 economics gates and additionally requires latest-of-
+event/as-of/observed-at point-in-time availability, executable-row-only
+authorizing statistics, vehicle-specific cost selection/provenance, raw
+confirmatory p-values for FDR, and a stressed-cost runtime abstention boundary.
+Evidence from older epochs is retained for audit but quarantined until replayed
+under epoch 4. Authorization requires exact epoch equality with current epoch 4;
+future epochs are audit-only too. Each current-epoch run seals one immutable
+verified gate proof, and re-derivation appends a new proof instead of rewriting
+history. A valid bounded LLM replacement is registered first when that lane is
 enabled. Demoted candidates
 may re-prove on a newer shadow run. Paper
 outcomes are appended for forward monitoring, scoped to their authorizing proof epoch, and may demote a
@@ -460,9 +469,17 @@ the operator safety action. Good edges emit deterministic,
 content-addressed edge proof reports and may send an optional HTTPS webhook. Keep data
 provenance, session date, feed, contract identity, and costs with each result.
 Do not combine regular-session evidence with pre/post-market or overnight data.
-Replay uses the runtime `ReplayPolicy`: strict 30-second market/quote freshness,
+Replay uses the runtime `ReplayPolicy`: `execution.strict_market_data` defaults
+to `true`, with strict 30-second market/quote freshness,
 DTE/spread/liquidity checks, latest-entry and force-flat cutoffs, and portfolio
 position/notional/gross/open-risk/daily-loss limits.
+Required records become actionable at the maximum of event timestamp, `as_of`,
+and `observed_at`. Delayed recorder bars may signal when observed; execution
+enters at that decision/observation time using fresh SIP/OPRA evidence. Delayed
+full OHLC never backfills an earlier entry, partial pre-entry ranges are
+excluded, and historical bar-fallback rows are diagnostic only and excluded
+from authorizing statistics. Fit diagnostics may count planned signal/exit
+geometry as quote-required, non-authorizing measurement.
 Authorizing fill quality requires both legs to retain provider/feed/source and
 quote age: SIP for equity entry and exit, OPRA for option entry and exit, each
 no older than 30 seconds. Bar-only, partial-feed, missing, or stale legs remain
@@ -489,17 +506,23 @@ accepts only strictly newer,
 complete, parity-matched rows with prior qualification and matching
 source/config/code/provenance/replay/gate hashes; family and global BH plus
 durable online-FDR are applied before an immutable `lane=shadow` proof and
-live-ingestion marker are appended. The confirmatory p-value resolution scales
+live-ingestion marker are appended. The v4 ingester first splits the tail into
+older chronological selection sessions and a newer disjoint confirmatory
+window: BH uses selection raw p-values, while only the selected candidate's raw
+confirmatory p-value is sent to LORD. Legacy same-tail v3 rows remain auditable
+but quarantined. The confirmatory p-value resolution scales
 to the next allocation; if the bounded simulation cap cannot resolve it, the
 ingester reports `confirmatory_resolution_exhausted` without spending alpha or
 advancing a boundary. A failed/mismatched/incomplete tail likewise leaves the
 candidate unchanged and ineligible.
 
-Research is vehicle-complete by default (`ALPACA_RESEARCH_VEHICLES=all`): it
-evaluates equity and single-leg option evidence independently even though the
-shipped trader remains on the `shares` execution profile. Option research does
-not authorize option orders. `python research.py vehicles` shows the selected
-research lanes; a comma-separated subset is an explicit narrowing decision.
+Scheduled research evaluates the equity vehicle only by default because the
+shipped trader remains on the `shares` execution profile. Set
+`ALPACA_RESEARCH_VEHICLES=all` explicitly to evaluate equity and single-leg
+option evidence independently; each lane retains separate calibration and
+authorization evidence. Option research does not authorize option orders.
+`python research.py vehicles` shows the selected research lanes; a
+comma-separated subset is an explicit narrowing decision.
 Selecting the separate `options` execution profile remains paper-only and
 requires reviewed OPRA evidence and controls. The dashboard reports proved
 option edges that the default `shares` runtime cannot execute, so that evidence
@@ -570,10 +593,14 @@ Calibration is an authorization veto: missing, stale, or insufficient evidence,
 an optimistic cost verdict, a terminal material underfill (<80% of requested
 quantity), or a partial-cancel rate above 20% exits non-zero and blocks shadow
 authorization. Offline discovery/factory diagnostics still run. In-flight
-orders are excluded, and the model is never adjusted automatically. The shipped
-cost model is 4 bps spread, 6 bps slippage, 0.5 bps per-side fee, plus a 0.65
-option fee per contract side; proof stress diagnostics are 9/15/25/50 bps with
-25 bps as the required veto scenario.
+orders are excluded, and the model is never adjusted automatically. Optional
+`costs.vehicles.equity`/`.option` schedules are selected and recorded per
+vehicle; otherwise the shipped cost model is 4 bps spread, 6 bps slippage,
+0.5 bps per-side fee, plus a 0.65 option fee per contract side. Runtime risk
+abstains when the configured stress scenario exceeds its cost-to-risk limit and
+persists scenario/cost/ratio telemetry, while order journal rows retain
+intended/delivered risk, delivery ratio, and shortfall; proof stress diagnostics
+are 9/15/25/50 bps with 25 bps as the required veto scenario.
 
 The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this
