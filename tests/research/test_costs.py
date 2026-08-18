@@ -20,7 +20,8 @@ from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
                             RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
-                            SQLiteQuoteIndex, index_quotes, quote_fill)
+                            SQLiteQuoteIndex, index_quotes, quote_fill,
+                            risk_unit_report)
 from research.edge_discovery_core import (DiscoveryError,
                                           _effective_ibr_config,
                                           _read_discovery_rows)
@@ -135,6 +136,56 @@ class CostModelTests(unittest.TestCase):
         # constraint rather than a number somebody remembers to copy.
         with self.assertRaises(CostError):
             CostModel.from_config({"execution": {"max_slippage_bps": 1}})
+
+
+class EquityProvenanceTests(unittest.TestCase):
+    """Only SIP quote legs can authorize equity economics evidence."""
+
+    @staticmethod
+    def _row(**changes):
+        row = {
+            "vehicle": "equity", "opportunity_id": "equity:1",
+            "no_trade": False, "entry_price": 100.0, "exit_price": 101.0,
+            "quantity": 1.0, "contract_multiplier": 1.0,
+            "risk_usd": 10.0, "entry_fill_source": QUOTE,
+            "exit_fill_source": QUOTE, "entry_feed": "sip",
+            "exit_feed": "sip", "entry_provider": "alpaca",
+            "exit_provider": "alpaca", "entry_quote_age_seconds": 0.0,
+            "exit_quote_age_seconds": 0.0,
+        }
+        row.update(changes)
+        return row
+
+    @staticmethod
+    def _report(row):
+        return risk_unit_report(
+            [row], vehicle="equity",
+            costs=CostModel(spread_bps=0, slippage_bps=0, fee_bps=0))
+
+    def test_sip_quote_sources_and_providers_are_adequate(self):
+        self.assertTrue(self._report(self._row())["adequate"])
+
+    def test_iex_quote_source_is_diagnostic_only(self):
+        report = self._report(self._row(entry_feed="iex", exit_feed="iex"))
+        self.assertFalse(report["adequate"])
+
+    def test_missing_or_unknown_equity_feed_is_diagnostic_only(self):
+        for changes in ({"entry_feed": None}, {"exit_feed": None},
+                        {"entry_feed": "unknown"}, {"exit_feed": "unknown"}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self._report(self._row(**changes))["adequate"])
+
+    def test_factory_quote_priced_legs_retain_feed_and_provider(self):
+        row = _simulate_trade(
+            _bars(RISING + FLAT), SPEC, [], "equity",
+            quotes=index_quotes([_quote(4, 99.0, 100.0),
+                                 _quote(8, 99.0, 100.0)]),
+            policy=PERMISSIVE_POLICY)
+        self.assertEqual((row["entry_fill_source"], row["exit_fill_source"]),
+                         (QUOTE, QUOTE))
+        self.assertEqual((row["entry_feed"], row["exit_feed"]), ("sip", "sip"))
+        self.assertEqual((row["entry_provider"], row["exit_provider"]),
+                         ("test", "test"))
 
 
 class SharedModelTests(unittest.TestCase):
@@ -556,6 +607,7 @@ class CalibrationTests(unittest.TestCase):
         report = calibration.json_report(self._journal([(100.10, 100.0, 10)] * 3))
         self.assertEqual(report["referenced_fills"], 3)
         self.assertEqual(report["verdict"], "insufficient_data")
+        self.assertEqual(report["authorization_exit_code"], 2)
 
     def test_an_empty_journal_is_insufficient_data_not_a_pass(self):
         db = sqlite3.connect(":memory:")
@@ -563,12 +615,78 @@ class CalibrationTests(unittest.TestCase):
         report = calibration.json_report(db)
         self.assertEqual(report["journal_fills"], 0)
         self.assertEqual(report["verdict"], "insufficient_data")
+        self.assertEqual(report["authorization_exit_code"], 2)
 
     def test_the_report_names_the_model_it_scored(self):
         db = self._journal([(100.02, 100.0, 10)])
         model = CostModel(spread_bps=1.0, slippage_bps=1.0)
         self.assertEqual(calibration.json_report(db, model)["model"],
                          model.as_dict())
+
+    def _evidence_journal(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute(
+            "CREATE TABLE trades (ts REAL, symbol TEXT, side TEXT, action TEXT, "
+            "qty REAL, price REAL, notional REAL, order_id TEXT, runtime_mode TEXT, "
+            "variant_id TEXT, execution_profile TEXT, vehicle TEXT, "
+            "reference_price REAL, entry_reference REAL, exit_reference REAL, "
+            "market_price REAL, mid_price REAL, requested_qty REAL, planned_qty REAL, "
+            "cumulative_filled_qty REAL, fill_fraction REAL)")
+        db.execute(
+            "CREATE TABLE orders (ts REAL, order_id TEXT, qty REAL, status TEXT, "
+            "filled_qty REAL, requested_qty REAL, planned_qty REAL, "
+            "execution_profile TEXT, vehicle TEXT, reference_price REAL, "
+            "entry_reference REAL, exit_reference REAL)")
+        return db
+
+    def test_incremental_rows_are_one_referenced_order_and_partial_cancel_vetoes(self):
+        db = self._evidence_journal()
+        db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (3, "o1", 10, "canceled", 4, 10, 10, "shares", "equity", 100, 100, None))
+        for ts, qty, price, cumulative in ((1, 2, 100.01, 2), (2, 2, 100.03, 4)):
+            db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (ts, "SPY", "buy", "open", qty, price, qty * price, "o1", "paper",
+                        "v1", "shares", "equity", 100, 100, None, None, None, 10, 10,
+                        cumulative, cumulative / 10))
+        db.commit()
+        report = calibration.json_report(db)
+        self.assertEqual(report["journal_fills"], 2)
+        self.assertEqual(report["unique_orders"], 1)
+        self.assertEqual(report["referenced_fills"], 1)
+        self.assertEqual(report["cumulative_filled_qty"], 4)
+        self.assertEqual(report["partial_cancel_orders"], 1)
+        self.assertEqual(report["authorization_exit_code"], 2)
+        self.assertEqual(report["authorization_verdict"], "veto_underfilled_execution")
+
+    def test_migrated_rows_without_explicit_reference_are_insufficient(self):
+        db = self._evidence_journal()
+        db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (1, "legacy", 10, "filled", 10, 10, 10, "shares", "equity", None, None, None))
+        db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (1, "SPY", "buy", "open", 10, 100.02, 1000.2, "legacy", "paper",
+                    "v1", "shares", "equity", None, None, None, None, None, 10, 10, 10, 1))
+        db.commit()
+        report = calibration.json_report(db)
+        self.assertEqual(report["referenced_fills"], 0)
+        self.assertEqual(report["verdict"], "insufficient_data")
+        self.assertEqual(report["authorization_verdict"], "insufficient_data")
+
+    def test_inflight_partial_status_is_reported_not_penalized(self):
+        db = self._evidence_journal()
+        db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (1, "open", 10, "partially_filled", 4, 10, 10, "shares", "equity", 100, 100, None))
+        db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (1, "SPY", "buy", "open", 4, 100.02, 400.08, "open", "paper",
+                    "v1", "shares", "equity", 100, 100, None, None, None, 10, 10, 4, .4))
+        db.commit()
+        report = calibration.json_report(db)
+        self.assertEqual(report["inflight_orders"], 1)
+        self.assertEqual(report["terminal_orders"], 0)
+        self.assertFalse(report["partial_execution_veto"])
+        # In-flight evidence is diagnostic, but cannot authorize promotion
+        # until the sample reaches the calibration floor.
+        self.assertEqual(report["authorization_exit_code"], 2)
 
 
 if __name__ == "__main__":

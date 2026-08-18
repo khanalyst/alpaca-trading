@@ -31,9 +31,9 @@ from agent.contracts.ibr import generate_ibr_signal
 from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate_rule_spec
 from agent.risk import RiskEngine
 from agent.strategy import build_setup_plan
-from deploy.recorder import corpus_partitions
-from research.costs import ReplayPolicy
-from research.edge_discovery_core import _effective_ibr_config
+from deploy.recorder import INDEX_NAME as RECORDER_INDEX_NAME, corpus_partitions
+from research.costs import ReplayPolicy, replay_policy_for_session
+from research.edge_discovery_core import _effective_ibr_config, _opportunity_rows
 from research.edge_discovery_core import _null_reference_rows, null_control_account
 from research.edge_lab import _null_spec
 from research.factory_core import simulate_account
@@ -101,10 +101,111 @@ def _timestamp(value: Any) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _availability_time(row: Mapping[str, Any]) -> datetime | None:
+    """Return when a recorded event was actually usable by the strategy.
+
+    Provider event time, provider as-of time, and local observation time are
+    separate point-in-time constraints.  The event is not available until all
+    three have occurred.
+    """
+    timestamp = _timestamp(row.get("timestamp"))
+    if timestamp is None:
+        return None
+    as_of = _timestamp(row.get("as_of") or row.get("timestamp"))
+    observed = _timestamp(row.get("observed_at") or row.get("as_of") or
+                          row.get("timestamp"))
+    if as_of is None or observed is None:
+        return None
+    return max(timestamp, as_of, observed)
+
+
+def _row_visible(row: Mapping[str, Any], at: datetime) -> bool:
+    available = _availability_time(row)
+    return available is not None and available <= at
+
+
+def _recorded_session_bounds(corpus_path: Path, session: str) -> tuple[datetime, datetime] | None:
+    """Read the recorder's Alpaca-calendar close for one session.
+
+    The sidecar is recorder-owned and rewritten atomically.  Missing legacy
+    calendar metadata deliberately falls back to the regular close in replay;
+    newly recorded early closes use the exact broker calendar boundary.
+    """
+    index_path = corpus_path.parent / RECORDER_INDEX_NAME
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    calendar = payload.get("session_calendar") if isinstance(payload, Mapping) else None
+    value = calendar.get(session) if isinstance(calendar, Mapping) else None
+    if not isinstance(value, Mapping):
+        return None
+    opened = _timestamp(value.get("open"))
+    closed = _timestamp(value.get("close"))
+    if (opened is None or closed is None or opened >= closed or
+            opened.astimezone(NEW_YORK).date().isoformat() != session or
+            closed.astimezone(NEW_YORK).date().isoformat() != session):
+        return None
+    return opened, closed
+
+
+def _recorded_session_close(corpus_path: Path, session: str) -> datetime | None:
+    bounds = _recorded_session_bounds(corpus_path, session)
+    return bounds[1] if bounds is not None else None
+
+
+def _session_close(corpus_path: Path, session: str, *,
+                   require_exact_calendar: bool = False) -> tuple[datetime | None, str]:
+    """Resolve the exact close, retaining an explicit legacy fallback label."""
+    recorded = _recorded_session_close(corpus_path, session)
+    if recorded is not None:
+        return recorded, "recorder_alpaca_calendar"
+    if require_exact_calendar:
+        return None, "exact_calendar_metadata_missing"
+    try:
+        local_day = date.fromisoformat(session)
+    except ValueError:
+        return None, "invalid_session"
+    return (datetime.combine(local_day, dt_time(16, 0), NEW_YORK).astimezone(UTC),
+            "regular_close_fallback")
+
+
+def _event_end(row: Mapping[str, Any]) -> datetime | None:
+    as_of = _timestamp(row.get("as_of"))
+    if as_of is not None:
+        return as_of
+    stamp = _timestamp(row.get("timestamp"))
+    return stamp + timedelta(minutes=1) if stamp is not None else None
+
+
+def _session_policy(config: Mapping[str, Any], close_at: datetime | None) -> ReplayPolicy:
+    """Apply runtime close-relative entry and force-flat cutoffs to replay."""
+    policy = _policy(config)
+    if close_at is None:
+        return policy
+    local_close = close_at.astimezone(NEW_YORK)
+    # The close-relative helper is shared with factory and IBR replay.  The
+    # synthetic open is only used to validate the NY session date here.
+    local_open = datetime.combine(local_close.date(), dt_time(9, 30),
+                                  tzinfo=NEW_YORK).astimezone(UTC)
+    return replay_policy_for_session(
+        policy, session_open=local_open, session_close=close_at,
+        session_date=local_close.date())
+
+
+def _option_snapshot_index(values: Sequence[Any]) -> dict[datetime, Any]:
+    """Preserve every option snapshot even when contracts share a timestamp."""
+    origin = datetime(1970, 1, 1, tzinfo=UTC)
+    return {origin + timedelta(microseconds=index): value
+            for index, value in enumerate(values)}
+
+
 def _plain(value: Any) -> Any:
     """Convert normalized dataclasses into finite JSON-safe mappings."""
     if dataclasses.is_dataclass(value):
         return _plain(dataclasses.asdict(value))
+    if not isinstance(value, type) and hasattr(value, "__dict__"):
+        return _plain(vars(value))
     if isinstance(value, Mapping):
         return {str(k): _plain(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -299,25 +400,58 @@ def _read_corpus_append(source: Path, offset: int) -> tuple[list[dict], int]:
 
 
 def _compact_shadow_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
-    """Keep all bars/options and the final quote per symbol/minute."""
+    """Keep all bars/options and every quote needed at a decision boundary.
+
+    First/last minute quotes retain the open/close path while the exact latest
+    visible quote at each recorded bar availability time preserves delayed
+    after-close decisions.  This remains bounded without replacing an entry
+    boundary quote with a later quote from the same minute.
+    """
     retained: list[dict] = []
-    quotes: dict[tuple[str, str], tuple[datetime, dict]] = {}
+    quote_rows: dict[str, list[tuple[datetime, datetime, dict]]] = {}
+    cutoffs: dict[str, list[datetime]] = {}
     for raw in rows:
         row = dict(raw)
         event_type = str(row.get("event_type") or "").strip().lower()
         if event_type != "quote":
             retained.append(row)
+            if event_type in {"bar", "bar_1m"}:
+                available = _availability_time(row)
+                if available is not None:
+                    cutoffs.setdefault(str(row.get("symbol") or ""), []).append(available)
             continue
         stamp = _timestamp(row.get("timestamp"))
-        if stamp is None:
+        available = _availability_time(row)
+        if stamp is None or available is None:
             retained.append(row)  # normal validation emits the hard failure
             continue
-        minute = stamp.replace(second=0, microsecond=0).isoformat()
-        key = (str(row.get("symbol") or ""), minute)
-        previous = quotes.get(key)
-        if previous is None or stamp >= previous[0]:
-            quotes[key] = (stamp, row)
-    retained.extend(item[1] for item in quotes.values())
+        quote_rows.setdefault(str(row.get("symbol") or ""), []).append(
+            (available, stamp, row))
+
+    selected: dict[str, dict] = {}
+    for symbol, values in quote_rows.items():
+        values.sort(key=lambda item: (item[1], str(item[2].get("event_key") or "")))
+        by_minute: dict[str, list[tuple[datetime, datetime, dict]]] = {}
+        for item in values:
+            by_minute.setdefault(item[1].replace(second=0, microsecond=0).isoformat(), []).append(item)
+        for minute_values in by_minute.values():
+            for item in (minute_values[0], minute_values[-1]):
+                row = item[2]
+                selected[str(row.get("event_key") or _digest(row))] = row
+
+        available_values = sorted(
+            values, key=lambda item: (item[0], item[1],
+                                      str(item[2].get("event_key") or "")))
+        cursor = 0
+        latest: dict | None = None
+        for cutoff in sorted(set(cutoffs.get(symbol, ()))):
+            while cursor < len(available_values) and available_values[cursor][0] <= cutoff:
+                latest = available_values[cursor][2]
+                cursor += 1
+            if latest is not None:
+                selected[str(latest.get("event_key") or _digest(latest))] = latest
+
+    retained.extend(selected.values())
     retained.sort(key=lambda row: (str(row.get("timestamp") or ""),
                                    str(row.get("event_key") or "")))
     return retained
@@ -691,10 +825,11 @@ class ShadowStore:
             raise ShadowError("shadow account cash/P&L must be finite")
         ordered: list[dict[str, Any]] = []
         for trade in trades:
-            if not isinstance(trade, Mapping) or trade.get("no_trade") is True:
+            if not isinstance(trade, Mapping):
                 continue
             ordered.append(dict(trade))
         ordered.sort(key=_json)
+        trade_count = len([row for row in ordered if row.get("no_trade") is not True])
         account_id = _digest({"candidate_id": candidate_id,
                               "session_date": session_date,
                               "replay_digest": replay_digest})
@@ -704,7 +839,7 @@ class ShadowStore:
                  starting_cash,ending_cash,realized_pnl,trade_count,replay_status,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
                     account_id, candidate_id, session_date, replay_digest,
-                    str(vehicle), values[0], values[1], values[2], len(ordered),
+                    str(vehicle), values[0], values[1], values[2], trade_count,
                     str(replay_status), time.time()))
             occurrence: dict[str, int] = {}
             for trade in ordered:
@@ -878,7 +1013,11 @@ def _policy(config: Mapping[str, Any]) -> ReplayPolicy:
     try:
         return replace(ReplayPolicy.from_config(config), strict_market_data=True)
     except Exception:
-        return ReplayPolicy()
+        session = config.get("session") if isinstance(config, Mapping) else {}
+        required = bool(session.get("require_exact_calendar", False)) \
+            if isinstance(session, Mapping) else False
+        return ReplayPolicy(strict_market_data=True,
+                            require_exact_calendar=required)
 
 
 def _safe_config(candidate: Mapping[str, Any]) -> dict:
@@ -982,7 +1121,7 @@ class ShadowRunner:
         valid = []
         for row in rows:
             stamp = _timestamp(row.get("timestamp"))
-            if stamp is not None and stamp <= at:
+            if stamp is not None and stamp <= at and _row_visible(row, at):
                 bid, ask = _finite(row.get("bid")), _finite(row.get("ask"))
                 if bid is not None and ask is not None and bid > 0 and ask >= bid:
                     valid.append((stamp, row))
@@ -994,12 +1133,42 @@ class ShadowRunner:
         symbol = str(event.get("symbol") or "")
         cfg = _safe_config(candidate)
         strategy = cfg.get("strategy", {})
-        event_at = _timestamp(event.get("as_of") or event.get("timestamp"))
+        event_at = _availability_time(event)
         if event_at is None:
             return "no_data", "event timestamp unavailable", {}, None
-        session = event_at.astimezone(NEW_YORK).date().isoformat()
+        market_at = _timestamp(event.get("timestamp") or event.get("as_of"))
+        if market_at is None:
+            return "no_data", "event market timestamp unavailable", {}, None
+        session = market_at.astimezone(NEW_YORK).date().isoformat()
+        session_cfg = cfg.get("session") if isinstance(cfg.get("session"), Mapping) else {}
+        require_exact_calendar = bool(session_cfg.get("require_exact_calendar", False))
+        close_at, calendar_source = _session_close(
+            self.config.corpus_path, session,
+            require_exact_calendar=require_exact_calendar)
+        if require_exact_calendar and close_at is None:
+            return ("no_data", "exact broker calendar metadata unavailable",
+                    {"session_date": session,
+                     "calendar_source": calendar_source}, None)
+        policy = _session_policy(cfg, close_at)
+        calendar_bounds = _recorded_session_bounds(
+            self.config.corpus_path, session)
+        if close_at is not None:
+            local_day = market_at.astimezone(NEW_YORK).date()
+            latest_at = (datetime.combine(local_day, policy.latest_entry_time,
+                                          tzinfo=NEW_YORK).astimezone(UTC)
+                         if policy.latest_entry_time is not None else close_at)
+            if event_at >= close_at or event_at >= latest_at:
+                return ("no_trade", "session entry cutoff reached",
+                        {"session_date": session,
+                         "session_close": close_at.isoformat(),
+                         "calendar_source": calendar_source}, None)
         stream = [row for row in bars.get(symbol, [])
-                  if (_timestamp(row.get("as_of") or row.get("timestamp")) or datetime.min.replace(tzinfo=UTC)) <= event_at]
+                  if _row_visible(row, event_at)
+                  and (close_at is None or (
+                      (calendar_bounds is None or
+                       (_timestamp(row.get("timestamp")) or close_at) >= calendar_bounds[0])
+                      and (_timestamp(row.get("timestamp")) or close_at) < close_at
+                      and (_event_end(row) or close_at) <= close_at))]
         if len(stream) < 2:
             return "no_data", "insufficient bars", {"session_date": session}, None
         strategy_id = str(candidate.get("strategy_id") or strategy.get("id") or "ibr")
@@ -1014,7 +1183,6 @@ class ShadowRunner:
         if signal is None:
             return "no_trade", "no signal", base, None
         quote = self._latest_quote(quotes.get(symbol, ()), event_at)
-        policy = _policy(cfg)
         snap: dict[str, Any] = {"price": _finite(event.get("close")) or _finite(event.get("open")),
                                 "close": _finite(event.get("close")),
                                 "spread_bps": None, "stale": True, "quote_stale": True,
@@ -1044,12 +1212,17 @@ class ShadowRunner:
             option_rows = []
             for row in options.get(symbol, ()):
                 stamp = _timestamp(row.get("timestamp"))
-                if stamp is not None and stamp <= event_at:
+                if (stamp is not None and stamp <= event_at and
+                        _row_visible(row, event_at) and
+                        str(row.get("feed") or "").strip().lower() == "opra"):
                     item = dict(row)
                     item.setdefault("quote_ts", stamp.isoformat())
                     age = max(0.0, (event_at - stamp).total_seconds())
                     item.setdefault("quote_age_seconds", age)
                     option_rows.append(item)
+            if not option_rows:
+                return ("unpriced", "executable OPRA option chain unavailable",
+                        base | {"snapshot": snap}, None)
             snap["option_chain"] = option_rows
         if snap["stale"] or snap["quote_stale"]:
             return "unpriced", "stale or unavailable quote", base | {"snapshot": snap}, None
@@ -1124,8 +1297,32 @@ class ShadowRunner:
         # digest so a corrected/stale option snapshot cannot be mistaken for
         # the same replay window merely because the underlying bars/quotes
         # were unchanged.
-        source_digest = _digest({"bars": session_bars, "quotes": session_quotes,
-                                 "options": session_options or ()})
+        cfg = _safe_config(candidate)
+        session_cfg = cfg.get("session") if isinstance(cfg.get("session"), Mapping) else {}
+        require_exact_calendar = bool(session_cfg.get("require_exact_calendar", False))
+        calendar_close, calendar_source = _session_close(
+            self.config.corpus_path, session,
+            require_exact_calendar=require_exact_calendar)
+        if require_exact_calendar and calendar_close is None:
+            session_bars = ()
+            session_quotes = ()
+            session_options = ()
+        in_session_bars = [row for row in session_bars
+                           if calendar_close is None or (
+                               (_timestamp(row.get("timestamp")) or calendar_close) < calendar_close
+                               and (_event_end(row) or calendar_close) <= calendar_close)]
+        in_session_quotes = [row for row in session_quotes
+                             if calendar_close is None or
+                             (_timestamp(row.get("timestamp")) or calendar_close) <= calendar_close]
+        in_session_options = [row for row in (session_options or ())
+                              if calendar_close is None or
+                              (_timestamp(row.get("timestamp")) or calendar_close) <= calendar_close]
+        source_digest = _digest({"bars": in_session_bars,
+                                 "quotes": in_session_quotes,
+                                 "options": in_session_options,
+                                 "session_close": (calendar_close.isoformat()
+                                                   if calendar_close else None),
+                                 "calendar_source": calendar_source})
         shadow_signatures = []
         for row in decisions:
             if row.get("session_date") != session:
@@ -1135,7 +1332,6 @@ class ShadowRunner:
                 shadow_signatures.append(signature)
         shadow_signatures.sort(key=lambda row: _json(row))
         shadow_digest = _digest(shadow_signatures)
-        cfg = _safe_config(candidate)
         replay_digest = None
         replay_ok = False
         replay_signatures: list[dict[str, Any]] = []
@@ -1146,29 +1342,44 @@ class ShadowRunner:
         ending_cash = starting_cash
         realized_pnl = 0.0
         details: dict[str, Any] = {"complete": False, "trade_count": 0,
+                                   "session_close": (calendar_close.isoformat()
+                                                     if calendar_close else None),
+                                   "calendar_source": calendar_source,
                                    "shadow_signatures": shadow_signatures,
                                    "replay_signatures": replay_signatures}
-        def event_end(row: Mapping[str, Any]) -> datetime:
-            as_of = _timestamp(row.get("as_of"))
-            if as_of is not None:
-                return as_of
-            stamp = _timestamp(row.get("timestamp"))
-            return ((stamp + timedelta(seconds=60)) if stamp is not None else
-                    datetime.min.replace(tzinfo=UTC))
-
-        complete = any(event_end(row).astimezone(NEW_YORK).time() >= dt_time(16, 0)
-                       for row in session_bars)
+        complete = bool(calendar_close is not None and
+                        any((_event_end(row) or datetime.min.replace(tzinfo=UTC)) >=
+                            calendar_close for row in in_session_bars))
         try:
-            normalized_bars = [_normalize_row(row)[1] for row in session_bars]
-            normalized_quotes = [_normalize_row(row)[1] for row in session_quotes]
+            calendar_bounds = _recorded_session_bounds(
+                self.config.corpus_path, session)
+            if require_exact_calendar and calendar_bounds is None:
+                raise ShadowError("exact broker calendar metadata unavailable")
+            normalized_bar_rows = []
+            for row in in_session_bars:
+                enriched = dict(row)
+                if calendar_bounds is not None:
+                    enriched["session_open"] = calendar_bounds[0].isoformat()
+                    enriched["session_close"] = calendar_bounds[1].isoformat()
+                normalized_bar_rows.append(enriched)
+            normalized_bars = [_normalize_row(row)[1]
+                              for row in normalized_bar_rows]
+            normalized_quotes = [_normalize_row(row)[1] for row in in_session_quotes]
             normalized_options = [_normalize_row(row)[1]
-                                 for row in (session_options or ())]
+                                 for row in in_session_options]
+            replay_policy = _session_policy(cfg, calendar_close)
             if str(candidate.get("strategy_id")) == "ibr":
-                replay_cfg, _ = _effective_ibr_config(cfg, {}, close_confirmed=True)
+                replay_cfg, _ = _effective_ibr_config(
+                    cfg, {}, close_confirmed=True, policy=replay_policy)
+                option_index = _option_snapshot_index(normalized_options)
                 result = replay_ibr(normalized_bars, config=replay_cfg,
-                                    vehicle=str(candidate.get("vehicle") or "equity"), quotes=normalized_quotes)
+                                    vehicle=str(candidate.get("vehicle") or "equity"),
+                                    option_snapshots=option_index,
+                                    quotes=normalized_quotes)
                 trades = [_plain(trade) for trade in result.trades]
-                evidence_rows = trades
+                evidence_rows = _opportunity_rows(
+                    result, normalized_bars,
+                    str(candidate.get("vehicle") or "equity"))
                 realized_pnl = sum(_finite(trade.get("net_pnl")) or 0.0
                                    for trade in trades)
                 ending_cash = starting_cash + realized_pnl
@@ -1176,7 +1387,8 @@ class ShadowRunner:
                                      if (signature := _replay_signature(
                                          trade, vehicle=str(candidate.get("vehicle") or "equity"),
                                          strategy_id="ibr", target_r=replay_cfg.target_r)) is not None]
-                details.update(complete=complete, trade_count=len(trades), trades=trades,
+                details.update(complete=complete, trade_count=len(trades),
+                               opportunity_count=len(evidence_rows), trades=trades,
                                replay_signatures=replay_signatures)
                 # Persist the exact-window randomized-entry null alongside the
                 # candidate replay.  It is a diagnostic research source, not a
@@ -1206,7 +1418,7 @@ class ShadowRunner:
                 spec = strategy.get("rule_spec") if isinstance(strategy, Mapping) else None
                 if not isinstance(spec, Mapping):
                     raise ValueError("rule candidate has no validated rule_spec")
-                policy = _policy(cfg)
+                policy = replay_policy
                 account = simulate_account(
                     normalized_bars, normalized_options,
                     spec, vehicle=str(candidate.get("vehicle") or "equity"),

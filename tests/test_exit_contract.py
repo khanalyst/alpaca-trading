@@ -18,6 +18,7 @@ from agent import state
 from agent.alpaca_domain import Account, Order, OrderRequest, Position, Quote
 from agent.config import validate_config
 from agent.contracts.rule import (BAR_SECONDS, RuleSpecError,
+                                  MIN_STOP_DISTANCE_FRACTION,
                                   generate_rule_signal, hold_deadline,
                                   rule_variant_id, validate_rule_spec)
 from agent.engine import Engine
@@ -43,6 +44,13 @@ FLAT = [100.8] * 8
 BAR_ONLY_POLICY = ReplayPolicy(strict_market_data=False)
 BAR_ONLY_SIZING_POLICY = ReplayPolicy(
     strict_market_data=False, risk_per_trade_pct=.05)
+
+
+def _expected_protective_levels():
+    """Derive the stop/target from the current executable stop floor."""
+    anchor = RISING[-1]
+    distance = anchor * MIN_STOP_DISTANCE_FRACTION
+    return anchor - distance, anchor + distance * SPEC["target_r"], distance
 
 
 def _payloads(closes, opens=None, ranges=None):
@@ -395,29 +403,33 @@ class ExitContractDifferentialTests(unittest.TestCase):
     def test_a_gap_up_entry_does_not_move_the_protective_levels(self):
         simulated, plan, reason, exit_at = self._differential(
             RISING + FLAT, "runtime-gap-up", opens={4: 101.0})
+        expected_stop, expected_target, expected_distance = _expected_protective_levels()
         self.assertEqual(simulated["underlying_entry"], 101.0)
-        self.assertAlmostEqual(simulated["stop_price"], 100.5, places=9)
-        self.assertAlmostEqual(simulated["target_price"], 101.4, places=9)
+        self.assertAlmostEqual(simulated["stop_price"], expected_stop, places=9)
+        self.assertAlmostEqual(simulated["target_price"], expected_target, places=9)
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "max_hold")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
         # Sizing still uses the nominal distance the runtime sizes on; the gap
         # shows up only in the risk the fill actually committed.
-        self.assertAlmostEqual(simulated["stop_distance"], .3, places=9)
-        self.assertAlmostEqual(simulated["risk_per_unit"], .3, places=9)
-        self.assertAlmostEqual(simulated["realized_risk_per_unit"], .5, places=9)
+        self.assertAlmostEqual(simulated["stop_distance"], expected_distance, places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], expected_distance, places=9)
+        self.assertAlmostEqual(simulated["realized_risk_per_unit"],
+                               101.0 - expected_stop, places=9)
 
     def test_a_gap_down_entry_does_not_move_the_protective_levels(self):
         simulated, plan, reason, exit_at = self._differential(
             RISING + FLAT, "runtime-gap-down", opens={4: 100.6})
+        expected_stop, expected_target, expected_distance = _expected_protective_levels()
         self.assertEqual(simulated["underlying_entry"], 100.6)
-        self.assertAlmostEqual(simulated["stop_price"], 100.5, places=9)
-        self.assertAlmostEqual(simulated["target_price"], 101.4, places=9)
+        self.assertAlmostEqual(simulated["stop_price"], expected_stop, places=9)
+        self.assertAlmostEqual(simulated["target_price"], expected_target, places=9)
         self.assertEqual(simulated["exit_reason"], "time")
         self.assertEqual(reason, "max_hold")
         self.assertEqual(exit_at.isoformat(), simulated["exit_timestamp"])
-        self.assertAlmostEqual(simulated["risk_per_unit"], .3, places=9)
-        self.assertAlmostEqual(simulated["realized_risk_per_unit"], .1, places=9)
+        self.assertAlmostEqual(simulated["risk_per_unit"], expected_distance, places=9)
+        self.assertAlmostEqual(simulated["realized_risk_per_unit"],
+                               100.6 - expected_stop, places=9)
 
     def test_a_gapped_entry_still_agrees_on_a_stop_exit(self):
         closes = RISING + [100.8, 100.4] + FLAT[:5]
@@ -466,15 +478,16 @@ class ExitContractDifferentialTests(unittest.TestCase):
         bars = _bars(RISING + FLAT, ranges={4: (100.85, 100.4)})
         simulated = _simulate_trade(
             bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
+        expected_stop, expected_target, _ = _expected_protective_levels()
         self.assertEqual(simulated["exit_reason"], "stop")
         self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
-        self.assertAlmostEqual(simulated["exit_reference"], 100.5, places=9)
+        self.assertAlmostEqual(simulated["exit_reference"], expected_stop, places=9)
         bars = _bars(RISING + FLAT, ranges={4: (101.45, 100.75)})
         simulated = _simulate_trade(
             bars, SPEC, [], "equity", policy=BAR_ONLY_POLICY)
         self.assertEqual(simulated["exit_reason"], "target")
         self.assertEqual(simulated["exit_timestamp"], bars[4].end.isoformat())
-        self.assertAlmostEqual(simulated["exit_reference"], 101.4, places=9)
+        self.assertAlmostEqual(simulated["exit_reference"], expected_target, places=9)
 
     def test_the_entry_bar_stop_wins_a_two_sided_tie(self):
         # Both levels inside one bar's range: the intrabar path is unknowable,
@@ -539,20 +552,24 @@ class GappedEntrySizingTests(unittest.TestCase):
                 self.assertEqual(row["quantity"], self._runtime_shares(
                     row["stop_price"] + row["stop_distance"],
                     row["stop_distance"]))
-                self.assertEqual(row["quantity"], 166)
 
     def test_a_gap_against_the_stop_overspends_the_risk_budget(self):
         flat, gapped = self._row(), self._row({4: 101.0})
         self.assertEqual(gapped["quantity"], flat["quantity"])
-        self.assertAlmostEqual(flat["risk_usd"], 166 * .3, places=6)
-        # 166 shares risking 101.00 - 100.50 is $83 against a $50 budget.
-        self.assertAlmostEqual(gapped["risk_usd"], 166 * .5, places=6)
+        self.assertAlmostEqual(flat["risk_usd"],
+                               flat["quantity"] * flat["stop_distance"], places=6)
+        # The gap commits more risk than the plan's nominal budget.
+        self.assertAlmostEqual(gapped["risk_usd"],
+                               gapped["quantity"] * gapped["realized_risk_per_unit"],
+                               places=6)
         self.assertGreater(gapped["risk_usd"], gapped["risk_budget"])
         self.assertLess(flat["risk_usd"], flat["risk_budget"] + 1e-9)
 
     def test_a_gap_toward_the_stop_underspends_the_risk_budget(self):
         row = self._row({4: 100.6})
-        self.assertAlmostEqual(row["risk_usd"], 166 * .1, places=6)
+        self.assertAlmostEqual(row["risk_usd"],
+                               row["quantity"] * row["realized_risk_per_unit"],
+                               places=6)
         self.assertLess(row["risk_usd"], row["risk_budget"])
 
     def test_an_entry_through_the_stop_is_booked_as_a_losing_trade(self):
@@ -565,7 +582,8 @@ class GappedEntrySizingTests(unittest.TestCase):
         self.assertIs(row["no_trade"], False)
         self.assertIs(row["entry_gap_fill"], True)
         self.assertEqual(row["exit_reason"], "stop")
-        self.assertEqual(row["quantity"], 166)
+        self.assertEqual(row["quantity"], self._runtime_shares(
+            row["stop_price"] + row["stop_distance"], row["stop_distance"]))
         self.assertEqual(book["trades"], 1)
         self.assertLess(row["net_pnl"], 0.0)
         # Exit is the fill, not the unreachable better stop price.

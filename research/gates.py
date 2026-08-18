@@ -19,11 +19,17 @@ from statistics import mean
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
-from .costs import QUOTE as QUOTE_FILL
+from .costs import CostError, CostModel, QUOTE as QUOTE_FILL, risk_unit_report as _risk_unit_report
 from .stats import (
-    DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS, cluster_bootstrap_lower_bound,
+    DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS,
+    effective_breadth_report, moving_block_cluster_bootstrap_lower_bound,
     paired_cluster_sign_flip, sign_flip_null_statistics, stable_seed,
 )
+
+# Publicly expose the report from the gate module as well: callers constructing
+# a proof need not know whether the economics calculation lives beside the
+# cost model or beside the acceptance checks.
+risk_unit_report = _risk_unit_report
 
 
 GATE_ENVELOPE_SCHEMA = "verified-research-gate.v2"
@@ -42,14 +48,121 @@ GATE_REQUIRED_CHECKS = frozenset({
     "cumulative_fdr_significant", "qualification_available",
     "qualification_net_positive", "qualification_delta_positive",
     "max_drawdown_supported",
+    "risk_unit_adequate", "fill_quality_adequate", "cost_stress_adequate",
+    "qualification_floor_adequate", "qualification_confidence_supported",
+    "qualification_drawdown_supported",
 })
 CLUSTER_SECONDS = 86_400
 LOWER_BOUND_CONFIDENCE = .95
+SERIAL_BLOCK_LENGTH = 5
+OPTION_MAX_QUOTE_AGE_SECONDS = 30.0
+# Immutable authorizing evidence floors.  The historical ``QUALIFICATION_*``
+# names above remain public compatibility knobs for local statistical fixtures,
+# but durable envelopes are checked against these protocol constants.  Keeping
+# the protocol separate means a compact diagnostic test cannot lower an
+# authorizing proof by monkeypatching a helper default or by forging the
+# ``minimums`` object persisted in an envelope.
+PROTOCOL_BACKTEST_MIN_TRADES = 100
+PROTOCOL_BACKTEST_MIN_SESSIONS = 30
+PROTOCOL_BACKTEST_MIN_CLUSTERS = 30
+PROTOCOL_SHADOW_MIN_TRADES = 150
+PROTOCOL_SHADOW_MIN_SESSIONS = 30
+PROTOCOL_SHADOW_MIN_CLUSTERS = 30
+PROTOCOL_QUALIFICATION_MIN_TRADES = 100
+PROTOCOL_QUALIFICATION_MIN_SESSIONS = 30
+PROTOCOL_QUALIFICATION_MIN_CLUSTERS = 30
+# Readable aliases for callers that want to display the protocol without
+# depending on the internal naming scheme.  Enforcement uses ``PROTOCOL_*``
+# directly so these compatibility names cannot weaken a durable check.
+BACKTEST_MIN_TRADES = PROTOCOL_BACKTEST_MIN_TRADES
+BACKTEST_MIN_SESSIONS = PROTOCOL_BACKTEST_MIN_SESSIONS
+BACKTEST_MIN_CLUSTERS = PROTOCOL_BACKTEST_MIN_CLUSTERS
+SHADOW_MIN_TRADES = PROTOCOL_SHADOW_MIN_TRADES
+SHADOW_MIN_SESSIONS = PROTOCOL_SHADOW_MIN_SESSIONS
+SHADOW_MIN_CLUSTERS = PROTOCOL_SHADOW_MIN_CLUSTERS
+QUALIFICATION_MIN_TRADES = PROTOCOL_QUALIFICATION_MIN_TRADES
+QUALIFICATION_MIN_SESSIONS = PROTOCOL_QUALIFICATION_MIN_SESSIONS
+QUALIFICATION_MIN_CLUSTERS = PROTOCOL_QUALIFICATION_MIN_CLUSTERS
 # Qualification observations are source evidence carried outside the run's
 # fit/held-out rows.  Keep both storage and verification bounded so a malformed
 # recorder row cannot inflate a proof envelope without limit.
 QUALIFICATION_MAX_ROWS = 10_000
 QUALIFICATION_MAX_BYTES = 2_000_000
+COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
+COST_STRESS_REQUIRED_BPS = 25.0
+
+
+def protocol_minimums(lane: str) -> dict[str, int]:
+    """Return the immutable minimum sample sizes for an authorizing lane.
+
+    ``backtest`` covers offline/factory evidence.  ``shadow`` is the
+    parity-matched live-shadow authorization lane and therefore carries the
+    larger executed-trade floor.  The returned mapping is a fresh dictionary
+    so callers cannot mutate the code-owned protocol constants.
+    """
+    normalized = str(lane).strip().lower()
+    if normalized == "backtest":
+        return {"trades": PROTOCOL_BACKTEST_MIN_TRADES,
+                "sessions": PROTOCOL_BACKTEST_MIN_SESSIONS,
+                "clusters": PROTOCOL_BACKTEST_MIN_CLUSTERS}
+    if normalized == "shadow":
+        return {"trades": PROTOCOL_SHADOW_MIN_TRADES,
+                "sessions": PROTOCOL_SHADOW_MIN_SESSIONS,
+                "clusters": PROTOCOL_SHADOW_MIN_CLUSTERS}
+    raise ValueError("lane must be backtest or shadow")
+
+
+def validate_protocol_floor(*, lane: str, min_trades: int,
+                            min_sessions: int) -> dict[str, int]:
+    """Reject caller-configured floors below the authorizing protocol.
+
+    This helper is intentionally independent from :func:`structural_floor`:
+    local diagnostics may request smaller samples, while production/API write
+    boundaries must fail before replay or persistence begins.
+    """
+    required = protocol_minimums(lane)
+    values = {"trades": min_trades, "sessions": min_sessions}
+    for name, value in values.items():
+        if (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(f"{name} must be an integer")
+        if int(value) < required[name]:
+            raise ValueError(
+                f"{name} must be >= {required[name]} for {lane} authorization")
+    return required
+
+
+def _floor_minimums_meet(report: Mapping[str, Any] | None, *, lane: str) -> bool:
+    """Whether a persisted fit/held-out floor declares the protocol minimum."""
+    if not isinstance(report, Mapping):
+        return False
+    minimums = report.get("minimums")
+    if not isinstance(minimums, Mapping):
+        return False
+    try:
+        required = protocol_minimums(lane)
+        return all(
+            (isinstance(minimums.get(name), int) and
+             not isinstance(minimums.get(name), bool) and
+             minimums.get(name) >= value)
+            for name, value in required.items())
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _qualification_minimums_meet(minimums: Mapping[str, Any] | None) -> bool:
+    if not isinstance(minimums, Mapping):
+        return False
+    try:
+        return all(
+            (isinstance(minimums.get(name), int) and
+             not isinstance(minimums.get(name), bool) and
+             minimums.get(name) >= value)
+            for name, value in (
+                ("trades", PROTOCOL_QUALIFICATION_MIN_TRADES),
+                ("sessions", PROTOCOL_QUALIFICATION_MIN_SESSIONS),
+                ("clusters", PROTOCOL_QUALIFICATION_MIN_CLUSTERS)))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 class SealedWindowError(RuntimeError):
@@ -256,7 +369,10 @@ def expectancy_rejection_report(
         rows: Iterable[Mapping], *, vehicle: str,
         minimum_useful_r: float = RETIREMENT_MIN_USEFUL_R,
         confidence: float = RETIREMENT_CONFIDENCE,
-        min_sessions: int = RETIREMENT_MIN_SESSIONS) -> dict:
+        min_sessions: int = RETIREMENT_MIN_SESSIONS,
+        draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+        seed: int | None = None,
+        block_length: int | None = None) -> dict:
     """Test whether a useful after-cost expectancy has been ruled out.
 
     Promotion asks whether the lower bound is positive.  Retirement is the
@@ -285,17 +401,24 @@ def expectancy_rejection_report(
     values = (r_values if r_complete else
               [float(row.get("net_pnl", 0.0)) for row in selected])
     clusters = [str(row.get("cluster") or _session_key(row)) for row in selected]
-    bound = cluster_bootstrap_lower_bound(
-        values, clusters, confidence=float(confidence))
+    session_count = len({cluster for cluster in clusters if cluster})
+    resolved_block_length = (min(SERIAL_BLOCK_LENGTH, max(1, session_count))
+                             if block_length is None else int(block_length))
+    bound = moving_block_cluster_bootstrap_lower_bound(
+        values, clusters, confidence=float(confidence), draws=int(draws),
+        seed=seed, block_length=resolved_block_length,
+        min_clusters=max(2, int(min_sessions)))
     threshold = float(minimum_useful_r) if r_complete else 0.0
     upper = bound.get("upper_bound")
-    session_count = len({cluster for cluster in clusters if cluster})
     sufficient = bool(bound.get("available") and
                       session_count >= int(min_sessions))
     rejects = bool(sufficient and upper is not None and
                    float(upper) <= threshold)
     return {
+        # Preserve the report's historical public method label; the nested
+        # bootstrap records the chronology-aware implementation explicitly.
         "method": "cluster_bootstrap_upper_equivalence_bound",
+        "bootstrap_method": bound.get("method"),
         "unit": unit,
         "minimum_useful_expectancy": threshold,
         "confidence": float(confidence),
@@ -307,6 +430,9 @@ def expectancy_rejection_report(
         "sessions_required": int(min_sessions),
         "sample_sufficient": sufficient,
         "rejects_minimum_useful_edge": rejects,
+        "draws": bound.get("draws"),
+        "seed": bound.get("seed"),
+        "block_length": bound.get("block_length"),
         "bootstrap": bound,
     }
 
@@ -399,8 +525,11 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
                in zip(pairs["timestamps"], pairs["deltas"])]
     result = paired_cluster_sign_flip(triples, cluster_seconds=CLUSTER_SECONDS,
                                        iterations=iterations, seed=seed)
-    bound = cluster_bootstrap_lower_bound(
-        pairs["deltas"], pairs["clusters"], confidence=confidence)
+    cluster_count = len(set(pairs["clusters"]))
+    block_length = min(SERIAL_BLOCK_LENGTH, max(1, cluster_count))
+    bound = moving_block_cluster_bootstrap_lower_bound(
+        pairs["deltas"], pairs["clusters"], confidence=confidence,
+        block_length=block_length)
     result["matched"] = pairs["matched"]
     result["matched_ids_hash"] = _content_hash(pairs["keys"])
     result["deltas"] = list(pairs["deltas"])
@@ -408,11 +537,135 @@ def matched_cluster_test(candidate: Iterable[Mapping], baseline: Iterable[Mappin
     result["mean_delta"] = (sum(pairs["deltas"]) / pairs["matched"]
                             if pairs["matched"] else None)
     result["mean_delta_lcb"] = bound["lower_bound"]
-    result["lower_bound"] = {key: bound[key] for key in
-                             ("method", "available", "confidence", "draws", "seed")}
+    result["lower_bound"] = {key: bound[key] for key in (
+        "method", "available", "confidence", "draws", "seed",
+        "block_length", "clusters", "observations")}
     result["actual_control"] = True
     result["available"] = bool(pairs["matched"])
     return result
+
+
+def matched_effective_breadth(candidate: Iterable[Mapping],
+                              baseline: Iterable[Mapping], *,
+                              vehicle: str) -> dict:
+    """Measure cross-symbol breadth without treating it as extra sample size.
+
+    Statistical independence is still earned from chronological session
+    clusters.  This diagnostic records whether those session-level deltas are
+    one common factor repeated across symbols or genuinely broader evidence;
+    it prevents claims about cross-sectional breadth from being inferred from
+    a raw trade count.
+    """
+    left = _unique_by_match_key(candidate, vehicle)
+    right = _unique_by_match_key(baseline, vehicle)
+    observations = []
+    for key in sorted(left):
+        other = right.get(key)
+        if other is None:
+            continue
+        row = left[key]
+        symbol = (row.get("underlying_symbol") if vehicle == "option" else None) or \
+            row.get("symbol") or row.get("underlying_symbol")
+        session = row.get("session_date") or row.get("cluster")
+        if symbol is None or session is None:
+            continue
+        observations.append({
+            "session": str(session), "symbol": str(symbol),
+            "delta": float(row.get("net_pnl", 0.0)) -
+                     float(other.get("net_pnl", 0.0)),
+        })
+    return effective_breadth_report(observations)
+
+
+def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
+                       risk_report: Mapping) -> dict:
+    """Reprice realized replay P&L under preregistered all-in cost shocks.
+
+    Source rows already contain P&L after the configured model.  Each stress
+    scenario therefore subtracts only the incremental cost above the model's
+    recorded round trip.  The 25 bps scenario is the authorization veto; 9,
+    15 and 50 bps remain persisted diagnostics so sensitivity is visible
+    rather than selected after seeing the result.
+    """
+    if vehicle not in {"equity", "option"}:
+        raise ValueError("vehicle must be equity or option")
+    model = CostModel.from_dict((risk_report or {}).get("cost_model") or {})
+    base_by_id = {
+        str(item.get("opportunity_id")): item.get("round_trip_cost")
+        for item in (risk_report or {}).get("observations", ())
+        if isinstance(item, Mapping)
+    }
+    executed = [dict(row) for row in rows
+                if isinstance(row, Mapping) and
+                row.get("vehicle", vehicle) == vehicle and
+                row.get("no_trade") is not True]
+    scenarios = []
+    for scenario_bps in COST_STRESS_SCENARIOS_BPS:
+        stressed_values = []
+        missing = []
+        for index, row in enumerate(executed):
+            def number(*names, default=None):
+                for name in names:
+                    raw = row.get(name)
+                    if raw is None:
+                        continue
+                    try:
+                        value = float(raw)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(value):
+                        return value
+                return default
+
+            entry = number("entry_price", "entry_reference", "plan_entry")
+            exit_price = number("exit_price", "exit_reference", default=entry)
+            quantity = number("quantity", "contracts", default=1.0)
+            multiplier = number(
+                "contract_multiplier", "multiplier",
+                default=100.0 if vehicle == "option" else 1.0)
+            net = number("net_pnl")
+            opportunity_id = str(row.get("opportunity_id", index))
+            if (entry is None or exit_price is None or quantity is None or
+                    multiplier is None or net is None or entry <= 0 or
+                    quantity <= 0 or multiplier <= 0):
+                missing.append(opportunity_id)
+                continue
+            base = base_by_id.get(opportunity_id)
+            try:
+                base_cost = float(base) if base is not None else model.round_trip_cost(
+                    entry, exit_price, quantity, multiplier, vehicle=vehicle,
+                    executable_quotes=(
+                        row.get("entry_fill_source") == QUOTE_FILL and
+                        row.get("exit_fill_source") == QUOTE_FILL))
+            except (CostError, TypeError, ValueError, OverflowError):
+                missing.append(opportunity_id)
+                continue
+            notional = abs(entry) * abs(quantity) * abs(multiplier)
+            stressed_cost = notional * float(scenario_bps) / 10_000.0
+            if vehicle == "option":
+                stressed_cost += abs(quantity) * 2.0 * \
+                    model.option_fee_per_contract_side
+            stressed_values.append(net - max(0.0, stressed_cost - base_cost))
+        net_pnl = sum(stressed_values)
+        scenarios.append({
+            "round_trip_bps": float(scenario_bps),
+            "trades": len(stressed_values),
+            "missing_opportunities": missing,
+            "net_pnl": net_pnl,
+            "expectancy": (net_pnl / len(stressed_values)
+                           if stressed_values else None),
+            "positive": bool(stressed_values and not missing and net_pnl > 0),
+        })
+    required = next(
+        item for item in scenarios
+        if item["round_trip_bps"] == COST_STRESS_REQUIRED_BPS)
+    return {
+        "schema": "cost-stress-report.v1", "vehicle": vehicle,
+        "required_round_trip_bps": COST_STRESS_REQUIRED_BPS,
+        "scenario_bps": list(COST_STRESS_SCENARIOS_BPS),
+        "scenarios": scenarios,
+        "adequate": bool(required["positive"]),
+    }
 
 
 def placebo_null_distribution(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
@@ -612,17 +865,51 @@ def walk_forward_report(candidate: Sequence[Mapping], baseline: Sequence[Mapping
 def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                          vehicle: str, sessions: Sequence[str],
                          candidate_id: str | None = None,
-                         preselected: bool = False) -> dict:
+                         preselected: bool = False,
+                         min_trades: int = QUALIFICATION_MIN_TRADES,
+                         min_sessions: int = QUALIFICATION_MIN_SESSIONS,
+                         min_clusters: int = QUALIFICATION_MIN_CLUSTERS,
+                         confidence: float = LOWER_BOUND_CONFIDENCE,
+                         max_drawdown: float | None = None,
+                         draws: int = DEFAULT_BOOTSTRAP_DRAWS,
+                         seed: int | None = None,
+                         block_length: int | None = None) -> dict:
     """Score a sealed final window for one preselected candidate.
 
     Qualification is post-selection evidence.  Callers that searched a
     qualification window across variants must leave ``preselected`` false;
     such a report remains diagnostic and cannot authorize a passing envelope.
     """
+    if (isinstance(min_trades, bool) or int(min_trades) < 0 or
+            isinstance(min_sessions, bool) or int(min_sessions) < 0 or
+            isinstance(min_clusters, bool) or int(min_clusters) < 0):
+        raise ValueError("qualification minimums must be non-negative integers")
+    confidence = float(confidence)
+    if not math.isfinite(confidence) or not 0.0 < confidence < 1.0:
+        raise ValueError("qualification confidence must be between zero and one")
+    if max_drawdown is not None:
+        max_drawdown = float(max_drawdown)
+        if not math.isfinite(max_drawdown) or max_drawdown < 0:
+            raise ValueError("qualification max_drawdown must be finite and non-negative")
     if not rows or not sessions:
         return {"available": False, "sessions": list(sessions), "net_pnl": 0.0,
                 "matched": 0, "mean_delta": None, "trades": 0,
                 "net_positive": False, "delta_positive": False,
+                "clusters": 0, "delta_lcb": None,
+                "minimums": {"trades": int(min_trades), "sessions": int(min_sessions),
+                              "clusters": int(min_clusters)},
+                "confidence": confidence, "confidence_supported": False,
+                "delta_bootstrap": {
+                    "method": "moving_block_cluster_bootstrap",
+                    "available": False, "confidence": confidence,
+                    "draws": max(1, int(draws)), "seed": seed,
+                    "block_length": (min(SERIAL_BLOCK_LENGTH, 1)
+                                     if block_length is None else int(block_length)),
+                    "clusters": 0, "observations": 0,
+                },
+                "max_drawdown": None, "drawdown_supported": False,
+                "max_drawdown_limit": max_drawdown,
+                "drawdown_within_limit": False, "adequate": False,
                 "post_selection": {"preselected": bool(preselected),
                                     "candidate_id": candidate_id}}
     declared = tuple(str(item) for item in sessions)
@@ -633,6 +920,25 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
     pairs = matched_pairs(rows, baseline, vehicle=vehicle)
     absolute = performance_floor(rows, vehicle=vehicle)
     delta = (sum(pairs["deltas"]) / pairs["matched"]) if pairs["matched"] else None
+    clusters = len({str(row.get("cluster") or _session_key(row))
+                    for row in rows if row.get("vehicle", vehicle) == vehicle})
+    resolved_block_length = (min(SERIAL_BLOCK_LENGTH, max(1, clusters))
+                             if block_length is None else int(block_length))
+    delta_bound = moving_block_cluster_bootstrap_lower_bound(
+        pairs["deltas"], pairs["clusters"], confidence=confidence,
+        draws=int(draws), seed=seed, block_length=resolved_block_length,
+        min_clusters=max(2, int(min_clusters)))
+    delta_lcb = delta_bound.get("lower_bound")
+    observed_drawdown = max_drawdown_of(rows)
+    confidence_supported = bool(delta_lcb is not None and float(delta_lcb) > 0)
+    drawdown_supported = bool(math.isfinite(float(observed_drawdown)))
+    drawdown_within_limit = bool(
+        drawdown_supported and (max_drawdown is None or
+                                float(observed_drawdown) <= max_drawdown))
+    adequate = bool(
+        absolute["trades"] >= int(min_trades) and
+        len(declared_set) >= int(min_sessions) and
+        clusters >= int(min_clusters))
     # The final window is intentionally outside the run's fit/held-out trades.
     # Carry the source observations and their independent digests in the
     # signed envelope so a proof can be re-verified after it leaves memory.
@@ -663,6 +969,18 @@ def qualification_report(rows: Sequence[Mapping], baseline: Sequence[Mapping], *
             "matched": pairs["matched"], "mean_delta": delta,
             "net_positive": bool(absolute["net_pnl_positive"]),
             "delta_positive": bool(delta is not None and delta > 0),
+            "clusters": clusters,
+            "minimums": {"trades": int(min_trades), "sessions": int(min_sessions),
+                          "clusters": int(min_clusters)},
+            "adequate": adequate,
+            "confidence": confidence,
+            "delta_lcb": delta_lcb,
+            "confidence_supported": confidence_supported,
+            "delta_bootstrap": delta_bound,
+            "max_drawdown": observed_drawdown,
+            "max_drawdown_limit": max_drawdown,
+            "drawdown_supported": drawdown_supported,
+            "drawdown_within_limit": drawdown_within_limit,
             "candidate_observations": candidate_observations,
             "baseline_observations": baseline_observations,
             "candidate_observation_digest": candidate_digest,
@@ -765,6 +1083,44 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str) -> dict:
             rejects[str(reason)] = rejects.get(str(reason), 0) + 1
     dominant = max(rejects.items(), key=lambda item: (item[1], item[0]))[0] if rejects else None
     quoted = sources.get(QUOTE_FILL, 0)
+    # A proof can only authorize on executable, point-in-time pricing.  Bar
+    # fallback remains useful for explicitly labelled diagnostic backtests,
+    # but it is never adequate for a passing envelope.
+    if vehicle == "equity":
+        def _sip_quote_leg(row: Mapping, leg: str) -> bool:
+            source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
+            feed = str(row.get(f"{leg}_feed") or "").strip().lower()
+            provider = str(row.get(f"{leg}_provider") or "").strip()
+            age = row.get(f"{leg}_quote_age_seconds")
+            return (source == QUOTE_FILL and feed == "sip" and bool(provider) and
+                    isinstance(age, (int, float)) and not isinstance(age, bool) and
+                    math.isfinite(float(age)) and
+                    0 <= float(age) <= OPTION_MAX_QUOTE_AGE_SECONDS)
+
+        # Equity evidence authorizes only when both executable legs carry
+        # explicit SIP provenance.  Bar fallback, IEX, missing, and unknown
+        # feeds remain valid diagnostics but cannot satisfy a proof gate.
+        quality_adequate = bool(
+            executed and all(_sip_quote_leg(row, leg)
+                             for row in executed for leg in ("entry", "exit")))
+    else:
+        # Options are priced from snapshots rather than the equity quote
+        # source field.  Require finite ages and explicit OPRA provenance on
+        # both legs; malformed/legacy or indicative rows remain diagnostic.
+        quality_adequate = bool(executed and all(
+            isinstance(row.get("entry_quote_age_seconds"), (int, float)) and
+            math.isfinite(float(row.get("entry_quote_age_seconds"))) and
+            0 <= float(row.get("entry_quote_age_seconds")) <=
+            OPTION_MAX_QUOTE_AGE_SECONDS and
+            isinstance(row.get("exit_quote_age_seconds"), (int, float)) and
+            math.isfinite(float(row.get("exit_quote_age_seconds"))) and
+            0 <= float(row.get("exit_quote_age_seconds")) <=
+            OPTION_MAX_QUOTE_AGE_SECONDS and
+            str(row.get("entry_feed", row.get("entry_option_feed")) or "").strip().lower() == "opra" and
+            str(row.get("exit_feed", row.get("exit_option_feed")) or "").strip().lower() == "opra" and
+            str(row.get("entry_fill_source") or "").strip().lower() == QUOTE_FILL and
+            str(row.get("exit_fill_source") or "").strip().lower() == QUOTE_FILL
+            for row in executed))
     return {
         "vehicle": vehicle,
         "opportunities": len(local),
@@ -776,7 +1132,19 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str) -> dict:
         # Nothing priced, and every refusal shares one cause: this is a
         # data-shape mismatch, not an edgeless corpus.
         "priced_nothing": bool(local and not executed),
+        "adequate": quality_adequate,
     }
+
+
+def _fill_quality_adequate(fit: Sequence[Mapping], heldout: Sequence[Mapping],
+                           *, vehicle: str, lane: str) -> bool:
+    partitions = [heldout] if lane == "shadow" else [fit, heldout]
+    summaries = [fill_source_summary(rows, vehicle=vehicle) for rows in partitions]
+    # An empty fit partition is normal for shadow; an empty held-out partition
+    # is not evidence.  Every partition with opportunities must be executable
+    # quote/snapshot evidence, never bar-only fallback.
+    return bool(summaries and all(
+        summary.get("adequate") is True for summary in summaries))
 
 
 def unevaluable_reason(gates: Iterable[Mapping]) -> str | None:
@@ -843,7 +1211,10 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
                            fit_control: Mapping | None = None,
                            online_fdr: Mapping | None = None,
                            provenance: Mapping | None = None,
-                           candidate_id: str | None = None) -> dict:
+                           candidate_id: str | None = None,
+                           costs: Any = None,
+                           risk_unit: Mapping | None = None,
+                           risk_unit_report: Mapping | None = None) -> dict:
     """Build the immutable, content-addressed gate decision persisted per run.
 
     ``q_value`` is the cycle-global false-discovery q; ``family_q_value`` is
@@ -892,8 +1263,16 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
     derived["null_control_delta_positive"] = bool(
         null_delta is not None and null_p is not None and
         float(null_delta) > 0 and float(null_p) <= float(alpha))
-    derived["fit_floor_adequate"] = bool((fit_floor or {}).get("adequate"))
-    derived["heldout_floor_adequate"] = bool((heldout_floor or {}).get("adequate"))
+    # A caller-supplied ``adequate`` flag is not authoritative.  The persisted
+    # floor must itself declare the immutable protocol minimum for this lane;
+    # otherwise a compact diagnostic report could be promoted by merely
+    # changing its summary booleans.
+    derived["fit_floor_adequate"] = bool(
+        (fit_floor or {}).get("adequate") and
+        _floor_minimums_meet(fit_floor, lane=lane))
+    derived["heldout_floor_adequate"] = bool(
+        (heldout_floor or {}).get("adequate") and
+        _floor_minimums_meet(heldout_floor, lane=lane))
     stats = {"q_value": q_value, "family_q_value":
              q_value if family_q_value is None else family_q_value, "alpha": alpha}
     derived["family_fdr_significant"] = float(stats["family_q_value"]) <= float(alpha)
@@ -915,13 +1294,57 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
             online.get("tested") is False and online.get("decision") is False)
     qual = dict(qualification or {})
     derived["qualification_available"] = bool(qual.get("available"))
+    qual_minimums = qual.get("minimums") if isinstance(qual.get("minimums"), Mapping) else {}
+    qualification_minimums_valid = _qualification_minimums_meet(qual_minimums)
+    derived["qualification_floor_adequate"] = bool(
+        qual.get("available") and qual.get("adequate") and
+        qualification_minimums_valid)
     derived["qualification_net_positive"] = bool(
-        qual.get("available") and qual.get("net_positive"))
+        qual.get("available") and qual.get("adequate") and qual.get("net_positive"))
     derived["qualification_delta_positive"] = bool(
-        qual.get("available") and qual.get("delta_positive"))
+        qual.get("available") and qual.get("adequate") and
+        qual.get("delta_positive"))
+    derived["qualification_confidence_supported"] = bool(
+        qual.get("available") and qual.get("adequate") and
+        qual.get("confidence_supported"))
+    derived["qualification_drawdown_supported"] = bool(
+        qual.get("available") and qual.get("adequate") and
+        qual.get("drawdown_supported") and qual.get("drawdown_within_limit", True))
     derived["max_drawdown_supported"] = bool(
         isinstance(reported.get("max_drawdown"), (int, float)) and
         math.isfinite(float(reported.get("max_drawdown"))))
+    # Persist the complete risk-unit calculation.  Callers may supply a
+    # precomputed report, but verification always rebuilds it from source rows
+    # and the model captured in the report.
+    supplied_risk = risk_unit_report if risk_unit_report is not None else risk_unit
+    if supplied_risk is None:
+        try:
+            supplied_risk = _risk_unit_report(
+                [*fit, *heldout], vehicle=vehicle, costs=costs)
+        except (CostError, TypeError, ValueError, OverflowError):
+            supplied_risk = {"schema": "risk-unit-report.v1", "vehicle": vehicle,
+                             "adequate": False, "observations": []}
+    risk = dict(supplied_risk) if isinstance(supplied_risk, Mapping) else {}
+    derived["risk_unit_adequate"] = bool(risk.get("adequate"))
+    derived["fill_quality_adequate"] = _fill_quality_adequate(
+        fit, heldout, vehicle=vehicle, lane=str(lane))
+    try:
+        stress = cost_stress_report(
+            [*fit, *heldout], vehicle=vehicle, risk_report=risk)
+    except (CostError, TypeError, ValueError, OverflowError):
+        stress = {"schema": "cost-stress-report.v1", "vehicle": vehicle,
+                  "required_round_trip_bps": COST_STRESS_REQUIRED_BPS,
+                  "scenarios": [], "adequate": False}
+    derived["cost_stress_adequate"] = bool(stress.get("adequate"))
+    try:
+        breadth = matched_effective_breadth(
+            heldout, heldout_baseline, vehicle=vehicle)
+    except (TypeError, ValueError, OverflowError):
+        breadth = {
+            "method": "symmetric_correlation_eigenvalue_participation_ratio",
+            "available": False, "effective_breadth": None,
+            "reason": "invalid_matched_breadth_evidence",
+        }
     # Required checks are the minimum schema, not a licence to ignore an
     # additional veto supplied by a caller.  A passing envelope must agree
     # with every persisted boolean decision, exactly as durable proof
@@ -966,6 +1389,9 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "walk_forward": dict(walk_forward or {}),
         "retirement": dict(retirement or {}),
         "qualification": dict(qualification or {}),
+        "risk_unit_report": risk,
+        "cost_stress": stress,
+        "effective_breadth": breadth,
         "null_control": dict(null_control or {}),
         "online_fdr": online,
         "provenance": dict(provenance or {}),
@@ -1011,11 +1437,34 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 candidate_id=((qualification.get("post_selection") or {}).get("candidate_id")
                               if isinstance(qualification.get("post_selection"), Mapping) else None),
                 preselected=bool((qualification.get("post_selection") or {}).get("preselected"))
-                if isinstance(qualification.get("post_selection"), Mapping) else False)
+                if isinstance(qualification.get("post_selection"), Mapping) else False,
+                min_trades=int((qualification.get("minimums") or {}).get(
+                    "trades", PROTOCOL_QUALIFICATION_MIN_TRADES)),
+                min_sessions=int((qualification.get("minimums") or {}).get(
+                    "sessions", PROTOCOL_QUALIFICATION_MIN_SESSIONS)),
+                min_clusters=int((qualification.get("minimums") or {}).get(
+                    "clusters", PROTOCOL_QUALIFICATION_MIN_CLUSTERS)),
+                confidence=float(qualification.get("confidence", LOWER_BOUND_CONFIDENCE)),
+                max_drawdown=qualification.get("max_drawdown_limit"),
+                draws=int(((qualification.get("delta_bootstrap") or {}).get(
+                    "draws", DEFAULT_BOOTSTRAP_DRAWS))),
+                seed=((qualification.get("delta_bootstrap") or {}).get("seed")
+                      if isinstance((qualification.get("delta_bootstrap") or {}).get(
+                          "seed"), int) else None),
+                block_length=int(((qualification.get("delta_bootstrap") or {}).get(
+                    "block_length", SERIAL_BLOCK_LENGTH))))
             for key in ("sessions", "net_pnl", "trades", "matched", "mean_delta",
-                        "net_positive", "delta_positive"):
+                        "net_positive", "delta_positive", "clusters", "minimums",
+                        "adequate", "confidence", "delta_lcb",
+                        "confidence_supported", "max_drawdown",
+                        "max_drawdown_limit", "drawdown_supported",
+                        "drawdown_within_limit"):
                 if expected.get(key) != qualification.get(key):
                     return False
+            if "delta_bootstrap" in qualification and (
+                    expected.get("delta_bootstrap") != qualification.get(
+                        "delta_bootstrap")):
+                return False
         body = {key: value for key, value in envelope.items() if key != "content_hash"}
         statistics = envelope.get("statistics")
         checks = envelope.get("checks")
@@ -1072,6 +1521,18 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         floors = envelope.get("floors")
         if not isinstance(floors, Mapping):
             return False
+        lane = str(envelope.get("lane") or "")
+        # A durable pass must carry protocol-compliant minimums in every
+        # persisted fit/held-out floor and in the sealed qualification report.
+        # This is checked independently of the producer's summary booleans so
+        # a forged compact envelope cannot authorize after re-verification.
+        if envelope.get("passes") and any(
+                not _floor_minimums_meet(floors.get(name), lane=lane)
+                for name in ("fit", "heldout")):
+            return False
+        if envelope.get("passes") and not _qualification_minimums_meet(
+                qualification.get("minimums")):
+            return False
         for name, source in (("fit", sources_fit), ("heldout", sources_held)):
             report = floors.get(name)
             if not isinstance(report, Mapping):
@@ -1091,6 +1552,39 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             if (feasibility.get("status") != recomputed_feasibility.get("status") or
                     bool(feasibility.get("adequate")) != bool(recomputed_feasibility.get("adequate"))):
                 return False
+        risk = envelope.get("risk_unit_report")
+        if not isinstance(risk, Mapping) or risk.get("schema") != "risk-unit-report.v1":
+            return False
+        try:
+            report_model = CostModel.from_dict(risk.get("cost_model") or {})
+            rebuilt_risk = _risk_unit_report(
+                [*sources_fit, *sources_held], vehicle=vehicle,
+                costs=report_model,
+                min_cost_coverage=float(risk.get("minimum_cost_coverage", 1.0)))
+        except (CostError, TypeError, ValueError, OverflowError):
+            return False
+        for key in ("vehicle", "rows", "adequate_rows", "total_risk_usd",
+                    "total_round_trip_cost", "mean_risk_usd",
+                    "mean_round_trip_cost", "risk_unit_usd",
+                    "round_trip_cost_usd", "cost_to_risk_ratio",
+                    "failed_opportunities", "observations", "adequate"):
+            if rebuilt_risk.get(key) != risk.get(key):
+                return False
+        expected_fill_quality = {
+            "fit": fill_source_summary(sources_fit, vehicle=vehicle),
+            "heldout": fill_source_summary(sources_held, vehicle=vehicle),
+        }
+        if envelope.get("fill_quality") != expected_fill_quality:
+            return False
+        expected_stress = cost_stress_report(
+            [*sources_fit, *sources_held], vehicle=vehicle,
+            risk_report=risk)
+        if envelope.get("cost_stress") != expected_stress:
+            return False
+        expected_breadth = matched_effective_breadth(
+            sources_held, baseline_held, vehicle=vehicle)
+        if envelope.get("effective_breadth") != expected_breadth:
+            return False
         performance = envelope.get("performance")
         if isinstance(performance, Mapping) and "max_drawdown" in performance:
             try:
@@ -1106,8 +1600,24 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             if not isinstance(retirement, Mapping):
                 return False
             if retirement:
+                retirement_bootstrap = retirement.get("bootstrap")
+                retirement_bootstrap = (retirement_bootstrap
+                                        if isinstance(retirement_bootstrap, Mapping)
+                                        else {})
                 expected_retirement = expectancy_rejection_report(
-                    sources_held, vehicle=vehicle)
+                    sources_held, vehicle=vehicle,
+                    confidence=float(retirement.get(
+                        "confidence", RETIREMENT_CONFIDENCE)),
+                    min_sessions=int(retirement.get(
+                        "sessions_required", RETIREMENT_MIN_SESSIONS)),
+                    draws=int(retirement_bootstrap.get(
+                        "draws", DEFAULT_BOOTSTRAP_DRAWS)),
+                    seed=(int(retirement_bootstrap["seed"])
+                          if isinstance(retirement_bootstrap.get("seed"), int)
+                          and not isinstance(retirement_bootstrap.get("seed"), bool)
+                          else None),
+                    block_length=int(retirement_bootstrap.get(
+                        "block_length", SERIAL_BLOCK_LENGTH)))
                 walk = envelope.get("walk_forward") or {}
                 negative_folds = [item for item in walk.get("results", ())
                                   if item.get("adequate") and
@@ -1181,6 +1691,7 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
                 online_fdr=online,
                 provenance=envelope.get("provenance") or {},
                 candidate_id=envelope.get("candidate_id"),
+                risk_unit_report=risk,
             )
             if (rebuilt.get("checks") != dict(checks) or
                     rebuilt.get("passes") != envelope.get("passes")):
@@ -1246,6 +1757,8 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
             isinstance(envelope.get("statistics"), Mapping) and
             isinstance(envelope.get("walk_forward"), Mapping) and
             isinstance(envelope.get("qualification"), Mapping) and
+            isinstance(envelope.get("cost_stress"), Mapping) and
+            isinstance(envelope.get("effective_breadth"), Mapping) and
             isinstance(envelope.get("null_control"), Mapping) and
             isinstance(envelope.get("online_fdr"), Mapping) and
             envelope.get("content_hash") == _content_hash(body))
@@ -1299,6 +1812,8 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
     confidence = LOWER_BOUND_CONFIDENCE
     bootstrap_draws = DEFAULT_BOOTSTRAP_DRAWS
     bootstrap_seed = None
+    bootstrap_block_length = min(
+        SERIAL_BLOCK_LENGTH, max(1, len({str(cluster) for cluster in clusters})))
     if isinstance(lower, Mapping):
         if isinstance(lower.get("confidence"), (int, float)) and \
                 not isinstance(lower.get("confidence"), bool):
@@ -1308,9 +1823,14 @@ def recompute_gate_statistics(envelope: Mapping) -> dict:
             bootstrap_draws = int(lower["draws"])
         if isinstance(lower.get("seed"), int) and not isinstance(lower.get("seed"), bool):
             bootstrap_seed = int(lower["seed"])
-    bound = cluster_bootstrap_lower_bound(
+        if isinstance(lower.get("block_length"), int) and \
+                not isinstance(lower.get("block_length"), bool) and \
+                lower["block_length"] > 0:
+            bootstrap_block_length = int(lower["block_length"])
+    bound = moving_block_cluster_bootstrap_lower_bound(
         values, [str(cluster) for cluster in clusters], confidence=confidence,
-        draws=bootstrap_draws, seed=bootstrap_seed)
+        draws=bootstrap_draws, seed=bootstrap_seed,
+        block_length=bootstrap_block_length)
     decision = falsification_gate(
         values, null["statistics"],
         alpha=float(falsification.get("alpha", .05))
@@ -1347,15 +1867,29 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
 __all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
     "GATE_REQUIRED_CHECKS", "fill_source_summary", "floor_feasibility",
            "unevaluable_reason",
-    "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
+           "protocol_minimums", "validate_protocol_floor",
+           "PROTOCOL_BACKTEST_MIN_TRADES", "PROTOCOL_BACKTEST_MIN_SESSIONS",
+           "PROTOCOL_BACKTEST_MIN_CLUSTERS", "PROTOCOL_SHADOW_MIN_TRADES",
+           "PROTOCOL_SHADOW_MIN_SESSIONS", "PROTOCOL_SHADOW_MIN_CLUSTERS",
+           "PROTOCOL_QUALIFICATION_MIN_TRADES",
+           "PROTOCOL_QUALIFICATION_MIN_SESSIONS",
+           "PROTOCOL_QUALIFICATION_MIN_CLUSTERS",
+           "BACKTEST_MIN_TRADES", "BACKTEST_MIN_SESSIONS",
+           "BACKTEST_MIN_CLUSTERS", "SHADOW_MIN_TRADES",
+           "SHADOW_MIN_SESSIONS", "SHADOW_MIN_CLUSTERS",
+           "LOWER_BOUND_CONFIDENCE", "SealedQualificationWindow",
+           "COST_STRESS_REQUIRED_BPS", "COST_STRESS_SCENARIOS_BPS",
+           "QUALIFICATION_MIN_TRADES", "QUALIFICATION_MIN_SESSIONS",
+           "QUALIFICATION_MIN_CLUSTERS",
            "QUALIFICATION_MAX_BYTES", "QUALIFICATION_MAX_ROWS",
-           "SealedWindowError", "chronological_split",
+           "SealedWindowError", "chronological_split", "cost_stress_report",
            "deterministic_placebo_deltas", "falsification_gate",
-           "heldout_separation", "matched_cluster_test", "matched_pairs",
+           "heldout_separation", "matched_cluster_test", "matched_effective_breadth",
+           "matched_pairs",
            "max_drawdown_of", "paired_delta", "performance_floor",
            "expectancy_rejection_report", "RETIREMENT_CONFIDENCE",
            "RETIREMENT_MIN_SESSIONS", "RETIREMENT_MIN_USEFUL_R",
            "placebo_null_distribution", "placebo_ratio", "qualification_report",
-           "recompute_gate_statistics", "sample_counts", "seal_final_window",
+           "recompute_gate_statistics", "risk_unit_report", "sample_counts", "seal_final_window",
            "structural_floor", "verified_gate_envelope", "verify_gate_envelope",
            "walk_forward_report"]

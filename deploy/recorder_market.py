@@ -56,7 +56,7 @@ def _feed(config: dict | None = None) -> str:
     if not isinstance(data, dict):
         data = {}
     value = (os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
-             or broker.get("data_feed") or data.get("feed") or "iex")
+             or broker.get("data_feed") or data.get("feed") or "sip")
     return _canonical_feed(value)
 
 
@@ -65,18 +65,24 @@ def _options_feed(config: dict | None = None) -> str:
     broker = (config or {}).get("broker") if isinstance(config, dict) else {}
     if not isinstance(broker, dict):
         broker = {}
+    data = (config or {}).get("data") if isinstance(config, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
     value = (os.getenv("ALPACA_OPTIONS_FEED") or broker.get("options_feed")
-             or "indicative")
-    return str(value).strip().lower() or "indicative"
+             or data.get("options_feed") or "opra")
+    feed = _canonical_feed(value, options=True)
+    if feed != "opra":
+        raise ValueError(
+            "indicative option data is non-executable; OPRA entitlement is "
+            "required for option recording/research")
+    return feed
 
 
 def _call_market_data(method, symbols, *, start, end, feed):
-    """Pass ``feed`` to newer providers while supporting tiny test fakes."""
+    """Pass ``feed`` on every provider shape; never silently drop entitlement."""
     attempts = (
         {"timeframe": _timeframe(), "start": start, "end": end, "feed": feed},
-        {"timeframe": _timeframe(), "start": start, "end": end},
         {"start": start, "end": end, "feed": feed},
-        {"start": start, "end": end},
     )
     last_error = None
     for kwargs in attempts:
@@ -88,25 +94,22 @@ def _call_market_data(method, symbols, *, start, end, feed):
 
 
 def _call_quotes(method, symbols, *, start, end, feed):
-    for kwargs in ({"start": start, "end": end, "feed": feed},
-                   {"start": start, "end": end}):
+    for kwargs in ({"start": start, "end": end, "feed": feed},):
         try:
             return method(symbols, **kwargs)
         except TypeError:
             continue
-    return method(symbols, start=start, end=end)
+    raise TypeError("provider quotes method does not accept an explicit data feed")
 
 
 def _call_options(method, symbol, *, now, underlying_price, feed,
                   min_dte, max_dte):
-    """Call option candidate providers while keeping tiny fakes usable."""
+    """Call option providers without ever dropping the OPRA feed argument."""
     attempts = (
         {"now": now, "underlying_price": underlying_price, "feed": feed,
          "min_dte": min_dte, "max_dte": max_dte},
         {"now": now, "underlying_price": underlying_price, "feed": feed},
-        {"now": now, "underlying_price": underlying_price},
         {"now": now, "feed": feed},
-        {},
     )
     last_error = None
     for kwargs in attempts:
@@ -220,6 +223,13 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
     min_dte = int(risk.get("options_min_dte", 7) or 7)
     max_dte = int(risk.get("options_max_dte", 60) or 60)
     option_feed = _options_feed(config)
+    provider_option_feed = getattr(provider, "options_feed", None)
+    if provider_option_feed is not None:
+        provider_option_feed = _canonical_feed(provider_option_feed, options=True)
+        if provider_option_feed != "opra":
+            raise ValueError(
+                "provider options feed is indicative/non-executable; "
+                "OPRA entitlement is required")
     for raw_underlying in symbols:
         underlying = validate_equity_symbol(raw_underlying)
         spot = _underlying_price(quotes.get(underlying) or quotes.get(str(underlying).upper()))
@@ -231,6 +241,16 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
             if not isinstance(candidate, dict):
                 continue
             right = _option_right(candidate)
+            candidate_feed = _canonical_feed(
+                candidate.get("feed") or option_feed, options=True)
+            if candidate_feed != option_feed:
+                raise RuntimeError(
+                    "option provider returned a feed different from the "
+                    f"requested {option_feed} entitlement")
+            if candidate_feed != "opra":
+                raise RuntimeError(
+                    "indicative option data is non-executable; OPRA "
+                    "entitlement is required")
             raw_symbol = str(candidate.get("symbol") or "").strip().upper()
             expiration = candidate.get("expiration") or candidate.get("expiration_date")
             strike = candidate.get("strike") or candidate.get("strike_price")
@@ -299,10 +319,15 @@ def _option_rows(provider, symbols: list[str], quotes: dict, now: datetime,
                 yield {
                     "event_key": _event_key("option_snapshot", candidate["symbol"], _iso(timestamp)),
                     "observed_at": observation.isoformat(), "provider": "alpaca",
-                    "feed": str(candidate.get("feed") or option_feed),
+                    "feed": candidate_feed,
                     "event_type": "option_snapshot", "symbol": candidate["symbol"],
                     "contract": candidate["symbol"],
-                    "timestamp": _iso(timestamp), "as_of": _iso(timestamp),
+                    # ``timestamp`` is when the quote was generated; the
+                    # executable point-in-time becomes available only when
+                    # this recorder fetched it.  Keeping ``as_of`` at the
+                    # observation boundary prevents replay from using a
+                    # stale/late-observed quote before it was available.
+                    "timestamp": _iso(timestamp), "as_of": observation.isoformat(),
                     "open": "", "high": "",
                     "low": "", "close": "", "volume": _value(volume),
                     "bid": _value(candidate.get("bid")), "ask": _value(candidate.get("ask")),

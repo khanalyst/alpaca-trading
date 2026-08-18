@@ -34,6 +34,11 @@ DEFAULT_TOTAL_CALLS = 64
 # A tuning reply proposes the variants of one hypothesis, so it is bounded by
 # the same ``MAX_VARIANTS`` the factory itself accepts.
 MAX_TUNED_VARIANTS = 8
+_TUNING_ZERO_AXIS_LIMITS = {
+    "threshold_bps": 10.0,
+    "min_atr_bps": 15.0,
+    "entry_after_minutes": 60.0,
+}
 _AUTH_ERROR_TOKENS = ("authentication", "authorization", "unauthorized",
                       "forbidden", "invalid api key", "invalid_api_key",
                       "credentials are unavailable", "credential unavailable")
@@ -103,7 +108,10 @@ EXPERIMENT PHASE.  The request names a refinement_phase.  In "coordinate"
 phase every returned variant must change exactly ONE field, so its effect is
 attributable and a useful value can be retained.  In "interaction" phase it
 must change exactly TWO fields whose one-field lessons were already measured.
-Never bundle extra changes.  Confirmatory replays are performed without you.
+Never bundle extra changes. Numeric moves must remain inside the deterministic
+local neighborhood: at most 20% of the root value (with the factory's declared
+small step for a zero-valued axis). Confirmatory replays are performed without
+you.
 
 WHAT YOU MUST LEARN FROM.  You are given the diagnosis of how the root failed
 on fit data only, and the graded lessons from earlier attempts: each lesson's
@@ -269,6 +277,26 @@ def _tuning_reason_check(reason: str, root: Mapping[str, Any],
         raise ValueError(
             f"{phase} tuning must change exactly {expected} field(s); "
             f"changed {len(changed)}: {', '.join(changed)}")
+    for key in changed:
+        before = root.get(key)
+        after = normalized.get(key)
+        if (isinstance(before, bool) or isinstance(after, bool) or
+                not isinstance(before, (int, float)) or
+                not isinstance(after, (int, float))):
+            continue
+        origin = float(before)
+        moved = abs(float(after) - origin)
+        if origin == 0.0:
+            limit = _TUNING_ZERO_AXIS_LIMITS.get(
+                key, 1.0 if isinstance(before, int) else .25)
+        elif isinstance(before, int):
+            limit = float(max(1, int(round(abs(origin) * .2))))
+        else:
+            limit = max(.25, abs(origin) * .2)
+        if moved > limit + 1e-12:
+            raise ValueError(
+                f"tuning change for {key} exceeds the bounded local step "
+                f"({moved:g} > {limit:g})")
     text = reason.lower()
     missing_cues: list[str] = []
     for key in changed:

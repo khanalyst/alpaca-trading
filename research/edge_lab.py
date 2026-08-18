@@ -21,7 +21,8 @@ from .gates import (
     expectancy_rejection_report, heldout_separation, matched_cluster_test,
     max_drawdown_of, paired_delta, performance_floor, qualification_report,
     sample_counts, seal_final_window, structural_floor, verified_gate_envelope,
-    walk_forward_report,
+    walk_forward_report, validate_protocol_floor,
+    PROTOCOL_SHADOW_MIN_TRADES, PROTOCOL_SHADOW_MIN_SESSIONS,
 )
 from .costs import CostModel, ReplayPolicy, replay_policy_for_mode
 from .ibr import IBRConfig, replay_ibr
@@ -37,6 +38,7 @@ from .edge_discovery_core import (
     _null_reference_rows, _opportunity_rows, _discover_gate, _finalize_gate,
     null_control_account,
 )
+from .edge_identity import candidate_assumptions
 
 
 # One regular session of one-minute bars: the randomized-entry null holds to
@@ -156,8 +158,9 @@ def _strengthen_gate(gate: dict, baseline: Sequence[Mapping], *, vehicle: str) -
 
 def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFAULT_DB_PATH,
              vehicle: str = "equity", lane: str = "auto", config: Mapping | None = None,
-             variants_path: str | Path | None = None, min_trades: int = 100,
-             min_sessions: int = 10, alpha: float = .05,
+             variants_path: str | Path | None = None,
+             min_trades: int = 100,
+             min_sessions: int = 30, alpha: float = .05,
              backtest_bar_fallback: bool = False) -> dict:
     """Run every bounded IBR variant on one normalized corpus.
 
@@ -177,13 +180,26 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     # These values are policy inputs, not harmless replay hints.  Reject bools,
     # fractional counts, non-finite values and out-of-range alpha before any
     # corpus is sealed or a candidate is registered.
-    for name, value in (("min_trades", min_trades), ("min_sessions", min_sessions)):
-        if (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-            raise DiscoveryError(f"{name} must be a positive integer")
+    # The requested lane is an authorizing write boundary.  Compact samples
+    # remain available to local gate helpers, but discovery must reject a
+    # lowered protocol before reading/sealing the corpus or touching a ledger.
+    floor_lane = "shadow" if lane == "shadow" else "backtest"
+    try:
+        validate_protocol_floor(lane=floor_lane, min_trades=min_trades,
+                                min_sessions=min_sessions)
+    except ValueError as exc:
+        raise DiscoveryError(str(exc)) from exc
     if (isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or
             not math.isfinite(float(alpha)) or not 0.0 < float(alpha) <= 1.0):
         raise DiscoveryError("alpha must be finite and in (0,1]")
-    raw_rows, bars, snapshots, quotes = _read_discovery_rows(data)
+    # Discovery is an authorizing boundary: preserve each equity row's own
+    # provider/feed identity and require the configured complete SIP feed.
+    broker = (config or {}).get("broker") if isinstance(config, Mapping) else {}
+    configured_feed = ((broker or {}).get("data_feed", "sip")
+                       if isinstance(broker, Mapping) else "sip")
+    raw_rows, bars, snapshots, quotes = _read_discovery_rows(
+        data, require_provenance=True,
+        expected_equity_feed=str(configured_feed or "sip"))
     from agent.variants import load_registry
     registry_path = variants_path or Path(__file__).with_name("variants.yaml")
     variants = load_registry(registry_path)
@@ -237,7 +253,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     runtime_policy = ReplayPolicy.from_config(config)
     for variant in selected:
         cfg, effective = _effective_ibr_config(config, variant.overrides)
-        effective_configs[variant.variant_id] = effective
+        effective_configs[variant.variant_id] = candidate_assumptions(
+            effective, vehicle=vehicle, strategy_id="ibr",
+            variant_id=variant.variant_id)
         configs[variant.variant_id] = cfg
 
     qualification_rows: dict[str, list[dict]] = {}
@@ -260,6 +278,19 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
 
     existing = {variant.variant_id: ledger.candidate_by_variant(variant.variant_id, vehicle)
                 for variant in selected}
+    # Candidate rows are immutable.  A legacy row whose stored assumptions do
+    # not equal the canonical validated envelope cannot be silently reused or
+    # given a new proof under a different config; stop the lane before any run
+    # or gate is persisted and require an explicit re-registration.
+    for variant in selected:
+        prior = existing.get(variant.variant_id)
+        if prior is None:
+            continue
+        expected_hash = content_hash(effective_configs[variant.variant_id])
+        if str(prior.get("config_hash") or "") != expected_hash:
+            raise DiscoveryError(
+                f"candidate {variant.variant_id!r} has immutable assumptions "
+                "from an older runtime config; re-register before discovery")
     active = {"backtest_passed", "shadow", "validated", "champion"}
     if lane == "shadow":
         if existing.get(baseline_variant.variant_id) is None:
@@ -337,6 +368,17 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         # selected; this keeps auto-lane backtests and shadows from sharing a
         # permissive/strict pricing decision accidentally.
 
+    # ``auto`` may resolve to a shadow lane for an existing candidate.  Keep
+    # the caller's backtest floor for fresh arms, but raise the effective
+    # shadow floor to the immutable live-shadow protocol before replay/gate
+    # construction.  This keeps scheduled auto cycles operational while never
+    # persisting a shadow proof below 150 trades and 30 sessions.
+    effective_minimums = {
+        "backtest": (int(min_trades), int(min_sessions)),
+        "shadow": (max(int(min_trades), PROTOCOL_SHADOW_MIN_TRADES),
+                    max(int(min_sessions), PROTOCOL_SHADOW_MIN_SESSIONS)),
+    }
+
     # Select the mode-specific replay policy only after auto-lane modes are
     # known. Candidate registration retains the stable strict config above;
     # mode-specific policy belongs to the replay run and its provenance.
@@ -352,11 +394,9 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         cfg, effective = _effective_ibr_config(
             config, variant.overrides, policy=mode_policy)
         configs[variant_id] = cfg
-        run_configs[variant_id] = {
-            **effective_configs[variant_id],
-            "replay_policy": mode_policy.as_dict(),
-            "replay_mode": mode,
-        }
+        # Keep lane-specific policy in provenance only.  The immutable
+        # candidate/run config is identical across backtest and shadow.
+        run_configs[variant_id] = dict(effective_configs[variant_id])
         if mode == "skip":
             base_results[variant_id] = []
             null_results[variant_id] = []
@@ -421,8 +461,10 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
         gates[variant.variant_id] = _strengthen_gate(
             _discover_gate(
                 eval_rows[variant.variant_id], candidate_baseline,
-                vehicle=vehicle, min_trades=min_trades,
-                min_sessions=min_sessions, alpha=alpha, shadow=(mode == "shadow"),
+                vehicle=vehicle,
+                min_trades=effective_minimums[mode][0],
+                min_sessions=effective_minimums[mode][1], alpha=alpha,
+                shadow=(mode == "shadow"),
                 null_rows=null_results[variant.variant_id],
                 qualification=window_reports[variant.variant_id]),
             candidate_baseline, vehicle=vehicle)
@@ -520,7 +562,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
             provenance=provenance_hash(
                 dataset=raw_rows, config=run_configs[variant.variant_id],
                 code=code_path, provenance=run_provenance),
-            candidate_id=variant.variant_id)
+            candidate_id=variant.variant_id,
+            costs=configs[variant.variant_id].costs)
     forward_success = any(
         modes[variant.variant_id] == "shadow" and
         gates.get(variant.variant_id, {}).get("passes", False)
@@ -543,7 +586,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
     baseline_gate = _strengthen_gate(
         _discover_gate(
             baseline_eval, baseline_zero, vehicle=vehicle,
-            min_trades=min_trades, min_sessions=min_sessions, alpha=alpha,
+            min_trades=effective_minimums[baseline_mode][0],
+            min_sessions=effective_minimums[baseline_mode][1], alpha=alpha,
             shadow=(baseline_mode == "shadow"), actual_control=False,
             control_kind="synthetic_zero_reference",
             null_rows=null_results[baseline_variant.variant_id],
@@ -565,7 +609,8 @@ def discover(data: str | Path | Sequence[Mapping], *, db_path: str | Path = DEFA
                         "replay_policy": mode_policies[baseline_variant.variant_id].as_dict(),
                         "backtest_bar_fallback": backtest_bar_fallback,
                         "selected_test_id": selected_test_id}),
-        candidate_id=baseline_variant.variant_id)
+        candidate_id=baseline_variant.variant_id,
+        costs=configs[baseline_variant.variant_id].costs)
     baseline_run = None
     # A control arm is never post-selection qualified, so its reusable
     # development run must not be labelled underpowered merely because the

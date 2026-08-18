@@ -215,6 +215,19 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual([row[1] for row in trades], ["open"] * 3)
         self.assertEqual([row[2] for row in trades], [3.0, 4.0, 3.0])
         self.assertEqual(sum(row[2] for row in trades), 10.0)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            evidence = db.execute(
+                "SELECT qty, notional, execution_profile, vehicle, "
+                "reference_price, entry_reference, requested_qty, planned_qty, "
+                "cumulative_filled_qty, fill_fraction FROM trades "
+                "WHERE action='open' ORDER BY id").fetchall()
+        self.assertEqual([row[0] for row in evidence], [3.0, 4.0, 3.0])
+        self.assertEqual([row[2:4] for row in evidence],
+                         [("shares", "equity")] * 3)
+        self.assertEqual([row[4:8] for row in evidence],
+                         [(101.5, 101.5, 10.0, 10.0)] * 3)
+        self.assertEqual([row[8:] for row in evidence],
+                         [(3.0, .3), (7.0, .7), (10.0, 1.0)])
 
     def test_terminal_rejection_keeps_max_partial_fill_and_is_not_pending(self):
         self._bind_engine(runtime_name="runtime-terminal-partial")
@@ -309,6 +322,84 @@ class ExecutionLifecycleTests(unittest.TestCase):
         runtime = state.load_state()
         self.assertEqual(runtime["active_trades"]["SPY"]["qty"], "3")
         self.assertEqual([row[1] for row in self._journal_trades()], ["open"])
+
+    def test_partial_cancellation_books_only_actual_exposure(self):
+        self._bind_engine(runtime_name="runtime-partial-accounting")
+        request = OrderRequest("SPY", Decimal("10"), "buy",
+                               client_order_id="entry-partial-accounting")
+        entry = self.provider.submit_order(request)
+        plan = {
+            "execution_profile": "shares", "direction": "long",
+            "entry_price": 100, "stop_price": 99, "target_price": 102,
+            "underlying_stop_price": 99, "underlying_target_price": 102,
+            "underlying_symbol": "SPY", "contract_multiplier": 1,
+            "setup_id": "entry-partial-accounting", "setup_type": "ibr",
+            "risk_usd": 10, "notional": 1000,
+        }
+        self.engine._record_open_order(request, entry, plan)
+        self.provider.set_order(entry.id, status="partially_filled", filled_qty=3,
+                                filled_avg_price=100)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("3"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("100"))]
+        self.engine.reconcile()
+
+        self.provider.set_order(entry.id, status="canceled", filled_qty=3,
+                                filled_avg_price=100)
+        # A transient empty position snapshot must not turn cancellation of
+        # the unfilled remainder into a close of the three filled shares.
+        self.provider.positions_live = []
+        self.engine.reconcile()
+        runtime = state.load_state()
+        trade = runtime["active_trades"]["SPY"]
+        self.assertEqual(runtime["orders"][entry.id]["status"], "canceled")
+        self.assertEqual(trade["qty"], "3")
+        self.assertEqual(trade["risk_usd"], 3.0)
+        self.assertEqual(trade["notional"], 300.0)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            row = db.execute(
+                "SELECT qty, price, notional, risk_usd FROM trades "
+                "WHERE action='open'").fetchone()
+        self.assertEqual(row, (3.0, 100.0, 300.0, 3.0))
+
+    def test_incremental_fill_journal_uses_implied_weighted_price(self):
+        self._bind_engine(runtime_name="runtime-weighted-accounting")
+        request = OrderRequest("SPY", Decimal("5"), "buy",
+                               client_order_id="entry-weighted-accounting")
+        entry = self.provider.submit_order(request)
+        plan = {
+            "execution_profile": "shares", "direction": "long",
+            "entry_price": 100, "stop_price": 99, "target_price": 104,
+            "underlying_stop_price": 99, "underlying_target_price": 104,
+            "underlying_symbol": "SPY", "contract_multiplier": 1,
+            "setup_id": "entry-weighted-accounting", "setup_type": "ibr",
+            "risk_usd": 5, "notional": 500,
+        }
+        self.engine._record_open_order(request, entry, plan)
+        self.provider.set_order(entry.id, status="partially_filled", filled_qty=2,
+                                filled_avg_price=100)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("2"), "long", avg_entry_price=Decimal("100"),
+            current_price=Decimal("100"))]
+        self.engine.reconcile()
+        self.provider.set_order(entry.id, status="filled", filled_qty=5,
+                                filled_avg_price=101.2)
+        self.provider.positions_live = [Position(
+            "SPY", Decimal("5"), "long", avg_entry_price=Decimal("101.2"),
+            current_price=Decimal("101"))]
+        self.engine.reconcile()
+
+        trade = state.load_state()["active_trades"]["SPY"]
+        self.assertEqual(trade["qty"], "5")
+        self.assertEqual(trade["entry_price"], 101.2)
+        self.assertEqual(trade["notional"], 506.0)
+        self.assertEqual(trade["risk_usd"], 11.0)
+        with closing(sqlite3.connect(state.JOURNAL_FILE)) as db:
+            rows = db.execute(
+                "SELECT qty, price, notional, risk_usd FROM trades "
+                "WHERE action='open' ORDER BY id").fetchall()
+        self.assertEqual(rows, [(2.0, 100.0, 200.0, 2.0),
+                                (3.0, 102.0, 306.0, 9.0)])
 
     def test_unprotected_position_stays_unprotected_and_fail_closed_close_dedupes(self):
         self._bind_engine(runtime_name="runtime-unprotected")

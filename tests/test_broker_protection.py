@@ -54,8 +54,8 @@ class ProtectionProvider:
     """Broker fake that returns bracket legs and tracks per-order cancels."""
 
     paper = True
-    data_feed = "iex"
-    options_feed = "indicative"
+    data_feed = "sip"
+    options_feed = "opra"
 
     class Session:
         api_key = "paper-key"
@@ -301,6 +301,7 @@ class BrokerProtectionTests(ProtectionHarness):
             "symbol": "SPY260821C00600000", "underlying_symbol": "SPY",
             "type": "call", "bid": 1.9, "ask": 2.0,
             "timestamp": self.NOW,
+            "feed": "opra",
             "volume": 10, "open_interest": 100, "multiplier": 100,
         }]
         request, _ = self.engine._risk_order(
@@ -793,7 +794,9 @@ class CostsConfigTests(unittest.TestCase):
         result = validate_config(self._cfg(
             {"spread_bps": 3, "slippage_bps": 4, "fee_bps": 0.25}))
         self.assertEqual(result["costs"], {"spread_bps": 3.0,
-                                           "slippage_bps": 4.0, "fee_bps": .25})
+                                           "slippage_bps": 4.0, "fee_bps": .25,
+                                           "option_fee_per_contract_side": .65,
+                                           "provenance": "config"})
 
     def test_costs_block_rejects_unknown_fields(self):
         with self.assertRaises(ConfigError):
@@ -811,8 +814,15 @@ class CostsConfigTests(unittest.TestCase):
                 execution={"max_spread_bps": 20, "max_slippage_bps": 50}))
         self.assertIn("rejection cap", str(caught.exception))
 
-    def test_default_config_still_omits_the_costs_block(self):
-        self.assertNotIn("costs", validate_config({"mode": "paper"}))
+    def test_default_config_carries_the_conservative_cost_schedule(self):
+        costs = validate_config({"mode": "paper"})["costs"]
+        self.assertEqual(costs["spread_bps"], 4.0)
+        self.assertEqual(costs["slippage_bps"], 6.0)
+        self.assertEqual(costs["fee_bps"], .5)
+        self.assertEqual(costs["option_fee_per_contract_side"], .65)
+        self.assertEqual(
+            costs["provenance"],
+            "shipped_conservative_v1_plus_25bps_stress")
 
 
 if __name__ == "__main__":

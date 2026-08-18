@@ -12,6 +12,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from research.edge_ledger import (
     PAPER_DEMOTION_MIN_OUTCOMES, PAPER_DEMOTION_R_FLOOR,
@@ -19,6 +20,7 @@ from research.edge_ledger import (
 )
 from research.edge_lab import EdgeLedger
 from research.trial import review_trials
+from . import test_strategy_factory as strategy_factory_tests
 from .test_strategy_factory import persist_rule_gate
 
 
@@ -44,6 +46,27 @@ def _outcomes(ledger, candidate_id, r_values, *, risk=100.0, prefix="op"):
             "opportunity_id": f"{prefix}{index}",
             "session_date": f"2026-05-{index % 28 + 1:02d}",
             "net_pnl": value * risk, "risk_usd": risk})
+
+
+def _persist_shadow_proof(ledger, candidate_id):
+    """Seed a strict shadow proof while retaining the compact fixture rows.
+
+    The shared fixture helper uses an optional empty fit floor for shadow runs,
+    but the immutable shadow envelope still has to carry the full 150-trade
+    protocol minimum.  Recompute that report locally; no ledger rows or
+    lifecycle checks are bypassed.
+    """
+    original_floor = strategy_factory_tests.structural_floor
+
+    def strict_shadow_floor(rows, **kwargs):
+        rows = list(rows)
+        if not rows and kwargs.get("min_trades", 0) < 150:
+            kwargs = {**kwargs, "min_trades": 150}
+        return original_floor(rows, **kwargs)
+
+    with patch.object(strategy_factory_tests, "structural_floor",
+                      side_effect=strict_shadow_floor):
+        persist_rule_gate(ledger, candidate_id, "shadow")
 
 
 class PaperPerformanceTests(unittest.TestCase):
@@ -139,7 +162,7 @@ class PaperPerformanceTests(unittest.TestCase):
             candidate = _candidate(ledger, status=None)
             persist_rule_gate(ledger, candidate, "backtest")
             ledger.transition(candidate, "backtest_passed", reason="backtest proof")
-            persist_rule_gate(ledger, candidate, "shadow")
+            _persist_shadow_proof(ledger, candidate)
             ledger.transition(candidate, "shadow", reason="shadow proof started")
             ledger.transition(candidate, "validated", reason="shadow proof passed")
             _outcomes(ledger, candidate, [-1.0] * 12, prefix="old")
@@ -148,7 +171,7 @@ class PaperPerformanceTests(unittest.TestCase):
 
             # Re-proof the same immutable candidate identity.  The new trial
             # must not inherit the old losses from the demoted epoch.
-            persist_rule_gate(ledger, candidate, "shadow")
+            _persist_shadow_proof(ledger, candidate)
             ledger.transition(candidate, "shadow", reason="new shadow proof")
             ledger.transition(candidate, "validated", reason="new shadow proof passed")
             report = ledger.paper_performance(candidate)

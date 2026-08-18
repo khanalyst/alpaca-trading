@@ -141,6 +141,16 @@ class RiskEngine:
                 rejected.append("not a mapping"); continue
             if option.get("_nested_identity_conflict"):
                 rejected.append("option identity metadata mismatch"); continue
+            # Indicative quotes are explicitly non-executable.  Provider
+            # candidates carry their feed, while the no-clock fixture path is
+            # retained for deterministic legacy sizing tests; a live/runtime
+            # evaluation (``now`` supplied) must prove OPRA provenance.
+            feed_value = option.get("feed")
+            feed = str(getattr(feed_value, "value", feed_value) or "").strip().lower()
+            if feed and feed != "opra":
+                rejected.append("non-executable option feed"); continue
+            if now is not None and feed != "opra":
+                rejected.append("option feed entitlement unavailable"); continue
             # Freshness and identity aliases must agree rather than relying
             # on whichever provider field happens to win a precedence chain.
             flag_invalid = False

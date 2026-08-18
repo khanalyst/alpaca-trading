@@ -15,6 +15,104 @@ from .instruments import validate_asset_class, validate_instrument
 
 
 class StartupEdgePolicyMixin:
+    @staticmethod
+    def _feed_name(value: Any, *, default: str) -> str:
+        """Return a provider/config feed's canonical comparison name.
+
+        Alpaca's SDK may expose enum values while injected providers usually
+        expose strings.  Startup authorization compares the two at the
+        semantic boundary, so normalize both representations here.
+        """
+        value = getattr(value, "value", value)
+        return str(default if value is None else value).strip().lower().replace("-", "_")
+
+    def _feed_policy(self) -> tuple[str | None, str | None, bool, bool]:
+        """Resolve configured feeds and the lanes that require entitlement.
+
+        A validated config normally carries feeds under ``broker``.  The
+        legacy ``data`` aliases remain accepted for direct Engine callers.
+        ``None`` means no feed was explicitly configured; in that case only
+        an enabled research/option lane supplies a fail-closed requirement.
+        """
+        cfg = self.cfg if isinstance(self.cfg, Mapping) else {}
+        broker = cfg.get("broker") if isinstance(cfg.get("broker"), Mapping) else {}
+        data = cfg.get("data") if isinstance(cfg.get("data"), Mapping) else {}
+        configured_data = (broker.get("data_feed") if "data_feed" in broker
+                           else data.get("feed") if "feed" in data else None)
+        configured_options = (broker.get("options_feed") if "options_feed" in broker
+                              else data.get("options_feed")
+                              if "options_feed" in data else None)
+        configured_data = (self._feed_name(configured_data, default="")
+                           if configured_data is not None else None)
+        configured_options = (self._feed_name(configured_options, default="")
+                              if configured_options is not None else None)
+
+        research = cfg.get("research") if isinstance(cfg.get("research"), Mapping) else {}
+        research_enabled = research.get("enabled") is True
+        strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
+        option_execution = str(strategy.get("execution_mode", "shares")).lower() \
+            in {"option", "options"}
+        universe = cfg.get("universe") if isinstance(cfg.get("universe"), Mapping) else {}
+        classes = universe.get("asset_classes", [])
+        option_research = research_enabled and isinstance(classes, (list, tuple)) and any(
+            str(item).lower() in {"us_option", "option", "options"}
+            for item in classes)
+        # A validated edge can promote an option vehicle even when a direct
+        # caller omitted the corresponding universe class.
+        option_research = option_research or (
+            research_enabled and
+            str((getattr(self, "_edge_record", None) or {}).get("vehicle", "")).lower() in
+            {"option", "options"})
+        return configured_data, configured_options, research_enabled, (
+            option_execution or option_research)
+
+    def _authorize_feeds(self, *, data_feed: str, options_feed: str,
+                         data_feed_missing: bool,
+                         options_feed_missing: bool) -> None:
+        """Enforce provider/config feed identity before trading can start."""
+        configured_data, configured_options, research_enabled, option_lane = \
+            self._feed_policy()
+
+        # Explicit config is authoritative even for diagnostics.  This closes
+        # the injected-provider path where a provider silently reports a
+        # different stream than the operator configured.
+        if configured_data is not None and configured_data not in {
+                "iex", "sip", "delayed_sip"}:
+            raise AlpacaError(f"unsupported configured equity feed {configured_data!r}")
+        if configured_options is not None and configured_options not in {
+                "indicative", "opra"}:
+            raise AlpacaError(f"unsupported configured options feed {configured_options!r}")
+        if configured_data is not None and data_feed != configured_data:
+            raise AlpacaError(
+                "provider equity feed does not match configured feed "
+                f"{configured_data!r} (provider={data_feed!r})")
+        if configured_options is not None and options_feed != configured_options:
+            raise AlpacaError(
+                "provider options feed does not match configured feed "
+                f"{configured_options!r} (provider={options_feed!r})")
+
+        # Research and validated-equity lanes must use the complete SIP view;
+        # option execution/research must use OPRA.  Missing provider metadata
+        # is not evidence of entitlement and therefore fails closed.
+        if research_enabled:
+            if data_feed_missing:
+                raise AlpacaError(
+                    "provider equity feed metadata is unavailable; "
+                    "research requires the SIP feed entitlement")
+            if data_feed != "sip":
+                raise AlpacaError(
+                    "research/validated-equity runtime requires the SIP "
+                    f"equity feed (provider={data_feed!r})")
+        if option_lane:
+            if options_feed_missing:
+                raise AlpacaError(
+                    "provider options feed metadata is unavailable; "
+                    "option execution/research requires the OPRA feed entitlement")
+            if options_feed != "opra":
+                raise AlpacaError(
+                    "option execution/research requires the OPRA feed "
+                    f"entitlement (provider={options_feed!r})")
+
     def preflight(self) -> dict[str, Any]:
         """Authenticate and validate the configured endpoint before orders."""
         if self._preflight is not None:
@@ -46,8 +144,14 @@ class StartupEdgePolicyMixin:
                 parsed_endpoint.username is not None or
                 parsed_endpoint.password is not None):
             raise AlpacaError(f"{self.mode} endpoint validation failed")
-        data_feed = str(getattr(self.provider, "data_feed", "iex")).lower()
-        options_feed = str(getattr(self.provider, "options_feed", "indicative")).lower()
+        provider_data_value = getattr(self.provider, "data_feed", None)
+        provider_options_value = getattr(self.provider, "options_feed", None)
+        data_feed_missing = provider_data_value is None or not str(
+            getattr(provider_data_value, "value", provider_data_value)).strip()
+        options_feed_missing = provider_options_value is None or not str(
+            getattr(provider_options_value, "value", provider_options_value)).strip()
+        data_feed = self._feed_name(provider_data_value, default="iex")
+        options_feed = self._feed_name(provider_options_value, default="indicative")
         if data_feed not in {"iex", "sip", "delayed_sip"}:
             raise AlpacaError(f"unsupported equity feed {data_feed!r}")
         if options_feed not in {"indicative", "opra"}:
@@ -75,6 +179,10 @@ class StartupEdgePolicyMixin:
         if self.mode == "live" and _value(account, "pattern_day_trader", None) is not True:
             raise AlpacaError(
                 "live account must explicitly report pattern_day_trader=true")
+        self._authorize_feeds(
+            data_feed=data_feed, options_feed=options_feed,
+            data_feed_missing=data_feed_missing,
+            options_feed_missing=options_feed_missing)
         if assets_supported:
             self._assets = {}
             for asset in assets:

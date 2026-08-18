@@ -47,6 +47,13 @@ RULE_FAMILIES = (
 CONFIRMATIONS = ("none", "trend", "volume", "volatility")
 SIDES = ("both", "long", "short")
 BAR_SECONDS = 60.0
+# A bracket that is tighter than the configured minimum can be consumed by
+# ordinary spread/slippage before it has a chance to express the strategy's
+# thesis.  This is deliberately an execution-time floor, not a grammar field:
+# keeping it out of ``DEFAULT_RULE_SPEC`` preserves every legacy rule hash and
+# variant id while making both research and runtime signals use the same floor.
+MIN_STOP_DISTANCE_BPS = 30.0
+MIN_STOP_DISTANCE_FRACTION = MIN_STOP_DISTANCE_BPS / 10_000.0
 
 DEFAULT_RULE_SPEC: dict[str, Any] = {
     "schema": RULE_SCHEMA,
@@ -759,7 +766,12 @@ def evaluate_rule_signal(rows: Sequence[Any], value: Mapping[str, Any]) -> dict 
     # spec that passes here in research passes here at runtime.
     if not _within_volatility_band(spec, atr, close):
         return None
-    distance = max(atr * spec["stop_atr"], close * .0005)
+    # The historical 5 bps safety floor was below the normal round-trip cost
+    # of the configured universe.  Apply the audited 30 bps floor only to the
+    # derived executable signal; never add it to the authored spec so legacy
+    # content hashes remain byte-for-byte stable.
+    distance = max(atr * spec["stop_atr"],
+                   close * MIN_STOP_DISTANCE_FRACTION)
     stop = close - distance if direction == "long" else close + distance
     target = close + distance * spec["target_r"] if direction == "long" else close - distance * spec["target_r"]
     stamp = _timestamp(current)
@@ -819,6 +831,7 @@ def setup_evidence(snapshot: Mapping[str, Any], config: Mapping[str, Any]) -> di
 
 __all__ = [
     "BAR_SECONDS", "CONFIRMATIONS", "DEFAULT_RULE_SPEC", "MAX_CONFIRMATIONS",
+    "MIN_STOP_DISTANCE_BPS", "MIN_STOP_DISTANCE_FRACTION",
     "RULE_FAMILIES", "RULE_SCHEMA", "RULE_SCHEMAS", "RULE_SCHEMA_V1",
            "RULE_SCHEMA_V2", "SESSION_MINUTES", "V2_DEFAULT_EXTENSIONS",
            "EXECUTABLE_RULE_FIELDS", "SESSION_ACCUMULATING_FAMILIES",

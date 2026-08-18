@@ -26,7 +26,7 @@ docker compose logs --tail=100 recorder
 docker compose logs --tail=100 watchdog
 docker compose exec -T trader python main.py check
 docker compose exec -T trader python main.py status
-docker compose --profile research ps research
+docker compose ps research
 ```
 
 `main.py check` is authenticated by default and must report the configured
@@ -49,8 +49,10 @@ sudo journalctl -u alpaca-research -n 100 --no-pager
 
 ## Session controls
 
-The calendar returned by Alpaca is authoritative for holidays and early
-closes. The trader must:
+The exact calendar returned by Alpaca is authoritative for holidays and early
+closes. Production replay and live-shadow require session open/close metadata;
+missing metadata is a refusal, never a promotion to a fixed 16:00 close. The
+trader must:
 
 1. complete the 09:30–09:45 America/New_York IBR window before evaluating a
    breakout;
@@ -115,8 +117,7 @@ evidence, and correct the scoped configuration before retrying.
 ## Start, stop, and pause
 
 ```bash
-docker compose up -d recorder trader dashboard
-docker compose --profile research up -d research  # uses recorder output by default
+docker compose up -d                         # recorder, trader, research, shadow, dashboard
 docker compose stop trader                 # pause new decisions safely
 docker compose start trader
 docker compose down                         # preserves named volumes
@@ -205,12 +206,17 @@ account before starting the trader.
 
 Review the diff and run the focused checks before restarting:
 
+Ensure `ALPACA_AGENT_SECRET_FILE` and the separately mounted
+`ALPACA_RESEARCH_LLM_SECRET_FILE` point to readable deployment files before
+running Compose validation. The research provider secret is required because
+the enabled research LLM lane fails closed when it is absent or unreadable.
+
 ```bash
 git fetch origin
 git diff --check origin/main...HEAD
 ./.venv/bin/python -m compileall -q agent deploy main.py research.py
 ./.venv/bin/python -m unittest discover -v
-docker compose config
+docker compose config --quiet
 docker compose build
 docker compose up -d --remove-orphans
 docker compose exec -T trader python main.py check
@@ -224,8 +230,9 @@ operator, mode, time, and check output in the deployment log.
 ## Bootstrapping the corpus
 
 The recorder samples forward in real time, so a new deployment has no history
-and cannot clear the research floors — a hundred held-out trades across ten
-sessions, then a strictly later forward window — for a long time. Seed the
+and cannot clear the research floors — 100 held-out trades across 30 complete
+sessions (30 session clusters), then a strictly later forward window — for a
+long time. Seed the
 corpus from Alpaca's historical bars instead:
 
 ```bash
@@ -246,8 +253,9 @@ Two limits are worth planning around. **Options are not backfilled** — the
 recorder's option rows are sampled chain snapshots with quote-age semantics no
 historical endpoint reconstructs, so the option lane still needs recorded
 sessions. And **history alone is not enough**: `_simulate_trade` takes at most
-one trade per symbol-session, so the 100-trade held-out floor is as much a
-universe-width requirement as a history-length one. The shipped default
+one trade per symbol-session, so the 100-trade held-out floor and 30-cluster
+session floor are as much a universe-width requirement as a history-length one.
+The shipped default
 universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`,
 `XLV`), improving opportunity capacity, but real signal rates still require
 sufficient history. Floor feasibility fails closed when 100 held-out trades
@@ -326,8 +334,8 @@ floor:
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | run the lane at all |
-| `min_sessions` | `20` | sessions before a verdict |
-| `min_trades` | `20` | trades before a verdict |
+| `min_sessions` | `30` | sessions before a verdict |
+| `min_trades` | `100` | trades before a verdict |
 | `min_total_r` | `0.0` | total R the window must beat |
 | `min_mean_r` | `0.0` | mean R per trade it must beat |
 
@@ -388,7 +396,14 @@ monitor any open exposure.
 
 ## Research and evidence
 
-Research is read-only with respect to broker authority. It discovers the
+Research is read-only with respect to broker authority. The shipped paper
+deployment requires SIP equity and OPRA option entitlements and keeps
+`ALPACA_LIVE_ENABLE=false`; these feeds are required for autonomous research
+and executable option evidence. The enabled research strategy LLM is a bounded
+proposal lane, not a runtime decision LLM: its separate readable provider
+secret is required, and the cycle fails closed before discovery when that
+secret is absent, unreadable, or missing the selected provider key.
+It discovers the
 recorder's mixed bars/quotes/options corpus under
 `runtime/research/recorded/sessions/` by default (or uses
 `ALPACA_RESEARCH_DATASET`; `ALPACA_RESEARCH_SESSION_WINDOW` loads only the most
@@ -420,11 +435,19 @@ reconsidered on a later cycle. The sealed qualification window is released
 once by one preselected candidate alone; other variants remain diagnostic.
 Refinement is coordinate-first: every initial child changes exactly one
 executable field. Bounded two-field interactions are formed only from the best
-measured coordinate lessons, followed by an unchanged confirmation. Retirement
-then requires the normal 100-trade fit and held-out floors, at least 30 held-out
-sessions, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
-and at least two negative forward windows for every point. A valid bounded LLM
-replacement is registered first when that lane is enabled. Demoted candidates
+measured coordinate lessons, followed by an unchanged confirmation. The
+immutable floors are 100 trades plus 30 complete sessions/clusters for
+backtest/factory evidence, 100 trades plus 30 complete sessions/clusters for
+the sealed qualification window, and 150 trades plus 30 complete sessions for
+the parity-matched live-shadow tail. Retirement then requires the same powered
+floors, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
+and at least two negative forward windows for every point. Replay epoch 3
+additionally requires a stop of at least 30 bps for both rule and IBR paths, a
+recomputable risk unit that covers round-trip cost, and executable
+quote/snapshot fill-quality evidence rather than bar-only fallback. Evidence
+from older epochs is retained for audit but quarantined until replayed under
+epoch 3. A valid bounded LLM replacement is registered first when that lane is
+enabled. Demoted candidates
 may re-prove on a newer shadow run. Paper
 outcomes are appended for forward monitoring, scoped to their authorizing proof epoch, and may demote a
 deployed edge. Only the broker-free ShadowRunner plus research-side `edge
@@ -440,11 +463,19 @@ Do not combine regular-session evidence with pre/post-market or overnight data.
 Replay uses the runtime `ReplayPolicy`: strict 30-second market/quote freshness,
 DTE/spread/liquidity checks, latest-entry and force-flat cutoffs, and portfolio
 position/notional/gross/open-risk/daily-loss limits.
+Authorizing fill quality requires both legs to retain provider/feed/source and
+quote age: SIP for equity entry and exit, OPRA for option entry and exit, each
+no older than 30 seconds. Bar-only, partial-feed, missing, or stale legs remain
+diagnostic and cannot authorize a proof. Serial inference uses deterministic
+seeded moving-block day/session-cluster bootstrap; its draw count, seed, and
+block length are persisted. Effective breadth is persisted/re-verified as a
+matched symbol/session correlation diagnostic and never counts as additional N.
 
 ### Broker-free live shadow and ingestion
 
-Run the optional lane with `docker compose --profile shadow up -d shadow`.
-ShadowRunner reads recorder events and eligible ledger candidates, evaluates
+The broker-free lane is part of the plain Compose startup: `docker compose up -d`
+starts `shadow-init` and `shadow` alongside research. ShadowRunner reads
+recorder events and eligible ledger candidates, evaluates
 each candidate in its own virtual book, and writes only its isolated SQLite WAL.
 For each complete session it records candidate, exact root-baseline, and
 randomized-entry-null replays; mismatch or incomplete rows remain quarantined
@@ -464,14 +495,15 @@ ingester reports `confirmatory_resolution_exhausted` without spending alpha or
 advancing a boundary. A failed/mismatched/incomplete tail likewise leaves the
 candidate unchanged and ineligible.
 
-Research studies only the vehicle this deployment can trade. A trader runs one
-execution profile, so proving an option edge in a `shares` deployment produces
-evidence it can never act on. `python research.py vehicles` prints what will be
-studied; set `ALPACA_RESEARCH_VEHICLES=all` (or a comma-separated subset) to
-run both lanes deliberately — for example while recording options ahead of a
-profile switch. The dashboard's Research card reports the tradeable vehicle and
-counts any proved edges in the other one, so evidence accumulated under a
-previous profile is visible rather than silently unusable.
+Research is vehicle-complete by default (`ALPACA_RESEARCH_VEHICLES=all`): it
+evaluates equity and single-leg option evidence independently even though the
+shipped trader remains on the `shares` execution profile. Option research does
+not authorize option orders. `python research.py vehicles` shows the selected
+research lanes; a comma-separated subset is an explicit narrowing decision.
+Selecting the separate `options` execution profile remains paper-only and
+requires reviewed OPRA evidence and controls. The dashboard reports proved
+option edges that the default `shares` runtime cannot execute, so that evidence
+is visible rather than silently discarded.
 
 A slot whose hypothesis proves an edge is reseeded with a new hypothesis in the
 same cycle, so logical research capacity stays constant instead of shrinking
@@ -531,11 +563,17 @@ python research.py calibrate runtime/paper/journal.db
 The command is read-only. It reconstructs each referenced fill's plan price and
 reports adverse cost, model bias, runtime-cap overruns, and a verdict of
 `conservative`, `optimistic`, or `insufficient_data`. Calibration is stratified
-by runtime mode, vehicle, execution profile, and entry versus exit when journal
-references are present; thin or missing strata stay insufficient and equity and
-options are never pooled. An `optimistic` finding exits non-zero so it cannot be
-missed in a scheduled run. Calibration is advisory only and never adjusts the
-model; changing a cost assumption is a human decision.
+by runtime mode, vehicle, execution profile, and both entry and exit when
+journal references are present; partial fills use plan/reference fields, thin
+or missing strata stay insufficient, and equity and options are never pooled.
+Calibration is an authorization veto: missing, stale, or insufficient evidence,
+an optimistic cost verdict, a terminal material underfill (<80% of requested
+quantity), or a partial-cancel rate above 20% exits non-zero and blocks shadow
+authorization. Offline discovery/factory diagnostics still run. In-flight
+orders are excluded, and the model is never adjusted automatically. The shipped
+cost model is 4 bps spread, 6 bps slippage, 0.5 bps per-side fee, plus a 0.65
+option fee per contract side; proof stress diagnostics are 9/15/25/50 bps with
+25 bps as the required veto scenario.
 
 The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this

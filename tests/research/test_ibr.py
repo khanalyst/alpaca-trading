@@ -196,7 +196,8 @@ def equity_quote(minute, bid, ask):
 
 
 def option_quote(timestamp, bid=2.0, ask=2.1, *, expiration="2024-02-16",
-                 bid_size=5, ask_size=5, volume=20, open_interest=100):
+                 bid_size=5, ask_size=5, volume=20, open_interest=100,
+                 feed="opra"):
     expiry = expiration[:10].replace("-", "")
     return normalize_option_snapshot({
         "symbol": f"SPY{expiry[2:]}C00101000", "underlying": "SPY",
@@ -204,7 +205,7 @@ def option_quote(timestamp, bid=2.0, ask=2.1, *, expiration="2024-02-16",
         "timestamp": timestamp.isoformat(), "bid": bid, "ask": ask,
         "last": (bid + ask) / 2, "underlying_price": 101,
         "bid_size": bid_size, "ask_size": ask_size, "volume": volume,
-        "open_interest": open_interest, "provider": "alpaca", "feed": "opra",
+        "open_interest": open_interest, "provider": "alpaca", "feed": feed,
     })
 
 
@@ -250,6 +251,92 @@ class IBRQuoteFillTests(unittest.TestCase):
                     vehicles=("option",),
                     option_snapshots={entry_time: entry, exit_time: exit_quote})
                 self.assertEqual(bool(result["option"].trades), accepted)
+
+    def test_indicative_option_feed_is_not_research_executable(self):
+        bars = bars_for_day()
+        entry_time, exit_time = bars[31].timestamp, bars[32].timestamp
+        result = replay_ibr(
+            bars, vehicle="option",
+            config=permissive_config(stop_pct=.01, target_pct=.02, costs=FREE),
+            option_snapshots={
+                entry_time: option_quote(entry_time, feed="indicative"),
+                exit_time: option_quote(exit_time, feed="indicative"),
+            })
+        self.assertEqual(result.trades, [])
+        self.assertEqual(result.refusals[0].reason, "no_eligible_option_contract")
+
+    def test_opra_option_trade_preserves_quote_provenance_and_premium_risk(self):
+        bars = bars_for_day()
+        entry_time, exit_time = bars[31].timestamp, bars[32].timestamp
+        result = replay_ibr(
+            bars, vehicle="option",
+            config=permissive_config(stop_pct=.01, target_pct=.02, costs=FREE),
+            option_snapshots={
+                entry_time: option_quote(entry_time, bid=1.9, ask=2.0),
+                exit_time: option_quote(exit_time, bid=3.0, ask=3.1),
+            })
+        trade = result.trades[0]
+        self.assertEqual((trade.entry_feed, trade.exit_feed), ("opra", "opra"))
+        self.assertEqual((trade.entry_provider, trade.exit_provider),
+                         ("alpaca", "alpaca"))
+        self.assertEqual((trade.entry_quote_age_seconds,
+                          trade.exit_quote_age_seconds), (0.0, 0.0))
+        self.assertEqual(trade.quantity, 1.0)
+        self.assertAlmostEqual(trade.risk_usd,
+                               trade.entry_price * trade.contract_multiplier)
+        from research.edge_discovery_core import _opportunity_rows
+        from research.gates import fill_source_summary, risk_unit_report
+        row = next(item for item in _opportunity_rows(result, bars, "option")
+                   if item.get("no_trade") is False)
+        self.assertTrue(fill_source_summary([row], vehicle="option")["adequate"])
+        self.assertTrue(risk_unit_report([row], vehicle="option")["adequate"])
+
+    def test_equity_trade_records_nominal_and_realized_stop_risk(self):
+        # Keep the position open through the session so both executable legs
+        # are boundary fills.  The entry quote is intentionally above the
+        # signal-close anchor, making realized stop risk differ from planned
+        # sizing risk while preserving the authored protective stop.
+        bars = bars_to_close()
+        result = replay_ibr(
+            bars,
+            config=IBRConfig(stop_pct=.01, target_pct=.02, quantity=3.0,
+                             costs=FREE),
+            quotes=[
+                equity_quote(31, 100.98, 101.06),
+                equity_quote(385, 100.90, 101.00),
+            ])
+        self.assertEqual(len(result.trades), 1)
+        trade = result.trades[0]
+        self.assertEqual((trade.entry_fill_source, trade.exit_fill_source),
+                         (QUOTE, QUOTE))
+        self.assertEqual((trade.entry_feed, trade.exit_feed), ("sip", "sip"))
+        self.assertEqual((trade.entry_provider, trade.exit_provider),
+                         ("alpaca", "alpaca"))
+        self.assertEqual((trade.entry_quote_age_seconds,
+                          trade.exit_quote_age_seconds), (0.0, 0.0))
+        self.assertEqual(trade.quantity, 3.0)
+        self.assertAlmostEqual(trade.risk_per_unit, 1.01, places=9)
+        self.assertAlmostEqual(trade.realized_risk_per_unit,
+                               trade.entry_price - trade.stop_price,
+                               places=9)
+        self.assertAlmostEqual(trade.risk_usd,
+                               trade.quantity * trade.realized_risk_per_unit,
+                               places=9)
+        from research.edge_discovery_core import _opportunity_rows
+        from research.gates import fill_source_summary, risk_unit_report
+        row = next(item for item in _opportunity_rows(result, bars, "equity")
+                   if item.get("no_trade") is False)
+        self.assertTrue(fill_source_summary([row], vehicle="equity")["adequate"])
+        self.assertTrue(risk_unit_report([row], vehicle="equity", costs=FREE)["adequate"])
+
+    def test_strict_equity_force_flat_requires_an_exit_quote(self):
+        bars = bars_to_close()
+        result = replay_ibr(
+            bars,
+            config=IBRConfig(stop_pct=.01, target_pct=.02, costs=FREE),
+            quotes=[equity_quote(31, 100.98, 101.06)])
+        self.assertEqual(result.trades, [])
+        self.assertEqual(result.refusals[0].reason, "no_quote_at_force_flat_exit")
 
     def test_a_missing_quote_falls_back_to_the_bar_and_says_so(self):
         trade = replay_ibr(bars_for_day(), config=permissive_config(

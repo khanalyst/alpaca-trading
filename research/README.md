@@ -10,6 +10,15 @@ records its provider, feed, schema, session date/timezone, observation time,
 and the as-of timestamp used by the analysis.  Naive timestamps, future
 as-of values, invalid quotes, and malformed OHLC values fail closed.
 
+The shipped paper deployment defaults to SIP equity data and OPRA option data;
+both entitlements are required for autonomous research and executable option
+evidence. The trader's runtime execution profile remains `shares`, with live
+trading disabled. Research still evaluates both vehicles by default
+(`ALPACA_RESEARCH_VEHICLES=all`): option research is evidence generation, not
+permission to execute options. Compose starts the recorder, scheduled research,
+broker-free shadow, watchdog, trader, and dashboard with one plain
+`docker compose up -d` command; systemd uses the same defaults.
+
 ## Normalized data
 
 `UnderlyingBar` is a one-minute OHLCV record. `QuoteSnapshot` is a timestamped
@@ -33,17 +42,32 @@ capital or P&L is shared between arms.
 Paper runtime selection can then use `selection_mode: all_proved`, which keeps
 one best proven variant per independent family under one global risk book.
 
-The 100-trade held-out floor is evidence, not a tuning knob. The shipped
-default universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`,
-`XLE`, `XLV`), improving opportunity capacity, but real signal rates still
-require sufficient history. Replay allows at most one trade per symbol-session;
-floor feasibility fails closed when 100 held-out trades cannot be supported.
-Widen history and/or `universe.symbols`, never lower the evidence floor.
+The authorizing evidence floors are immutable: backtest/factory windows require
+100 trades, 30 complete sessions, and 30 session clusters; qualification
+requires 100 trades and 30 complete sessions/clusters; the parity-matched
+live-shadow tail requires 150 trades and 30 complete sessions. These are
+evidence floors, not tuning knobs. The shipped default universe is eight liquid
+ETFs (`SPY`, `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`, `XLV`), improving
+opportunity capacity, but real signal rates still require sufficient history.
+Replay allows at most one trade per symbol-session; floor feasibility fails
+closed when a required floor cannot be supported. Widen history and/or
+`universe.symbols`, never lower a floor.
 
-The default session timezone is `America/New_York`. Session dates are derived
-after timezone conversion, so the daylight-saving transitions in March and
-November do not shift a bar into a neighboring session. A source `as_of`
-timestamp may not be later than its observation/ingestion timestamp.
+Qualification is powered at a minimum of 100 trades, 30 complete sessions, and
+30 session-level clusters. Replay epoch 3 additionally requires a 30 bps
+minimum stop distance for both rule and IBR paths, a recomputable risk unit
+that covers round-trip cost, and executable quote/snapshot fill-quality
+evidence rather than bar-only fallback. Evidence from older replay epochs
+remains auditable but is quarantined and cannot validate, champion, or authorize
+the paper trader until replayed under epoch 3.
+
+The default session timezone is `America/New_York`. Production replay requires
+the exact Alpaca calendar session bounds for every session, including early
+closes; it never promotes a missing calendar day to a fixed 16:00 close.
+Session dates are derived after timezone conversion, so the daylight-saving
+transitions in March and November do not shift a bar into a neighboring session.
+A source `as_of` timestamp may not be later than its observation/ingestion
+timestamp.
 
 ## IBR replay
 
@@ -80,6 +104,13 @@ records whether `quote` or `bar` supplied it. Forward-shadow, broker-free
 live-shadow, and paper remain strict and require fresh executable quotes.
 Backtest evidence never authorizes paper.
 
+Authorizing fill-quality evidence is stricter than a diagnostic backtest:
+equity entry and exit legs must carry Alpaca SIP quote provenance, and option
+entry and exit legs must carry OPRA quote provenance. Every leg records provider,
+feed, quote timestamp/age, and fill source; both legs must be executable and no
+older than 30 seconds. Bar-only, missing, partial-feed, or stale legs remain
+diagnostic and cannot authorize a proof.
+
 The command-line surface is intentionally small:
 
 ```bash
@@ -98,9 +129,14 @@ state.
 `research.costs.CostModel` is the single expected-cost model: every lane --
 IBR replay, edge discovery, and the strategy factory -- prices its fills
 through it, and none carries its own spread/slippage/fee numbers or its own
-arithmetic. Its parameters come from one `costs` block
-(`spread_bps`, `slippage_bps`, `fee_bps`); the defaults describe a normal
-marketable fill in the configured liquid ETF universe.
+arithmetic. The shipped `costs` block is 4 bps spread, 6 bps adverse
+slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit option fee
+per contract per side. These are expected costs, not rejection caps.
+
+Every proof also persists the preregistered all-in stress scenarios of 9, 15,
+25, and 50 bps. The 25 bps scenario is the authorization requirement; the
+other scenarios remain diagnostics. A stress result that is missing, negative,
+or not positive at 25 bps cannot authorize a candidate.
 
 The runtime's `execution.max_slippage_bps` and `max_spread_bps` are rejection
 caps, not expectations. They are read into the same model and bound it: a
@@ -124,17 +160,22 @@ python research.py calibrate runtime/paper/journal.db
 `research.calibration` reads the runtime journal read-only and reports adverse
 cost in basis points, model bias, runtime-cap overruns, and a verdict of
 `conservative`, `optimistic`, or `insufficient_data`. Results are stratified by
-runtime mode, vehicle, execution profile, and by entry versus exit when
-references are present; missing or thin strata remain insufficient and equity
-and options are never pooled. A fill whose reference cannot be reconstructed is
-unreferenced rather than scored against a guess. Calibration is advisory only:
-it never adjusts the model, and an optimistic finding exits non-zero so it is
-visible to scheduled operation.
+runtime mode, vehicle, execution profile, and by both entry and exit when
+references are present; partial fills use the plan/reference fields rather than
+their realized notional, and missing references remain unreferenced. Equity and
+options are never pooled. Calibration is an authorization gate: missing, stale,
+or insufficient evidence, an optimistic cost verdict, a terminal material
+underfill (<80% of requested quantity), or a partial-cancel rate above 20%
+returns a veto and non-zero status. The scheduled cycle still records offline
+discovery/factory diagnostics, but it does not ingest shadow authorization until
+calibration is fresh and authorized. In-flight orders are excluded; calibration
+never adjusts the model automatically.
 
 ## Evidence and provenance
 
-Research artifacts should retain the normalized input digest, provider/feed
-identity, configuration, code version, cost model, risk/`ReplayPolicy`, and
+Research artifacts require row-level provider/feed identity; command-line flags
+cannot manufacture missing SIP/OPRA provenance. They retain the normalized input
+digest, configuration, code version, cost model, risk/`ReplayPolicy`, and
 gate assumptions alongside results. The experiment identity binds dataset,
 configuration, code, cost, risk, gates, and provenance hashes. Any feature or
 label must be computed from events at or before its as-of timestamp.  A
@@ -150,6 +191,14 @@ same fixed rule in every fold. The cumulative
 online-FDR allocation is durable per vehicle scope and persists across cycles;
 the sealed qualification window is released once by one preselected candidate
 alone, while other variants remain diagnostic.
+
+Serial inference is deterministic: paired deltas are grouped by chronological
+session/day clusters and the persisted lower bound uses a seeded moving-block
+cluster bootstrap (with its draw count, seed, and block length). The persisted
+effective-breadth report is a correlation/eigenvalue participation-ratio
+diagnostic over matched symbol-by-session deltas. Breadth is re-derived and
+verified with the proof, but it never counts as additional independent sample
+size; independence still comes from session clusters.
 
 ## Edge laboratory
 
@@ -190,7 +239,22 @@ safety action.
 
 ## Broker-free live shadow
 
-The optional Compose `shadow` profile reads recorder rows and EdgeLedger
+For a supported paper deployment, create two files outside Git: an Alpaca
+paper broker secret (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`,
+`ALPACA_PAPER=true`) and a separate readable research-provider dotenv file
+containing `OPENAI_API_KEY` for the checked provider (or the matching
+configured provider key). Set the host path in
+`ALPACA_RESEARCH_LLM_SECRET_FILE`, validate, and start every lane together:
+
+```bash
+docker compose config --quiet
+docker compose up -d
+docker compose ps
+```
+
+Compose starts scheduled research and the broker-free shadow lane in the default
+startup. It refuses to render the research service when the separate provider
+secret path is missing or unreadable. The plain Compose `shadow` service reads recorder rows and EdgeLedger
 candidates through read-only connections, evaluates eligible candidates in
 isolated virtual books, and writes only its own WAL SQLite database. For each
 complete session it creates candidate, exact root-baseline, and
@@ -253,12 +317,13 @@ reports `seeded`, `revived`, `reseeds`, and `active_slots` separately —
 `revived` is the one that says something had gone wrong — so idle capacity is
 visible rather than silent.
 
-Research is also scoped to what the deployment can trade. `research.py
-vehicles` resolves the trader's execution profile to a vehicle, and the nightly
-cycle studies only that; `ALPACA_RESEARCH_VEHICLES` (`all`, or a comma-separated
-subset) overrides it. Proving an option edge in a `shares` deployment produces
-evidence the trader can never act on, so the dashboard reports any such
-proved-but-untradeable edges rather than letting them accumulate silently.
+Research defaults to both vehicles. `research.py vehicles` reports the selected
+set, and `ALPACA_RESEARCH_VEHICLES` may narrow it to a comma-separated subset;
+the shipped Compose and systemd paths set it to `all`. The trader still runs one
+runtime execution profile, `shares`, so proving an option edge is useful
+research evidence but never switches the trader to options or authorizes an
+options order. Select the `options` execution profile separately, on paper,
+only after its OPRA evidence and controls have been reviewed.
 
 On a fresh corpus, each worker diagnoses its baseline only from the
 chronological fit partition, creates bounded variants based on the observed
@@ -347,9 +412,9 @@ candidate at `shadow`; only live parity ingestion can authorize runtime. A
 tuned variant gets its own isolated
 simulated account and faces every gate a mutated variant faces. **The LLM
 chooses what to try next; it can never shorten the evidence path or authorize
-trading.** Every seeding and tuning path falls back to the deterministic
-ladder and mutation table, so the factory keeps discovering with no provider
-configured at all.
+trading.** The shipped lane requires its separate readable provider secret;
+missing or unreadable credentials fail closed before discovery rather than
+downgrading the run to an unauthenticated or silently different mode.
 
 Every proposal records a **reason** before the gate that will judge it exists,
 and that reason is **graded** against the gate afterwards. The pair lives in two
@@ -463,12 +528,14 @@ compared with itself. The root remains a real candidate in the family and
 cycle-global Benjamini–Hochberg denominators, so it consumes multiplicity like
 any mutation.
 
-The checked config uses deterministic discovery. These adapters can be enabled
-with OpenAI `gpt-5` and read provider keys only from
-`ALPACA_RESEARCH_LLM_SECRETS_FILE`, never from the broker secret file. An
-enabled adapter without its provider key fails before discovery; invalid or
-rejected model output records a pending replacement and cannot retire a family
-prematurely. Successful proof produces a deterministic,
+The checked config enables model-assisted discovery, replacement, and tuning
+with OpenAI `gpt-5`. Compose uses the host override
+`ALPACA_RESEARCH_LLM_SECRET_FILE`; the scheduler reads the mounted path through
+`ALPACA_RESEARCH_LLM_SECRETS_FILE`. Provider keys are read only from that
+separate readable file, never from the broker secret. An enabled adapter
+without its provider key fails before discovery; invalid or rejected model
+output records a pending replacement and cannot retire a family prematurely.
+Successful proof produces a deterministic,
 content-addressed finding. `research.proof.webhook_url` may send that finding
 to an HTTPS webhook without changing the durable artifact.
 

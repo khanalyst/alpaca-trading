@@ -27,12 +27,11 @@ from research.strategy_factory import run_factory
 
 NEW_YORK = ZoneInfo("America/New_York")
 SYMBOLS = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH")
-# `_simulate_trade` takes at most one trade per symbol-session, so the 100-trade
-# held-out floor is a symbol count as much as a session count.  56 sessions seal
-# 11, leaving 45 development sessions that split 31/14; 14 held-out sessions
-# across eight symbols is 112 trades, clearing both floors without slack to
-# spare.
-SESSIONS = 56
+# Promotion now requires at least 30 independent clusters in both held-out and
+# sealed qualification windows.  150 sessions leave 120 development sessions
+# (36 held-out) and 30 qualification sessions; eight symbols provide ample
+# trade coverage for the economics gates as well.
+SESSIONS = 150
 # Slot 0 of the shipped catalog. The refinement protocol keeps the root and
 # changes exactly one coordinate in the second arm.
 ROOT_SPEC = validate_rule_spec({
@@ -43,10 +42,10 @@ ROOT_VARIANT = rule_variant_id(ROOT_SPEC)
 WINNING_VARIANT = rule_variant_id(WINNING_SPEC)
 FIRST_COORDINATE_SPEC = validate_rule_spec({**ROOT_SPEC, "threshold_bps": 4.0})
 FIRST_COORDINATE_VARIANT = rule_variant_id(FIRST_COORDINATE_SPEC)
-# Six bps of spread and fifteen of slippage: still inside the runtime's own
-# rejection caps, so this is a fill the trader would accept, not an impossible
-# one chosen to guarantee the failure.
-WORSE_COSTS = CostModel(spread_bps=12.0, slippage_bps=25.0, fee_bps=1.0)
+# A materially worse, but still runtime-admissible, schedule. The 50 bps
+# slippage is the configured execution cap; it makes the narrow 2.5R edge
+# unprofitable while the normal schedule remains positive.
+WORSE_COSTS = CostModel(spread_bps=0.0, slippage_bps=50.0, fee_bps=1.0)
 
 
 def _wobble(symbol: str, day: int) -> float:
@@ -74,10 +73,18 @@ def _session_closes(symbol: str, day: int) -> tuple[list[float], list[int]]:
         volumes.append(1000)
     closes.append(100.85 + drift)
     volumes.append(6000)
-    for step in (.20, .40, .60):
+    # Keep the pre-gap close below both the root's 2R target and the winning
+    # arm's 2.5R target.  ``_session_rows`` then opens the next bar materially
+    # above both levels: the replay records an arrival/gap fill at that
+    # boundary and can price the exit from the explicit SIP quote there.
+    # This is deliberately a market gap, not a production fallback around the
+    # strict fill-quality gate; the authored 30 bps stop economics are unchanged.
+    for step in (.23,):
         closes.append(100.85 + drift + step)
         volumes.append(3000)
-    price = 101.45 + drift
+    closes.append(101.70 + drift)
+    volumes.append(3000)
+    price = 101.70 + drift
     for _ in range(15):
         price -= .10
         closes.append(price)
@@ -90,6 +97,11 @@ def _session_rows(symbol: str, day: int, opening: datetime) -> list[dict]:
     rows = []
     opened = 100.60
     for index, (close, volume) in enumerate(zip(closes, volumes)):
+        # The final breakout bar arrives above both authored targets while the
+        # preceding close remains below them.  Keep that discontinuity visible
+        # in the bar's open rather than silently carrying forward the close.
+        if index == 17:
+            opened = round(101.70 + _wobble(symbol, day), 4)
         stamp = opening + timedelta(minutes=index)
         end = stamp + timedelta(minutes=1)
         rows.append({
@@ -140,7 +152,13 @@ class EarnedGatePassTests(unittest.TestCase):
         # No patching of `_worker`, no synthetic rows: everything below is
         # replayed from these bars through the shared cost model.
         cls.result = run_factory(cls.corpus, db_path=cls.db, strategies=1,
-                                 variants_per_strategy=2, workers=1)
+                                 variants_per_strategy=2, workers=1,
+                                 # The same corpus is replayed in the strict
+                                 # shadow lane below, whose protocol floor is
+                                 # 150 trades; keeping that floor in the
+                                 # originating run makes the persisted report
+                                 # authorizable in both lanes.
+                                 min_trades=150)
 
     @classmethod
     def tearDownClass(cls):
@@ -191,10 +209,10 @@ class EarnedGatePassTests(unittest.TestCase):
         # through shadow to validated before a champion exists at all.
         with tempfile.TemporaryDirectory(prefix="alpaca-e2e-fwd-") as forward:
             shutil.copytree(self.directory.name, forward, dirs_exist_ok=True)
-            result = run_factory(edge_corpus(30, skip=SESSIONS),
+            result = run_factory(edge_corpus(SESSIONS, skip=SESSIONS),
                                  db_path=Path(forward) / "edge.sqlite3",
                                  strategies=1, variants_per_strategy=2,
-                                 workers=1)
+                                 workers=1, min_trades=150)
         rows = self._by_variant(result)
         self.assertEqual(list(rows), [ROOT_VARIANT])
         self.assertEqual(rows[ROOT_VARIANT]["mode"], "shadow")
@@ -214,7 +232,7 @@ class EarnedGatePassTests(unittest.TestCase):
             result = run_factory(self.corpus,
                                  db_path=Path(directory) / "edge.sqlite3",
                                  strategies=1, variants_per_strategy=2,
-                                 workers=1, costs=WORSE_COSTS)
+                                 workers=1, costs=WORSE_COSTS, min_trades=150)
         self.assertEqual(result["status"], "complete")
         self.assertEqual([row["variant_id"] for row in result["results"]
                           if row["gate"]["passes"]], [])

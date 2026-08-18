@@ -103,6 +103,18 @@ def _field(payload: Mapping[str, Any], *names: str, default: Any = None) -> Any:
     return default
 
 
+def _identity_value(payload: Mapping[str, Any], supplied: Any,
+                    names: tuple[str, ...], name: str) -> str:
+    """Resolve provenance while refusing a caller override of row metadata."""
+    raw = _field(payload, *names)
+    if supplied is not None and raw not in (None, ""):
+        if str(raw).strip().lower() != str(supplied).strip().lower():
+            raise NormalizationError(
+                f"{name} override conflicts with row provenance")
+    value = raw if raw not in (None, "") else supplied
+    return str(_required(value, name)).strip()
+
+
 def _scoped_symbol(payload: Mapping[str, Any], value: Any, *, option: bool = False,
                    underlying: Any = None, expiration: Any = None,
                    strike: Any = None) -> str:
@@ -177,8 +189,8 @@ def _identity(payload: Mapping[str, Any], *, provider: str | None = None,
     except Exception as exc:
         raise NormalizationError(f"invalid timezone: {zone!r}") from exc
     return EventIdentity(
-        provider=str(_required(provider or _field(payload, "provider"), "provider")),
-        feed=str(_required(feed or _field(payload, "feed", "feed_id"), "feed")),
+        provider=_identity_value(payload, provider, ("provider",), "provider"),
+        feed=_identity_value(payload, feed, ("feed", "feed_id"), "feed"),
         as_of=as_of,
         observed_at=observed,
         session_date=local.date(),
@@ -200,6 +212,12 @@ class UnderlyingBar:
     identity: EventIdentity
     interval_seconds: int = 60
     atr: float | None = None
+    # Exact broker calendar boundaries are carried on every bar when the
+    # production corpus is calendar-authoritative.  They remain optional on
+    # the record itself so low-level legacy fixtures can still be normalized;
+    # replay policies decide whether omission is admissible.
+    session_open: datetime | None = None
+    session_close: datetime | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -218,6 +236,27 @@ class UnderlyingBar:
             raise NormalizationError("volume cannot be negative")
         if self.interval_seconds <= 0:
             raise NormalizationError("interval_seconds must be positive")
+        if (self.session_open is None) != (self.session_close is None):
+            raise NormalizationError(
+                "session_open and session_close must be supplied together")
+        if self.session_open is not None:
+            if (not isinstance(self.session_open, datetime) or
+                    not isinstance(self.session_close, datetime) or
+                    self.session_open.tzinfo is None or
+                    self.session_open.utcoffset() is None or
+                    self.session_close is None or
+                    self.session_close.tzinfo is None or
+                    self.session_close.utcoffset() is None):
+                raise NormalizationError(
+                    "session_open and session_close must be timezone-aware")
+            opened = self.session_open.astimezone(NEW_YORK)
+            closed = self.session_close.astimezone(NEW_YORK)
+            bar_day = self.identity.session_date
+            if opened.date() != closed.date() or opened.date() != bar_day:
+                raise NormalizationError(
+                    "session_open and session_close must identify the same NY session")
+            if self.session_open >= self.session_close:
+                raise NormalizationError("session_open must be before session_close")
 
     @property
     def end(self) -> datetime:
@@ -250,6 +289,14 @@ class UnderlyingBar:
     @property
     def timezone(self) -> str:
         return self.identity.timezone
+
+    @property
+    def provider_id(self) -> str:
+        return self.identity.provider_id
+
+    @property
+    def feed_id(self) -> str:
+        return self.identity.feed_id
 
 
 @dataclass(frozen=True)
@@ -288,6 +335,24 @@ class QuoteSnapshot:
     @property
     def timezone(self) -> str:
         return self.identity.timezone
+
+    @property
+    def provider(self) -> str:
+        """Provider identity retained on the normalized quote."""
+        return self.identity.provider
+
+    @property
+    def feed(self) -> str:
+        """Feed identity retained on the normalized quote."""
+        return self.identity.feed
+
+    @property
+    def provider_id(self) -> str:
+        return self.identity.provider_id
+
+    @property
+    def feed_id(self) -> str:
+        return self.identity.feed_id
 
     @property
     def as_of(self) -> datetime:
@@ -380,6 +445,14 @@ class OptionSnapshot:
         return self.identity.timezone
 
     @property
+    def provider(self) -> str:
+        return self.identity.provider
+
+    @property
+    def feed(self) -> str:
+        return self.identity.feed
+
+    @property
     def as_of(self) -> datetime:
         return self.identity.as_of
 
@@ -433,6 +506,12 @@ def normalize_underlying_bar(payload: Mapping[str, Any], *, provider: str | None
         volume=volume,
         identity=_identity(payload, provider=provider, feed=feed, timestamp=ts),
         interval_seconds=interval_seconds,
+        session_open=(None if _field(payload, "session_open", "session_open_at") is None
+                      else parse_timestamp(_field(payload, "session_open", "session_open_at"),
+                                           name="session_open")),
+        session_close=(None if _field(payload, "session_close", "session_close_at") is None
+                       else parse_timestamp(_field(payload, "session_close", "session_close_at"),
+                                            name="session_close")),
     )
 
 
@@ -479,8 +558,8 @@ def normalize_option_contract(payload: Mapping[str, Any], *, provider: str | Non
         right={"c": "call", "p": "put"}.get(right, right),
         multiplier=multiplier,
         currency=str(_field(payload, "currency", default="USD")),
-        provider=str(_required(provider or _field(payload, "provider"), "provider")),
-        feed=str(_required(feed or _field(payload, "feed", "feed_id"), "feed")),
+        provider=_identity_value(payload, provider, ("provider",), "provider"),
+        feed=_identity_value(payload, feed, ("feed", "feed_id"), "feed"),
     )
 
 

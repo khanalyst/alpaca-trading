@@ -388,6 +388,17 @@ class MarketEntryRiskMixin:
                 "symbol": symbol, "reason": "asset is not shortable"})
             return None
         if decision["execution_profile"] == "options":
+            configured_option_feed = str(
+                edge_cfg.get("broker", {}).get("options_feed") or
+                edge_cfg.get("data", {}).get("options_feed") or
+                getattr(self.provider, "options_feed", "") or ""
+            ).strip().lower()
+            if configured_option_feed != "opra":
+                self._event("risk_reject", {
+                    "symbol": symbol,
+                    "reason": "indicative option feed is non-executable; OPRA entitlement required",
+                })
+                return None
             candidates = (row.get("option_chain") or row.get("options") or
                           row.get("option_snapshots") or [])
             if isinstance(candidates, Mapping):

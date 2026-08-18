@@ -9,12 +9,14 @@ populations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
+from agent.contracts.rule import MIN_STOP_DISTANCE_FRACTION
+from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
+                    index_quotes, quote_fill_record, replay_policy_for_bars)
 
 RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
@@ -112,6 +114,29 @@ class IBRTrade:
     # or the bar it fell back to.  Calibration needs to know the difference.
     entry_fill_source: str = BAR
     exit_fill_source: str = BAR
+    # Option evidence is point-in-time and executable only when it carries the
+    # quote age and feed identity used by the replay.  These fields are at the
+    # end of the dataclass to preserve positional construction of legacy
+    # equity fixtures.
+    entry_quote_age_seconds: float | None = None
+    exit_quote_age_seconds: float | None = None
+    entry_feed: str | None = None
+    exit_feed: str | None = None
+    entry_provider: str | None = None
+    exit_provider: str | None = None
+    quantity: float = 1.0
+    risk_per_unit: float | None = None
+    realized_risk_per_unit: float | None = None
+    risk_usd: float | None = None
+    # Underlying bar provenance is retained separately from quote-leg
+    # provenance so diagnostic bar fallback cannot masquerade as an executable
+    # quote.
+    signal_bar_feed: str | None = None
+    signal_bar_provider: str | None = None
+    entry_bar_feed: str | None = None
+    entry_bar_provider: str | None = None
+    exit_bar_feed: str | None = None
+    exit_bar_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +204,20 @@ def _option_liquid(snapshot: OptionSnapshot) -> bool:
     return option_has_liquidity(snapshot)
 
 
+def _option_executable(snapshot: OptionSnapshot) -> bool:
+    """Require the recorded option quote and contract to identify OPRA.
+
+    Feed identity is carried in both the event and contract provenance.  A
+    mismatch is treated as non-executable rather than choosing whichever
+    spelling happens to be present, so an indicative snapshot cannot enter
+    research evidence through an adapter seam.
+    """
+    identity = getattr(snapshot, "identity", None)
+    contract = getattr(snapshot, "contract", None)
+    return (str(getattr(identity, "feed", "")).strip().lower() == "opra" and
+            str(getattr(contract, "feed", "")).strip().lower() == "opra")
+
+
 def _session_start(day: date, cfg: IBRConfig, zone: ZoneInfo) -> datetime:
     return datetime.combine(day, cfg.session_open, tzinfo=zone)
 
@@ -218,7 +257,14 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
                      reason: str, tie: bool, gap: bool, cfg: IBRConfig,
                      stop_price: float, target_price: float, multiplier: int = 1,
                      entry_timestamp: datetime | None = None,
-                     entry_source: str = BAR, exit_source: str = BAR) -> IBRTrade:
+                     entry_source: str = BAR, exit_source: str = BAR,
+                     entry_quote_age_seconds: float | None = None,
+                     exit_quote_age_seconds: float | None = None,
+                     entry_feed: str | None = None,
+                     exit_feed: str | None = None,
+                     entry_provider: str | None = None,
+                     exit_provider: str | None = None,
+                     planned_risk_per_unit: float | None = None) -> IBRTrade:
     # Listed options are always bought to open in the runtime, including puts
     # used for a short-underlying thesis.  Their P&L is therefore long-option
     # P&L even when the underlying direction is short.
@@ -237,6 +283,29 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
     gross = signed_move * cfg.quantity * multiplier
     costs = cfg.costs.fees(entry_price, exit_price, cfg.quantity, multiplier,
                            vehicle=vehicle)
+    # Equity sizing risk is the stop distance authored from the signal bar.
+    # A next-bar gap can move the actual fill away from that anchor, so account
+    # risk uses the directional distance from the executed entry to the
+    # protective stop (a fill already through its stop has zero remaining loss
+    # to that stop). This mirrors the runtime/factory distinction between
+    # planned sizing risk and realized fill risk.
+    if vehicle == "option":
+        # Listed options are long-premium positions: the premium paid is the
+        # monetary risk unit, including its contract multiplier. Underlying
+        # stop geometry is not an option risk proxy.
+        risk_per_unit = entry_price * multiplier
+        realized_risk_per_unit = risk_per_unit
+    else:
+        risk_per_unit = (float(planned_risk_per_unit)
+                         if planned_risk_per_unit is not None else
+                         abs(entry_price - float(stop_price)))
+        realized_risk_per_unit = max(
+            0.0,
+            (entry_price - float(stop_price)
+             if execution_direction == "long" else
+             float(stop_price) - entry_price),
+        )
+    risk_usd = float(cfg.quantity) * realized_risk_per_unit
     return IBRTrade(
         vehicle=vehicle, session_date=day, symbol=symbol, direction=direction,
         range_high=range_high, range_low=range_low,
@@ -248,6 +317,15 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         costs=costs, net_pnl=gross - costs, tie_broken=tie, gap_fill=gap,
         contract_multiplier=multiplier, entry_fill_source=entry_source,
         exit_fill_source=exit_source,
+        entry_quote_age_seconds=entry_quote_age_seconds,
+        exit_quote_age_seconds=exit_quote_age_seconds,
+        entry_feed=entry_feed, exit_feed=exit_feed,
+        entry_provider=entry_provider, exit_provider=exit_provider,
+        quantity=float(cfg.quantity), risk_per_unit=risk_per_unit,
+        realized_risk_per_unit=realized_risk_per_unit, risk_usd=risk_usd,
+        signal_bar_feed=signal.feed, signal_bar_provider=signal.provider,
+        entry_bar_feed=entry_bar.feed, entry_bar_provider=entry_bar.provider,
+        exit_bar_feed=exit_bar.feed, exit_bar_provider=exit_bar.provider,
     )
 
 
@@ -274,7 +352,22 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                        detail=dict(detail or {})))
         return None
 
-    start = _session_start(day, cfg, zone)
+    try:
+        effective_policy = replay_policy_for_bars(
+            cfg.policy, bars, session_date=day)
+    except CostError as exc:
+        return refuse(str(exc))
+    cfg = replace(cfg, policy=effective_policy)
+
+    exact_open = bars[0].session_open
+    exact_close = bars[0].session_close
+    if exact_open is not None and exact_close is not None:
+        if any(bar.timestamp < exact_open or bar.end > exact_close
+               for bar in bars):
+            return refuse("bar_outside_exact_session")
+
+    start = (_local(exact_open, zone) if exact_open is not None
+             else _session_start(day, cfg, zone))
     range_end = start + timedelta(minutes=cfg.range_minutes)
     close_at = datetime.combine(day, cfg.force_flat, tzinfo=zone)
     if cfg.policy.force_flat_time is not None:
@@ -362,17 +455,27 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # Option snapshots are selected at/before the entry bar.  A caller may pass
     # a sparse mapping from timestamp to snapshot; absence is explicit no-data.
     selected_contract = None
+    entry_snap: OptionSnapshot | None = None
+    entry_quote_age_seconds: float | None = None
+    exit_quote_age_seconds: float | None = None
+    entry_feed: str | None = None
+    exit_feed: str | None = None
+    entry_provider: str | None = None
+    exit_provider: str | None = None
     if vehicle == "equity":
         # The fill instant is the entry bar's open.  A quote recorded at that
         # instant is the real executable price; the bar open is a trade print
         # that has to be marked up by the modelled spread instead.
-        quoted = quote_fill(
+        quoted = quote_fill_record(
             quotes, symbol=symbol, at=entry_bar.timestamp,
             side="buy" if direction == "long" else "sell",
             max_age_seconds=cfg.policy.max_market_data_age_seconds,
             session_date=day)
         if quoted is not None:
-            entry_ref, entry_source = quoted, QUOTE
+            entry_ref, entry_source = quoted.price, QUOTE
+            entry_feed, entry_provider = quoted.feed, quoted.provider
+            entry_quote_age_seconds = max(
+                0.0, (entry_bar.timestamp - quoted.timestamp).total_seconds())
         elif cfg.policy.strict_market_data:
             return refuse("no_quote_at_entry")
     if vehicle == "option":
@@ -392,6 +495,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                     and ((s.ask - s.bid) / ((s.ask + s.bid) / 2.0) * 100.0 <=
                          option_policy.options_max_spread_pct)
                     and option_has_liquidity(s)
+                    and _option_executable(s)
                     and str(s.contract.right).lower() in {
                         wanted_right, wanted_right[0]}]
         if not eligible:
@@ -403,12 +507,18 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             abs(float(item.contract.strike) - float(spot)),
             (item.ask - item.bid) / ((item.ask + item.bid) / 2.0),
             -item.timestamp.timestamp(), item.contract.symbol))
+        entry_snap = snap
         contract = snap.contract
         selected_contract = contract
         entry_ref = snap.ask
         if entry_ref <= 0:
             return refuse("option_entry_ask_not_positive")
         multiplier = snap.contract.multiplier
+        entry_source = QUOTE
+        entry_quote_age_seconds = max(
+            0.0, (entry_bar.timestamp - snap.timestamp).total_seconds())
+        entry_feed = str(snap.identity.feed)
+        entry_provider = str(snap.identity.provider)
     # The runtime derives both levels from the completed breakout bar's close,
     # because the bracket legs are submitted with the entry and no fill price
     # exists yet.  Anchoring here to the entry bar's open instead would give
@@ -416,18 +526,23 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     anchor = float(signal.close)
     if cfg.range_stop:
         stop = low if direction == "long" else high
-        distance = abs(anchor - stop)
+        distance = max(abs(anchor - stop),
+                       abs(anchor) * MIN_STOP_DISTANCE_FRACTION)
         target_r = cfg.target_r if cfg.target_r is not None else (
             cfg.target_pct / cfg.stop_pct)
+        stop = anchor - distance if direction == "long" else anchor + distance
         target = (anchor + target_r * distance if direction == "long"
                   else anchor - target_r * distance)
     else:
-        stop = anchor * (
-            1 - cfg.stop_pct if direction == "long" else 1 + cfg.stop_pct)
-        target = anchor * (
-            1 + cfg.target_pct if direction == "long" else 1 - cfg.target_pct)
+        distance = max(abs(anchor) * cfg.stop_pct,
+                       abs(anchor) * MIN_STOP_DISTANCE_FRACTION)
+        target_distance = max(abs(anchor) * cfg.target_pct,
+                              abs(anchor) * MIN_STOP_DISTANCE_FRACTION)
+        stop = anchor - distance if direction == "long" else anchor + distance
+        target = (anchor + target_distance if direction == "long"
+                  else anchor - target_distance)
 
-    def option_exit_reference(cutoff: datetime) -> float | None:
+    def option_exit_snapshot(cutoff: datetime) -> OptionSnapshot | None:
         if vehicle != "option":
             return None
         eligible_exits = [s for s in option_snapshots.values()
@@ -436,22 +551,44 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                           and s.timestamp <= cutoff and _visible(s, cutoff)
                           and s.session_date == day and s.bid > 0
                           and cutoff.timestamp() - s.timestamp.timestamp() <=
-                              cfg.policy.max_market_data_age_seconds]
+                              cfg.policy.max_market_data_age_seconds
+                          and _option_executable(s)]
         if not eligible_exits:
             return None
-        return max(eligible_exits, key=lambda item: item.timestamp).bid
+        return max(eligible_exits, key=lambda item: item.timestamp)
+
+    def option_exit_reference(cutoff: datetime) -> float | None:
+        snapshot = option_exit_snapshot(cutoff)
+        return None if snapshot is None else snapshot.bid
+
+    def option_exit_fill(cutoff: datetime) -> float | None:
+        """Return the exit bid and retain its point-in-time provenance."""
+        nonlocal exit_quote_age_seconds, exit_feed, exit_provider
+        snapshot = option_exit_snapshot(cutoff)
+        if snapshot is None:
+            return None
+        exit_quote_age_seconds = max(
+            0.0, (cutoff - snapshot.timestamp).total_seconds())
+        exit_feed = str(snapshot.identity.feed)
+        exit_provider = str(snapshot.identity.provider)
+        return snapshot.bid
 
     exit_side = "sell" if direction == "long" else "buy"
 
-    def boundary_exit(reference: float, at: datetime) -> tuple[float, str]:
+    def boundary_exit(reference: float, at: datetime) -> tuple[float, str, str | None, str | None]:
         """Price a fill that happens at a bar boundary, quote-first."""
+        nonlocal exit_quote_age_seconds
         if vehicle != "equity":
-            return reference, BAR
-        quoted = quote_fill(
+            return reference, BAR, None, None
+        quoted = quote_fill_record(
             quotes, symbol=symbol, at=at, side=exit_side,
             max_age_seconds=cfg.policy.max_market_data_age_seconds,
             session_date=day)
-        return (quoted, QUOTE) if quoted is not None else (reference, BAR)
+        if quoted is None:
+            return reference, BAR, None, None
+        exit_quote_age_seconds = max(
+            0.0, (at - quoted.timestamp).total_seconds())
+        return quoted.price, QUOTE, quoted.feed, quoted.provider
 
     for bar in hold:
         if _local(bar.timestamp, zone) >= close_at:
@@ -472,9 +609,11 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             reason = "stop" if gap_stop else "target"
             exit_source = BAR
             if vehicle == "option":
-                exit_reference = option_exit_reference(bar.timestamp)
+                exit_source = QUOTE
+                exit_reference = option_exit_fill(bar.timestamp)
             else:
-                exit_reference, exit_source = boundary_exit(bar.open, bar.timestamp)
+                (exit_reference, exit_source, exit_feed,
+                 exit_provider) = boundary_exit(bar.open, bar.timestamp)
             if (cfg.policy.strict_market_data and vehicle == "equity" and
                     exit_source != QUOTE):
                 return refuse("no_quote_at_gap_exit")
@@ -487,7 +626,13 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     reason=reason, tie=False, gap=True, cfg=cfg,
                                     multiplier=multiplier, stop_price=stop,
                                     target_price=target, entry_source=entry_source,
-                                    exit_source=exit_source)
+                                    exit_source=exit_source,
+                                    entry_quote_age_seconds=entry_quote_age_seconds,
+                                    exit_quote_age_seconds=exit_quote_age_seconds,
+                                    entry_feed=entry_feed, exit_feed=exit_feed,
+                                    entry_provider=entry_provider,
+                                    exit_provider=exit_provider,
+                                    planned_risk_per_unit=distance)
         if hit_stop or hit_target:
             # Stop wins if both are touched by one candle.
             reason = "stop" if hit_stop else "target"
@@ -495,7 +640,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             # Intrabar trigger has no precise quote instant.  Use the latest
             # snapshot available at the bar open, never a post-trigger bar-end
             # quote that would look into the future.
-            exit_reference = (option_exit_reference(
+            exit_reference = (option_exit_fill(
                 bar.timestamp if cfg.policy.strict_market_data else bar.end)
                               if vehicle == "option" else level)
             if exit_reference is None:
@@ -507,26 +652,37 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     reason=reason, tie=hit_stop and hit_target, gap=False,
                                     cfg=cfg, multiplier=multiplier,
                                     stop_price=stop, target_price=target,
-                                    entry_source=entry_source)
+                                    entry_source=entry_source,
+                                    exit_source=(QUOTE if vehicle == "option" else BAR),
+                                    entry_quote_age_seconds=entry_quote_age_seconds,
+                                    exit_quote_age_seconds=exit_quote_age_seconds,
+                                    entry_feed=entry_feed, exit_feed=exit_feed,
+                                    entry_provider=entry_provider,
+                                    exit_provider=exit_provider,
+                                    planned_risk_per_unit=distance)
     # Force-flat at the last completed bar before the configured close.
     boundary = next((b for b in hold if _local(b.timestamp, zone) >= close_at
                      and _visible(b, b.timestamp)), None)
     exit_source = BAR
     if boundary is not None:
         last = boundary
-        exit_ref, exit_source = boundary_exit(last.open, last.timestamp)
+        exit_ref, exit_source, exit_feed, exit_provider = boundary_exit(
+            last.open, last.timestamp)
     else:
         candidates = [b for b in hold if b.end <= close_at and _visible(b, b.end)]
         if not candidates:
             return refuse("no_visible_bar_before_force_flat")
         last = candidates[-1]
-        exit_ref, exit_source = boundary_exit(last.close, last.end)
-        if vehicle == "option":
-            exit_ref = option_exit_reference(last.timestamp)
-            if exit_ref is None:
-                return refuse("no_option_exit_reference_at_force_flat")
-        elif cfg.policy.strict_market_data and exit_source != QUOTE:
-            return refuse("no_quote_at_force_flat_exit")
+        exit_ref, exit_source, exit_feed, exit_provider = boundary_exit(
+            last.close, last.end)
+    if vehicle == "option":
+        # Option liquidation is always priced from the selected contract's
+        # latest visible bid, including the force-flat boundary path.
+        exit_ref = option_exit_fill(last.timestamp)
+        if exit_ref is None:
+            return refuse("no_option_exit_reference_at_force_flat")
+    elif cfg.policy.strict_market_data and exit_source != QUOTE:
+        return refuse("no_quote_at_force_flat_exit")
     return _trade_from_exit(vehicle=vehicle, symbol=symbol, day=day, direction=direction,
                             range_high=high, range_low=low, signal=signal,
                             entry_bar=entry_bar, entry_reference=entry_ref,
@@ -534,7 +690,13 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                             reason="force_flat", tie=False, gap=False, cfg=cfg,
                             multiplier=multiplier, stop_price=stop,
                             target_price=target, entry_source=entry_source,
-                            exit_source=exit_source)
+                            exit_source=(QUOTE if vehicle == "option" else exit_source),
+                            entry_quote_age_seconds=entry_quote_age_seconds,
+                            exit_quote_age_seconds=exit_quote_age_seconds,
+                            entry_feed=entry_feed, exit_feed=exit_feed,
+                            entry_provider=entry_provider,
+                            exit_provider=exit_provider,
+                            planned_risk_per_unit=distance)
 
 
 def replay_ibr(bars: Iterable[UnderlyingBar], *, symbol: str | None = None,

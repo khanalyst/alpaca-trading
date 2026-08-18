@@ -20,6 +20,8 @@ from agent.config import ConfigError, validate_config
 from agent import engine as engine_module
 from agent.engine import Engine
 from agent.edge import resolve_validated_variant, resolve_validated_variants
+from agent.variants import apply as apply_registered_variant, load_registry
+from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from agent.market import MarketData
 from agent.risk import RiskEngine
 from agent.runtime_control import RuntimeControlMixin
@@ -27,7 +29,9 @@ from agent.startup_edge_policy import StartupEdgePolicyMixin
 from agent.market_entry_risk import MarketEntryRiskMixin
 from agent import engine_cycle as engine_cycle_module
 from agent.engine_cycle import EngineCycleMixin
+from agent.engine_cycle import _rule_runtime_bars
 from research.edge_lab import EdgeLedger
+from research.edge_identity import candidate_assumptions
 from research.edge_ledger_store import hash_config
 
 
@@ -580,9 +584,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(options[0].feed, "opra")
         request_feeds = [(name, kwargs.get("feed")) for name, kwargs in seen]
         self.assertEqual(request_feeds[:3], [
-            ("StockBarsRequest", "IEX"),
-            ("StockQuotesRequest", "IEX"),
-            ("OptionChainRequest", "INDICATIVE")])
+            ("StockBarsRequest", "SIP"),
+            ("StockQuotesRequest", "SIP"),
+            ("OptionChainRequest", "OPRA")])
         request_feeds = dict(request_feeds)
         self.assertEqual(request_feeds["StockBarsRequest"], "SIP")
         self.assertEqual(request_feeds["StockQuotesRequest"], "SIP")
@@ -716,6 +720,56 @@ class RuntimeSafetyTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                         AlpacaError, "authenticated paper preflight failed"):
                     engine.preflight()
+
+    def test_preflight_keeps_iex_and_indicative_for_explicit_diagnostics(self):
+        """Non-research equity diagnostics retain their partial-feed lane."""
+        engine = Engine(_cfg(), light=True, provider=FakeProvider())
+        self.addCleanup(engine.close)
+        result = engine.preflight()
+        self.assertEqual(result["data_feed"], "iex")
+        self.assertEqual(result["options_feed"], "indicative")
+
+    def test_preflight_rejects_injected_provider_feed_bypass_for_research(self):
+        class ResearchProvider(FakeProvider):
+            data_feed = "iex"
+            options_feed = "indicative"
+
+        cfg = _cfg()
+        cfg["broker"].update(data_feed="sip", options_feed="opra")
+        cfg["research"] = {"enabled": True, "require_validated_variant": False,
+                            "db_path": str(Path(self.runtime_tmp.name) / "edge.sqlite3")}
+        engine = Engine(cfg, light=True, provider=ResearchProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "provider equity feed"):
+            engine.preflight()
+
+    def test_preflight_rejects_option_execution_without_opra_provider(self):
+        class IndicativeProvider(FakeProvider):
+            options_feed = "indicative"
+
+        cfg = _cfg()
+        cfg["strategy"]["execution_mode"] = "options"
+        cfg["broker"]["options_feed"] = "opra"
+        engine = Engine(cfg, light=True, provider=IndicativeProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError,
+                                    "provider options feed|option execution/research"):
+            engine.preflight()
+
+    def test_preflight_rejects_option_research_without_opra_provider(self):
+        class IndicativeProvider(FakeProvider):
+            data_feed = "sip"
+            options_feed = "indicative"
+
+        cfg = _cfg()
+        cfg["broker"].update(data_feed="sip", options_feed="opra")
+        cfg["universe"]["asset_classes"] = ["us_equity", "us_option"]
+        cfg["research"] = {"enabled": True, "require_validated_variant": False,
+                            "db_path": str(Path(self.runtime_tmp.name) / "edge.sqlite3")}
+        engine = Engine(cfg, light=True, provider=IndicativeProvider())
+        self.addCleanup(engine.close)
+        with self.assertRaisesRegex(AlpacaError, "provider options feed"):
+            engine.preflight()
 
     def test_market_data_is_closed_before_calendar_load(self):
         market = MarketData(FakeProvider())
@@ -955,6 +1009,10 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     def test_required_edge_blocks_the_real_order_path_until_champion_exists(self):
         provider = FakeProvider()
+        # Research-enabled runtimes must advertise their entitled feeds even
+        # when this test is focused on the missing validated edge.
+        provider.data_feed = "sip"
+        provider.options_feed = "opra"
         cfg = _cfg()
         cfg["research"] = {
             "enabled": True,
@@ -1407,6 +1465,9 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     def test_premarket_required_edge_refreshes_paused_heartbeat_after_cleanup(self):
         class PreopenProvider(FakeProvider):
+            data_feed = "sip"
+            options_feed = "opra"
+
             def clock(self):
                 now = self.day.open - timedelta(minutes=30)
                 return MarketClock(now, False, next_open=self.day.open,
@@ -1468,9 +1529,19 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     @staticmethod
     def _prove(ledger, variant_id, *, confidence=.99):
+        base = validate_config({
+            "strategy": {"id": "ibr", "variant_id": variant_id,
+                         "execution_mode": "shares"},
+        })
+        registry = load_registry(Path(__file__).resolve().parents[1] /
+                                 "research" / "variants.yaml")
+        applied = apply_registered_variant(registry[variant_id], base)
+        assumptions = candidate_assumptions(
+            applied, vehicle="equity", strategy_id="ibr",
+            variant_id=variant_id)
         record = ledger.register_candidate(
             variant_id, strategy_id="ibr", vehicle="equity",
-            hypothesis=f"proof for {variant_id}", config={}, axes={})
+            hypothesis=f"proof for {variant_id}", config=assumptions, axes={})
         passing = {"gate": {"passes": True, "heldout_delta": .1,
                             "heldout_trades": 20},
                    "confidence": confidence}
@@ -1510,7 +1581,12 @@ class RuntimeSafetyTests(unittest.TestCase):
         }
         with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
                 patch.object(EdgeLedger, "latest_verified_run",
-                             return_value=self._verified_proof()):
+                             return_value=self._verified_proof()), \
+                patch.object(
+                    EdgeLedger, "eligibility",
+                    return_value={"eligible": True,
+                                  "latest_verified_run": self._verified_proof(
+                                      config_hash=pinned["config_hash"])}):
             cfg = validate_config(raw)
             engine = Engine(cfg, light=True, provider=LiveProvider())
         self.addCleanup(engine.close)
@@ -1533,7 +1609,12 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
                 patch.object(EdgeLedger, "latest_verified_run",
-                             return_value=self._verified_proof()):
+                             return_value=self._verified_proof()), \
+                patch.object(
+                    EdgeLedger, "eligibility",
+                    return_value={"eligible": True,
+                                  "latest_verified_run": self._verified_proof(
+                                      config_hash=pinned["config_hash"])}):
             cfg = validate_config({
                 "mode": "live", "broker": {"paper": False, "allow_live": True},
                 "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
@@ -1558,12 +1639,40 @@ class RuntimeSafetyTests(unittest.TestCase):
                     patch.object(
                         EdgeLedger, "latest_verified_run",
                         return_value=self._verified_proof(
-                            config_hash=proof_hash or "")):
+                            config_hash=proof_hash or "")), \
+                    patch.object(
+                        EdgeLedger, "eligibility",
+                        return_value={"eligible": True,
+                                      "latest_verified_run": self._verified_proof(
+                                          config_hash=proof_hash or "")}):
                 self.assertIsNone(resolve_validated_variant(cfg, db_path=db))
         with patch.object(EdgeLedger, "latest_verified_run",
                           return_value=self._verified_proof(
-                              config_hash=record["config_hash"])):
+                              config_hash=record["config_hash"])), \
+                patch.object(
+                    EdgeLedger, "eligibility",
+                    return_value={"eligible": True,
+                                  "latest_verified_run": self._verified_proof(
+                                      config_hash=record["config_hash"])}):
             self.assertIsNotNone(resolve_validated_variant(cfg, db_path=db))
+
+    def test_edge_rejects_current_runtime_when_cost_assumptions_drift(self):
+        """A passing proof cannot authorize a materially different runtime."""
+        db = Path(self.runtime_tmp.name) / "edge-cost-drift.sqlite3"
+        ledger = EdgeLedger(db)
+        record = self._prove(ledger, "ibr.baseline")
+        cfg = validate_config({
+            "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                         "selection_mode": "specific"},
+            "costs": {"spread_bps": 5.0},
+        })
+        proof = self._verified_proof(config_hash=record["config_hash"])
+        with patch.object(EdgeLedger, "latest_verified_run",
+                          return_value=proof), \
+                patch.object(EdgeLedger, "eligibility",
+                             return_value={"eligible": True,
+                                           "latest_verified_run": proof}):
+            self.assertIsNone(resolve_validated_variant(cfg, db_path=db))
 
     def test_live_preflight_requires_explicit_pdt_eligibility(self):
         db = Path(self.runtime_tmp.name) / "live-pdt.sqlite3"
@@ -1576,7 +1685,12 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
                 patch.object(EdgeLedger, "latest_verified_run",
-                             return_value=self._verified_proof()):
+                             return_value=self._verified_proof()), \
+                patch.object(
+                    EdgeLedger, "eligibility",
+                    return_value={"eligible": True,
+                                  "latest_verified_run": self._verified_proof(
+                                      config_hash=self._prove(ledger, "ibr.baseline")["config_hash"])}):
             cfg = validate_config({
                 "mode": "live", "broker": {"paper": False, "allow_live": True},
                 "strategy": {"id": "ibr", "variant_id": "ibr.baseline",
@@ -1615,16 +1729,34 @@ class RuntimeSafetyTests(unittest.TestCase):
     def test_all_proved_resolver_keeps_one_deterministic_edge_per_family(self):
         db = Path(self.runtime_tmp.name) / "all-proved.sqlite3"
         ledger = EdgeLedger(db)
-        rows = [
-            ("rule.alpha.0000000000000001", "mean_reversion"),
-            ("rule.alpha.0000000000000002", "mean_reversion"),
-            ("rule.beta.0000000000000001", "volume_breakout"),
+        specs = [
+            ("mean_reversion", {"lookback": 10}),
+            ("mean_reversion", {"lookback": 11}),
+            ("volume_breakout", {"lookback": 10}),
         ]
+        rows = [(rule_variant_id({"family": family, **params}), family)
+                for family, params in specs]
         for variant_id, family in rows:
+            spec = validate_rule_spec({"family": family,
+                                       **dict(next(params for fam, params in specs
+                                                   if fam == family))})
+            # Use a deterministic, valid spec for each family; the second
+            # mean-reversion arm is intentionally a distinct lookback.
+            if family == "mean_reversion":
+                lookback = 10 if variant_id == rows[0][0] else 11
+                spec = validate_rule_spec({"family": family,
+                                           "lookback": lookback})
+            else:
+                spec = validate_rule_spec({"family": family, "lookback": 10})
+            assumptions = candidate_assumptions(
+                validate_config({"strategy": {"id": "rule",
+                                               "execution_mode": "shares"}}),
+                vehicle="equity", strategy_id="rule", variant_id=variant_id,
+                rule_spec=spec)
             record = ledger.register_candidate(
                 variant_id, strategy_id="rule", vehicle="equity",
                 hypothesis=family,
-                config={"strategy": {"rule_spec": {"family": family}}})
+                config=assumptions)
             with closing(sqlite3.connect(ledger.path)) as db_handle, db_handle:
                 db_handle.execute(
                     "UPDATE candidate_state SET status='validated' WHERE candidate_id=?",
@@ -1634,15 +1766,76 @@ class RuntimeSafetyTests(unittest.TestCase):
             return self._verified_proof(
                 config_hash=ledger.candidate(candidate_id)["config_hash"])
         with patch.object(EdgeLedger, "latest_verified_run",
-                          side_effect=proof_for):
+                          side_effect=proof_for), \
+                patch.object(
+                    EdgeLedger, "eligibility",
+                    side_effect=lambda candidate_id, lane="shadow": {
+                        "eligible": True,
+                        "latest_verified_run": proof_for(candidate_id, lane=lane)}):
             selected = resolve_validated_variants({
                 "strategy": {"id": "rule", "execution_mode": "shares",
                              "selection_mode": "all_proved"}}, db_path=db)
         self.assertEqual(len(selected), 2)
-        self.assertEqual({row["variant_id"] for row in selected}, {
-            "rule.alpha.0000000000000002",
-            "rule.beta.0000000000000001",
-        })
+        self.assertEqual({row["variant_id"] for row in selected},
+                         {rows[0][0], rows[2][0]})
+
+    def test_every_resolver_mode_uses_the_ledger_eligibility_boundary(self):
+        """A passing-looking proof cannot bypass epoch/live-shadow auth."""
+        db = Path(self.runtime_tmp.name) / "eligibility-boundary.sqlite3"
+        ledger = EdgeLedger(db)
+        specific = self._prove(ledger, "ibr.baseline")
+        rule = ledger.register_candidate(
+            "rule.orb.boundary000000", strategy_id="rule", vehicle="equity",
+            hypothesis="boundary", config={"strategy": {
+                "rule_spec": {"family": "opening_range_breakout"}}})
+        with closing(sqlite3.connect(ledger.path)) as db_handle, db_handle:
+            db_handle.execute("UPDATE candidate_state SET status='validated' "
+                              "WHERE candidate_id=?", (rule["candidate_id"],))
+        proof = self._verified_proof(config_hash=specific["config_hash"])
+        modes = (
+            {"strategy": {"id": "ibr", "variant_id": "ibr.baseline",
+                          "selection_mode": "specific"}},
+            {"strategy": {"id": "ibr", "selection_mode": "all_proved"}},
+            {"strategy": {"id": "rule", "selection_mode": "pinned",
+                          "pinned": [{"variant_id": rule["variant_id"],
+                                      "vehicle": "equity",
+                                      "strategy_id": "rule"}]}},
+        )
+        for config in modes:
+            with self.subTest(mode=config["strategy"]["selection_mode"]), \
+                    patch.object(EdgeLedger, "latest_verified_run",
+                                 return_value=proof), \
+                    patch.object(EdgeLedger, "eligibility",
+                                 return_value={"eligible": False,
+                                               "latest_verified_run": proof}) as boundary:
+                self.assertEqual(resolve_validated_variants(config, db_path=db), [])
+                self.assertTrue(boundary.called)
+
+    def test_rule_runtime_requires_completed_contiguous_feature_window(self):
+        from agent.contracts.rule import validate_rule_spec
+
+        opening = datetime(2026, 8, 18, 13, 30, tzinfo=timezone.utc)
+        now = opening + timedelta(minutes=8, seconds=30)
+        spec = validate_rule_spec({"family": "momentum_continuation",
+                                   "lookback": 3, "atr_period": 3})
+
+        def bars(drop=None, partial=False):
+            rows = []
+            for index in range(8):
+                if index == drop:
+                    continue
+                stamp = opening + timedelta(minutes=index)
+                rows.append({"timestamp": stamp,
+                             "open": 100 + index, "high": 101 + index,
+                             "low": 99 + index, "close": 100 + index,
+                             "volume": 1000})
+            if partial:
+                rows[-1]["timestamp"] = now - timedelta(seconds=30)
+            return rows
+
+        self.assertIsNotNone(_rule_runtime_bars(bars(), spec, now))
+        self.assertIsNone(_rule_runtime_bars(bars(drop=3), spec, now))
+        self.assertIsNone(_rule_runtime_bars(bars(partial=True), spec, now))
 
     def test_stale_broker_clock_blocks_entry_but_runs_cleanup_path(self):
         class StaleClockProvider(FakeProvider):

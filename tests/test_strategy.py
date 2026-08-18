@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from agent import strategy
 from agent.config import validate_config
 from agent.contracts.ibr import build_ibr_range, evaluate_exit, evaluate_ibr_breakout
-from agent.contracts.rule import generate_rule_signal, rule_variant_id, validate_rule_spec
+from agent.contracts.rule import (MIN_STOP_DISTANCE_FRACTION,
+                                  generate_rule_signal, rule_variant_id,
+                                  validate_rule_spec)
 
 
 def bars(start, *, high=100.5, low=99.5, close=100.0, volume=10.0):
@@ -55,6 +57,38 @@ class IBRContractTests(unittest.TestCase):
         self.assertEqual(long_signal["stop_price"], opening["low"])
         self.assertEqual(short_signal["stop_price"], opening["high"])
         self.assertEqual(long_signal["target_r"], short_signal["target_r"])
+
+    def test_ibr_contract_and_runtime_plan_enforce_the_30bps_stop_floor(self):
+        start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)
+        opening = build_ibr_range(bars(
+            start, high=100.01, low=99.99, close=100.0))
+        signal = evaluate_ibr_breakout(
+            opening, {"timestamp": start + timedelta(minutes=15),
+                      "high": 100.1, "low": 100.0, "close": 100.07,
+                      "volume": 20})
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(
+            signal["stop_distance"],
+            signal["entry_price"] * MIN_STOP_DISTANCE_FRACTION)
+
+        cfg = {"strategy": {"id": "ibr", "version": "v1",
+                            "target_r": 2.0, "breakout_buffer_bps": 5,
+                            "min_relative_volume": 1}}
+        snapshot = {
+            "price": 100.07, "close": 100.07, "signal_ts": 1710164760,
+            "ibr_range": {"high": 100.01, "low": 99.99, "width": .02,
+                          "range_end_ts": 1710164700, "complete": True},
+            "relative_volume": 2, "spread_bps": 10,
+            "stale": False, "quote_stale": False,
+            "session": "2024-03-11",
+        }
+        plan, why = strategy.build_setup_plan(
+            {"symbol": "SPY", "direction": "long",
+             "setup_type": "ibr_breakout"}, snapshot, cfg)
+        self.assertIsNone(why)
+        self.assertAlmostEqual(
+            plan["stop_distance"],
+            plan["entry_price"] * MIN_STOP_DISTANCE_FRACTION)
 
     def test_one_signal_per_symbol_session(self):
         start = datetime(2024, 3, 11, 13, 30, tzinfo=timezone.utc)

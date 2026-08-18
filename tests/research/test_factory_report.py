@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 from agent.contracts.rule import (rule_spec_hash, rule_variant_id,
                                   validate_rule_spec)
+import research.gates as gates
 from research.factory_report import (DEFAULT_REPORT_ROOT, REPORT_SCHEMA,
                                      build_report, render_markdown,
                                      render_text, write_report)
@@ -69,14 +70,26 @@ def _run(directory, *, llm=True):
     """One real cycle whose single family fails and is replaced."""
     db = Path(directory) / "edge.sqlite3"
     with patch.object(factory_module, "ProcessPoolExecutor", side_effect=OSError), \
-            patch.object(factory_module, "_worker", side_effect=fake_adequate_worker):
+            patch.object(factory_module, "_worker", side_effect=fake_adequate_worker), \
+            patch.multiple(
+                gates,
+                PROTOCOL_BACKTEST_MIN_TRADES=1,
+                PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+                PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+                PROTOCOL_SHADOW_MIN_TRADES=1,
+                PROTOCOL_SHADOW_MIN_SESSIONS=1,
+                PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+                PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+                PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+                PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
+            patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1):
         run_factory(
-            losing_breakouts(), db_path=db, strategies=1,
-            variants_per_strategy=2, workers=1, min_trades=1, min_sessions=1,
-            alpha=1.0, max_generations=2,
-            strategy_llm=({"enabled": True, "provider": "openai",
-                           "model": "gpt-5"} if llm else None),
-            proposal_adapter=Adapter() if llm else None)
+                losing_breakouts(), db_path=db, strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1, min_sessions=1,
+                alpha=1.0, max_generations=2,
+                strategy_llm=({"enabled": True, "provider": "openai",
+                               "model": "gpt-5"} if llm else None),
+                proposal_adapter=Adapter() if llm else None)
     return db
 
 
@@ -155,7 +168,19 @@ class ReportContentTests(unittest.TestCase):
             with patch.object(factory_module, "ProcessPoolExecutor",
                               side_effect=OSError), \
                     patch.object(factory_module, "_worker",
-                                 side_effect=fake_adequate_worker):
+                                 side_effect=fake_adequate_worker), \
+                    patch.multiple(
+                        gates,
+                        PROTOCOL_BACKTEST_MIN_TRADES=1,
+                        PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+                        PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+                        PROTOCOL_SHADOW_MIN_TRADES=1,
+                        PROTOCOL_SHADOW_MIN_SESSIONS=1,
+                        PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+                        PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+                        PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+                        PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
+                    patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1):
                 run_factory(losing_breakouts(), db_path=db, strategies=1,
                             variants_per_strategy=2, workers=1, min_trades=1,
                             min_sessions=1, alpha=1.0, max_generations=2,

@@ -17,6 +17,8 @@ PAIRED_SIGN_FLIP_NULL_ASSUMPTION = (
     "cluster_delta_sign_exchangeability_under_symmetric_null")
 DEFAULT_NULL_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_DRAWS = 4_000
+DEFAULT_BREADTH_MIN_CLUSTERS = 2
+DEFAULT_BREADTH_MIN_SESSIONS = 3
 
 
 def stable_seed(value) -> int:
@@ -129,12 +131,21 @@ def sign_flip_null_statistics(deltas, clusters, *, draws: int = DEFAULT_NULL_DRA
 
 def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
                                   draws: int = DEFAULT_BOOTSTRAP_DRAWS,
-                                  seed: int | None = None) -> dict:
+                                  seed: int | None = None,
+                                  block_length: int | None = None,
+                                  min_clusters: int = 1) -> dict:
     """Bootstrap one-sided bounds on the mean over whole clusters.
 
     Clusters, not observations, are resampled: intraday deltas inside one
-    session are not independent and must move together.
+    session are not independent and must move together.  Passing
+    ``block_length`` opts into :func:`moving_block_cluster_bootstrap_lower_bound`
+    while retaining this historical function name for callers of the research
+    gates.
     """
+    if block_length is not None:
+        return moving_block_cluster_bootstrap_lower_bound(
+            deltas, clusters, confidence=confidence, draws=draws, seed=seed,
+            block_length=block_length, min_clusters=min_clusters)
     grouped: dict[str, list[float]] = {}
     for delta, cluster in zip(deltas, clusters):
         try:
@@ -146,6 +157,10 @@ def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
     keys = sorted(grouped)
     total = sum(len(grouped[key]) for key in keys)
     resamples = max(1, int(draws))
+    try:
+        minimum = max(1, int(min_clusters))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_clusters must be a non-negative integer") from exc
     if not 0 < float(confidence) < 1:
         raise ValueError("confidence must be between zero and one")
     resolved_seed = int(stable_seed({"bootstrap": [grouped[key] for key in keys],
@@ -158,6 +173,16 @@ def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
                 "mean": None, "clusters": 0,
                 "observations": 0, "draws": 0, "seed": resolved_seed,
                 "confidence": float(confidence)}
+    if len(keys) < minimum:
+        return {"method": "cluster_bootstrap", "available": False,
+                "lower_bound": None, "upper_bound": None,
+                "mean": sum(sum(grouped[key]) for key in keys) / total,
+                "clusters": len(keys), "observations": total,
+                "draws": resamples, "seed": resolved_seed,
+                "confidence": float(confidence),
+                "minimum_clusters": minimum,
+                "reason": ("no_finite_observations" if not keys or total == 0
+                           else "insufficient_clusters")}
     rng = random.Random(resolved_seed)
     size = len(keys)
     means = []
@@ -180,6 +205,370 @@ def cluster_bootstrap_lower_bound(deltas, clusters, *, confidence: float = .95,
             "mean": sum(sum(grouped[key]) for key in keys) / total,
             "clusters": size, "observations": total, "draws": resamples,
             "seed": resolved_seed, "confidence": float(confidence)}
+
+
+def moving_block_cluster_bootstrap_lower_bound(
+        deltas, clusters, *, confidence: float = .95,
+        draws: int = DEFAULT_BOOTSTRAP_DRAWS, block_length: int = 1,
+        seed: int | None = None,
+        min_clusters: int = DEFAULT_BREADTH_MIN_CLUSTERS) -> dict:
+    """Return a seeded lower bound using a moving-block cluster bootstrap.
+
+    ``clusters`` are expected in chronological order.  The first occurrence
+    of each cluster establishes that order; observations belonging to the same
+    cluster move together.  Circular overlapping blocks preserve short-range
+    serial dependence while allowing a fixed-length bootstrap series.  The
+    statistic is the observation-weighted mean, matching the historical
+    cluster bootstrap contract.
+
+    Fewer than ``min_clusters`` independent clusters are reported as
+    unavailable.  This is deliberately conservative: one cluster cannot
+    identify a sampling distribution, even when it contains many observations.
+    All result metadata (including the resolved seed and requested draw count)
+    is returned so persisted evidence can be recomputed exactly.
+    """
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("confidence must be between zero and one") from exc
+    if not 0 < confidence_value < 1:
+        raise ValueError("confidence must be between zero and one")
+    try:
+        length = int(block_length)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("block_length must be a positive integer") from exc
+    if length <= 0:
+        raise ValueError("block_length must be a positive integer")
+    try:
+        minimum = max(1, int(min_clusters))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_clusters must be a non-negative integer") from exc
+    resamples = max(1, int(draws))
+
+    grouped: dict[str, list[float]] = {}
+    order: list[str] = []
+    for delta, cluster in zip(deltas, clusters):
+        try:
+            value = float(delta)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        key = str(cluster)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(value)
+
+    observations = sum(len(grouped[key]) for key in order)
+    cluster_count = len(order)
+    payload = {
+        "moving_block_bootstrap": [
+            {"cluster": key, "values": grouped[key]} for key in order],
+        "confidence": confidence_value, "draws": resamples,
+        "block_length": length, "min_clusters": minimum,
+    }
+    resolved_seed = int(stable_seed(payload) if seed is None else seed)
+    mean = (sum(sum(grouped[key]) for key in order) / observations
+            if observations else None)
+    common = {
+        "method": "moving_block_cluster_bootstrap",
+        "bootstrap_method": "moving_block",
+        "available": False,
+        "lower_bound": None, "upper_bound": None, "mean": mean,
+        "clusters": cluster_count, "cluster_count": cluster_count,
+        "observations": observations, "draws": resamples,
+        "block_length": length, "seed": resolved_seed,
+        "confidence": confidence_value, "minimum_clusters": minimum,
+    }
+    if observations == 0:
+        return {**common, "reason": "no_finite_observations"}
+    if cluster_count < minimum:
+        return {**common, "reason": "insufficient_clusters"}
+
+    # The moving-block bootstrap has one circular block for every possible
+    # starting cluster.  Truncate a concatenation of ceil(n/L) blocks to n
+    # clusters so every replicate has the same effective sample size.
+    size = cluster_count
+    block_count = (size + length - 1) // length
+    rng = random.Random(resolved_seed)
+    means: list[float] = []
+    for _ in range(resamples):
+        selected: list[str] = []
+        for _ in range(block_count):
+            start = rng.randrange(size)
+            selected.extend(order[(start + offset) % size]
+                           for offset in range(length))
+        selected = selected[:size]
+        pooled = sum(sum(grouped[key]) for key in selected)
+        count = sum(len(grouped[key]) for key in selected)
+        means.append(pooled / count if count else 0.0)
+
+    means.sort()
+    lower_index = int(math.floor((1.0 - confidence_value) * resamples))
+    lower_index = min(max(lower_index, 0), resamples - 1)
+    upper_index = int(math.ceil(confidence_value * resamples)) - 1
+    upper_index = min(max(upper_index, 0), resamples - 1)
+    return {**common, "available": True,
+            "lower_bound": means[lower_index],
+            "upper_bound": means[upper_index],
+            "replicate_min": means[0], "replicate_max": means[-1],
+            "reason": None}
+
+
+def _breadth_value(row, keys):
+    """Read the first present field from a mapping without truthiness bugs."""
+    for key in keys:
+        if key in row:
+            return row[key]
+    return None
+
+
+def _coerce_breadth_observations(
+        paired_deltas, sessions=None, symbols=None, *,
+        delta_key: str = "delta", session_key: str = "session",
+        symbol_key: str = "symbol") -> tuple[list[tuple[str, str, float]],
+                                               set[str], set[str], int]:
+    """Normalize common row, tuple, matrix, and mapping breadth inputs."""
+    observations: list[tuple[str, str, float]] = []
+    session_labels: set[str] = set()
+    symbol_labels: set[str] = set()
+    invalid = 0
+
+    def add(session, symbol, delta):
+        nonlocal invalid
+        if session is None or symbol is None:
+            invalid += 1
+            return
+        session_key_value = str(session)
+        symbol_key_value = str(symbol)
+        session_labels.add(session_key_value)
+        symbol_labels.add(symbol_key_value)
+        try:
+            value = float(delta)
+        except (TypeError, ValueError):
+            invalid += 1
+            return
+        if not math.isfinite(value):
+            invalid += 1
+            return
+        observations.append((session_key_value, symbol_key_value, value))
+
+    # A flat delta vector plus parallel session and symbol vectors is useful
+    # for callers that already materialize paired values separately.
+    if sessions is not None or symbols is not None:
+        if sessions is None or symbols is None:
+            raise ValueError("sessions and symbols must be supplied together")
+        values = list(paired_deltas or ())
+        session_values = list(sessions)
+        symbol_values = list(symbols)
+        # Also accept a rectangular matrix with explicit row/column labels.
+        # This form retains labels for entirely missing cells, which improves
+        # the missing-data diagnostics over inferring labels from observations.
+        if (len(values) == len(session_values) and
+                all(isinstance(row, (list, tuple)) for row in values) and
+                all(len(row) == len(symbol_values) for row in values)):
+            for row, session in zip(values, session_values):
+                for value, symbol in zip(row, symbol_values):
+                    add(session, symbol, value)
+            return observations, session_labels, symbol_labels, invalid
+        if not (len(values) == len(session_values) == len(symbol_values)):
+            raise ValueError("paired deltas, sessions, and symbols must align")
+        for value, session, symbol in zip(values, session_values, symbol_values):
+            add(session, symbol, value)
+        return observations, session_labels, symbol_labels, invalid
+
+    # A mapping of session -> {symbol: delta} is an unambiguous matrix form.
+    if isinstance(paired_deltas, dict):
+        for session, values in paired_deltas.items():
+            if isinstance(values, dict):
+                for symbol, value in values.items():
+                    add(session, symbol, value)
+            elif isinstance(session, (tuple, list)) and len(session) == 2:
+                add(session[0], session[1], values)
+            else:
+                invalid += 1
+        return observations, session_labels, symbol_labels, invalid
+
+    for row in paired_deltas or ():
+        if isinstance(row, dict):
+            session = _breadth_value(
+                row, (session_key, "session", "session_id", "session_date",
+                      "date"))
+            symbol = _breadth_value(row, (symbol_key, "symbol", "ticker"))
+            delta = _breadth_value(
+                row, (delta_key, "delta", "paired_delta", "difference",
+                      "candidate_minus_baseline"))
+            add(session, symbol, delta)
+        else:
+            try:
+                session, symbol, delta = row[:3]
+            except (TypeError, ValueError, IndexError):
+                invalid += 1
+                continue
+            add(session, symbol, delta)
+    return observations, session_labels, symbol_labels, invalid
+
+
+def _symmetric_eigenvalues(matrix: list[list[float]]) -> list[float]:
+    """Compute eigenvalues of a small real symmetric matrix with Jacobi sweeps."""
+    size = len(matrix)
+    if size == 0:
+        return []
+    values = [list(row) for row in matrix]
+    # A deterministic Jacobi diagonalization avoids a numpy dependency and is
+    # stable for the small symbol counts used in research breadth reports.
+    max_sweeps = max(12, 50 * size * size)
+    tolerance = 1e-12
+    for _ in range(max_sweeps):
+        p, q = 0, 0
+        largest = 0.0
+        for row in range(size):
+            for col in range(row + 1, size):
+                magnitude = abs(values[row][col])
+                if magnitude > largest:
+                    largest, p, q = magnitude, row, col
+        if largest <= tolerance:
+            break
+        angle = .5 * math.atan2(
+            2.0 * values[p][q], values[q][q] - values[p][p])
+        cosine, sine = math.cos(angle), math.sin(angle)
+        app, aqq, apq = values[p][p], values[q][q], values[p][q]
+        values[p][p] = (cosine * cosine * app - 2.0 * sine * cosine * apq
+                        + sine * sine * aqq)
+        values[q][q] = (sine * sine * app + 2.0 * sine * cosine * apq
+                        + cosine * cosine * aqq)
+        values[p][q] = values[q][p] = 0.0
+        for index in range(size):
+            if index in (p, q):
+                continue
+            aip, aiq = values[index][p], values[index][q]
+            values[index][p] = values[p][index] = cosine * aip - sine * aiq
+            values[index][q] = values[q][index] = sine * aip + cosine * aiq
+    result = []
+    for index in range(size):
+        value = values[index][index]
+        # Correlation matrices are positive semidefinite; round only tiny
+        # Jacobi residuals below zero, while rejecting materially bad results.
+        result.append(0.0 if value < 0.0 and value > -1e-9 else max(0.0, value))
+    return sorted(result, reverse=True)
+
+
+def effective_breadth_report(
+        paired_deltas, sessions=None, symbols=None, *, delta_key: str = "delta",
+        session_key: str = "session", symbol_key: str = "symbol",
+        min_sessions: int = DEFAULT_BREADTH_MIN_SESSIONS) -> dict:
+    """Estimate independent breadth from session-by-symbol paired deltas.
+
+    The report uses complete sessions to form a centered symbol matrix, then a
+    symmetric correlation matrix and its eigenvalue participation ratio
+    ``(sum(lambda))**2 / sum(lambda**2)``.  Complete-case construction keeps
+    the matrix positive semidefinite under missing data; diagnostics expose
+    how much data was omitted rather than silently imputing it.
+    """
+    observations, session_labels, symbol_labels, invalid = (
+        _coerce_breadth_observations(
+            paired_deltas, sessions, symbols, delta_key=delta_key,
+            session_key=session_key, symbol_key=symbol_key))
+    ordered_sessions = sorted(session_labels)
+    ordered_symbols = sorted(symbol_labels)
+    expected = len(ordered_sessions) * len(ordered_symbols)
+    cells: dict[tuple[str, str], list[float]] = {}
+    for session, symbol, value in observations:
+        cells.setdefault((session, symbol), []).append(value)
+    duplicate_cells = sum(max(0, len(values) - 1) for values in cells.values())
+    # Duplicate cells are averaged in input order.  This is deterministic and
+    # prevents accidental duplicate rows from overweighting one symbol/session.
+    matrix = {key: sum(values) / len(values) for key, values in cells.items()}
+    observed = len(matrix)
+    missing_cells = max(0, expected - observed)
+    complete = [session for session in ordered_sessions
+                if all((session, symbol) in matrix for symbol in ordered_symbols)]
+    complete_count = len(complete)
+    symbol_counts = {
+        symbol: sum((session, symbol) in matrix for session in ordered_sessions)
+        for symbol in ordered_symbols}
+    common = {
+        "method": "symmetric_correlation_eigenvalue_participation_ratio",
+        "available": False, "effective_breadth": None, "breadth": None,
+        "participation_ratio": None, "eigenvalues": [],
+        "sessions": len(ordered_sessions), "symbols": len(ordered_symbols),
+        "complete_sessions": complete_count,
+        "observations": observed, "expected_observations": expected,
+        "missing_cells": missing_cells,
+        "missing_rate": (missing_cells / expected if expected else 1.0),
+        "invalid_observations": invalid, "duplicate_cells": duplicate_cells,
+        "symbol_counts": symbol_counts,
+        "missing_data": {
+            "expected_cells": expected, "observed_cells": observed,
+            "missing_cells": missing_cells,
+            "missing_rate": (missing_cells / expected if expected else 1.0),
+            "complete_sessions": complete_count,
+            "invalid_observations": invalid,
+            "duplicate_cells": duplicate_cells,
+        },
+        "missing": {
+            "expected_cells": expected, "observed_cells": observed,
+            "missing_cells": missing_cells,
+            "missing_rate": (missing_cells / expected if expected else 1.0),
+        },
+        "concentration": None, "concentration_index": None,
+        "concentration_diagnostics": {},
+    }
+    try:
+        minimum = max(2, int(min_sessions))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_sessions must be a positive integer") from exc
+    if len(ordered_symbols) < 2:
+        return {**common, "reason": "insufficient_symbols",
+                "minimum_sessions": minimum}
+    if complete_count < minimum:
+        return {**common, "reason": "insufficient_complete_sessions",
+                "minimum_sessions": minimum}
+
+    columns = [[matrix[(session, symbol)] for session in complete]
+               for symbol in ordered_symbols]
+    means = [sum(column) / len(column) for column in columns]
+    centered = [[value - means[index] for value in column]
+                for index, column in enumerate(columns)]
+    variances = [sum(value * value for value in column)
+                 for column in centered]
+    if any(value <= 1e-18 for value in variances):
+        return {**common, "reason": "degenerate_symbol_variance",
+                "minimum_sessions": minimum}
+    correlations = [[0.0] * len(ordered_symbols)
+                    for _ in ordered_symbols]
+    for row in range(len(ordered_symbols)):
+        correlations[row][row] = 1.0
+        for col in range(row):
+            covariance = sum(centered[row][i] * centered[col][i]
+                             for i in range(complete_count))
+            denominator = math.sqrt(variances[row] * variances[col])
+            correlation = covariance / denominator if denominator else 0.0
+            correlation = min(1.0, max(-1.0, correlation))
+            correlations[row][col] = correlations[col][row] = correlation
+    eigenvalues = _symmetric_eigenvalues(correlations)
+    total = sum(eigenvalues)
+    squared = sum(value * value for value in eigenvalues)
+    if total <= 1e-12 or squared <= 1e-12:
+        return {**common, "reason": "degenerate_correlation_spectrum",
+                "minimum_sessions": minimum}
+    breadth = min(float(len(ordered_symbols)), max(1.0, total * total / squared))
+    shares = [value / total for value in eigenvalues]
+    herfindahl = sum(value * value for value in shares)
+    concentration = {
+        "herfindahl": herfindahl,
+        "max_eigenvalue_share": max(shares),
+        "top_eigenvalue": eigenvalues[0],
+        "independent_limit": len(ordered_symbols),
+    }
+    return {**common, "available": True, "reason": None,
+            "minimum_sessions": minimum, "eigenvalues": eigenvalues,
+            "effective_breadth": breadth, "breadth": breadth,
+            "participation_ratio": breadth, "concentration": herfindahl,
+            "concentration_index": herfindahl,
+            "concentration_diagnostics": concentration,
+            "correlation": correlations}
 
 
 def paired_cluster_sign_flip(
@@ -235,7 +624,11 @@ def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
     }
 
 
-__all__ = ["DEFAULT_BOOTSTRAP_DRAWS", "DEFAULT_NULL_DRAWS",
-           "benjamini_hochberg", "cluster_bootstrap_lower_bound",
-           "cluster_contributions", "paired_cluster_sign_flip",
-           "sign_flip_null_statistics", "stable_seed"]
+__all__ = ["DEFAULT_BREADTH_MIN_CLUSTERS", "DEFAULT_BREADTH_MIN_SESSIONS",
+           "DEFAULT_BOOTSTRAP_DRAWS", "DEFAULT_NULL_DRAWS",
+           "benjamini_hochberg",
+           "cluster_bootstrap_lower_bound", "cluster_contributions",
+           "effective_breadth_report",
+           "moving_block_cluster_bootstrap_lower_bound",
+           "paired_cluster_sign_flip", "sign_flip_null_statistics",
+           "stable_seed"]

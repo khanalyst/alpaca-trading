@@ -116,6 +116,10 @@ DEDUP_HORIZON = timedelta(minutes=15)
 DEFAULT_FETCH_WINDOW_MINUTES = 15
 DEFAULT_BAR_GAP_MINUTES = 5
 MAX_ERROR_BACKOFF_SECONDS = 15 * 60
+# Calendar metadata is an audit boundary, not a deduplication cache.  Keep the
+# name for callers that imported the old constant, but do not prune calendar
+# entries by age.
+SESSION_CALENDAR_RETENTION_DAYS = 90
 
 
 def _canonical_data_feed(value: object) -> str:
@@ -221,6 +225,7 @@ def _scan_corpus(output: Path) -> dict:
              "watermark": watermark.isoformat() if watermark else None,
              "latest_bars": latest_bars, "recent_keys": recent_keys,
              "option_pins": {}, "bar_coverage": {},
+             "session_calendar": {},
              "data_feed": next(iter(data_feeds), None),
              "partitions": _partition_sizes(output)}
     return _prune_index(index)
@@ -274,6 +279,7 @@ def _partition_sizes(output: Path) -> dict[str, int]:
 def _prune_index(index: dict) -> dict:
     """Drop dedup keys and option pins that fell out of their bounded window."""
     index.setdefault("bar_coverage", {})
+    index.setdefault("session_calendar", {})
     index.setdefault("data_feed", None)
     watermark = _timestamp(index.get("watermark"))
     if watermark is not None:
@@ -302,6 +308,28 @@ def _load_index(output: Path) -> dict | None:
         index["bar_coverage"] = {}
     elif not isinstance(coverage, dict):
         return None
+    session_calendar = index.get("session_calendar")
+    if session_calendar is None:  # additive recorder-index.v1 field
+        index["session_calendar"] = {}
+    elif not isinstance(session_calendar, dict):
+        return None
+    else:
+        for day, value in session_calendar.items():
+            if not isinstance(day, str) or not isinstance(value, dict):
+                return None
+            if not all(isinstance(value.get(name), str)
+                       for name in ("open", "close")):
+                return None
+            opened = _timestamp(value.get("open"))
+            closed = _timestamp(value.get("close"))
+            try:
+                parsed_day = date.fromisoformat(day)
+            except ValueError:
+                return None
+            if (opened is None or closed is None or opened >= closed or
+                    opened.astimezone(NEW_YORK).date() != parsed_day or
+                    closed.astimezone(NEW_YORK).date() != parsed_day):
+                return None
     data_feed = index.get("data_feed")
     if data_feed is not None and not isinstance(data_feed, str):
         return None
@@ -395,14 +423,16 @@ class CalendarCache:
             return
         self.fetches += 1
         self.days = {}
+        malformed = False
         for row in rows:
             try:
                 session = normalize_calendar_day(row)
             except (TypeError, ValueError):
+                malformed = True
                 continue
             self.days[session.date] = session
         self.covered = (start, end)
-        self.available = True
+        self.available = not malformed
 
     def session(self, day: date):
         """Return the calendar day, or ``None`` when the market is shut."""
@@ -417,6 +447,54 @@ class CalendarCache:
     def known(self, day: date) -> bool:
         self.session(day)
         return self.available is True
+
+
+def _record_session_calendar(index: dict, calendar: CalendarCache | None,
+                             start: datetime, end: datetime) -> None:
+    """Persist exact Alpaca opens/closes for replay completion boundaries."""
+    if calendar is None:
+        return
+    # The requested range is the authority.  Historical calendar boundaries
+    # must remain available for reproducible replay well beyond ninety days.
+    first = start.astimezone(NEW_YORK).date()
+    last = end.astimezone(NEW_YORK).date()
+    sessions = index.setdefault("session_calendar", {})
+    cursor = first
+    while cursor <= last:
+        if calendar.known(cursor):
+            session = calendar.session(cursor)
+            if session is not None:
+                sessions[cursor.isoformat()] = {
+                    "open": session.open.astimezone(timezone.utc).isoformat(),
+                    "close": session.close.astimezone(timezone.utc).isoformat(),
+                    "source": "alpaca_calendar",
+                }
+        cursor += timedelta(days=1)
+
+
+def _inside_recorded_session(index: dict, row: dict, *,
+                              require_exact_calendar: bool = False) -> bool:
+    """Drop extended-hours rows when an exact broker session is known."""
+    stamp = _timestamp(row.get("timestamp"))
+    if stamp is None:
+        return False
+    session = stamp.astimezone(NEW_YORK).date().isoformat()
+    calendar = index.get("session_calendar")
+    value = calendar.get(session) if isinstance(calendar, dict) else None
+    if not isinstance(value, dict):
+        return not require_exact_calendar
+    opened = _timestamp(value.get("open"))
+    closed = _timestamp(value.get("close"))
+    if (opened is None or closed is None or opened >= closed or
+            opened.astimezone(NEW_YORK).date().isoformat() != session or
+            closed.astimezone(NEW_YORK).date().isoformat() != session):
+        return False
+    if not opened <= stamp < closed:
+        return False
+    if str(row.get("event_type") or "") in {"bar", "bar_1m"}:
+        as_of = _timestamp(row.get("as_of"))
+        return as_of is not None and as_of <= closed
+    return True
 
 
 def _regular_session_gap(previous: datetime, current: datetime,
@@ -824,6 +902,13 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     _corpus_root(output).mkdir(parents=True, exist_ok=True)
     migrate_corpus(output)
     index = _load_index(output) or _scan_corpus(output)
+    session_cfg = (config or {}).get("session") if isinstance(config, dict) else {}
+    require_exact_calendar = bool(
+        session_cfg.get("require_exact_calendar", False)
+        if isinstance(session_cfg, dict) else False)
+    if require_exact_calendar and calendar is None:
+        raise RuntimeError(
+            "exact broker calendar metadata is required for production recording")
     resolved_feed = _resolved_feed(provider, feed, config)
     indexed_feed = str(index.get("data_feed") or "").strip().lower()
     if not indexed_feed and (index.get("partitions") or
@@ -852,6 +937,7 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     # materialize millions of quotes in one provider response.
     start = (watermark - timedelta(minutes=1)
              if watermark is not None else now - timedelta(minutes=3))
+    _record_session_calendar(index, calendar, start, now)
     pins = {contract: value for contract, value in index["option_pins"].items()
             if str(value) > now.isoformat()}
     horizon = None if watermark is None else watermark - DEDUP_HORIZON
@@ -861,7 +947,7 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     total_unique = 0
     while True:
         window_end = min(cursor + window, now)
-        rows = list(_rows(
+        fetched_rows = list(_rows(
             provider, symbols, window_end, feed=resolved_feed, config=config,
             # Option-chain snapshots are observations made now, not historical
             # market data. Sampling them in every stale catch-up window can
@@ -872,7 +958,18 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
             include_options=bool(include_options and window_end >= now),
             option_limit=option_limit,
             start=cursor, option_pins=frozenset(pins), observed_at=now))
-        total_rows += len(rows)
+        total_rows += len(fetched_rows)
+        rows = []
+        for row in fetched_rows:
+            inside = _inside_recorded_session(
+                index, row, require_exact_calendar=require_exact_calendar)
+            if require_exact_calendar and not inside:
+                session = _session_date(parsed) if (parsed := _timestamp(
+                    row.get("timestamp"))) is not None else "unknown"
+                raise RuntimeError(
+                    f"exact broker calendar metadata missing or row outside session: {session}")
+            if inside:
+                rows.append(row)
         index, seen, watermark, latest_bars, pins, unique = _ingest_chunk(
             output, index, seen, watermark, latest_bars, pins, rows, symbols,
             window_end, now, option_hold, horizon, calendar,

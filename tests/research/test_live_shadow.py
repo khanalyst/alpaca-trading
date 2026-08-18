@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from deploy.recorder import iter_corpus_rows
+from deploy.recorder import INDEX_NAME, iter_corpus_rows
 from deploy.recorder_market import _event_key
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from research.edge_ledger import EdgeLedger
@@ -129,7 +129,7 @@ class LiveShadowTests(unittest.TestCase):
         with self.assertRaises((InputConflict, ShadowError)):
             self._run(max_events=20)
 
-    def test_quote_burst_is_compacted_to_last_quote_per_symbol_minute(self):
+    def test_quote_burst_preserves_first_and_last_quote_per_symbol_minute(self):
         start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
         rows = [{
             "event_key": f"quote-{index}", "event_type": "quote",
@@ -137,8 +137,42 @@ class LiveShadowTests(unittest.TestCase):
             "bid": str(100 + index / 100), "ask": str(101 + index / 100),
         } for index in range(30)]
         compacted = _compact_shadow_rows(rows)
-        self.assertEqual(len(compacted), 1)
-        self.assertEqual(compacted[0]["event_key"], "quote-29")
+        self.assertEqual(len(compacted), 2)
+        self.assertEqual([row["event_key"] for row in compacted],
+                         ["quote-0", "quote-29"])
+
+    def test_quote_compaction_preserves_exact_delayed_decision_boundary(self):
+        start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
+        quotes = [{
+            "event_key": f"quote-{second}", "event_type": "quote",
+            "symbol": "SPY", "timestamp": (start + timedelta(seconds=second)).isoformat(),
+            "as_of": (start + timedelta(seconds=second)).isoformat(),
+            "observed_at": (start + timedelta(seconds=second)).isoformat(),
+            "bid": "100", "ask": "100.1",
+        } for second in (1, 5, 59)]
+        bar = {
+            "event_key": "bar", "event_type": "bar_1m", "symbol": "SPY",
+            "timestamp": (start - timedelta(minutes=1)).isoformat(),
+            "as_of": start.isoformat(),
+            "observed_at": (start + timedelta(seconds=6)).isoformat(),
+        }
+        compacted = _compact_shadow_rows([*quotes, bar])
+        self.assertEqual(
+            [row["event_key"] for row in compacted if row["event_type"] == "quote"],
+            ["quote-1", "quote-5", "quote-59"])
+
+    def test_quote_visibility_requires_as_of_and_observation_before_decision(self):
+        at = datetime(2026, 1, 2, 14, 30, 10, tzinfo=timezone.utc)
+        future_observation = {
+            "symbol": "SPY", "timestamp": "2026-01-02T14:30:00+00:00",
+            "as_of": "2026-01-02T14:30:00+00:00",
+            "observed_at": "2026-01-02T14:30:11+00:00",
+            "bid": 100, "ask": 100.1,
+        }
+        self.assertIsNone(ShadowRunner._latest_quote([future_observation], at))
+        visible = {**future_observation,
+                   "observed_at": "2026-01-02T14:30:09+00:00"}
+        self.assertEqual(ShadowRunner._latest_quote([visible], at), visible)
 
     def test_saturated_legacy_wal_baselines_then_ingests_only_appends(self):
         self._candidate()
@@ -229,14 +263,21 @@ class LiveShadowTests(unittest.TestCase):
                   "risk_usd": risk_usd, "notional": notional})
 
     def _evaluate_with_context(self, runner, candidate, symbol="QQQ"):
-        event = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
+        event = self._replay_row(
+            timestamp="2026-01-02T16:00:00+00:00",
+            as_of="2026-01-02T16:01:00+00:00")
+        event["observed_at"] = "2026-01-02T16:01:00+00:00"
         event["symbol"] = symbol
         event["event_key"] = _event_key("bar_1m", symbol, event["timestamp"])
-        previous = dict(event, timestamp="2026-01-02T20:58:00+00:00",
-                        as_of="2026-01-02T20:59:00+00:00",
+        previous = dict(event, timestamp="2026-01-02T15:59:00+00:00",
+                        as_of="2026-01-02T16:00:00+00:00",
+                        observed_at="2026-01-02T16:00:00+00:00",
                         event_key=_event_key("bar_1m", symbol,
-                                             "2026-01-02T20:58:00+00:00"))
-        quote = {"symbol": symbol, "timestamp": event["as_of"],
+                                             "2026-01-02T15:59:00+00:00"))
+        quote = {"symbol": symbol, "timestamp": event["observed_at"],
+                 "as_of": event["observed_at"],
+                 "observed_at": event["observed_at"],
+                 "provider": "recorded", "feed": "sip",
                  "bid": "99.9", "ask": "100.1"}
         signal_ts = datetime.fromisoformat(event["timestamp"]).timestamp()
         signal = {"symbol": symbol, "direction": "long",
@@ -331,6 +372,115 @@ class LiveShadowTests(unittest.TestCase):
         self.assertTrue(details["complete"])
         self.assertNotIn("from_mapping", details.get("error", ""))
 
+    def test_option_replay_receives_every_normalized_snapshot(self):
+        candidate = {**self._candidate(), "vehicle": "option"}
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        row = self._replay_row(as_of="2026-01-02T21:00:00+00:00")
+        base = {
+            "event_type": "option_snapshot", "underlying": "SPY",
+            "expiration": "2026-01-16", "strike": "100", "right": "call",
+            "multiplier": "100", "bid": "1.0", "ask": "1.1",
+            "bid_size": "5", "ask_size": "5", "volume": "20",
+            "open_interest": "100", "provider": "alpaca", "feed": "opra",
+        }
+        options = []
+        for index, contract in enumerate(
+                ("SPY260116C00100000", "SPY260116C00101000")):
+            stamp = datetime(2026, 1, 2, 20, 59, index, tzinfo=timezone.utc)
+            options.append({
+                **base, "event_key": f"option-{index}", "symbol": contract,
+                "contract": contract, "strike": str(100 + index),
+                "timestamp": stamp.isoformat(), "as_of": stamp.isoformat(),
+                "observed_at": stamp.isoformat(),
+            })
+        with patch("research.live_shadow.replay_ibr",
+                   return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
+            runner._replay(candidate, "2026-01-02", [row], [], [], options)
+        snapshots = replay.call_args.kwargs["option_snapshots"]
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(
+            {snapshot.contract.symbol for snapshot in snapshots.values()},
+            {"SPY260116C00100000", "SPY260116C00101000"})
+
+    def test_recorder_calendar_marks_an_early_close_complete(self):
+        candidate = self._candidate()
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        (self.corpus.parent / INDEX_NAME).write_text(json.dumps({
+            "session_calendar": {"2026-01-02": {
+                "open": "2026-01-02T14:30:00+00:00",
+                "close": "2026-01-02T18:00:00+00:00",
+                "source": "alpaca_calendar",
+            }},
+        }), encoding="utf-8")
+        row = self._replay_row(
+            timestamp="2026-01-02T17:59:00+00:00",
+            as_of="2026-01-02T18:00:00+00:00")
+        row["observed_at"] = "2026-01-02T18:00:00+00:00"
+        extended = self._replay_row(
+            timestamp="2026-01-02T18:01:00+00:00",
+            as_of="2026-01-02T18:02:00+00:00")
+        extended["observed_at"] = "2026-01-02T18:02:00+00:00"
+        with patch("research.live_shadow.replay_ibr",
+                   return_value=SimpleNamespace(trades=[], refusals=[])) as replay:
+            self.assertTrue(runner._replay(
+                candidate, "2026-01-02", [row, extended], [], []))
+        replay_bars = replay.call_args.args[0]
+        replay_config = replay.call_args.kwargs["config"]
+        self.assertEqual(len(replay_bars), 1)
+        self.assertEqual(replay_config.policy.force_flat_time.isoformat(), "12:50:00")
+        self.assertEqual(replay_config.policy.latest_entry_time.isoformat(), "12:55:00")
+        metadata = runner.store.replay_metadata(candidate["candidate_id"])[0]
+        self.assertTrue(metadata["details"]["complete"])
+        self.assertEqual(metadata["details"]["calendar_source"],
+                         "recorder_alpaca_calendar")
+
+    def test_early_close_cutoff_prevents_shadow_entry(self):
+        candidate = self._candidate()
+        runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
+        (self.corpus.parent / INDEX_NAME).write_text(json.dumps({
+            "session_calendar": {"2026-01-02": {
+                "open": "2026-01-02T14:30:00+00:00",
+                "close": "2026-01-02T18:00:00+00:00",
+                "source": "alpaca_calendar",
+            }},
+        }), encoding="utf-8")
+        event = self._replay_row(
+            timestamp="2026-01-02T17:59:00+00:00",
+            as_of="2026-01-02T18:00:00+00:00")
+        event["observed_at"] = "2026-01-02T18:00:00+00:00"
+        previous = dict(
+            event, timestamp="2026-01-02T17:58:00+00:00",
+            as_of="2026-01-02T17:59:00+00:00",
+            observed_at="2026-01-02T17:59:00+00:00")
+        kind, reason, payload, plan = runner._evaluate(
+            candidate, event, {"SPY": [previous, event]}, {"SPY": []}, {})
+        self.assertEqual((kind, reason, plan),
+                         ("no_trade", "session entry cutoff reached", None))
+        self.assertEqual(payload["calendar_source"], "recorder_alpaca_calendar")
+
+    def test_no_trade_opportunity_is_persisted_for_gate_denominators(self):
+        store = ShadowStore(self.shadow)
+        replay = "replay-no-trade"
+        store.replay_diff(
+            candidate_id="candidate", session_date="2026-01-02",
+            source_digest="source", shadow_digest="shadow",
+            replay_digest=replay, status="match",
+            details={"complete": True, "signature_match": True})
+        opportunity = {
+            "vehicle": "equity", "symbol": "SPY",
+            "session_date": "2026-01-02",
+            "opportunity_id": "equity:SPY:2026-01-02",
+            "net_pnl": 0.0, "return_value": 0.0, "no_trade": True,
+        }
+        store.record_replay_evidence(
+            candidate_id="candidate", session_date="2026-01-02",
+            replay_digest=replay, vehicle="equity", starting_cash=100_000,
+            ending_cash=100_000, realized_pnl=0.0, trades=[opportunity],
+            replay_status="match")
+        self.assertEqual(store.gate_rows("candidate", "2026-01-02"),
+                         [opportunity])
+        self.assertEqual(store.replay_accounts("candidate")[0]["trade_count"], 0)
+
     def test_completed_replay_replaces_earlier_incomplete_window(self):
         candidate = self._candidate()
         runner = ShadowRunner(ShadowConfig(self.corpus, self.edge, self.shadow))
@@ -421,12 +571,16 @@ class LiveShadowTests(unittest.TestCase):
         trades = [{"symbol": symbol, "session_date": "2026-01-02",
                    "direction": "long", "signal_timestamp": "2026-01-02T16:00:00+00:00",
                    "entry_timestamp": "2026-01-02T16:01:00+00:00",
-                   "stop_price": 99, "target_price": 102, "stop_distance": 1}
+                   "stop_price": 99, "target_price": 102, "stop_distance": 1,
+                   "net_pnl": 0.0}
                   for symbol in ("SPY", "QQQ")]
+        result_trades = [SimpleNamespace(
+            **{**trade, "session_date": date.fromisoformat(trade["session_date"])})
+            for trade in trades]
         self.assertTrue(store.has_open(candidate["candidate_id"], "SPY"))
         self.assertTrue(store.has_open(candidate["candidate_id"], "QQQ"))
         with patch("research.live_shadow.replay_ibr",
-                   return_value=SimpleNamespace(trades=trades)) as replay:
+                   return_value=SimpleNamespace(trades=result_trades, refusals=[])) as replay:
             self.assertTrue(runner._replay(candidate, "2026-01-02", rows, [], decisions))
             self.assertEqual(replay.call_count, 1)
             self.assertEqual({bar.symbol for bar in replay.call_args.args[0]}, {"SPY", "QQQ"})
@@ -435,7 +589,7 @@ class LiveShadowTests(unittest.TestCase):
             "SELECT status,details_json FROM replay_diffs WHERE candidate_id=?",
             (candidate["candidate_id"],)).fetchone()
         self.assertIsNotNone(stored)
-        self.assertEqual(stored[0], "match")
+        self.assertEqual(stored[0], "match", stored[1])
         details = json.loads(stored[1])
         self.assertEqual(len(details["shadow_signatures"]), 2)
         self.assertEqual(len(details["replay_signatures"]), 2)
@@ -450,9 +604,11 @@ class LiveShadowTests(unittest.TestCase):
             (candidate["candidate_id"],)).fetchall()
         self.assertEqual(books, [("QQQ", "closed_replay"), ("SPY", "closed_replay")])
 
-        mismatch_trades = [{**trade, "target_price": 103} for trade in trades]
+        mismatch_trades = [SimpleNamespace(
+            **{**trade, "session_date": date.fromisoformat(trade["session_date"]),
+               "target_price": 103}) for trade in trades]
         with patch("research.live_shadow.replay_ibr",
-                   return_value=SimpleNamespace(trades=mismatch_trades)):
+                   return_value=SimpleNamespace(trades=mismatch_trades, refusals=[])):
             runner._replay(candidate, "2026-01-02", rows, [], decisions)
         self.assertEqual(store.gate_rows(candidate["candidate_id"]), [])
 

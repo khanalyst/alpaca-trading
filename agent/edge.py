@@ -16,6 +16,8 @@ from .governance import pinned_variant_ids
 from .registry import baseline_variant_id, known_variant_ids
 from .variants import from_record, apply as apply_variant_config
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
+from research.edge_identity import candidate_assumptions
+from research.edge_ledger_store import content_hash
 
 
 VEHICLES = ("equity", "option")
@@ -118,16 +120,81 @@ def _proof_confidence(proof: Mapping) -> float:
         return 0.0
 
 
+def _runtime_identity_matches(record: Mapping, runtime_config: Mapping) -> bool:
+    """Bind the loaded runtime assumptions to the immutable candidate hash.
+
+    Applying a record is deliberately local and side-effect free; this helper
+    never resolves another edge.  A malformed or legacy candidate config is a
+    hard stop, even when its stored proof itself still verifies.
+    """
+    try:
+        # Applying a candidate invokes the strict runtime validator.  For
+        # identity purposes we neutralize the process's paper/live guard so a
+        # refresh after startup does not depend on an environment variable;
+        # candidate_assumptions itself intentionally excludes deployment mode.
+        identity_config = dict(runtime_config)
+        identity_config["mode"] = "paper"
+        identity_broker = dict(identity_config.get("broker") or {})
+        identity_broker.update({"paper": True, "allow_live": False})
+        identity_config["broker"] = identity_broker
+        applied = apply_variant(identity_config, record)
+        record_config = record.get("config")
+        if not isinstance(record_config, Mapping):
+            record_config = json.loads(record.get("config_json") or "{}")
+        strategy = record_config.get("strategy") if isinstance(record_config, Mapping) else {}
+        rule_spec = strategy.get("rule_spec") if isinstance(strategy, Mapping) else None
+        assumptions = candidate_assumptions(
+            applied, vehicle=str(record.get("vehicle") or ""),
+            strategy_id=str(record.get("strategy_id") or "ibr"),
+            variant_id=str(record.get("variant_id") or ""),
+            rule_spec=rule_spec if isinstance(rule_spec, Mapping) else None)
+        return content_hash(assumptions) == str(record.get("config_hash") or "")
+    except Exception:  # noqa: BLE001 - identity mismatch fails closed
+        return False
+
+
 def _eligible(ledger: EdgeLedger, record: Mapping | None, *, strategy_id: str,
-              vehicle: str, min_confidence: float = 0.0) -> dict | None:
+              vehicle: str, min_confidence: float = 0.0,
+              runtime_config: Mapping | None = None) -> dict | None:
     if (record is None or record.get("strategy_id") != strategy_id or
             record.get("vehicle") != vehicle or
             record.get("status") not in {"validated", "champion"}):
         return None
-    proof = _latest_passing_proof(ledger, record)
+    # ``eligibility`` is the ledger's single deployment boundary.  It
+    # re-verifies the latest immutable shadow gate, rejects a proof produced
+    # by an older replay engine epoch, and requires the complete
+    # parity-matched live-shadow ingestion marker.  Resolver modes must not
+    # duplicate a weaker subset of those checks: a candidate that is safe for
+    # ``select_champion`` is the same candidate that is safe when explicitly
+    # requested, selected by ``all_proved``, or pinned by an operator.
+    candidate_id = str(record.get("candidate_id") or "")
+    if not candidate_id:
+        return None
+    try:
+        boundary = ledger.eligibility(candidate_id, lane="shadow")
+    except Exception:  # noqa: BLE001 - unreadable authorization fails closed
+        return None
+    if (not isinstance(boundary, Mapping) or
+            boundary.get("eligible") is not True):
+        return None
+    proof = boundary.get("latest_verified_run")
+    if not isinstance(proof, Mapping):
+        return None
     decoded = _decoded(record)
-    if (proof is None or decoded is None or
+    if (decoded is None or
             _proof_confidence(proof) < float(min_confidence)):
+        return None
+    # The eligibility boundary authenticates the run and gate; this identity
+    # check binds that proof to the immutable candidate configuration so a
+    # stale/mis-attributed run can never authorize a different record.
+    candidate_config_hash = record.get("config_hash")
+    proof_config_hash = proof.get("config_hash")
+    if (not isinstance(candidate_config_hash, str) or
+            not isinstance(proof_config_hash, str) or
+            not candidate_config_hash or proof_config_hash != candidate_config_hash):
+        return None
+    if runtime_config is not None and not _runtime_identity_matches(
+            record, runtime_config):
         return None
     decoded["latest_proof"] = proof
     return decoded
@@ -175,7 +242,7 @@ def resolve_validated_variant(config: Mapping, vehicle: str | None = None,
             strategy_id=strategy_id)
     record = _eligible(
         ledger, record, strategy_id=strategy_id, vehicle=selected_vehicle,
-        min_confidence=min_confidence)
+        min_confidence=min_confidence, runtime_config=config)
     if record is None:
         return None
     if candidate_id is not None and record.get("candidate_id") != candidate_id:
@@ -213,7 +280,7 @@ def resolve_validated_variants(config: Mapping, vehicle: str | None = None,
     for raw in ledger.status(vehicle=selected_vehicle):
         record = _eligible(
             ledger, raw, strategy_id=strategy_id, vehicle=selected_vehicle,
-            min_confidence=min_confidence)
+            min_confidence=min_confidence, runtime_config=config)
         if record is None:
             continue
         family = _family(record)
@@ -259,7 +326,8 @@ def resolve_pinned_variants(config: Mapping, vehicle: str | None = None,
             ledger,
             ledger.candidate_by_variant(str(entry.get("variant_id")), entry_vehicle),
             strategy_id=str(entry.get("strategy_id") or "rule"),
-            vehicle=entry_vehicle, min_confidence=min_confidence)
+            vehicle=entry_vehicle, min_confidence=min_confidence,
+            runtime_config=config)
         if record is None:
             continue
         # Carry the promotion through so every downstream record — journal
@@ -304,7 +372,8 @@ def unresolved_promotions(config: Mapping, vehicle: str | None = None,
         elif record.get("status") not in {"validated", "champion"}:
             reason = f"candidate status is {record.get('status')!r}"
         elif _eligible(ledger, record, strategy_id=str(entry.get("strategy_id") or "rule"),
-                       vehicle=entry_vehicle, min_confidence=min_confidence) is None:
+                       vehicle=entry_vehicle, min_confidence=min_confidence,
+                       runtime_config=config) is None:
             reason = "no re-verified passing shadow proof at the required confidence"
         else:
             continue

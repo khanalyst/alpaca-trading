@@ -244,9 +244,14 @@ class StateSafetyTests(unittest.TestCase):
         self.assertTrue({"run_id", "cycle_id", "runtime_mode",
                          "account_fingerprint"}.issubset(columns["events"]))
         self.assertTrue({"reason", "run_id", "cycle_id", "runtime_mode",
-                         "account_fingerprint", "setup_id"}.issubset(columns["orders"]))
+                         "account_fingerprint", "setup_id", "execution_profile",
+                         "vehicle", "reference_price", "entry_reference",
+                         "exit_reference", "requested_qty", "planned_qty",
+                         "fill_fraction"}.issubset(columns["orders"]))
         self.assertTrue({"run_id", "cycle_id", "runtime_mode",
-                         "account_fingerprint"}.issubset(columns["trades"]))
+                         "account_fingerprint", "execution_profile", "vehicle",
+                         "reference_price", "entry_reference", "exit_reference",
+                         "requested_qty", "planned_qty", "fill_fraction"}.issubset(columns["trades"]))
         self.assertTrue({"run_id", "cycle_id", "runtime_mode",
                          "account_fingerprint"}.issubset(columns["equity"]))
 

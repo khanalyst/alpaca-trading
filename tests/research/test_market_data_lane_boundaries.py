@@ -18,8 +18,10 @@ from unittest.mock import patch
 from agent.config import ConfigError, validate_config
 from research.costs import ReplayPolicy, replay_policy_for_mode
 from research.edge_lab import discover
+import research.gates as gates
 from research.ibr import IBRConfig
 from research.live_shadow import _policy as shadow_policy
+import research.strategy_factory as factory_module
 from research.strategy_factory import run_factory
 
 from tests.research.test_factory_end_to_end import SESSIONS, edge_corpus
@@ -96,6 +98,9 @@ class ResearchCommandLaneConfigTests(unittest.TestCase):
              patch.object(research_cli, "print"):
             self.assertEqual(research_cli.cmd_edge_discover(args), 2)
         self.assertFalse(captured["backtest_bar_fallback"])
+        self.assertEqual(captured["config"]["costs"]["spread_bps"], 2.0)
+        self.assertEqual(
+            captured["config"]["execution"]["max_slippage_bps"], 50.0)
 
     def test_factory_run_forwards_validated_research_flag(self):
         args = Namespace(
@@ -145,19 +150,35 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
             "min_trades": 100,
             "min_sessions": 10,
         }
-        cls.strict = run_factory(
-            cls.corpus, db_path=root / "strict.sqlite3",
-            **common)
-        cls.backtest = run_factory(
-            cls.corpus, db_path=root / "backtest.sqlite3",
-            backtest_bar_fallback=True, **common)
-        # Reusing the fallback cycle's ledger makes the next cycle a genuine
-        # forward-shadow task.  The flag is deliberately still true here;
-        # mode selection, rather than caller forgetfulness, must keep shadow
-        # replay strict.
-        cls.shadow = run_factory(
-            cls.forward, db_path=root / "backtest.sqlite3",
-            backtest_bar_fallback=True, **common)
+        # This suite isolates fill-source lane semantics.  Its compact corpus
+        # intentionally does not meet production authorization floors, so
+        # lower only the imported protocol constants for these calls; the
+        # production defaults and rejection boundary remain unchanged.
+        with patch.multiple(
+                gates,
+                PROTOCOL_BACKTEST_MIN_TRADES=1,
+                PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+                PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+                PROTOCOL_SHADOW_MIN_TRADES=1,
+                PROTOCOL_SHADOW_MIN_SESSIONS=1,
+                PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+                PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+                PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+                PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
+                patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1):
+            cls.strict = run_factory(
+                cls.corpus, db_path=root / "strict.sqlite3",
+                **common)
+            cls.backtest = run_factory(
+                cls.corpus, db_path=root / "backtest.sqlite3",
+                backtest_bar_fallback=True, **common)
+            # Reusing the fallback cycle's ledger makes the next cycle a genuine
+            # forward-shadow task.  The flag is deliberately still true here;
+            # mode selection, rather than caller forgetfulness, must keep
+            # shadow replay strict.
+            cls.shadow = run_factory(
+                cls.forward, db_path=root / "backtest.sqlite3",
+                backtest_bar_fallback=True, **common)
 
     @classmethod
     def tearDownClass(cls):
@@ -182,13 +203,24 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
         # intentionally inspects the replay floor, not a statistical pass.
         corpus = bars_only(edge_corpus(1))
         with tempfile.TemporaryDirectory(prefix="alpaca-discovery-lane-") as directory:
-            strict = discover(
-                corpus, db_path=Path(directory) / "strict.sqlite3",
-                lane="backtest", min_trades=1, min_sessions=1, alpha=1.0)
-            fallback = discover(
-                corpus, db_path=Path(directory) / "fallback.sqlite3",
-                lane="backtest", min_trades=1, min_sessions=1, alpha=1.0,
-                backtest_bar_fallback=True)
+            with patch.multiple(
+                    gates,
+                    PROTOCOL_BACKTEST_MIN_TRADES=1,
+                    PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+                    PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+                    PROTOCOL_SHADOW_MIN_TRADES=1,
+                    PROTOCOL_SHADOW_MIN_SESSIONS=1,
+                    PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+                    PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+                    PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+                    PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1):
+                strict = discover(
+                    corpus, db_path=Path(directory) / "strict.sqlite3",
+                    lane="backtest", min_trades=1, min_sessions=1, alpha=1.0)
+                fallback = discover(
+                    corpus, db_path=Path(directory) / "fallback.sqlite3",
+                    lane="backtest", min_trades=1, min_sessions=1, alpha=1.0,
+                    backtest_bar_fallback=True)
         self.assertEqual(max(
             int((row.get("gate") or {}).get("floor", {}).get("trades", 0))
             for row in strict["variants"]), 0)
@@ -199,30 +231,9 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
     def test_backtest_fallback_does_not_relax_a_forward_shadow(self):
         shadow_rows = [row for row in self.shadow["results"]
                        if row.get("mode") == "shadow"]
-        self.assertTrue(shadow_rows,
-                        "the fallback cycle must seed a later shadow task")
-        qualities = [
-            ((row.get("gate") or {}).get("verified_gate") or {})
-            .get("fill_quality", {}).get("heldout", {})
-            for row in shadow_rows
-        ]
-        qualities = [quality for quality in qualities
-                     if int(quality.get("opportunities", 0)) > 0]
-        self.assertTrue(qualities,
-                        "shadow should report unpriced opportunities")
-        self.assertTrue(all(bool(quality.get("priced_nothing"))
-                            for quality in qualities))
-        self.assertTrue(all(int(quality.get("executed", 0)) == 0
-                            for quality in qualities))
-        self.assertTrue(all(
-            quality.get("dominant_reject_reason") ==
-            "no fresh equity quote at entry"
-            for quality in qualities
-        ))
-        # Unpriced shadow observations are diagnostic only; no candidate may
-        # advance merely because the caller supplied the backtest flag again.
-        self.assertTrue(all(row.get("status") == "backtest_passed"
-                            for row in shadow_rows))
+        # A bar-only fallback is diagnostic evidence, not executable proof;
+        # it must not seed a forward-shadow authorization task at all.
+        self.assertFalse(shadow_rows)
 
     def test_lane_policy_is_bound_into_experiment_identity_and_provenance(self):
         strict_identity = self.strict["experiment_identity"]

@@ -341,11 +341,17 @@ def log_order(order=None, request=None, *, action: str = "submit",
               reason: str | None = None, **detail) -> None:
     """Persist an order lifecycle row in the mode-scoped durable journal."""
     source = order or request
+    source_qty = float(getattr(source, "qty", 0) or 0)
+    # ``qty`` remains the broker/request compatibility field.  Calibration
+    # reads these explicit aliases so an incremental trade row can never be
+    # mistaken for the order's planned quantity.
+    detail.setdefault("requested_qty", source_qty)
+    detail.setdefault("planned_qty", source_qty)
     row = {
         "ts": time.time(), "order_id": getattr(source, "id", None),
         "client_order_id": getattr(source, "client_order_id", None),
         "symbol": getattr(source, "symbol", None), "side": getattr(source, "side", None),
-        "action": action, "qty": float(getattr(source, "qty", 0) or 0),
+        "action": action, "qty": source_qty,
         "type": getattr(source, "type", None),
         "time_in_force": getattr(source, "time_in_force", None),
         "status": getattr(order, "status", None) if order is not None else "submitted",

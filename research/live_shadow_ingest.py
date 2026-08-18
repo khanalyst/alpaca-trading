@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 from .edge_discovery_core import _discover_gate, _finalize_gate
 from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
-from .gates import verify_gate_envelope
+from .gates import verify_gate_envelope, validate_protocol_floor
 from .live_shadow import ShadowError, ShadowStore
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
 from .factory_ledger import FDR_METHOD, FactoryLedger
@@ -180,10 +180,11 @@ class ShadowIngestConfig:
     alpha: float = DEFAULT_ALPHA
 
     def __post_init__(self) -> None:
-        for name in ("min_trades", "min_sessions"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
+        try:
+            validate_protocol_floor(lane="shadow", min_trades=self.min_trades,
+                                    min_sessions=self.min_sessions)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         if isinstance(self.alpha, bool) or not isinstance(self.alpha, (int, float)) \
                 or not 0.0 < float(self.alpha) <= 1.0:
             raise ValueError("alpha must be finite and in (0,1]")

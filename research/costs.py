@@ -18,11 +18,12 @@ model that expects a cost the runtime would reject fails closed here.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import math
 from pathlib import Path
 import tempfile
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 # A quoted spread of ~2 bps covers a one- to two-cent book on the configured
 # ETF universe including its less liquid members, not only the tightest name.
@@ -36,7 +37,7 @@ DEFAULT_FEE_BPS = 0.5
 # Conservative listed-option broker/exchange fee floor per contract per side.
 # Configuration may override this, but a default zero would systematically
 # overstate option expectancy relative to equity.
-DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE = 0.05
+DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE = 0.65
 # Mirrors the checked `execution` block; these are caps, never expectations.
 RUNTIME_MAX_SPREAD_BPS = 100.0
 RUNTIME_MAX_SLIPPAGE_BPS = 50.0
@@ -70,11 +71,19 @@ class ReplayPolicy:
     max_open_risk_pct: float | None = None
     daily_loss_limit_pct: float | None = None
     strict_market_data: bool = True
+    # Direct low-level fixtures intentionally remain compatibility-default
+    # false.  A validated shipped runtime config sets this true and therefore
+    # cannot silently substitute a regular 16:00 close for an unknown broker
+    # calendar day.
+    require_exact_calendar: bool = False
+    force_flat_minutes_before_close: int | None = None
+    reject_new_entries_minutes_before_close: int | None = None
 
     def __post_init__(self) -> None:
         age = float(self.max_market_data_age_seconds)
-        if not math.isfinite(age) or age < 0:
-            raise CostError("max_market_data_age_seconds must be finite and non-negative")
+        if not math.isfinite(age) or age < 0 or age > 30:
+            raise CostError(
+                "max_market_data_age_seconds must be finite and between 0 and 30 seconds")
         if int(self.options_min_dte) != self.options_min_dte or self.options_min_dte < 0:
             raise CostError("options_min_dte must be a non-negative integer")
         if int(self.options_max_dte) != self.options_max_dte or self.options_max_dte < self.options_min_dte:
@@ -93,6 +102,14 @@ class ReplayPolicy:
                 raise CostError(f"{name} must be finite and non-negative when supplied")
         if not isinstance(self.strict_market_data, bool):
             raise CostError("strict_market_data must be true or false")
+        if not isinstance(self.require_exact_calendar, bool):
+            raise CostError("require_exact_calendar must be true or false")
+        for name in ("force_flat_minutes_before_close",
+                     "reject_new_entries_minutes_before_close"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or
+                                      int(value) != value or int(value) < 0):
+                raise CostError(f"{name} must be a non-negative integer when supplied")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +128,9 @@ class ReplayPolicy:
             "max_open_risk_pct": self.max_open_risk_pct,
             "daily_loss_limit_pct": self.daily_loss_limit_pct,
             "strict_market_data": self.strict_market_data,
+            "require_exact_calendar": self.require_exact_calendar,
+            "force_flat_minutes_before_close": self.force_flat_minutes_before_close,
+            "reject_new_entries_minutes_before_close": self.reject_new_entries_minutes_before_close,
         }
 
     @classmethod
@@ -145,6 +165,16 @@ class ReplayPolicy:
                 force = time.fromisoformat(str(force))
             except ValueError as exc:
                 raise CostError("force_flat_time must be HH:MM") from exc
+        require_exact = session.get("require_exact_calendar", False)
+        if not isinstance(require_exact, bool):
+            raise CostError("session.require_exact_calendar must be true or false")
+        flat_offset = session.get("force_flat_minutes_before_close", 10)
+        reject_offset = session.get("reject_new_entries_minutes_before_close", 5)
+        for name, value in (("session.force_flat_minutes_before_close", flat_offset),
+                            ("session.reject_new_entries_minutes_before_close", reject_offset)):
+            if value is not None and (isinstance(value, bool) or
+                                      not isinstance(value, int) or value < 0):
+                raise CostError(f"{name} must be a non-negative integer")
         return cls(
             max_market_data_age_seconds=float(execution.get("max_market_data_age_seconds", 30.0)),
             options_min_dte=int(risk.get("options_min_dte", 7)),
@@ -167,7 +197,77 @@ class ReplayPolicy:
             # nothing at all, which is a data-shape mismatch rather than a
             # research result -- see ``fill_source_summary``.
             strict_market_data=_strict_market_data(execution),
+            require_exact_calendar=require_exact,
+            force_flat_minutes_before_close=flat_offset,
+            reject_new_entries_minutes_before_close=reject_offset,
         )
+
+
+def replay_policy_for_session(
+        policy: ReplayPolicy, *, session_open: datetime | None = None,
+        session_close: datetime | None = None,
+        session_date: date | None = None) -> ReplayPolicy:
+    """Derive close-relative cutoffs for one broker calendar session.
+
+    Exact metadata is mandatory only for policies created from the shipped
+    production configuration.  Compatibility fixtures can omit it and retain
+    their existing static cutoffs.  When metadata is present, both force-flat
+    and latest-entry boundaries are derived from that close (with the checked
+    strategy latest-entry cap still applied).
+    """
+    if not isinstance(policy, ReplayPolicy):
+        raise CostError("policy must be a ReplayPolicy")
+    if (session_open is None) != (session_close is None):
+        raise CostError("exact_session_calendar_missing")
+    if session_open is None:
+        if policy.require_exact_calendar:
+            raise CostError("exact_session_calendar_missing")
+        return policy
+    if (session_open.tzinfo is None or session_open.utcoffset() is None or
+            session_close is None or session_close.tzinfo is None or
+            session_close.utcoffset() is None):
+        raise CostError("exact_session_calendar_malformed")
+    zone = ZoneInfo("America/New_York")
+    opened = session_open.astimezone(zone)
+    closed = session_close.astimezone(zone)
+    if opened.date() != closed.date() or opened >= closed:
+        raise CostError("exact_session_calendar_conflict")
+    if session_date is not None and opened.date() != session_date:
+        raise CostError("exact_session_calendar_conflict")
+    flat_minutes = (10 if policy.force_flat_minutes_before_close is None
+                    else int(policy.force_flat_minutes_before_close))
+    reject_minutes = (0 if policy.reject_new_entries_minutes_before_close is None
+                      else int(policy.reject_new_entries_minutes_before_close))
+    force = (closed - timedelta(minutes=flat_minutes)).time().replace(tzinfo=None)
+    latest = (closed - timedelta(minutes=reject_minutes)).time().replace(tzinfo=None)
+    if policy.latest_entry_time is not None:
+        latest = min(latest, policy.latest_entry_time)
+    return replace(policy, force_flat_time=force, latest_entry_time=latest)
+
+
+def replay_policy_for_bars(policy: ReplayPolicy, bars: Sequence[Any], *,
+                           session_date: date | None = None) -> ReplayPolicy:
+    """Resolve one policy from bars carrying exact session metadata."""
+    if not bars:
+        return replay_policy_for_session(policy, session_date=session_date)
+    metadata = {(getattr(bar, "session_open", None),
+                 getattr(bar, "session_close", None)) for bar in bars}
+    has_missing = any(opened is None or closed is None
+                      for opened, closed in metadata)
+    if has_missing and len(metadata) > 1:
+        raise CostError("exact_session_calendar_conflict")
+    if has_missing:
+        return replay_policy_for_session(policy, session_date=session_date)
+    if len(metadata) != 1:
+        raise CostError("exact_session_calendar_conflict")
+    opened, closed = next(iter(metadata))
+    return replay_policy_for_session(policy, session_open=opened,
+                                     session_close=closed,
+                                     session_date=session_date)
+
+
+# Descriptive alias used by callers that prefer the derivation terminology.
+derive_session_replay_policy = replay_policy_for_session
 
 
 def replay_policy_for_mode(policy: ReplayPolicy, mode: str, *,
@@ -289,6 +389,47 @@ class CostModel:
             total += float(quantity) * 2.0 * self.option_fee_per_contract_side
         return total
 
+    def round_trip_cost(self, entry_price: float, exit_price: float,
+                        quantity: float = 1.0, multiplier: float = 1.0,
+                        *, vehicle: str = "equity",
+                        executable_quotes: bool = False) -> float:
+        """Return the configured expected cost for both execution legs.
+
+        This is intentionally separate from :meth:`fees`: fees are only one
+        component of the round trip and a risk-unit check must account for the
+        same spread/slippage assumption that priced the replay.  A quoted
+        execution already contains its spread, so callers that have an
+        executable bid/ask may opt into the slippage-only leg cost.
+        """
+        entry = float(entry_price)
+        exit = float(exit_price)
+        qty = float(quantity)
+        mult = float(multiplier)
+        if not all(math.isfinite(value) for value in (entry, exit, qty, mult)):
+            raise CostError("round-trip cost inputs must be finite")
+        if qty < 0 or mult <= 0 or entry < 0 or exit < 0:
+            raise CostError("round-trip cost inputs must be non-negative")
+        bps = self.per_side_bps(executable_quote=bool(executable_quotes)) / 10_000.0
+        notional = (abs(entry) + abs(exit)) * qty * mult
+        return notional * bps + self.fees(entry, exit, qty, mult, vehicle=vehicle)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CostModel":
+        """Rebuild a model persisted inside a risk-unit report."""
+        if not isinstance(value, Mapping):
+            raise CostError("cost model must be a mapping")
+        return cls(
+            spread_bps=value.get("spread_bps", DEFAULT_SPREAD_BPS),
+            slippage_bps=value.get("slippage_bps", DEFAULT_SLIPPAGE_BPS),
+            fee_bps=value.get("fee_bps", DEFAULT_FEE_BPS),
+            option_fee_per_contract_side=value.get(
+                "option_fee_per_contract_side",
+                value.get("option_fee_per_contract", DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE)),
+            max_spread_bps=value.get("max_spread_bps", RUNTIME_MAX_SPREAD_BPS),
+            max_slippage_bps=value.get("max_slippage_bps", RUNTIME_MAX_SLIPPAGE_BPS),
+            provenance=str(value.get("provenance", "report")),
+        )
+
     def as_dict(self) -> dict:
         return {"spread_bps": self.spread_bps, "slippage_bps": self.slippage_bps,
                 "fee_bps": self.fee_bps,
@@ -334,6 +475,178 @@ class CostModel:
 
 BAR = "bar"
 QUOTE = "quote"
+
+
+@dataclass(frozen=True)
+class QuoteFill:
+    """The executable quote selected at a fill boundary.
+
+    ``quote_fill`` intentionally retains its historical numeric return type;
+    replay lanes that need to persist evidence use this richer record so feed
+    and provider identity cannot disappear between normalization and gating.
+    """
+
+    price: float
+    timestamp: datetime
+    as_of: datetime
+    provider: str
+    feed: str
+
+
+def _quote_fill_from_record(quote: Any, *, side: str) -> QuoteFill | None:
+    identity = getattr(quote, "identity", None)
+    if identity is None:
+        return None
+    try:
+        price = float(quote.ask if side == "buy" else quote.bid)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    try:
+        timestamp = quote.timestamp
+        as_of = identity.as_of
+        provider = str(identity.provider).strip()
+        feed = str(identity.feed).strip()
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not provider or not feed:
+        return None
+    return QuoteFill(price, timestamp, as_of, provider, feed)
+
+
+def _cost_model_for_vehicle(costs: Any, vehicle: str) -> CostModel:
+    """Resolve a shared model or a vehicle-keyed model mapping."""
+    if costs is None:
+        return CostModel()
+    if isinstance(costs, CostModel):
+        return costs
+    if isinstance(costs, Mapping):
+        selected = costs.get(vehicle, costs.get("default", costs))
+        if isinstance(selected, CostModel):
+            return selected
+        if isinstance(selected, Mapping):
+            return CostModel.from_dict(selected)
+    raise CostError("costs must be a CostModel or vehicle-keyed mapping")
+
+
+def risk_unit_report(rows: Iterable[Mapping], *, vehicle: str,
+                     costs: Any = None, config: Mapping | None = None,
+                     min_cost_coverage: float = 1.0) -> dict[str, Any]:
+    """Recompute whether each executed row has a cost-covered risk unit.
+
+    A risk unit is the monetary loss to the authored stop (``risk_usd`` when
+    the replay recorded it, otherwise stop distance times quantity and
+    multiplier).  The configured round-trip cost is charged independently for
+    equity and options, including the option per-contract fee.  The complete
+    row observations and model are persisted so a gate can recompute this
+    report instead of trusting a caller-supplied boolean.
+    """
+    if not isinstance(vehicle, str) or vehicle not in {"equity", "option"}:
+        raise CostError("vehicle must be equity or option")
+    if config is not None and costs is None:
+        configured = config.get(CONFIG_BLOCK) if isinstance(config, Mapping) else None
+        if isinstance(configured, Mapping) and vehicle in configured and \
+                isinstance(configured.get(vehicle), Mapping):
+            # Reports are vehicle-local even when a caller carries separate
+            # equity/option schedules in one configuration envelope.
+            costs = CostModel.from_config({
+                **dict(config), CONFIG_BLOCK: configured[vehicle]})
+        else:
+            costs = CostModel.from_config(config)
+    model = _cost_model_for_vehicle(costs, vehicle)
+    coverage = float(min_cost_coverage)
+    if not math.isfinite(coverage) or coverage < 0:
+        raise CostError("min_cost_coverage must be finite and non-negative")
+    local = [dict(row) for row in rows
+             if isinstance(row, Mapping) and row.get("vehicle", vehicle) == vehicle]
+    executed = [row for row in local if row.get("no_trade") is not True]
+    observations: list[dict[str, Any]] = []
+    failures: list[str] = []
+    total_risk = 0.0
+    total_cost = 0.0
+    for index, row in enumerate(executed):
+        def number(*names: str, default: float | None = None) -> float | None:
+            for name in names:
+                raw = row.get(name)
+                if raw is None:
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value):
+                    return value
+            return default
+
+        qty = number("quantity", "contracts", default=1.0)
+        mult = number("contract_multiplier", "multiplier", default=100.0 if vehicle == "option" else 1.0)
+        entry = number("entry_price", "entry_reference", "plan_entry")
+        exit = number("exit_price", "exit_reference", default=entry)
+        stop_distance = number("stop_distance", "risk_per_unit")
+        risk = number("risk_usd", "realized_risk_usd", "risk_unit_usd", "risk_unit")
+        if risk is None and stop_distance is not None and qty is not None and mult is not None:
+            risk = abs(stop_distance) * abs(qty) * abs(mult if vehicle == "option" and stop_distance else 1.0)
+        cost = None
+        if entry is not None and exit is not None and qty is not None and mult is not None:
+            try:
+                cost = model.round_trip_cost(
+                    entry, exit, qty, mult, vehicle=vehicle,
+                    executable_quotes=(row.get("entry_fill_source") == QUOTE and
+                                       row.get("exit_fill_source") == QUOTE))
+            except CostError:
+                cost = None
+        # Equity proof is executable only when both legs were priced from
+        # recorded quotes carrying explicit SIP provenance.  Backtests may
+        # retain bar/IEX/unknown rows for diagnostics, but those rows can
+        # never satisfy an authorizing risk-unit report.  Options deliberately
+        # follow their existing OPRA gate and are not subject to this SIP rule.
+        equity_provenance = True
+        if vehicle == "equity":
+            def _sip_leg(leg: str) -> bool:
+                source = str(row.get(f"{leg}_fill_source") or "").strip().lower()
+                feed = str(row.get(f"{leg}_feed") or "").strip().lower()
+                provider = str(row.get(f"{leg}_provider") or "").strip()
+                return source == QUOTE and feed == "sip" and bool(provider)
+            equity_provenance = _sip_leg("entry") and _sip_leg("exit")
+        adequate = bool(
+            risk is not None and cost is not None and risk > 0 and
+            cost >= 0 and risk >= cost * coverage and equity_provenance)
+        if not adequate:
+            failures.append(str(row.get("opportunity_id", index)))
+        if risk is not None and math.isfinite(risk):
+            total_risk += max(0.0, risk)
+        if cost is not None and math.isfinite(cost):
+            total_cost += max(0.0, cost)
+        observations.append({
+            "opportunity_id": str(row.get("opportunity_id", index)),
+            "risk_usd": risk, "round_trip_cost": cost,
+            "cost_coverage": (risk / cost if cost and risk is not None else None),
+            "adequate": adequate,
+        })
+    # An empty set cannot authorize anything.  It remains a valid diagnostic
+    # report so old evidence is readable and explicitly underpowered.
+    adequate = bool(executed and observations and not failures)
+    return {
+        "schema": "risk-unit-report.v1",
+        "vehicle": vehicle,
+        "minimum_cost_coverage": coverage,
+        "cost_model": model.as_dict(),
+        "rows": len(executed),
+        "adequate_rows": sum(1 for item in observations if item["adequate"]),
+        "total_risk_usd": total_risk,
+        "total_round_trip_cost": total_cost,
+        "mean_risk_usd": (total_risk / len(executed) if executed else None),
+        "mean_round_trip_cost": (total_cost / len(executed) if executed else None),
+        # Stable aliases make the economics legible to report consumers while
+        # retaining the explicit aggregate names above.
+        "risk_unit_usd": (total_risk / len(executed) if executed else None),
+        "round_trip_cost_usd": (total_cost / len(executed) if executed else None),
+        "cost_to_risk_ratio": (total_cost / total_risk if total_risk > 0 else None),
+        "failed_opportunities": failures,
+        "observations": observations,
+        "adequate": adequate,
+    }
 
 
 @dataclass(frozen=True)
@@ -388,13 +701,15 @@ class SQLiteQuoteIndex:
                 as_of REAL NOT NULL,
                 bid REAL NOT NULL,
                 ask REAL NOT NULL,
+                provider TEXT NOT NULL,
+                feed TEXT NOT NULL,
                 session_day INTEGER NOT NULL,
                 sequence INTEGER NOT NULL,
                 PRIMARY KEY (symbol_id, timestamp, sequence)
             ) WITHOUT ROWID
         """)
         self._symbols: dict[str, int] = {}
-        self._pending: list[tuple[int, float, float, float, float, int, int]] = []
+        self._pending: list[tuple[int, float, float, float, float, str, str, int, int]] = []
         self._sequence = 0
         self._count = 0
         self._max_session_day: int | None = None
@@ -457,10 +772,14 @@ class SQLiteQuoteIndex:
             self._symbols[symbol] = symbol_id
         timestamp = float(quote.timestamp.timestamp())
         as_of = float(quote.identity.as_of.timestamp())
+        provider = str(quote.identity.provider).strip()
+        feed = str(quote.identity.feed).strip()
+        if not provider or not feed:
+            raise CostError("quote provider and feed are required")
         session_day = int(quote.session_date.toordinal())
         self._pending.append((
             symbol_id, timestamp, as_of, float(quote.bid), float(quote.ask),
-            session_day, self._sequence,
+            provider, feed, session_day, self._sequence,
         ))
         self._sequence += 1
         self._count += 1
@@ -475,7 +794,7 @@ class SQLiteQuoteIndex:
         if self._read_only:
             raise RuntimeError("read-only quote index cannot write")
         self._db.executemany(
-            "INSERT INTO quotes VALUES (?,?,?,?,?,?,?)", self._pending)
+            "INSERT INTO quotes VALUES (?,?,?,?,?,?,?,?,?)", self._pending)
         self._db.commit()
         self._pending.clear()
 
@@ -493,10 +812,10 @@ class SQLiteQuoteIndex:
         return (date.fromordinal(self._max_session_day)
                 if self._max_session_day is not None else None)
 
-    def quote_fill(self, *, symbol: str, at: datetime, side: str,
+    def quote_fill_record(self, *, symbol: str, at: datetime, side: str,
                    max_age_seconds: float | None = 30.0,
-                   session_date: date | None = None) -> float | None:
-        """Resolve the same latest-visible quote as the in-memory index."""
+                   session_date: date | None = None) -> QuoteFill | None:
+        """Resolve the latest-visible quote, retaining its provenance."""
         if self._closed or self._count == 0:
             return None
         if not self._read_only:
@@ -509,13 +828,13 @@ class SQLiteQuoteIndex:
         session_day = (None if session_date is None else
                        int(session_date.toordinal()))
         cursor = self._db.execute(
-            """SELECT timestamp, as_of, bid, ask, session_day
+            """SELECT timestamp, as_of, bid, ask, provider, feed, session_day
                  FROM quotes
                 WHERE symbol_id=? AND timestamp<=?
                 ORDER BY timestamp DESC, sequence DESC""",
             (symbol_id, at_ts),
         )
-        for timestamp, as_of, bid, ask, row_session_day in cursor:
+        for timestamp, as_of, bid, ask, provider, feed, row_session_day in cursor:
             age = at_ts - float(timestamp)
             if age > limit:
                 # Rows are newest first, so all remaining rows are stale.
@@ -525,8 +844,23 @@ class SQLiteQuoteIndex:
             if float(as_of) > at_ts:
                 continue
             price = float(ask if side == "buy" else bid)
-            return price if math.isfinite(price) and price > 0 else None
+            if not math.isfinite(price) or price <= 0:
+                return None
+            return QuoteFill(
+                price=price,
+                timestamp=datetime.fromtimestamp(float(timestamp), timezone.utc),
+                as_of=datetime.fromtimestamp(float(as_of), timezone.utc),
+                provider=str(provider), feed=str(feed),
+            )
         return None
+
+    def quote_fill(self, *, symbol: str, at: datetime, side: str,
+                   max_age_seconds: float | None = 30.0,
+                   session_date: date | None = None) -> float | None:
+        record = self.quote_fill_record(symbol=symbol, at=at, side=side,
+                                        max_age_seconds=max_age_seconds,
+                                        session_date=session_date)
+        return None if record is None else record.price
 
     def close(self) -> None:
         if self._closed:
@@ -571,9 +905,20 @@ def quote_fill(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None, *
     ``None`` means no quote was recorded for that instant; the caller must
     fall back to the bar and say so rather than inventing a price.
     """
+    record = quote_fill_record(indexed, symbol=symbol, at=at, side=side,
+                               max_age_seconds=max_age_seconds,
+                               session_date=session_date)
+    return None if record is None else record.price
+
+
+def quote_fill_record(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None,
+                      *, symbol: str, at: datetime, side: str,
+                      max_age_seconds: float | None = 30.0,
+                      session_date: date | None = None) -> QuoteFill | None:
+    """Return the latest visible quote and preserve feed/provider identity."""
     if indexed is None:
         return None
-    resolver = getattr(indexed, "quote_fill", None)
+    resolver = getattr(indexed, "quote_fill_record", None)
     if callable(resolver):
         return resolver(symbol=symbol, at=at, side=side,
                         max_age_seconds=max_age_seconds,
@@ -599,8 +944,7 @@ def quote_fill(indexed: Mapping[str, Sequence[Any]] | SQLiteQuoteIndex | None, *
     limit = 30.0 if max_age_seconds is None else float(max_age_seconds)
     if age < 0 or age > limit:
         return None
-    price = float(best.ask if side == "buy" else best.bid)
-    return price if math.isfinite(price) and price > 0 else None
+    return _quote_fill_from_record(best, side=side)
 
 
 __all__ = [
@@ -608,6 +952,9 @@ __all__ = [
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS", "ReplayPolicy",
-    "replay_policy_for_mode",
-    "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes", "quote_fill",
+    "replay_policy_for_mode", "replay_policy_for_session",
+    "replay_policy_for_bars", "derive_session_replay_policy",
+    "risk_unit_report",
+    "QuoteFill", "SQLiteQuoteIndex", "SQLiteQuoteIndexDescriptor", "index_quotes",
+    "quote_fill", "quote_fill_record",
 ]

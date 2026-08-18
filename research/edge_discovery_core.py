@@ -23,6 +23,8 @@ from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
 from .market_data import OptionSnapshot, QuoteSnapshot, UnderlyingBar
 from .stats import stable_seed
 
+MIN_PROMOTION_CLUSTERS = 30
+
 
 def _facade_dependency(name: str):
     from . import edge_lab
@@ -183,7 +185,49 @@ def _stream_rows(source: Path):
             raise DiscoveryError(f"invalid discovery JSONL {partition}: {exc}") from exc
 
 
-def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None = None) -> tuple[
+def _row_provenance(row: Mapping[str, Any], *, kind: str,
+                    require: bool = False,
+                    expected_equity_feed: str = "sip",
+                    expected_provider: str | None = None) -> tuple[str | None, str | None]:
+    """Read a row's provenance without manufacturing research metadata.
+
+    Recorder rows carry these fields at write time.  An explicitly supplied
+    external corpus must do the same: passing the CLI's provider/feed as
+    normalizer overrides used to make an unlabelled (or IEX) row look like SIP
+    evidence.  Non-strict callers retain the legacy diagnostic projection, but
+    strict authorizing callers get a hard error before replay can create gates.
+    """
+    equity = kind in {"bar", "underlying", "underlying_bar",
+                      "quote", "quote_snapshot", "equity_quote",
+                      "underlying_quote"}
+    raw_provider = row.get("provider")
+    raw_feed = row.get("feed", row.get("feed_id"))
+    provider = None if raw_provider is None else str(raw_provider).strip()
+    feed = None if raw_feed is None else str(raw_feed).strip().lower()
+    if require and not provider:
+        raise DiscoveryError(
+            f"{kind} research requires explicit provider provenance")
+    if require and equity:
+        if not feed:
+            raise DiscoveryError(
+                f"{kind} research requires explicit feed provenance")
+        expected = str(expected_equity_feed or "sip").strip().lower()
+        if expected != "sip":
+            raise DiscoveryError(
+                f"equity research requires configured SIP feed, got {expected or '[missing]'}")
+        if feed != expected:
+            raise DiscoveryError(
+                f"{kind} row feed {feed!r} is not executable; expected {expected!r}")
+        if expected_provider and provider != str(expected_provider).strip():
+            raise DiscoveryError(
+                f"{kind} row provider {provider!r} does not match configured provider")
+    return provider, feed
+
+
+def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None = None,
+                      require_provenance: bool = False,
+                      expected_equity_feed: str = "sip",
+                      expected_provider: str | None = None) -> tuple[
         list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Normalize one row stream into the three replay books.
 
@@ -199,11 +243,17 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
             raise DiscoveryError("discovery rows must be JSON objects")
         row = dict(source_row)
         kind = str(row.get("kind", "bar")).lower()
-        provider = str(row.get("provider") or "alpaca")
-        feed = str(row.get("feed") or ("opra" if "option" in kind else "sip"))
         try:
+            provider, feed = _row_provenance(
+                row, kind=kind, require=require_provenance,
+                expected_equity_feed=expected_equity_feed,
+                expected_provider=expected_provider)
             if kind in {"bar", "underlying", "underlying_bar"}:
-                bar = normalize_underlying_bar(row, provider=provider, feed=feed)
+                # The permissive projection is diagnostic-only compatibility
+                # for old in-memory fixtures.  Authorizing callers always set
+                # ``require_provenance`` and therefore never reach defaults.
+                bar = normalize_underlying_bar(
+                    row, provider=provider or "alpaca", feed=feed or "sip")
                 if keep is None or keep(_bar_session(bar)):
                     bars.append(bar)
             elif kind in {"option", "option_snapshot", "option_quote"}:
@@ -213,6 +263,16 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                     flattened.update({key: value for key, value in row.items()
                                       if key != "contract"})
                     row = flattened
+                option_provider, option_feed = _row_provenance(
+                    row, kind=kind, require=True,
+                    expected_provider=expected_provider)
+                option_provider = option_provider or "alpaca"
+                option_feed = option_feed or ""
+                if option_feed != "opra":
+                    raise ValueError(
+                        "option research requires explicit OPRA feed provenance")
+                provider = option_provider
+                feed = option_feed
                 snap = normalize_option_snapshot(row, provider=provider, feed=feed)
                 if keep is None or keep(snap.session_date.isoformat()):
                     snapshots[f"{snap.timestamp.isoformat()}|{snap.contract.symbol}"] = snap
@@ -220,7 +280,8 @@ def _normalize_corpus(rows, *, keep=None, quote_index: SQLiteQuoteIndex | None =
                 # An equity quote is the executable price at its instant.  It
                 # is used only where a fill lands on that instant; everything
                 # else still falls back to the bar and says so.
-                quote = normalize_quote(row, provider=provider, feed=feed)
+                quote = normalize_quote(
+                    row, provider=provider or "alpaca", feed=feed or "sip")
                 if keep is None or keep(quote.session_date.isoformat()):
                     if quote_index is None:
                         quotes.append(quote)
@@ -243,7 +304,10 @@ def _bar_session(bar: UnderlyingBar) -> str:
 
 
 def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
-                         force_quote_index: bool = False) -> tuple[
+                         force_quote_index: bool = False,
+                         require_provenance: bool = False,
+                         expected_equity_feed: str = "sip",
+                         expected_provider: str | None = None) -> tuple[
         list[dict], list[UnderlyingBar], dict[str, OptionSnapshot], list[QuoteSnapshot]]:
     """Load one normalized JSONL corpus: bars, option quotes, equity quotes.
 
@@ -262,7 +326,10 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
             raw_rows = list(_stream_rows(source))
             if any(not isinstance(row, Mapping) for row in raw_rows):
                 raise DiscoveryError("discovery rows must be JSON objects")
-            bars, snapshots, quotes = _normalize_corpus(raw_rows)
+            bars, snapshots, quotes = _normalize_corpus(
+                raw_rows, require_provenance=require_provenance,
+                expected_equity_feed=expected_equity_feed,
+                expected_provider=expected_provider)
             if not bars:
                 raise DiscoveryError("discovery corpus contains no underlying bars")
             return raw_rows, bars, snapshots, quotes
@@ -285,7 +352,10 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
         quote_index = SQLiteQuoteIndex()
         try:
             bars, snapshots, quotes = _normalize_corpus(
-                hasher_source, quote_index=quote_index)
+                hasher_source, quote_index=quote_index,
+                require_provenance=require_provenance,
+                expected_equity_feed=expected_equity_feed,
+                expected_provider=expected_provider)
         except Exception:
             if quote_index is not None:
                 quote_index.close()
@@ -305,12 +375,18 @@ def _read_discovery_rows(data: str | Path | Sequence[Mapping], *,
             quote_index = SQLiteQuoteIndex()
             try:
                 bars, snapshots, quotes = _normalize_corpus(
-                    raw_rows, quote_index=quote_index)
+                    raw_rows, quote_index=quote_index,
+                    require_provenance=require_provenance,
+                    expected_equity_feed=expected_equity_feed,
+                    expected_provider=expected_provider)
             except Exception:
                 quote_index.close()
                 raise
         else:
-            bars, snapshots, quotes = _normalize_corpus(raw_rows)
+            bars, snapshots, quotes = _normalize_corpus(
+                raw_rows, require_provenance=require_provenance,
+                expected_equity_feed=expected_equity_feed,
+                expected_provider=expected_provider)
     if not bars:
         raise DiscoveryError("discovery corpus contains no underlying bars")
     return raw_rows, bars, snapshots, quotes
@@ -350,7 +426,8 @@ def validate_worker_projection(source: str | Path, *,
             yield row
 
     projected_bars, projected_snapshots, projected_quotes = _normalize_corpus(
-        projection_rows())
+        projection_rows(), require_provenance=True,
+        expected_equity_feed="sip")
     if projected_quotes:
         raise DiscoveryError("worker_data must not contain equity quotes")
     if (projected_bars != list(bars) or
@@ -411,7 +488,8 @@ def corpus_slice(source: str | Path, *, after: str | None = None,
 
     try:
         bars, snapshots, quotes = _normalize_corpus(
-            rows(), keep=keep, quote_index=quote_index)
+            rows(), keep=keep, quote_index=quote_index,
+            require_provenance=True, expected_equity_feed="sip")
         if (digest is not None and
                 digest.hexdigest() != str(expected_digest)):
             raise DiscoveryError("worker_data changed after parent validation")
@@ -778,11 +856,13 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                        if str(row.get("session_date") or "") in held_sessions]
     fit_floor = structural_floor(
         fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        required=not shadow)
+        min_clusters=MIN_PROMOTION_CLUSTERS, required=not shadow)
     held_floor = structural_floor(
-        heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+        heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
+        min_clusters=MIN_PROMOTION_CLUSTERS)
     overall_floor = structural_floor(
-        ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+        ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
+        min_clusters=MIN_PROMOTION_CLUSTERS)
     separation = (heldout_separation(fit, heldout) if not shadow else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": bool(heldout), "mode": "new_data"})
@@ -886,7 +966,8 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
                    online_fdr: Mapping | None = None,
                    global_fdr: Mapping | None = None,
                    provenance: Mapping | None = None,
-                   candidate_id: str | None = None) -> dict:
+                   candidate_id: str | None = None,
+                   costs: CostModel | None = None) -> dict:
     online = dict(online_fdr or {})
     global_data = dict(global_fdr or family)
     cumulative_passes = bool(
@@ -938,7 +1019,7 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
         qualification=gate.get("qualification"),
         null_control=gate.get("null_control"),
         online_fdr=online, provenance=provenance,
-        candidate_id=candidate_id, performance=performance)
+        candidate_id=candidate_id, performance=performance, costs=costs)
     gate["passes"] = bool(envelope["passes"])
     gate["verified_gate"] = envelope
     gate["gate_hash"] = envelope["content_hash"]
@@ -950,4 +1031,4 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
 __all__ = ["DiscoveryError", "corpus_partitions", "corpus_slice",
            "_read_discovery_rows", "_effective_ibr_config",
            "_opportunity_rows", "_null_reference_rows", "_discover_gate",
-           "_finalize_gate"]
+           "_finalize_gate", "MIN_PROMOTION_CLUSTERS"]

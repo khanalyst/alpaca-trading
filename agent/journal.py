@@ -44,7 +44,12 @@ _JOURNAL_TABLES = {
         action TEXT, qty REAL, type TEXT, time_in_force TEXT, status TEXT,
         filled_qty REAL, filled_avg_price REAL, reason TEXT,
         run_id TEXT, cycle_id TEXT, runtime_mode TEXT,
-        account_fingerprint TEXT, setup_id TEXT
+        account_fingerprint TEXT, setup_id TEXT,
+        execution_profile TEXT, vehicle TEXT, variant_id TEXT,
+        reference_price REAL, entry_reference REAL, exit_reference REAL,
+        market_price REAL, mid_price REAL, requested_qty REAL,
+        planned_qty REAL, cumulative_filled_qty REAL, fill_fraction REAL,
+        filled_fraction REAL
     )""",
     "trades": """CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -59,7 +64,11 @@ _JOURNAL_TABLES = {
         run_id TEXT, cycle_id TEXT, runtime_mode TEXT,
         account_fingerprint TEXT, variant_id TEXT,
         strategy_config_version TEXT, close_trigger TEXT, close_evidence TEXT,
-        entry_equity_usd REAL
+        entry_equity_usd REAL,
+        execution_profile TEXT, vehicle TEXT, reference_price REAL,
+        entry_reference REAL, exit_reference REAL, market_price REAL,
+        mid_price REAL, requested_qty REAL, planned_qty REAL,
+        cumulative_filled_qty REAL, fill_fraction REAL, filled_fraction REAL
     )""",
     "equity": """CREATE TABLE IF NOT EXISTS equity (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -171,11 +180,23 @@ def initialize_journal(
                 "orders": {
                     "reason": "TEXT", "run_id": "TEXT", "cycle_id": "TEXT",
                     "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
-                    "setup_id": "TEXT",
+                    "setup_id": "TEXT", "execution_profile": "TEXT",
+                    "vehicle": "TEXT", "variant_id": "TEXT",
+                    "reference_price": "REAL", "entry_reference": "REAL",
+                    "exit_reference": "REAL", "market_price": "REAL",
+                    "mid_price": "REAL", "requested_qty": "REAL",
+                    "planned_qty": "REAL", "cumulative_filled_qty": "REAL",
+                    "fill_fraction": "REAL", "filled_fraction": "REAL",
                 },
                 "trades": {
                     "run_id": "TEXT", "cycle_id": "TEXT",
                     "runtime_mode": "TEXT", "account_fingerprint": "TEXT",
+                    "execution_profile": "TEXT", "vehicle": "TEXT",
+                    "reference_price": "REAL", "entry_reference": "REAL",
+                    "exit_reference": "REAL", "market_price": "REAL",
+                    "mid_price": "REAL", "requested_qty": "REAL",
+                    "planned_qty": "REAL", "cumulative_filled_qty": "REAL",
+                    "fill_fraction": "REAL", "filled_fraction": "REAL",
                 },
                 "equity": {
                     "run_id": "TEXT", "cycle_id": "TEXT",

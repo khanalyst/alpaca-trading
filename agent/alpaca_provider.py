@@ -167,10 +167,31 @@ class AlpacaProvider(AlpacaMarketDataMixin):
             raise PaperModeError("broker endpoint overrides are disabled")
         import_env_feed = os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED")
         import_env_option_feed = os.getenv("ALPACA_OPTIONS_FEED")
-        configured_data_feed = broker.get("data_feed") if "data_feed" in broker else data_cfg.get("feed", "iex")
-        configured_options_feed = broker.get("options_feed") if "options_feed" in broker else data_cfg.get("options_feed", "indicative")
+        # Keep minimal/injected configs fail-closed too.  A caller that has
+        # not passed the validated shipped config must not silently fall back
+        # to the partial IEX or indicative option stream.
+        configured_data_feed = broker.get("data_feed") if "data_feed" in broker else data_cfg.get("feed", "sip")
+        configured_options_feed = broker.get("options_feed") if "options_feed" in broker else data_cfg.get("options_feed", "opra")
         self.data_feed = _canonical_feed(import_env_feed or configured_data_feed)
         self.options_feed = _canonical_feed(import_env_option_feed or configured_options_feed, options=True)
+        strategy = cfg.get("strategy") if isinstance(cfg.get("strategy"), Mapping) else {}
+        research = cfg.get("research") if isinstance(cfg.get("research"), Mapping) else {}
+        classes = (cfg.get("universe") or {}).get("asset_classes", []) \
+            if isinstance(cfg.get("universe"), Mapping) else []
+        option_lane = any(str(item).lower() in {"us_option", "option", "options"}
+                          for item in classes)
+        # The checked configuration defaults research on; an unvalidated
+        # mapping must not opt out merely by omitting the field.
+        research_enabled = bool(research.get("enabled", True))
+        if research_enabled and self.data_feed != "sip":
+            raise PaperModeError(
+                "autonomous research requires the SIP equity feed entitlement")
+        if ((str(strategy.get("execution_mode", "shares")).lower()
+             in {"options", "option"}) or
+                (research_enabled and option_lane)) and \
+                self.options_feed != "opra":
+            raise PaperModeError(
+                "option execution/research requires the OPRA feed entitlement")
         paper = paper_value
         allow_live = allow_live_value
         self.session = session or AlpacaSession(

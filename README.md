@@ -31,9 +31,9 @@ flowchart LR
     A["Alpaca market data"] --> B["Recorder / backfill"]
     B --> C["Session-partitioned corpus"]
     C --> D["Research factory + IBR baseline"]
-    L["Optional research LLM"] -.->|bounded rule proposals only| D
+    L["Bounded research LLM"] -.->|bounded rule proposals only| D
     D --> E["Offline chronological gates + forward replay"]
-    E --> S["Optional broker-free ShadowRunner + isolated WAL"]
+    E --> S["Broker-free ShadowRunner + isolated WAL"]
     S --> I2["edge ingest-shadow (read-only WAL) + live marker"]
     I2 --> F["Edge ledger + verified proof"]
     F --> G["Edge resolver"]
@@ -65,6 +65,17 @@ family can legitimately pass its local test but fail the global one; only the
 global result can authorize cross-family selection. Historical and offline
 forward screens do not spend cumulative alpha. The one durable online-FDR test
 is reserved for the later parity-matched live-shadow tail.
+
+The authorizing floors are immutable: backtest/factory evidence requires 100
+trades and 30 complete sessions/clusters; the sealed qualification window
+requires 100 trades and 30 complete sessions/clusters; the parity-matched
+live-shadow tail requires 150 trades and 30 complete sessions. Effective
+breadth is persisted as a matched symbol/session correlation diagnostic, is
+re-verified with the proof, and never counts as extra independent N.
+
+Serial inference is deterministic. Session/day-cluster deltas use a seeded
+moving-block cluster bootstrap, with draw count, seed, and block length carried
+in the evidence so the bound can be recomputed.
 
 The final qualification sessions are sealed before the workers run. After
 development ranking and correction preselect one candidate, that candidate
@@ -118,13 +129,18 @@ recovery all reconcile against broker state; an unreadable state file is a
 blocking safety fault, never an empty book.
 
 A trader process uses one execution profile (`shares` or `options`) at a time.
-The market calendar is America/New_York (NYSE regular session). Entries outside
-the session are rejected, orders are day-only, and positions are force-closed
-before the close. Research replay receives the same runtime `ReplayPolicy`:
-strict 30-second market/quote freshness, configured DTE (default 7–60), option
-spread and liquidity checks, latest-entry and force-flat cutoffs, and
-portfolio/risk limits (position count/notional, gross/open risk, and daily
-loss) are all enforced rather than relaxed for simulation.
+The market calendar is America/New_York (NYSE regular session), and production
+replay requires the exact Alpaca calendar boundary for each session, including
+early closes; it never promotes a missing day to a fixed 16:00 close. Entries
+outside the session are rejected, orders are day-only, and positions are
+force-closed before the broker calendar close. Research replay receives the
+same runtime `ReplayPolicy`: strict 30-second market/quote freshness, configured
+DTE (default 7–60), option spread and liquidity checks, latest-entry and
+force-flat cutoffs, and portfolio/risk limits (position count/notional,
+gross/open risk, and daily loss) are all enforced rather than relaxed for
+simulation. Authorizing fills retain provider/feed/age/source for both legs:
+SIP for equity entry and exit, OPRA for option entry and exit, each no older
+than 30 seconds. Bar-only, partial-feed, or stale legs cannot authorize proof.
 
 ### Where the LLM is used
 
@@ -134,8 +150,8 @@ loss) are all enforced rather than relaxed for simulation.
 | Optional paper runtime | Return a subtractive veto after the deterministic setup and risk prerequisites already exist | Create a setup, change side/quantity/price, bypass risk, or submit an order |
 | Live runtime | Nothing; `llm.enabled: true` and injected decision brains are rejected | Participate in any live trading decision |
 
-Research works without an LLM because every proposal path has a deterministic
-fallback. Discovery, replacement, and tuning use strict full-schema structured
+Research uses a bounded LLM proposal lane with a deterministic rule grammar.
+Discovery, replacement, and tuning use strict full-schema structured
 contracts (`additionalProperties: false`, including the complete rule
 specification), and record schema/grammar hashes. The adapter enforces a
 per-run total-call budget, per-call attempt/timeout/response bounds, and an
@@ -154,6 +170,25 @@ which prompt/request/response was used, not that a provider will reproduce the
 same answer later. The adapter's call budget is a per-run call-count guard, not
 spend accounting; provider-side quotas remain an operational control for
 unattended research.
+
+### Costs and authorization checks
+
+The shipped expected-cost model is 4 bps spread, 6 bps adverse slippage, and
+0.5 bps per-side notional fee, plus a 0.65 currency-unit listed-option fee per
+contract per side. Proofs also persist preregistered all-in stress scenarios of
+9, 15, 25, and 50 bps; the 25 bps scenario is the required authorization
+check, while the others are diagnostics. Runtime rejection caps are separate
+from expected costs.
+
+`research.py calibrate` reads the journal without mutation and checks entry and
+exit fills independently. Shadow authorization fails closed when the journal is
+missing or stale, the sample is insufficient, costs are optimistic, a terminal
+fill is materially underfilled (<80% of requested quantity), or the
+partial-cancel rate exceeds 20%. Offline discovery and factory diagnostics may
+continue, but no shadow proof is ingested until calibration is fresh and
+authorized. In-flight orders are excluded, and partial fills are measured from
+plan/reference fields rather than realized notional. The model is never
+adjusted automatically.
 
 ## How an edge reaches money
 
@@ -268,15 +303,15 @@ The lean deployment topology is:
 | Service | Responsibility | Durable state |
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and option snapshots (paper by default) | `runtime-data` |
-| `trader` | One intraday decision loop in its configured execution profile; no overnight book | `runtime-data` |
-| `research` | Scheduled offline replay, evidence, reports, and optional shadow-WAL ingestion | `runtime-data`, research volumes |
-| `shadow` (optional profile) | Broker-free virtual evaluation and semantic replay parity | Read-only recorder/EdgeLedger inputs, isolated WAL |
+| `trader` | One paper intraday decision loop in the shipped `shares` execution profile; no overnight book | `runtime-data` |
+| `research` | Scheduled offline replay, evidence, reports, and shadow-WAL ingestion | `runtime-data`, research volumes |
+| `shadow` | Broker-free virtual evaluation and semantic replay parity | Read-only recorder/EdgeLedger inputs, isolated WAL |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
 
-The research service is an opt-in Compose profile, but a fresh deployment must
-run offline research, the broker-free shadow service, and the default
-shadow-WAL ingestion long enough to produce a live-shadow-marked champion
-before the trader can open risk. It
+The plain supported Compose deployment starts offline research, the broker-free
+shadow service, and default shadow-WAL ingestion in the default startup. A fresh
+deployment must run these lanes long enough to produce a live-shadow-marked
+champion before the trader can open risk. It
 consumes the recorder's mixed corpus (bars, quotes, and option snapshots),
 which is written one append-only partition per New York session date under
 `runtime/research/recorded/sessions/` with a sidecar index; the cycle script
@@ -290,8 +325,8 @@ at `runtime/research/edge_lab.sqlite3`; the dashboard only observes ledger
 status, latest re-verified passing edges, per-edge live paper results, edge
 proof reports, and the execution journal.
 
-The optional Compose `shadow` profile reads the recorder corpus and EdgeLedger
-read-only, has no broker credentials, and writes only its isolated shadow WAL.
+The Compose `shadow` service reads the recorder corpus and EdgeLedger read-only,
+has no broker credentials, and writes only its isolated shadow WAL.
 It evaluates eligible candidates in isolated virtual books from recorder events,
 creates exact-session candidate/root-baseline/randomized-null replays, and
 quarantines mismatch/incomplete rows. It compares semantic runtime-shadow
@@ -348,21 +383,40 @@ chmod 600 .env
 ```
 
 Set `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER=true`, and the
-selected `ALPACA_DATA_FEED`/`ALPACA_OPTIONS_FEED` in `.env`. `check` is the
+SIP/OPRA entitlements in the broker secret. The scheduled research lane also
+requires a separate readable dotenv file with `OPENAI_API_KEY` for the checked
+`openai`/`gpt-5` provider (or the matching configured provider key); set
+`ALPACA_RESEARCH_LLM_SECRET_FILE` to that path. Do not put provider keys in the
+broker secret. `check` is the
 authenticated preflight by default; `check --offline` validates local
 configuration only and is not a trading preflight. Unit tests use fakes and do
-not need credentials. The checked config uses deterministic research. Bounded
-model-assisted discovery and replacement can be enabled with model `gpt-5`;
-they read provider credentials only from the separate
-`ALPACA_RESEARCH_LLM_SECRETS_FILE`. Enabling the model lane without the matching
-provider key fails the research cycle before discovery. Invalid model output
-leaves a pending replacement; it never retires a family or authorizes trading. Runtime
-decision LLM use remains disabled (`llm.enabled: false`). The default stock
-feed is IEX. Long options remain subject to liquidity and contract checks.
-Research studies only the vehicle the configured execution profile can trade
-(`python research.py vehicles`); `ALPACA_RESEARCH_VEHICLES=all` runs both lanes
-deliberately. Seed months of history in one command instead of waiting for the
-recorder to accumulate it:
+not need credentials. Research LLM discovery/replacement/tuning is enabled with
+the checked `openai`/`gpt-5` provider and fails closed before discovery when its
+separate secret is absent, unreadable, or keyless. Provider credentials are
+read only from `ALPACA_RESEARCH_LLM_SECRET_FILE`; invalid model output leaves a
+pending replacement and never retires a family or authorizes trading.
+Runtime decision LLM use is hard-off in the paper trader. The default trader
+remains paper-only with the `shares` execution profile; options research is
+evidence only and does not enable options execution. `ALPACA_RESEARCH_VEHICLES=all`
+is the default and researches both equity and option vehicles. Seed months of
+history in one command instead of waiting for the recorder to accumulate it:
+
+For the plain supported Compose deployment, first provide both credential
+paths, then start every paper service (including scheduled research and the
+broker-free shadow lane):
+
+```bash
+export ALPACA_AGENT_SECRET_FILE=/etc/alpaca-agent-trading/agent.env
+export ALPACA_RESEARCH_LLM_SECRET_FILE=/etc/alpaca-agent-trading/research-llm.env
+docker compose config --quiet
+docker compose up -d
+docker compose ps
+```
+
+The broker secret must contain the Alpaca paper key/secret; the separate
+research secret must be readable and contain the configured provider key.
+Compose refuses to render the research service when that provider path is
+missing or unreadable.
 
 ```bash
 ./.venv/bin/python deploy/backfill.py --days 180
@@ -382,6 +436,16 @@ on a strictly newer recorder tail. Only that complete parity-matched live proof
 can authorize validation/champion selection. This delay is an intentional
 evidence gate, not a startup error.
 
+Backtest/factory evidence requires 100 trades plus 30 complete sessions/clusters;
+sealed qualification requires 100 trades plus 30 complete sessions/clusters;
+and the parity-matched shadow tail requires 150 trades plus 30 complete
+sessions. Replay epoch 3 additionally requires a 30 bps minimum stop distance
+for both rule and IBR paths, a recomputable risk unit that covers round-trip
+cost, and executable SIP/OPRA quote/snapshot fill-quality evidence on both legs
+within 30 seconds rather than bar-only fallback. Runs from older replay epochs
+remain auditable but are quarantined and cannot validate or authorize the trader
+until replayed under epoch 3.
+
 For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow
 [OPERATIONS.md](OPERATIONS.md). A paused-runtime recovery uses the
@@ -395,8 +459,7 @@ at it so the edge ledger is durable, and closing the network security group.
 ```bash
 ./.venv/bin/python -m compileall -q agent deploy main.py research.py
 ./.venv/bin/python -m unittest discover -v
-docker compose config
-docker compose --profile research config
+docker compose config --quiet
 docker compose build
 ```
 

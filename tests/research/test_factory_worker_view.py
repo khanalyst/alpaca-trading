@@ -1,11 +1,13 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from research import strategy_factory as factory_module
-from research.strategy_factory import run_factory
+import research.gates as gates
+from research.strategy_factory import FactoryError, run_factory
 
 from tests.research.test_strategy_factory import losing_breakouts
 
@@ -13,6 +15,24 @@ from tests.research.test_strategy_factory import losing_breakouts
 def _write_rows(path: Path, rows) -> None:
     path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
                     encoding="utf-8")
+
+
+@contextmanager
+def _compact_factory_protocol():
+    """Keep worker-view equivalence fixtures below production evidence floors."""
+    with patch.multiple(
+            gates,
+            PROTOCOL_BACKTEST_MIN_TRADES=1,
+            PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+            PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+            PROTOCOL_SHADOW_MIN_TRADES=1,
+            PROTOCOL_SHADOW_MIN_SESSIONS=1,
+            PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+            PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+            PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+            PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
+            patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1):
+        yield
 
 
 class FactoryWorkerViewTests(unittest.TestCase):
@@ -36,10 +56,20 @@ class FactoryWorkerViewTests(unittest.TestCase):
         return rows + quotes
 
     def _run(self, source, *, db, worker_data=None, progress_callback=None):
-        return run_factory(
-            source, worker_data=worker_data, db_path=db, strategies=1,
-            variants_per_strategy=2, workers=1, min_trades=1,
-            min_sessions=1, alpha=1.0, progress_callback=progress_callback)
+        with _compact_factory_protocol():
+            return run_factory(
+                source, worker_data=worker_data, db_path=db, strategies=1,
+                variants_per_strategy=2, workers=1, min_trades=1,
+                min_sessions=1, alpha=1.0,
+                progress_callback=progress_callback)
+
+    def test_public_run_factory_rejects_low_protocol_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                    FactoryError, "trades must be >= 100 for backtest authorization"):
+                run_factory(self._corpus(), db_path=Path(directory) / "factory.sqlite3",
+                            strategies=1, variants_per_strategy=2, workers=1,
+                            min_trades=1, min_sessions=1, alpha=1.0)
 
     def test_worker_view_preserves_gates_and_avoids_quote_rescans(self):
         rows = self._corpus()

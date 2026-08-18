@@ -5,6 +5,8 @@ import tempfile
 import unittest
 
 from research.factory_ledger import FDR_METHOD, FactoryLedger, deferred_fdr
+from research.factory_core import initial_hypotheses
+from research.factory_ledger import FactoryError
 
 
 class FactoryFdrTests(unittest.TestCase):
@@ -55,6 +57,26 @@ class FactoryFdrTests(unittest.TestCase):
         self.assertEqual(record["status"], "deferred_to_live_shadow")
         self.assertNotIn("p_value", record)
         self.assertNotIn("allocated_alpha", record)
+
+    def test_qualification_claim_survives_restart_and_rejects_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "edge.sqlite3"
+            ledger = FactoryLedger(path)
+            hypothesis = initial_hypotheses(1)[0]
+            ledger.register(hypothesis)
+            first = ledger.claim_qualification(
+                "cycle-a", hypothesis.hypothesis_id, vehicle="equity",
+                variant_id="variant-a", sessions=["2026-01-02", "2026-01-03"])
+            self.assertEqual(first["sessions"], ["2026-01-02", "2026-01-03"])
+            # A new ledger instance sees the durable claim; it is not an
+            # in-memory sealed-window convention that a crash can erase.
+            restarted = FactoryLedger(path)
+            self.assertEqual(restarted.evidence_sessions("equity"),
+                             {"2026-01-02", "2026-01-03"})
+            with self.assertRaises(FactoryError):
+                restarted.claim_qualification(
+                    "cycle-b", hypothesis.hypothesis_id, vehicle="equity",
+                    variant_id="variant-b", sessions=["2026-01-03", "2026-01-04"])
 
 
 if __name__ == "__main__":  # pragma: no cover

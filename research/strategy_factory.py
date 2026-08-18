@@ -30,6 +30,7 @@ from .edge_lab import (
     DEFAULT_DB_PATH, EdgeLedger, _read_discovery_rows, content_hash,
 )
 from .edge_ledger_store import provenance_hash
+from .edge_identity import candidate_assumptions
 # One randomized-entry null control serves both research lanes; it lives in
 # the shared discovery helpers and is re-exported here for its callers.
 from .edge_discovery_core import (corpus_slice, null_control_account,
@@ -46,6 +47,7 @@ from .gates import (chronological_split, heldout_separation,
                     RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
                     qualification_report as _qualification_report,
+                    validate_protocol_floor,
                     sample_counts, seal_final_window,
                     structural_floor, verified_gate_envelope,
                     walk_forward_report)
@@ -65,6 +67,11 @@ from .factory_core import (
 
 DEFAULT_WORKERS = 2
 MAX_WORKERS = 16
+# Promotion evidence is clustered by independent market session.  A caller's
+# trade/session floor remains useful for diagnostics, but no candidate may be
+# selected for qualification or a durable proof on fewer than this many
+# independent clusters.
+MIN_PROMOTION_CLUSTERS = 30
 # Exact semantic aliases are always removed. Near-duplicate suppression is a
 # transparent policy knob for model-authored proposals; deterministic
 # parameter sweeps remain a complete search regardless of this value.
@@ -612,6 +619,7 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                                   error=f"{type(exc).__name__}: provider tuning unavailable")
     chosen: list[TunedVariant] = []
     seen: set[str] = set()
+    allowed_pool_ids = {rule_variant_id(spec) for spec, _reason in pool}
     deterministic_seed = pool[0] if pool else None
     if deterministic_seed is not None:
         chosen.append(TunedVariant(
@@ -635,6 +643,13 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
                     {**dict(diagnostic), "refinement_phase": phase}, lessons)
             except (TypeError, ValueError, KeyError):
                 continue
+            # The model may choose among the same finite neighborhood the
+            # deterministic lane would test, but it may not invent a larger
+            # numerical jump inside the broad grammar bounds.  This keeps LLM
+            # tuning a search-order aid rather than a second, unaccounted-for
+            # hypothesis generator.
+            if variant_id not in allowed_pool_ids:
+                continue
             # Re-proposing a parameter set a graded lesson already recorded as
             # an adequate failure is not a new experiment; the ledger has that
             # answer.  Dropping it here is what makes "learn from the lessons"
@@ -642,16 +657,11 @@ def _tuned_variants(hypothesis: Mapping[str, Any], diagnostic: Mapping[str, Any]
             if (variant_id in seen or _failed_variant(entry["rule_spec"], failed) or
                     _variant_seen(entry["rule_spec"], seen)):
                 continue
-            # Only provider-authored candidates are fuzzy-filtered. Include
-            # persisted hypotheses/candidates, the current root, and earlier
-            # accepted proposals in this cycle; deterministic pool entries
-            # below intentionally retain every neighboring point.
-            if _semantic_duplicate(
-                    normalized_entry,
-                    [*existing_specs, root,
-                     *(item.rule_spec for item in chosen)],
-                    near_distance=near_distance):
-                continue
+            # Tuning proposals are now exact members of the deterministic
+            # neighborhood. Near-duplicate suppression would discard that
+            # entire local grid against its own root, so exact variant/lesson
+            # de-duplication above is the appropriate boundary here. Discovery
+            # and replacement proposals retain semantic suppression.
             _mark_variant(normalized_entry, seen)
             chosen.append(TunedVariant(normalized_entry, str(entry.get("reason") or "provider tuning"),
                                        "llm", entry.get("builds_on")))
@@ -1083,11 +1093,13 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                        if str(row.get("session_date") or "") in held_sessions]
     fit_floor = structural_floor(
         fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
-        required=mode != "shadow")
+        min_clusters=MIN_PROMOTION_CLUSTERS, required=mode != "shadow")
     held_floor = structural_floor(
-        heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+        heldout, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
+        min_clusters=MIN_PROMOTION_CLUSTERS)
     overall_floor = structural_floor(
-        ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions)
+        ordered, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
+        min_clusters=MIN_PROMOTION_CLUSTERS)
     fit_test = (matched_cluster_test(fit, base_fit, vehicle=vehicle) if mode != "shadow" else
                 {"available": True, "actual_control": True, "matched": 0,
                  "mean_delta": None, "p_value": 1.0, "mode": "prior_backtest"})
@@ -1150,6 +1162,15 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
         "falsification": bool(falsification["passes"]),
         "heldout_net_pnl_positive": bool(absolute["net_pnl_positive"]),
         "heldout_expectancy_positive": bool(absolute["expectancy_positive"]),
+        # Trade counts are not independent draws. Keep the cluster boundary as
+        # an explicit named check so reports and proof envelopes expose the
+        # multiplicity unit instead of hiding it in min_sessions.
+        "promotable_cluster_floor": bool(
+            int(held_floor.get("clusters", 0)) >= MIN_PROMOTION_CLUSTERS),
+        "qualification_cluster_floor": bool(
+            final.get("available") and len({str(item) for item in
+                                             (final.get("sessions") or ())
+                                             if str(item)}) >= MIN_PROMOTION_CLUSTERS),
         "null_control_available": bool(null_control["available"]),
         "null_control_delta_positive": bool(
             null_control["mean_delta"] is not None and
@@ -1166,7 +1187,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
     development_checks = {
         name: value for name, value in checks.items()
         if name not in {"qualification_net_positive",
-                        "qualification_delta_positive"}
+                        "qualification_delta_positive",
+                        "qualification_cluster_floor"}
     }
     return {
         "passes_without_family": bool(all(checks.values())),
@@ -1266,7 +1288,7 @@ def run_factory(data: str | Path | Sequence[Mapping], *,
                 strategies: int = DEFAULT_STRATEGIES,
                 variants_per_strategy: int = DEFAULT_VARIANTS,
                 workers: int = DEFAULT_WORKERS, starting_cash: float = 100_000.0,
-                min_trades: int = 100, min_sessions: int = 10,
+                min_trades: int = 100, min_sessions: int = 30,
                 alpha: float = .05, max_generations: int = 5,
                 max_rotations: int = MAX_ROTATIONS,
                 rotation_budget: int = ROTATION_BUDGET,
@@ -1301,7 +1323,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 strategies: int = DEFAULT_STRATEGIES,
                 variants_per_strategy: int = DEFAULT_VARIANTS,
                 workers: int = DEFAULT_WORKERS, starting_cash: float = 100_000.0,
-                min_trades: int = 100, min_sessions: int = 10,
+                min_trades: int = 100, min_sessions: int = 30,
                 alpha: float = .05, max_generations: int = 5,
                 max_rotations: int = MAX_ROTATIONS,
                 rotation_budget: int = ROTATION_BUDGET,
@@ -1322,8 +1344,13 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError(f"variants_per_strategy must be between 2 and {MAX_VARIANTS}")
     if not 1 <= int(workers) <= MAX_WORKERS:
         raise FactoryError(f"workers must be between 1 and {MAX_WORKERS}")
-    if starting_cash <= 0 or min_trades < 1 or min_sessions < 1:
-        raise FactoryError("starting_cash, min_trades and min_sessions must be positive")
+    if starting_cash <= 0:
+        raise FactoryError("starting_cash must be positive")
+    try:
+        validate_protocol_floor(lane="backtest", min_trades=min_trades,
+                                min_sessions=min_sessions)
+    except ValueError as exc:
+        raise FactoryError(str(exc)) from exc
     if not 0 < alpha <= 1:
         raise FactoryError("alpha must be in (0,1]")
     if int(max_rotations) < 0 or int(rotation_budget) < 0:
@@ -1347,7 +1374,17 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         elif (not worker_data_path.is_file() or
               worker_data_path.stat().st_size <= 0):
             raise FactoryError("worker_data must be a non-empty JSONL file")
-    model = costs or CostModel()
+    # The envelope, replay workers, and provenance must all use one identical
+    # cost schedule. When a caller does not pass an explicit model, derive it
+    # from the validated runtime config rather than silently reverting to the
+    # default spread/slippage schedule.
+    model = costs if costs is not None else CostModel.from_config(runtime_config)
+    # The explicit model is the replay economics actually used by workers.
+    # Feed it into the identity envelope so a caller-provided calibration (or
+    # the module's conservative default) cannot be hidden behind the shipped
+    # runtime-config costs when a candidate is persisted.
+    identity_runtime_config = dict(runtime_config or {})
+    identity_runtime_config["costs"] = model.as_dict()
     policy = ReplayPolicy.from_config(runtime_config)
     backtest_policy = replay_policy_for_mode(
         policy, "backtest", backtest_bar_fallback=backtest_bar_fallback)
@@ -1403,6 +1440,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     dataset_hash = content_hash(raw_rows)
     gate_assumptions = {
         "min_trades": int(min_trades), "min_sessions": int(min_sessions),
+        "min_promotion_clusters": MIN_PROMOTION_CLUSTERS,
         "alpha": float(alpha), "qualification_fraction": .2,
         "walk_forward_folds": 3,
         "retirement_confidence": RETIREMENT_CONFIDENCE,
@@ -1493,6 +1531,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     tasks = []
     sealed_windows: dict[str, tuple[Any, list, list]] = {}
     snapshots = list(snapshot_map.values())
+    # Held-out and qualification sessions are confirmatory evidence, not a
+    # renewable tuning corpus.  The ledger records these claims atomically;
+    # excluding them before scheduling keeps a later adaptive cycle from
+    # treating the same sessions as fresh evidence.
+    consumed_evidence_sessions = factory.evidence_sessions(vehicle)
     quote_resolver = callable(getattr(quote_rows, "quote_fill", None))
     quotes = quote_rows if quote_resolver else list(quote_rows)
     # A recorded corpus is re-read by each worker from its own descriptor; an
@@ -1519,11 +1562,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         mode = "shadow" if hypothesis.get("status") == "backtest_passed" else "backtest"
         boundary = (factory.last_boundary(hypothesis["hypothesis_id"], vehicle)
                     if mode == "shadow" else hypothesis.get("not_before"))
-        selected_bars = [bar for bar in bars if boundary is None or _session(bar) > boundary]
-        selected_snapshots = [snap for snap in snapshots if boundary is None or snap.session_date.isoformat() > boundary]
+        selected_bars = [bar for bar in bars
+                         if (boundary is None or _session(bar) > boundary)
+                         and _session(bar) not in consumed_evidence_sessions]
+        selected_snapshots = [snap for snap in snapshots
+                              if (boundary is None or snap.session_date.isoformat() > boundary)
+                              and snap.session_date.isoformat() not in consumed_evidence_sessions]
         selected_quotes = (quotes if quote_resolver else
                            [quote for quote in quotes
-                            if boundary is None or quote.session_date.isoformat() > boundary])
+                            if (boundary is None or quote.session_date.isoformat() > boundary)
+                            and quote.session_date.isoformat() not in consumed_evidence_sessions])
         specs = _existing_specs(edge, hypothesis["hypothesis_id"], vehicle) if mode == "shadow" else []
         if mode == "shadow" and not specs:
             factory.event(hypothesis["hypothesis_id"], "backtest_passed",
@@ -1542,6 +1590,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         development_bars, sealed = seal_final_window(
             selected_bars, session_of=_session, fraction=.2)
         sealed_sessions = set(sealed.session_dates)
+        excluded_sessions = set(sealed_sessions) | set(consumed_evidence_sessions)
         sealed_windows[hypothesis["hypothesis_id"]] = (
             sealed,
             [snap for snap in selected_snapshots
@@ -1568,14 +1617,14 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         elif quote_descriptor is not None and worker_data_path is not None:
             task["corpus"] = {
                 "source": corpus_source, "after": boundary,
-                "until": corpus_end, "exclude": sorted(sealed_sessions),
+                "until": corpus_end, "exclude": sorted(excluded_sessions),
                 "quote_descriptor": quote_descriptor,
                 "projection_digest": projection_digest,
             }
         else:
             task["corpus"] = {"source": corpus_source, "after": boundary,
                               "until": corpus_end,
-                              "exclude": sorted(sealed_sessions)}
+                              "exclude": sorted(excluded_sessions)}
         tasks.append(task)
     if not tasks:
         return {"schema": FACTORY_SCHEMA, "status": "waiting_for_new_data",
@@ -1765,7 +1814,9 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             _progress("aggregating", aggregation_done, aggregation_total)
     # Selection compares candidates across every family and lane in the cycle,
     # so the false-discovery correction that authorizes a champion has to be
-    # global.  The family-local correction is retained as reported evidence.
+    # global.  The named rule-family correction is computed over every slot and
+    # generation carrying that family; a per-worker/per-slot correction would
+    # incorrectly grant each adaptive lineage its own fresh multiplicity.
     # A root is a real hypothesis compared against an independent randomized
     # entry null. It is therefore a tested candidate and consumes multiplicity
     # exactly like a mutation; excluding it would grant a free hypothesis.
@@ -1773,28 +1824,45 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
     global_correction = benjamini_hochberg(
         {f"{owner['hypothesis']['hypothesis_id']}:{variant['variant_id']}": gate["p_raw"]
          for owner, variant, gate in candidate_rows}, alpha=alpha)
-    for worker in worker_results:
-        local_rows = [(variant, gate) for owner, variant, gate in variant_rows
-                      if owner is worker]
-        correction = benjamini_hochberg(
-            {variant["variant_id"]: gate["p_raw"] for variant, gate in local_rows},
-            alpha=alpha)
-        for variant, gate in local_rows:
-            family = correction.get(variant["variant_id"], {
+    family_rows: dict[str, list[tuple[Mapping, Mapping]]] = {}
+    for owner, variant, gate in variant_rows:
+        rule_family = str((variant.get("rule_spec") or {}).get(
+            "family") or owner["hypothesis"]["family"])
+        family_rows.setdefault(rule_family, []).append(
+            (variant, gate))
+    family_corrections: dict[str, dict] = {}
+    for family_name in family_rows:
+        family_corrections[family_name] = benjamini_hochberg(
+            {
+                f"{family_name}|{owner['hypothesis']['hypothesis_id']}|"
+                f"{variant['variant_id']}": gate["p_raw"]
+                for owner, variant, gate in variant_rows
+                if str((variant.get("rule_spec") or {}).get("family") or
+                       owner["hypothesis"]["family"]) == family_name
+            }, alpha=alpha)
+    for worker, variant, gate in variant_rows:
+        family_name = str((variant.get("rule_spec") or {}).get(
+            "family") or worker["hypothesis"]["family"])
+        correction = family_corrections.get(family_name, {})
+        family_key = (f"{family_name}|{worker['hypothesis']['hypothesis_id']}|"
+                      f"{variant['variant_id']}")
+        family = correction.get(family_key, {
+            "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
+            "significant": float(gate["p_raw"]) <= float(alpha),
+            "family_size": len(correction), "family": family_name})
+        family = {**family, "family": family_name}
+        overall = global_correction.get(
+            f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}", {
                 "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
                 "significant": float(gate["p_raw"]) <= float(alpha),
-                "family_size": len(correction)})
-            overall = global_correction.get(
-                f"{worker['hypothesis']['hypothesis_id']}:{variant['variant_id']}", {
-                    "p": gate["p_raw"], "p_adjusted": gate["p_raw"],
-                    "significant": float(gate["p_raw"]) <= float(alpha),
-                    "family_size": len(global_correction)})
-            gate["multiple_tests"] = {**family, "method": "benjamini_hochberg",
-                                      "scope": "family"}
-            gate["global_multiple_tests"] = {**overall,
-                                             "method": "benjamini_hochberg",
-                                             "scope": "cycle_global"}
-            gate["confidence"] = 1.0 - float(overall["p_adjusted"])
+                "family_size": len(global_correction)})
+        gate["multiple_tests"] = {**family, "method": "benjamini_hochberg",
+                                  "scope": "rule_family",
+                                  "family": family_name}
+        gate["global_multiple_tests"] = {**overall,
+                                         "method": "benjamini_hochberg",
+                                         "scope": "cycle_global"}
+        gate["confidence"] = 1.0 - float(overall["p_adjusted"])
 
     # Rank only development-eligible candidates, then open one sealed window.
     # Cumulative alpha is deliberately not spent on historical or offline
@@ -1829,18 +1897,30 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
          if selected_test_key else f"{identity['identity_hash']}:no-selection"))
     qualification_target = selected_test
 
+    # Allocate the cycle identity before reserving a qualification window. The
+    # ledger claim commits before ``sealed.release`` so a crash cannot make
+    # that same window look unused on a later invocation.
+    cycle_id = uuid.uuid4().hex
     qualification_key = None
     qualification_report: dict[str, Any] | None = None
+    qualification_claim_error: str | None = None
     if qualification_target is not None:
         selected_worker, selected_variant, _selected_gate = qualification_target
         hypothesis_id = str(selected_worker["hypothesis"]["hypothesis_id"])
         selected_policy = selected_worker.get("policy", policy)
         sealed, sealed_snapshots, sealed_quotes = sealed_windows.get(
             hypothesis_id, (None, [], []))
-        qualification_bars = (sealed.release(
-            reason=f"post-selection qualification {selected_variant['variant_id']}")
-            if sealed is not None and sealed.session_dates else None)
         sessions = tuple(sealed.session_dates) if sealed is not None else ()
+        qualification_bars = None
+        if sealed is not None and sessions:
+            try:
+                factory.claim_qualification(
+                    cycle_id, hypothesis_id, vehicle=vehicle,
+                    variant_id=str(selected_variant["variant_id"]), sessions=sessions)
+                qualification_bars = sealed.release(
+                    reason=f"post-selection qualification {selected_variant['variant_id']}")
+            except FactoryError as exc:
+                qualification_claim_error = str(exc)
         if qualification_bars:
             control_rows = simulate_account(
                 qualification_bars, sealed_snapshots,
@@ -1881,6 +1961,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             "available": False, "sessions": [], "net_pnl": 0.0,
             "matched": 0, "mean_delta": None, "trades": 0,
             "net_positive": False, "delta_positive": False,
+            **({"unavailable_reason": qualification_claim_error}
+               if qualification_claim_error else {}),
             "post_selection": {"preselected": False,
                                 "candidate_id": variant["variant_id"]},
         })
@@ -1889,6 +1971,10 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             final.get("available") and final.get("net_positive"))
         gate["checks_without_family"]["qualification_delta_positive"] = bool(
             final.get("available") and final.get("delta_positive"))
+        gate["checks_without_family"]["qualification_cluster_floor"] = bool(
+            final.get("available") and len({str(item) for item in
+                                             (final.get("sessions") or ())
+                                             if str(item)}) >= MIN_PROMOTION_CLUSTERS)
         family = gate["multiple_tests"]
         overall = gate["global_multiple_tests"]
         checks = {
@@ -1916,14 +2002,16 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         fit_baseline = gate.pop("_fit_baseline_rows", [])
         heldout_baseline = gate.pop("_heldout_baseline_rows", [])
         null_source = gate.pop("_null_rows", [])
-        config = {"strategy": {"id": "rule", "version": "v1",
-                                "variant_id": variant["variant_id"],
-                                "rule_spec": variant["rule_spec"]}}
+        # Candidate identity is the complete validated runtime assumptions
+        # with this rule applied.  Replay mode/policy belongs only in the
+        # provenance body below, so backtest and shadow share one hash.
+        config = candidate_assumptions(
+            identity_runtime_config, vehicle=vehicle, strategy_id="rule",
+            variant_id=variant["variant_id"],
+            rule_spec=variant["rule_spec"])
         worker_policy = worker.get(
             "policy", shadow_policy if worker["mode"] == "shadow" else backtest_policy)
-        run_config = {**config, "replay_policy": worker_policy.as_dict(),
-                      "replay_mode": worker["mode"],
-                      "backtest_bar_fallback": backtest_bar_fallback}
+        run_config = dict(config)
         run_provenance = {
             "factory": FACTORY_SCHEMA,
             "experiment_identity": identity["identity_hash"],
@@ -1955,6 +2043,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             qualification=gate["qualification"],
             null_control=gate["null_control"],
             online_fdr=(cumulative if key == selected_test_key else {}),
+            costs=model,
             provenance=provenance_hash(
                 dataset=raw_rows, config=run_config, code=Path(__file__),
                 provenance=run_provenance),
@@ -1997,7 +2086,6 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         except (FactoryError, KeyError, sqlite3.Error):
             pass
 
-    cycle_id = uuid.uuid4().hex
     summaries = []
     replacements = []
     rotations: list[dict] = []
@@ -2056,6 +2144,11 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
                 candidate = edge.candidate_by_variant(variant["variant_id"], vehicle)
                 if candidate is None:
                     raise
+                if str(candidate.get("config_hash") or "") != content_hash(config):
+                    raise FactoryError(
+                        f"candidate {variant['variant_id']!r} has immutable "
+                        "assumptions from an older runtime config; "
+                        "re-register before discovery")
             lineage = _llm_lineage_evidence(factory, hypothesis)
             if lineage is not None:
                 prior = [item for item in edge.evidence(candidate["candidate_id"])
@@ -2447,7 +2540,8 @@ def factory_status(db_path: str | Path = DEFAULT_DB_PATH) -> dict:
 
 
 __all__ = [
-    "DEFAULT_STRATEGIES", "DEFAULT_VARIANTS", "DEFAULT_WORKERS", "FactoryError",
+    "DEFAULT_STRATEGIES", "DEFAULT_VARIANTS", "DEFAULT_WORKERS",
+    "MIN_PROMOTION_CLUSTERS", "FactoryError",
     "FactoryLedger", "StrategyHypothesis", "diagnose", "discovery_hypothesis",
     "factory_status", "initial_hypotheses", "mutate_from_diagnosis",
     "replacement_hypothesis", "run_factory", "simulate_account",

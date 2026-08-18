@@ -68,7 +68,7 @@ class RiskProfileTests(unittest.TestCase):
         candidate = {
             "type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
             "volume": 10, "open_interest": 100, "multiplier": 100,
-            "quote_ts": evaluation, "quote_age_seconds": 0,
+            "quote_ts": evaluation, "quote_age_seconds": 0, "feed": "opra",
         }
         with patch.object(risk_module, "_candidate_sequence",
                           wraps=risk_inputs._candidate_sequence) as sequence, \
@@ -157,7 +157,7 @@ class RiskProfileTests(unittest.TestCase):
         timestamped = {
             "type": "call", "dte": 14, "bid": 1.9, "ask": 2.0,
             "volume": 10, "open_interest": 100, "multiplier": 100,
-            "quote_ts": evaluation, "quote_age_seconds": 0,
+            "quote_ts": evaluation, "quote_age_seconds": 0, "feed": "opra",
         }
         for clock in (evaluation, evaluation.timestamp()):
             with self.subTest(clock=clock):
@@ -343,10 +343,11 @@ class RiskProfileTests(unittest.TestCase):
 
     def test_option_snapshot_dataclass_is_normalized_and_occ_identity_checked(self):
         evaluation = datetime(2026, 8, 9, 14, 30, tzinfo=timezone.utc)
-        contract = OptionContract.from_sdk({"symbol": "SPY260821C00600000"})
+        contract = OptionContract.from_sdk({"symbol": "SPY260821C00600000",
+                                            "feed": "opra"})
         snapshot = OptionSnapshot(
             symbol=contract.symbol, contract=contract, bid=1.9, ask=2,
-            volume=10, open_interest=100, timestamp=evaluation)
+            volume=10, open_interest=100, timestamp=evaluation, feed="opra")
         selected = self.risk.select_option_contract(
             [snapshot], direction="long", now=evaluation.timestamp(),
             underlying="SPY")

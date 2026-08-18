@@ -8,7 +8,8 @@ from research.gates import (
     expectancy_rejection_report, paired_delta, performance_floor,
     placebo_null_distribution,
     qualification_report, recompute_gate_statistics, seal_final_window, structural_floor,
-    verified_gate_envelope, verify_gate_envelope, walk_forward_report,
+    risk_unit_report, verified_gate_envelope, verify_gate_envelope,
+    walk_forward_report,
 )
 
 
@@ -21,6 +22,104 @@ def _rows(count, *, net, start=2, symbol="SPY", prefix="candidate"):
 
 
 class EvidenceGateTests(unittest.TestCase):
+    @staticmethod
+    def _equity_quote_row(**changes):
+        row = {
+            "vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-02",
+            "opportunity_id": "equity-1", "net_pnl": 20.0,
+            "entry_fill_source": "quote", "exit_fill_source": "quote",
+            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_provider": "alpaca", "exit_provider": "alpaca",
+            "entry_quote_age_seconds": 0.0,
+            "exit_quote_age_seconds": 0.0,
+        }
+        row.update(changes)
+        return row
+
+    def test_equity_fill_quality_requires_sip_quote_provenance_on_both_legs(self):
+        from research.gates import fill_source_summary
+        self.assertTrue(fill_source_summary(
+            [self._equity_quote_row()], vehicle="equity")["adequate"])
+        for changes in (
+                {"entry_feed": "iex"}, {"exit_feed": "iex"},
+                {"entry_feed": None}, {"exit_feed": None},
+                {"entry_feed": "unknown"}, {"exit_feed": "unknown"},
+                {"entry_fill_source": "bar"}, {"exit_fill_source": "bar"},
+                {"entry_provider": None}, {"exit_provider": ""}):
+            with self.subTest(changes=changes):
+                self.assertFalse(fill_source_summary(
+                    [self._equity_quote_row(**changes)],
+                    vehicle="equity")["adequate"])
+
+    def test_opra_option_rows_satisfy_fill_and_risk_evidence(self):
+        rows = [{
+            "vehicle": "option", "symbol": "SPY",
+            "session_date": "2026-01-02", "opportunity_id": "opra-1",
+            "net_pnl": 20.0, "entry_price": 2.0, "exit_price": 2.2,
+            "quantity": 1.0, "contract_multiplier": 100,
+            "risk_usd": 200.0, "entry_fill_source": "quote",
+            "exit_fill_source": "quote", "entry_quote_age_seconds": 0.0,
+            "exit_quote_age_seconds": 0.0, "entry_feed": "opra",
+            "exit_feed": "opra",
+        }]
+        from research.gates import fill_source_summary
+        self.assertTrue(fill_source_summary(rows, vehicle="option")["adequate"])
+        report = risk_unit_report(rows, vehicle="option")
+        self.assertTrue(report["adequate"])
+        envelope = verified_gate_envelope(
+            lane="shadow", vehicle="option", fit=[], heldout=rows,
+            fit_floor={}, heldout_floor={}, control={}, p_value=1.0,
+            q_value=1.0, alpha=.05, falsification={}, separation={},
+            checks={}, passes=False, risk_unit_report=report)
+        self.assertTrue(envelope["checks"]["fill_quality_adequate"])
+        self.assertTrue(envelope["checks"]["risk_unit_adequate"])
+
+    def test_indicative_option_rows_fail_fill_quality_even_with_quote_ages(self):
+        row = {
+            "vehicle": "option", "opportunity_id": "indicative-1",
+            "entry_quote_age_seconds": 0.0, "exit_quote_age_seconds": 0.0,
+            "entry_feed": "indicative", "exit_feed": "indicative",
+            "entry_price": 2.0, "exit_price": 2.2, "quantity": 1,
+            "contract_multiplier": 100, "risk_usd": 200.0,
+        }
+        from research.gates import fill_source_summary
+        self.assertFalse(fill_source_summary([row], vehicle="option")["adequate"])
+
+    def test_option_quote_age_authorization_caps_both_legs_at_thirty_seconds(self):
+        row = {
+            "vehicle": "option", "opportunity_id": "fresh-option-1",
+            "entry_quote_age_seconds": 30.0,
+            "exit_quote_age_seconds": 30.0,
+            "entry_feed": "opra", "exit_feed": "opra",
+            "entry_fill_source": "quote", "exit_fill_source": "quote",
+        }
+        from research.gates import fill_source_summary
+        self.assertTrue(fill_source_summary([row], vehicle="option")["adequate"])
+        self.assertFalse(fill_source_summary(
+            [{**row, "entry_quote_age_seconds": 31.0}],
+            vehicle="option")["adequate"])
+        self.assertFalse(fill_source_summary(
+            [{**row, "exit_quote_age_seconds": 31.0}],
+            vehicle="option")["adequate"])
+
+    def test_equity_quote_age_authorization_caps_both_legs_at_thirty_seconds(self):
+        row = {
+            "vehicle": "equity", "opportunity_id": "fresh-equity-1",
+            "entry_quote_age_seconds": 30.0,
+            "exit_quote_age_seconds": 30.0,
+            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_provider": "alpaca", "exit_provider": "alpaca",
+            "entry_fill_source": "quote", "exit_fill_source": "quote",
+        }
+        from research.gates import fill_source_summary
+        self.assertTrue(fill_source_summary([row], vehicle="equity")["adequate"])
+        self.assertFalse(fill_source_summary(
+            [{**row, "entry_quote_age_seconds": 31.0}],
+            vehicle="equity")["adequate"])
+        self.assertFalse(fill_source_summary(
+            [{**row, "exit_quote_age_seconds": 31.0}],
+            vehicle="equity")["adequate"])
+
     def test_floor_is_vehicle_local_and_no_trade_rows_do_not_count_as_trades(self):
         rows = [
             {"vehicle": "equity", "session_date": "2024-01-02",

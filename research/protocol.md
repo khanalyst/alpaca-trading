@@ -8,6 +8,30 @@ no later than its observation timestamp and no later than the decision cutoff.
 Records retain provider/feed identity and the New York session date used for
 grouping.
 
+The shipped paper deployment requires SIP for equities and OPRA for options.
+Those are the defaults and the minimum entitlements for autonomous research
+and executable option evidence; a partial or non-executable feed cannot satisfy a
+research proof. The trader remains paper-only with live trading disabled and
+uses the `shares` runtime execution profile. Research is nevertheless
+vehicle-complete by default (`ALPACA_RESEARCH_VEHICLES=all`), so option research
+is evidence generation only and does not authorize options live execution.
+Selecting the separate `options` execution profile is an explicit paper
+runtime decision after OPRA evidence and controls are reviewed.
+
+The immutable authorizing floors are: 100 trades plus 30 complete
+sessions/clusters for backtest/factory windows; 100 trades plus 30 complete
+sessions/clusters for the sealed qualification window; and 150 trades plus 30
+complete sessions for the parity-matched live-shadow tail. Replay epoch 3 adds
+the economics gates: a minimum 30 bps stop distance for both rule and IBR
+paths, a recomputable risk unit covering round-trip cost, and quote/snapshot
+fill-quality evidence rather than bar-only fallback. Evidence from older replay
+epochs remains readable for audit but is quarantined and cannot validate,
+champion, or authorize the paper trader until replayed under epoch 3.
+
+Production replay requires exact Alpaca calendar metadata for every session,
+including early closes. Missing metadata is a refusal; no fixed 16:00 close is
+promoted as a fallback.
+
 ## Replay gates
 
 Every replay must establish the following invariants:
@@ -33,6 +57,10 @@ Every replay must establish the following invariants:
   freshness bound at the instant being priced; a signal whose contract has no such quote
   is recorded as an explicit unpriced row, never dropped and never filled from
   the contract's last quote of the morning;
+- authorizing equity fills require SIP quote provenance on both entry and exit
+  legs; authorizing option fills require OPRA quote provenance on both legs.
+  Provider, feed, quote age, and fill source are retained for each leg, and any
+  leg older than 30 seconds, bar-only, partial-feed, or missing remains diagnostic;
 - positions are force-flat before the session close;
 - a bounded rule position also carries a `max_hold_bars` time exit, computed by
   the one helper the runtime uses (`agent/contracts/rule.py::hold_deadline`)
@@ -42,14 +70,21 @@ Every replay must establish the following invariants:
 
 `research/costs.py` owns the single expected-cost model and the fill
 arithmetic every lane spends it through; no lane carries its own
-spread/slippage/fee numbers. Its parameters come from one `costs` config
-block. The runtime's `execution.max_slippage_bps` and `max_spread_bps` are
-rejection caps, not expectations: they bound the model, and a model expecting
-a cost the runtime would refuse to submit fails closed. `research/calibration.py`
-provides a read-only advisory calibration stratified by runtime mode, vehicle,
-execution profile, and entry versus exit when references are present. Thin or
-missing strata are `insufficient_data`; no pooled equity/options verdict is
-emitted and the model is never adjusted automatically.
+spread/slippage/fee numbers. The shipped `costs` block is 4 bps spread, 6 bps
+adverse slippage, 0.5 bps per-side notional fee, and a 0.65 currency-unit
+option fee per contract per side. The runtime's `execution.max_slippage_bps`
+and `max_spread_bps` are rejection caps, not expectations: they bound the
+model, and a model expecting a cost the runtime would refuse to submit fails
+closed. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
+bps is the authorization requirement and the others remain diagnostics.
+`research/calibration.py` is a read-only authorization check stratified by
+runtime mode, vehicle, execution profile, and both entry and exit when
+references are present. Partial fills use plan/reference fields. Missing,
+stale, or insufficient calibration, an optimistic cost verdict, a terminal fill
+below 80% of requested quantity, or a partial-cancel rate above 20% returns a
+veto and non-zero status. Offline diagnostics may still run, but shadow
+authorization remains blocked. In-flight orders are excluded, and the model is
+never adjusted automatically.
 
 `ReplayPolicy.from_config` is the runtime policy source for replay. It carries
 the strict 30-second market-data age, option DTE (default 7–60), option spread
@@ -57,6 +92,12 @@ and liquidity checks, latest-entry and force-flat times, and portfolio limits
 (concurrent positions, position notional, gross exposure, open risk, and daily
 loss). Research cannot relax these option, timing, or risk constraints while
 simulating.
+
+Serial inference is deterministic: day/session-cluster deltas use a seeded
+moving-block cluster bootstrap with persisted draw count, seed, and block
+length. Effective breadth is persisted and re-verified as a matched
+symbol-by-session correlation/eigenvalue diagnostic only; it never increases N
+or replaces independent session clusters.
 
 The IBR implementation in `research/ibr.py` provides these invariants. A
 missing or partial opening range is `no trade`, not an imputed range. A missing
@@ -143,6 +184,10 @@ variant ids are content hashes of those specifications. Arbitrary source code
 or unbounded fields are rejected. `agent.edge` resolves only a SQLite candidate
 whose status is `validated` or `champion` for the configured strategy/vehicle
 and whose latest shadow proof carries the parity-matched live-ingestion marker.
+Candidate registration and every proof run share one canonical assumptions
+hash covering feeds, session/calendar, strategy, risk, execution, and costs.
+The runtime reapplies the candidate and recomputes that hash before selection;
+legacy evidence or any assumption drift fails closed and must be re-researched.
 Paper `selection_mode: all_proved` may run one strongest passing variant per
 independent family under one global risk book. Live mode resolves exactly one
 proved record: preferably one `selection_mode: pinned` entry, or one legacy
@@ -296,8 +341,12 @@ the raw held-out delta.
 
 Every run also records the replay generation it was measured under
 (`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
-and never accepted from a caller. A run from a superseded generation cannot
-authorize `validated`, `champion`, or runtime eligibility, and
+and never accepted from a caller. The current generation is **epoch 3**. Epoch
+3 enforces the 30 bps stop floor, recomputable round-trip risk-unit coverage,
+quote/snapshot fill-quality, and powered qualification evidence in addition to
+the earlier point-in-time, portfolio, walk-forward, sealed-window, and
+multiplicity controls. A run from a superseded generation cannot authorize
+`validated`, `champion`, or runtime eligibility, and
 `EdgeLedger.eligibility` names that quarantine rather than reporting a bare
 ineligibility. This is deliberately not a digest check: evidence measured under
 a replay engine that has since been corrected still re-hashes and still
@@ -305,9 +354,9 @@ recomputes, because the recorded rows are exactly what that engine produced.
 What changed is that those rows describe fills, quote ages, portfolio limits or
 multiplicity accounting the current protocol does not accept. Quarantine is not
 deletion — the rows stay readable and the lifecycle history stays intact — so
-re-deriving under the current engine is the only route back to a deployable
-proof. The constant is raised whenever a replay or gate change invalidates
-evidence recorded before it.
+re-deriving under epoch 3 is the only route back to a deployable proof. The
+constant is raised whenever a replay or gate change invalidates evidence
+recorded before it.
 Underpowered or inconclusive data is not failure. Retirement is permitted only
 after every bounded point and the confirmation carry a powered upper-bound
 rejection across multiple negative windows; an enabled LLM lane must first
@@ -329,7 +378,8 @@ qualification, source/config/code/provenance/replay/gate hashes, family/global
 BH, and durable online FDR before appending immutable `lane=shadow` proof and
 the live-ingestion marker.
 
-The optional live-shadow Compose profile is broker-free: it reads recorder rows
+The live-shadow Compose service is broker-free and starts with the plain
+supported deployment: it reads recorder rows
 and EdgeLedger candidates through read-only connections, evaluates isolated
 virtual books, and writes only its own WAL SQLite database. It has no broker
 credentials or broker/runtime mutation path. The scheduled research cycle
@@ -339,10 +389,13 @@ signatures for parity; only the research consumer can append the authorization
 marker.
 
 The checked research config enables the bounded strategy LLM with model
-`gpt-5`. It reads only the optional `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing
-or invalid credentials/output leave a pending replacement and cannot trigger
-premature retirement. Good edges produce deterministic content-addressed
-edge proof reports under `research/results/edges/`, with an optional HTTPS
-webhook notification. Scheduled cycles report
+`gpt-5`. Compose requires the host override
+`ALPACA_RESEARCH_LLM_SECRET_FILE` and mounts that separate readable provider
+dotenv as `ALPACA_RESEARCH_LLM_SECRETS_FILE`; missing, unreadable, or keyless
+credentials fail the cycle closed before discovery. Invalid model output leaves
+a pending replacement and cannot trigger premature retirement. Good edges
+produce deterministic content-addressed edge proof reports under
+`research/results/edges/`, with an optional HTTPS webhook notification.
+Scheduled cycles report
 `completed`, `completed_no_edge`, `no_data`, or `failed`; no status bypasses the
 runtime edge gate.

@@ -8,8 +8,9 @@ cycle.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from . import state
 from .alpaca_provider import AlpacaError
@@ -18,6 +19,104 @@ from .execution_lifecycle import (
     _plain,
     _value,
 )
+
+
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _rule_bar_timestamp(row: Any) -> datetime | None:
+    """Parse the normalized one-minute bar timestamp used by rule runtime."""
+    raw = (row.get("timestamp", row.get("ts"))
+           if isinstance(row, Mapping)
+           else getattr(row, "timestamp", getattr(row, "ts", None)))
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    try:
+        text = str(raw)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rule_session(ts: datetime) -> str:
+    return ts.astimezone(_NEW_YORK).date().isoformat()
+
+
+def _rule_runtime_bars(
+        bars: Any, spec: Mapping[str, Any], now: datetime, *,
+        max_age_seconds: float = 90.0) -> tuple[list, str, float] | None:
+    """Return the current session's completed, contiguous feature prefix.
+
+    Replay evaluates one completed session and rejects a gap inside the exact
+    feature window a signal reads.  Runtime receives provider rows directly,
+    so it must enforce that same boundary before invoking the shared rule
+    evaluator; otherwise a fixed lookback could silently span an outage or a
+    partial latest candle could become a look-ahead signal.
+    """
+    if not isinstance(bars, (list, tuple)) or not isinstance(spec, Mapping):
+        return None
+    current = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    parsed: list[tuple[datetime, Any]] = []
+    for row in bars:
+        stamp = _rule_bar_timestamp(row)
+        if stamp is None:
+            return None
+        stamp = stamp.astimezone(timezone.utc)
+        # A row is visible only after its one-minute candle has closed.
+        if stamp + timedelta(minutes=1) > current or stamp > current:
+            return None
+        parsed.append((stamp, row))
+    if not parsed:
+        return None
+    # The replay stream is an ordered event log.  Provider normalization sorts
+    # its own responses before this boundary; any caller that reaches here
+    # with an early/reversed row is malformed and must fail closed rather than
+    # silently repairing the evidence.
+    if any(right[0] <= left[0] for left, right in zip(parsed, parsed[1:])):
+        return None
+    parsed.sort(key=lambda item: item[0])
+    timestamps = [stamp for stamp, _row in parsed]
+    if len(set(timestamps)) != len(timestamps):
+        return None
+    latest_stamp = timestamps[-1]
+    # A completed bar from a prior local session is not an immediate runtime
+    # observation.  This also prevents a feed outage at the next open from
+    # replaying yesterday's final signal merely because its quote is fresh.
+    if _rule_session(latest_stamp) != _rule_session(current):
+        return None
+    try:
+        age = (current - (latest_stamp + timedelta(minutes=1))).total_seconds()
+        if age < 0 or age > max(float(max_age_seconds), 60.0):
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    session = _rule_session(latest_stamp)
+    session_rows = [(stamp, row) for stamp, row in parsed
+                    if _rule_session(stamp) == session]
+    if not session_rows or session_rows[-1][0] != latest_stamp:
+        return None
+    try:
+        from .contracts.rule import feature_window_bars
+        window = feature_window_bars(spec)
+    except (TypeError, ValueError):
+        return None
+    feature_rows = session_rows if window is None else session_rows[-int(window):]
+    if window is not None and len(feature_rows) < int(window):
+        return None
+    # The current signal's feature prefix must be one-minute adjacent.  A gap
+    # after a previously resolved position is not in this prefix and is not
+    # considered here, matching replay's scoped continuity rule.
+    if any(right[0] - left[0] != timedelta(minutes=1)
+           for left, right in zip(feature_rows, feature_rows[1:])):
+        return None
+    # Keep the complete current-session prefix for the evaluator.  Opening
+    # range families need their clock-anchored opening bars even though their
+    # trailing feature continuity check is bounded; dropping those bars here
+    # would make runtime diverge from replay.
+    return [row for _stamp, row in session_rows], session, latest_stamp.timestamp()
 
 
 def generate_ibr_signal(*args, **kwargs):
@@ -316,13 +415,79 @@ class EngineCycleMixin:
                 bars = row.get("bars", [])
                 strategy_cfg = (edge_cfg.get("strategy", {})
                                 if isinstance(edge_cfg.get("strategy"), Mapping) else {})
-                if str(strategy_cfg.get("id")) == "rule":
-                    signal = generate_rule_signal(symbol, bars, config=edge_cfg, now=now)
+                strategy_id = str(strategy_cfg.get("id"))
+                edge_identity = str(
+                    (edge_record or {}).get("candidate_id") or
+                    strategy_cfg.get("variant_id") or
+                    f"{strategy_cfg.get('id', 'ibr')}:{strategy_cfg.get('version', 'v1')}")
+                if strategy_id == "rule":
+                    # Autonomous rules share one per-symbol/session budget
+                    # across proved edges.  Replay emits at most one signal for
+                    # a symbol-session; allowing each all-proved mutation to
+                    # re-fire would change that sample and multiply exposure.
+                    signal_state_key = f"rule|{symbol}"
+                    try:
+                        from .contracts.rule import validate_rule_spec
+                        rule_spec = validate_rule_spec(
+                            strategy_cfg.get("rule_spec") or {})
+                    except (TypeError, ValueError):
+                        continue
+                    execution_cfg = (edge_cfg.get("execution", {})
+                                     if isinstance(edge_cfg.get("execution"), Mapping)
+                                     else {})
+                    try:
+                        configured_bar_age = float(
+                            execution_cfg.get("max_market_data_age_seconds", 90) or 90)
+                    except (TypeError, ValueError, OverflowError):
+                        configured_bar_age = 90.0
+                    prepared = _rule_runtime_bars(
+                        bars, rule_spec, now,
+                        max_age_seconds=max(configured_bar_age, 60.0))
+                    if prepared is None:
+                        self._event("rule_signal_reject", {
+                            "symbol": symbol,
+                            "reason": "completed_contiguous_feature_bars_required",
+                            "variant_id": (edge_record or {}).get("variant_id")})
+                        continue
+                    rule_bars, current_session, latest_bar_ts = prepared
+                    if signal_sessions.get(signal_state_key) == current_session:
+                        self._event("rule_signal_duplicate_blocked", {
+                            "symbol": symbol, "session": current_session})
+                        continue
+                    signal = generate_rule_signal(
+                        symbol, rule_bars, config=edge_cfg, now=now)
+                    if signal is not None:
+                        signal_ts = signal.get("signal_ts")
+                        try:
+                            signal_ts = float(signal_ts)
+                        except (TypeError, ValueError, OverflowError):
+                            signal_ts = None
+                        # A rule signal is actionable only on the newest
+                        # completed bar.  This rejects a monkeypatched or
+                        # stale provider result after no new bar arrived.
+                        if (signal_ts is None or
+                                abs(signal_ts - latest_bar_ts) > 1e-6 or
+                                str(signal.get("session") or "") != current_session):
+                            self._event("rule_signal_reject", {
+                                "symbol": symbol,
+                                "reason": "signal_not_fresh_for_latest_completed_bar",
+                                "variant_id": (edge_record or {}).get("variant_id")})
+                            signal = None
+                    if signal is not None:
+                        emitted_session = current_session
+
+                        def remember_rule_signal(current):
+                            remembered = dict(current.get("signal_sessions") or {})
+                            remembered[signal_state_key] = emitted_session
+                            current["signal_sessions"] = remembered
+                            return current
+
+                        try:
+                            self._runtime_state = state.update_state(remember_rule_signal)
+                            signal_sessions = dict(self._runtime_state["signal_sessions"])
+                        except Exception as exc:
+                            return self._fail_closed("signal_session_persistence_failed", exc)
                 else:
-                    edge_identity = str(
-                        (edge_record or {}).get("candidate_id") or
-                        strategy_cfg.get("variant_id") or
-                        f"{strategy_cfg.get('id', 'ibr')}:{strategy_cfg.get('version', 'v1')}")
                     signal_state_key = f"{edge_identity}|{symbol}"
                     prior_session = signal_sessions.get(signal_state_key)
                     session_state = {"signals": ({(symbol, prior_session)}
@@ -333,7 +498,7 @@ class EngineCycleMixin:
                 if signal is None:
                     continue
                 signal = dict(signal)
-                if str(strategy_cfg.get("id")) != "rule":
+                if strategy_id != "rule":
                     emitted_session = str(signal.get("session") or "")
                     if len(emitted_session) != 10:
                         return self._fail_closed(

@@ -20,9 +20,13 @@ from agent.engine import Engine
 from agent.edge import (resolve_pinned_variants, resolve_validated_variants,
                         unresolved_promotions)
 from research.edge_lab import EdgeLedger
+from research.edge_identity import candidate_assumptions
 
 
-VARIANT = "rule.orb.aaaabbbbccccdddd"
+RULE_SPEC = {
+    "family": "opening_range_breakout",
+}
+VARIANT = rule_variant_id(RULE_SPEC)
 
 
 def _config(entries, **strategy):
@@ -34,9 +38,24 @@ def _config(entries, **strategy):
 
 def _deployed(ledger, variant=VARIANT, *, status="validated", proof=True):
     """A candidate at ``status``, with or without the proof deployment needs."""
+    spec = dict(RULE_SPEC)
+    # A few negative tests intentionally use unknown ids/statuses.  Those rows
+    # still need a coherent immutable assumptions object; their lifecycle
+    # state/proof is what makes them ineligible.
+    if variant == VARIANT:
+        assumptions = candidate_assumptions(
+            validate_config({"strategy": {"id": "rule",
+                                           "execution_mode": "shares"}}),
+            vehicle="equity", strategy_id="rule", variant_id=variant,
+            rule_spec=spec)
+    else:
+        # Deliberately malformed/legacy ids are used only in negative
+        # lifecycle tests; resolution must quarantine them before applying a
+        # strategy or trusting their proof.
+        assumptions = {"strategy": {"rule_spec": spec}}
     record = ledger.register_candidate(
         variant, strategy_id="rule", vehicle="equity", hypothesis="pinned",
-        config={"strategy": {"rule_spec": {"family": "opening_range_breakout"}}})
+        config=assumptions)
     with closing(sqlite3.connect(ledger.path)) as db, db:
         db.execute("UPDATE candidate_state SET status=? WHERE candidate_id=?",
                    (status, record["candidate_id"]))
@@ -60,18 +79,17 @@ class PinnedResolutionTests(unittest.TestCase):
     def test_a_pinned_entry_resolves_and_carries_its_promotion(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
-            record = ledger.register_candidate(
-                VARIANT, strategy_id="rule", vehicle="equity",
-                hypothesis="pinned",
-                config={"strategy": {"rule_spec": {"family": "opening_range_breakout"}}})
-            with closing(sqlite3.connect(ledger.path)) as db, db:
-                db.execute("UPDATE candidate_state SET status='champion' "
-                           "WHERE candidate_id=?", (record["candidate_id"],))
+            _deployed(ledger, status="champion", proof=False)
+            record = ledger.candidate_by_variant(VARIANT, "equity")
             config = _config([{"id": "pin-orb-may", "variant_id": VARIANT,
                                "vehicle": "equity",
                                "note": "cleared its live trial"}])
             with patch("agent.edge._latest_passing_proof",
-                       return_value=_stub_proof(ledger, record)):
+                       return_value=_stub_proof(ledger, record)), \
+                    patch.object(
+                        EdgeLedger, "eligibility",
+                        return_value={"eligible": True,
+                                      "latest_verified_run": _stub_proof(ledger, record)}):
                 resolved = resolve_pinned_variants(config, db_path=ledger.path)
             self.assertEqual(len(resolved), 1)
             self.assertEqual(resolved[0]["variant_id"], VARIANT)
@@ -163,17 +181,16 @@ class UnresolvedPromotionTests(unittest.TestCase):
     def test_a_resolvable_pin_is_not_reported_as_a_problem(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EdgeLedger(Path(directory) / "edge.sqlite3")
-            record = ledger.register_candidate(
-                VARIANT, strategy_id="rule", vehicle="equity",
-                hypothesis="pinned",
-                config={"strategy": {"rule_spec": {"family": "opening_range_breakout"}}})
-            with closing(sqlite3.connect(ledger.path)) as db, db:
-                db.execute("UPDATE candidate_state SET status='validated' "
-                           "WHERE candidate_id=?", (record["candidate_id"],))
+            _deployed(ledger, status="validated", proof=False)
+            record = ledger.candidate_by_variant(VARIANT, "equity")
             config = _config([{"id": "pin-ok", "variant_id": VARIANT,
                                "vehicle": "equity"}])
             with patch("agent.edge._latest_passing_proof",
-                       return_value=_stub_proof(ledger, record)):
+                       return_value=_stub_proof(ledger, record)), \
+                    patch.object(
+                        EdgeLedger, "eligibility",
+                        return_value={"eligible": True,
+                                      "latest_verified_run": _stub_proof(ledger, record)}):
                 self.assertEqual(
                     unresolved_promotions(config, db_path=ledger.path), [])
 
@@ -209,10 +226,16 @@ class LivePinnedRuntimeTests(unittest.TestCase):
             ledger = EdgeLedger(db_path)
 
             def deploy(variant_id, status, family):
+                spec = {"family": family}
+                assumptions = candidate_assumptions(
+                    validate_config({"strategy": {"id": "rule",
+                                                   "execution_mode": "shares"}}),
+                    vehicle="equity", strategy_id="rule",
+                    variant_id=variant_id, rule_spec=spec)
                 record = ledger.register_candidate(
                     variant_id, strategy_id="rule", vehicle="equity",
                     hypothesis=variant_id,
-                    config={"strategy": {"rule_spec": {"family": family}}})
+                    config=assumptions)
                 with closing(sqlite3.connect(ledger.path)) as db, db:
                     db.execute("UPDATE candidate_state SET status=? WHERE candidate_id=?",
                                (status, record["candidate_id"]))
@@ -248,7 +271,12 @@ class LivePinnedRuntimeTests(unittest.TestCase):
                 })
             with patch.dict("os.environ", {"ALPACA_LIVE_ENABLE": "true"}, clear=False), \
                     patch.object(EdgeLedger, "latest_verified_run",
-                                 side_effect=proof_for):
+                                 side_effect=proof_for), \
+                    patch.object(
+                        EdgeLedger, "eligibility",
+                        side_effect=lambda candidate_id, lane="shadow": {
+                            "eligible": proof_for(candidate_id, lane=lane) is not None,
+                            "latest_verified_run": proof_for(candidate_id, lane=lane)}):
                 engine = Engine(cfg, light=True, provider=self._LiveProvider())
             self.addCleanup(engine.close)
 
@@ -259,7 +287,12 @@ class LivePinnedRuntimeTests(unittest.TestCase):
             # Startup refresh re-resolves the pin, rather than selecting the
             # stronger champion that an automatic resolver would prefer.
             with patch.object(EdgeLedger, "latest_verified_run",
-                              side_effect=proof_for):
+                              side_effect=proof_for), \
+                    patch.object(
+                        EdgeLedger, "eligibility",
+                        side_effect=lambda candidate_id, lane="shadow": {
+                            "eligible": proof_for(candidate_id, lane=lane) is not None,
+                            "latest_verified_run": proof_for(candidate_id, lane=lane)}):
                 self.assertTrue(engine._refresh_edge(), engine._edge_error)
             self.assertEqual(engine._edge_record["candidate_id"],
                              pinned["candidate_id"])
@@ -267,7 +300,10 @@ class LivePinnedRuntimeTests(unittest.TestCase):
             # A missing proof blocks the exact pin and cannot fall through to
             # the competing champion.
             with patch.object(EdgeLedger, "latest_verified_run",
-                              return_value=None):
+                              return_value=None), \
+                    patch.object(EdgeLedger, "eligibility",
+                                 return_value={"eligible": False,
+                                               "latest_verified_run": None}):
                 self.assertFalse(engine._refresh_edge())
             self.assertIsNone(engine._edge_record)
 

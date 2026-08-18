@@ -29,7 +29,11 @@ from research.market_data import (
     normalize_underlying_bar,
     parse_timestamp,
 )
-from research.gates import unevaluable_reason
+from research.gates import (
+    PROTOCOL_BACKTEST_MIN_SESSIONS, PROTOCOL_BACKTEST_MIN_TRADES,
+    PROTOCOL_SHADOW_MIN_SESSIONS, PROTOCOL_SHADOW_MIN_TRADES,
+    unevaluable_reason,
+)
 from research.proof import write_proof
 from research.strategy_factory import (DEFAULT_STRATEGIES, DEFAULT_WORKERS,
                                        factory_status, run_factory)
@@ -65,6 +69,46 @@ def _json_rows(path: str | Path) -> list[dict[str, Any]]:
     return list(_iter_json_rows(path))
 
 
+def _validated_row_provenance(row: Mapping[str, Any], *, kind: str,
+                              configured_provider: str | None = None,
+                              configured_feed: str | None = None) -> tuple[str, str]:
+    """Require provenance to be present on the row before normalizing it.
+
+    CLI provider/feed values describe the configured adapter; they are not
+    permission to rewrite an external row's identity.  Equity evidence is
+    authorizable only from the complete SIP feed, while option evidence keeps
+    its independent OPRA requirement.
+    """
+    provider_value = row.get("provider")
+    feed_value = row.get("feed", row.get("feed_id"))
+    provider = "" if provider_value is None else str(provider_value).strip()
+    feed = "" if feed_value is None else str(feed_value).strip().lower()
+    if not provider:
+        raise NormalizationError(f"{kind} row requires explicit provider provenance")
+    expected_provider = (None if configured_provider in (None, "")
+                         else str(configured_provider).strip())
+    if expected_provider and provider != expected_provider:
+        raise NormalizationError(
+            f"{kind} row provider {provider!r} does not match configured provider")
+    if kind in {"option", "option_snapshot", "option_quote"}:
+        if feed != "opra":
+            raise NormalizationError(
+                f"{kind} row feed {feed or '[missing]'!r} is not executable; OPRA is required")
+        return provider, feed
+    expected_feed = (None if configured_feed in (None, "")
+                     else str(configured_feed).strip().lower())
+    # ``validate-data`` is the research authorization preflight.  Keep the
+    # complete equity requirement explicit even when a caller supplies an
+    # IEX/indicative CLI hint for diagnostics.
+    if expected_feed != "sip":
+        raise NormalizationError(
+            f"equity research requires configured SIP feed, got {expected_feed or '[missing]'}")
+    if feed != expected_feed:
+        raise NormalizationError(
+            f"{kind} row feed {feed or '[missing]'!r} is not executable; expected 'sip'")
+    return provider, feed
+
+
 def _config(args: argparse.Namespace) -> IBRConfig:
     return IBRConfig(
         range_minutes=args.range_minutes,
@@ -93,20 +137,53 @@ def cmd_validate_data(args: argparse.Namespace) -> int:
     errors: list[str] = []
     for number, row in enumerate(_iter_json_rows(args.input), 1):
         kind = str(row.get("kind", "bar")).lower()
+        supported = {"bar", "underlying_bar", "underlying", "quote",
+                     "quote_snapshot", "equity_quote", "underlying_quote",
+                     "option", "option_snapshot", "option_quote"}
+        if kind not in supported:
+            errors.append(f"row {number}: unsupported kind {kind!r}")
+            continue
+        # Run structural normalization against the row's own metadata first,
+        # so diagnostics retain useful symbol/value errors even when a second
+        # provenance check also rejects an IEX or missing-feed row.  Missing
+        # fields use CLI values only for this diagnostic attempt; a row cannot
+        # count as valid unless the explicit check below succeeds.
+        raw_provider = row.get("provider")
+        raw_feed = row.get("feed", row.get("feed_id"))
+        diagnostic_provider = (raw_provider if raw_provider not in (None, "")
+                               else getattr(args, "provider", None))
+        diagnostic_feed = (raw_feed if raw_feed not in (None, "")
+                           else getattr(args, "feed", None))
+        structural_error = None
         try:
             if kind in {"bar", "underlying_bar", "underlying"}:
-                normalize_underlying_bar(row, provider=args.provider, feed=args.feed)
-                counts["bars"] += 1
-            elif kind in {"quote", "quote_snapshot"}:
-                normalize_quote(row, provider=args.provider, feed=args.feed)
-                counts["quotes"] += 1
-            elif kind in {"option", "option_snapshot"}:
-                normalize_option_snapshot(row, provider=args.provider, feed=args.feed)
-                counts["options"] += 1
+                normalize_underlying_bar(row, provider=diagnostic_provider,
+                                         feed=diagnostic_feed)
+            elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
+                normalize_quote(row, provider=diagnostic_provider,
+                                feed=diagnostic_feed)
             else:
-                errors.append(f"row {number}: unsupported kind {kind!r}")
+                normalize_option_snapshot(row, provider=diagnostic_provider,
+                                          feed=diagnostic_feed)
         except (NormalizationError, ValueError) as exc:
+            structural_error = exc
             errors.append(f"row {number}: {exc}")
+        provenance_error = None
+        try:
+            provider, feed = _validated_row_provenance(
+                row, kind=kind,
+                configured_provider=getattr(args, "provider", None),
+                configured_feed=getattr(args, "feed", None) or "sip")
+        except (NormalizationError, ValueError) as exc:
+            provenance_error = exc
+            errors.append(f"row {number}: {exc}")
+        if structural_error is None and provenance_error is None:
+            if kind in {"bar", "underlying_bar", "underlying"}:
+                counts["bars"] += 1
+            elif kind in {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}:
+                counts["quotes"] += 1
+            else:
+                counts["options"] += 1
     output = {"counts": counts, "errors": errors, "valid": not errors}
     print(json.dumps(output, sort_keys=True))
     return 0 if not errors else 2
@@ -116,8 +193,12 @@ def _bars(args: argparse.Namespace):
     bars = []
     for number, row in enumerate(_json_rows(args.bars), 1):
         try:
+            provider, feed = _validated_row_provenance(
+                row, kind=str(row.get("kind", "bar")).lower(),
+                configured_provider=getattr(args, "provider", None),
+                configured_feed=getattr(args, "feed", None) or "sip")
             bars.append(normalize_underlying_bar(
-                row, provider=args.provider, feed=args.feed))
+                row, provider=provider, feed=feed))
         except (NormalizationError, ValueError) as exc:
             raise SystemExit(f"bar row {number}: {exc}") from exc
     return bars
@@ -152,8 +233,12 @@ def _quotes(args: argparse.Namespace):
                     row = json.loads(line)
                     if not isinstance(row, dict):
                         raise ValueError("expected an object")
+                    provider, feed = _validated_row_provenance(
+                        row, kind=str(row.get("kind", "quote")).lower(),
+                        configured_provider=getattr(args, "provider", None),
+                        configured_feed=getattr(args, "feed", None) or "sip")
                     index.add(normalize_quote(
-                        row, provider=args.provider, feed=args.feed))
+                        row, provider=provider, feed=feed))
                 except (json.JSONDecodeError, NormalizationError, ValueError) as exc:
                     index.close()
                     raise SystemExit(f"{source}:{number}: invalid quote: {exc}") from exc
@@ -486,9 +571,24 @@ def cmd_edge_discover(args: argparse.Namespace) -> int:
     config = _read_json(args.config, {})
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
+    # Discovery must replay the same costs, execution freshness, risk, session
+    # calendar and strategy boundaries as the checked runtime.  Historically
+    # ``--agent-config`` only supplied the bar-fallback flag, leaving scheduled
+    # IBR runs on weaker library defaults even though factory runs were bound
+    # to the validated configuration.
+    runtime_config = dict(agent_config)
+    for block in ("costs", "execution", "risk", "strategy", "session"):
+        if block not in config:
+            continue
+        base = runtime_config.get(block)
+        override = config.get(block)
+        if isinstance(base, dict) and isinstance(override, dict):
+            runtime_config[block] = {**base, **override}
+        else:
+            runtime_config[block] = override
     result = discover(
         args.data, db_path=_db(args), vehicle=args.vehicle, lane=args.lane,
-        config=config, variants_path=args.variants,
+        config=runtime_config, variants_path=args.variants,
         min_trades=args.min_trades, min_sessions=args.min_sessions,
         alpha=args.alpha,
         backtest_bar_fallback=bool((agent_config.get("research") or {}).get(
@@ -642,8 +742,14 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
                             help="isolated variants/accounts per strategy")
         parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
         parser.add_argument("--starting-cash", type=float, default=100000.0)
-        parser.add_argument("--min-trades", type=int, default=100)
-        parser.add_argument("--min-sessions", type=int, default=10)
+        parser.add_argument("--min-trades", type=int,
+                            default=PROTOCOL_BACKTEST_MIN_TRADES,
+                            help=("minimum executed trades (protocol floor: "
+                                  f"{PROTOCOL_BACKTEST_MIN_TRADES})"))
+        parser.add_argument("--min-sessions", type=int,
+                            default=PROTOCOL_BACKTEST_MIN_SESSIONS,
+                            help=("minimum independent sessions (protocol floor: "
+                                  f"{PROTOCOL_BACKTEST_MIN_SESSIONS})"))
         parser.add_argument("--alpha", type=float, default=.05)
         parser.add_argument("--max-generations", type=int, default=5)
         parser.add_argument("--config", default=None,
@@ -682,8 +788,14 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
                             help="paired baseline candidate id")
         parser.add_argument("--null-candidate", default=None,
                             help="paired randomized-null candidate id")
-        parser.add_argument("--min-trades", type=int, default=150)
-        parser.add_argument("--min-sessions", type=int, default=30)
+        parser.add_argument("--min-trades", type=int,
+                            default=PROTOCOL_SHADOW_MIN_TRADES,
+                            help=("minimum executed trades (protocol floor: "
+                                  f"{PROTOCOL_SHADOW_MIN_TRADES})"))
+        parser.add_argument("--min-sessions", type=int,
+                            default=PROTOCOL_SHADOW_MIN_SESSIONS,
+                            help=("minimum independent sessions (protocol floor: "
+                                  f"{PROTOCOL_SHADOW_MIN_SESSIONS})"))
         parser.add_argument("--alpha", type=float, default=.05)
         parser.set_defaults(func=cmd_edge_ingest_shadow)
     elif command == "paper":
@@ -715,8 +827,16 @@ def _edge_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--agent-config", default=None,
                             help="validated agent config (default: config.yaml)")
         parser.add_argument("--variants", help="optional preregistration JSON/YAML path")
-        parser.add_argument("--min-trades", type=int, default=100)
-        parser.add_argument("--min-sessions", type=int, default=10)
+        parser.add_argument("--min-trades", type=int,
+                            default=PROTOCOL_BACKTEST_MIN_TRADES,
+                            help=("minimum executed trades (backtest floor: "
+                                  f"{PROTOCOL_BACKTEST_MIN_TRADES}; auto "
+                                  "requires the shadow floor when it consumes "
+                                  "a shadow tail)"))
+        parser.add_argument("--min-sessions", type=int,
+                            default=PROTOCOL_BACKTEST_MIN_SESSIONS,
+                            help=("minimum independent sessions (protocol floor: "
+                                  f"{PROTOCOL_BACKTEST_MIN_SESSIONS})"))
         parser.add_argument("--alpha", type=float, default=.05)
         parser.set_defaults(func=cmd_edge_discover)
     return parser

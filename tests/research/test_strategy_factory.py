@@ -14,7 +14,9 @@ from agent.contracts.rule import (
 )
 from agent.edge import apply_variant, resolve_validated_variant
 from research.edge_lab import EdgeLedger
+from research.edge_identity import candidate_assumptions
 from research.edge_ledger_store import content_hash, provenance_hash
+from research import gates
 from research.gates import (
     falsification_gate, heldout_separation, matched_cluster_test,
     performance_floor, placebo_null_distribution, qualification_report,
@@ -113,25 +115,43 @@ def fake_adequate_worker(payload):
 def persist_rule_gate(ledger, candidate_id, lane):
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
+    symbols = ("SPY", "QQQ", "IWM", "DIA")
+    session_count = 40
+
+    def row(symbol, session, opportunity, net_pnl):
+        return {
+            "vehicle": "equity", "symbol": symbol,
+            "session_date": session, "opportunity_id": opportunity,
+            "net_pnl": net_pnl, "entry_price": 100.0,
+            "exit_price": 101.0, "quantity": 1.0, "risk_usd": 1.0,
+            "entry_fill_source": "quote", "exit_fill_source": "quote",
+            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_provider": "alpaca", "exit_provider": "alpaca",
+            "entry_quote_age_seconds": 0.0,
+            "exit_quote_age_seconds": 0.0,
+        }
+
     fit = [] if lane == "shadow" else [
-        {"vehicle": "equity", "symbol": "SPY", "session_date": "2026-01-05",
-         "opportunity_id": f"{lane}-fit", "net_pnl": 1.0}]
-    # Eight held-out sessions are the minimum that can carry a sign-flip
-    # falsification below alpha; two never could.
+        row(symbol, (datetime(2025, 11, 20) + timedelta(days=offset)).date().isoformat(),
+            f"{lane}-fit-{offset}-{symbol}", 1.0)
+        for offset in range(session_count) for symbol in symbols]
+    first_heldout = datetime(2026, 1, 6)
     heldout = [
-        {"vehicle": "equity", "symbol": "SPY", "session_date": f"2026-01-{day:02d}",
-         "opportunity_id": f"{lane}-held-{day}", "net_pnl": 1.0}
-        for day in range(6, 14)]
+        row(symbol, (first_heldout + timedelta(days=offset)).date().isoformat(),
+            f"{lane}-held-{offset}-{symbol}", 1.0)
+        for offset in range(session_count) for symbol in symbols]
     baseline = [{**row, "net_pnl": 0.0, "opportunity_id": f"base-{index}"}
                 for index, row in enumerate(heldout)]
     fit_baseline = [{**row, "net_pnl": 0.0,
                      "opportunity_id": f"fit-base-{index}"}
                     for index, row in enumerate(fit)]
     fit_floor = structural_floor(
-        fit, vehicle="equity", min_trades=1, min_sessions=1,
+        fit, vehicle="equity", min_trades=100, min_sessions=30,
+        min_clusters=30,
         required=lane != "shadow")
     held_floor = structural_floor(
-        heldout, vehicle="equity", min_trades=1, min_sessions=1)
+        heldout, vehicle="equity", min_trades=150 if lane == "shadow" else 100,
+        min_sessions=30, min_clusters=30)
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"passes": True, "mode": "new_data"})
     control = matched_cluster_test(heldout, baseline, vehicle="equity")
@@ -222,6 +242,26 @@ def persist_rule_gate(ledger, candidate_id, lane):
 
 
 class StrategyFactoryTests(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise bounded mutation/lifecycle mechanics with
+        # compact synthetic corpora.  Explicitly lower protocol constants in
+        # this test-only context; production ``run_factory`` remains strict,
+        # and dedicated floor-regression tests below cover that boundary.
+        self.compact_protocol = patch.multiple(
+            gates,
+            PROTOCOL_BACKTEST_MIN_TRADES=1,
+            PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+            PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+            PROTOCOL_SHADOW_MIN_TRADES=1,
+            PROTOCOL_SHADOW_MIN_SESSIONS=1,
+            PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+            PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+            PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+            PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1,
+        )
+        self.compact_protocol.start()
+        self.addCleanup(self.compact_protocol.stop)
+
     def test_facade_reexports_deterministic_core_symbols_by_identity(self):
         moved = (
             "DEFAULT_STRATEGIES", "DEFAULT_VARIANTS", "MAX_STRATEGIES", "MAX_VARIANTS",
@@ -290,7 +330,7 @@ class StrategyFactoryTests(unittest.TestCase):
             # record_verified_gate path used by the factory.
             persist_rule_gate(EdgeLedger(path), candidate["candidate_id"], "shadow")
             self.assertEqual(factory.last_boundary(
-                hypothesis.hypothesis_id, "equity"), "2026-01-13")
+                hypothesis.hypothesis_id, "equity"), "2026-02-14")
 
     def test_run_factory_records_family_pass_global_fail_as_a_failed_gate(self):
         """A normal BH family pass must not bypass the cycle-global gate."""
@@ -692,11 +732,17 @@ class StrategyFactoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / "edge.sqlite3"
             ledger = EdgeLedger(db)
+            runtime_config = validate_config({
+                "strategy": {"id": "rule", "version": "v1",
+                             "variant_id": "auto"},
+            })
+            assumptions = candidate_assumptions(
+                runtime_config, vehicle="equity", strategy_id="rule",
+                variant_id=variant_id, rule_spec=spec)
             candidate = ledger.register_candidate(
                 variant_id, strategy_id="rule", vehicle="equity",
                 hypothesis="bounded momentum",
-                config={"strategy": {"id": "rule", "version": "v1",
-                                     "variant_id": variant_id, "rule_spec": spec}},
+                config=assumptions,
                 axes={"hypothesis_id": "test"})
             row = {"vehicle": "equity", "session_date": "2026-01-05",
                    "opportunity_id": "test", "net_pnl": 1.0,
@@ -721,6 +767,25 @@ class StrategyFactoryTests(unittest.TestCase):
 
 class CorpusDescriptorTests(unittest.TestCase):
     """A worker re-reading its own sessions computes exactly what a copy did."""
+
+    def setUp(self):
+        # Corpus-descriptor tests intentionally use a compact losing-breakout
+        # fixture.  Keep the production factory floor strict while allowing
+        # these backend-equivalence checks to exercise the descriptor logic.
+        self.compact_protocol = patch.multiple(
+            gates,
+            PROTOCOL_BACKTEST_MIN_TRADES=1,
+            PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+            PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+            PROTOCOL_SHADOW_MIN_TRADES=1,
+            PROTOCOL_SHADOW_MIN_SESSIONS=1,
+            PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+            PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+            PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+            PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1,
+        )
+        self.compact_protocol.start()
+        self.addCleanup(self.compact_protocol.stop)
 
     @staticmethod
     def _write(root: Path, rows, *, partitioned: bool) -> Path:

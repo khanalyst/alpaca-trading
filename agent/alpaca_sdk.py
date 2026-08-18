@@ -23,7 +23,10 @@ OPTION_FEEDS = {"indicative", "opra"}
 def _canonical_feed(value: Any, *, options: bool = False) -> str:
     """Normalize configured feed names before SDK enum conversion."""
     raw_value = getattr(value, "value", value)
-    raw = str(raw_value or ("indicative" if options else "iex")).strip().lower().replace("-", "_")
+    # A missing feed is a configuration error in spirit; using the complete
+    # entitled feed as the parser fallback prevents a partial/indicative
+    # stream from being selected implicitly by a caller that omitted it.
+    raw = str(raw_value or ("opra" if options else "sip")).strip().lower().replace("-", "_")
     aliases = {"delayed": "delayed_sip", "delayed_sip": "delayed_sip",
                "opra": "opra", "indicative": "indicative"}
     canonical = aliases.get(raw, raw)

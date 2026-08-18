@@ -36,8 +36,12 @@ def _clean(value):
 def _csv_payload(row: Mapping[str, object]) -> dict:
     event = str(row.get("event_type") or "").lower()
     common = {
-        "provider": row.get("provider") or "alpaca",
-        "feed": row.get("feed") or "iex",
+        # Preserve provenance exactly as recorded.  A missing provider/feed is
+        # an integrity error for research and must remain visible to
+        # ``validate-data``; silently selecting Alpaca/IEX would turn a
+        # partial external row into apparently executable evidence.
+        "provider": _clean(row.get("provider")),
+        "feed": _clean(row.get("feed")),
         "symbol": _clean(row.get("symbol")),
         "timestamp": _clean(row.get("timestamp")),
         "observed_at": _clean(row.get("observed_at") or row.get("timestamp")),

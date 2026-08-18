@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 from .contracts import finite as _finite
 from .contracts.ibr import build_ibr_range
 from .contracts.rule import (BAR_SECONDS, RuleSpecError, hold_deadline,
-                             rule_variant_id, validate_rule_spec)
+                             MIN_STOP_DISTANCE_FRACTION, rule_variant_id,
+                             validate_rule_spec)
 
 from .registry import (baseline_variant_id, contract_for_variant,
                        validate_contract_config)
@@ -214,10 +215,12 @@ def build_setup_plan(decision: Mapping, symbol_snapshot: Mapping,
         return None, "spread is too wide"
     if symbol_snapshot.get("stale") is not False or symbol_snapshot.get("quote_stale") is not False:
         return None, "market data freshness is unavailable"
-    stop = float(rng["low"] if direction == "long" else rng["high"])
-    distance = abs(entry - stop)
+    natural_stop = float(rng["low"] if direction == "long" else rng["high"])
+    distance = max(abs(entry - natural_stop),
+                   entry * MIN_STOP_DISTANCE_FRACTION)
     if distance <= 0:
         return None, "opposite-range stop distance is invalid"
+    stop = entry - distance if direction == "long" else entry + distance
     extension_r = max(0.0, (entry - float(rng["high"])) / float(rng["width"]) if direction == "long" else (float(rng["low"]) - entry) / float(rng["width"]))
     extension_limit = _finite(strategy.get("max_entry_extension_r"), float("inf"))
     if extension_limit is not None and extension_r > extension_limit:

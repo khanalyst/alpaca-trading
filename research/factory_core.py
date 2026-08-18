@@ -19,7 +19,9 @@ from agent.contracts.rule import (
     feature_window_bars, hold_deadline, rule_semantic_signature,
     rule_variant_id, validate_rule_spec,
 )
-from .costs import BAR, QUOTE, CostModel, ReplayPolicy, index_quotes, quote_fill
+from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
+                    index_quotes, quote_fill, quote_fill_record,
+                    replay_policy_for_bars)
 from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
 from .gates import max_drawdown_of
@@ -165,6 +167,8 @@ def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
     latest = sorted(snapshots, key=lambda item: (item.timestamp, item.contract.symbol))
     eligible = [snap for snap in snapshots
                 if snap.contract.underlying.upper() == symbol.upper()
+                and str(snap.contract.feed).lower() == "opra"
+                and str(snap.identity.feed).lower() == "opra"
                 and snap.session_date == day and snap.timestamp <= cutoff
                 and snap.timestamp.timestamp() >= floor
                 and _visible(snap, cutoff) and snap.bid > 0 and snap.ask > 0
@@ -210,6 +214,10 @@ def _unpriced(signal_bar: UnderlyingBar, entry_bar: UnderlyingBar, day: date,
     """
     return {"unpriced_reason": reason, "direction": direction, "contract": contract,
             "session_date": day.isoformat(),
+            "signal_bar_feed": signal_bar.feed,
+            "signal_bar_provider": signal_bar.provider,
+            "entry_bar_feed": entry_bar.feed,
+            "entry_bar_provider": entry_bar.provider,
             "signal_timestamp": signal_bar.end.isoformat(),
             "entry_timestamp": entry_bar.timestamp.isoformat()}
 
@@ -268,6 +276,21 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
     resolved_policy = _coerce_policy(policy)
     if not _session_bars_valid(session_bars):
         return None
+    try:
+        resolved_policy = replay_policy_for_bars(
+            resolved_policy, session_bars,
+            session_date=(session_bars[0].session_date if session_bars else None))
+    except CostError as exc:
+        return _unpriced(session_bars[0], session_bars[0],
+                         session_bars[0].session_date,
+                         "unknown", str(exc))
+    metadata = (session_bars[0].session_open, session_bars[0].session_close)
+    if metadata[0] is not None and metadata[1] is not None:
+        if any(bar.timestamp < metadata[0] or bar.end > metadata[1]
+               for bar in session_bars):
+            return _unpriced(session_bars[0], session_bars[0],
+                             session_bars[0].session_date, "unknown",
+                             "bar_outside_exact_session")
     # ``None`` means the family accumulates from the session open, so its
     # window starts at the session's first bar rather than a trailing offset.
     window = feature_window_bars(spec)
@@ -411,33 +434,42 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         contract = None
         entry_ref = entry_underlying
         entry_source = exit_source = BAR
+        entry_feed = exit_feed = None
+        entry_provider = exit_provider = None
+        entry_age = exit_age = 0.0
         if vehicle == "equity":
             # A fill that lands on a bar boundary has a real instant, so a
             # recorded quote is its executable price.  A level-triggered exit
             # inside a bar has no such instant and keeps the bar's level.
             side = "buy" if direction == "long" else "sell"
-            quoted = quote_fill(
+            quoted = quote_fill_record(
                 quotes, symbol=signal_bar.symbol, at=entry_bar.timestamp,
                 side=side,
                 max_age_seconds=resolved_policy.max_market_data_age_seconds,
                 session_date=day)
             if quoted is not None:
-                entry_ref, entry_source = quoted, QUOTE
+                entry_ref, entry_source = quoted.price, QUOTE
+                entry_feed, entry_provider = quoted.feed, quoted.provider
+                entry_age = max(
+                    0.0, (entry_bar.timestamp - quoted.timestamp).total_seconds())
             elif resolved_policy.strict_market_data:
                 return _unpriced(signal_bar, entry_bar, day, direction,
                                  "no fresh equity quote at entry")
             if reason == "time" or gapped or exit_gapped:
-                quoted_exit = quote_fill(
+                quoted_exit = quote_fill_record(
                     quotes, symbol=signal_bar.symbol, at=pricing_cutoff,
                     side="sell" if direction == "long" else "buy",
                     max_age_seconds=resolved_policy.max_market_data_age_seconds,
                     session_date=day)
                 if quoted_exit is not None:
-                    exit_ref, exit_source = quoted_exit, QUOTE
+                    exit_ref, exit_source = quoted_exit.price, QUOTE
+                    exit_feed, exit_provider = quoted_exit.feed, quoted_exit.provider
+                    exit_age = max(
+                        0.0, (pricing_cutoff - quoted_exit.timestamp).total_seconds())
                 elif resolved_policy.strict_market_data:
                     return _unpriced(signal_bar, entry_bar, day, direction,
                                      "no fresh equity quote at exit")
-        entry_age = exit_age = 0.0
+        entry_option_feed = exit_option_feed = None
         if vehicle == "option":
             entry_snap = _option_at(snapshots, symbol=signal_bar.symbol, day=day,
                                     direction=direction, cutoff=entry_bar.timestamp,
@@ -457,8 +489,15 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
                                  "entry contract stopped being quoted before exit",
                                  contract=entry_snap.contract.symbol)
             contract = entry_snap.contract.symbol
+            entry_option_feed = str(entry_snap.contract.feed).lower()
+            exit_option_feed = str(exit_snap.contract.feed).lower()
+            entry_feed = str(entry_snap.identity.feed)
+            exit_feed = str(exit_snap.identity.feed)
+            entry_provider = str(entry_snap.identity.provider)
+            exit_provider = str(exit_snap.identity.provider)
             entry_ref = entry_snap.ask
             exit_ref = exit_snap.bid
+            entry_source = exit_source = QUOTE
             multiplier = entry_snap.contract.multiplier
             # A snapshot inside the exit bar but after a level-triggered instant
             # is not stale, it is simply the bar's quote; only genuinely older
@@ -474,6 +513,15 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # conservatively represented at the completed bar cutoff used for
             # its bar-level price.  Never imply a quote after the trigger.
             "exit_timestamp": exit_at.isoformat(),
+            # Bar provenance remains available for diagnostic/bar-fallback
+            # rows; quote leg provenance below is reserved for the source that
+            # actually priced each executable boundary.
+            "signal_bar_feed": signal_bar.feed,
+            "signal_bar_provider": signal_bar.provider,
+            "entry_bar_feed": entry_bar.feed,
+            "entry_bar_provider": entry_bar.provider,
+            "exit_bar_feed": exit_bar.feed,
+            "exit_bar_provider": exit_bar.provider,
             "entry_reference": entry_ref, "exit_reference": exit_ref,
             "underlying_entry": entry_underlying, "stop_price": stop,
             "target_price": target, "exit_reason": reason, "tie_broken": tie,
@@ -483,6 +531,12 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             "entry_fill_source": entry_source, "exit_fill_source": exit_source,
             "entry_quote_age_seconds": entry_age,
             "exit_quote_age_seconds": exit_age,
+            "entry_feed": entry_feed,
+            "exit_feed": exit_feed,
+            "entry_provider": entry_provider,
+            "exit_provider": exit_provider,
+            "entry_option_feed": entry_option_feed,
+            "exit_option_feed": exit_option_feed,
             # The price the runtime plans and caps notional against; the fill
             # reference above may have gapped away from it.
             "plan_entry": float(signal["entry_price"]),
@@ -994,9 +1048,15 @@ _DISCOVERY_BANDS: tuple[tuple[float, float], ...] = (
 # (side, target_r, stop_atr, max_hold_bars) — the payoff shape the conditional
 # entry is expressed with.
 _DISCOVERY_SHAPES: tuple[tuple[str, float, float, int], ...] = (
-    ("both", 2.0, 1.0, 90), ("both", 1.25, 0.75, 30), ("both", 3.0, 1.5, 180),
-    ("long", 2.0, 1.0, 60), ("short", 2.0, 1.0, 60), ("both", 1.5, 2.0, 45),
-    ("both", 4.0, 1.0, 240),
+    # Cover the complete audited payoff span, including low-risk-unit roots
+    # whose default stop/target pair otherwise leaves no economic signal.
+    ("both", .25, .2, 1), ("both", .5, .5, 10),
+    ("both", 1.0, .75, 30), ("both", 1.25, .75, 45),
+    ("both", 2.0, 1.0, 90), ("both", 3.0, 1.5, 180),
+    ("both", 5.0, 2.0, 240), ("both", 10.0, 4.0, 390),
+    ("both", 10.0, 10.0, 390),
+    ("long", 2.0, 1.0, 60), ("short", 2.0, 1.0, 60),
+    ("long", 10.0, 10.0, 390), ("short", 10.0, 10.0, 390),
 )
 # One complete Cartesian traversal is the bounded search contract.  Derive the
 # cap from the declared dimensions so adding an axis cannot silently make the

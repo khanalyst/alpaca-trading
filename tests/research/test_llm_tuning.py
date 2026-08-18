@@ -10,11 +10,12 @@ the gate that will judge it exists, and that reason is graded afterwards and
 handed back to the next proposal.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from agent.contracts.rule import (rule_variant_id, validate_rule_spec)
 from research.edge_lab import EdgeLedger
@@ -28,10 +29,29 @@ from research.llm_strategy import (
     MAX_REASON_CHARS, MAX_TUNED_VARIANTS, TUNING_SCHEMA, ProposalResult,
     RuleProposalAdapter,
 )
+import research.gates as gates
 import research.strategy_factory as factory_module
 from research.strategy_factory import _lesson_brief, _tuned_variants, run_factory
 
 from .test_strategy_factory import losing_breakouts
+
+
+@contextmanager
+def _compact_factory_protocol():
+    """Keep compact LLM-cycle fixtures below production evidence floors."""
+    with patch.multiple(
+            gates,
+            PROTOCOL_BACKTEST_MIN_TRADES=1,
+            PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+            PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+            PROTOCOL_SHADOW_MIN_TRADES=1,
+            PROTOCOL_SHADOW_MIN_SESSIONS=1,
+            PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+            PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+            PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+            PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
+            patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1):
+        yield
 
 
 ROOT = validate_rule_spec(family_template("opening_range_breakout"))
@@ -65,9 +85,9 @@ class TuningContractTests(unittest.TestCase):
     and the evaluator."""
 
     def test_a_valid_reply_normalizes_every_spec_and_keeps_its_reason(self):
-        adapter = _adapter(_reply(_tuned({"threshold_bps": 40.0}),
-                                  _tuned({"threshold_bps": 55.0}, "Widened the "
-                                         "threshold further to test the same idea harder.")))
+        adapter = _adapter(_reply(_tuned({"threshold_bps": 6.0}),
+                                  _tuned({"threshold_bps": 4.0}, "Lowered the "
+                                         "threshold within the local neighborhood.")))
         result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=2)
         self.assertTrue(result.success, result.error)
         self.assertEqual(result.schema, TUNING_SCHEMA)
@@ -100,8 +120,18 @@ class TuningContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("exactly 1 field", result.error)
 
+    def test_coordinate_tuning_rejects_an_unbounded_numeric_jump(self):
+        jumped = {**ROOT, "threshold_bps": 40.0}
+        adapter = _adapter(_reply((
+            jumped, "Raised threshold_bps after the negative expectancy diagnosis.")))
+        result = adapter.tune(
+            "equity", 0, ROOT,
+            {**DIAGNOSIS, "refinement_phase": "coordinate"}, count=1)
+        self.assertFalse(result.success)
+        self.assertIn("bounded local step", result.error)
+
     def test_interaction_tuning_accepts_exactly_two_named_fields(self):
-        interaction = {**ROOT, "threshold_bps": 40.0, "target_r": 1.5}
+        interaction = {**ROOT, "threshold_bps": 6.0, "target_r": 1.6}
         adapter = _adapter(_reply((
             interaction,
             "Combined the measured threshold and target R coordinate gains.")))
@@ -127,7 +157,7 @@ class TuningContractTests(unittest.TestCase):
         """Pinning is to the root's own version, not to v1 forever."""
         root = validate_rule_spec({**ROOT, "schema": "rule-strategy.v2",
                                    "entry_after_minutes": 30})
-        adapter = _adapter(_reply(({**root, "entry_after_minutes": 60},
+        adapter = _adapter(_reply(({**root, "entry_after_minutes": 36},
                                    "Pushed the entry window later.")))
         result = adapter.tune("equity", 0, root, DIAGNOSIS, count=1)
         self.assertTrue(result.success, result.error)
@@ -206,9 +236,9 @@ class TuningContractTests(unittest.TestCase):
                 self.assertIn(expected, result.error)
 
     def test_a_duplicate_spec_is_dropped_rather_than_failing_the_reply(self):
-        adapter = _adapter(_reply(_tuned({"threshold_bps": 40.0}),
-                                  _tuned({"threshold_bps": 40.0}),
-                                  _tuned({"threshold_bps": 60.0})))
+        adapter = _adapter(_reply(_tuned({"threshold_bps": 6.0}),
+                                  _tuned({"threshold_bps": 6.0}),
+                                  _tuned({"threshold_bps": 4.0})))
         result = adapter.tune("equity", 0, ROOT, DIAGNOSIS, count=3)
         self.assertTrue(result.success, result.error)
         self.assertEqual(len(result.variants), 2)
@@ -265,7 +295,7 @@ class CitedLearningTests(unittest.TestCase):
          "verdict": "passed", "tried": {"max_hold_bars": {"from": 90, "to": 45}}},
     ]
 
-    def _reply_with(self, builds_on, threshold=40.0):
+    def _reply_with(self, builds_on, threshold=6.0):
         return json.dumps({"schema": TUNING_SCHEMA, "variants": [{
             "rule_spec": {**ROOT, "threshold_bps": threshold},
             "reason": "Backing off the threshold the cited lesson overshot.",
@@ -304,7 +334,7 @@ class CitedLearningTests(unittest.TestCase):
 
     def test_the_first_cycle_may_propose_without_a_citation(self):
         reply = json.dumps({"schema": TUNING_SCHEMA, "variants": [
-            {"rule_spec": {**ROOT, "threshold_bps": 40.0},
+            {"rule_spec": {**ROOT, "threshold_bps": 6.0},
              "reason": "Nothing has been tried yet; widen threshold."}]})
         result = _adapter(reply).tune("equity", 0, ROOT, DIAGNOSIS, count=1)
         self.assertTrue(result.success, result.error)
@@ -312,8 +342,8 @@ class CitedLearningTests(unittest.TestCase):
 
     def test_a_repeat_of_a_graded_failure_is_dropped(self):
         """The ledger already answered that experiment."""
-        repeat = validate_rule_spec({**ROOT, "threshold_bps": 40.0})
-        adapter = _adapter(self._reply_with("a1b2c3d4e5f6", threshold=40.0))
+        repeat = validate_rule_spec({**ROOT, "threshold_bps": 6.0})
+        adapter = _adapter(self._reply_with("a1b2c3d4e5f6", threshold=6.0))
         chosen, proposal = _tuned_variants(
             {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=3,
             vehicle="equity", llm_enabled=True, config={"model": "test"},
@@ -404,8 +434,8 @@ class VariantSelectionTests(unittest.TestCase):
         self.assertEqual({item.builds_on for item in chosen}, {None})
 
     def test_tuned_variants_are_adopted_and_topped_up_to_count(self):
-        adapter = _adapter(_reply(_tuned({"threshold_bps": 41.0}),
-                                  _tuned({"threshold_bps": 42.0})))
+        adapter = _adapter(_reply(_tuned({"threshold_bps": 6.0}),
+                                  _tuned({"threshold_bps": 4.0})))
         chosen, proposal = _tuned_variants(
             {"rule_spec": ROOT, "slot": 0}, DIAGNOSIS, count=4,
             vehicle="equity", llm_enabled=True, config={"model": "test"},
@@ -417,10 +447,9 @@ class VariantSelectionTests(unittest.TestCase):
         # itself, so it is the null calibration, not a candidate.
         self.assertEqual(chosen[0].rule_spec, ROOT)
         self.assertEqual(origins[0], "deterministic")
-        # The one-point threshold sweep is a semantic near duplicate at the
-        # default 0.001 radius, so only the first model proposal is accepted;
-        # the deterministic ladder still tops the request up to four arms.
-        self.assertEqual(origins.count("llm"), 1)
+        # Both provider choices are exact members of the deterministic local
+        # neighborhood; the deterministic ladder tops up the remaining arms.
+        self.assertEqual(origins.count("llm"), 2)
         self.assertEqual(
             len({rule_variant_id(item.rule_spec) for item in chosen}), 4)
 
@@ -620,19 +649,34 @@ class FeedbackLoopTests(unittest.TestCase):
                 # Cite the most recent lesson, exactly as the contract makes a
                 # real model do once any history exists.
                 cite = lessons[0]["id"] if lessons else None
-                # A model that learns proposes something it has not already
-                # been told the answer to, so the values move with the history.
-                base = 40.0 + 3.0 * len(lessons)
-                specs = [validate_rule_spec(
-                    {**rule_spec, "threshold_bps": base + 7 * index})
-                    for index in range(count)]
+                tried: set[str] = set()
+                for lesson in lessons:
+                    changes = lesson.get("tried") or {}
+                    if not isinstance(changes, dict):
+                        continue
+                    candidate = dict(rule_spec)
+                    usable = True
+                    for field, change in changes.items():
+                        if not isinstance(change, dict) or "to" not in change:
+                            usable = False
+                            break
+                        candidate[field] = change["to"]
+                    if usable:
+                        try:
+                            tried.add(rule_variant_id(validate_rule_spec(candidate)))
+                        except (TypeError, ValueError):
+                            pass
+                specs = [spec for spec, _reason in coordinate_mutation_pool(
+                    rule_spec, diagnosis)
+                    if rule_variant_id(spec) != rule_variant_id(rule_spec)
+                    and rule_variant_id(spec) not in tried][:count]
                 return ProposalResult(
                     True, schema=TUNING_SCHEMA, rule_spec=rule_spec,
                     evidence={"kind": "tuning"},
                     variants=tuple(
                         {"rule_spec": spec, "variant_id": rule_variant_id(spec),
-                         "reason": f"Threshold to {spec['threshold_bps']} against "
-                                   f"{diagnosis.get('primary_failure')}.",
+                         "reason": f"Changed {' and '.join(spec_delta(rule_spec, spec))} "
+                                   f"against {diagnosis.get('primary_failure')}.",
                          "builds_on": cite}
                         for spec in specs))
         return Model()
@@ -647,10 +691,11 @@ class FeedbackLoopTests(unittest.TestCase):
                 min_sessions=1, alpha=1.0,
                 strategy_llm={"enabled": True, "model": "test"},
                 proposal_adapter=self._model(briefs))
-            first = run_factory(rows, **options)
-            # A different corpus, so this is a real second cycle rather than
-            # the duplicate-dataset short circuit.
-            second = run_factory(rows[:-60], **options)
+            with _compact_factory_protocol():
+                first = run_factory(rows, **options)
+                # A different corpus, so this is a real second cycle rather than
+                # the duplicate-dataset short circuit.
+                second = run_factory(rows[:-60], **options)
             factory = FactoryLedger(options["db_path"])
             recorded = factory.lessons(vehicle="equity", limit=100)
 
@@ -877,11 +922,12 @@ class FrozenEdgeTests(unittest.TestCase):
 
         rows = losing_breakouts()
         with tempfile.TemporaryDirectory() as directory:
-            run_factory(rows, db_path=Path(directory) / "edge_lab.sqlite3",
-                        strategies=1, variants_per_strategy=2, workers=1,
-                        min_trades=1, min_sessions=1, alpha=1.0,
-                        strategy_llm={"enabled": True, "model": "test"},
-                        proposal_adapter=Model())
+            with _compact_factory_protocol():
+                run_factory(rows, db_path=Path(directory) / "edge_lab.sqlite3",
+                            strategies=1, variants_per_strategy=2, workers=1,
+                            min_trades=1, min_sessions=1, alpha=1.0,
+                            strategy_llm={"enabled": True, "model": "test"},
+                            proposal_adapter=Model())
         # Every tuning request in a backtest cycle names a backtest diagnosis;
         # ``forward_validation`` never reaches the tuner at all.
         self.assertTrue(calls)

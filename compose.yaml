@@ -36,9 +36,10 @@ services:
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_LIVE_ENABLE: "false"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
       ALPACA_RECORDER_OPTION_LIMIT: ${ALPACA_RECORDER_OPTION_LIMIT:-10}
       ALPACA_RECORDER_OPTION_HOLD_MINUTES: ${ALPACA_RECORDER_OPTION_HOLD_MINUTES:-180}
       ALPACA_RECORDER_FETCH_WINDOW_MINUTES: ${ALPACA_RECORDER_FETCH_WINDOW_MINUTES:-15}
@@ -74,9 +75,10 @@ services:
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_LIVE_ENABLE: "false"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -122,9 +124,10 @@ services:
     environment:
       ALPACA_AGENT_SECRETS_FILE: /run/secrets/agent_credentials
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_LIVE_ENABLE: "false"
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
     secrets:
       - source: agent_credentials
         target: agent_credentials
@@ -152,7 +155,6 @@ services:
 
   research:
     <<: *app
-    profiles: [research]
     container_name: alpaca-research
     command:
       - python
@@ -168,9 +170,10 @@ services:
     environment:
       ALPACA_PAPER: "true"
       ALPACA_RESEARCH_LLM_SECRETS_FILE: /run/secrets/research_llm_credentials
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
-      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-iex}
-      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-indicative}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
+      ALPACA_STOCK_FEED: ${ALPACA_STOCK_FEED:-sip}
+      ALPACA_OPTIONS_FEED: ${ALPACA_OPTIONS_FEED:-opra}
+      ALPACA_RESEARCH_VEHICLES: ${ALPACA_RESEARCH_VEHICLES:-all}
       ALPACA_RESEARCH_DATASET: ${ALPACA_RESEARCH_DATASET:-}
       ALPACA_RESEARCH_BACKTEST: ${ALPACA_RESEARCH_BACKTEST:-1}
       ALPACA_FACTORY_ENABLED: ${ALPACA_FACTORY_ENABLED:-1}
@@ -179,7 +182,7 @@ services:
       ALPACA_FACTORY_WORKERS: ${ALPACA_FACTORY_WORKERS:-2}
       ALPACA_FACTORY_STARTING_CASH: ${ALPACA_FACTORY_STARTING_CASH:-100000}
       ALPACA_FACTORY_MIN_TRADES: ${ALPACA_FACTORY_MIN_TRADES:-100}
-      ALPACA_FACTORY_MIN_SESSIONS: ${ALPACA_FACTORY_MIN_SESSIONS:-10}
+      ALPACA_FACTORY_MIN_SESSIONS: ${ALPACA_FACTORY_MIN_SESSIONS:-30}
       ALPACA_FACTORY_ALPHA: ${ALPACA_FACTORY_ALPHA:-0.05}
       ALPACA_RESEARCH_SESSION_WINDOW: ${ALPACA_RESEARCH_SESSION_WINDOW:-0}
       TMPDIR: ${ALPACA_RESEARCH_TMPDIR:-/app/research/cache/tmp}
@@ -219,7 +222,6 @@ services:
 
   shadow-init:
     <<: *app
-    profiles: [shadow]
     container_name: alpaca-shadow-init
     # The application remains least-privilege. This short-lived initializer
     # only repairs the ownership of the persistent WAL directory, then exits.
@@ -244,7 +246,6 @@ services:
 
   shadow:
     <<: *app
-    profiles: [shadow]
     container_name: alpaca-shadow
     depends_on:
       shadow-init:
@@ -284,7 +285,7 @@ services:
     command: ["python", "deploy/dashboard.py", "--host", "0.0.0.0", "--port", "8080"]
     environment:
       ALPACA_PAPER: "true"
-      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-sip}
       ALPACA_EDGE_DB: ${ALPACA_EDGE_DB:-runtime/research/edge_lab.sqlite3}
     ports:
       - "127.0.0.1:${ALPACA_DASHBOARD_PORT:-8080}:8080"
@@ -315,7 +316,10 @@ secrets:
   agent_credentials:
     file: ${ALPACA_AGENT_SECRET_FILE:-.env}
   research_llm_credentials:
-    file: ${ALPACA_RESEARCH_LLM_SECRET_FILE:-/dev/null}
+    # Research is autonomous in the shipped profile. Do not mount /dev/null
+    # and let the cycle silently downgrade; Compose itself requires the
+    # separate provider-secret file before this service can start.
+    file: ${ALPACA_RESEARCH_LLM_SECRET_FILE:?set ALPACA_RESEARCH_LLM_SECRET_FILE to a readable dotenv file}
 
 volumes:
   runtime-data:

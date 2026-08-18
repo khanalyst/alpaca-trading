@@ -338,6 +338,30 @@ class FactoryLedger:
             db.execute("""CREATE TRIGGER IF NOT EXISTS factory_fdr_no_delete
                 BEFORE DELETE ON factory_fdr BEGIN
                 SELECT RAISE(ABORT, 'factory FDR decisions are immutable'); END;""")
+            # Confirmatory evidence is a consumable resource.  Keep the
+            # session set at the factory boundary so a process crash between
+            # releasing a sealed window and writing its proof cannot make the
+            # same sessions look new on the next cycle.
+            db.execute("""CREATE TABLE IF NOT EXISTS factory_evidence_claims (
+                claim_id TEXT PRIMARY KEY,
+                cycle_id TEXT NOT NULL,
+                hypothesis_id TEXT NOT NULL REFERENCES factory_hypotheses(hypothesis_id),
+                vehicle TEXT NOT NULL CHECK(vehicle IN ('equity','option')),
+                variant_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('heldout','qualification')),
+                sessions_json TEXT NOT NULL,
+                session_digest TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(cycle_id,hypothesis_id,variant_id,kind)
+            )""")
+            db.execute("""CREATE INDEX IF NOT EXISTS factory_evidence_vehicle
+                ON factory_evidence_claims(vehicle,kind,created_at)""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS factory_evidence_no_update
+                BEFORE UPDATE ON factory_evidence_claims BEGIN
+                SELECT RAISE(ABORT, 'factory evidence claims are immutable'); END;""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS factory_evidence_no_delete
+                BEFORE DELETE ON factory_evidence_claims BEGIN
+                SELECT RAISE(ABORT, 'factory evidence claims are immutable'); END;""")
             db.execute("""CREATE TRIGGER IF NOT EXISTS factory_cycles_no_update
                 BEFORE UPDATE ON factory_cycles BEGIN
                 SELECT RAISE(ABORT, 'factory cycles are immutable'); END;""")
@@ -711,6 +735,124 @@ class FactoryLedger:
                 account["realized_pnl"], account["max_drawdown"], account["trades"],
                 result["worker_pid"], canonical_json(dict(result)), datetime.now().timestamp(),
             ))
+            gate = result.get("gate") if isinstance(result, Mapping) else None
+            envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
+            heldout = (envelope.get("heldout_source")
+                       if isinstance(envelope, Mapping) else
+                       (gate.get("heldout_source") or gate.get("_heldout_rows")
+                        if isinstance(gate, Mapping) else ()))
+            try:
+                self._claim_evidence_db(
+                    db, cycle_id=cycle_id, hypothesis_id=hypothesis_id,
+                    vehicle=str(result["vehicle"]), variant_id=str(result["variant_id"]),
+                    kind="heldout", sessions=self._sessions_from_rows(heldout))
+            except FactoryError:
+                # Synthetic/replayed worker rows can be produced after a
+                # previous claim (for example during a crash-recovery retry).
+                # Preserve the immutable account for audit, while the
+                # scheduler's evidence-session filter and qualification claim
+                # ensure the reused rows cannot authorize a fresh promotion.
+                pass
+
+    @staticmethod
+    def _sessions_from_rows(rows: Any) -> tuple[str, ...]:
+        if not isinstance(rows, (list, tuple)):
+            return ()
+        values = {str(row.get("session_date") or "") for row in rows
+                  if isinstance(row, Mapping) and row.get("session_date")}
+        return tuple(sorted(item for item in values if item))
+
+    @staticmethod
+    def _claim_evidence_db(db: sqlite3.Connection, *, cycle_id: str,
+                           hypothesis_id: str, vehicle: str,
+                           variant_id: str, kind: str,
+                           sessions: tuple[str, ...] | list[str]) -> dict[str, Any] | None:
+        """Atomically reserve a session set for one confirmatory claim.
+
+        Claims from the same cycle are idempotent and may share a held-out
+        partition across variants. Any overlap with a prior cycle is rejected,
+        regardless of whether that prior claim was held-out or qualification.
+        """
+        normalized = tuple(sorted({str(item) for item in (sessions or ())
+                                   if str(item)}))
+        if not normalized:
+            return None
+        if kind not in {"heldout", "qualification"}:
+            raise FactoryError(f"unknown evidence kind: {kind}")
+        existing = db.execute(
+            """SELECT * FROM factory_evidence_claims
+               WHERE cycle_id=? AND hypothesis_id=? AND variant_id=? AND kind=?""",
+            (str(cycle_id), str(hypothesis_id), str(variant_id), str(kind))).fetchone()
+        if existing is not None:
+            return dict(existing)
+        rows = db.execute(
+            "SELECT cycle_id,kind,sessions_json FROM factory_evidence_claims WHERE vehicle=?",
+            (str(vehicle),)).fetchall()
+        requested = set(normalized)
+        for row in rows:
+            # Same-cycle variants may share one held-out partition. A
+            # qualification claim must still be disjoint from held-out rows
+            # in that cycle, since those are different evidence roles.
+            if (str(row["cycle_id"]) == str(cycle_id) and
+                    str(row["kind"]) == str(kind)):
+                continue
+            try:
+                prior = set(json.loads(row["sessions_json"]))
+            except (TypeError, json.JSONDecodeError):
+                prior = set()
+            overlap = sorted(requested & {str(item) for item in prior})
+            if overlap:
+                raise FactoryError(
+                    "confirmatory evidence session already consumed: "
+                    + ", ".join(overlap[:3]))
+        digest = content_hash({"vehicle": str(vehicle), "kind": str(kind),
+                               "sessions": normalized})
+        claim_id = uuid.uuid4().hex
+        db.execute(
+            """INSERT INTO factory_evidence_claims
+               (claim_id,cycle_id,hypothesis_id,vehicle,variant_id,kind,
+                sessions_json,session_digest,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (claim_id, str(cycle_id), str(hypothesis_id), str(vehicle),
+             str(variant_id), str(kind), canonical_json(list(normalized)),
+             digest, datetime.now().timestamp()))
+        return {"claim_id": claim_id, "cycle_id": str(cycle_id),
+                "hypothesis_id": str(hypothesis_id), "vehicle": str(vehicle),
+                "variant_id": str(variant_id), "kind": str(kind),
+                "sessions": list(normalized), "session_digest": digest}
+
+    def claim_qualification(self, cycle_id: str, hypothesis_id: str, *,
+                            vehicle: str, variant_id: str,
+                            sessions: tuple[str, ...] | list[str]) -> dict[str, Any] | None:
+        """Reserve a sealed qualification window before it is released.
+
+        The insert is the crash-safe boundary: once it commits, a restarted
+        process cannot spend that session set as a fresh qualification window.
+        """
+        with closing(_connect(self.path)) as db, db:
+            return self._claim_evidence_db(
+                db, cycle_id=cycle_id, hypothesis_id=hypothesis_id,
+                vehicle=vehicle, variant_id=variant_id, kind="qualification",
+                sessions=sessions)
+
+    def evidence_sessions(self, vehicle: str, *, kind: str | None = None) -> set[str]:
+        """Return all session dates consumed by prior confirmatory claims."""
+        clause = " AND kind=?" if kind is not None else ""
+        parameters: tuple[Any, ...] = (str(vehicle),) + (
+            (str(kind),) if kind is not None else ())
+        with closing(_connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT sessions_json FROM factory_evidence_claims "
+                "WHERE vehicle=?" + clause, parameters).fetchall()
+        output: set[str] = set()
+        for row in rows:
+            try:
+                values = json.loads(row["sessions_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(values, list):
+                output.update(str(item) for item in values if str(item))
+        return output
 
     def last_boundary(self, hypothesis_id: str, vehicle: str) -> str | None:
         # A factory account is diagnostic evidence, not a consumed forward

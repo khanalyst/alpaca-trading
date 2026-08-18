@@ -22,6 +22,22 @@ def _facade_helper(name: str):
     return getattr(alpaca_provider, name)
 
 
+def _require_executable_option_feed(feed: str) -> str:
+    """Require OPRA before option data can enter an executable path.
+
+    Alpaca's indicative stream is useful for display/diagnostics, but it is
+    not a two-sided executable quote entitlement.  A candidate returned from
+    this boundary is consumed by runtime sizing and therefore must never be
+    sourced from that stream or silently downgraded to it.
+    """
+    canonical = str(feed or "").strip().lower()
+    if canonical != "opra":
+        raise AlpacaError(
+            "indicative option data is non-executable; OPRA entitlement is "
+            "required for option candidates")
+    return canonical
+
+
 def parse_occ_symbol(*args, **kwargs):
     return _facade_helper("parse_occ_symbol")(*args, **kwargs)
 
@@ -258,25 +274,15 @@ class AlpacaMarketDataMixin:
             request_kwargs.update(kwargs)
             if start is not None: request_kwargs["start"] = start
             if end is not None: request_kwargs["end"] = end
-            request = None
-            # alpaca-py has shipped several OptionChainRequest signatures.
-            # Retry only compatible shape reductions; never leak constructor
-            # TypeError to callers.
-            attempts = [dict(request_kwargs)]
-            for drop in (("feed",), ("feed", "start"), ("feed", "end"),
-                         ("feed", "start", "end"), ("start", "end")):
-                candidate = {k: v for k, v in request_kwargs.items() if k not in drop}
-                if candidate not in attempts:
-                    attempts.append(candidate)
-            last_error = None
-            for candidate in attempts:
-                try:
-                    request = OptionChainRequest(**candidate)
-                    break
-                except TypeError as exc:
-                    last_error = exc
-            if request is None:
-                raise AlpacaError(f"option chain request construction failed: {last_error}")
+            # Never retry without ``feed``: an SDK signature that cannot
+            # carry OPRA would otherwise silently fall back to an indicative
+            # stream while the normalized row still claims executable data.
+            try:
+                request = OptionChainRequest(**request_kwargs)
+            except TypeError as exc:
+                raise AlpacaError(
+                    "option chain request cannot carry the required OPRA feed: "
+                    f"{exc}") from exc
         except ImportError:
             request = {"underlying_symbol": underlying_symbol, "start": start,
                        "end": end, "feed": requested_feed, **kwargs}
@@ -371,6 +377,7 @@ class AlpacaMarketDataMixin:
         """
         underlying = validate_equity_symbol(underlying_symbol)
         requested_feed = _canonical_feed(feed or self.options_feed, options=True)
+        _require_executable_option_feed(requested_feed)
         if now is None:
             now_dt = datetime.now(timezone.utc)
         elif isinstance(now, datetime):

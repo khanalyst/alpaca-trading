@@ -4,6 +4,10 @@ Installation is in [`../SETUP.md`](../SETUP.md); operation, backup, and
 recovery are in [`../OPERATIONS.md`](../OPERATIONS.md). This file records
 process ownership and the two supported paper launch lanes. The runtime scope
 is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
+Every shipped deployment is paper-only (`ALPACA_PAPER=true`, live disabled),
+uses SIP for equities and OPRA for options, and keeps the trader's runtime
+execution profile at `shares`. Options research is enabled as an evidence lane;
+it does not enable options order execution.
 
 ## Docker Compose (recommended)
 
@@ -12,11 +16,11 @@ is US-listed equities/ETFs and listed OCC options only; crypto is rejected.
 | Service | Responsibility | Durable state |
 | --- | --- | --- |
 | `recorder` | Alpaca bars, quotes, and session observations (paper by default) | `runtime-data` |
-| `trader` | Exactly one intraday loop in one configured execution profile and broker reconciliation | `runtime-data`, `research-cache` |
-| `research` (profile `research`) | Scheduled eleven-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
+| `trader` | Exactly one paper intraday loop in the shipped `shares` execution profile and broker reconciliation | `runtime-data`, `research-cache` |
+| `research` | Scheduled eleven-slot offline factory/replay and shadow-WAL ingestion; no broker authority | `runtime-data`, research volumes |
 | `watchdog` | Independent stale-trader flatten; cancel and close only, never entries | `runtime-data` |
 | `dashboard` | Read-only localhost health and reports | Read-only mounts |
-| `shadow` (profile `shadow`) | Broker-free incremental shadow evaluation and semantic replay parity; no broker authority | Read-only recorder/EdgeLedger mounts, isolated shadow WAL |
+| `shadow` | Broker-free incremental shadow evaluation and semantic replay parity; no broker authority | Read-only recorder/EdgeLedger mounts, isolated shadow WAL |
 
 All workload services run as UID/GID 10001, drop Linux capabilities, use a
 read-only root filesystem, and receive only the secret/config mounts they
@@ -66,8 +70,9 @@ sample (default 10, capped at 25) and keeps every contract it has sampled in
 the sample for `ALPACA_RECORDER_OPTION_HOLD_MINUTES` (default 180) so a trade
 opened on a contract still has quotes at its exit.
 
-Bar coverage is judged against the cached Alpaca calendar, so holidays and
-early closes remain quiet. An intraday gap larger than
+Bar coverage and replay cutoffs use the exact Alpaca calendar, so holidays and
+early closes remain quiet; missing calendar metadata is a refusal, never a
+fixed 16:00 promotion fallback. An intraday gap larger than
 `ALPACA_RECORDER_BAR_GAP_MINUTES` (default 5) is recorded per symbol under
 `bar_coverage` in the index and exposed by recorder health as
 `coverage_status`, `bar_gap_symbols`, and `bar_gap_observations`. It does not
@@ -78,29 +83,46 @@ to make those observations fail closed for explicitly governed feeds. The
 recorder refuses to change equity feeds inside an existing corpus because event
 identity and per-symbol continuity must not cross feed provenance.
 
-The research profile is disabled by default. `deploy/research-cycle.sh`
+The plain supported startup includes research: `docker compose up -d` starts
+the scheduled research service in the default startup. `deploy/research-cycle.sh`
 discovers and routes the corpus automatically, concatenating partitions in
 session order; `ALPACA_RESEARCH_SESSION_WINDOW` limits that to the most recent
 N sessions, and `ALPACA_RESEARCH_DATASET` can override the source with
-normalized JSONL. Start it with
-`docker compose --profile research up -d research`. The edge ledger is stored
-at `runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
+normalized JSONL. The edge ledger is stored at
+`runtime/research/edge_lab.sqlite3` (override with `ALPACA_EDGE_DB`) and is
 read-only from the dashboard. Research cannot place orders or mutate broker
 state. Paper `selection_mode: all_proved` runs one best proven variant per
 independent family under one global risk book. Defaults are eleven logical
 strategy slots over all eleven bounded rule families and four isolated variant
 accounts per strategy; each isolated book is processed by one bounded worker.
-Capacity is configurable through the
+`ALPACA_RESEARCH_VEHICLES=all` is the default and deliberately evaluates both
+equity and option research vehicles, even though runtime execution remains the
+single `shares` profile. Capacity is configurable through the
 `ALPACA_FACTORY_*` environment variables.
 
 The shipped/default universe is eight liquid ETFs (`SPY`, `QQQ`, `IWM`, `DIA`,
-`XLF`, `XLK`, `XLE`, `XLV`), improving opportunity capacity. Real signal rates
-still require sufficient history, and floor feasibility fails closed when the
-100-trade held-out floor cannot be supported; widen history and/or the
-configured universe, never lower the floor.
+`XLF`, `XLK`, `XLE`, `XLV`), improving opportunity capacity. Authorizing floors
+are immutable: backtest/factory requires 100 trades and 30 complete
+sessions/clusters; sealed qualification requires 100 trades and 30 complete
+sessions/clusters; parity-matched live shadow requires 150 trades and 30
+complete sessions. Real signal rates still require sufficient history, and
+floor feasibility fails closed; widen history and/or the configured universe,
+never lower a floor. Effective breadth is a persisted/re-verified matched
+symbol/session diagnostic and never counts as extra independent N. Serial
+inference uses a deterministic seeded moving-block day/session-cluster
+bootstrap.
 
-Start the broker-free shadow lane with `docker compose --profile shadow up -d
-shadow`. Compose first runs the short-lived `shadow-init` service to repair the
+Research qualification requires at least 100 trades, 30 complete sessions, and
+30 session-level clusters. Epoch 3 also makes the economics gates explicit:
+every executable stop in both rule and IBR paths must be at least 30 bps,
+the recomputed risk unit must cover the configured round-trip cost, and fill
+quality must be backed by executable quote/snapshot evidence (not a bar-only
+fallback). Evidence from replay generations older than epoch 3 is quarantined
+for audit and cannot validate, champion, or authorize the paper trader until it
+is replayed under epoch 3.
+
+The plain supported startup also includes the broker-free shadow lane:
+`docker compose up -d` runs the short-lived `shadow-init` service to repair the
 ownership of the persistent WAL directory, then starts ShadowRunner as UID/GID
 10001. It mounts the recorder corpus and EdgeLedger read-only, has no broker
 credentials, and writes only `/app/shadow/shadow.sqlite3` (SQLite WAL). It
@@ -125,11 +147,16 @@ The scheduled research cycle invokes `edge ingest-shadow` by default when
 mounts the same `shadow-data` volume read-only at `/app/shadow` and is the only
 process that writes the live-ingestion authorization marker to EdgeLedger.
 
-The default Compose lane passes the Alpaca paper endpoint and feed settings
-explicitly through `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and
-`ALPACA_OPTIONS_FEED`. Credentials are mounted from
-`ALPACA_AGENT_SECRET_FILE`, never copied into the image. Named volumes survive
-ordinary `docker compose down`; a second trader or `down -v` can
+The default Compose lane passes the Alpaca paper endpoint and SIP/OPRA feed
+settings explicitly through `ALPACA_PAPER`, `ALPACA_DATA_FEED`, and
+`ALPACA_OPTIONS_FEED`; a partial-feed override is not a supported
+autonomous-research deployment. Credentials are mounted from
+`ALPACA_AGENT_SECRET_FILE`, never copied into the image. The research service
+also requires `ALPACA_RESEARCH_LLM_SECRET_FILE` to name a separate readable
+dotenv file containing `OPENAI_API_KEY` (or the configured provider's key).
+There is no deterministic downgrade when that file is absent or unreadable:
+the Compose interpolation or cycle preflight fails closed. Named volumes
+survive ordinary `docker compose down`; a second trader or `down -v` can
 corrupt/delete operational state.
 
 Before market-data or order calls, run `python main.py check`; this is the
@@ -140,16 +167,27 @@ paper runtime lock, an open market, and an initially flat account, then buys
 and closes one share and proves the account is flat. Orders are day-only;
 startup cleanup cancels working
 orders and flattens residuals, and the session policy force-flats before the
-regular NY close. The checked research config uses deterministic strategy
-discovery. Bounded model-assisted replacement can be enabled with credentials
-only from `ALPACA_RESEARCH_LLM_SECRETS_FILE`; enabling it without the matching
-provider key fails the research cycle before discovery. LLM
-discovery/replacement/tuning use full-schema structured
+exact broker calendar close. The checked research config enables bounded model-assisted
+discovery, replacement, and tuning. Credentials come only from
+`ALPACA_RESEARCH_LLM_SECRET_FILE`; an absent, unreadable, or keyless file fails
+the research cycle before discovery. LLM requests use full-schema structured
 contracts, a per-run call budget and authentication circuit, and record
-per-attempt evidence. Runtime decision LLM use remains disabled. The trader opens
+per-attempt evidence. The runtime decision LLM is hard-off in the paper trader.
+The trader opens
 entries only when the SQLite ledger has a vehicle-local `validated` or
 `champion` edge for its configured execution profile whose latest shadow proof
 carries the parity-matched live-ingestion marker.
+
+Authorizing fill quality retains provider/feed/source and quote age for both
+legs: SIP for equity entry and exit, OPRA for option entry and exit, each no
+older than 30 seconds. Bar-only, partial-feed, missing, or stale legs remain
+diagnostic and cannot authorize a proof. The shipped expected-cost model is
+4 bps spread, 6 bps slippage, 0.5 bps per-side fee, plus a 0.65 option fee per
+contract side. Preregistered stress scenarios are 9/15/25/50 bps; 25 bps is
+the authorization requirement. Missing, stale, or insufficient calibration,
+an optimistic cost result, terminal material underfill (<80%), or partial-cancel
+rate above 20% blocks shadow authorization. Offline discovery/factory
+diagnostics remain available while that boundary is closed.
 
 Research never rewrites the append-only recorder corpus. A temporary cycle view
 explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,
@@ -164,13 +202,13 @@ when they read it. `research-progress.v1` records expose the current bounded
 phase through scheduler health and the dashboard without changing gate or
 promotion semantics.
 
-Model-assisted research is disabled in the shipped paper configuration so an
-empty Compose secret can never masquerade as an authenticated provider. To
-enable it, set `research.strategy_llm.enabled=true` and set
-`ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of the
-separate research-provider dotenv file. It is mounted read-only as
-`/run/secrets/research_llm_credentials`; broker credentials are not mounted
-into the research service.
+Model-assisted research is enabled in the shipped paper configuration. Set
+`ALPACA_RESEARCH_LLM_SECRET_FILE` to the host path of the separate
+research-provider dotenv file before startup; it is mounted read-only as
+`/run/secrets/research_llm_credentials`. The file must be readable by the
+container's restricted UID and contain `OPENAI_API_KEY` for the checked
+`openai`/`gpt-5` provider (or the matching `ANTHROPIC_API_KEY` when configured).
+Broker credentials are not mounted into the research service.
 
 The shipped Compose and systemd lanes are paper-scoped. A live deployment is a
 separate reviewed config/runtime scope: `mode: live`, `broker.paper: false`,
@@ -219,7 +257,20 @@ For an existing non-Compose host, install these units as the restricted
 The units are alternatives to Compose. Do not enable both lanes on one host or
 run a second trader against the same paper account. Keep the EnvironmentFile
 outside Git and set `ALPACA_AGENT_SECRETS_FILE` only for the processes that
-need it. Disable the lane before migrating to Compose.
+need it. Copy `agent.env.example`, `research.env.example`, and
+`research-llm.env.example` to `/etc/alpaca-agent-trading/`, fill the Alpaca
+paper key/secret and the separate provider key, then set mode `0400` and owner
+`alpaca`. The research unit defaults to `ALPACA_RESEARCH_VEHICLES=all`, SIP,
+OPRA, and the provider path above; it fails closed if the provider file is not
+readable. Enable the full paper lane with:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now alpaca-recorder.service alpaca-trader.service \
+  alpaca-watchdog.service alpaca-research.timer
+```
+
+Disable the lane before migrating to Compose.
 
 ## Backup override
 

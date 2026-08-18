@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 from typing import get_args, get_type_hints
 
-from research import edge_lab, edge_ledger, edge_ledger_proof, edge_ledger_store
+from research import edge_lab, edge_ledger, edge_ledger_proof, edge_ledger_store, gates
 from research import edge_discovery_core
 from research.edge_lab import DiscoveryError, EdgeLedger, discover
 from research.edge_ledger import (
@@ -66,7 +66,11 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
             (100, 101, 99, 100),        # one-minute opening range
             (100, 102, 99.5, 102),      # confirmed breakout
             (102, 103, 101.5, 103),     # next-bar entry at 102
-            (103, 107, 102.5, 106.8),   # 1.5R (106.5) target, but not 2R (108)
+            # Gap through the 1.5R target at the next-bar boundary.  The
+            # candidate's exit is therefore priced by the executable SIP
+            # quote at that boundary; the 2R baseline still holds to the
+            # force-flat boundary because this bar's high remains below 2R.
+            (106.5, 107, 102.5, 106.8),
         ]
         price = 106.8
         for _ in range(20):            # the whole move handed back
@@ -92,48 +96,98 @@ def _sessions(start: datetime, count: int, symbols=("SPY", "QQQ", "IWM", "DIA"))
                     "timestamp": timestamp.isoformat(),
                     "as_of": timestamp.isoformat(),
                     "observed_at": timestamp.isoformat(),
-                    "bid": open_ + shift - .01, "ask": open_ + shift + .01,
+                    # The target bar needs an executable SIP bid for the
+                    # long exit; opening-price quotes would force a bar
+                    # fallback and make this lifecycle fixture fail the
+                    # production fill-quality gate.
+                    "bid": (high if minute == 3 else open_) + shift - .01,
+                    "ask": (high if minute == 3 else open_) + shift + .01,
                     "provider": "alpaca", "feed": "sip",
                 })
+            # The baseline (2R) remains open through this compact session and
+            # is force-flat on the final completed bar.  Supply a distinct
+            # quote at that exact bar-end boundary so strict replay records a
+            # genuine SIP exit rather than silently falling back to OHLC.
+            final_timestamp = session + timedelta(minutes=len(values))
+            final_close = values[-1][3] + shift
+            rows.append({
+                "kind": "quote", "symbol": symbol,
+                "timestamp": final_timestamp.isoformat(),
+                "as_of": final_timestamp.isoformat(),
+                "observed_at": final_timestamp.isoformat(),
+                "bid": final_close - .01, "ask": final_close + .01,
+                "provider": "alpaca", "feed": "sip",
+            })
     return rows
 
 
 def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   passes: bool = True, record: bool = True,
                   score: float = 1.0,
-                  scores: list[float] | None = None,
-                  r_multiples: list[float] | None = None) -> tuple[dict, dict]:
+                   scores: list[float] | None = None,
+                   r_multiples: list[float] | None = None) -> tuple[dict, dict]:
+    def priced(row: dict) -> dict:
+        return {
+            **row,
+            "no_trade": False,
+            "entry_price": 100.0,
+            "exit_price": 100.1,
+            "quantity": 1.0,
+            "multiplier": 1.0,
+            "stop_distance": 1.0,
+            "risk_usd": 10.0,
+            "entry_fill_source": "quote",
+            "exit_fill_source": "quote",
+            "entry_feed": "sip", "exit_feed": "sip",
+            "entry_provider": "alpaca", "exit_provider": "alpaca",
+            "entry_quote_age_seconds": 0.0,
+            "exit_quote_age_seconds": 0.0,
+        }
+
     prefix = f"{lane}-{'pass' if passes else 'fail'}"
+    # Five opportunities per each of thirty independent sessions satisfy the
+    # immutable 100-trade/30-cluster offline floor and the 150-trade shadow
+    # floor while keeping this shared proof fixture compact.
+    symbols = ("SPY", "QQQ", "IWM", "DIA", "AAPL")
+    session_count = 30
     fit = [] if lane == "shadow" else [
-        {"vehicle": "equity", "symbol": "SPY", "session_date": "2024-01-02",
-         "opportunity_id": f"{prefix}-fit", "net_pnl": 1.0},
-    ]
-    # Eight held-out sessions: a sign-flip null over two clusters cannot
-    # reach any useful significance level, so the old two-session fixture
-    # could never have supported a passing falsification.
+        priced({"vehicle": "equity", "symbol": symbol,
+                "session_date": (datetime(2023, 12, 1, tzinfo=timezone.utc) +
+                                  timedelta(days=index)).date().isoformat(),
+                "opportunity_id": f"{prefix}-fit-{index}-{symbol}",
+                "net_pnl": 1.0})
+        for index in range(session_count) for symbol in symbols]
+    # ``scores`` gives one P&L per held-out session, which lets a fixture hold
+    # the mean delta fixed while moving its dispersion, and therefore its
+    # lower confidence bound.  Short score sequences repeat over the 30
+    # sessions but preserve their distribution for ranking tests.
     # ``scores`` gives one P&L per held-out session, which lets a fixture hold
     # the mean delta fixed while moving its dispersion, and therefore its
     # lower confidence bound.
-    values = list(scores) if scores is not None else [
-        score if passes else -1.0] * 8
-    heldout = [
-        {"vehicle": "equity", "symbol": "SPY",
-         "session_date": f"2024-01-{day:02d}",
-         "opportunity_id": f"{prefix}-held-{day}",
-         "net_pnl": value}
-        for day, value in zip(range(3, 3 + len(values)), values)
-    ]
+    score_values = list(scores) if scores is not None else [score]
+    values = [score_values[index % len(score_values)] if passes else -1.0
+              for index in range(session_count)]
+    heldout_start = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    heldout = [priced({
+        "vehicle": "equity", "symbol": symbol,
+        "session_date": (heldout_start + timedelta(days=index)).date().isoformat(),
+        "opportunity_id": f"{prefix}-held-{index}-{symbol}",
+        "net_pnl": values[index],
+    }) for index in range(session_count) for symbol in symbols]
     baseline = [{**row, "net_pnl": 0.0,
                  "opportunity_id": f"baseline-{index}"}
                 for index, row in enumerate(heldout)]
     fit_baseline = [{**row, "net_pnl": 0.0,
                      "opportunity_id": f"fit-baseline-{index}"}
                     for index, row in enumerate(fit)]
+    floor_trades = 150 if lane == "shadow" else 100
     fit_floor = structural_floor(
-        fit, vehicle="equity", min_trades=1, min_sessions=1,
+        fit, vehicle="equity", min_trades=floor_trades, min_sessions=30,
+        min_clusters=30,
         required=lane != "shadow")
     held_floor = structural_floor(
-        heldout, vehicle="equity", min_trades=1, min_sessions=1)
+        heldout, vehicle="equity", min_trades=floor_trades, min_sessions=30,
+        min_clusters=30)
     separation = (heldout_separation(fit, heldout) if lane == "backtest" else
                   {"fit": 0, "heldout": len(heldout), "overlap_sessions": [],
                    "passes": True, "mode": "new_data"})
@@ -142,9 +196,21 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                    if fit else {"available": True, "actual_control": True,
                                 "matched": 0, "mean_delta": None,
                                 "p_value": 1.0, "mode": "prior_backtest"})
+    qualification_start = datetime(2024, 2, 1, tzinfo=timezone.utc)
+    qualification_rows = [priced({
+        "vehicle": "equity", "symbol": symbol,
+        "session_date": (qualification_start + timedelta(days=index)).date().isoformat(),
+        "opportunity_id": f"{prefix}-qualification-{index}-{symbol}",
+        "net_pnl": 1.0,
+    }) for index in range(session_count) for symbol in symbols]
+    qualification_baseline = [
+        {**row, "net_pnl": 0.0,
+         "opportunity_id": f"qualification-baseline-{index}"}
+        for index, row in enumerate(qualification_rows)
+    ]
     qualification = qualification_report(
-        heldout, baseline, vehicle="equity",
-        sessions=sorted({row["session_date"] for row in heldout}),
+        qualification_rows, qualification_baseline, vehicle="equity",
+        sessions=sorted({row["session_date"] for row in qualification_rows}),
         candidate_id=candidate_id, preselected=True)
     candidate = ledger.candidate(candidate_id)
     candidate_config = json.loads(candidate["config_json"])
@@ -394,6 +460,47 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
         self.assertEqual(snapshots, {})
         self.assertEqual(quotes, [])
         normalizer.assert_called_once_with(row, provider="alpaca", feed="sip")
+
+    def test_option_corpus_requires_explicit_opra_provenance(self):
+        row = {
+            "kind": "option", "symbol": "SPY240119C00100000",
+            "underlying": "SPY", "expiration": "2024-01-19",
+            "strike": 100, "right": "call", "multiplier": 100,
+            "timestamp": "2024-01-02T14:31:00+00:00",
+            "as_of": "2024-01-02T14:31:00+00:00",
+            "observed_at": "2024-01-02T14:31:00+00:00",
+            "bid": 1.0, "ask": 1.1, "bid_size": 5, "ask_size": 5,
+            "provider": "alpaca",
+        }
+        for feed in (None, "indicative"):
+            with self.subTest(feed=feed):
+                candidate = dict(row)
+                if feed is not None:
+                    candidate["feed"] = feed
+                with self.assertRaisesRegex(
+                        DiscoveryError, "explicit OPRA feed provenance"):
+                    edge_discovery_core._normalize_corpus([candidate])
+        opra = {**row, "feed": "opra"}
+        _bars, snapshots, _quotes = edge_discovery_core._normalize_corpus([opra])
+        self.assertEqual(len(snapshots), 1)
+
+    def test_discovery_promotion_requires_thirty_session_clusters(self):
+        candidate = [{
+            "vehicle": "equity", "symbol": "SPY",
+            "session_date": f"2026-03-{index + 1:02d}",
+            "opportunity_id": f"edge:{index}", "net_pnl": 1.0,
+            "return_value": .001, "no_trade": False,
+        } for index in range(29)]
+        baseline = [{**row, "net_pnl": 0.0, "return_value": 0.0}
+                    for row in candidate]
+        gate = edge_discovery_core._discover_gate(
+            candidate, baseline, vehicle="equity", min_trades=1,
+            min_sessions=1, alpha=.05, test_iterations=100,
+            null_rows=baseline,
+            qualification={"available": True, "net_positive": True,
+                           "delta_positive": True})
+        self.assertEqual(gate["heldout_floor"]["minimums"]["clusters"], 30)
+        self.assertFalse(gate["heldout_floor"]["checks"]["clusters"])
 
     def test_discover_uses_patchable_edge_lab_helper_alias(self):
         with mock.patch.object(edge_lab, "_read_discovery_rows",
@@ -1050,7 +1157,10 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
     # mean held-out delta; STEADY the higher lower bound.  Both are positive,
     # so both pass the gate and the ranking rule alone separates them.
     STEADY = [3.5] * 8
-    SPIKY = [9.0, 1.0, 9.0, 1.0, 9.0, 1.0, 9.0, 1.0]
+    # Chronological runs matter under the moving-block bootstrap.  This series
+    # has the higher raw mean, but its clustered high/low regimes produce a
+    # lower conservative bound than the steady candidate.
+    SPIKY = [9.0, 9.0, 9.0, 9.0, -1.0, -1.0, -1.0, -1.0]
     # Same mean as a flat +1 series, but a lower bound below zero.
     ERRATIC = [30.0, -28.0, 25.0, -22.0, 20.0, -18.0, 15.0, -14.0]
 
@@ -1145,21 +1255,51 @@ class EdgeDiscoveryLifecycleTests(unittest.TestCase):
             data_all.write_text("\n".join(json.dumps(row) for row in first + later), encoding="utf-8")
             variants.write_text(json.dumps(registry), encoding="utf-8")
 
-            initial = discover(data_one, db_path=db, variants_path=variants,
-                               config=config, min_trades=5, min_sessions=5,
-                               lane="auto")
-            candidate = initial["variants"][0]
-            self.assertEqual(candidate["status"], "backtest_passed")
-            self.assertIsNone(candidate["shadow_run_id"])
+            qualification = edge_lab.qualification_report
 
-            with self.assertRaises(DiscoveryError):
-                discover(data_one, db_path=db, variants_path=variants,
-                         config=config, min_trades=5, min_sessions=5,
-                         lane="shadow")
+            def compact_qualification(*args, **kwargs):
+                kwargs.update(min_trades=4, min_sessions=4, min_clusters=4)
+                return qualification(*args, **kwargs)
 
-            forward = discover(data_all, db_path=db, variants_path=variants,
-                               config=config, min_trades=5, min_sessions=5,
-                               lane="auto")
+            # This test isolates lifecycle boundary behavior. Production's
+            # 30-cluster contract is asserted separately; a compact local
+            # floor keeps this already-expensive replay fixture focused.
+            with mock.patch.object(
+                    edge_discovery_core, "MIN_PROMOTION_CLUSTERS", 4), \
+                    mock.patch.object(
+                        edge_lab, "qualification_report",
+                        side_effect=compact_qualification), \
+                    mock.patch.multiple(
+                        gates,
+                        PROTOCOL_BACKTEST_MIN_TRADES=4,
+                        PROTOCOL_BACKTEST_MIN_SESSIONS=4,
+                        PROTOCOL_BACKTEST_MIN_CLUSTERS=4,
+                        PROTOCOL_SHADOW_MIN_TRADES=4,
+                        PROTOCOL_SHADOW_MIN_SESSIONS=4,
+                        PROTOCOL_SHADOW_MIN_CLUSTERS=4,
+                        PROTOCOL_QUALIFICATION_MIN_TRADES=4,
+                        PROTOCOL_QUALIFICATION_MIN_SESSIONS=4,
+                        PROTOCOL_QUALIFICATION_MIN_CLUSTERS=4), \
+                    mock.patch.object(edge_lab, "PROTOCOL_SHADOW_MIN_TRADES", 4), \
+                    mock.patch.object(edge_lab, "PROTOCOL_SHADOW_MIN_SESSIONS", 4), \
+                    mock.patch.object(gates, "QUALIFICATION_MIN_TRADES", 4), \
+                    mock.patch.object(gates, "QUALIFICATION_MIN_SESSIONS", 4), \
+                    mock.patch.object(gates, "QUALIFICATION_MIN_CLUSTERS", 4):
+                initial = discover(data_one, db_path=db, variants_path=variants,
+                                   config=config, min_trades=5, min_sessions=5,
+                                   lane="auto")
+                candidate = initial["variants"][0]
+                self.assertEqual(candidate["status"], "backtest_passed")
+                self.assertIsNone(candidate["shadow_run_id"])
+
+                with self.assertRaises(DiscoveryError):
+                    discover(data_one, db_path=db, variants_path=variants,
+                             config=config, min_trades=5, min_sessions=5,
+                             lane="shadow")
+
+                forward = discover(data_all, db_path=db, variants_path=variants,
+                                   config=config, min_trades=5, min_sessions=5,
+                                   lane="auto")
             candidate = forward["variants"][0]
             # Offline forward replay remains diagnostic; lifecycle validation
             # is authorized only by the research-side live-shadow ingester.
@@ -1279,8 +1419,38 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         data.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
         variants.write_text(json.dumps(self.REGISTRY), encoding="utf-8")
         options = {"min_trades": 5, "min_sessions": 5, "lane": "auto", **kwargs}
-        return discover(data, db_path=root / "edge.sqlite3", variants_path=variants,
-                        config=self.CONFIG, **options)
+        qualification = edge_lab.qualification_report
+
+        def compact_qualification(*args, **call_kwargs):
+            call_kwargs.update(min_trades=4, min_sessions=4, min_clusters=4)
+            return qualification(*args, **call_kwargs)
+
+        # These tests isolate IBR/factory evidence parity rather than the
+        # production sample-size policy.  A separate regression asserts the
+        # shipped 30-cluster floor; keeping this replay fixture compact avoids
+        # multiplying every parity test by 7.5x.
+        with mock.patch.object(
+                edge_discovery_core, "MIN_PROMOTION_CLUSTERS", 4), \
+                mock.patch.object(
+                    edge_lab, "qualification_report",
+                    side_effect=compact_qualification), \
+                mock.patch.multiple(
+                    gates,
+                    PROTOCOL_BACKTEST_MIN_TRADES=4,
+                    PROTOCOL_BACKTEST_MIN_SESSIONS=4,
+                    PROTOCOL_BACKTEST_MIN_CLUSTERS=4,
+                    PROTOCOL_SHADOW_MIN_TRADES=4,
+                    PROTOCOL_SHADOW_MIN_SESSIONS=4,
+                    PROTOCOL_SHADOW_MIN_CLUSTERS=4,
+                    PROTOCOL_QUALIFICATION_MIN_TRADES=4,
+                    PROTOCOL_QUALIFICATION_MIN_SESSIONS=4,
+                    PROTOCOL_QUALIFICATION_MIN_CLUSTERS=4), \
+                mock.patch.object(gates, "QUALIFICATION_MIN_TRADES", 4), \
+                mock.patch.object(gates, "QUALIFICATION_MIN_SESSIONS", 4), \
+                mock.patch.object(gates, "QUALIFICATION_MIN_CLUSTERS", 4):
+            return discover(
+                data, db_path=root / "edge.sqlite3", variants_path=variants,
+                config=self.CONFIG, **options)
 
     def test_edge_lab_rejects_invalid_statistical_policy_inputs_before_replay(self):
         rows = _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 2)
@@ -1389,7 +1559,7 @@ class IbrLaneEvidenceParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = self._discover(
                 _sessions(datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc), 1),
-                directory, min_trades=1, min_sessions=1)
+                directory, min_trades=4, min_sessions=4)
             candidate = result["variants"][0]
             events = EdgeLedger(Path(directory) / "edge.sqlite3").history(
                 candidate["candidate_id"])

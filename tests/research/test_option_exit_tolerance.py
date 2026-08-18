@@ -58,6 +58,17 @@ def _rising_session(minutes: int = 40) -> list[UnderlyingBar]:
 
 
 class OptionExitToleranceTests(unittest.TestCase):
+    def test_indicative_option_quote_is_not_executable_research_evidence(self):
+        bars = _rising_session()
+        indicative = OptionContract(
+            symbol=CONTRACT.symbol, underlying="SPY", expiration=CONTRACT.expiration,
+            strike=CONTRACT.strike, right="call", multiplier=100,
+            currency="USD", provider="alpaca", feed="indicative")
+        self.assertIsNone(_option_at(
+            [_snap(6, contract=indicative)], symbol="SPY", day=SESSION,
+            direction="long", cutoff=bars[6].timestamp,
+            contract_symbol=indicative.symbol))
+
     def test_missing_or_empty_liquidity_is_not_an_eligible_option_quote(self):
         bars = _rising_session()
         for kwargs in (
@@ -174,8 +185,8 @@ class OptionExitToleranceTests(unittest.TestCase):
         bars = _rising_session()
         quoted = [_snap(minute) for minute in range(1, 40)]
         gapped = [snap for snap in quoted
-                  if not OPEN + timedelta(minutes=16) <= snap.timestamp
-                  <= OPEN + timedelta(minutes=18)]
+                  if not OPEN + timedelta(minutes=20) <= snap.timestamp
+                  <= OPEN + timedelta(minutes=22)]
         fresh_book = simulate_account(bars, quoted, SPEC, vehicle="option",
                                       account_id="fresh")
         stale_book = simulate_account(bars, gapped, SPEC, vehicle="option",
@@ -209,7 +220,7 @@ class OptionExitToleranceTests(unittest.TestCase):
             for minute in range(1, 40):
                 if day_index < 3 and minute > 12:
                     continue                      # contract lost for the session
-                if 3 <= day_index < 8 and 16 <= minute <= 18:
+                if 3 <= day_index < 8 and 20 <= minute <= 22:
                     continue                      # three skipped recorder cycles
                 ts = OPEN + timedelta(minutes=offset + minute)
                 snaps.append(OptionSnapshot(

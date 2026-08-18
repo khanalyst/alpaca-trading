@@ -52,7 +52,10 @@ def _int(block: Mapping[str, Any], key: str, path: str, lo: int, hi: int, defaul
 
 
 def _feed(value: Any, *, options: bool = False) -> str:
-    raw = str(value or ("indicative" if options else "iex")).strip().lower().replace("-", "_")
+    # SIP/OPRA are the only feeds with the complete executable market view.
+    # Keep the parser's fallback fail-closed as well as the shipped config:
+    # an omitted feed must never silently select a partial/indicative stream.
+    raw = str(value or ("opra" if options else "sip")).strip().lower().replace("-", "_")
     if raw == "delayed":
         raw = "delayed_sip"
     allowed = {"indicative", "opra"} if options else {"iex", "sip", "delayed_sip"}
@@ -63,12 +66,15 @@ def _feed(value: Any, *, options: bool = False) -> str:
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "mode": "paper",
-    "broker": {"paper": True, "allow_live": False, "data_feed": "iex", "options_feed": "indicative"},
-    "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
+    "broker": {"paper": True, "allow_live": False, "data_feed": "sip", "options_feed": "opra"},
+    "session": {"timezone": "America/New_York", "entries_regular_session_only": True, "allow_exits_outside_session": True, "require_exact_calendar": True, "force_flat_minutes_before_close": 10, "reject_new_entries_minutes_before_close": 5},
     "universe": {"symbols": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV"], "asset_classes": ["us_equity", "us_option"], "min_price": 1.0, "max_symbols": 50, "denylist": []},
     "strategy": {"id": "rule", "version": "v1", "variant_id": "auto", "selection_mode": "all_proved", "pinned": [], "execution_mode": "shares", "range_minutes": 15, "breakout_buffer_bps": 5, "min_relative_volume": 1.0, "target_r": 2.0, "max_entry_extension_r": 1.0, "min_ibr_width_atr": 0.25, "max_ibr_width_atr": 3.0, "atr_period": 14, "max_spread_bps": 25.0, "stale_minutes": 60, "latest_entry_time": "15:00", "force_flat_minutes_before_close": 10},
     "risk": {"risk_per_trade_pct": 0.5, "daily_loss_limit_pct": 2.0, "max_open_risk_pct": 2.0, "max_concurrent_positions": 3, "max_position_notional_pct": 25.0, "options_min_dte": 7, "options_max_dte": 60, "options_max_spread_pct": 10.0, "min_confidence": 0.0},
     "execution": {"order_type": "market", "time_in_force": "day", "client_order_id_prefix": "edge", "max_slippage_bps": 50, "max_market_data_age_seconds": 30, "max_spread_bps": 100},
+    "costs": {"spread_bps": 4.0, "slippage_bps": 6.0, "fee_bps": 0.5,
+              "option_fee_per_contract_side": 0.65,
+              "provenance": "shipped_conservative_v1_plus_25bps_stress"},
     # Runtime rule execution stays deterministic.  The separate decision-LLM
     # boundary remains disabled unless explicitly enabled.
     "llm": {"enabled": False, "provider": "openai", "model": "", "temperature": 0.2, "max_tokens": 2000, "timeout_seconds": 10.0},
@@ -144,8 +150,19 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         if "options_feed" in data:
             data["options_feed"] = _feed(data["options_feed"], options=True)
         out["data"] = data
+        # ``data`` is the legacy alias accepted by provider callers. Respect
+        # it when broker did not explicitly choose a feed; otherwise the
+        # merged broker defaults would silently mask an indicative override.
+        raw_broker = cfg.get("broker")
+        raw_broker = raw_broker if isinstance(raw_broker, Mapping) else {}
+        if ("feed" in data and "data_feed" not in raw_broker and
+                not (os.getenv("ALPACA_DATA_FEED") or os.getenv("ALPACA_STOCK_FEED"))):
+            broker["data_feed"] = data["feed"]
+        if ("options_feed" in data and "options_feed" not in raw_broker and
+                not os.getenv("ALPACA_OPTIONS_FEED")):
+            broker["options_feed"] = data["options_feed"]
     session = _map(out.get("session"), "session")
-    _unknown(session, {"timezone", "entries_regular_session_only", "allow_exits_outside_session", "force_flat_minutes_before_close", "reject_new_entries_minutes_before_close"}, "session")
+    _unknown(session, {"timezone", "entries_regular_session_only", "allow_exits_outside_session", "require_exact_calendar", "force_flat_minutes_before_close", "reject_new_entries_minutes_before_close"}, "session")
     if session.get("timezone") != "America/New_York":
         raise ConfigError("session.timezone must be America/New_York")
     session["entries_regular_session_only"] = _bool(session, "entries_regular_session_only", "session", True)
@@ -154,6 +171,8 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         raise ConfigError("session.entries_regular_session_only must be true")
     if session["allow_exits_outside_session"] is not True:
         raise ConfigError("session.allow_exits_outside_session must be true")
+    session["require_exact_calendar"] = _bool(
+        session, "require_exact_calendar", "session", True)
     session["force_flat_minutes_before_close"] = _int(session, "force_flat_minutes_before_close", "session", 1, 240, 10)
     session["reject_new_entries_minutes_before_close"] = _int(session, "reject_new_entries_minutes_before_close", "session", 0, 240, 5)
     out["session"] = session
@@ -185,6 +204,25 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     except ValueError as exc:
         raise ConfigError(f"universe.denylist: {exc}") from exc
     out["universe"] = universe
+
+    # Autonomous research and execution require the complete entitled feeds.
+    # IEX/indicative remain valid only for explicitly non-research, equity-only
+    # diagnostics; they are never allowed to become runtime evidence for a
+    # configured research or option lane.
+    research_requested = bool(
+        isinstance(out.get("research"), Mapping)
+        and out.get("research", {}).get("enabled", True))
+    option_lane = any(str(item).lower() in {"us_option", "option", "options"}
+                      for item in universe["asset_classes"])
+    if research_requested and broker["data_feed"] != "sip":
+        raise ConfigError(
+            "research.enabled requires the SIP equity feed entitlement; "
+            "set broker.data_feed=\"sip\" or ALPACA_DATA_FEED=sip")
+    if (option_lane and research_requested and
+            broker["options_feed"] != "opra"):
+        raise ConfigError(
+            "option research requires the OPRA feed entitlement; "
+            "set broker.options_feed=\"opra\" or ALPACA_OPTIONS_FEED=opra")
 
     strategy = _map(out.get("strategy"), "strategy")
     _unknown(strategy, {"id", "version", "variant_id", "selection_mode", "execution_mode", "rule_spec", "pinned", "range_minutes", "breakout_buffer_bps", "min_relative_volume", "target_r", "max_entry_extension_r", "min_ibr_width_atr", "max_ibr_width_atr", "atr_period", "max_ibr_width_pct", "max_spread_bps", "stale_minutes", "latest_entry_time", "force_flat_minutes_before_close"}, "strategy")
@@ -225,6 +263,11 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         session["force_flat_minutes_before_close"])
     if strategy["min_ibr_width_atr"] > strategy["max_ibr_width_atr"]:
         raise ConfigError("strategy.min_ibr_width_atr cannot exceed max_ibr_width_atr")
+    if (str(strategy.get("execution_mode", "shares")).lower() in {"options", "option"}
+            and broker["options_feed"] != "opra"):
+        raise ConfigError(
+            "option execution requires the OPRA feed entitlement; "
+            "set broker.options_feed=\"opra\" or ALPACA_OPTIONS_FEED=opra")
     latest_entry_time = strategy.get("latest_entry_time")
     if (not isinstance(latest_entry_time, str) or
             re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", latest_entry_time) is None):
@@ -261,7 +304,11 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
     if not isinstance(execution.get("client_order_id_prefix", "ibr"), str) or not execution["client_order_id_prefix"]:
         raise ConfigError("execution.client_order_id_prefix must be non-empty")
     execution["max_slippage_bps"] = _num(execution, "max_slippage_bps", "execution", 0, 10_000, 50)
-    execution["max_market_data_age_seconds"] = _num(execution, "max_market_data_age_seconds", "execution", 1, 3600, 30)
+    # A quote older than one recorder cycle is not an executable authorization
+    # boundary.  Lower values are valid for stricter deployments; relaxing
+    # beyond thirty seconds would let research and runtime disagree.
+    execution["max_market_data_age_seconds"] = _num(
+        execution, "max_market_data_age_seconds", "execution", 1, 30, 30)
     execution["max_spread_bps"] = _num(execution, "max_spread_bps", "execution", 0, 10_000, 100)
     out["execution"] = execution
 
@@ -271,14 +318,27 @@ def validate_config(raw: Mapping[str, Any]) -> dict:
         # only makes the block reachable from the checked-in configuration
         # instead of a --config JSON override, and fails closed on its errors.
         from research.costs import CostError, CostModel
+        raw_costs = _map(costs, "costs")
+        explicit_costs = (_map(cfg.get("costs"), "costs")
+                          if "costs" in cfg else None)
+        model_costs = dict(raw_costs)
+        # Once an operator changes any cost input, the shipped schedule's
+        # provenance label is no longer truthful unless they explicitly name
+        # their replacement calibration/source.
+        if explicit_costs is not None and "provenance" not in explicit_costs:
+            model_costs["provenance"] = "config"
         try:
-            model = CostModel.from_config({"costs": _map(costs, "costs"),
+            model = CostModel.from_config({"costs": model_costs,
                                            "execution": execution})
         except CostError as exc:
             raise ConfigError(f"costs: {exc}") from exc
-        out["costs"] = {"spread_bps": model.spread_bps,
-                        "slippage_bps": model.slippage_bps,
-                        "fee_bps": model.fee_bps}
+        normalized_costs = {"spread_bps": model.spread_bps,
+                            "slippage_bps": model.slippage_bps,
+                            "fee_bps": model.fee_bps,
+                            "option_fee_per_contract_side":
+                                model.option_fee_per_contract_side,
+                            "provenance": model.provenance}
+        out["costs"] = normalized_costs
 
     llm = _map(out.get("llm"), "llm")
     _unknown(llm, {"enabled", "provider", "model", "temperature", "max_tokens", "timeout_seconds", "base_url"}, "llm")

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from research import edge_discovery_core, gates
 from research.edge_ledger import EdgeLedger
 from research.live_shadow import ShadowStore
 from research.factory_ledger import FactoryLedger
@@ -20,6 +21,31 @@ from tests.research.test_edge_discovery import _persist_gate
 
 class LiveShadowIngestTests(unittest.TestCase):
     def setUp(self):
+        # Ingestion/tamper behavior is the subject of this fixture.  Production
+        # promotion still requires 30 clusters and is covered separately; the
+        # compact eight-session tail keeps these boundary tests fast.
+        self.cluster_floor = patch.object(
+            edge_discovery_core, "MIN_PROMOTION_CLUSTERS", 1)
+        self.cluster_floor.start()
+        self.addCleanup(self.cluster_floor.stop)
+        # This module exercises replay/idempotency boundaries with an
+        # eight-session tail.  Explicitly lower every immutable protocol
+        # constant in this test-only context; production code and the CLI
+        # never expose this patch seam.
+        self.compact_protocol = patch.multiple(
+            gates,
+            PROTOCOL_BACKTEST_MIN_TRADES=1,
+            PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+            PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+            PROTOCOL_SHADOW_MIN_TRADES=1,
+            PROTOCOL_SHADOW_MIN_SESSIONS=1,
+            PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+            PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+            PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+            PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1,
+        )
+        self.compact_protocol.start()
+        self.addCleanup(self.compact_protocol.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.edge_path = root / "edge.sqlite3"
@@ -40,7 +66,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _rows(self, cid, values, *, status="match"):
-        sessions = [f"2024-02-{day:02d}" for day in range(1, 9)]
+        sessions = [f"2024-04-{day:02d}" for day in range(1, 9)]
         for session, value in zip(sessions, values):
             row = {"vehicle": "equity", "symbol": "SPY",
                    "session_date": session,
@@ -48,7 +74,17 @@ class LiveShadowIngestTests(unittest.TestCase):
                    # candidate, baseline, and null books therefore pair on
                    # the exact same observation.
                    "opportunity_id": f"equity:SPY:{session}",
-                   "net_pnl": float(value), "return_value": float(value)}
+                   "net_pnl": float(value), "return_value": float(value),
+                   "no_trade": False, "entry_price": 100.0,
+                   "exit_price": 100.1, "quantity": 1.0,
+                   "multiplier": 1.0, "stop_distance": 1.0,
+                   "risk_usd": 10.0,
+                   "entry_fill_source": "quote",
+                   "exit_fill_source": "quote",
+                   "entry_feed": "sip", "exit_feed": "sip",
+                   "entry_provider": "alpaca", "exit_provider": "alpaca",
+                   "entry_quote_age_seconds": 0.0,
+                   "exit_quote_age_seconds": 0.0}
             digest = f"source:{cid}:{session}"
             replay = f"replay:{cid}:{session}"
             self.store.replay_diff(
@@ -65,10 +101,18 @@ class LiveShadowIngestTests(unittest.TestCase):
                         replay_status=status)
 
     def _row(self, cid, day, value, *, status="match"):
-        session = f"2024-02-{day:02d}"
+        session = f"2024-04-{day:02d}"
         row = {"vehicle": "equity", "symbol": "SPY", "session_date": session,
                "opportunity_id": f"equity:SPY:{session}", "net_pnl": float(value),
-               "return_value": float(value)}
+               "return_value": float(value), "no_trade": False,
+               "entry_price": 100.0, "exit_price": 100.1,
+               "quantity": 1.0, "multiplier": 1.0,
+               "stop_distance": 1.0, "risk_usd": 10.0,
+               "entry_fill_source": "quote", "exit_fill_source": "quote",
+               "entry_feed": "sip", "exit_feed": "sip",
+               "entry_provider": "alpaca", "exit_provider": "alpaca",
+               "entry_quote_age_seconds": 0.0,
+               "exit_quote_age_seconds": 0.0}
         replay = f"replay:{cid}:{session}"
         self.store.replay_diff(
             candidate_id=cid, session_date=session,
@@ -89,7 +133,7 @@ class LiveShadowIngestTests(unittest.TestCase):
         self._rows(f"shadow:null:{cid}", [-1.0] * 8)
         result = ingest_shadow(ShadowIngestConfig(
             self.edge_path, self.shadow_path, min_trades=1, min_sessions=1))
-        self.assertEqual(result["ingested"], 1)
+        self.assertEqual(result["ingested"], 1, result)
         row = self.ledger.candidate(cid)
         self.assertEqual(row["status"], "validated")
         runs = self.ledger.runs(cid, lane="shadow")

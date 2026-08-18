@@ -99,6 +99,10 @@ class SemanticNearDuplicateTests(unittest.TestCase):
 
     def test_current_cycle_llm_alias_is_rejected(self):
         root = validate_rule_spec(family_template("momentum_continuation"))
+        # These broad-grammar values are deliberately outside the current
+        # deterministic coordinate neighborhood.  Model tuning is now a
+        # search-order aid over that finite preregistered pool, not a second
+        # uncounted hypothesis generator.
         first = dict(root, lookback=30)
         second = dict(root, lookback=31)
         chosen, proposal = _tuned_variants(
@@ -109,8 +113,9 @@ class SemanticNearDuplicateTests(unittest.TestCase):
             adapter=_TuningAdapter([first, second]), existing_specs=[])
         self.assertTrue(proposal.success)
         self.assertEqual(len(chosen), 4)
-        self.assertEqual([item.source for item in chosen].count("llm"), 1)
-        self.assertEqual([item.rule_spec for item in chosen].count(first), 1)
+        self.assertEqual([item.source for item in chosen].count("llm"), 0)
+        self.assertNotIn(first, [item.rule_spec for item in chosen])
+        self.assertNotIn(second, [item.rule_spec for item in chosen])
 
     def test_near_duplicate_llm_falls_back_to_complete_deterministic_ladder(self):
         root = validate_rule_spec(family_template("momentum_continuation"))

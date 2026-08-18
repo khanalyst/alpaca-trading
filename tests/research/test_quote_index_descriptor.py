@@ -3,10 +3,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from deploy.research_dataset import build_views
 from research.costs import SQLiteQuoteIndex, quote_fill
 from research.edge_discovery_core import DiscoveryError
+import research.gates as gates
+import research.strategy_factory as factory_module
 from research.strategy_factory import run_factory
 from research.market_data import normalize_quote
 
@@ -99,10 +102,26 @@ class QuoteIndexDescriptorTests(unittest.TestCase):
                 encoding="utf-8")
             replay = root / "replay.jsonl"
             replay.write_text(full.read_text().splitlines()[0] + "\n", encoding="utf-8")
-            with self.assertRaises(DiscoveryError):
-                run_factory(full, worker_data=replay, db_path=root / "factory.sqlite3",
-                            strategies=1, variants_per_strategy=2, workers=1,
-                            min_trades=1, min_sessions=1, alpha=1.0)
+            # Reach the source-descriptor validation before the compact fixture
+            # is rejected for having fewer authorization samples than the
+            # immutable production floors.
+            with patch.multiple(
+                    gates,
+                    PROTOCOL_BACKTEST_MIN_TRADES=1,
+                    PROTOCOL_BACKTEST_MIN_SESSIONS=1,
+                    PROTOCOL_BACKTEST_MIN_CLUSTERS=1,
+                    PROTOCOL_SHADOW_MIN_TRADES=1,
+                    PROTOCOL_SHADOW_MIN_SESSIONS=1,
+                    PROTOCOL_SHADOW_MIN_CLUSTERS=1,
+                    PROTOCOL_QUALIFICATION_MIN_TRADES=1,
+                    PROTOCOL_QUALIFICATION_MIN_SESSIONS=1,
+                    PROTOCOL_QUALIFICATION_MIN_CLUSTERS=1), \
+                    patch.object(factory_module, "MIN_PROMOTION_CLUSTERS", 1), \
+                    self.assertRaises(DiscoveryError):
+                run_factory(full, worker_data=replay,
+                            db_path=root / "factory.sqlite3", strategies=1,
+                            variants_per_strategy=2, workers=1, min_trades=1,
+                            min_sessions=1, alpha=1.0)
 
 
 if __name__ == "__main__":

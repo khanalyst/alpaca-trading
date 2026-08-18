@@ -57,8 +57,9 @@ can do to shorten the wait.
 - An Alpaca account (paper access is free).
 - An Ubuntu LTS x86-64 VM: 4 vCPUs, 8 GB RAM, 40 GB+ disk.
 - Comfort with SSH and a terminal. You do not need to read Python.
-- Optionally, an OpenAI or Anthropic API key for LLM-driven discovery. The
-  system works without one; discovery falls back to a deterministic search.
+- A separate readable OpenAI or Anthropic provider secret for the enabled
+  research LLM lane. The research cycle fails closed before discovery when
+  this secret is absent, unreadable, or missing the configured provider key.
 
 Do not start with live credentials. Live mode is an optional, separately
 guarded step at the very end.
@@ -73,10 +74,10 @@ guarded step at the very end.
    is the most common place to go wrong.
 3. Generate a paper API key and secret.
 4. Save both immediately in a password manager. **The secret is shown once.**
-5. Note which data feed your account is entitled to. This project defaults to
-   `iex` for stocks and `indicative` for options — both available on the free
-   tier. Use `sip` or `opra` only if your account actually has them; requesting
-   an unentitled feed fails at the first authenticated call.
+5. Confirm that the paper account has SIP equity and OPRA option entitlements.
+   These are the supported defaults and required feeds for autonomous research
+   and executable option evidence; requesting an unentitled feed fails at the
+   first authenticated call.
 6. Do not configure crypto. This repository accepts US equity/ETF underlyings
    and listed OCC option contracts only, and rejects everything else.
 
@@ -86,7 +87,7 @@ Official references:
 - [Alpaca authentication and API domains](https://docs.alpaca.markets/us/docs/authentication)
 - [Alpaca option-chain feeds](https://docs.alpaca.markets/us/reference/optionchain)
 
-**Checkpoint:** you have a paper key, a paper secret, and you know your feed.
+**Checkpoint:** you have a paper key and secret plus SIP and OPRA entitlements.
 
 ## 2. Create the VM
 
@@ -165,26 +166,28 @@ Enter only the paper credentials and selected feeds:
 ALPACA_API_KEY=<paper-api-key>
 ALPACA_SECRET_KEY=<paper-api-secret>
 ALPACA_PAPER=true
-ALPACA_DATA_FEED=iex
-ALPACA_STOCK_FEED=iex
-ALPACA_OPTIONS_FEED=indicative
+ALPACA_LIVE_ENABLE=false
+ALPACA_DATA_FEED=sip
+ALPACA_STOCK_FEED=sip
+ALPACA_OPTIONS_FEED=opra
 ```
 
 Never put live credentials in this file. Never commit it. In your Alpaca
 account, use trading permissions only and keep withdrawals disabled.
 
-## 6. Optionally configure the research LLM
+## 6. Configure the enabled research LLM
 
-The LLM's job here is narrow and worth understanding before you enable it:
+The research LLM is enabled in the checked configuration. Its job here is
+narrow and worth understanding:
 
 - It **proposes** new rule specs — new hypotheses for free research slots, and
   replacements for families that have failed.
 - It **cannot** write code, place an order, or shorten the evidence path. Its
   proposals enter the ledger as `queued` and must pass exactly the same gates a
   deterministic hypothesis faces.
-- If you skip this step, keep `research.strategy_llm.enabled: false`; discovery
-  uses deterministic search over the same grammar. Enabling the model lane
-  without its provider key fails the research cycle before discovery.
+- The provider secret is a prerequisite, not an optional enhancement. If it is
+  absent, unreadable, or missing the selected provider key, the research cycle
+  fails closed before discovery.
 
 Create a **separate** provider-only secret — Alpaca credentials must never
 appear in it:
@@ -207,9 +210,10 @@ ANTHROPIC_API_KEY=<research-provider-key>
 ```
 
 The model is set in `config.yaml` under `research.strategy_llm.model` and
-defaults to `gpt-5`. Set `research.strategy_llm.enabled` to `true` only after
-the provider secret is installed. Set `research.strategy_llm.provider` to
-`anthropic` if you supplied an Anthropic key.
+defaults to `gpt-5`; leave `research.strategy_llm.enabled: true`. Set
+`research.strategy_llm.provider` to `anthropic` if you supplied an Anthropic
+key. Compose mounts this file separately and systemd reads it through
+`ALPACA_RESEARCH_LLM_SECRETS_FILE`; never put provider keys in `agent.env`.
 
 Treat a custom provider base URL as a secret-bearing outbound destination.
 `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` receives the provider key and bounded
@@ -250,26 +254,32 @@ rates still require sufficient history. Floor feasibility fails closed when the
 100-trade floor cannot be supported; widen history and/or `universe.symbols`,
 never lower the floor. Keep them US equity/ETF symbols.
 
-**`strategy.execution_mode`** picks one profile per trader process:
+**`strategy.execution_mode`** picks one execution profile per trader process:
 
 - `shares` trades proved equity variants;
 - `options` selects single-leg long listed options for proved option variants.
 
-Research now studies only the vehicle your profile can trade, so this also
-decides what gets researched. `options` is paper-only — see step 11.
+The trader remains on the `shares` profile by default. Research is vehicle
+complete by default (`ALPACA_RESEARCH_VEHICLES=all`), so it evaluates equity
+and option evidence independently even while runtime execution stays on
+`shares`. Option research is evidence generation, not permission to submit
+option orders; selecting `options` is a separate, paper-only runtime decision
+after OPRA evidence and controls are reviewed.
 
-`validate_config` also accepts an optional top-level `costs` block
-(`spread_bps`, `slippage_bps`, `fee_bps`) — the expected per-fill cost every
-research lane prices its simulated fills through, built by
-`research/costs.py::CostModel.from_config`. It defaults to 2.0/3.0/0.5 bps when
-the block is absent. These are expectations, not rejection caps, and the
-`execution` block bounds them: a model whose expected half-spread plus
-slippage exceeds `execution.max_slippage_bps`, or whose expected spread exceeds
+`validate_config` reads one top-level `costs` block
+(`spread_bps`, `slippage_bps`, `fee_bps`, and the option fee) for every research
+lane. The shipped values are 4 bps spread, 6 bps adverse slippage, 0.5 bps
+per-side notional fee, and a 0.65 currency-unit option fee per contract per
+side. These are expectations, not rejection caps, and the `execution` block
+bounds them: a model whose expected half-spread plus slippage exceeds
+`execution.max_slippage_bps`, or whose expected spread exceeds
 `execution.max_spread_bps`, fails validation rather than simulating fills the
-runtime would refuse to submit. Sourcing an expected slippage from the cap is
-as wrong as ignoring the cap. **Leave the block out** unless you have measured
-values; `python research.py calibrate` (see OPERATIONS.md) is how they are
-checked against real fills.
+runtime would refuse to submit. Preregistered all-in stress scenarios are 9,
+15, 25, and 50 bps; 25 bps is the authorization requirement. `python
+research.py calibrate` (see OPERATIONS.md) is an authorization check against
+real entry and exit fills, including terminal underfill/partial-cancel evidence.
+Missing, stale, or insufficient calibration blocks shadow authorization while
+leaving offline discovery/factory diagnostics available.
 
 ## 8. Export deployment paths and validate Compose
 
@@ -282,18 +292,15 @@ export ALPACA_AGENT_SECRET_FILE=/etc/alpaca-agent-trading/agent.env
 export ALPACA_RESEARCH_LLM_SECRET_FILE=/etc/alpaca-agent-trading/research-llm.env
 ```
 
-If you skipped step 6, omit the second export.
-
 Validate and build:
 
 ```bash
 docker compose config --quiet
-docker compose --profile research config --quiet
 docker compose build
 ```
 
-**Expected:** the two `config` commands print nothing (that is success), and
-the build completes.
+**Expected:** `config` prints nothing (that is success), and the build
+completes.
 
 **If `docker compose config` errors** about a missing file, one of the two
 exports above is unset or points at a path that does not exist. Any validation
@@ -399,7 +406,7 @@ recorder's first live cycle resumes cleanly from a completed session boundary.
 ## 11. Start recording market data
 
 ```bash
-docker compose up -d recorder dashboard
+docker compose up -d
 docker compose ps
 docker compose logs --tail=100 recorder
 ```
@@ -407,11 +414,12 @@ docker compose logs --tail=100 recorder
 **Expected:** `recorded N Alpaca rows to ...` roughly once a minute during
 market hours, and the recorder's health turning healthy.
 
-Outside market hours the recorder is quiet — this is normal. Coverage is judged
-against the Alpaca calendar, so holidays and early closes are silent. Intraday
-bar gaps are retained as per-symbol index and health evidence rather than being
-treated as automatic corpus corruption; replay gates still refuse a gap where
-the strategy actually needs adjacent bars.
+Outside market hours the recorder is quiet — this is normal. Coverage and
+session cutoffs use the exact Alpaca calendar, so holidays and early closes are
+silent and a missing calendar day is never promoted to a fixed 16:00 close.
+Intraday bar gaps are retained as per-symbol index and health evidence rather
+than being treated as automatic corpus corruption; replay gates still refuse a
+gap where the strategy actually needs adjacent bars.
 
 The recorder writes one append-only partition per New York session date under
 `runtime/research/recorded/sessions/`, with a sidecar `.recorder-index.json`
@@ -486,13 +494,13 @@ forces a close before the session ends.
 Start the scheduled research service:
 
 ```bash
-docker compose --profile research up -d research
+docker compose up -d
 ```
 
 It runs daily at 03:00 UTC. To run one cycle immediately:
 
 ```bash
-docker compose --profile research run --rm research \
+docker compose run --rm research \
   /bin/bash deploy/research-cycle.sh
 ```
 
@@ -527,13 +535,13 @@ use it merely to hide malformed older data or to lower the configured floors.
 The scheduled cycle runs `edge ingest-shadow` by default when
 `ALPACA_SHADOW_INGEST_ENABLED=1`; a missing shadow WAL is a harmless no-op. The
 offline cycle may produce a passing `lane=shadow` candidate, but that status is
-only forward-stability evidence. Start the optional broker-free live lane and
-then ingest its complete parity-matched sessions before validation/champion
-selection can authorize the trader:
+only forward-stability evidence. The broker-free live lane starts with the
+plain Compose deployment and must ingest complete parity-matched sessions before
+validation/champion selection can authorize the trader:
 
 ```bash
-docker compose --profile shadow up -d shadow
-docker compose --profile research run --rm research \
+docker compose up -d
+docker compose run --rm research \
   python research.py edge ingest-shadow
 ```
 
@@ -548,21 +556,42 @@ is appended. Historical and offline-forward selection explicitly defers this
 cumulative test; it cannot consume the budget or authorize deployment. Manual/
 offline promotion cannot bypass it.
 
+Authorizing fill quality is point-in-time and provenance-bound: equity entry and
+exit legs must use SIP quotes, option entry and exit legs must use OPRA quotes,
+and every leg must retain provider, feed, source, and quote age no older than
+30 seconds. Bar-only, partial-feed, missing, or stale legs remain diagnostic and
+cannot authorize a proof.
+
 ### How much data a first proof actually needs
 
-The bare structural floor is 100 executed trades and 10 sessions per required
-window (`ALPACA_FACTORY_MIN_TRADES`, `ALPACA_FACTORY_MIN_SESSIONS`), but those
-floors apply to windows that are themselves fractions of the corpus:
+The authorizing floors are immutable and cannot be lowered by environment
+overrides:
+
+| Evidence window | Minimum |
+| --- | --- |
+| Backtest/factory fit and held-out | 100 executed trades, 30 complete sessions, 30 session clusters |
+| Sealed qualification | 100 executed trades, 30 complete sessions, 30 session clusters |
+| Parity-matched live shadow | 150 executed trades, 30 complete sessions (and its required session clusters) |
+
+`ALPACA_FACTORY_MIN_TRADES` and `ALPACA_FACTORY_MIN_SESSIONS` only select the
+shipped-compatible worker settings; they cannot weaken these protocol floors.
+The development windows are themselves fractions of the corpus:
+
+Inference preserves serial dependence with a deterministic, seeded moving-block
+bootstrap over chronological day/session clusters. Reports persist the draw
+count, seed, and block length. Effective breadth is a persisted and
+re-verified diagnostic over matched symbol/session deltas; it never counts as
+extra independent observations or raises the trade/session N.
 
 - the latest 20% of sessions are sealed into a final qualification window
   before any worker runs, leaving 80% as development corpus;
 - the development corpus is cut chronologically into a 70% fit and 30%
   held-out partition, by whole sessions;
-- **both** partitions must clear the floor, and the held-out one binds: 10
-  held-out sessions out of a 70/30 split needs about 31 development sessions,
-  which after the 20% seal needs about 38 recorded sessions **with trades**;
+- **both** partitions must clear the floor, and the held-out one binds: 30
+  held-out sessions out of a 70/30 split needs about 100 development sessions,
+  plus a later sealed qualification window of at least 30 sessions;
 - the offline forward-shadow evaluation is a second, strictly later corpus,
-  sealed the same way, needing about 12 further sessions of its own; live
+  sealed the same way, needing at least 30 complete sessions of its own; live
   ShadowRunner ingestion then needs a still-newer complete parity-matched tail;
 - walk-forward needs a fit block plus three test blocks;
 - the falsification gate is an empirical p-value against cluster-level
@@ -573,9 +602,9 @@ floors apply to windows that are themselves fractions of the corpus:
 
 The trade floors bind separately — 100 executed trades in each partition — and
 the arithmetic above assumes every session produces trades, which no strategy
-does. **Treat "about fifty trading sessions before a first proof is even
-possible" as a floor on patience, not a schedule.** This is why step 10 and a
-wider `universe.symbols` matter so much.
+does. Treat the resulting multi-month corpus requirement as a floor on
+patience, not a schedule. This is why step 10 and a wider `universe.symbols`
+matter so much.
 
 Those are development/promotion floors. Complete statistical rejection is
 stricter: each variant also needs at least 30 held-out sessions, a 95%
@@ -584,9 +613,13 @@ negative rolling-forward windows. Until then the report says `underpowered` or
 `adequate_negative_inconclusive`; it does not call the edge disproved.
 
 Live shadow requires at least 150 trades across 30 complete, parity-matched
-sessions. A proved paper edge is reviewed only after 100 live trades across 30
-sessions. These defaults make rejection and deployment decisions span market
-sessions rather than a handful of fills.
+sessions. A separate paper trial is reviewed only after its configured 100
+trades across 30 sessions. Replay epoch 3 additionally requires a stop of at
+least 30 bps for both the rule and IBR paths, a recomputable risk unit that
+covers round-trip costs, and executable quote/snapshot fill-quality evidence;
+older-epoch evidence is quarantined until replayed. These defaults make
+rejection and deployment decisions span market sessions rather than a handful
+of fills.
 
 ## 14. Read the reports
 
@@ -596,7 +629,7 @@ This is where you watch the system think. Run these from
 ### The one command that answers most questions
 
 ```bash
-docker compose --profile research run --rm research \
+docker compose run --rm research \
   python research.py factory report
 ```
 
@@ -702,8 +735,8 @@ ssh -L 8080:127.0.0.1:8080 <vm-user>@<vm-address>
 
 Then open `http://127.0.0.1:8080`. It shows trader and recorder health, the
 research scheduler's last cycle, the proved-edges table with promotion
-confidence, a **live paper results by edge** table, and — if your profile
-changed — a count of proved edges the current profile cannot trade.
+confidence, a **live paper results by edge** table, and a count of proved
+option edges that the default `shares` runtime cannot execute.
 
 The dashboard is read-only and localhost-bound. It is an observation aid, not
 an execution console.
@@ -735,7 +768,7 @@ docker compose ps
 docker compose logs --tail=100 recorder
 docker compose logs --tail=100 trader
 docker compose logs --tail=100 watchdog
-docker compose --profile research logs --tail=100 research
+docker compose logs --tail=100 research
 ```
 
 For an operator-requested exit:
@@ -853,8 +886,8 @@ place.
 | `docker compose config` errors | Missing export | Re-run step 8. |
 | Watchdog says `acted` | It flattened a stale trader's positions | Reconcile per OPERATIONS.md before restarting. |
 | Recorder health lists `bar_gap_symbols` | Sparse feed coverage or a real hole inside a session | Compare the exact index gap with the provider; let research adjacency gates decide usability. Do not delete the corpus. |
-| Dashboard shows "proved but untradeable" > 0 | Edges proved under a different `execution_mode` | Expected after a profile change; harmless. |
-| LLM proposals never appear in the report | No provider key, or proposals rejected | Check step 6; the report shows rejection reasons. |
+| Dashboard shows "proved but untradeable" > 0 | Research evaluates both vehicles while runtime execution is `shares` | Expected for option evidence; select the paper `options` profile only after reviewing controls. |
+| LLM proposals never appear in the report | The required research provider secret is absent/unreadable, or proposals were rejected | Check the separately mounted `research-llm.env` from step 6 and the report's rejection reasons; the cycle fails closed before discovery when the secret is invalid. |
 
 ---
 

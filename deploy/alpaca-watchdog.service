@@ -10,7 +10,11 @@ Group=alpaca
 WorkingDirectory=/opt/alpaca-agent-trading
 EnvironmentFile=-/etc/alpaca-agent-trading/agent.env
 Environment=ALPACA_PAPER=true
+Environment=ALPACA_LIVE_ENABLE=false
 Environment=ALPACA_AGENT_SECRETS_FILE=/etc/alpaca-agent-trading/agent.env
+Environment=ALPACA_DATA_FEED=sip
+Environment=ALPACA_STOCK_FEED=sip
+Environment=ALPACA_OPTIONS_FEED=opra
 ExecStart=/opt/alpaca-agent-trading/.venv/bin/python /opt/alpaca-agent-trading/deploy/watchdog.py \
   --config config.yaml --interval 30 --max-heartbeat-age 300
 Restart=on-failure

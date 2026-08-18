@@ -144,6 +144,23 @@ class ExecutionLifecycleMixin:
         if status == "filled" and filled_qty <= 0:
             filled_qty = float(request.qty)
         fill_price = self._number(getattr(order, "filled_avg_price", None))
+        profile = str(risk_plan.get("execution_profile", "shares") or "shares").lower()
+        vehicle = "option" if profile in {"option", "options"} else "equity"
+        option = risk_plan.get("option") if isinstance(risk_plan.get("option"), Mapping) else {}
+        # These are plan-time values, not reconstructed from any observed
+        # fill.  Options are priced in their own premium unit; the underlying
+        # entry price is retained separately on the active trade.
+        reference = (risk_plan.get("reference_price")
+                     or risk_plan.get("entry_reference")
+                     or (option.get("debit") if profile == "options" else None)
+                     or risk_plan.get("entry_price"))
+        planned_qty = self._number(risk_plan.get("planned_qty"))
+        if planned_qty is None:
+            planned_qty = self._number(request.qty)
+        requested_qty = self._number(request.qty)
+        market_price = (self._number(risk_plan.get("market_price"))
+                        or self._number(risk_plan.get("mid_price")))
+        mid_price = self._number(risk_plan.get("mid_price"))
         order_state = {
             "order_id": order_id, "symbol": symbol, "status": status,
             "client_order_id": request.client_order_id, "qty": str(request.qty),
@@ -152,9 +169,16 @@ class ExecutionLifecycleMixin:
             "time_in_force": request.time_in_force,
             "position_intent": request.position_intent,
             "order_class": request.order_class,
+            "execution_profile": profile, "vehicle": vehicle,
+            "variant_id": risk_plan.get("variant_id"),
+            "reference_price": self._number(reference),
+            "entry_reference": self._number(risk_plan.get("entry_reference") or reference),
+            "exit_reference": self._number(risk_plan.get("exit_reference")),
+            "market_price": market_price, "mid_price": mid_price,
+            "requested_qty": requested_qty, "planned_qty": planned_qty,
             "protective_legs": _protective_legs(getattr(order, "legs", ())),
             "risk_plan": _plain(risk_plan), "fill_logged": False,
-            "logged_filled_qty": 0.0,
+            "logged_filled_qty": 0.0, "logged_filled_avg_price": None,
             "updated_ts": time.time(),
         }
         def update(current: dict) -> dict:
@@ -166,7 +190,19 @@ class ExecutionLifecycleMixin:
         current = state.update_state(update)
         state.log_order(order, request, action="submit", run_id=self.run_id,
                         runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
-                        setup_id=risk_plan.get("setup_id"))
+                        setup_id=risk_plan.get("setup_id"),
+                        execution_profile=profile, vehicle=vehicle,
+                        variant_id=risk_plan.get("variant_id"),
+                        reference_price=self._number(reference),
+                        entry_reference=self._number(risk_plan.get("entry_reference") or reference),
+                        exit_reference=self._number(risk_plan.get("exit_reference")),
+                        market_price=market_price, mid_price=mid_price,
+                        requested_qty=requested_qty, planned_qty=planned_qty,
+                        cumulative_filled_qty=filled_qty,
+                        fill_fraction=(filled_qty / requested_qty
+                                       if requested_qty and requested_qty > 0 else None),
+                        filled_fraction=(filled_qty / requested_qty
+                                         if requested_qty and requested_qty > 0 else None))
         self._event("order_submitted", {"symbol": request.symbol, "qty": str(request.qty),
                                          "status": status, "filled_qty": filled_qty,
                                          "client_order_id": request.client_order_id,
@@ -182,6 +218,7 @@ class ExecutionLifecycleMixin:
         plan = plan if isinstance(plan, Mapping) else {}
         symbol = str(order_state.get("symbol", "")).upper()
         profile = str(plan.get("execution_profile", "shares"))
+        vehicle = "option" if profile.lower() in {"option", "options"} else "equity"
         underlying = str(plan.get("underlying_symbol") or
                          (symbol if profile == "shares" else "")).upper()
         direction = str(plan.get("direction") or
@@ -193,12 +230,102 @@ class ExecutionLifecycleMixin:
                 isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
         existing = current.get("active_trades", {}).get(symbol, {})
         existing = existing if isinstance(existing, Mapping) else {}
+        # The broker's ``filled_avg_price`` is cumulative.  Keep the last
+        # journaled average so an incremental row can be priced at the
+        # implied fill rather than at the new cumulative average.  This is
+        # important when fills arrive at different prices: summing the rows
+        # must still reproduce the actual weighted position economics.
+        logged_qty = self._number(order_state.get("logged_filled_qty")) or 0.0
+        logged_avg = self._number(order_state.get("logged_filled_avg_price"))
+        if logged_avg is None and logged_qty > 0:
+            logged_avg = self._number(existing.get("entry_price"))
+        if fill_price is None:
+            fill_price = self._number(existing.get("entry_price"))
+        if fill_price is None:
+            fill_price = self._number(
+                plan.get("option", {}).get("debit") if profile == "options" and
+                isinstance(plan.get("option"), Mapping) else plan.get("entry_price"))
+        instrument_entry = fill_price
+
+        if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
+            # Older state files used a boolean only; avoid duplicating their
+            # already-journaled fill during a rolling upgrade.
+            logged_qty = filled_qty
+        incremental_qty = max(0.0, filled_qty - logged_qty)
+        incremental_price = fill_price
+        if (incremental_qty > 0 and logged_qty > 0 and logged_avg is not None and
+                fill_price is not None):
+            # ``filled_avg_price`` is a quantity-weighted cumulative average.
+            # Recover the price represented by this increment while tolerating
+            # a contradictory broker snapshot by falling back to its reported
+            # cumulative price.
+            implied = ((fill_price * filled_qty) - (logged_avg * logged_qty)) / incremental_qty
+            if implied == implied and abs(implied) != float("inf"):
+                incremental_price = implied
+
+        multiplier = self._number(plan.get("contract_multiplier"))
+        multiplier = abs(multiplier) if multiplier is not None and multiplier > 0 else 1.0
+        requested_qty = (self._number(order_state.get("requested_qty"))
+                         or self._number(order_state.get("qty"))
+                         or self._number(plan.get("planned_qty")))
+        planned_qty = (self._number(order_state.get("planned_qty"))
+                       or requested_qty)
+        option = plan.get("option") if isinstance(plan.get("option"), Mapping) else {}
+        entry_reference = (self._number(plan.get("entry_reference"))
+                           or self._number(plan.get("reference_price"))
+                           or (self._number(option.get("debit")) if profile == "options" else None)
+                           or self._number(plan.get("entry_price")))
+        market_price = (self._number(plan.get("market_price"))
+                        or self._number(plan.get("mid_price")))
+        mid_price = self._number(plan.get("mid_price"))
+
+        def economics(quantity: float, price: float | None) -> tuple[float | None, float | None]:
+            """Return actual notional and opening risk for a filled quantity."""
+            if quantity <= 0:
+                return 0.0, 0.0
+            planned_qty = self._number(order_state.get("qty"))
+            ratio = (quantity / planned_qty if planned_qty and planned_qty > 0 else 1.0)
+            planned_notional = self._number(plan.get("notional"))
+            planned_risk = self._number(plan.get("risk_usd"))
+            notional = None
+            risk = None
+            if price is not None and price == price and abs(price) != float("inf"):
+                notional = abs(price) * quantity * multiplier
+                if profile == "options":
+                    # A long option's defined opening risk is the debit paid.
+                    risk = notional
+                else:
+                    stop = self._number(plan.get("underlying_stop_price",
+                                               plan.get("stop_price")))
+                    if stop is not None:
+                        risk = abs(price - stop) * quantity * multiplier
+            if notional is None and planned_notional is not None:
+                notional = planned_notional * ratio
+            if risk is None and planned_risk is not None:
+                risk = planned_risk * ratio
+            # Keep JSON/journal values stable when a cumulative average such
+            # as 101.2 implies a repeating binary float (11.000000000000014
+            # should remain the economically exact 11.0).
+            return (round(notional, 12) if notional is not None else None,
+                    round(risk, 12) if risk is not None else None)
+
+        cumulative_notional, cumulative_risk = economics(filled_qty, fill_price)
         trade = {
             "symbol": symbol, "underlying_symbol": underlying,
-            "execution_profile": profile, "direction": direction,
+            "execution_profile": profile, "vehicle": vehicle,
+            "direction": direction,
             "position_side": "long" if order_state.get("side") == "buy" else "short",
             "qty": str(filled_qty), "entry_price": instrument_entry,
             "underlying_entry_price": plan.get("entry_price"),
+            "requested_qty": requested_qty, "planned_qty": planned_qty,
+            "cumulative_filled_qty": filled_qty,
+            "fill_fraction": (filled_qty / requested_qty
+                              if requested_qty and requested_qty > 0 else None),
+            "filled_fraction": (filled_qty / requested_qty
+                                if requested_qty and requested_qty > 0 else None),
+            "reference_price": entry_reference, "entry_reference": entry_reference,
+            "exit_reference": self._number(plan.get("exit_reference")),
+            "market_price": market_price, "mid_price": mid_price,
             "opened_at": existing.get("opened_at", time.time()),
             "setup_type": plan.get("setup_type", "ibr"),
             "setup_id": plan.get("setup_id"), "order_id": order_state.get("order_id"),
@@ -208,8 +335,8 @@ class ExecutionLifecycleMixin:
             "max_hold_bars": plan.get("max_hold_bars", existing.get("max_hold_bars")),
             "hold_deadline_ts": plan.get("hold_deadline_ts",
                                          existing.get("hold_deadline_ts")),
-            "risk_usd": plan.get("risk_usd"),
-            "notional": plan.get("notional"), "variant_id": plan.get("variant_id"),
+            "risk_usd": cumulative_risk,
+            "notional": cumulative_notional, "variant_id": plan.get("variant_id"),
             "candidate_id": plan.get("candidate_id"),
             "proof_run_id": plan.get("proof_run_id"),
             "strategy_id": plan.get("strategy_id", self.cfg.get("strategy", {}).get("id")),
@@ -237,25 +364,35 @@ class ExecutionLifecycleMixin:
                 "underlying_symbol", "stop_price", "target_price", "force_flat_at",
                 "max_hold_bars", "hold_deadline_ts", "protective_legs")
         }
-        logged_qty = self._number(order_state.get("logged_filled_qty")) or 0.0
-        if order_state.get("fill_logged") and "logged_filled_qty" not in order_state:
-            # Older state files used a boolean only; avoid duplicating their
-            # already-journaled fill during a rolling upgrade.
-            logged_qty = filled_qty
-        incremental_qty = max(0.0, filled_qty - logged_qty)
         if incremental_qty > 0:
+            incremental_notional, incremental_risk = economics(
+                incremental_qty, incremental_price)
             state.log_trade(
                 symbol, order_state.get("side"), "open", incremental_qty,
-                price=instrument_entry, notional=plan.get("notional"),
-                risk_usd=plan.get("risk_usd"), order_id=order_state.get("order_id"),
+                price=incremental_price, notional=incremental_notional,
+                risk_usd=incremental_risk, order_id=order_state.get("order_id"),
                 setup_id=plan.get("setup_id"), setup_type=plan.get("setup_type"),
                 strategy_id=trade.get("strategy_id"),
                 strategy_version=trade.get("strategy_version"),
                 variant_id=trade.get("variant_id"), fill_status="filled",
+                execution_profile=profile, vehicle=trade.get("vehicle"),
+                reference_price=entry_reference, entry_reference=entry_reference,
+                exit_reference=trade.get("exit_reference"), market_price=market_price,
+                mid_price=mid_price, requested_qty=requested_qty,
+                planned_qty=planned_qty, cumulative_filled_qty=filled_qty,
+                fill_fraction=(filled_qty / requested_qty
+                               if requested_qty and requested_qty > 0 else None),
+                filled_fraction=(filled_qty / requested_qty
+                                 if requested_qty and requested_qty > 0 else None),
                 runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
                 run_id=self.run_id)
             order_state["fill_logged"] = True
             order_state["logged_filled_qty"] = filled_qty
+        if filled_qty > 0:
+            # Persist the cumulative average even when quantity did not grow;
+            # a corrected broker average must be the baseline for the next
+            # increment and must not cause a duplicate journal row.
+            order_state["logged_filled_avg_price"] = fill_price
         return trade
 
     def _option_take_profit_price(self, trade: Mapping) -> float | None:
@@ -860,11 +997,37 @@ class ExecutionLifecycleMixin:
                 # to protect and journal the incremental fill.
                 self._activate_filled_trade(current, saved, filled_qty, fill_price)
             if status != old_status:
+                evidence_plan = saved.get("risk_plan") if isinstance(
+                    saved.get("risk_plan"), Mapping) else {}
+                evidence_profile = str(saved.get(
+                    "execution_profile",
+                    evidence_plan.get("execution_profile", "shares")) or "shares").lower()
+                evidence_vehicle = str(saved.get(
+                    "vehicle",
+                    "option" if evidence_profile in {"option", "options"} else "equity"))
+                evidence_requested = (self._number(saved.get("requested_qty"))
+                                      or self._number(saved.get("qty")))
+                evidence_planned = (self._number(saved.get("planned_qty"))
+                                    or evidence_requested)
+                evidence_reference = (self._number(saved.get("reference_price"))
+                                      or self._number(saved.get("entry_reference"))
+                                      or self._number(evidence_plan.get("entry_price")))
                 state.log_order(
                     broker_order, None, action="reconcile", run_id=self.run_id,
                     runtime_mode=self.mode, account_fingerprint=current.get("account_fingerprint"),
-                    setup_id=(saved.get("risk_plan") or {}).get("setup_id")
-                    if isinstance(saved.get("risk_plan"), Mapping) else None)
+                    setup_id=evidence_plan.get("setup_id"),
+                    execution_profile=evidence_profile, vehicle=evidence_vehicle,
+                    variant_id=saved.get("variant_id") or evidence_plan.get("variant_id"),
+                    reference_price=evidence_reference,
+                    entry_reference=(self._number(saved.get("entry_reference"))
+                                    or evidence_reference),
+                    exit_reference=self._number(saved.get("exit_reference")),
+                    requested_qty=evidence_requested, planned_qty=evidence_planned,
+                    cumulative_filled_qty=filled_qty,
+                    fill_fraction=(filled_qty / evidence_requested
+                                   if evidence_requested and evidence_requested > 0 else None),
+                    filled_fraction=(filled_qty / evidence_requested
+                                     if evidence_requested and evidence_requested > 0 else None))
 
         pending_by_symbol: dict[str, list[dict]] = {}
         for saved in order_state.values():
@@ -889,7 +1052,23 @@ class ExecutionLifecycleMixin:
             symbol = str(_value(position, "symbol", "")).upper()
             if not symbol:
                 continue
-            item = dict(previous.get(symbol, {}))
+            # Order reconciliation above may have advanced a cumulative fill
+            # in this same broker snapshot.  Prefer that fresh activation over
+            # the immutable pre-snapshot view; otherwise a position row would
+            # clobber its newly-correct risk/notional with stale economics.
+            fresh_item = current.get("active_trades", {}).get(symbol, {})
+            refreshed_item = previous.get(symbol, {})
+            item = dict(fresh_item if isinstance(fresh_item, Mapping)
+                        else refreshed_item)
+            # ``previous`` is also where this reconciliation refreshed the
+            # broker-resident child legs.  A fresh fill activation must win
+            # for quantity/economics, while the refreshed leg lifecycle must
+            # win for protection and any close it just observed.
+            if isinstance(refreshed_item, Mapping):
+                for key in ("protective_legs", "closing_order_id",
+                            "closing_reason", "closing_price"):
+                    if key in refreshed_item:
+                        item[key] = deepcopy(refreshed_item[key])
             pending = next((row for row in pending_by_symbol.get(symbol, [])
                             if not row.get("position_closed")), None)
             if not item and isinstance(pending, dict):
@@ -950,6 +1129,20 @@ class ExecutionLifecycleMixin:
                 if isinstance(fresh, Mapping):
                     active[symbol] = dict(fresh)
                 continue
+            # A canceled/rejected entry with a positive fill still owns real
+            # exposure.  If the position endpoint transiently omits that
+            # residual, do not interpret cancellation of the remainder as a
+            # close of the filled quantity.
+            entry_order = order_state.get(str(trade.get("order_id") or ""))
+            entry_status = (str(entry_order.get("status", "")).lower()
+                            if isinstance(entry_order, Mapping) else "")
+            entry_filled_qty = (self._number(entry_order.get("filled_qty")) or 0.0
+                                if isinstance(entry_order, Mapping) else 0.0)
+            if (entry_status in {"canceled", "cancelled", "expired", "rejected"} and
+                    entry_filled_qty > 0 and not trade.get("closing_order_id")):
+                fresh = current.get("active_trades", {}).get(symbol)
+                active[symbol] = dict(fresh if isinstance(fresh, Mapping) else trade)
+                continue
             qty = self._number(trade.get("qty")) or 0.0
             entry = self._number(trade.get("entry_price"))
             exit_price = self._number(trade.get("closing_price"))
@@ -976,16 +1169,72 @@ class ExecutionLifecycleMixin:
                 if entry_order_id or close_order_id else
                 f"close:{symbol}:{trade.get('opened_at')}"
             )
+            # Close evidence is explicit and independent of the entry's
+            # incremental notional.  A terminal close snapshot may carry a
+            # partial fill; use the broker's cumulative quantity when it is
+            # available, otherwise preserve the historical filled-status
+            # fallback where brokers omitted it.
+            close_order = (closing_order if closing_order is not None else
+                           order_state.get(close_order_id))
+            close_status = str(
+                getattr(close_order, "status", "") if close_order is not None
+                else (close_order.get("status", "") if isinstance(close_order, Mapping) else "")
+            ).lower()
+            close_filled = (self._number(getattr(close_order, "filled_qty", None))
+                            if close_order is not None and not isinstance(close_order, Mapping)
+                            else self._number(close_order.get("filled_qty"))
+                            if isinstance(close_order, Mapping) else None)
+            if close_filled is None or close_filled <= 0:
+                close_filled = qty if close_status == "filled" else 0.0
+            # A locally recorded close can be durable before its broker order
+            # row is available (for example, a position snapshot arrives
+            # after the close was submitted but before order reconciliation).
+            # ``closing_price`` is only populated as close evidence by the
+            # monitor when it has no order fill to report; when an order id is
+            # present we wait for that order's terminal fill above.  Preserve
+            # the historical close inference for this order-less, explicit
+            # local close while continuing to reject canceled/rejected closes
+            # with no fill evidence.
+            if (close_filled <= 0 and close_order is None and
+                    exit_price is not None and trade.get("closing_reason")):
+                close_filled = qty
+            close_filled = min(qty, max(0.0, close_filled))
+            if close_filled <= 0:
+                # A canceled/rejected close with no fill is not an exit. Keep
+                # the durable exposure active so the monitor can retry it,
+                # and never create a zero-quantity calibration row.
+                active[symbol] = dict(trade)
+                continue
+            close_reference = (self._number(trade.get("exit_reference"))
+                               or self._number(trade.get("current_price")))
+            close_notional = (abs(exit_price) * close_filled * multiplier
+                              if exit_price is not None and close_filled > 0 else None)
+            close_requested = (self._number(close_order.get("qty"))
+                               if isinstance(close_order, Mapping) else
+                               self._number(getattr(close_order, "qty", None))) or qty
+            close_fraction = (close_filled / close_requested
+                              if close_requested and close_requested > 0 else None)
+            if entry is not None and exit_price is not None:
+                realized = (exit_price - entry) * close_filled * multiplier * sign
             state.log_trade(
                 symbol, "sell" if str(trade.get("position_side", "long")) == "long" else "buy",
-                "close", qty, price=exit_price, reason=trade.get("closing_reason", "broker_reconcile"),
+                "close", close_filled, price=exit_price, notional=close_notional,
+                reason=trade.get("closing_reason", "broker_reconcile"),
                 trade_id=close_trade_id,
                 realized_pnl_usd=realized, pnl_pct=pnl_pct,
                 close_trigger=trade.get("closing_reason", "broker_reconcile"),
                 setup_id=trade.get("setup_id"), setup_type=trade.get("setup_type"),
                 strategy_id=trade.get("strategy_id"),
                 strategy_version=trade.get("strategy_version"),
-                variant_id=trade.get("variant_id"), runtime_mode=self.mode,
+                variant_id=trade.get("variant_id"),
+                execution_profile=trade.get("execution_profile"),
+                vehicle=trade.get("vehicle"), reference_price=close_reference,
+                entry_reference=trade.get("entry_reference"),
+                exit_reference=close_reference, market_price=trade.get("current_price"),
+                mid_price=trade.get("mid_price"), requested_qty=close_requested,
+                planned_qty=close_requested, cumulative_filled_qty=close_filled,
+                fill_fraction=close_fraction, filled_fraction=close_fraction,
+                runtime_mode=self.mode,
                 account_fingerprint=current.get("account_fingerprint"), run_id=self.run_id)
             self._record_edge_outcome(trade, realized, pnl_pct, exit_price)
             entry_order = order_state.get(entry_order_id)

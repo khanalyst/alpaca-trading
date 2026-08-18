@@ -41,6 +41,11 @@ class SessionPolicy:
     timezone: str = "America/New_York"
     entries_regular_session_only: bool = True
     allow_exits_outside_session: bool = True
+    # Research/replay uses this flag to require broker calendar metadata.  The
+    # live session object already receives an authoritative CalendarDay, so it
+    # is intentionally a validated compatibility field here rather than a
+    # second source of session-boundary truth.
+    require_exact_calendar: bool = True
     force_flat_minutes_before_close: int = 10
     reject_new_entries_minutes_before_close: int = 5
 
@@ -51,6 +56,8 @@ class SessionPolicy:
             raise ValueError("entries_regular_session_only must be true")
         if self.allow_exits_outside_session is not True:
             raise ValueError("allow_exits_outside_session must be true")
+        if not isinstance(self.require_exact_calendar, bool):
+            raise ValueError("require_exact_calendar must be true or false")
         if self.force_flat_minutes_before_close < 1:
             raise ValueError("force_flat_minutes_before_close must be >= 1")
         if self.reject_new_entries_minutes_before_close < 0:

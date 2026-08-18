@@ -16,6 +16,7 @@ from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from . import finite, register
+from .rule import MIN_STOP_DISTANCE_FRACTION
 
 DEFAULT_IBR_TIMEZONE = "America/New_York"
 DEFAULT_SESSION_START = "09:30"
@@ -374,10 +375,12 @@ def evaluate_ibr_breakout(
     if direction is None:
         return None
     entry = close
-    stop = float(rng["low"] if direction == "long" else rng["high"])
-    distance = abs(entry - stop)
+    natural_stop = float(rng["low"] if direction == "long" else rng["high"])
+    distance = max(abs(entry - natural_stop),
+                   entry * MIN_STOP_DISTANCE_FRACTION)
     if distance <= 0:
         return None
+    stop = entry - distance if direction == "long" else entry + distance
     extension = max(0.0, (entry - float(rng["high"])) / width if direction == "long"
                     else (float(rng["low"]) - entry) / width)
     if extension > cfg.max_entry_extension_r:
