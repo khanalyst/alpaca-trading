@@ -258,7 +258,7 @@ services:
       - python
       - deploy/shadow.py
       - --corpus
-      - /app/runtime/research/recorded/data.csv
+      - /app/runtime/research/recorded/market.csv
       - --edge-db
       - /app/runtime/research/edge_lab.sqlite3
       - --shadow-db

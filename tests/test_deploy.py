@@ -375,6 +375,8 @@ class DeployTests(unittest.TestCase):
         self.assertIn("- shadow-data:/app/shadow:ro", research)
         shadow = text.split("  shadow:", 1)[1].split("  dashboard:", 1)[0]
         self.assertIn("- shadow-data:/app/shadow", shadow)
+        self.assertIn("- /app/runtime/research/recorded/market.csv", shadow)
+        self.assertNotIn("/app/runtime/research/recorded/data.csv", shadow)
         self.assertIn("- /app/shadow/shadow.sqlite3", shadow)
         self.assertIn("depends_on:", shadow)
         self.assertIn("shadow-init:", shadow)
