@@ -10,7 +10,8 @@ from agent import engine as engine_module
 from agent import risk as risk_module
 from agent import risk_inputs
 from agent.risk import RiskEngine, select_option_contract, size_shares
-from research.costs import stressed_cost_usd
+from research.costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+                            stressed_cost_usd)
 
 
 class RiskProfileTests(unittest.TestCase):
@@ -459,6 +460,9 @@ class RiskProfileTests(unittest.TestCase):
                 self.assertAlmostEqual(plan["stressed_cost_to_risk_ratio"], limit,
                                        delta=2e-6)
                 self.assertEqual(plan["stressed_cost_vehicle"], "equity")
+                self.assertEqual(plan["stressed_cost_schema"], STRESSED_COST_SCHEMA)
+                self.assertEqual(plan["stressed_cost_basis"], STRESSED_COST_BASIS)
+                self.assertEqual(plan["stressed_cost_entry_notional"], 5_000.0)
             else:
                 self.assertEqual(why, "stressed_cost_risk_limit")
 
@@ -491,11 +495,32 @@ class RiskProfileTests(unittest.TestCase):
     def test_config_validates_stressed_cost_controls(self):
         cfg = validate_config({})
         self.assertEqual(cfg["risk"]["stressed_cost_scenario_bps"], 25.0)
-        self.assertEqual(cfg["risk"]["max_stressed_cost_to_risk_ratio"], 1.0)
+        self.assertEqual(cfg["risk"]["max_stressed_cost_to_risk_ratio"], 0.30)
         with self.assertRaises(ConfigError):
             validate_config({"risk": {"stressed_cost_scenario_bps": 10}})
         with self.assertRaises(ConfigError):
             validate_config({"risk": {"max_stressed_cost_to_risk_ratio": float("nan")}})
+
+    def test_25bp_entry_notional_stress_ratio_is_vetoed_at_30_percent(self):
+        # $10,000 entry notional at 25 bps is $25.  Against a $30 authored
+        # risk unit the ratio is 25/30 = 0.8333..., above the shipped .30
+        # limit; the stress is a veto and does not mutate the plan arithmetic.
+        risk = RiskEngine({"risk": {
+            "stressed_cost_scenario_bps": 25.0,
+            "max_stressed_cost_to_risk_ratio": 0.30,
+        }})
+        self.assertAlmostEqual(
+            stressed_cost_usd(entry_notional=10_000.0, scenario_bps=25.0,
+                              vehicle="equity") / 30.0,
+            25.0 / 30.0,
+            places=12,
+        )
+        plan, reason = risk.check_stressed_cost({
+            "execution_profile": "shares", "shares": 100,
+            "notional": 10_000.0, "risk_usd": 30.0,
+        })
+        self.assertIsNone(plan)
+        self.assertEqual(reason, "stressed_cost_risk_limit")
 
 
 if __name__ == "__main__":

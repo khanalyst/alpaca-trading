@@ -70,8 +70,10 @@ The exit grammar remains fixed: an ATR-derived bracket (with the 30 bps minimum
 stop floor), configured R target, and bounded bar-cap time exit. Factory
 fit-only measurement reports eligible prefixes/first signals, 30-bps floor
 binding, planned exits, configured/stressed economics, power,
-delivered-versus-intended risk, and behavioral aliases for operator review; it
-is diagnostic only, does not expand exits, and cannot authorize a candidate.
+delivered-versus-intended risk, provider/feed provenance, pricing source,
+configured limits, pass/fail/unknown row counts, and behavioral aliases for
+operator review; it is diagnostic only, does not expand exits, and cannot
+authorize a candidate.
 
 The authorizing floors are immutable: backtest/factory evidence requires 100
 trades and 30 complete sessions/clusters; the sealed qualification window
@@ -202,7 +204,11 @@ notional fee, plus a 0.65 currency-unit listed-option fee per contract per side.
 Proofs also persist preregistered all-in stress scenarios of
 9, 15, 25, and 50 bps; the 25 bps scenario is the required authorization
 check, while the others are diagnostics. Runtime rejection caps are separate
-from expected costs.
+from expected costs. Stress applies the scenario bps to entry notional and then
+adds listed-option round-trip fees for both per-contract sides; it is not a
+per-side bps charge. The shipped `max_stressed_cost_to_risk_ratio` is `0.30`.
+For a 30-bps-floor trade, 25 bps of entry-notional stress is about `0.833` of
+risk, so the trade is vetoed by that limit before any option fees.
 
 `research.py calibrate` reads the journal without mutation and checks entry and
 exit fills independently per vehicle; equity and option calibration is never
@@ -360,6 +366,10 @@ It evaluates eligible candidates in isolated virtual books from recorder events,
 creates exact-session candidate/root-baseline/randomized-null replays, and
 quarantines mismatch/incomplete rows. It compares semantic runtime-shadow
 signatures with factory/IBR replay and has no order or broker authority.
+Verified gate envelopes also retain per-arm candidate, baseline, and null counts,
+fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
+and directional/pair coverage. A denser or sparser quote corpus can therefore
+change null/control evidence even when the candidate count is unchanged.
 
 The read-only dashboard (`http://127.0.0.1:8080`) is the detailed reporting
 surface. Beyond trader health it shows: paper-account trials with each edge's live
@@ -378,6 +388,11 @@ python research.py edge trials --dry-run    # what a trial review would do
 python research.py edge paper --deployed    # how each deployed edge is doing
 python research.py factory report           # the full discovery narrative
 ```
+
+The standalone `research.py factory run` (or `factory-run`) preflight requires
+readable normalized JSONL with explicit provenance; the default equity lane
+requires SIP. `--diagnostic-only` is the explicit non-authorizing escape hatch:
+it records the source as diagnostic and emits no proofs.
 
 Three read-only views answer three different questions, and none can change a
 lifecycle state:

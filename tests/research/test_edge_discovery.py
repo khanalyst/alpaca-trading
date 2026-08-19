@@ -28,6 +28,7 @@ from research.gates import (
 )
 from research.costs import SQLiteQuoteIndex, quote_fill
 from research.factory_ledger import FactoryLedger
+from tests.research.test_factory_end_to_end import edge_corpus
 
 
 def _gate_evidence(heldout, *, alpha=.05):
@@ -636,6 +637,58 @@ class EdgeDiscoveryCoreExtractionTests(unittest.TestCase):
                            "delta_positive": True})
         self.assertEqual(gate["heldout_floor"]["minimums"]["clusters"], 30)
         self.assertFalse(gate["heldout_floor"]["checks"]["clusters"])
+
+    def test_arm_diagnostics_keep_candidate_fixed_while_null_quotes_fill_gaps(self):
+        """Sparse null pricing is visible without changing candidate evidence."""
+        corpus = edge_corpus(36)
+        keys = sorted({(str(row.get("symbol")), str(row.get("timestamp", ""))[:10])
+                       for row in corpus
+                       if str(row.get("kind", "bar")).lower() not in {
+                           "quote", "equity_quote", "underlying_quote"}})
+        self.assertEqual(len(keys), 288)
+
+        def priced(prefix: str, index: int, key: tuple[str, str], net: float) -> dict:
+            symbol, day = key
+            return {
+                "vehicle": "equity", "symbol": symbol, "session_date": day,
+                "comparison_id": f"{symbol}:{day}",
+                "opportunity_id": f"{prefix}:{index}", "no_trade": False,
+                "net_pnl": net, "gross_pnl": net + .1, "costs": .1,
+                "entry_fill_source": "quote", "exit_fill_source": "quote",
+                "entry_feed": "sip", "exit_feed": "sip",
+                "entry_provider": "fixture", "exit_provider": "fixture",
+                "entry_quote_age_seconds": 0.0, "exit_quote_age_seconds": 0.0,
+            }
+
+        candidate = [priced("candidate", index, key, 1.0)
+                     for index, key in enumerate(keys)]
+        baseline = [priced("baseline", index, key, 0.0)
+                    for index, key in enumerate(keys)]
+        for added_quotes, expected_null in ((0, 265), (15, 280),
+                                            (30, 288), (45, 288)):
+            eligible = min(len(keys), 265 + added_quotes)
+            null = [priced("null", index, key, 0.0)
+                    if index < eligible else {
+                        **priced("null", index, key, 0.0),
+                        "no_trade": True,
+                        "reject_reason": "no fresh equity quote at entry",
+                    }
+                    for index, key in enumerate(keys)]
+            gate = edge_discovery_core._discover_gate(
+                candidate, baseline, vehicle="equity", min_trades=1,
+                min_sessions=1, alpha=1.0, test_iterations=100,
+                null_rows=null)
+            all_arms = gate["arm_diagnostics"]["all"]["arms"]
+            self.assertEqual(
+                all_arms["candidate"]["counts"]["eligible"], 288)
+            self.assertEqual(
+                all_arms["null"]["counts"]["eligible"], expected_null)
+            pairing = gate["arm_diagnostics"]["all"]["pairing"][
+                "candidate_vs_null"]
+            self.assertEqual(pairing["matched"], expected_null)
+            self.assertEqual(pairing["adequacy_reason"],
+                             "full_pair_coverage" if expected_null == 288
+                             else "partial_pair_coverage")
 
     def test_discover_uses_patchable_edge_lab_helper_alias(self):
         with mock.patch.object(edge_lab, "_read_discovery_rows",

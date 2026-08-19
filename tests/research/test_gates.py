@@ -64,6 +64,25 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertEqual(candidate["reasons"], {
             "no_trade": 1, "non_authorizing_fill_source": 1})
 
+    def test_cost_stress_report_names_its_entry_notional_basis(self):
+        from research.costs import STRESSED_COST_BASIS, STRESSED_COST_SCHEMA
+        from research.gates import cost_stress_report
+
+        row = self._equity_quote_row(
+            entry_price=100.0, exit_price=101.0, quantity=1.0,
+            gross_pnl=1.0, costs=.1, net_pnl=.9)
+        report = cost_stress_report([row], vehicle="equity", risk_report={})
+        self.assertEqual(report["stress_basis_schema"], STRESSED_COST_SCHEMA)
+        self.assertEqual(report["stress_basis"], STRESSED_COST_BASIS)
+        self.assertEqual(report["required_entry_notional_bps"], 25.0)
+        required = next(item for item in report["scenarios"]
+                        if item["entry_notional_bps"] == 25.0)
+        self.assertEqual(required["stress_basis_schema"], STRESSED_COST_SCHEMA)
+        self.assertEqual(required["stress_basis"], STRESSED_COST_BASIS)
+        # The old field remains an explicit compatibility alias, not the
+        # authoritative description of how the stress is charged.
+        self.assertEqual(required["round_trip_bps"], 25.0)
+
     def test_qualification_excludes_no_trade_and_bar_fallback_rows(self):
         from research.gates import qualification_report
         good = self._equity_quote_row()

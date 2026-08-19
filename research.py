@@ -323,8 +323,9 @@ def _dataset_context(path: str | Path) -> dict[str, Any]:
                 continue
             if row.get("provider"):
                 providers.add(str(row["provider"]))
-            if row.get("feed"):
-                feeds.add(str(row["feed"]))
+            raw_feed = row.get("feed", row.get("feed_id"))
+            if raw_feed:
+                feeds.add(str(raw_feed))
             kinds.add(str(row.get("kind") or "bar").lower())
             raw_time = row.get("as_of") or row.get("observed_at") or row.get("timestamp")
             if raw_time is None:
@@ -348,6 +349,135 @@ def _dataset_context(path: str | Path) -> dict[str, Any]:
                 ZoneInfo("America/New_York")).date().isoformat(),
         })
     return result
+
+
+_EQUITY_FACTORY_KINDS = frozenset({
+    "bar", "bar_1m", "underlying", "underlying_bar",
+    "quote", "quote_snapshot", "equity_quote", "underlying_quote",
+})
+_OPTION_FACTORY_KINDS = frozenset({
+    "option", "option_snapshot", "option_quote",
+})
+
+
+def _factory_feed_contract(config: Mapping[str, Any]) -> tuple[str, str | None]:
+    """Return the configured factory feed and optional provider identity.
+
+    ``broker.data_feed`` is the canonical runtime setting.  The provider is
+    not part of the shipped config (the Alpaca adapter is implied), but keep
+    support for an explicit provider field in externally supplied configs so
+    a CLI corpus cannot be mixed across adapters when one is declared.
+    """
+    broker = config.get("broker")
+    broker = broker if isinstance(broker, Mapping) else {}
+    data = config.get("data")
+    data = data if isinstance(data, Mapping) else {}
+    feed = (broker.get("data_feed") or data.get("feed") or "sip")
+    provider = (broker.get("provider") or data.get("provider") or
+                config.get("provider") or os.getenv("ALPACA_DATA_PROVIDER"))
+    return str(feed).strip().lower(), (
+        str(provider).strip() if provider not in (None, "") else None)
+
+
+def _factory_dataset_preflight(
+        args: argparse.Namespace, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Check CLI factory input provenance before invoking ``run_factory``.
+
+    The public factory API intentionally retains its historical permissive
+    in-memory behavior.  This stricter check belongs to the standalone CLI,
+    where a file is an authorizing research artifact and command-line metadata
+    must never relabel an IEX or unlabelled row as SIP evidence.
+
+    The returned context is suitable for a diagnostic result.  File-backed
+    factory runs fail closed when the source cannot be inspected; callers that
+    intentionally want to study an unavailable/partial source must opt into
+    ``--diagnostic-only``.
+    """
+    source = getattr(args, "data", None)
+    diagnostic_only = bool(getattr(args, "diagnostic_only", False))
+    context = _dataset_context(source or "-")
+    if diagnostic_only:
+        return {
+            "authorizing": False,
+            "diagnostic_only": True,
+            "source": context,
+        }
+    if source in (None, "-"):
+        raise ValueError(
+            "factory data provenance preflight requires a readable JSONL path; "
+            "use --diagnostic-only for a non-authorizing run")
+    path = Path(source)
+    if not path.is_file():
+        raise ValueError(
+            f"factory data provenance preflight cannot read {path}; "
+            "use --diagnostic-only for a non-authorizing run")
+
+    expected_feed, expected_provider = _factory_feed_contract(config)
+    errors: list[str] = []
+    rows = 0
+    equity_rows = 0
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                rows += 1
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    errors.append(f"row {number}: invalid JSON: {exc}")
+                    continue
+                if not isinstance(row, Mapping):
+                    errors.append(f"row {number}: expected an object")
+                    continue
+                kind = str(row.get("kind") or "bar").strip().lower()
+                if kind in _EQUITY_FACTORY_KINDS:
+                    equity_rows += 1
+                    provider = str(row.get("provider") or "").strip()
+                    feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
+                    if not provider:
+                        errors.append(f"row {number}: {kind} requires explicit provider provenance")
+                    elif expected_provider and provider != expected_provider:
+                        errors.append(
+                            f"row {number}: {kind} provider {provider!r} does not match "
+                            f"configured provider {expected_provider!r}")
+                    if expected_feed != "sip":
+                        errors.append(
+                            "configured equity research feed must be SIP; "
+                            f"got {expected_feed or '[missing]'}")
+                    elif feed != "sip":
+                        errors.append(
+                            f"row {number}: {kind} feed {feed or '[missing]'!r} "
+                            "is not executable; expected 'sip'")
+                elif kind in _OPTION_FACTORY_KINDS:
+                    # A mixed corpus may carry option evidence while an equity
+                    # factory lane is running.  Keep that evidence explicit as
+                    # well, without allowing OPRA rows to satisfy the SIP gate.
+                    provider = str(row.get("provider") or "").strip()
+                    feed = str(row.get("feed", row.get("feed_id")) or "").strip().lower()
+                    if not provider:
+                        errors.append(f"row {number}: {kind} requires explicit provider provenance")
+                    elif expected_provider and provider != expected_provider:
+                        errors.append(
+                            f"row {number}: {kind} provider {provider!r} does not match "
+                            f"configured provider {expected_provider!r}")
+                    if feed != "opra":
+                        errors.append(
+                            f"row {number}: {kind} feed {feed or '[missing]'!r} "
+                            "is not executable; expected 'opra'")
+    except OSError as exc:
+        raise ValueError(f"factory data preflight failed for {path}: {exc}") from exc
+
+    if not rows:
+        errors.append("factory data preflight found no normalized rows")
+    if not equity_rows:
+        errors.append("factory data preflight found no equity bars or quotes")
+    if errors:
+        raise ValueError(
+            "factory data provenance preflight failed; use --diagnostic-only "
+            "for an explicitly non-authorizing run: " + "; ".join(errors[:8]))
+    return {"authorizing": True, "diagnostic_only": False,
+            "source": context}
 
 
 def _emit_proofs(args: argparse.Namespace, result: dict,
@@ -624,6 +754,8 @@ def _write_factory_report(args: argparse.Namespace) -> str | None:
 
 def cmd_factory_run(args: argparse.Namespace) -> int:
     agent_config = _agent_config(args)
+    preflight = _factory_dataset_preflight(args, agent_config)
+    diagnostic_only = bool(preflight.get("diagnostic_only"))
     config = _read_json(getattr(args, "config", None), {})
     if not isinstance(config, dict):
         raise ValueError("--config JSON must be an object")
@@ -659,11 +791,33 @@ def cmd_factory_run(args: argparse.Namespace) -> int:
         costs=CostModel.from_config(runtime_config),
         runtime_config=runtime_config,
         strategy_llm=(agent_config.get("research") or {}).get("strategy_llm"),
-        worker_data=getattr(args, "worker_data", None),
+        # A worker projection is itself a strict, authorizing view.  Do not
+        # let it turn the explicit diagnostic escape hatch back into a hard
+        # provenance failure when the source carries IEX/missing metadata.
+        worker_data=(None if diagnostic_only else
+                     getattr(args, "worker_data", None)),
         progress_callback=_research_progress,
         backtest_bar_fallback=bool((agent_config.get("research") or {}).get(
             "backtest_bar_fallback", True)))
-    proofs = _emit_proofs(args, result, agent_config)
+    if diagnostic_only:
+        # Keep diagnostic output visibly non-authorizing even if an injected
+        # library runner happens to return validated candidates.  In
+        # particular, proof emission is never reached on this path.
+        result["diagnostic_only"] = True
+        result["authorizing"] = False
+        result["source"] = preflight.get("source") or {}
+        result["source_provenance"] = {
+            key: result["source"].get(key)
+            for key in ("provider", "feed")
+            if key in result["source"]
+        }
+        result["source_provider"] = result["source"].get("provider")
+        result["source_feed"] = result["source"].get("feed")
+        result["provenance"] = dict(result["source_provenance"])
+        result["proofs"] = []
+        proofs: list[dict[str, Any]] = []
+    else:
+        proofs = _emit_proofs(args, result, agent_config)
     # Archive the narrative every cycle, not only when an edge proves out. A
     # cycle that found nothing is exactly the one an operator needs to read,
     # and on a headless deployment the dashboard's report list is the only
@@ -735,6 +889,10 @@ def _factory_parser(sub: argparse._SubParsersAction, name: str, command: str):
         parser.add_argument("--data", required=True, help="normalized mixed market JSONL")
         parser.add_argument("--worker-data", default=None,
                             help="optional bar+option JSONL replay view for workers")
+        parser.add_argument(
+            "--diagnostic-only", action="store_true",
+            help=("run despite IEX or missing source provenance; the result is "
+                  "non-authorizing and no edge proofs are emitted"))
         parser.add_argument("--agent-config", default=None,
                             help="validated agent config (default: config.yaml)")
         parser.add_argument("--vehicle", choices=("equity", "option"), default="equity")

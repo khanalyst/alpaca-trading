@@ -46,7 +46,8 @@ def _snap(minute: int, *, bid: float = 2.0, ask: float | None = None,
     ts = OPEN + timedelta(minutes=minute, seconds=seconds)
     return OptionSnapshot(contract=contract, timestamp=ts, bid=bid,
                           ask=bid + .1 if ask is None else ask,
-                          last=bid, underlying_price=500.0, identity=_identity(ts),
+                          last=bid, underlying_price=500.0 + minute * .5,
+                          identity=_identity(ts),
                           bid_size=bid_size, ask_size=ask_size, volume=volume,
                           open_interest=open_interest)
 
@@ -225,7 +226,8 @@ class OptionExitToleranceTests(unittest.TestCase):
                 ts = OPEN + timedelta(minutes=offset + minute)
                 snaps.append(OptionSnapshot(
                     contract=CONTRACT, timestamp=ts, bid=2.0, ask=2.1, last=2.0,
-                    underlying_price=500.0, bid_size=5, ask_size=5, volume=20,
+                    underlying_price=500.0 + minute * .5,
+                    bid_size=5, ask_size=5, volume=20,
                     open_interest=100,
                     identity=EventIdentity(
                         provider="alpaca", feed="opra", as_of=ts, observed_at=ts,

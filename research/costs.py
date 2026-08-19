@@ -50,6 +50,15 @@ RUNTIME_MAX_SLIPPAGE_BPS = 50.0
 # Runtime may select one of these scenarios, but must not invent a new stress
 # level that has no corresponding research evidence.
 COST_STRESS_SCENARIOS_BPS = (9.0, 15.0, 25.0, 50.0)
+# The stress is deliberately a cost shock, not a multiplier on configured
+# replay costs or risk.  Keep this machine-readable so runtime telemetry and
+# fit reports cannot describe the same arithmetic in contradictory terms.
+STRESSED_COST_SCHEMA = "stressed-entry-cost.v1"
+STRESSED_COST_BASIS = {
+    "notional": "entry_notional",
+    "notional_charge": "scenario_bps_of_entry_notional",
+    "option_fees": "round_trip_two_sides_per_contract",
+}
 
 CONFIG_BLOCK = "costs"
 
@@ -593,20 +602,28 @@ def cost_model_for_vehicle(costs: Any, vehicle: str) -> CostModel:
     raise CostError("costs must be a CostModel or vehicle-keyed mapping")
 
 
-def stressed_cost_usd(planned_notional: float, scenario_bps: float, *,
+def stressed_cost_usd(planned_notional: float | None = None,
+                      scenario_bps: float | None = None, *,
+                      entry_notional: float | None = None,
                       vehicle: str, quantity: float = 1.0,
                       costs: Any = None, config: Mapping | None = None) -> float:
     """Return the deterministic all-in stressed entry cost for a plan.
 
     This deliberately matches :func:`research.gates.cost_stress_report`:
-    planned/entry notional is charged at the selected scenario in basis
-    points, and listed options additionally pay two per-contract fees for the
-    entry and exit sides.  ``costs``/``config`` are resolved through the
-    vehicle-aware :class:`CostModel` parser so nested runtime schedules cannot
-    accidentally use the equity fee for an option plan.
+    entry notional is charged at the selected scenario in basis points, and
+    listed options additionally pay two per-contract fees for the entry and
+    exit sides.  ``planned_notional`` remains a compatibility name for the
+    explicit ``entry_notional`` basis.  ``costs``/``config`` are resolved
+    through the vehicle-aware :class:`CostModel` parser so nested runtime
+    schedules cannot accidentally use the equity fee for an option plan.
     """
     if vehicle not in {"equity", "option"}:
         raise CostError("vehicle must be equity or option")
+    if entry_notional is not None:
+        if planned_notional is not None:
+            raise CostError(
+                "provide entry_notional or planned_notional, not both")
+        planned_notional = entry_notional
     try:
         notional = float(planned_notional)
         scenario = float(scenario_bps)
@@ -1130,7 +1147,8 @@ __all__ = [
     "DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE", "DEFAULT_SLIPPAGE_BPS",
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",
-    "COST_STRESS_SCENARIOS_BPS", "ReplayPolicy",
+    "COST_STRESS_SCENARIOS_BPS", "STRESSED_COST_SCHEMA", "STRESSED_COST_BASIS",
+    "ReplayPolicy",
     "replay_policy_for_mode", "replay_policy_for_session",
     "replay_policy_for_bars", "derive_session_replay_policy",
     "cost_model_for_vehicle", "stressed_cost_usd", "stress_cost_usd",

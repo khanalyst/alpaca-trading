@@ -87,6 +87,10 @@ and `max_spread_bps` are rejection caps, not expectations: they bound the
 model, and a model expecting a cost the runtime would refuse to submit fails
 closed. Preregistered all-in stress scenarios are 9, 15, 25, and 50 bps; 25
 bps is the authorization requirement and the others remain diagnostics.
+Stress bps are charged against entry notional, with listed-option round-trip
+fees added for both per-contract sides; they are not per-side bps. The shipped
+`max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade's 25-bps
+entry-notional stress is about `0.833` of risk and is vetoed before option fees.
 `research/calibration.py` is a read-only authorization check stratified by
 runtime mode, vehicle, execution profile, and both entry and exit when
 references are present. Partial fills use plan/reference fields. Missing,
@@ -243,13 +247,20 @@ isolated simulated account.
 Before variant replay, the factory records compact fit-only diagnostics: the
 eligible-prefix and first-signal rates, ATR-in-basis-points and 30-bps-floor
 binding, signal-anchored planned stop/target/hold distributions, configured
-and stressed cost-to-risk (9/15/25/50x) summaries, delivered versus intended
+and stressed cost-to-risk (9/15/25/50 bps) summaries, delivered versus intended
 risk, realized exit reasons/ties/gaps, and a diagnostic clustered MDE/power
-report whose effect and cluster units are explicit. The current fixed exit
-grammar (ATR-floor bracket, configured R target, and bar cap) is surfaced for
-operator review and never expanded by this measurement. Planned signal/exit
-geometry may be counted even when executable quote pricing is absent, but is
-marked quote-required and remains non-authorizing.
+report whose effect and cluster units are explicit. It also records
+provider/feed provenance, entry-pricing source, configured limits, and
+pass/fail/unknown row counts. The current fixed exit grammar (ATR-floor
+bracket, configured R target, and bar cap) is surfaced for operator review and
+never expanded by this measurement. Planned signal/exit geometry may be
+counted even when executable quote pricing is absent, but is marked
+quote-required and remains non-authorizing.
+
+The standalone `research.py factory run`/`factory-run` preflight requires
+explicit row provenance and SIP for the default equity lane. `--diagnostic-only`
+is an explicit non-authorizing mode for incomplete or non-SIP input and emits
+no proofs.
 
 The first-signal planned vectors also produce deterministic entry and full
 behavior fingerprints. When the fit contains a signal, full behavioral aliases
@@ -366,6 +377,13 @@ observations, the exact declared session set, and content digests. Verification
 recomputes the qualification report and rejects a row from an undeclared
 session, a missing declared session, digest tampering, excessive row count, or
 an oversized envelope.
+
+Each verified gate envelope also carries per-arm candidate, baseline, and
+randomized-null evidence: raw/executed/eligible counts, fill sources,
+entry/exit quote-age summaries, gross/cost/net economics, matched and dropped
+match keys, and directional/pair coverage. Quote density may change the
+eligible or paired null/control evidence even when the candidate count is
+unchanged.
 
 Both research lanes are held to this standard. The explicit IBR lane and the
 autonomous factory lane share one randomized-entry null control and one sealed

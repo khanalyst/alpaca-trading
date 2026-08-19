@@ -152,10 +152,11 @@ The executable exit grammar is fixed to the ATR-derived bracket (including the
 30 bps minimum stop floor), configured R target, and bar-cap time exit. The
 factory's fit-only diagnostics expose signal eligibility, 30-bps floor binding,
 planned exits, configured/stressed economics, clustered power, behavioral alias
-fingerprints, and intended-versus-delivered risk for operator review. Planned
-signal/exit geometry may be counted as quote-required measurement when delayed
-pricing is unavailable; it remains non-authorizing. Diagnostics never expand
-the exit grammar or authorize a candidate.
+fingerprints, intended-versus-delivered risk, provider/feed provenance,
+entry-pricing source, configured limits, and pass/fail/unknown row counts for
+operator review. Planned signal/exit geometry may be counted as quote-required
+measurement when delayed pricing is unavailable; it remains non-authorizing.
+Diagnostics never expand the exit grammar or authorize a candidate.
 
 The runtime persists the resulting `hold_deadline_ts` on the trade, so the exit
 survives a restart. `agent.execution_lifecycle` fires the `max_hold` close from
@@ -339,7 +340,11 @@ charges spread, slippage and fees through the shared cost model, and closes
 before the session boundary. Equity and option
 vehicles have separate books. `cost_model_for_vehicle` applies any explicit
 vehicle schedule with recorded provenance; the shipped fallback is 4 bps
-spread, 6 bps slippage, and the configured per-side fees.
+spread, 6 bps slippage, and the configured per-side fees. Preregistered stress
+charges scenario bps against entry notional, plus listed-option round-trip fees
+for both per-contract sides; it is not a per-side bps charge. The shipped
+25-bps scenario and `max_stressed_cost_to_risk_ratio: 0.30` veto a 30-bps-floor
+trade at about `0.833` cost-to-risk before option fees.
 
 `research.edge_discovery_core` owns deterministic corpus loading, effective
 IBR configuration, opportunity materialization, the randomized-entry null
@@ -577,8 +582,12 @@ rows are skipped rather than crashing champion selection. The final sealed
 qualification decision retains bounded candidate/baseline source observations,
 their declared session set, and content digests in the envelope; verification
 recomputes the qualification report and rejects missing, extra, or tampered
-sessions. Paper outcomes are append-only and can demote an edge; they cannot
-manufacture a proof. Retirement requires adequate terminal negative evidence
+sessions. Gate envelopes also retain per-arm candidate, baseline, and
+randomized-null counts, fill sources, quote-age summaries, gross/cost/net
+economics, matched and dropped keys, and directional/pair coverage. Quote
+density can legitimately change null/control evidence even when the candidate
+count is unchanged. Paper outcomes are append-only and can demote an edge; they
+cannot manufacture a proof. Retirement requires adequate terminal negative evidence
 for every intended variant (and a valid bounded replacement when that lane is
 enabled), not an underpowered or transient result. A demoted candidate remains
 eligible to re-prove on a newer shadow run, which starts a new evidence epoch.

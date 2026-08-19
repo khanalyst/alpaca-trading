@@ -429,6 +429,10 @@ that cannot authorize deployment. A family pass
 with a global failure is a normal marginal result and cannot authorize
 selection. Final qualification evidence binds its declared sessions, bounded
 candidate/baseline observations, and content digests so it can be recomputed.
+The gate envelope also records per-arm candidate, baseline, and randomized-null
+counts, fill sources, quote ages, gross/cost/net economics, matched and dropped
+keys, and directional/pair coverage. Quote density can change null/control
+evidence even when the candidate count is unchanged.
 Underpowered data is not a failure: a shadow worker advances no durable
 boundary until all intended variants are adequately powered, so the tail is
 reconsidered on a later cycle. The sealed qualification window is released
@@ -439,8 +443,9 @@ measured coordinate lessons, followed by an unchanged confirmation. The
 executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
 configured R target, and bar-cap time exit. Fit-only diagnostics (prefix and
 first-signal rates, floor binding, planned exits, configured/stressed economics,
-power, behavioral aliases, and intended-versus-delivered risk) are
-operator-review telemetry only; they do not expand exits or authorize proof.
+power, behavioral aliases, intended-versus-delivered risk, provider/feed
+provenance, pricing source, configured limits, and pass/fail/unknown row counts)
+are operator-review telemetry only; they do not expand exits or authorize proof.
 immutable floors are 100 trades plus 30 complete sessions/clusters for
 backtest/factory evidence, 100 trades plus 30 complete sessions/clusters for
 the sealed qualification window, and 150 trades plus 30 complete sessions for
@@ -600,7 +605,11 @@ vehicle; otherwise the shipped cost model is 4 bps spread, 6 bps slippage,
 abstains when the configured stress scenario exceeds its cost-to-risk limit and
 persists scenario/cost/ratio telemetry, while order journal rows retain
 intended/delivered risk, delivery ratio, and shortfall; proof stress diagnostics
-are 9/15/25/50 bps with 25 bps as the required veto scenario.
+are 9/15/25/50 bps with 25 bps as the required veto scenario. Stress charges
+scenario bps against entry notional and adds listed-option round-trip fees for
+both per-contract sides; it is not a per-side bps charge. The shipped
+`max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade is about
+`0.833` cost-to-risk at the 25-bps stress and is vetoed before option fees.
 
 The paper journal is the source for realized performance summaries:
 `python report.py runtime/paper/journal.db --json`. The dashboard reads this

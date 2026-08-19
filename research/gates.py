@@ -19,7 +19,11 @@ from statistics import mean
 import math
 from typing import Any, Iterable, Mapping, Sequence
 
-from .costs import CostError, CostModel, QUOTE as QUOTE_FILL, risk_unit_report as _risk_unit_report
+from .costs import (
+    CostError, CostModel, QUOTE as QUOTE_FILL,
+    STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+    risk_unit_report as _risk_unit_report,
+)
 from .stats import (
     DEFAULT_BOOTSTRAP_DRAWS, DEFAULT_NULL_DRAWS,
     clustered_mde_power, clustered_mde_power_report, effective_breadth_report,
@@ -712,13 +716,15 @@ def matched_effective_breadth(candidate: Iterable[Mapping],
 
 def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
                        risk_report: Mapping) -> dict:
-    """Reprice realized replay P&L under preregistered all-in cost shocks.
+    """Reprice realized replay P&L under preregistered entry-notional shocks.
 
     Source rows already contain P&L after the configured model.  Each stress
     scenario therefore subtracts only the incremental cost above the model's
-    recorded round trip.  The 25 bps scenario is the authorization veto; 9,
-    15 and 50 bps remain persisted diagnostics so sensitivity is visible
-    rather than selected after seeing the result.
+    recorded round trip.  Scenario bps are charged once against entry
+    notional; listed options additionally include two per-contract fee sides.
+    The 25 bps scenario is the authorization veto; 9, 15 and 50 bps remain
+    persisted diagnostics so sensitivity is visible rather than selected
+    after seeing the result.
     """
     if vehicle not in {"equity", "option"}:
         raise ValueError("vehicle must be equity or option")
@@ -781,7 +787,12 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
             stressed_values.append(net - max(0.0, stressed_cost - base_cost))
         net_pnl = sum(stressed_values)
         scenarios.append({
+            "entry_notional_bps": float(scenario_bps),
+            # Compatibility alias for v1 readers.  The machine-readable basis
+            # below removes the historical ambiguity in this field name.
             "round_trip_bps": float(scenario_bps),
+            "stress_basis_schema": STRESSED_COST_SCHEMA,
+            "stress_basis": dict(STRESSED_COST_BASIS),
             "trades": len(stressed_values),
             "missing_opportunities": missing,
             "net_pnl": net_pnl,
@@ -791,9 +802,13 @@ def cost_stress_report(rows: Iterable[Mapping], *, vehicle: str,
         })
     required = next(
         item for item in scenarios
-        if item["round_trip_bps"] == COST_STRESS_REQUIRED_BPS)
+        if item["entry_notional_bps"] == COST_STRESS_REQUIRED_BPS)
     return {
         "schema": "cost-stress-report.v1", "vehicle": vehicle,
+        "stress_basis_schema": STRESSED_COST_SCHEMA,
+        "stress_basis": dict(STRESSED_COST_BASIS),
+        "required_entry_notional_bps": COST_STRESS_REQUIRED_BPS,
+        # Compatibility alias retained for existing signed envelopes/readers.
         "required_round_trip_bps": COST_STRESS_REQUIRED_BPS,
         "scenario_bps": list(COST_STRESS_SCENARIOS_BPS),
         "scenarios": scenarios,
@@ -1341,6 +1356,213 @@ def fill_source_summary(rows: Iterable[Mapping], *, vehicle: str) -> dict:
     }
 
 
+ARM_EVIDENCE_SCHEMA = "gate-arm-evidence.v1"
+
+
+def _numeric_summary(values: Sequence[float], *, missing: int = 0) -> dict:
+    """Return a bounded, deterministic summary for quote ages or money.
+
+    Quote provenance is optional on diagnostic rows.  Missing values are
+    counted explicitly instead of being converted to zero, which would make a
+    sparse quote corpus look as fresh as a dense one.
+    """
+    clean = [float(value) for value in values
+             if isinstance(value, (int, float)) and not isinstance(value, bool)
+             and math.isfinite(float(value))]
+    result = {
+        "count": len(clean),
+        "missing": int(missing),
+        "min": min(clean) if clean else None,
+        "max": max(clean) if clean else None,
+        "mean": (sum(clean) / len(clean)) if clean else None,
+    }
+    if clean:
+        ordered = sorted(clean)
+        result["median"] = ordered[len(ordered) // 2]
+    else:
+        result["median"] = None
+    return result
+
+
+def _arm_key_index(
+        rows: Iterable[Mapping], *, vehicle: str,
+        ) -> tuple[dict[str, Mapping], list[str]]:
+    """Index authorizing rows by the same key used by paired inference."""
+    values: dict[str, Mapping] = {}
+    duplicates: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("vehicle", vehicle) != vehicle:
+            continue
+        key = _match_key(row, vehicle)
+        if not key:
+            continue
+        if key in values:
+            duplicates.add(key)
+        else:
+            values[key] = row
+    for key in duplicates:
+        values.pop(key, None)
+    return values, sorted(duplicates)
+
+
+def _arm_pairing(candidate: Mapping[str, Any], other: Mapping[str, Any], *,
+                 candidate_name: str, other_name: str) -> dict:
+    left = set(candidate.get("_unique_match_keys", ()))
+    right = set(other.get("_unique_match_keys", ()))
+    matched = sorted(left & right)
+    dropped_candidate = sorted(left - right)
+    dropped_other = sorted(right - left)
+    candidate_count = len(left)
+    other_count = len(right)
+    matched_count = len(matched)
+    # ``paired_coverage`` is the fraction of the smaller available arm that
+    # can actually be paired.  The directional ratios make an asymmetric
+    # sparse/null arm visible without treating missing rows as zero P&L.
+    smaller = min(candidate_count, other_count)
+    paired = (matched_count / smaller) if smaller else 0.0
+    candidate_ratio = (matched_count / candidate_count) if candidate_count else 0.0
+    other_ratio = (matched_count / other_count) if other_count else 0.0
+    if not candidate_count and not other_count:
+        reason = "no_eligible_rows"
+    elif not candidate_count or not other_count:
+        reason = "one_arm_has_no_eligible_rows"
+    elif not matched_count:
+        reason = "no_matched_match_keys"
+    elif matched_count == candidate_count == other_count:
+        reason = "full_pair_coverage"
+    else:
+        reason = "partial_pair_coverage"
+    return {
+        "candidate_arm": candidate_name,
+        "other_arm": other_name,
+        "matched": matched_count,
+        "matched_match_keys": matched,
+        "matched_keys": matched,
+        "dropped_match_keys": {
+            candidate_name: dropped_candidate,
+            other_name: dropped_other,
+        },
+        "dropped_keys": {
+            candidate_name: dropped_candidate,
+            other_name: dropped_other,
+        },
+        "candidate_coverage": candidate_ratio,
+        "other_coverage": other_ratio,
+        "paired_coverage": paired,
+        "coverage_ratio": paired,
+        # This is diagnostic evidence only.  It mirrors the existing paired
+        # control invariant (at least one matched observation) and is not a
+        # new arbitrary promotion floor.
+        "adequate": bool(matched_count),
+        "adequacy_reason": reason,
+    }
+
+
+def arm_evidence_report(*, candidate: Iterable[Mapping],
+                        baseline: Iterable[Mapping] = (),
+                        null: Iterable[Mapping] = (), vehicle: str,
+                        projections: Mapping[str, Mapping[str, Any]] | None = None) -> dict:
+    """Persist explainable evidence diagnostics for candidate/control arms.
+
+    ``authorization_projection`` remains the authorizing boundary.  This
+    report deliberately carries both its raw and eligible views, plus the
+    refused reasons and pair-key coverage needed to explain a sparse quote
+    corpus.  It is safe for failed/underpowered reports and never authorizes a
+    proof by itself.
+    """
+    if vehicle not in {"equity", "option"}:
+        raise ValueError("vehicle must be equity or option")
+    raw_arms = {
+        "candidate": [dict(row) for row in candidate if isinstance(row, Mapping)],
+        "baseline": [dict(row) for row in baseline if isinstance(row, Mapping)],
+        "null": [dict(row) for row in null if isinstance(row, Mapping)],
+    }
+    projections = dict(projections or {})
+    arms: dict[str, dict[str, Any]] = {}
+    for name, raw in raw_arms.items():
+        projection = projections.get(name)
+        if not isinstance(projection, Mapping):
+            strict = any(_has_fill_metadata(row) for row in raw)
+            projection = authorization_projection(raw, vehicle=vehicle, strict=strict)
+        eligible = [dict(row) for row in projection.get("eligible", ())
+                    if isinstance(row, Mapping)]
+        executed_raw = [row for row in raw if row.get("no_trade") is not True]
+        executed_eligible = [row for row in eligible if row.get("no_trade") is not True]
+        pairs: dict[str, int] = {}
+        for row in executed_raw:
+            entry = str(row.get("entry_fill_source") or "unknown").strip().lower()
+            exit_ = str(row.get("exit_fill_source") or "unknown").strip().lower()
+            key = f"{entry}->{exit_}"
+            pairs[key] = pairs.get(key, 0) + 1
+        age_summaries: dict[str, dict] = {}
+        for leg in ("entry", "exit"):
+            ages = []
+            missing = 0
+            for row in executed_raw:
+                value = row.get(f"{leg}_quote_age_seconds")
+                if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(float(value))):
+                    ages.append(float(value))
+                else:
+                    missing += 1
+            age_summaries[leg] = _numeric_summary(ages, missing=missing)
+        def total(rows: Sequence[Mapping], name: str) -> float:
+            return sum(float(row.get(name, 0.0) or 0.0) for row in rows
+                       if isinstance(row.get(name, 0.0), (int, float)) and
+                       not isinstance(row.get(name, 0.0), bool) and
+                       math.isfinite(float(row.get(name, 0.0) or 0.0)))
+        unique, duplicates = _arm_key_index(executed_eligible, vehicle=vehicle)
+        reasons = dict(sorted((str(key), int(value)) for key, value in
+                              (projection.get("reasons") or {}).items()))
+        reject_reasons: dict[str, int] = {}
+        for row in raw:
+            if row.get("no_trade") is True and row.get("reject_reason"):
+                key = str(row["reject_reason"])
+                reject_reasons[key] = reject_reasons.get(key, 0) + 1
+        arms[name] = {
+            "schema": ARM_EVIDENCE_SCHEMA,
+            "vehicle": vehicle,
+            "counts": {"raw": len(raw), "executed": len(executed_raw),
+                        "eligible": len(eligible),
+                        "eligible_executed": len(executed_eligible),
+                        "excluded": len(projection.get("excluded", ()))},
+            "excluded_reasons": reasons,
+            "reject_reasons": dict(sorted(reject_reasons.items())),
+            "fill_source_pairs": dict(sorted(pairs.items())),
+            "quote_age_seconds": age_summaries,
+            # ``totals`` describes every executed replay row, including
+            # diagnostic-only bar/IEX fills.  The explicit eligible totals
+            # keep authorizing economics separate for downstream consumers.
+            "totals": {name: total(executed_raw, name)
+                       for name in ("gross_pnl", "costs", "net_pnl")},
+            "eligible_totals": {name: total(executed_eligible, name)
+                                for name in ("gross_pnl", "costs", "net_pnl")},
+            "gross_pnl": total(executed_raw, "gross_pnl"),
+            "costs": total(executed_raw, "costs"),
+            "net_pnl": total(executed_raw, "net_pnl"),
+            "eligible_gross_pnl": total(executed_eligible, "gross_pnl"),
+            "eligible_costs": total(executed_eligible, "costs"),
+            "eligible_net_pnl": total(executed_eligible, "net_pnl"),
+            "match_keys": sorted(unique),
+            "duplicate_match_keys": duplicates,
+            "_unique_match_keys": sorted(unique),
+        }
+    pairing = {
+        "candidate_vs_baseline": _arm_pairing(
+            arms["candidate"], arms["baseline"],
+            candidate_name="candidate", other_name="baseline"),
+        "candidate_vs_null": _arm_pairing(
+            arms["candidate"], arms["null"],
+            candidate_name="candidate", other_name="null"),
+    }
+    # The private index is an implementation detail; all persisted key sets
+    # remain explicit in ``match_keys`` and the pair reports.
+    for arm in arms.values():
+        arm.pop("_unique_match_keys", None)
+    return {"schema": ARM_EVIDENCE_SCHEMA, "vehicle": vehicle,
+            "arms": arms, "pairing": pairing}
+
+
 def _fill_quality_adequate(fit: Sequence[Mapping], heldout: Sequence[Mapping],
                            *, vehicle: str, lane: str) -> bool:
     partitions = [heldout] if lane == "shadow" else [fit, heldout]
@@ -1579,6 +1801,9 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
             [*fit, *heldout], vehicle=vehicle, risk_report=risk)
     except (CostError, TypeError, ValueError, OverflowError):
         stress = {"schema": "cost-stress-report.v1", "vehicle": vehicle,
+                  "stress_basis_schema": STRESSED_COST_SCHEMA,
+                  "stress_basis": dict(STRESSED_COST_BASIS),
+                  "required_entry_notional_bps": COST_STRESS_REQUIRED_BPS,
                   "required_round_trip_bps": COST_STRESS_REQUIRED_BPS,
                   "scenarios": [], "adequate": False}
     derived["cost_stress_adequate"] = bool(stress.get("adequate"))
@@ -1591,6 +1816,48 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
             "available": False, "effective_breadth": None,
             "reason": "invalid_matched_breadth_evidence",
         }
+    fit_sessions = {str(row.get("session_date") or "") for row in fit_source_raw}
+    heldout_sessions = {str(row.get("session_date") or "") for row in heldout_source_raw}
+    fit_null_raw = [row for row in null_source_raw
+                    if str(row.get("session_date") or "") in fit_sessions]
+    heldout_null_raw = [row for row in null_source_raw
+                        if str(row.get("session_date") or "") in heldout_sessions]
+    # A null arm is generated for the held-out comparison in current factory
+    # lanes.  Keep the fit projection empty unless it explicitly contains fit
+    # session keys, so its counts cannot imply evidence that was never replayed.
+    fit_null_projection = (authorization_projection(
+        fit_null_raw, vehicle=vehicle, strict=strict_projection)
+        if fit_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
+    heldout_null_projection = (authorization_projection(
+        heldout_null_raw, vehicle=vehicle, strict=strict_projection)
+        if heldout_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
+    arm_diagnostics = {
+        "fit": arm_evidence_report(
+            candidate=fit_source_raw, baseline=fit_baseline_source_raw,
+            null=fit_null_raw, vehicle=vehicle,
+            projections={"candidate": projections["fit"],
+                         "baseline": projections["fit_baseline"],
+                         "null": fit_null_projection}),
+        "heldout": arm_evidence_report(
+            candidate=heldout_source_raw, baseline=heldout_baseline_source_raw,
+            null=heldout_null_raw, vehicle=vehicle,
+            projections={"candidate": projections["heldout"],
+                         "baseline": projections["heldout_baseline"],
+                         "null": heldout_null_projection}),
+        "all": arm_evidence_report(
+            candidate=[*fit_source_raw, *heldout_source_raw],
+            baseline=[*fit_baseline_source_raw, *heldout_baseline_source_raw],
+            null=null_source_raw, vehicle=vehicle,
+            projections={
+                "candidate": authorization_projection(
+                    [*fit_source_raw, *heldout_source_raw],
+                    vehicle=vehicle, strict=strict_projection),
+                "baseline": authorization_projection(
+                    [*fit_baseline_source_raw, *heldout_baseline_source_raw],
+                    vehicle=vehicle, strict=strict_projection),
+                "null": projections["null"],
+            }),
+    }
     # Required checks are the minimum schema, not a licence to ignore an
     # additional veto supplied by a caller.  A passing envelope must agree
     # with every persisted boolean decision, exactly as durable proof
@@ -1626,6 +1893,7 @@ def verified_gate_envelope(*, lane: str, vehicle: str,
         "authorization_projection": {
             name: _projection_summary(value) for name, value in projections.items()
         },
+        "arm_diagnostics": arm_diagnostics,
         "fit_control": fit_summary,
         "control": dict(control),
         "statistics": {"p_value": float(p_value), "q_value": float(q_value),
@@ -1886,6 +2154,46 @@ def verify_gate_envelope(envelope: Mapping) -> bool:
         }
         if envelope.get("fill_quality") != expected_fill_quality:
             return False
+        if "arm_diagnostics" in envelope:
+            source_fit_sessions = {str(row.get("session_date") or "")
+                                   for row in sources_fit}
+            source_heldout_sessions = {str(row.get("session_date") or "")
+                                       for row in sources_held}
+            raw_null_fit = [row for row in null_source
+                            if str(row.get("session_date") or "") in source_fit_sessions]
+            raw_null_heldout = [row for row in null_source
+                                if str(row.get("session_date") or "") in source_heldout_sessions]
+            expected_arm_diagnostics = {
+                "fit": arm_evidence_report(
+                    candidate=sources_fit, baseline=baseline_fit,
+                    null=raw_null_fit, vehicle=vehicle,
+                    projections={"candidate": source_projections["fit"],
+                                 "baseline": source_projections["fit_baseline"],
+                                     "null": authorization_projection(
+                                     raw_null_fit, vehicle=vehicle, strict=projection_strict)}),
+                "heldout": arm_evidence_report(
+                    candidate=sources_held, baseline=baseline_held,
+                    null=raw_null_heldout, vehicle=vehicle,
+                    projections={"candidate": source_projections["heldout"],
+                                 "baseline": source_projections["heldout_baseline"],
+                                 "null": authorization_projection(
+                                     raw_null_heldout, vehicle=vehicle, strict=projection_strict)}),
+                "all": arm_evidence_report(
+                    candidate=[*sources_fit, *sources_held],
+                    baseline=[*baseline_fit, *baseline_held],
+                    null=null_source, vehicle=vehicle,
+                    projections={
+                        "candidate": authorization_projection(
+                            [*sources_fit, *sources_held],
+                            vehicle=vehicle, strict=projection_strict),
+                        "baseline": authorization_projection(
+                            [*baseline_fit, *baseline_held],
+                            vehicle=vehicle, strict=projection_strict),
+                        "null": source_projections["null"],
+                    }),
+            }
+            if envelope.get("arm_diagnostics") != expected_arm_diagnostics:
+                return False
         expected_stress = cost_stress_report(
             [*sources_fit_eligible, *sources_held_eligible], vehicle=vehicle,
             risk_report=risk)
@@ -2298,9 +2606,9 @@ def _close_number(left: Any, right: Any, tolerance: float = 1e-9) -> bool:
         return False
 
 
-__all__ = ["AcceptanceFloor", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
+__all__ = ["AcceptanceFloor", "ARM_EVIDENCE_SCHEMA", "CLUSTER_SECONDS", "GATE_ENVELOPE_SCHEMA",
            "GATE_REQUIRED_CHECKS", "AUTHORIZATION_PROJECTION_SCHEMA",
-           "authorization_projection", "fill_source_summary", "floor_feasibility",
+           "authorization_projection", "arm_evidence_report", "fill_source_summary", "floor_feasibility",
            "unevaluable_reason",
            "protocol_minimums", "validate_protocol_floor",
            "PROTOCOL_BACKTEST_MIN_TRADES", "PROTOCOL_BACKTEST_MIN_SESSIONS",

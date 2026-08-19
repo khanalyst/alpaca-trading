@@ -2,7 +2,9 @@
 
 from argparse import Namespace
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -16,14 +18,28 @@ _CLI_SPEC.loader.exec_module(research_cli)
 
 
 class ScheduledResearchTests(unittest.TestCase):
-    def test_factory_command_uses_validated_agent_cost_and_execution_config(self):
-        agent_config = {
+    @staticmethod
+    def _factory_args(data: Path, *, diagnostic_only: bool = False) -> Namespace:
+        return Namespace(
+            agent_config="config.yaml", config=None, data=str(data),
+            db="edge.sqlite3", vehicle="equity", strategies=1,
+            variants=2, workers=1, starting_cash=100_000.0,
+            min_trades=1, min_sessions=1, alpha=.05, max_generations=1,
+            worker_data=None, diagnostic_only=diagnostic_only)
+
+    @staticmethod
+    def _factory_config() -> dict:
+        return {
+            "broker": {"data_feed": "sip"},
             "costs": {"spread_bps": 7.0, "slippage_bps": 4.0,
                       "fee_bps": 0.8},
             "execution": {"max_spread_bps": 20.0,
                           "max_slippage_bps": 15.0},
             "research": {"strategy_llm": {"enabled": False}},
         }
+
+    def test_factory_command_uses_validated_agent_cost_and_execution_config(self):
+        agent_config = self._factory_config()
         args = Namespace(
             agent_config="config.yaml", config=None, data="market.jsonl",
             db="edge.sqlite3", vehicle="equity", strategies=1,
@@ -36,6 +52,10 @@ class ScheduledResearchTests(unittest.TestCase):
             return {"results": []}
 
         with patch.object(research_cli, "_agent_config", return_value=agent_config), \
+             patch.object(research_cli, "_factory_dataset_preflight",
+                          return_value={"authorizing": True,
+                                        "diagnostic_only": False,
+                                        "source": {}}), \
              patch.object(research_cli, "run_factory", side_effect=fake_run_factory), \
              patch.object(research_cli, "_emit_proofs", return_value=False), \
              patch.object(research_cli, "_write_factory_report", return_value=None):
@@ -46,6 +66,85 @@ class ScheduledResearchTests(unittest.TestCase):
         self.assertEqual(model.slippage_bps, 4.0)
         self.assertEqual(model.max_spread_bps, 20.0)
         self.assertEqual(model.max_slippage_bps, 15.0)
+
+    def test_factory_default_rejects_non_sip_or_missing_provenance_before_runner(self):
+        for row in (
+                {"kind": "bar", "provider": "alpaca", "feed": "iex"},
+                {"kind": "bar", "feed": "sip"}):
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "market.jsonl"
+                source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                args = self._factory_args(source)
+                with patch.object(research_cli, "_agent_config",
+                                  return_value=self._factory_config()), \
+                     patch.object(research_cli, "run_factory") as factory, \
+                     patch.object(research_cli, "_emit_proofs"):
+                    with self.assertRaisesRegex(ValueError,
+                                                "provenance preflight"):
+                        research_cli.cmd_factory_run(args)
+                factory.assert_not_called()
+
+    def test_factory_diagnostic_only_marks_result_and_emits_no_proof(self):
+        row = {"kind": "bar", "provider": "alpaca", "feed": "iex"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "market.jsonl"
+            source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            args = self._factory_args(source, diagnostic_only=True)
+            output = []
+
+            def fake_run_factory(*_args, **_kwargs):
+                return {"results": []}
+
+            with patch.object(research_cli, "_agent_config",
+                              return_value=self._factory_config()), \
+                 patch.object(research_cli, "run_factory",
+                              side_effect=fake_run_factory) as factory, \
+                 patch.object(research_cli, "_emit_proofs") as emit, \
+                 patch.object(research_cli, "_write_factory_report",
+                              return_value=None), \
+                 patch.object(research_cli, "print",
+                              side_effect=lambda value, **_kwargs: output.append(value)):
+                self.assertEqual(research_cli.cmd_factory_run(args), 2)
+            factory.assert_called_once()
+            emit.assert_not_called()
+            result = json.loads(output[-1])
+            self.assertTrue(result["diagnostic_only"])
+            self.assertFalse(result["authorizing"])
+            self.assertEqual(result["source"]["provider"], "alpaca")
+            self.assertEqual(result["source"]["feed"], "iex")
+            self.assertEqual(result["source_provider"], "alpaca")
+            self.assertEqual(result["source_feed"], "iex")
+            self.assertEqual(result["source_provenance"],
+                             {"provider": "alpaca", "feed": "iex"})
+            self.assertEqual(result["provenance"],
+                             {"provider": "alpaca", "feed": "iex"})
+            self.assertEqual(result["proofs"], [])
+
+    def test_factory_sip_default_keeps_proof_emission_path(self):
+        row = {"kind": "bar", "provider": "alpaca", "feed": "sip"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "market.jsonl"
+            source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            args = self._factory_args(source)
+            with patch.object(research_cli, "_agent_config",
+                              return_value=self._factory_config()), \
+                 patch.object(research_cli, "run_factory",
+                              return_value={"results": []}), \
+                 patch.object(research_cli, "_emit_proofs",
+                              return_value=[]) as emit, \
+                 patch.object(research_cli, "_write_factory_report",
+                              return_value=None), \
+                 patch.object(research_cli, "print"):
+                self.assertEqual(research_cli.cmd_factory_run(args), 2)
+            emit.assert_called_once()
+
+    def test_factory_parser_exposes_diagnostic_only_for_both_command_forms(self):
+        parser = research_cli.build_parser()
+        for argv in (
+                ["factory", "run", "--data", "market.jsonl", "--diagnostic-only"],
+                ["factory-run", "--data", "market.jsonl", "--diagnostic-only"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(parser.parse_args(argv).diagnostic_only)
 
     def test_research_cycle_script_has_no_bash4_mapfile_or_empty_quote_array(self):
         script = (Path(__file__).parents[2] / "deploy" / "research-cycle.sh").read_text()

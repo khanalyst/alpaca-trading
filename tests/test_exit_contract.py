@@ -269,7 +269,12 @@ class ExitContractDifferentialTests(unittest.TestCase):
             "strategy": {"id": "rule", "version": "v1",
                          "variant_id": self.variant_id, "rule_spec": SPEC,
                          "execution_mode": "shares"},
-            "risk": {}, "execution": {"client_order_id_prefix": "exit"},
+            # These fixtures exercise exit geometry after a position is
+            # opened.  Keep the historical generous stressed-cost allowance
+            # here so the global production default (0.30) cannot veto the
+            # mechanics under test before monitoring begins.
+            "risk": {"max_stressed_cost_to_risk_ratio": 1.0},
+            "execution": {"client_order_id_prefix": "exit"},
             "llm": {"enabled": False},
             "research": {"enabled": True, "require_validated_variant": False,
                          "db_path": str(Path(self.tmp.name) / "edge.sqlite3")},

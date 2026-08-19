@@ -21,7 +21,7 @@ from .gates import (
     expectancy_rejection_report, heldout_separation, matched_cluster_test,
     max_drawdown_of, paired_delta, performance_floor, qualification_report,
     sample_counts, seal_final_window, structural_floor, verified_gate_envelope,
-    authorization_projection,
+    authorization_projection, arm_evidence_report,
     walk_forward_report, validate_protocol_floor,
     PROTOCOL_SHADOW_MIN_TRADES, PROTOCOL_SHADOW_MIN_SESSIONS,
 )

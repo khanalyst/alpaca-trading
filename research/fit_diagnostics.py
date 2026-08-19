@@ -21,7 +21,8 @@ from agent.contracts.rule import (
     MIN_STOP_DISTANCE_BPS, evaluate_rule_signal_metadata, feature_window_bars,
     rule_variant_id, validate_rule_spec,
 )
-from .costs import stressed_cost_usd
+from .costs import (STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
+                    stressed_cost_usd)
 from .market_data import record_available_at, record_is_available
 from .stats import clustered_mde_power_report
 
@@ -307,13 +308,101 @@ def _configured_cost_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
             "eligible_rows": len(values), "unit": "usd"}
 
 
+def _record_identity(record: Any, *, leg: str | None = None) -> tuple[str | None, str | None]:
+    """Return provider/feed without assuming a concrete market-record type."""
+    if leg is not None and isinstance(record, Mapping):
+        provider = record.get(f"{leg}_provider")
+        feed = record.get(f"{leg}_feed", record.get(f"{leg}_option_feed"))
+    elif isinstance(record, Mapping):
+        provider = record.get("provider")
+        feed = record.get("feed", record.get("feed_id"))
+    else:
+        provider = getattr(record, "provider", None)
+        feed = getattr(record, "feed", None)
+        identity = getattr(record, "identity", None)
+        if provider is None and identity is not None:
+            provider = getattr(identity, "provider", None)
+        if feed is None and identity is not None:
+            feed = getattr(identity, "feed", None)
+    provider = str(provider).strip() if provider not in (None, "") else None
+    feed = str(feed).strip() if feed not in (None, "") else None
+    return provider, feed
+
+
+def _provenance_summary(records: Sequence[Any], *, fill_rows: bool = False) -> dict[str, Any]:
+    """Aggregate provider/feed identity for fit evidence, never as a gate."""
+    providers: Counter[str] = Counter()
+    feeds: Counter[str] = Counter()
+    pairs: Counter[str] = Counter()
+    unknown = 0
+    observations = 0
+    for record in records:
+        legs = ("entry", "exit") if fill_rows else (None,)
+        for leg in legs:
+            provider, feed = _record_identity(record, leg=leg)
+            observations += 1
+            if provider is None or feed is None:
+                unknown += 1
+                continue
+            providers[provider] += 1
+            feeds[feed] += 1
+            pairs[f"{provider}/{feed}"] += 1
+    return {
+        "observations": observations,
+        "providers": dict(sorted(providers.items())),
+        "feeds": dict(sorted(feeds.items())),
+        "provider_feed": dict(sorted(pairs.items())),
+        "unknown": unknown,
+        "diagnostic_only": True,
+    }
+
+
+def _entry_pricing_summary(signals: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    counts: Counter[str] = Counter()
+    for item in signals:
+        source = str(item.get("entry_pricing") or "unknown").strip().lower()
+        if source not in {"bar", "quote_required"}:
+            source = "unknown"
+        counts[source] += 1
+    return {
+        "signals": len(signals),
+        "source_counts": dict(sorted(counts.items())),
+        "bar_available": counts.get("bar", 0),
+        "quote_required": counts.get("quote_required", 0),
+        "unknown": counts.get("unknown", 0),
+        "diagnostic_only": True,
+    }
+
+
+def _stress_controls(risk_config: Mapping[str, Any] | None) -> tuple[float | None, float | None]:
+    """Resolve configured stress controls while retaining fail-closed unknowns."""
+    source = risk_config if isinstance(risk_config, Mapping) else {}
+    risk = source.get("risk", source)
+    risk = risk if isinstance(risk, Mapping) else {}
+    scenario = _number(risk.get("stressed_cost_scenario_bps"))
+    limit = _number(risk.get("max_stressed_cost_to_risk_ratio"))
+    if scenario is None and "stressed_cost_scenario_bps" not in risk:
+        scenario = 25.0
+    if limit is None and "max_stressed_cost_to_risk_ratio" not in risk:
+        limit = 0.30
+    if scenario not in {9.0, 15.0, 25.0, 50.0}:
+        scenario = None
+    if limit is not None and limit < 0:
+        limit = None
+    return scenario, limit
+
+
 def _stressed_cost_summary(rows: Sequence[Mapping[str, Any]], scenario_bps: float,
-                           *, vehicle: str, costs: Any) -> dict[str, Any]:
+                           *, vehicle: str, costs: Any,
+                           configured_limit: float | None = None) -> dict[str, Any]:
     values: list[float] = []
     risks: list[float] = []
+    status_counts = {"pass": 0, "fail": 0, "unknown": 0}
+    considered = 0
     for row in rows:
         if row.get("no_trade") is True:
             continue
+        considered += 1
         quantity = _number(row.get("quantity", row.get("contracts", 1.0))) or 1.0
         multiplier = _number(row.get(
             "contract_multiplier",
@@ -325,17 +414,37 @@ def _stressed_cost_summary(rows: Sequence[Mapping[str, Any]], scenario_bps: floa
             notional = abs(plan_entry) * abs(quantity) * abs(multiplier)
         risk = _risk_value(row)
         if notional is None or risk is None or risk <= 0:
+            status_counts["unknown"] += 1
             continue
-        values.append(stressed_cost_usd(
-            notional, scenario_bps, vehicle=vehicle, quantity=quantity,
-            costs=costs))
+        try:
+            stress = stressed_cost_usd(
+                entry_notional=notional, scenario_bps=scenario_bps,
+                vehicle=vehicle, quantity=quantity, costs=costs)
+        except (TypeError, ValueError, OverflowError):
+            status_counts["unknown"] += 1
+            continue
+        values.append(stress)
         risks.append(risk)
+        if configured_limit is None:
+            status_counts["unknown"] += 1
+        elif stress / risk <= configured_limit:
+            status_counts["pass"] += 1
+        else:
+            status_counts["fail"] += 1
     total = sum(values)
     risk_total = sum(risks)
     return {"bps": float(scenario_bps), "total_cost": total,
             "mean_cost": total / len(values) if values else None,
             "cost_to_risk_ratio": total / risk_total if risk_total > 0 else None,
-            "eligible_rows": len(values), "unit": "usd"}
+            "eligible_rows": len(values), "rows_considered": considered,
+            "row_status": status_counts,
+            "row_counts": dict(status_counts),
+            "pass_rows": status_counts["pass"],
+            "fail_rows": status_counts["fail"],
+            "unknown_rows": status_counts["unknown"],
+            "configured_limit": configured_limit,
+            "basis_schema": STRESSED_COST_SCHEMA,
+            "basis": dict(STRESSED_COST_BASIS), "unit": "usd"}
 
 
 def _risk_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -409,7 +518,9 @@ def _mde(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def measure_fit_diagnostics(
         bars: Sequence[Any], spec: Mapping[str, Any], *,
         account_rows: Sequence[Mapping[str, Any]] = (),
-        costs: Any | None = None, vehicle: str | None = None) -> dict[str, Any]:
+        costs: Any | None = None, vehicle: str | None = None,
+        risk_config: Mapping[str, Any] | None = None,
+        config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Measure compact fit-only behavior and execution summaries.
 
     ``bars`` and ``account_rows`` must already be the fit/development slice.
@@ -432,17 +543,29 @@ def measure_fit_diagnostics(
         "hold_bars": _quantiles([item.get("planned_hold_bars") for item in signals]),
     }
     rows = [dict(row) for row in account_rows if isinstance(row, Mapping)]
+    controls_input = risk_config if risk_config is not None else config
+    stress_scenario, stress_limit = _stress_controls(controls_input)
     resolved_vehicle = vehicle or next(
         (str(row.get("vehicle")) for row in rows
          if str(row.get("vehicle")) in {"equity", "option"}), "equity")
     configured = _configured_cost_summary(rows)
     stressed = {str(int(scenario_bps)): _stressed_cost_summary(
-        rows, scenario_bps, vehicle=resolved_vehicle, costs=costs)
+        rows, scenario_bps, vehicle=resolved_vehicle, costs=costs,
+        configured_limit=stress_limit)
                 for scenario_bps in COST_STRESS_MULTIPLIERS}
+    provenance = _provenance_summary(bars)
+    if rows:
+        provenance["fills"] = _provenance_summary(rows, fill_rows=True)
+    pricing = _entry_pricing_summary(signals)
+    configured_stress = (stressed.get(str(int(stress_scenario)), {})
+                         if stress_scenario is not None else {})
+    configured_status = configured_stress.get(
+        "row_status", {"pass": 0, "fail": 0, "unknown": len(rows)})
     fit_diagnostics = {
         "schema": FIT_DIAGNOSTICS_SCHEMA,
         "scope": "fit_only",
         "authorizing": False,
+        "diagnostic_only": True,
         "variant_id": rule_variant_id(normalized),
         "eligible_prefix": {
             "eligible": eligible, "total": total,
@@ -467,6 +590,28 @@ def measure_fit_diagnostics(
         },
         "planned": planned,
         "vehicle": resolved_vehicle,
+        "provenance": provenance,
+        "entry_pricing": pricing,
+        "pricing": {"entry": dict(pricing), "diagnostic_only": True},
+        "risk_controls": {
+            "stressed_cost_scenario_bps": stress_scenario,
+            "max_stressed_cost_to_risk_ratio": stress_limit,
+            "scenario_bps": stress_scenario,
+            "limit": stress_limit,
+            "configured_stress": {
+                "scenario_bps": stress_scenario,
+                "max_cost_to_risk_ratio": stress_limit,
+            },
+            "basis_schema": STRESSED_COST_SCHEMA,
+            "basis": dict(STRESSED_COST_BASIS),
+            "row_status": configured_status,
+            "row_counts": dict(configured_status),
+            "pass_rows": configured_status["pass"],
+            "fail_rows": configured_status["fail"],
+            "unknown_rows": configured_status["unknown"],
+            "authorizing": False,
+            "diagnostic_only": True,
+        },
         "cost_to_risk": {"configured": configured, "stressed": stressed},
         "risk": _risk_summary(rows),
         "exits": _exit_summary(rows),

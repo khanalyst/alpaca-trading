@@ -44,7 +44,7 @@ from .gates import (chronological_split, heldout_separation,
                     expectancy_rejection_report,
                     matched_cluster_test, matched_pairs, max_drawdown_of,
                     performance_floor, placebo_null_distribution,
-                    authorization_projection,
+                    authorization_projection, arm_evidence_report,
                     RETIREMENT_CONFIDENCE, RETIREMENT_MIN_SESSIONS,
                     RETIREMENT_MIN_USEFUL_R,
                     falsification_gate,
@@ -1250,7 +1250,7 @@ def _diagnose_worker(payload: Mapping[str, Any]) -> dict:
         fit_diagnostics = measure_fit_diagnostics(
             fit_bars, hypothesis["rule_spec"],
             account_rows=root_account["rows"], costs=payload["costs"],
-            vehicle=vehicle)
+            vehicle=vehicle, risk_config=payload.get("risk_config"))
         return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
                 "diagnostic": {
                     **diagnose(root_account["rows"], starting_cash=starting_cash),
@@ -1286,7 +1286,8 @@ def _fit_variants_worker(payload: Mapping[str, Any]) -> dict:
                 quotes=quotes, policy=payload.get("policy"))
             output[variant_id] = measure_fit_diagnostics(
                 fit_bars, spec, account_rows=account["rows"],
-                costs=payload["costs"], vehicle=str(payload["vehicle"]))
+                costs=payload["costs"], vehicle=str(payload["vehicle"]),
+                risk_config=payload.get("risk_config"))
         return {"hypothesis_id": str(hypothesis["hypothesis_id"]),
                 "fit_diagnostics": output, "worker_pid": os.getpid()}
     finally:
@@ -1414,6 +1415,8 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                     if str(row.get("session_date") or "") in fit_sessions]
         base_heldout = [row for row in base_ordered
                        if str(row.get("session_date") or "") in held_sessions]
+    fit_sessions = {str(row.get("session_date") or "") for row in raw_fit}
+    held_sessions = {str(row.get("session_date") or "") for row in raw_heldout}
     fit_floor = structural_floor(
         fit, vehicle=vehicle, min_trades=min_trades, min_sessions=min_sessions,
         min_clusters=MIN_PROMOTION_CLUSTERS, required=mode != "shadow")
@@ -1513,6 +1516,42 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
                         "qualification_delta_positive",
                         "qualification_cluster_floor"}
     }
+    fit_null_raw = [row for row in raw_null
+                    if str(row.get("session_date") or "") in fit_sessions]
+    heldout_null_raw = [row for row in raw_null
+                        if str(row.get("session_date") or "") in held_sessions]
+    fit_null_projection = (authorization_projection(
+        fit_null_raw, vehicle=vehicle, strict=strict_projection)
+        if fit_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
+    heldout_null_projection = (authorization_projection(
+        heldout_null_raw, vehicle=vehicle, strict=strict_projection)
+        if heldout_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
+    arm_diagnostics = {
+        "fit": arm_evidence_report(
+            candidate=raw_fit, baseline=raw_base_fit, null=fit_null_raw,
+            vehicle=vehicle,
+            projections={"candidate": authorization_projection(
+                             raw_fit, vehicle=vehicle, strict=strict_projection),
+                         "baseline": authorization_projection(
+                             raw_base_fit, vehicle=vehicle, strict=strict_projection),
+                         "null": fit_null_projection}),
+        "heldout": arm_evidence_report(
+            candidate=raw_heldout, baseline=raw_base_heldout,
+            null=heldout_null_raw, vehicle=vehicle,
+            projections={"candidate": authorization_projection(
+                             raw_heldout, vehicle=vehicle, strict=strict_projection),
+                         "baseline": authorization_projection(
+                             raw_base_heldout, vehicle=vehicle, strict=strict_projection),
+                         "null": heldout_null_projection}),
+        "all": arm_evidence_report(
+            candidate=ordered_raw, baseline=base_ordered_raw,
+            null=raw_null, vehicle=vehicle,
+            projections={"candidate": authorization_projection(
+                             ordered_raw, vehicle=vehicle, strict=strict_projection),
+                         "baseline": authorization_projection(
+                             base_ordered_raw, vehicle=vehicle, strict=strict_projection),
+                         "null": null_projection}),
+    }
     return {
         "passes_without_family": bool(all(checks.values())),
         "development_passes_without_family": bool(all(development_checks.values())),
@@ -1557,6 +1596,7 @@ def _gate(rows: Sequence[Mapping], baseline: Sequence[Mapping], *,
             "null": {key: null_projection.get(key) for key in
                       ("schema", "vehicle", "strict", "counts", "reasons", "excluded")},
         },
+        "arm_diagnostics": arm_diagnostics,
     }
 
 
@@ -1973,6 +2013,7 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
             "hypothesis": hypothesis, "vehicle": vehicle, "mode": mode,
             "existing_specs": specs, "variants_per_strategy": variants_per_strategy,
             "starting_cash": starting_cash, "costs": model,
+            "risk_config": risk_assumptions,
             "policy": (shadow_policy if mode == "shadow" else backtest_policy),
             "backtest_bar_fallback": backtest_bar_fallback,
         }

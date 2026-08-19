@@ -133,6 +133,10 @@ class ResearchCommandLaneConfigTests(unittest.TestCase):
 
         with patch.object(research_cli, "_agent_config",
                           return_value=self._agent_config(False)), \
+             patch.object(research_cli, "_factory_dataset_preflight",
+                          return_value={"authorizing": True,
+                                        "diagnostic_only": False,
+                                        "source": {}}), \
              patch.object(research_cli, "run_factory", side_effect=fake_factory), \
              patch.object(research_cli, "_emit_proofs", return_value=False), \
              patch.object(research_cli, "_write_factory_report", return_value=None), \

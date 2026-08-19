@@ -21,8 +21,10 @@ from research.costs import (BAR, CostError, CostModel, DEFAULT_FEE_BPS,
                             DEFAULT_OPTION_FEE_PER_CONTRACT_SIDE,
                             DEFAULT_SLIPPAGE_BPS, DEFAULT_SPREAD_BPS, QUOTE,
                             RUNTIME_MAX_SLIPPAGE_BPS, ReplayPolicy,
+                            STRESSED_COST_BASIS, STRESSED_COST_SCHEMA,
                             SQLiteQuoteIndex, index_quotes, quote_fill,
-                            cost_model_for_vehicle, risk_unit_report)
+                            cost_model_for_vehicle, risk_unit_report,
+                            stressed_cost_usd)
 from research.edge_discovery_core import (DiscoveryError,
                                           _effective_ibr_config,
                                           _read_discovery_rows)
@@ -77,6 +79,16 @@ def _quote(minute, bid, ask, *, as_of_minute=None):
 
 
 class CostModelTests(unittest.TestCase):
+    def test_stress_names_entry_notional_and_basis_without_changing_formula(self):
+        self.assertAlmostEqual(
+            stressed_cost_usd(entry_notional=1_000.0, scenario_bps=25.0,
+                              vehicle="equity"), 2.5)
+        with self.assertRaisesRegex(CostError, "not both"):
+            stressed_cost_usd(1_000.0, 25.0, entry_notional=1_000.0,
+                              vehicle="equity")
+        self.assertEqual(STRESSED_COST_SCHEMA, "stressed-entry-cost.v1")
+        self.assertEqual(STRESSED_COST_BASIS["notional"], "entry_notional")
+
     def test_option_default_has_a_conservative_two_side_contract_fee(self):
         option = CostModel().fees(2.0, 2.0, 1, 100, vehicle="option")
         equity = CostModel().fees(2.0, 2.0, 1, 100, vehicle="equity")

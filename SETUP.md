@@ -279,7 +279,11 @@ bounds them: a model whose expected half-spread plus slippage exceeds
 runtime would refuse to submit. Preregistered all-in stress scenarios are 9,
 15, 25, and 50 bps; 25 bps is the authorization requirement. Runtime risk
 abstains before submission when the configured stressed cost exceeds its
-cost-to-risk limit and records scenario/cost/ratio telemetry.
+cost-to-risk limit and records scenario/cost/ratio telemetry. Stress applies
+scenario bps to entry notional, then adds listed-option round-trip fees for
+both per-contract sides; it is not a per-side bps charge. The shipped
+`max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade is about
+`0.833` cost-to-risk at the 25-bps stress and is vetoed before option fees.
 `execution.strict_market_data` defaults to `true`; `python research.py calibrate`
 (see OPERATIONS.md) is an authorization check against
 real entry and exit fills, including terminal underfill/partial-cancel evidence.
@@ -562,6 +566,10 @@ and global BH plus durable online FDR must pass before an immutable live marker
 is appended. Historical and offline-forward selection explicitly defers this
 cumulative test; it cannot consume the budget or authorize deployment. Manual/
 offline promotion cannot bypass it.
+Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
+fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
+and directional/pair coverage. Quote density can change null/control evidence
+even when the candidate count is unchanged.
 Epoch-4 ingestion uses independent chronological selection and confirmatory
 windows: BH uses selection p-values, only the selected candidate's raw
 confirmatory p reaches LORD, and same-tail v3 scopes remain audit-only.
@@ -642,8 +650,9 @@ of fills.
 The rule exit grammar remains fixed to the 30-bps-floor ATR bracket, configured
 R target, and bar-cap time exit. Fit-only diagnostics report first-signal and
 floor-binding rates, planned exits, configured/stressed economics, power,
-behavioral aliases, and intended versus delivered risk for operator review; they
-do not expand exits or authorize proof.
+behavioral aliases, intended versus delivered risk, provider/feed provenance,
+pricing source, configured limits, and pass/fail/unknown row counts for operator
+review; they do not expand exits or authorize proof.
 
 ## 14. Read the reports
 

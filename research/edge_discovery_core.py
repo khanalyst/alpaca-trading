@@ -108,6 +108,10 @@ def authorization_projection(*args, **kwargs):
     return _facade_dependency("authorization_projection")(*args, **kwargs)
 
 
+def arm_evidence_report(*args, **kwargs):
+    return _facade_dependency("arm_evidence_report")(*args, **kwargs)
+
+
 def _projection_summary(projection: Mapping[str, Any]) -> dict:
     return {key: projection.get(key) for key in (
         "schema", "vehicle", "strict", "counts", "reasons", "excluded")}
@@ -1118,6 +1122,42 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
     passes_without_family = bool(
         all(checks.values()) and delta_all.get("mean_delta") is not None and
         float(delta_all["mean_delta"]) > 0)
+    fit_null_raw = [row for row in null_raw
+                    if str(row.get("session_date") or "") in fit_sessions]
+    heldout_null_raw = [row for row in null_raw
+                        if str(row.get("session_date") or "") in heldout_sessions]
+    fit_null_projection = (authorization_projection(
+        fit_null_raw, vehicle=vehicle, strict=True)
+        if fit_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
+    heldout_null_projection = (authorization_projection(
+        heldout_null_raw, vehicle=vehicle, strict=True)
+        if heldout_null_raw else {"eligible": [], "excluded": [], "reasons": {}})
+    arm_diagnostics = {
+        "fit": arm_evidence_report(
+            candidate=raw_fit, baseline=raw_base_fit, null=fit_null_raw,
+            vehicle=vehicle,
+            projections={"candidate": authorization_projection(
+                             raw_fit, vehicle=vehicle, strict=True),
+                         "baseline": authorization_projection(
+                             raw_base_fit, vehicle=vehicle, strict=True),
+                         "null": fit_null_projection}),
+        "heldout": arm_evidence_report(
+            candidate=raw_heldout, baseline=raw_base_heldout,
+            null=heldout_null_raw, vehicle=vehicle,
+            projections={"candidate": authorization_projection(
+                             raw_heldout, vehicle=vehicle, strict=True),
+                         "baseline": authorization_projection(
+                             raw_base_heldout, vehicle=vehicle, strict=True),
+                         "null": heldout_null_projection}),
+        "all": arm_evidence_report(
+            candidate=ordered_raw, baseline=base_ordered_raw,
+            null=null_raw, vehicle=vehicle,
+            projections={"candidate": authorization_projection(
+                             ordered_raw, vehicle=vehicle, strict=True),
+                         "baseline": authorization_projection(
+                             base_ordered_raw, vehicle=vehicle, strict=True),
+                         "null": null_projection}),
+    }
     return {"vehicle": vehicle, "shadow": shadow,
             "alpha": float(alpha),
             "passes_without_family": passes_without_family,
@@ -1152,7 +1192,9 @@ def _discover_gate(candidate: Sequence[Mapping], baseline: Sequence[Mapping], *,
                 "candidate": _projection_summary(candidate_projection),
                 "baseline": _projection_summary(baseline_projection),
                 "null": _projection_summary(null_projection),
-            }}
+            },
+            "arm_diagnostics": arm_diagnostics,
+            }
 
 
 def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
@@ -1233,5 +1275,5 @@ def _finalize_gate(gate: dict, *, lane: str, family: Mapping,
 __all__ = ["DiscoveryError", "corpus_partitions", "corpus_slice",
            "_read_discovery_rows", "_effective_ibr_config",
            "_opportunity_rows", "_null_reference_rows", "_discover_gate",
-           "_finalize_gate", "authorization_projection",
+           "_finalize_gate", "authorization_projection", "arm_evidence_report",
            "MIN_PROMOTION_CLUSTERS"]

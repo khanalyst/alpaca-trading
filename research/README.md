@@ -154,6 +154,13 @@ Every proof also persists the preregistered all-in stress scenarios of 9, 15,
 other scenarios remain diagnostics. A stress result that is missing, negative,
 or not positive at 25 bps cannot authorize a candidate.
 
+Stress semantics are explicit: each scenario charges its bps against entry
+notional, then listed options add round-trip fees for both per-contract sides;
+the stress bps are not per-side bps. The shipped
+`max_stressed_cost_to_risk_ratio` is `0.30`; a 30-bps-floor trade has about
+`0.833` cost-to-risk at the 25-bps stress and is therefore vetoed before any
+option fees.
+
 The runtime's stressed-cost risk check abstains before order submission when
 the configured 25 bps scenario (or another preregistered 9/15/50 bps choice)
 exceeds its allowed cost-to-risk ratio, and persists the scenario, cost, ratio,
@@ -371,10 +378,12 @@ still pass strictly later forward data before runtime can select them.
 Before full variant replay, `research.fit_diagnostics` records fit-only
 eligible-prefix and first-signal rates, ATR and 30-bps-floor binding, planned
 stop/target/hold distributions, configured/stressed cost-to-risk, intended
-versus delivered risk, exit reason/tie/gap counts, clustered MDE/power, and
-behavioral alias fingerprints. The exit grammar stays fixed (ATR-floor bracket,
-configured R target, and bar cap); these measurements are operator-review
-diagnostics only and never authorize or expand a candidate.
+versus delivered risk, exit reason/tie/gap counts, clustered MDE/power,
+provider/feed provenance, entry-pricing sources, configured limits,
+pass/fail/unknown row counts, and behavioral alias fingerprints. The exit
+grammar stays fixed (ATR-floor bracket, configured R target, and bar cap);
+these measurements are operator-review diagnostics only and never authorize or
+expand a candidate.
 
 A worker is given a corpus descriptor — the session window it needs — rather
 than a copy of the corpus, and re-reads that window itself. The predicates are
@@ -566,6 +575,12 @@ compared with itself. The root remains a real candidate in the family and
 cycle-global Benjamini–Hochberg denominators, so it consumes multiplicity like
 any mutation.
 
+Verified gate envelopes carry explainable arm evidence for candidate, baseline,
+and randomized-null rows: raw/executed/eligible counts, fill sources, quote-age
+summaries, gross/cost/net economics, matched and dropped match keys, and
+directional/pair coverage. Quote density can legitimately change null/control
+evidence even when the candidate count is unchanged.
+
 The checked config enables model-assisted discovery, replacement, and tuning
 with OpenAI `gpt-5`. Compose uses the host override
 `ALPACA_RESEARCH_LLM_SECRET_FILE`; the scheduler reads the mounted path through
@@ -604,6 +619,11 @@ python research.py factory run --data market.jsonl --strategies 11 --variants 4 
 python research.py factory status
 python research.py factory report [--slot N] [--format text|markdown|json] [--write]
 ```
+
+The standalone factory preflight requires readable normalized JSONL with
+explicit provider/feed provenance; the default equity lane requires SIP.
+`--diagnostic-only` is an explicit non-authorizing mode for partial or
+non-SIP input, marks the result diagnostic, and emits no proofs.
 
 `factory run` archives the Markdown narrative under `research/results/factory/`
 on every cycle, including a cycle that proved nothing, so the read-only

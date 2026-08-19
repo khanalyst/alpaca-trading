@@ -11,7 +11,8 @@ from datetime import date, datetime, timezone
 from collections.abc import Mapping
 
 from .instruments import validate_equity_symbol, validate_option_symbol
-from research.costs import CostError, stressed_cost_usd
+from research.costs import (CostError, STRESSED_COST_BASIS,
+                            STRESSED_COST_SCHEMA, stressed_cost_usd)
 
 from .risk_inputs import (
     _OCC_OPTION_RE,
@@ -127,7 +128,7 @@ class RiskEngine:
         if scenario is None:
             scenario = 25.0 if "stressed_cost_scenario_bps" not in risk else None
         if limit is None:
-            limit = 1.0 if "max_stressed_cost_to_risk_ratio" not in risk else None
+            limit = 0.30 if "max_stressed_cost_to_risk_ratio" not in risk else None
         if scenario not in {9.0, 15.0, 25.0, 50.0}:
             scenario = None
         if limit is not None and (not math.isfinite(limit) or limit < 0):
@@ -158,8 +159,8 @@ class RiskEngine:
             return None, "stressed_cost_invalid"
         try:
             stressed = stressed_cost_usd(
-                notional, scenario, vehicle=vehicle, quantity=quantity,
-                config=source)
+                entry_notional=notional, scenario_bps=scenario,
+                vehicle=vehicle, quantity=quantity, config=source)
             ratio = stressed / risk_usd
         except (CostError, TypeError, ValueError, OverflowError, ZeroDivisionError):
             return None, "stressed_cost_invalid"
@@ -171,6 +172,9 @@ class RiskEngine:
         enriched.update({
             "vehicle": vehicle,
             "stressed_cost_vehicle": vehicle,
+            "stressed_cost_schema": STRESSED_COST_SCHEMA,
+            "stressed_cost_basis": dict(STRESSED_COST_BASIS),
+            "stressed_cost_entry_notional": float(notional),
             "stressed_cost_scenario_bps": float(scenario),
             "stressed_cost_usd": float(stressed),
             "stressed_cost_to_risk_ratio": float(ratio),

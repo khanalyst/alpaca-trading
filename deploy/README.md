@@ -205,12 +205,18 @@ partial-cancel
 rate above 20% blocks shadow authorization. Offline discovery/factory
 diagnostics remain available while that boundary is closed. Fit diagnostics may
 count planned signal/exit geometry as quote-required, non-authorizing
-measurement.
+measurement. Stress applies scenario bps to entry notional and adds listed-option
+round-trip fees for both per-contract sides; it is not a per-side bps charge.
+The shipped `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade
+is about `0.833` cost-to-risk at the 25-bps stress and is vetoed before option
+fees.
 
 The executable exit grammar remains fixed to the 30-bps-floor ATR bracket,
 configured R target, and bar-cap time exit. Fit-only factory diagnostics expose
-signal-prefix/floor binding, planned exits, cost/risk, power, and behavior
-aliases for operator review; they are non-authorizing and do not expand exits.
+signal-prefix/floor binding, planned exits, cost/risk, power, behavior aliases,
+provider/feed provenance, pricing source, configured limits, and
+pass/fail/unknown row counts for operator review; they are non-authorizing and
+do not expand exits.
 
 Research never rewrites the append-only recorder corpus. A temporary cycle view
 explicitly quarantines legacy rows whose `as_of` is later than `observed_at`,
@@ -268,6 +274,10 @@ registered before retirement when enabled, and demoted candidates can re-prove
 on a newer shadow run. Scheduler
 terminal statuses are `completed`, `completed_no_edge`, `no_data`, and
 `failed`.
+Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
+fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
+and directional/pair coverage. Quote density can change null/control evidence
+even when the candidate count is unchanged.
 
 ## Legacy systemd lane
 

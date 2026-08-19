@@ -140,6 +140,39 @@ class FitDiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(option["cost_to_risk"]["stressed"]["9"]["cost_to_risk_ratio"],
                                .0296)
 
+    def test_fit_output_exposes_provenance_pricing_and_risk_controls(self):
+        bars, _snapshots, _quotes = self._fit()
+        diagnostic = measure_fit_diagnostics(
+            bars, ROOT_SPEC,
+            account_rows=[{
+                "vehicle": "equity", "no_trade": False,
+                "plan_entry": 100.0, "quantity": 1,
+                "contract_multiplier": 1, "risk_usd": 0.5,
+                "entry_fill_source": "quote", "exit_fill_source": "quote",
+                "entry_feed": "sip", "exit_feed": "sip",
+                "entry_provider": "alpaca", "exit_provider": "alpaca",
+            }, {"vehicle": "equity", "no_trade": False}],
+            risk_config={"risk": {
+                "stressed_cost_scenario_bps": 25.0,
+                "max_stressed_cost_to_risk_ratio": 0.30,
+            }},
+        )
+        self.assertFalse(diagnostic["authorizing"])
+        self.assertTrue(diagnostic["diagnostic_only"])
+        provenance = diagnostic["provenance"]
+        self.assertEqual(set(provenance["feeds"]), {"sip"})
+        self.assertEqual(set(provenance["providers"]), {"test"})
+        self.assertGreater(provenance["observations"], 0)
+        pricing = diagnostic["entry_pricing"]
+        self.assertEqual(pricing["signals"], pricing["quote_required"])
+        self.assertEqual(pricing["bar_available"], 0)
+        controls = diagnostic["risk_controls"]
+        self.assertEqual(controls["stressed_cost_scenario_bps"], 25.0)
+        self.assertEqual(controls["max_stressed_cost_to_risk_ratio"], 0.30)
+        self.assertEqual(controls["basis"]["notional"], "entry_notional")
+        statuses = diagnostic["cost_to_risk"]["stressed"]["25"]["row_status"]
+        self.assertEqual(statuses, {"pass": 0, "fail": 1, "unknown": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
