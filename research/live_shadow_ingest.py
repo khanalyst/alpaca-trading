@@ -18,11 +18,13 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import sqlite3
 from typing import Any, Mapping, Sequence
 
 from .edge_discovery_core import _discover_gate, _finalize_gate
 from .edge_lab import _strengthen_gate
 from .edge_ledger import EdgeLedger, VEHICLES, provenance_hash
+from .edge_ledger_store import REPLAY_ENGINE_EPOCH, content_hash
 from .gates import sample_counts, verify_gate_envelope, validate_protocol_floor
 from .live_shadow import ShadowError, ShadowStore
 from agent.contracts.rule import rule_variant_id, validate_rule_spec
@@ -147,9 +149,46 @@ def _window_ready(rows: Sequence[Mapping[str, Any]], *, vehicle: str,
 
 
 def _latest_boundary(ledger: EdgeLedger, candidate_id: str) -> str | None:
-    """Return the greatest consumed session in any persisted run."""
+    """Return the greatest session consumed by a complete authorizing run.
+
+    A crash can leave a deterministic shadow run (and its held-out bounds)
+    durable before trades/evidence/lifecycle completion.  Such a run must not
+    advance the source boundary or its retry would be mistaken for a no-op.
+    Superseded replay epochs likewise remain readable but cannot consume the
+    current epoch's tail.
+    """
     values: list[str] = []
+    evidence = ledger.evidence(candidate_id)
+    # A durable validated transition binds lifecycle completion to the exact
+    # run.  Looking only at current candidate status would lose boundaries
+    # after a later safety demotion and could replay already-consumed sessions.
+    validated_runs: set[str] = set()
+    for event in ledger.history(candidate_id):
+        if event.get("to_status") != "validated":
+            continue
+        try:
+            payload = json.loads(str(event.get("payload_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, Mapping) and payload.get("run_id"):
+            validated_runs.add(str(payload["run_id"]))
     for run in ledger.runs(candidate_id):
+        if run.get("lane") == "shadow":
+            metrics = run.get("metrics")
+            if (not isinstance(metrics, Mapping) or
+                    metrics.get("replay_engine_epoch") != int(REPLAY_ENGINE_EPOCH) or
+                    str(run.get("run_id")) not in validated_runs):
+                continue
+            run_evidence = [item for item in evidence
+                            if item.get("run_id") == run.get("run_id")]
+            markers = [item for item in run_evidence
+                        if item.get("kind") == "shadow_ingestion"]
+            gates = [item for item in run_evidence
+                     if item.get("kind") == "verified_gate"]
+            if (len(markers) != 1 or len(gates) != 1 or
+                    any(item.get("evidence_hash") != content_hash(item.get("payload"))
+                        for item in (markers + gates))):
+                continue
         for key in ("fit_end", "heldout_end"):
             if run.get(key):
                 values.append(str(run[key]))
@@ -345,6 +384,155 @@ class ShadowIngestor:
         variant = str(candidate.get("variant_id") or "")
         parts = variant.split(".")
         return f"{candidate.get('strategy_id', 'unknown')}:{parts[1] if len(parts) > 1 else variant}"
+
+    @staticmethod
+    def _trade_id(run_id: str, index: int, row: Mapping[str, Any]) -> str:
+        """Return the immutable id used for one confirmatory source row."""
+        return _digest({"run_id": run_id, "index": index,
+                        "opportunity_id": row.get("opportunity_id")})
+
+    def _existing_run_error(self, run: Mapping[str, Any], *, candidate_id: str,
+                            vehicle: str, source: Mapping[str, Any],
+                            replay_digests: Sequence[str], gate: Mapping[str, Any],
+                            hashes: Mapping[str, Any]) -> str | None:
+        """Validate the immutable identity before resuming a partial run."""
+        if (run.get("run_id") is None or run.get("candidate_id") != candidate_id or
+                run.get("lane") != "shadow" or run.get("vehicle") != vehicle):
+            return "existing shadow run identity conflicts with candidate"
+        metrics = run.get("metrics")
+        if not isinstance(metrics, Mapping):
+            return "existing shadow run metrics are invalid"
+        if (metrics.get("shadow_source") != dict(source) or
+                metrics.get("replay_digests") != list(replay_digests)):
+            return "existing shadow run source identity conflicts with retry"
+        if metrics.get("replay_engine_epoch") != int(REPLAY_ENGINE_EPOCH):
+            return "existing shadow run replay engine epoch is stale"
+        expected_envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
+        existing_gate = metrics.get("gate")
+        existing_envelope = (existing_gate.get("verified_gate")
+                             if isinstance(existing_gate, Mapping) else None)
+        if (not isinstance(expected_envelope, Mapping) or
+                not isinstance(existing_envelope, Mapping) or
+                content_hash(existing_envelope) != content_hash(expected_envelope)):
+            return "existing shadow run gate identity conflicts with retry"
+        for key in ("dataset_hash", "config_hash", "code_hash", "provenance_hash"):
+            if run.get(key) != hashes.get(key):
+                return f"existing shadow run {key} conflicts with retry"
+        return None
+
+    def _run_evidence(self, candidate_id: str, run_id: str,
+                      kind: str) -> list[dict[str, Any]]:
+        return [item for item in self.ledger.evidence(candidate_id)
+                if item.get("run_id") == run_id and item.get("kind") == kind]
+
+    @staticmethod
+    def _evidence_payload_valid(item: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        payload = item.get("payload")
+        if (not isinstance(payload, Mapping) or
+                item.get("evidence_hash") != content_hash(payload)):
+            return None
+        return payload
+
+    def _reconcile_run(self, *, candidate_id: str, vehicle: str,
+                       run_id: str, run: Mapping[str, Any],
+                       confirmatory_rows: Sequence[Mapping[str, Any]],
+                       gate: Mapping[str, Any], marker: Mapping[str, Any]) -> tuple[bool, str | None]:
+        """Complete a run left partially durable by a process crash.
+
+        Every existing row is checked against the deterministic source before
+        a missing row/evidence item is appended.  Any unexpected or conflicting
+        durable state fails closed; concurrent retries may safely race because
+        each insert is idempotently re-checked after a uniqueness error.
+        """
+        changed = False
+        expected: dict[str, tuple[Mapping[str, Any], str]] = {
+            self._trade_id(run_id, index, row): (
+                row, str(row.get("opportunity_id") or row.get("entry_timestamp") or ""))
+            for index, row in enumerate(confirmatory_rows)
+        }
+        durable = [item for item in self.ledger.trades(candidate_id, lane="shadow")
+                   if item.get("run_id") == run_id]
+        seen: set[str] = set()
+        for item in durable:
+            tid = str(item.get("trade_id") or "")
+            if tid not in expected or tid in seen:
+                return False, "existing shadow run contains unexpected or duplicate trade"
+            seen.add(tid)
+            row, opportunity = expected[tid]
+            if str(item.get("opportunity_id") or "") != opportunity:
+                return False, "existing shadow run trade identity conflicts with retry"
+            try:
+                payload = json.loads(str(item.get("payload_json") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False, "existing shadow run trade payload is invalid"
+            if not isinstance(payload, Mapping) or dict(payload) != dict(row):
+                return False, "existing shadow run trade payload conflicts with retry"
+        for index, row in enumerate(confirmatory_rows):
+            tid = self._trade_id(run_id, index, row)
+            if tid in seen:
+                continue
+            try:
+                self.ledger.append_trade(run_id, row, trade_id=tid)
+            except sqlite3.IntegrityError:
+                # Another consumer may have inserted the same deterministic
+                # row.  Re-read and accept it only when it is byte-for-byte
+                # equivalent to this retry's source.
+                current = [item for item in self.ledger.trades(candidate_id, lane="shadow")
+                           if item.get("run_id") == run_id and item.get("trade_id") == tid]
+                if len(current) != 1:
+                    return False, "concurrent shadow trade insert is conflicting"
+                try:
+                    payload = json.loads(str(current[0].get("payload_json") or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return False, "concurrent shadow trade payload is invalid"
+                if dict(payload) != dict(row):
+                    return False, "concurrent shadow trade payload conflicts with retry"
+            changed = True
+            seen.add(tid)
+
+        expected_envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
+        gates = self._run_evidence(candidate_id, run_id, "verified_gate")
+        if len(gates) > 1:
+            return False, "existing shadow run has duplicate verified gate evidence"
+        if gates:
+            payload = self._evidence_payload_valid(gates[0])
+            if (not isinstance(payload, Mapping) or
+                    payload.get("gate_hash") != (expected_envelope or {}).get("content_hash") or
+                    payload.get("gate") != expected_envelope):
+                return False, "existing shadow run verified gate conflicts with retry"
+        else:
+            try:
+                self.ledger.record_verified_gate(run_id, gate)
+            except (sqlite3.IntegrityError, ValueError):
+                gates = self._run_evidence(candidate_id, run_id, "verified_gate")
+                if len(gates) != 1:
+                    return False, "concurrent verified gate insert is conflicting"
+                payload = self._evidence_payload_valid(gates[0])
+                if (not isinstance(payload, Mapping) or
+                        payload.get("gate_hash") != (expected_envelope or {}).get("content_hash") or
+                        payload.get("gate") != expected_envelope):
+                    return False, "concurrent verified gate conflicts with retry"
+            changed = True
+
+        markers = self._run_evidence(candidate_id, run_id, "shadow_ingestion")
+        if len(markers) > 1:
+            return False, "existing shadow run has duplicate shadow ingestion markers"
+        if markers:
+            payload = self._evidence_payload_valid(markers[0])
+            if not isinstance(payload, Mapping) or dict(payload) != dict(marker):
+                return False, "existing shadow ingestion marker conflicts with retry"
+        else:
+            try:
+                self.ledger.record_shadow_ingestion(candidate_id, marker, run_id=run_id)
+            except (sqlite3.IntegrityError, ValueError):
+                markers = self._run_evidence(candidate_id, run_id, "shadow_ingestion")
+                if len(markers) != 1:
+                    return False, "concurrent shadow marker insert is conflicting"
+                payload = self._evidence_payload_valid(markers[0])
+                if not isinstance(payload, Mapping) or dict(payload) != dict(marker):
+                    return False, "concurrent shadow marker conflicts with retry"
+            changed = True
+        return changed, None
 
     def _one(self, candidate_id: str, *, correction: Mapping[str, Any] | None = None,
              dry: bool = False,
@@ -631,6 +819,12 @@ class ShadowIngestor:
                       "session_disjoint": True,
                       "test_iterations": int(test_iterations),
                       "minimum_raw_p": 1.0 / (int(test_iterations) + 1)}
+            # FactoryLedger returns storage-only identity/timestamp columns
+            # when this test id already exists.  They are not part of the
+            # immutable gate identity and would make a crash retry's envelope
+            # differ from the run written by the first attempt.
+            online.pop("decision_id", None)
+            online.pop("created_at", None)
             family = {"p": selection_p_value,
                       "p_adjusted": family_q,
                       "significant": bool(family_data.get("significant")),
@@ -697,35 +891,51 @@ class ShadowIngestor:
                     "reason": str(exc), "ingested": False, "boundary": boundary}
 
         replay_digests = tuple(str(item.get("replay_digest")) for item in source["sessions"])
+        # Include the replay generation in the idempotency key.  A corrected
+        # engine must be able to re-prove the same candidate/tail beside its
+        # older evidence instead of colliding with the legacy run.
         run_id = "shadow-" + _digest({"candidate_id": candidate_id,
                                        "vehicle": vehicle,
+                                       "replay_engine_epoch": int(REPLAY_ENGINE_EPOCH),
                                        "replay_digests": replay_digests})
-        existing = self.ledger.run(run_id)
-        if existing is not None:
-            return {"candidate_id": candidate_id, "status": "already_ingested",
-                    "ingested": False, "run_id": run_id,
-                    "sessions": available, "boundary": boundary}
-        run = self.ledger.append_run(
-            candidate_id, lane="shadow", vehicle=vehicle,
+        hashes = provenance_hash(
             dataset=source, config=_config(candidate), code=Path(__file__),
-            # The authorizing run contains only the disjoint confirmatory
-            # window, matching the verified gate envelope.  Its heldout_end is
-            # still the newest session in the complete consumed tail.
-            provenance=run_provenance, fit=[], heldout=confirmatory_rows,
-            metrics={"gate": gate, "shadow_source": source,
-                     "replay_digests": list(replay_digests),
-                     "selection_sessions": selection_sessions,
-                     "confirmatory_sessions": confirmatory_sessions,
-                     "independent_confirmatory": True,
-                     "disjoint_sessions": True,
-                     "session_disjoint": True,
-                     "prior_run_id": previous_run.get("run_id")}, run_id=run_id)
-        for index, row in enumerate(confirmatory_rows):
-            self.ledger.append_trade(
-                run["run_id"], row,
-                trade_id=_digest({"run_id": run_id, "index": index,
-                                  "opportunity_id": row.get("opportunity_id")}))
-        self.ledger.record_verified_gate(run_id, gate)
+            provenance=run_provenance)
+        metrics = {"gate": gate, "shadow_source": source,
+                   "replay_digests": list(replay_digests),
+                   "selection_sessions": selection_sessions,
+                   "confirmatory_sessions": confirmatory_sessions,
+                   "independent_confirmatory": True,
+                   "disjoint_sessions": True,
+                   "session_disjoint": True,
+                   "prior_run_id": previous_run.get("run_id")}
+        existing = self.ledger.run(run_id)
+        created = False
+        if existing is None:
+            try:
+                # The authorizing run contains only the disjoint confirmatory
+                # window, matching the verified gate envelope.  Its heldout_end
+                # is still the newest session in the complete consumed tail.
+                existing = self.ledger.append_run(
+                    candidate_id, lane="shadow", vehicle=vehicle,
+                    dataset=source, config=_config(candidate), code=Path(__file__),
+                    provenance=run_provenance, fit=[], heldout=confirmatory_rows,
+                    metrics=metrics, run_id=run_id)
+                created = True
+            except sqlite3.IntegrityError:
+                # A concurrent ingester may have won the deterministic insert;
+                # reconcile its run below rather than reporting a false no-op.
+                existing = self.ledger.run(run_id)
+                if existing is None:
+                    raise
+        run = existing
+        conflict = self._existing_run_error(
+            run, candidate_id=candidate_id, vehicle=vehicle, source=source,
+            replay_digests=replay_digests, gate=gate, hashes=hashes)
+        if conflict:
+            return {"candidate_id": candidate_id, "status": "conflicting_partial_state",
+                    "reason": conflict, "ingested": False, "run_id": run_id,
+                    "sessions": available, "boundary": boundary}
         evidence = {
             "schema": INGEST_SCHEMA, "candidate_id": candidate_id,
             "vehicle": vehicle, "source": source,
@@ -745,32 +955,62 @@ class ShadowIngestor:
             "candidate_proof": payload["run_provenance"]["candidate_proof"],
             "gate_hash": envelope["content_hash"],
         }
-        self.ledger.append_evidence(candidate_id, "shadow_ingestion", evidence,
-                                    run_id=run_id)
-        status = str(candidate.get("status"))
+        reconciled, conflict = self._reconcile_run(
+            candidate_id=candidate_id, vehicle=vehicle, run_id=run_id,
+            run=run, confirmatory_rows=confirmatory_rows, gate=gate,
+            marker=evidence)
+        if conflict:
+            return {"candidate_id": candidate_id, "status": "conflicting_partial_state",
+                    "reason": conflict, "ingested": False, "run_id": run_id,
+                    "sessions": available, "boundary": boundary}
+        # The candidate status may have advanced before a retry reached this
+        # point.  Always re-read it and perform only the missing transitions.
+        current = self.ledger.candidate(candidate_id) or {}
+        status = str(current.get("status"))
         transitions: list[str] = []
         if status in {"backtest_passed", "demoted"}:
-            self.ledger.transition(candidate_id, "shadow",
-                                   reason="complete parity-matched live shadow ingestion",
-                                   actor="shadow_ingest",
-                                   payload={"run_id": run_id, "source": source})
-            transitions.append("shadow")
-            status = "shadow"
+            try:
+                self.ledger.transition(candidate_id, "shadow",
+                                       reason="complete parity-matched live shadow ingestion",
+                                       actor="shadow_ingest",
+                                       payload={"run_id": run_id, "source": source})
+                transitions.append("shadow")
+                status = "shadow"
+            except ValueError:
+                status = str((self.ledger.candidate(candidate_id) or {}).get("status"))
+                if status != "shadow":
+                    return {"candidate_id": candidate_id, "status": "conflicting_partial_state",
+                            "reason": "shadow lifecycle transition conflicts with retry",
+                            "ingested": False, "run_id": run_id,
+                            "sessions": available, "boundary": boundary}
         if status == "shadow":
-            self.ledger.transition(candidate_id, "validated",
-                                   reason="live shadow verified gate passed",
-                                   actor="shadow_ingest",
-                                   payload={"run_id": run_id, "source": source})
-            transitions.append("validated")
-            status = "validated"
+            try:
+                self.ledger.transition(candidate_id, "validated",
+                                       reason="live shadow verified gate passed",
+                                       actor="shadow_ingest",
+                                       payload={"run_id": run_id, "source": source})
+                transitions.append("validated")
+                status = "validated"
+            except ValueError:
+                status = str((self.ledger.candidate(candidate_id) or {}).get("status"))
+                if status != "validated":
+                    return {"candidate_id": candidate_id, "status": "conflicting_partial_state",
+                            "reason": "validated lifecycle transition conflicts with retry",
+                            "ingested": False, "run_id": run_id,
+                            "sessions": available, "boundary": boundary}
+        if status not in {"validated", "champion"}:
+            return {"candidate_id": candidate_id, "status": "conflicting_partial_state",
+                    "reason": f"shadow run is complete but candidate status is {status!r}",
+                    "ingested": False, "run_id": run_id,
+                    "sessions": available, "boundary": boundary}
         # Rule-factory slots are reseeded only after this real-time proof, not
         # after an offline forward replay.  The hypothesis id is immutable
         # candidate lineage (axes_json), so this cannot mark another slot.
-        if "validated" in transitions and str(candidate.get("strategy_id")) == "rule":
-            axes = candidate.get("axes")
-            if axes is None and isinstance(candidate.get("axes_json"), str):
+        if "validated" in transitions and str(current.get("strategy_id")) == "rule":
+            axes = current.get("axes")
+            if axes is None and isinstance(current.get("axes_json"), str):
                 try:
-                    axes = json.loads(str(candidate["axes_json"]))
+                    axes = json.loads(str(current["axes_json"]))
                 except (TypeError, ValueError, json.JSONDecodeError):
                     axes = None
             hypothesis_id = axes.get("hypothesis_id") if isinstance(axes, Mapping) else None
@@ -780,7 +1020,9 @@ class ShadowIngestor:
                     "parity-matched live shadow ingestion validated candidate",
                     {"candidate_id": candidate_id, "run_id": run_id,
                      "source": source})
-        return {"candidate_id": candidate_id, "status": "ingested", "ingested": True,
+        complete_status = "ingested" if (created or reconciled or transitions) else "already_ingested"
+        return {"candidate_id": candidate_id, "status": complete_status,
+                "ingested": complete_status == "ingested",
                 "run_id": run_id, "sessions": available, "boundary": boundary,
                 "selection_sessions": selection_sessions,
                 "confirmatory_sessions": confirmatory_sessions,

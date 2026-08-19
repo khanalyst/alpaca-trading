@@ -15,10 +15,11 @@ reason is written into the lesson ledger as live evidence, so the next tuning
 cycle proposes parameter values against what actually happened on the book
 rather than only against a replay.
 
-Two boundaries hold throughout. A pinned edge is never judged here: the
-operator owns it, and the guards notify rather than act. And parking an
-underperformer never promotes anything in its place — the replacement still
-has to earn `backtest_passed`, a strictly later shadow pass, and every gate.
+Two boundaries hold throughout. A pinned edge remains operator-selected, but
+that selection cannot bypass a hard safety stop: a failed trial parks it just
+like an automatic edge and records the pin context. Parking an underperformer
+never promotes anything in its place — the replacement still has to earn
+`backtest_passed`, a strictly later shadow pass, and every gate.
 """
 
 from __future__ import annotations
@@ -156,12 +157,13 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
             "pinned": is_pinned, "verdict": verdict,
             "family": _family_of(ledger, candidate),
         }
-        # A pinned edge is the operator's. Report it, never act on it.
-        if is_pinned:
-            review["action"] = "none_pinned"
-            reviews.append(review)
-            continue
         if verdict["state"] == "passed":
+            # A pin is already the operator's selection; keep it out of the
+            # promotable hand-off while still evaluating its safety verdict.
+            if is_pinned:
+                review["action"] = "none_pinned"
+                reviews.append(review)
+                continue
             review["action"] = "promotable"
             promotable.append({"candidate_id": candidate_id,
                                "variant_id": variant_id,
@@ -177,7 +179,13 @@ def review_trials(db_path: str | Path = DEFAULT_DB_PATH, *,
             ledger.transition(
                 candidate_id, "demoted",
                 reason="live paper trial finished below its floor",
-                actor="trial", payload={"schema": TRIAL_SCHEMA, **verdict})
+                actor="trial", payload={
+                    "schema": TRIAL_SCHEMA, **verdict,
+                    "pinned": is_pinned,
+                    "pin_context": ({"variant_id": variant_id,
+                                     "vehicle": candidate_vehicle}
+                                    if is_pinned else {}),
+                })
             _record_live_lesson(factory, ledger, candidate, verdict, reason)
             parked.append({"candidate_id": candidate_id,
                            "variant_id": variant_id,

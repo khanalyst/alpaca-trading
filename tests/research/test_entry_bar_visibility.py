@@ -5,13 +5,14 @@ from datetime import datetime, timedelta, timezone
 import unittest
 
 from agent.config import ConfigError, validate_config
-from research.costs import ReplayPolicy
+from research.costs import ReplayPolicy, diagnostic_backfill_policy
 from research.costs import index_quotes
 from research.edge_discovery_core import _null_reference_rows
 from research.edge_lab import _read_discovery_rows
 from research.factory_core import _simulate_trade
 from research.fit_diagnostics import _fit_prefixes, measure_fit_diagnostics
 from research.ibr import IBRConfig, replay_ibr
+from research.gates import authorization_projection
 from research.market_data import normalize_underlying_bar
 from research.strategy_factory import null_control_account
 
@@ -38,6 +39,36 @@ def _delayed(bar, minutes=5):
 
 
 class EntryBarVisibilityTests(unittest.TestCase):
+    def test_backfill_requires_explicit_diagnostic_policy_and_cannot_authorize(self):
+        observed = datetime(2026, 8, 19, tzinfo=timezone.utc)
+        bars = [replace(
+            bar,
+            identity=replace(
+                bar.identity, as_of=bar.end, observed_at=observed,
+                source_mode="historical_backfill",
+            ),
+        ) for bar in bars_for_day()]
+        base = permissive_config(stop_pct=.01, target_pct=.02, costs=FREE)
+
+        refused = replay_ibr(bars, config=base)
+        self.assertEqual(refused.trades, [])
+
+        diagnostic = replay_ibr(
+            bars,
+            config=replace(
+                base, policy=diagnostic_backfill_policy(base.policy)),
+        )
+        self.assertEqual(len(diagnostic.trades), 1)
+        trade = diagnostic.trades[0]
+        self.assertEqual(trade.evidence_mode,
+                         "diagnostic_historical_backfill")
+        row = vars(trade)
+        projection = authorization_projection([row], vehicle="equity")
+        self.assertEqual(projection["eligible"], [])
+        self.assertEqual(projection["reasons"], {
+            "diagnostic_historical_backfill": 1,
+        })
+
     def test_ibr_rejects_delayed_open_but_accepts_exact_boundary(self):
         baseline = bars_for_day()
         config = permissive_config(stop_pct=.01, target_pct=.02, costs=FREE)

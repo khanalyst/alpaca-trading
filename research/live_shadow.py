@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import dataclasses
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
@@ -952,7 +952,11 @@ def _read_candidates(path: Path, *, max_candidates: int) -> list[dict]:
         return []
     uri = f"file:{path.resolve()}?mode=ro"
     try:
-        with sqlite3.connect(uri, uri=True, timeout=5) as db:
+        # ``sqlite3.Connection`` implements the transaction context manager,
+        # but that manager does not close the connection on exit.  These
+        # read-only helpers are called on every shadow poll; explicitly close
+        # each handle so repeated polls cannot leak file descriptors.
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("""SELECT c.*, s.status FROM candidates c JOIN candidate_state s
                 ON c.candidate_id=s.candidate_id
@@ -997,7 +1001,7 @@ def _read_factory_rule_roots(path: Path) -> dict[str, dict[str, Any]]:
         return {}
     uri = f"file:{path.resolve()}?mode=ro"
     try:
-        with sqlite3.connect(uri, uri=True, timeout=5) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute(
                 "SELECT hypothesis_id,vehicle,spec_json FROM factory_hypotheses"
@@ -1651,36 +1655,57 @@ class ShadowRunner:
         for candidate in candidates:
             if str(candidate.get("vehicle") or "equity") not in {"equity", "option"}:
                 continue
-            cid = str(candidate["candidate_id"])
+            # Tuned rule descendants are paired with a synthetic namespace for
+            # the immutable factory root.  The control is a first-class shadow
+            # candidate: it must consume the same event stream, maintain its
+            # own virtual books, and produce its own replay evidence.  It is
+            # deliberately persisted only in the isolated shadow WAL; the
+            # EdgeLedger remains a read-only source for this worker.
+            root_control = self._rule_root_control(candidate)
+            paired_candidates: tuple[Mapping[str, Any], ...] = (
+                (candidate, root_control) if root_control is not None
+                else (candidate,))
+            if root_control is not None:
+                # Real candidates were persisted in the source-catalog pass
+                # above; only the synthetic arm needs a new WAL row here.
+                self.store.upsert_candidate(root_control)
             for session in sorted(session_events):
+                session_bars, session_quotes, session_options = session_inputs[session]
                 for event in session_events[session]:
                     symbol = str(event.get("symbol"))
-                    if self.store.has_open(cid, symbol):
-                        kind, reason, payload, plan = (
-                            "no_trade", "virtual book has an incomplete open",
-                            {"session_date": session, "strategy_id": candidate.get("strategy_id"),
-                             "variant_id": candidate.get("variant_id")}, None)
-                    else:
-                        kind, reason, payload, plan = self._evaluate(candidate, event, bars, quotes, options)
-                    inserted = self.store.decision(
-                        candidate_id=cid, event_key=str(event["event_key"]),
-                        session_date=session, symbol=symbol, kind=kind, reason=reason,
-                        payload=payload, max_decisions=self.config.max_decisions)
-                    if inserted and plan is not None:
-                        self.store.virtual_open(
-                            candidate_id=cid,
-                            decision_id=_digest({"candidate_id": cid, "event_key": event["event_key"]}),
-                            symbol=symbol, plan=plan)
+                    event_key = str(event["event_key"])
+                    # Evaluate candidate and paired control against this exact
+                    # event before advancing to the next event.  Each id has a
+                    # separate decision/book namespace, so admission in one
+                    # arm cannot create cross-arm contention.
+                    for paired in paired_candidates:
+                        paired_id = str(paired["candidate_id"])
+                        if self.store.has_open(paired_id, symbol):
+                            kind, reason, payload, plan = (
+                                "no_trade", "virtual book has an incomplete open",
+                                {"session_date": session,
+                                 "strategy_id": paired.get("strategy_id"),
+                                 "variant_id": paired.get("variant_id")}, None)
+                        else:
+                            kind, reason, payload, plan = self._evaluate(
+                                paired, event, bars, quotes, options)
+                        inserted = self.store.decision(
+                            candidate_id=paired_id, event_key=event_key,
+                            session_date=session, symbol=symbol, kind=kind,
+                            reason=reason, payload=payload,
+                            max_decisions=self.config.max_decisions)
+                        if inserted and plan is not None:
+                            self.store.virtual_open(
+                                candidate_id=paired_id,
+                                decision_id=_digest({"candidate_id": paired_id,
+                                                     "event_key": event_key}),
+                                symbol=symbol, plan=plan)
 
-                rows = self.store.decisions(cid)
-                session_bars, session_quotes, session_options = session_inputs[session]
-                self._replay(candidate, session, session_bars, session_quotes,
-                             rows, session_options)
-                root_control = self._rule_root_control(candidate)
-                if root_control is not None:
-                    self._replay(root_control, session, session_bars, session_quotes,
-                                 self.store.decisions(str(root_control["candidate_id"])),
-                                 session_options)
+                for paired in paired_candidates:
+                    paired_id = str(paired["candidate_id"])
+                    rows = self.store.decisions(paired_id)
+                    self._replay(paired, session, session_bars, session_quotes,
+                                 rows, session_options)
         self.store.prune()
         return {"candidates": len(candidates), "ingested_events": ingested,
                 "events": len(events), "decisions": len(self.store.decisions()),

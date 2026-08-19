@@ -26,8 +26,9 @@ from .edge_ledger import content_hash
 from .factory_ledger import FactoryError
 from .gates import max_drawdown_of
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
-                          option_has_liquidity, record_available_at,
-                          record_is_available)
+                          historical_backfill_record, option_has_liquidity,
+                          replay_available_at, replay_open_is_available,
+                          replay_record_is_available)
 
 
 # `risk.max_position_notional_pct` in the checked runtime config.  Research
@@ -146,8 +147,32 @@ def _session(row: UnderlyingBar) -> str:
     return row.timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
 
 
-def _visible(row: Any, cutoff: datetime) -> bool:
-    return record_is_available(row, cutoff)
+def _available(row: Any, policy: ReplayPolicy) -> datetime | None:
+    return replay_available_at(
+        row,
+        allow_historical_backfill_diagnostics=(
+            policy.allow_historical_backfill_diagnostics),
+    )
+
+
+def _visible(row: Any, cutoff: datetime,
+             policy: ReplayPolicy | None = None) -> bool:
+    resolved = ReplayPolicy() if policy is None else policy
+    return replay_record_is_available(
+        row, cutoff,
+        allow_historical_backfill_diagnostics=(
+            resolved.allow_historical_backfill_diagnostics),
+    )
+
+
+def _open_visible(row: Any, cutoff: datetime,
+                  policy: ReplayPolicy | None = None) -> bool:
+    resolved = ReplayPolicy() if policy is None else policy
+    return replay_open_is_available(
+        row, cutoff,
+        allow_historical_backfill_diagnostics=(
+            resolved.allow_historical_backfill_diagnostics),
+    )
 
 
 def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
@@ -171,7 +196,8 @@ def _option_at(snapshots: Sequence[OptionSnapshot], *, symbol: str, day: date,
                 and str(snap.identity.feed).lower() == "opra"
                 and snap.session_date == day and snap.timestamp <= cutoff
                 and snap.timestamp.timestamp() >= floor
-                and _visible(snap, cutoff) and snap.bid > 0 and snap.ask > 0
+                and _visible(snap, cutoff, resolved_policy)
+                and snap.bid > 0 and snap.ask > 0
                 # Runtime rejects 0DTE even when a configured lower bound is
                 # zero; research must preserve that hard executable boundary.
                 and (snap.contract.expiration - day).days >= max(
@@ -310,9 +336,9 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         if signal is None:
             continue
         entry_bar = session_bars[index + 1]
-        available = [record_available_at(item)
+        available = [_available(item, resolved_policy)
                      for item in session_bars[feature_start:index + 1]
-                     if record_available_at(item) is not None]
+                     if _available(item, resolved_policy) is not None]
         signal_ready = max([signal_bar.end, *available], default=None)
         if signal_ready is None:
             continue
@@ -346,7 +372,8 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
         # as the fill/underlying anchor when available.  Bar fallback remains
         # explicit and therefore requires the bar itself to be visible at its
         # timestamp; delayed OHLC never becomes an entry by hindsight.
-        entry_bar_visible = _visible(entry_bar, entry_bar.timestamp)
+        entry_bar_visible = _open_visible(
+            entry_bar, entry_bar.timestamp, resolved_policy)
         entry_underlying: float | None = (
             float(entry_bar.open) if entry_bar_visible else None)
         entry_ref: float | None = entry_underlying
@@ -473,7 +500,7 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # path is unknowable either way, so the established stop-wins-ties
             # rule resolves it against the strategy here too.
             for bar in session_bars[entry_index:last_index + 1]:
-                if record_available_at(bar) is None:
+                if _available(bar, resolved_policy) is None:
                     # Resting exits consume completed OHLC once the record is
                     # observed, even when observation trails market end.
                     continue
@@ -601,6 +628,13 @@ def _simulate_trade(session_bars: Sequence[UnderlyingBar], spec: Mapping[str, An
             # nominal and realized risk are the same number.
             "realized_risk_per_unit": (entry_ref * multiplier
                                        if vehicle == "option" else real_risk),
+            "evidence_mode": (
+                "diagnostic_historical_backfill"
+                if resolved_policy.allow_historical_backfill_diagnostics and any(
+                    historical_backfill_record(item)
+                    for item in (signal_bar, entry_bar, exit_bar))
+                else "forward_observed"
+            ),
         }
     return None
 
@@ -611,7 +645,8 @@ def _fresh(raw: Mapping[str, Any], leg: str,
     return float(raw.get(f"{leg}_quote_age_seconds") or 0.0) <= limit
 
 
-def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime) -> float | None:
+def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime,
+                      policy: ReplayPolicy | None = None) -> float | None:
     """Return the last bar price that was observable at ``cutoff``.
 
     A bar's open is the boundary observation used for an entry at its
@@ -620,9 +655,9 @@ def _visible_bar_mark(rows: Sequence[UnderlyingBar], cutoff: datetime) -> float 
     visible, so its close/high/low can never leak into an earlier mark.
     """
     for row in reversed(rows):
-        if row.timestamp == cutoff and _visible(row, cutoff):
+        if row.timestamp == cutoff and _open_visible(row, cutoff, policy):
             return float(row.open)
-        if row.end <= cutoff and _visible(row, row.end):
+        if row.end <= cutoff and _visible(row, row.end, policy):
             return float(row.close)
     return None
 
@@ -718,7 +753,10 @@ def simulate_account(bars: Sequence[UnderlyingBar], snapshots: Sequence[OptionSn
                     max_age_seconds=resolved_policy.max_market_data_age_seconds,
                     session_date=date.fromisoformat(str(item["session_date"])))
                 if mark is None:
-                    mark = _visible_bar_mark(bars_by_symbol.get(symbol, ()), timestamp)
+                    mark = _visible_bar_mark(
+                        bars_by_symbol.get(symbol, ()), timestamp,
+                        resolved_policy,
+                    )
             if mark is None:
                 # No visible mark is a zero-move assumption, not permission to
                 # inspect a future exit price.  Entry-side fees still reduce

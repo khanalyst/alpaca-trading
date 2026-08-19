@@ -1731,6 +1731,8 @@ def _run_factory(data: str | Path | Sequence[Mapping], *,
         raise FactoryError(str(exc)) from exc
     if not 0 < alpha <= 1:
         raise FactoryError("alpha must be in (0,1]")
+    if int(max_generations) < 1:
+        raise FactoryError("max_generations must be at least 1")
     if int(max_rotations) < 0 or int(rotation_budget) < 0:
         raise FactoryError("max_rotations and rotation_budget must not be negative")
     if int(max_rotations) > MAX_ROTATIONS or int(rotation_budget) > ROTATION_BUDGET:

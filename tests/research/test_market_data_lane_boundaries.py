@@ -16,7 +16,8 @@ import importlib.util
 from unittest.mock import patch
 
 from agent.config import ConfigError, validate_config
-from research.costs import ReplayPolicy, replay_policy_for_mode
+from research.costs import (ReplayPolicy, diagnostic_backfill_policy,
+                            replay_policy_for_mode)
 from research.edge_lab import discover
 import research.gates as gates
 from research.ibr import IBRConfig
@@ -211,6 +212,14 @@ class MarketDataLaneBoundaryTests(unittest.TestCase):
             ReplayPolicy(), "shadow", backtest_bar_fallback=True)
         self.assertFalse(permissive.strict_market_data)
         self.assertTrue(shadow.strict_market_data)
+        diagnostic = diagnostic_backfill_policy()
+        self.assertTrue(diagnostic.allow_historical_backfill_diagnostics)
+        self.assertFalse(replay_policy_for_mode(
+            diagnostic, "backtest", backtest_bar_fallback=True,
+        ).allow_historical_backfill_diagnostics)
+        self.assertFalse(replay_policy_for_mode(
+            diagnostic, "shadow", backtest_bar_fallback=True,
+        ).allow_historical_backfill_diagnostics)
 
     def test_strict_default_refuses_bars_only_but_explicit_backtest_fallback_prices(self):
         self.assertEqual(floor_trades(self.strict), 0)

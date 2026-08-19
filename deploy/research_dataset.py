@@ -29,6 +29,29 @@ QUOTE_KINDS = {"quote", "quote_snapshot", "equity_quote", "underlying_quote"}
 OPTION_KINDS = {"option", "option_snapshot", "option_quote"}
 
 
+def apply_partition_source(payload: dict, session_day: str,
+                           partition_sources: Mapping[str, object] | None,
+                           *, row_number: int | None = None) -> dict:
+    """Annotate a temporary view from recorder sidecar source metadata."""
+    if not isinstance(partition_sources, Mapping):
+        return payload
+    source = partition_sources.get(f"market-{session_day}.csv")
+    if source is None:
+        return payload
+    label = f"row {row_number}" if row_number is not None else "row"
+    if not isinstance(source, Mapping):
+        raise ValueError(f"source metadata for {session_day} is malformed")
+    source_mode = str(source.get("source_mode") or "").strip().lower()
+    if source_mode != "historical_backfill":
+        raise ValueError(f"source metadata for {session_day} is unsupported")
+    row_mode = str(payload.get("source_mode") or "").strip().lower()
+    if row_mode and row_mode != source_mode:
+        raise ValueError(
+            f"{label} conflicts with recorder source metadata for {session_day}")
+    payload["source_mode"] = source_mode
+    return payload
+
+
 def _clean(value):
     return None if value in (None, "") else value
 
@@ -42,6 +65,7 @@ def _csv_payload(row: Mapping[str, object]) -> dict:
         # partial external row into apparently executable evidence.
         "provider": _clean(row.get("provider")),
         "feed": _clean(row.get("feed")),
+        "source_mode": _clean(row.get("source_mode")),
         "symbol": _clean(row.get("symbol")),
         "timestamp": _clean(row.get("timestamp")),
         "observed_at": _clean(row.get("observed_at") or row.get("timestamp")),

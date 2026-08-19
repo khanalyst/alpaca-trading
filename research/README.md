@@ -45,6 +45,13 @@ capital or P&L is shared between arms.
 Paper runtime selection can then use `selection_mode: all_proved`, which keeps
 one best proven variant per independent family under one global risk book.
 
+Historical `deploy/backfill.py` partitions retain the recorder schema but carry
+`source_mode: historical_backfill` and exact Alpaca session open/close metadata,
+including early closes. Their fetch-time `observed_at` is retained rather than
+backdated. An explicit diagnostic replay policy may inspect these rows and
+labels resulting trades `diagnostic_historical_backfill`; they are excluded from
+authorizing statistics and can never authorize a live-shadow proof.
+
 The authorizing evidence floors are immutable: backtest/factory windows require
 100 trades, 30 complete sessions, and 30 session clusters; qualification
 requires 100 trades and 30 complete sessions/clusters; the parity-matched
@@ -57,16 +64,17 @@ closed when a required floor cannot be supported. Widen history and/or
 `universe.symbols`, never lower a floor.
 
 Qualification is powered at a minimum of 100 trades, 30 complete sessions, and
-30 session-level clusters. Replay epoch 4 retains the epoch-3 economics gates
-and additionally requires latest-of-event/as-of/observed-at point-in-time
-availability, executable-row-only authorizing statistics, vehicle-specific
-cost selection/provenance, raw confirmatory p-values for FDR, and a stressed-
-cost runtime abstention boundary. Evidence from older replay epochs remains
-auditable but is quarantined and cannot validate, champion, or authorize the
-paper trader until replayed under epoch 4. Authorization requires exact epoch
-equality with current epoch 4; future epochs are audit-only as well. A verified
-current-epoch gate is sealed immutably per run, and re-derivation appends a new
-proof instead of rewriting prior evidence.
+30 session-level clusters. Replay epoch 5 retains the epoch-4 point-in-time,
+executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
+and additionally seals paired synthetic root-control shadow decisions/replays,
+diagnostic-only historical-backfill provenance with exact calendar metadata,
+durable live-shadow FDR allocation binding, chronological paired inference,
+finite BH input validation, and conservative broker-tick equity rounding.
+Epoch-4 proofs remain readable for audit but are quarantined and cannot validate,
+champion, or authorize the paper trader until re-derived under epoch 5.
+Authorization requires exact epoch equality with current epoch 5; future epochs
+are audit-only as well. A verified current-epoch gate is sealed immutably per
+run, and re-derivation appends a new proof instead of rewriting prior evidence.
 
 The default session timezone is `America/New_York`. Production replay requires
 the exact Alpaca calendar session bounds for every session, including early
@@ -289,20 +297,26 @@ startup. It refuses to render the research service when the separate provider
 secret path is missing or unreadable. The plain Compose `shadow` service reads recorder rows and EdgeLedger
 candidates through read-only connections, evaluates eligible candidates in
 isolated virtual books, and writes only its own WAL SQLite database. For each
-complete session it creates candidate, exact root-baseline, and
+complete session it creates candidate, paired synthetic root-control, and
 randomized-entry-null replays; mismatch or incomplete rows are quarantined.
 It uses the deterministic runtime signal/setup/risk path and compares semantic
-shadow signatures with factory/IBR replay for parity. It has no broker
+shadow signatures with factory/IBR replay for parity. Tuned rule descendants
+also receive a paired synthetic root-control arm: it consumes the same events
+in its own virtual book and writes first-class shadow replay evidence, while
+remaining outside EdgeLedger lifecycle state. It has no broker
 credentials, order path, or broker/runtime state authority. The scheduled
 research cycle runs `edge ingest-shadow` by default when enabled; absent shadow
 DB is a no-op. Ingestion opens the WAL read-only and requires strictly newer,
 complete parity-matched rows, prior qualification, source/config/code/
 provenance/replay/gate hashes, family/global BH, and durable online FDR before
 appending the immutable `lane=shadow` proof and live marker.
-Epoch-4 ingestion splits each tail into older chronological selection sessions
-and a newer disjoint confirmatory window; BH uses the selection p-values, and
-only the selected candidate's raw confirmatory p-value reaches LORD. Same-tail
-v3 scopes remain audit-only and cannot authorize.
+The unchanged `shadow-confirmation-v4` scope splits each tail into older
+chronological selection sessions and a newer disjoint confirmatory window; BH
+uses the selection p-values, and only the selected candidate's raw confirmatory
+p-value reaches LORD. Same-tail v3 scopes remain audit-only and cannot
+authorize. Under epoch 5, the persisted live proof must match the durable FDR
+allocation (scope/test id, p-value, alpha, allocation, and decision), not merely
+repeat those fields in a caller-supplied envelope.
 
 ## Autonomous strategy factory
 
@@ -541,8 +555,11 @@ default):
 - **Window still open, or outcomes carry no usable R** → nothing happens.
   Underpowered is not failure here either.
 
-A pinned edge is never judged: it is reported with its verdict and left exactly
-where the operator put it.
+A pinned edge is still judged. The rolling-R guard, sequential drift stop, and
+trial review run for pinned identities just as they do for automatic selections;
+a failed guard parks or demotes the edge and records the pin context for audit.
+Pinning selects an identity and prevents silent substitution, but never bypasses
+authorization or a hard lifecycle stop.
 
 ```bash
 python research.py edge trials --dry-run   # verdicts, changing nothing

@@ -618,7 +618,8 @@ class RiskEngine:
         stop_pct = distance / entry * 100.0
         tp_pct = abs(target - entry) / entry * 100.0
         plan.update({"symbol": symbol, "direction": direction, "entry_price": entry,
-                     "stop_price": stop, "target_price": target, "sl_pct": stop_pct,
+                     "stop_price": stop, "target_price": target,
+                     "stop_distance": distance, "sl_pct": stop_pct,
                      "tp_pct": tp_pct, "stop_loss_pct": stop_pct,
                      "take_profit_pct": tp_pct, "estimated_loss_pct": stop_pct,
                      "margin_pct_equity": plan["notional"] / equity * 100.0,

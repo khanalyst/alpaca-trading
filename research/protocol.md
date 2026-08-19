@@ -27,17 +27,26 @@ runtime decision after OPRA evidence and controls are reviewed.
 The immutable authorizing floors are: 100 trades plus 30 complete
 sessions/clusters for backtest/factory windows; 100 trades plus 30 complete
 sessions/clusters for the sealed qualification window; and 150 trades plus 30
-complete sessions for the parity-matched live-shadow tail. Replay epoch 4
-retains the epoch-3 economics gates and adds latest-of-event/as-of/observed-at
-point-in-time availability, executable-row-only authorizing statistics,
-vehicle-specific cost selection/provenance, raw confirmatory p-values for FDR,
-and a stressed-cost runtime abstention boundary. Evidence from older replay
-epochs remains readable for audit but is quarantined and cannot validate,
-champion, or authorize the paper trader until replayed under epoch 4.
+complete sessions for the parity-matched live-shadow tail. Replay epoch 5
+retains the epoch-4 point-in-time, executable-row, vehicle-cost,
+raw-confirmatory-p, and stressed-cost boundaries and additionally seals paired
+synthetic root-control shadow decisions/replays, diagnostic-only historical-
+backfill provenance with exact calendar metadata, durable live-shadow FDR
+allocation binding, chronological paired inference, finite BH input
+validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
+readable for audit but are quarantined and cannot validate, champion, or
+authorize the paper trader until re-derived under epoch 5.
 
 Production replay requires exact Alpaca calendar metadata for every session,
 including early closes. Missing metadata is a refusal; no fixed 16:00 close is
 promoted as a fallback.
+
+Historical backfill preserves that exact calendar metadata in the recorder
+sidecar and labels rows `source_mode: historical_backfill`. Its truthful
+fetch-time `observed_at` is retained. Only an explicit diagnostic replay policy
+may inspect those rows at their provider `as_of` boundary; resulting evidence is
+marked `diagnostic_historical_backfill`, excluded from authorizing statistics,
+and cannot authorize a proof or live deployment.
 
 ## Replay gates
 
@@ -91,6 +100,10 @@ Stress bps are charged against entry notional, with listed-option round-trip
 fees added for both per-contract sides; they are not per-side bps. The shipped
 `max_stressed_cost_to_risk_ratio` is `0.30`, so a 30-bps-floor trade's 25-bps
 entry-notional stress is about `0.833` of risk and is vetoed before option fees.
+For equity orders, bracket legs and limit prices are rounded toward the entry
+to Alpaca's valid price ticks (`$0.01` at or above `$1`, `$0.0001` below) before
+risk sizing and submission; a rounded bracket that no longer straddles entry is
+rejected.
 `research/calibration.py` is a read-only authorization check stratified by
 runtime mode, vehicle, execution profile, and both entry and exit when
 references are present. Partial fills use plan/reference fields. Missing,
@@ -173,14 +186,15 @@ through the same evidence gate and a pin that does not resolve trades nothing
 rather than being substituted. It is the preferred live route because the
 operator-assigned id makes the promotion explicit and auditable; the legacy
 `selection_mode: specific` route remains supported for one exact proved
-variant. A pinned candidate is exempt from every automatic lifecycle change:
-the rolling-R guard, the sequential drift test, and the trial review all still
-evaluate and still record what they found, but they raise a durable alert
-instead of transitioning it. Runtime risk limits are unaffected; they are
-safety, not lifecycle.
+variant. A pinned candidate is not exempt from automatic lifecycle stops: the
+rolling-R guard, sequential drift test, and trial review still evaluate it and a
+breach parks or demotes it. The operator-assigned pin identity and promotion
+fields are carried into the transition as audit context, while runtime risk
+limits remain independent safety controls.
 
-No automatic process may move a candidate into the pinned state, and none may
-move one out of it.
+No automatic process may add, remove, or rewrite the operator's configuration
+pin. Lifecycle guards may nevertheless demote a pinned candidate and remove it
+from runtime eligibility; the pin entry and its context remain audit metadata.
 
 ## Configuration provenance
 
@@ -220,8 +234,11 @@ forward-shadow evidence. Passing gates advance `candidate` ->
 backtest or offline forward-shadow evidence cannot authorize paper deployment.
 The broker-free ShadowRunner
 evaluates eligible candidates in isolated virtual books from recorder events,
-creates exact-session candidate/root-baseline/randomized-null replays, and
-quarantines mismatch/incomplete rows. Research-side `edge ingest-shadow` opens
+creates exact-session candidate, paired synthetic root-control, and
+randomized-null replays, and quarantines mismatch/incomplete rows. A tuned rule
+descendant's root-control arm consumes the same event stream in its own virtual
+book and remains isolated from EdgeLedger lifecycle state. Research-side
+`edge ingest-shadow` opens
 the shadow WAL read-only, requires strictly newer complete parity-matched rows,
 prior qualification, source/config/code/provenance/replay/gate hashes, family
 and global BH plus durable online FDR, then appends the immutable `lane=shadow`
@@ -341,15 +358,18 @@ LORD validity still requires that confirmatory p-value to be based on evidence
 not reused for the adaptive selection step (the in-process replay remains
 diagnostic unless that independence boundary is established).
 
-Live-shadow ingestion establishes that boundary chronologically. Each complete
-new tail is split deterministically into an older selection window and a newer,
-disjoint confirmatory window; both windows must independently meet the configured
+Live-shadow ingestion establishes that boundary chronologically. The unchanged
+`shadow-confirmation-v4` scope handles each complete new tail by splitting it
+deterministically into an older selection window and a newer, disjoint
+confirmatory window; both windows must independently meet the configured
 trade/session floors before any online allocation is spent. Family and global BH
 use only the selection-window raw p-values. At most the selected, preflight-ready
 candidate is recomputed on the confirmatory window, and only that gate's raw p is
 sent to LORD. The source and provenance persist both session lists, their
 digests, the disjointness marker, and the confirmatory p-value source. Legacy
-same-tail v3 records remain auditable but cannot authorize under epoch 4.
+same-tail v3 records remain auditable but cannot authorize under epoch 5. The
+persisted live proof must match the durable FDR allocation for its vehicle scope
+and test id; caller-supplied p/alpha/allocation fields are not authority.
 
 Beating a control is necessary but never sufficient. A variant must also show
 absolute after-cost profitability on unseen data (positive net P&L and
@@ -406,28 +426,29 @@ the raw held-out delta.
 
 Every run also records the replay generation it was measured under
 (`research/edge_ledger_store.py::REPLAY_ENGINE_EPOCH`), assigned by the ledger
-and never accepted from a caller. The current generation is **epoch 4**. Epoch
-4 retains the epoch-3 economics gates and additionally applies latest-of-
-event/as-of/observed-at point-in-time availability, excludes non-executable
-fallback rows from authorizing statistics, binds vehicle-specific cost
-selection/provenance, feeds raw confirmatory p-values to FDR accounting, and
-enforces the stressed-cost runtime abstention boundary. A run from a superseded
-generation cannot authorize
-`validated`, `champion`, or runtime eligibility, and
-`EdgeLedger.eligibility` names that quarantine rather than reporting a bare
-ineligibility. This is deliberately not a digest check: evidence measured under
-a replay engine that has since been corrected still re-hashes and still
-recomputes, because the recorded rows are exactly what that engine produced.
-What changed is that those rows describe fills, quote ages, portfolio limits or
-multiplicity accounting the current protocol does not accept. Quarantine is not
-deletion — the rows stay readable and the lifecycle history stays intact — so
-re-deriving under epoch 4 is the only route back to a deployable proof. Epoch
-authorization requires exact equality with current epoch 4, so future as well as
-stale epochs remain audit-only. Each current-epoch run seals one immutable
-verified gate proof; re-derivation appends a new proof rather than rewriting
-history. The
-constant is raised whenever a replay or gate change invalidates evidence
-recorded before it.
+and never accepted from a caller. The current generation is **epoch 5**. Epoch
+5 retains the epoch-4 point-in-time availability, executable-row-only
+statistics, vehicle-specific cost provenance, raw confirmatory p accounting,
+and stressed-cost abstention boundary. It additionally seals paired synthetic
+root-control shadow decisions/replays, marks historical backfill as diagnostic
+non-authorizing evidence with exact calendar metadata, binds live-shadow
+authorization to the durable FDR allocation, orders paired inference
+chronologically, validates finite BH inputs (alpha in `(0,1]`, p-values in
+`[0,1]`), and rounds broker-bound equity prices conservatively to valid ticks
+before sizing.
+
+A run from a superseded generation cannot authorize `validated`, `champion`, or
+runtime eligibility, and `EdgeLedger.eligibility` names that quarantine rather
+than reporting a bare ineligibility. This is deliberately not a digest check:
+evidence measured under a replay engine that has since been corrected still
+re-hashes and still recomputes, because the recorded rows are exactly what that
+engine produced. Quarantine is not deletion — the rows stay readable and the
+lifecycle history stays intact — so epoch-4 proofs remain audit-readable but
+must be re-derived under epoch 5 to authorize. Authorization requires exact
+equality with current epoch 5; future as well as stale epochs remain audit-only.
+Each current-epoch run seals one immutable verified gate proof; re-derivation
+appends a new proof rather than rewriting history. The constant is raised
+whenever a replay or gate change invalidates evidence recorded before it.
 Underpowered or inconclusive data is not failure. Retirement is permitted only
 after every bounded point and the confirmation carry a powered upper-bound
 rejection across multiple negative windows; an enabled LLM lane must first
@@ -442,7 +463,7 @@ that worker persists no shadow proof, transition, or reseed, and the complete
 tail remains eligible for reconsideration on the next cycle. Offline shadow
 status never authorizes runtime. The live ShadowRunner consumes recorder
 events in candidate-isolated virtual books and creates exact-session candidate,
-root-baseline, and randomized-null replays; mismatched/incomplete rows are
+paired synthetic root-control, and randomized-null replays; mismatched/incomplete rows are
 quarantined. `edge ingest-shadow` is the sole authorization boundary: it opens
 the WAL read-only, requires strictly newer complete parity-matched rows, prior
 qualification, source/config/code/provenance/replay/gate hashes, family/global

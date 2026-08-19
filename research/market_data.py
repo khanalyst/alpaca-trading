@@ -145,6 +145,7 @@ class EventIdentity:
     session_date: date
     timezone: str = "America/New_York"
     schema: str = "market-event.v1"
+    source_mode: str = "forward_observed"
 
     def __post_init__(self) -> None:
         if not self.provider.strip() or not self.feed.strip():
@@ -153,6 +154,9 @@ class EventIdentity:
             raise NormalizationError("as_of and observed_at must be timezone-aware")
         if self.as_of > self.observed_at:
             raise NormalizationError("as_of cannot be after observed_at")
+        if self.source_mode not in {"forward_observed", "historical_backfill"}:
+            raise NormalizationError(
+                "source_mode must be forward_observed or historical_backfill")
 
     @property
     def as_of_ts(self) -> float:
@@ -197,6 +201,9 @@ def _identity(payload: Mapping[str, Any], *, provider: str | None = None,
         timezone="America/New_York",
         schema=str(_field(payload, "schema", "schema_version",
                           default="market-event.v1")),
+        source_mode=str(_field(
+            payload, "source_mode", default="forward_observed") or
+            "forward_observed").strip().lower(),
     )
 
 
@@ -226,6 +233,76 @@ def record_available_at(record: Any) -> datetime | None:
         return max(value.astimezone(UTC) for value in values)
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def historical_backfill_record(record: Any) -> bool:
+    """Return whether a normalized record is truthfully labelled backfill."""
+    identity = getattr(record, "identity", None)
+    return getattr(identity, "source_mode", None) == "historical_backfill"
+
+
+def replay_available_at(
+        record: Any, *, allow_historical_backfill_diagnostics: bool = False
+) -> datetime | None:
+    """Resolve availability for an explicitly non-authorizing replay.
+
+    Forward/default replay always uses :func:`record_available_at`, including
+    wall-clock observation time.  A diagnostic caller may inspect a labelled
+    historical backfill at its truthful provider ``as_of`` boundary.  The
+    source identity and original ``observed_at`` remain unchanged.
+    """
+    if not isinstance(allow_historical_backfill_diagnostics, bool):
+        return None
+    if (not allow_historical_backfill_diagnostics or
+            not historical_backfill_record(record)):
+        return record_available_at(record)
+    identity = getattr(record, "identity", None)
+    event = getattr(record, "timestamp", getattr(record, "ts", None))
+    as_of = getattr(identity, "as_of", None)
+    values = (event, as_of)
+    if any(not isinstance(value, datetime) or value.tzinfo is None or
+           value.utcoffset() is None for value in values):
+        return None
+    try:
+        return max(value.astimezone(UTC) for value in values)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def replay_record_is_available(
+        record: Any, cutoff: datetime, *,
+        allow_historical_backfill_diagnostics: bool = False) -> bool:
+    """Return point-in-time visibility under the explicit replay policy."""
+    if (not isinstance(cutoff, datetime) or cutoff.tzinfo is None or
+            cutoff.utcoffset() is None):
+        return False
+    available = replay_available_at(
+        record,
+        allow_historical_backfill_diagnostics=(
+            allow_historical_backfill_diagnostics),
+    )
+    return available is not None and available <= cutoff.astimezone(UTC)
+
+
+def replay_open_is_available(
+        record: Any, cutoff: datetime, *,
+        allow_historical_backfill_diagnostics: bool = False) -> bool:
+    """Return whether an opening print is usable by a replay.
+
+    Only the explicit historical diagnostic lane may inspect a labelled bar's
+    opening print at its market timestamp.  Completed OHLC remains bounded by
+    :func:`replay_available_at`; default/authorizing replay is unchanged.
+    """
+    if (not isinstance(cutoff, datetime) or cutoff.tzinfo is None or
+            cutoff.utcoffset() is None):
+        return False
+    if (allow_historical_backfill_diagnostics and
+            historical_backfill_record(record)):
+        event = getattr(record, "timestamp", getattr(record, "ts", None))
+        return (isinstance(event, datetime) and event.tzinfo is not None and
+                event.utcoffset() is not None and
+                event.astimezone(UTC) <= cutoff.astimezone(UTC))
+    return record_is_available(record, cutoff)
 
 
 def record_is_available(record: Any, cutoff: datetime) -> bool:
@@ -654,6 +731,8 @@ __all__ = [
     "QuoteSnapshot", "UnderlyingBar", "normalize_option_contract",
     "normalize_option_snapshot", "normalize_quote",
     "normalize_underlying_bar", "option_has_liquidity",
-    "parse_timestamp", "record_available_at", "record_is_available",
+    "historical_backfill_record", "parse_timestamp", "record_available_at",
+    "record_is_available", "replay_available_at",
+    "replay_open_is_available", "replay_record_is_available",
     "NEW_YORK", "UTC",
 ]

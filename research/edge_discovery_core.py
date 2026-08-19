@@ -22,7 +22,9 @@ from .costs import (BAR, QUOTE, CostModel, ReplayPolicy, SQLiteQuoteIndex,
                     SQLiteQuoteIndexDescriptor, index_quotes, quote_fill,
                     quote_fill_record)
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
-                          record_available_at, record_is_available)
+                          historical_backfill_record, replay_available_at,
+                          replay_open_is_available,
+                          replay_record_is_available)
 from .stats import stable_seed
 
 MIN_PROMOTION_CLUSTERS = 30
@@ -689,7 +691,11 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
             continue
         entry_index = rng.randrange(1, len(session_bars) - 1)
         source_entry_bar = session_bars[entry_index]
-        source_ready = record_available_at(source_entry_bar)
+        source_ready = replay_available_at(
+            source_entry_bar,
+            allow_historical_backfill_diagnostics=(
+                policy.allow_historical_backfill_diagnostics),
+        )
         if source_ready is None:
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "entry_bar_not_visible"))
@@ -706,7 +712,11 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         # executable boundary quote can authorize a strict entry without
         # consuming that delayed OHLC; permissive bar fallback still requires
         # the opening record itself to be visible at its timestamp.
-        entry_bar_visible = record_is_available(entry_bar, entry_bar.timestamp)
+        entry_bar_visible = replay_open_is_available(
+            entry_bar, entry_bar.timestamp,
+            allow_historical_backfill_diagnostics=(
+                policy.allow_historical_backfill_diagnostics),
+        )
         entry_underlying = (float(entry_bar.open)
                             if entry_bar_visible else None)
         entry_ref = entry_underlying
@@ -788,7 +798,10 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         # record is not available even at that close boundary, so do not leak
         # its eventual close into the null account.
         if (exit_bar is entry_bar and
-                not record_is_available(entry_bar, entry_bar.end)):
+                not replay_record_is_available(
+                    entry_bar, entry_bar.end,
+                    allow_historical_backfill_diagnostics=(
+                        policy.allow_historical_backfill_diagnostics))):
             rows.append(_null_row(symbol, day, opportunity, vehicle,
                                   "entry_bar_not_visible"))
             continue
@@ -796,7 +809,10 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
         exit_at = exit_bar.end
         boundary_exit = True
         for bar in session_bars[entry_index:last_index + 1]:
-            if record_available_at(bar) is None:
+            if replay_available_at(
+                    bar,
+                    allow_historical_backfill_diagnostics=(
+                        policy.allow_historical_backfill_diagnostics)) is None:
                 # A resting null exit may consume a delayed completed bar once
                 # its full record is observed; only bars before entry are
                 # excluded by the availability-time entry resolver.
@@ -906,7 +922,14 @@ def null_control_account(bars: Sequence[Any], snapshots: Sequence[Any],
                      "entry_feed": entry_feed,
                      "exit_feed": exit_feed,
                      "entry_provider": entry_provider,
-                     "exit_provider": exit_provider})
+                     "exit_provider": exit_provider,
+                     "evidence_mode": (
+                         "diagnostic_historical_backfill"
+                         if policy.allow_historical_backfill_diagnostics and any(
+                             historical_backfill_record(item)
+                             for item in (source_entry_bar, entry_bar, exit_bar))
+                         else "forward_observed"
+                     )})
     executed = [row for row in rows if row.get("no_trade") is not True]
     return {"account_id": account_id, "starting_cash": float(starting_cash),
             "ending_equity": cash, "realized_pnl": cash - float(starting_cash),
@@ -949,8 +972,12 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) ->
                               and bar.timestamp >= entry_at]
                 if candidates:
                     entry_bar = min(candidates, key=lambda bar: bar.timestamp)
+        diagnostic = (trade is not None and getattr(
+            trade, "evidence_mode", "") == "diagnostic_historical_backfill")
         bar_visible = (entry_bar is not None and
-                       record_is_available(entry_bar, entry_bar.timestamp))
+                       replay_open_is_available(
+                           entry_bar, entry_bar.timestamp,
+                           allow_historical_backfill_diagnostics=diagnostic))
         # Strict replay may have priced a delayed bar from a fresh boundary
         # quote/snapshot.  Prefer the persisted underlying anchor for both
         # vehicles; the option ``entry_reference`` is its premium and cannot
@@ -963,6 +990,8 @@ def _null_reference_rows(result, bars: Sequence[UnderlyingBar], vehicle: str) ->
                       (bar_visible or quote_anchor or persisted_anchor is not None))
         row = {"vehicle": vehicle, "symbol": symbol, "session_date": day.isoformat(),
                "no_trade": not executable}
+        if diagnostic:
+            row["evidence_mode"] = "diagnostic_historical_backfill"
         anchor = None
         if executable:
             anchor = (float(persisted_anchor) if persisted_anchor is not None else

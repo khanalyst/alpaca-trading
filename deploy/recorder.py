@@ -105,6 +105,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 INDEX_NAME = ".recorder-index.json"
 INDEX_SCHEMA = "recorder-index.v1"
 PARTITION_DIR = "sessions"
+PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
 # The recorder only ever asks the provider for ``watermark - 1 minute`` onwards,
 # so a row it can legally receive is at most one minute older than the
 # watermark. The dedup window is fifteen minutes: an order of magnitude of
@@ -140,6 +141,57 @@ def _corpus_root(output: Path) -> Path:
 
 def _partition_path(output: Path, day: date) -> Path:
     return _corpus_root(output) / PARTITION_DIR / f"market-{day.isoformat()}.csv"
+
+
+def _partition_source_path(output: Path, day: date) -> Path:
+    """Durable provenance marker written before a backfill partition."""
+    partition = _partition_path(output, day)
+    return partition.with_name(partition.name + ".source.json")
+
+
+def _save_partition_source(output: Path, day: date, source_mode: str) -> None:
+    """Atomically persist partition provenance independently of the index.
+
+    The recorder index is rebuilt after a crash.  Keeping this tiny marker
+    beside the partition prevents that rebuild from silently relabelling a
+    historical backfill as forward-observed evidence.
+    """
+    if source_mode != "historical_backfill":
+        raise RuntimeError("unsupported recorder partition source mode")
+    path = _partition_source_path(output, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump({"schema": PARTITION_SOURCE_SCHEMA,
+                   "partition": _partition_path(output, day).name,
+                   "source_mode": source_mode}, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _partition_sources_from_markers(output: Path) -> dict[str, dict[str, str]]:
+    """Load provenance markers for partitions that actually exist."""
+    directory = _corpus_root(output) / PARTITION_DIR
+    if not directory.is_dir():
+        return {}
+    existing = {path.name for path in corpus_partitions(output)}
+    result: dict[str, dict[str, str]] = {}
+    for path in sorted(directory.glob("market-*.csv.source.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid recorder partition source marker {path}") from exc
+        partition = payload.get("partition") if isinstance(payload, dict) else None
+        source_mode = payload.get("source_mode") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or
+                payload.get("schema") != PARTITION_SOURCE_SCHEMA or
+                not isinstance(partition, str) or partition not in existing or
+                path.name != partition + ".source.json" or
+                source_mode != "historical_backfill"):
+            raise RuntimeError(f"invalid recorder partition source marker {path}")
+        result[partition] = {"source_mode": source_mode}
+    return result
 
 
 def corpus_partitions(output: Path) -> list[Path]:
@@ -226,6 +278,7 @@ def _scan_corpus(output: Path) -> dict:
              "latest_bars": latest_bars, "recent_keys": recent_keys,
              "option_pins": {}, "bar_coverage": {},
              "session_calendar": {},
+             "partition_sources": _partition_sources_from_markers(output),
              "data_feed": next(iter(data_feeds), None),
              "partitions": _partition_sizes(output)}
     return _prune_index(index)
@@ -280,6 +333,7 @@ def _prune_index(index: dict) -> dict:
     """Drop dedup keys and option pins that fell out of their bounded window."""
     index.setdefault("bar_coverage", {})
     index.setdefault("session_calendar", {})
+    index.setdefault("partition_sources", {})
     index.setdefault("data_feed", None)
     watermark = _timestamp(index.get("watermark"))
     if watermark is not None:
@@ -330,6 +384,20 @@ def _load_index(output: Path) -> dict | None:
                     opened.astimezone(NEW_YORK).date() != parsed_day or
                     closed.astimezone(NEW_YORK).date() != parsed_day):
                 return None
+    partition_sources = index.get("partition_sources")
+    if partition_sources is None:  # additive recorder-index.v1 field
+        index["partition_sources"] = {}
+    elif not isinstance(partition_sources, dict):
+        return None
+    else:
+        for name, value in partition_sources.items():
+            if (not isinstance(name, str) or not isinstance(value, dict) or
+                    not isinstance(value.get("source_mode"), str)):
+                return None
+    durable_sources = _partition_sources_from_markers(output)
+    if any(index["partition_sources"].get(name) != value
+           for name, value in durable_sources.items()):
+        return None
     data_feed = index.get("data_feed")
     if data_feed is not None and not isinstance(data_feed, str):
         return None

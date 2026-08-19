@@ -1,7 +1,9 @@
 """Durable confirmatory false-discovery budget tests."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from research.factory_ledger import (
@@ -49,6 +51,37 @@ class FactoryFdrTests(unittest.TestCase):
             self.assertEqual(duplicate["p_value"], .001)
             self.assertTrue(duplicate["decision"])
             self.assertEqual(ledger.fdr_state(scope)["tests"], 1)
+
+    def test_scope_alpha_is_locked_by_the_first_durable_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            scope = "shadow-confirmation-v4:equity"
+            first = ledger.record_fdr_decision(scope, "proof-a", 1.0, alpha=.05)
+            self.assertAlmostEqual(first["allocated_alpha"], .025)
+            with self.assertRaisesRegex(FactoryError, "immutable"):
+                ledger.next_fdr_allocation(scope, alpha=1.0)
+            with self.assertRaisesRegex(FactoryError, "immutable"):
+                ledger.record_fdr_decision(scope, "proof-b", 1.0, alpha=1.0)
+            self.assertEqual(ledger.fdr_state(scope)["tests"], 1)
+
+    def test_concurrent_decisions_cannot_spend_the_same_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = FactoryLedger(Path(directory) / "edge.sqlite3")
+            scope = "shadow-confirmation-v4:equity"
+            barrier = threading.Barrier(2)
+
+            def record(test_id):
+                barrier.wait()
+                return ledger.record_fdr_decision(scope, test_id, 1.0)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                rows = list(pool.map(record, ("proof-a", "proof-b")))
+            self.assertEqual(sorted(row["tests"] for row in rows), [1, 2])
+            self.assertEqual(
+                sorted(round(row["allocated_alpha"], 12) for row in rows),
+                sorted((round(.05 / 2, 12), round(.05 / 6, 12))),
+            )
+            self.assertEqual(ledger.fdr_state(scope)["tests"], 2)
 
     def test_offline_deferral_is_explicit_and_non_authorizing(self):
         record = deferred_fdr("shadow-confirmation-v4:equity", "candidate-a")

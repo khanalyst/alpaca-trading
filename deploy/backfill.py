@@ -7,11 +7,12 @@ across ten sessions, and then a *strictly later* forward window — for months.
 That delay is an artefact of how the corpus is acquired, not of the evidence
 standard, and backfilling removes it without weakening a single gate.
 
-What this writes is deliberately identical to what the recorder writes: the
-same normalized CSV fields, the same ``event_key``, the same one-partition-per-
-New-York-session layout, and the same sidecar index.  Research therefore cannot
-tell a backfilled session from a recorded one, and nothing downstream needs a
-special case.
+What this writes deliberately retains the recorder's normalized CSV contract,
+``event_key``, one-partition-per-New-York-session layout, and sidecar index.
+Unlike a forward observation, however, every row is explicitly labelled
+``historical_backfill``.  Its truthful wall-clock ``observed_at`` is never
+backdated; an explicit diagnostic replay policy is required to inspect the
+historical mechanics, and those results cannot authorize a candidate.
 
 Three boundaries keep it honest:
 
@@ -58,6 +59,7 @@ from deploy.recorder import (  # noqa: E402
     _load_index,
     _partition_path,
     _save_index,
+    _save_partition_source,
     _scan_corpus,
     audit_corpus,
     corpus_partitions,
@@ -81,6 +83,27 @@ class BackfillError(RuntimeError):
     """Raised when a backfill cannot produce a corpus research may trust."""
 
 
+def _calendar_sessions(provider, start: date, end: date) -> dict[date, object]:
+    """Return normalized Alpaca calendar sessions in ``[start, end]``."""
+    method = getattr(provider, "calendar", None)
+    if not callable(method):
+        raise BackfillError("provider exposes no trading calendar")
+    try:
+        rows = method(start=start, end=end) or []
+    except (AlpacaError, TypeError, ValueError, OSError) as exc:
+        raise BackfillError(f"trading calendar unavailable: {exc}") from exc
+    sessions: dict[date, object] = {}
+    for index, row in enumerate(rows, start=1):
+        try:
+            session = normalize_calendar_day(row)
+        except (TypeError, ValueError) as exc:
+            raise BackfillError(
+                f"trading calendar row {index} is invalid: {exc}") from exc
+        if start <= session.date <= end:
+            sessions[session.date] = session
+    return dict(sorted(sessions.items()))
+
+
 def completed_sessions(provider, start: date, end: date) -> list[date]:
     """Return the completed NYSE session dates in ``[start, end]``.
 
@@ -89,22 +112,7 @@ def completed_sessions(provider, start: date, end: date) -> list[date]:
     invents sessions on holidays would put fabricated gaps into the one corpus
     every downstream statistic is computed from.
     """
-    method = getattr(provider, "calendar", None)
-    if not callable(method):
-        raise BackfillError("provider exposes no trading calendar")
-    try:
-        rows = method(start=start, end=end) or []
-    except (AlpacaError, TypeError, ValueError, OSError) as exc:
-        raise BackfillError(f"trading calendar unavailable: {exc}") from exc
-    sessions = []
-    for row in rows:
-        try:
-            day = normalize_calendar_day(row)
-        except (TypeError, ValueError):
-            continue
-        if start <= day.date <= end:
-            sessions.append(day.date)
-    return sorted(set(sessions))
+    return list(_calendar_sessions(provider, start, end))
 
 
 def last_completed_session(now: datetime) -> date:
@@ -126,7 +134,8 @@ def _session_bounds(day: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
-def _bar_rows(provider, symbols, day: date, *, feed: str, observed: str):
+def _bar_rows(provider, symbols, day: date, *, session, feed: str,
+              observed: str):
     start, end = _session_bounds(day)
     bars = _call_market_data(provider.bars, symbols, start=start, end=end,
                              feed=feed) or {}
@@ -142,6 +151,9 @@ def _bar_rows(provider, symbols, day: date, *, feed: str, observed: str):
             # in the wrong partition and corrupt the session index.
             if parsed.astimezone(NEW_YORK).date() != day:
                 continue
+            as_of = parsed + timedelta(minutes=1)
+            if not session.open <= parsed < session.close or as_of > session.close:
+                continue
             yield {
                 "event_key": _event_key("bar_1m", symbol, timestamp),
                 "observed_at": observed, "provider": "alpaca", "feed": feed,
@@ -149,14 +161,15 @@ def _bar_rows(provider, symbols, day: date, *, feed: str, observed: str):
                 # A one-minute OHLC row is knowable only after its closing
                 # boundary, even when the provider timestamps it at the open.
                 "timestamp": timestamp,
-                "as_of": (parsed + timedelta(minutes=1)).isoformat(),
+                "as_of": as_of.isoformat(),
                 "open": _value(bar.open), "high": _value(bar.high),
                 "low": _value(bar.low), "close": _value(bar.close),
                 "volume": _value(bar.volume), "bid": "", "ask": "", "last": "",
             }
 
 
-def _quote_rows(provider, symbols, day: date, *, feed: str, observed: str):
+def _quote_rows(provider, symbols, day: date, *, session, feed: str,
+                observed: str):
     start, end = _session_bounds(day)
     quotes = _call_quotes(provider.quotes, symbols, start=start, end=end,
                           feed=feed) or {}
@@ -168,6 +181,8 @@ def _quote_rows(provider, symbols, day: date, *, feed: str, observed: str):
                 continue
             parsed = _timestamp(timestamp)
             if parsed.astimezone(NEW_YORK).date() != day:
+                continue
+            if not session.open <= parsed < session.close:
                 continue
             yield {
                 "event_key": _event_key("quote", symbol, timestamp),
@@ -204,6 +219,10 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
     except ValueError as exc:
         raise BackfillError(str(exc)) from exc
     index = _load_index(output)
+    existing_calendar = dict(index.get("session_calendar") or {}) \
+        if index is not None else {}
+    existing_sources = dict(index.get("partition_sources") or {}) \
+        if index is not None else {}
     existing_feed = (str(index.get("data_feed") or "").strip().lower()
                      if index is not None else "")
     if not existing_feed and corpus_partitions(output):
@@ -214,7 +233,8 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
             f"{resolved_feed}; use a separate corpus")
     end = last_completed_session(now)
     start = end - timedelta(days=int(days) - 1)
-    sessions = completed_sessions(provider, start, end)
+    calendar = _calendar_sessions(provider, start, end)
+    sessions = list(calendar)
     existing = {path.name for path in corpus_partitions(output)}
     written_rows = 0
     written_sessions: list[str] = []
@@ -230,10 +250,10 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
             # file. Appending instead would duplicate every event key and make
             # the corpus unreadable at the recorder's next scan.
             partition.unlink()
-        rows = list(_bar_rows(provider, symbols, day,
+        rows = list(_bar_rows(provider, symbols, day, session=calendar[day],
                               feed=resolved_feed, observed=observed))
         if include_quotes:
-            rows.extend(_quote_rows(provider, symbols, day,
+            rows.extend(_quote_rows(provider, symbols, day, session=calendar[day],
                                     feed=resolved_feed, observed=observed))
         if not rows:
             # A scheduled session with no bars is a data hole, not a holiday;
@@ -246,6 +266,11 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
         unique: dict[str, dict] = {}
         for row in rows:
             unique.setdefault(row["event_key"], row)
+        # Persist the non-authorizing provenance before the partition.  If the
+        # process crashes before the aggregate index rewrite, corpus recovery
+        # reconstructs the label from this marker instead of treating the CSV
+        # as forward-observed evidence.
+        _save_partition_source(output, day, "historical_backfill")
         _append_partitions(output, list(unique.values()))
         written_rows += len(unique)
         written_sessions.append(day.isoformat())
@@ -254,7 +279,22 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
     # Backfill is an explicit offline operation, so retain the full duplicate
     # audit before rebuilding the bounded live index.
     audit_corpus(output)
-    _save_index(output, _scan_corpus(output))
+    index = _scan_corpus(output)
+    index["session_calendar"] = {**existing_calendar, **{
+        day.isoformat(): {
+            "open": session.open.astimezone(timezone.utc).isoformat(),
+            "close": session.close.astimezone(timezone.utc).isoformat(),
+            "source": "alpaca_calendar",
+        }
+        for day, session in calendar.items()
+    }}
+    index["partition_sources"] = {**existing_sources, **{
+        _partition_path(output, date.fromisoformat(day)).name: {
+            "source_mode": "historical_backfill",
+        }
+        for day in written_sessions
+    }}
+    _save_index(output, index)
     return {
         "schema": "recorder-backfill.v1", "feed": resolved_feed,
         "symbols": symbols, "requested_days": int(days),
@@ -262,7 +302,8 @@ def backfill(provider, symbols, output: Path, *, days: int = DEFAULT_BACKFILL_DA
         "calendar_sessions": len(sessions),
         "written_sessions": written_sessions, "skipped_sessions": skipped,
         "rows": written_rows, "quotes": bool(include_quotes),
-        "options": False,
+        "options": False, "source_mode": "historical_backfill",
+        "authorizing": False,
     }
 
 

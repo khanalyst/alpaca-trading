@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Mapping
 
 from .allocation import evidence_rank
-from .governance import pinned_variant_ids
 from .registry import baseline_variant_id, known_variant_ids
 from .variants import from_record, apply as apply_variant_config
 from research.edge_lab import DEFAULT_DB_PATH, EdgeLedger
@@ -444,9 +443,10 @@ def record_paper_outcome(outcome: Mapping, *, candidate_id: str | None = None,
                          config: Mapping | None = None) -> dict:
     """Append an observed paper outcome and return the resulting status.
 
-    When ``config`` pins this variant, the outcome is ingested frozen: the
-    guards still evaluate and still record what they found, but they raise an
-    alert instead of demoting, because the operator owns that decision.
+    When ``config`` pins this variant, the outcome carries the promotion
+    context into the hard guard.  Pinning selects an identity but does not
+    exempt it from safety demotion; a breached pinned edge is removed from
+    runtime selection and the operator's promotion remains auditable.
     """
     ledger = EdgeLedger(db_path or DEFAULT_DB_PATH)
     cid = candidate_id or outcome.get("candidate_id")
@@ -460,13 +460,27 @@ def record_paper_outcome(outcome: Mapping, *, candidate_id: str | None = None,
             raise KeyError(f"unknown candidate {variant_id!r}/{vehicle!r}")
         cid = record["candidate_id"]
     frozen = False
+    pin_context: dict[str, object] = {}
     if config is not None:
         if not variant_id or not vehicle:
             record = ledger.candidate(str(cid)) or {}
             variant_id = variant_id or record.get("variant_id")
             vehicle = vehicle or record.get("vehicle")
-        frozen = (str(variant_id), str(vehicle)) in pinned_variant_ids(config)
-    return ledger.ingest_paper_outcome(str(cid), outcome, frozen=frozen)
+        strategy = config.get("strategy") if isinstance(config, Mapping) else {}
+        entries = strategy.get("pinned") if isinstance(strategy, Mapping) else ()
+        for entry in entries or ():
+            if (isinstance(entry, Mapping) and
+                    str(entry.get("variant_id")) == str(variant_id) and
+                    str(entry.get("vehicle") or "equity") == str(vehicle)):
+                frozen = True
+                pin_context = {
+                    key: entry.get(key) for key in
+                    ("id", "variant_id", "vehicle", "strategy_id",
+                     "promoted_at", "note") if key in entry
+                }
+                break
+    return ledger.ingest_paper_outcome(
+        str(cid), outcome, frozen=frozen, pin_context=pin_context)
 
 
 __all__ = ["VEHICLES", "apply_variant", "record_paper_outcome",

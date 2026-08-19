@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import sqlite3
 from typing import Any, Mapping
@@ -66,6 +67,24 @@ def _fdr_allocation(decisions: list[Mapping[str, Any]], alpha: float) -> tuple[i
         if bool(row["decision"]):
             allocated += float(alpha) * _fdr_gamma(test_index - discovery_index)
     return test_index, min(float(alpha), allocated)
+
+
+def _locked_scope_alpha(rows: list[Mapping[str, Any]], requested: float) -> float:
+    """Keep one preregistered alpha for the lifetime of an FDR scope."""
+    if not rows:
+        return float(requested)
+    values = [_real(row["alpha"] if "alpha" in row.keys() else None)
+              for row in rows]
+    if any(value is None for value in values):
+        raise FactoryError("durable FDR scope has an invalid alpha")
+    locked = float(values[0])
+    if any(not math.isclose(float(value), locked, rel_tol=0.0, abs_tol=1e-12)
+           for value in values[1:]):
+        raise FactoryError("durable FDR scope contains inconsistent alpha values")
+    if not math.isclose(float(requested), locked, rel_tol=0.0, abs_tol=1e-12):
+        raise FactoryError(
+            f"FDR scope alpha is immutable at {locked:g}; requested {requested:g}")
+    return locked
 
 
 def deferred_fdr(scope: str, test_id: str) -> dict[str, Any]:
@@ -976,8 +995,9 @@ class FactoryLedger:
         resolved_scope = str(scope)
         with closing(_connect(self.path)) as db:
             rows = db.execute(
-                "SELECT decision FROM factory_fdr WHERE scope=? "
+                "SELECT decision,alpha FROM factory_fdr WHERE scope=? "
                 "ORDER BY created_at,decision_id", (resolved_scope,)).fetchall()
+        nominal = _locked_scope_alpha(list(rows), nominal)
         test_index, allocated = _fdr_allocation(list(rows), nominal)
         method, p_kind = _fdr_semantics(resolved_scope)
         return {"scope": resolved_scope, "alpha": nominal,
@@ -1003,9 +1023,15 @@ class FactoryLedger:
         scope, test_id = str(scope), str(test_id)
         method, p_kind = _fdr_semantics(scope)
         with closing(_connect(self.path)) as db, db:
+            # Allocation and insertion are one serialized state transition.
+            # A deferred transaction lets concurrent workers both read the
+            # same prefix and spend the same LORD allocation before either
+            # INSERT becomes visible.
+            db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
                 "SELECT * FROM factory_fdr WHERE scope=? "
                 "ORDER BY created_at,decision_id", (scope,)).fetchall()
+            nominal = _locked_scope_alpha(list(rows), nominal)
             for existing_index, existing in enumerate(rows, start=1):
                 if str(existing["test_id"]) == test_id:
                     return dict(existing) | {

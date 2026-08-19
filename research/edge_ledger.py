@@ -232,8 +232,9 @@ class EdgeLedger(EdgeLedgerProofMixin):
 
     def append_evidence(self, candidate_id: str, kind: str, payload: Any,
                         *, run_id: str | None = None) -> dict:
-        if str(kind) == "verified_gate":
-            raise ValueError("verified_gate evidence must be recorded through record_verified_gate")
+        if str(kind) in {"verified_gate", "shadow_ingestion"}:
+            raise ValueError(
+                f"{kind} evidence must be recorded through its validated recording path")
         if self.candidate(candidate_id) is None:
             raise KeyError(candidate_id)
         if run_id is not None:
@@ -248,6 +249,89 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 (evidence_id,candidate_id,run_id,kind,payload_json,evidence_hash,created_at)
                 VALUES(?,?,?,?,?,?,?)""",
                 (eid, candidate_id, run_id, str(kind), _json(payload), content_hash(payload), _utc()))
+            row = db.execute("SELECT * FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
+        return _row(row) or {}
+
+    def record_shadow_ingestion(self, candidate_id: str, payload: Mapping,
+                                *, run_id: str) -> dict:
+        """Persist one validated parity-ingestion attestation.
+
+        Shadow authorization is a distinct write boundary.  A generic
+        ``append_evidence`` call must not be able to manufacture the marker
+        consumed by :meth:`eligibility`; callers must bind the attestation to
+        the exact immutable shadow run and its source payload first.  The
+        final authorization verifier performs the expensive replay/FDR
+        checks, while this boundary rejects cross-candidate/run transplants
+        before anything is appended.
+        """
+        if not isinstance(payload, Mapping):
+            raise ValueError("shadow ingestion evidence must be a mapping")
+        candidate = self.candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(candidate_id)
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("shadow ingestion evidence requires a run_id")
+        run = self.run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run.get("candidate_id") != candidate_id:
+            raise ValueError("shadow ingestion run belongs to another candidate")
+        if run.get("lane") != "shadow" or run.get("vehicle") != candidate.get("vehicle"):
+            raise ValueError("shadow ingestion requires the candidate's shadow run")
+        if payload.get("schema") != "shadow-ingest.v1":
+            raise ValueError("shadow ingestion schema is invalid")
+        if payload.get("candidate_id") != candidate_id:
+            raise ValueError("shadow ingestion candidate identity does not match run")
+        if payload.get("vehicle") != run.get("vehicle"):
+            raise ValueError("shadow ingestion vehicle does not match run")
+        metrics = run.get("metrics") if isinstance(run.get("metrics"), Mapping) else {}
+        source = payload.get("source")
+        recorded_source = metrics.get("shadow_source")
+        if (not isinstance(source, Mapping) or
+                not isinstance(recorded_source, Mapping) or
+                dict(source) != dict(recorded_source)):
+            raise ValueError("shadow ingestion source does not match immutable run")
+        replay_digests = payload.get("replay_digests")
+        recorded_replays = metrics.get("replay_digests")
+        source_replays = [item.get("replay_digest") for item in source.get("sessions", ())
+                          if isinstance(item, Mapping)]
+        if (not isinstance(replay_digests, list) or
+                not isinstance(recorded_replays, list) or
+                replay_digests != recorded_replays or
+                replay_digests != source_replays):
+            raise ValueError("shadow ingestion replay digests do not match immutable run")
+        gate = metrics.get("gate") if isinstance(metrics, Mapping) else None
+        envelope = gate.get("verified_gate") if isinstance(gate, Mapping) else None
+        if (not isinstance(envelope, Mapping) and isinstance(gate, Mapping) and
+                gate.get("schema") == "verified-research-gate.v2"):
+            envelope = gate
+        if (not isinstance(envelope, Mapping) or
+                payload.get("gate_hash") != envelope.get("content_hash")):
+            raise ValueError("shadow ingestion gate hash does not match immutable run")
+        candidate_proof = payload.get("candidate_proof")
+        if not isinstance(candidate_proof, Mapping) or any(
+                candidate_proof.get(key) != candidate.get(key)
+                for key in ("candidate_id", "dataset_hash", "config_hash",
+                            "code_hash", "provenance_hash")):
+            raise ValueError("shadow ingestion candidate proof does not match candidate")
+        run_provenance = payload.get("run_provenance")
+        if not isinstance(run_provenance, Mapping):
+            raise ValueError("shadow ingestion run provenance is missing")
+        if run_provenance.get("candidate_id") != candidate_id:
+            raise ValueError("shadow ingestion provenance candidate does not match run")
+        evidence = dict(payload)
+        eid = uuid.uuid4().hex
+        with closing(_connect(self.path)) as db, db:
+            existing = db.execute(
+                "SELECT 1 FROM evidence WHERE run_id=? AND kind='shadow_ingestion' LIMIT 1",
+                (run_id,)).fetchone()
+            if existing is not None:
+                raise ValueError("run already has immutable shadow ingestion evidence")
+            db.execute("""INSERT INTO evidence
+                (evidence_id,candidate_id,run_id,kind,payload_json,evidence_hash,created_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (eid, candidate_id, run_id, "shadow_ingestion", _json(evidence),
+                 content_hash(evidence), _utc()))
             row = db.execute("SELECT * FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
         return _row(row) or {}
 
@@ -628,15 +712,15 @@ class EdgeLedger(EdgeLedgerProofMixin):
                 "duplicate": duplicate}
 
     def ingest_paper_outcome(self, candidate_id: str, outcome: Mapping, *,
-                             frozen: bool = False) -> dict:
+                             frozen: bool = False,
+                             pin_context: Mapping | None = None) -> dict:
         """Append one observed paper outcome and return the resulting status.
 
-        ``frozen`` marks a candidate the operator pinned in configuration.  A
-        pinned edge is theirs: the guards still run and still say what they
-        found, but they raise a durable alert instead of changing the
-        lifecycle, because an automatic demotion would be exactly the silent
-        change pinning exists to prevent.  Runtime risk limits are unaffected —
-        they are safety, not lifecycle.
+        ``frozen`` records that a candidate was operator-pinned in
+        configuration.  Pinning selects an identity, but it cannot bypass a
+        hard paper safety guard: a rolling-R or held-out-drift breach demotes
+        the edge and records the pin context so runtime selection fails closed.
+        Runtime risk limits remain independent safety controls.
         """
         candidate = self.candidate(candidate_id)
         if candidate is None:
@@ -739,16 +823,10 @@ class EdgeLedger(EdgeLedgerProofMixin):
             kind, reason, detail = breach
             payload = {**detail, "from_status": candidate["status"], "guard": kind}
             if frozen:
-                # The operator pinned this edge; say so loudly and leave it
-                # exactly where they put it.
-                self.append_event(
-                    candidate_id=candidate_id, event_type="guard_alert",
-                    actor="paper",
-                    reason=f"{reason}; pinned edge left unchanged for the operator",
-                    payload={**payload, "pinned": True, "action": "notify_only"})
-            else:
-                self.transition(candidate_id, "demoted", reason=reason,
-                                payload=payload)
+                payload.update({"pinned": True, "pin_context": dict(pin_context or {}),
+                                "action": "demote_and_pause"})
+            self.transition(candidate_id, "demoted", reason=reason,
+                            actor="paper", payload=payload)
         summary = self._paper_summary(candidate_id, oid)
         summary["guard_breach"] = breach[0] if breach else None
         summary["frozen"] = bool(frozen)

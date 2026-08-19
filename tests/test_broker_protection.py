@@ -27,6 +27,7 @@ from agent.engine import Engine
 from agent.execution_lifecycle import (_broker_protected, _leg_live, _leg_rows,
                                         _protective_legs)
 from agent.market import MarketData
+from agent.market_entry_risk import _quantize_equity_price
 from deploy import watchdog
 
 
@@ -284,6 +285,77 @@ class BrokerProtectionTests(ProtectionHarness):
         self.assertEqual(request.take_profit, Decimal(str(plan["target_price"])))
         self.assertEqual(request.symbol, "SPY")
         self.assertEqual(request.side, "buy")
+
+    def test_equity_entry_rounds_bracket_legs_to_broker_ticks_before_sizing(self):
+        self._bind_engine(runtime_name="runtime-bracket-ticks")
+        signal = self._signal()
+        signal.update(stop_price=99.997, target_price=105.003,
+                      stop_distance=1.503)
+        request, plan = self.engine._risk_order(
+            "SPY", signal, self._row(), self.provider.account(), [], self.NOW)
+        self.assertEqual(request.stop_loss, Decimal("100.00"))
+        self.assertEqual(request.take_profit, Decimal("105.00"))
+        self.assertEqual(plan["stop_price"], 100.0)
+        self.assertEqual(plan["target_price"], 105.0)
+        self.assertEqual(plan["stop_distance"], 1.5)
+
+    def test_equity_tick_rounding_uses_executable_quote_when_signal_omits_entry(self):
+        self._bind_engine(runtime_name="runtime-bracket-quote-entry")
+        signal = self._signal()
+        signal.pop("entry_price")
+        signal.update(stop_price=99.997, target_price=105.003)
+        request, plan = self.engine._risk_order(
+            "SPY", signal, self._row(), self.provider.account(), [], self.NOW)
+        self.assertEqual(plan["entry_price"], 101.5)
+        self.assertEqual(plan["stop_price"], 100.0)
+        self.assertEqual(request.stop_loss, Decimal("100.00"))
+        self.assertEqual(request.take_profit, Decimal("105.00"))
+
+    def test_quote_derived_entry_is_rounded_adversely_before_equity_sizing(self):
+        self._bind_engine(runtime_name="runtime-bracket-subpenny-quote")
+        row = {"symbol": "SPY", "quote": {"timestamp": self.NOW,
+                                             "bid": 101.507, "ask": 101.507}}
+        for direction, expected_entry, stop, target in (
+                ("long", 101.51, 99.997, 105.003),
+                ("short", 101.50, 103.003, 98.997)):
+            with self.subTest(direction=direction):
+                signal = self._signal(direction)
+                signal.pop("entry_price")
+                signal.update(stop_price=stop, target_price=target)
+                request, plan = self.engine._risk_order(
+                    "SPY", signal, row, self.provider.account(), [], self.NOW)
+                self.assertEqual(plan["entry_price"], expected_entry)
+                self.assertEqual(request.stop_loss, Decimal("100.00") if direction == "long"
+                                 else Decimal("103.00"))
+                self.assertEqual(request.take_profit, Decimal("105.00") if direction == "long"
+                                 else Decimal("99.00"))
+
+    def test_executable_quote_drives_geometry_while_signal_entry_drives_slippage(self):
+        self._bind_engine(runtime_name="runtime-bracket-current-quote")
+        self.engine.cfg["execution"]["max_slippage_bps"] = 1000
+        signal = self._signal()
+        signal.update(entry_price=101.0, stop_price=99.997,
+                      target_price=105.003)
+        row = {"symbol": "SPY", "quote": {"timestamp": self.NOW,
+                                             "bid": 101.497, "ask": 101.507}}
+        request, plan = self.engine._risk_order(
+            "SPY", signal, row, self.provider.account(), [], self.NOW)
+        self.assertEqual(plan["entry_price"], 101.51)
+        self.assertEqual(plan["stop_distance"], 1.51)
+        self.assertEqual(request.stop_loss, Decimal("100.00"))
+        self.assertEqual(request.take_profit, Decimal("105.00"))
+
+    def test_malformed_authored_entry_cannot_be_repaired_by_a_valid_quote(self):
+        self._bind_engine(runtime_name="runtime-bracket-invalid-authored-entry")
+        signal = self._signal()
+        signal["entry_price"] = "not-a-price"
+        self.assertIsNone(self.engine._risk_order(
+            "SPY", signal, self._row(), self.provider.account(), [], self.NOW))
+
+    def test_subdollar_tick_rounding_normalizes_when_it_crosses_one_dollar(self):
+        self.assertEqual(
+            _quantize_equity_price(0.99996, rounding="ROUND_CEILING"),
+            Decimal("1.00"))
 
     def test_bracket_rejected_by_validation_is_reported_not_raised(self):
         self._bind_engine(runtime_name="runtime-bracket-reject")

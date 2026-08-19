@@ -510,6 +510,46 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertTrue(family["target"]["significant"])
         self.assertFalse(global_["target"]["significant"])
 
+    def test_family_fdr_rejects_nonfinite_or_out_of_range_probabilities(self):
+        from research.stats import benjamini_hochberg
+        for value in (float("nan"), float("inf"), -0.01, 1.01, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                benjamini_hochberg({"bad": value, "ok": .5})
+        with self.assertRaises(ValueError):
+            benjamini_hochberg({"ok": .5}, alpha=float("nan"))
+
+    def test_matched_pairs_feed_block_bootstrap_in_market_chronology(self):
+        from research.gates import matched_pairs
+        candidate = []
+        baseline = []
+        # Match-key sorting would put symbol A's later sessions before symbol
+        # B's earlier sessions.  The statistical order must instead be time.
+        for symbol, days, pnl in (("A", range(6, 11), 10.0),
+                                  ("B", range(1, 6), -10.0)):
+            for day in days:
+                row = self._equity_quote_row(
+                    symbol=symbol, session_date=f"2026-01-{day:02d}",
+                    opportunity_id=f"{symbol}-{day}", net_pnl=pnl)
+                candidate.append(row)
+                baseline.append({**row, "net_pnl": 0.0})
+        pairs = matched_pairs(candidate, baseline, vehicle="equity")
+        self.assertEqual(pairs["deltas"], [-10.0] * 5 + [10.0] * 5)
+        self.assertEqual(pairs["timestamps"], sorted(pairs["timestamps"]))
+
+    def test_naive_legacy_pair_timestamp_is_host_timezone_independent(self):
+        from datetime import datetime, timezone
+        from research.gates import matched_pairs
+        row = self._equity_quote_row(
+            symbol="SPY", session_date="2026-01-01",
+            opportunity_id="naive", net_pnl=1.0)
+        row["entry_timestamp"] = "2026-01-01T09:30:00"
+        pairs = matched_pairs([row], [{**row, "net_pnl": 0.0}],
+                              vehicle="equity")
+        self.assertEqual(
+            pairs["timestamps"],
+            [datetime(2026, 1, 1, 9, 30, tzinfo=timezone.utc).timestamp()],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

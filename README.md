@@ -100,11 +100,12 @@ can become `validated` or `champion`. An underpowered, mismatched, or incomplete
 shadow cycle advances no durable boundary, so those sessions are reconsidered
 when enough data exists instead of being silently consumed.
 
-The v4 live-shadow scope is independent and chronological: each complete tail
-is split into an older selection window and a newer disjoint confirmatory
-window. Batch BH uses selection p-values; only the selected candidate's raw
-confirmatory p-value is sent to LORD. Same-tail v3 scopes remain audit-only and
-cannot authorize.
+The `shadow-confirmation-v4` live-shadow scope is independent and chronological:
+each complete tail is split into an older selection window and a newer disjoint
+confirmatory window. Batch BH uses selection p-values; only the selected
+candidate's raw confirmatory p-value is sent to LORD. Same-tail v3 scopes remain
+audit-only and cannot authorize. This v4 scope remains unchanged under replay
+epoch 5.
 
 Within a hypothesis, refinement first changes exactly one executable field at
 a time. Only after that coordinate neighborhood is measured can it combine two
@@ -234,7 +235,7 @@ Four states, and only one transition a machine cannot make.
 | **Research** — hypotheses, variants, gates | the factory | yes, continuously |
 | **Proved** — `validated`/`champion` plus a live-shadow marker | the gates and live ingestion | yes, on evidence |
 | **Trial** — trading the same Alpaca paper account, with outcomes scoped to its authorizing shadow proof | automatic | yes: a trial below its floor is parked and its failure becomes a lesson |
-| **Pinned** — an id you wrote into `config.yaml` | **you only** | **no.** Guards still run and still report; they raise an alert and leave it in place |
+| **Pinned** — an id you wrote into `config.yaml` | **you only** | **yes, on a hard rolling-R, drift, or trial stop; the pin context is retained and no replacement is auto-selected** |
 
 Promotion is the one step that is never automatic. When an edge clears its
 trial, `research.py edge promotable` names the variant, shows what it actually
@@ -253,12 +254,14 @@ returned on the book, and prints the exact configuration block:
       "note": "live paper: 34 trades over 21 sessions, total R 6.40" } ] } }
 ```
 
-Paste it, restart the trader, and that edge is frozen: pinning exempts it from
-automatic demotion, from trial parking, and from every other lane that would
-otherwise move it. Pinning selects, it never authorizes — a pinned entry still
-has to resolve to a proved ledger record with a re-verified passing proof, so
-an id in a file cannot put an unproved variant on the book. A pin that cannot
-resolve is reported rather than silently substituted.
+Paste it, restart the trader, and the pin records the operator's selected
+identity and promotion context. Pinning does not exempt the edge from the
+rolling-R guard, sequential drift stop, or trial review: a breach still parks
+or demotes it and runtime selection fails closed, with the pin context retained
+for audit. Pinning selects, it never authorizes — a pinned entry still has to
+resolve to a proved ledger record with a re-verified passing proof, so an id in
+a file cannot put an unproved variant on the book. A pin that cannot resolve is
+reported rather than silently substituted.
 
 Manual `edge promote` and offline replay cannot manufacture the live-shadow
 marker. A legacy `validated` or `champion` row without that marker may be
@@ -363,9 +366,12 @@ proof reports, and the execution journal.
 The Compose `shadow` service reads the recorder corpus and EdgeLedger read-only,
 has no broker credentials, and writes only its isolated shadow WAL.
 It evaluates eligible candidates in isolated virtual books from recorder events,
-creates exact-session candidate/root-baseline/randomized-null replays, and
-quarantines mismatch/incomplete rows. It compares semantic runtime-shadow
-signatures with factory/IBR replay and has no order or broker authority.
+creates exact-session candidate, paired synthetic root-control, and
+randomized-null replays, and quarantines mismatch/incomplete rows. The paired
+root-control arm consumes the same events in its own virtual book; it is shadow
+evidence, not an EdgeLedger lifecycle record. It compares semantic
+runtime-shadow signatures with factory/IBR replay and has no order or broker
+authority.
 Verified gate envelopes also retain per-arm candidate, baseline, and null counts,
 fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. A denser or sparser quote corpus can therefore
@@ -468,9 +474,13 @@ missing or unreadable.
 ./.venv/bin/python deploy/backfill.py --days 180
 ```
 
-Backfill writes the same partitions, `as_of` semantics, and index the recorder
-writes, so no gate is weakened; options are not backfilled and still need
-recorded sessions. The shipped default universe is eight liquid ETFs (`SPY`,
+Backfill writes the recorder's normalized partitions and index, but labels each
+partition `source_mode: historical_backfill` and retains exact Alpaca calendar
+open/close metadata (including early closes). Its fetch-time `observed_at` is
+not backdated. Historical rows may be inspected only through the explicit
+diagnostic replay policy and are marked `diagnostic_historical_backfill`; they
+are never authorizing evidence or a live-shadow authorization. Options are not
+backfilled and still need recorded sessions. The shipped default universe is eight liquid ETFs (`SPY`,
 `QQQ`, `IWM`, `DIA`, `XLF`, `XLK`, `XLE`, `XLV`), which improves opportunity
 capacity, but real signal rates still require sufficient history. Floor
 feasibility fails closed when the 100-trade held-out floor cannot be met;
@@ -485,15 +495,17 @@ evidence gate, not a startup error.
 Backtest/factory evidence requires 100 trades plus 30 complete sessions/clusters;
 sealed qualification requires 100 trades plus 30 complete sessions/clusters;
 and the parity-matched shadow tail requires 150 trades plus 30 complete
-sessions. Replay epoch 4 retains the epoch-3 economics gates and additionally
-requires latest-of-event/as-of/observed-at point-in-time availability,
-executable-row-only authorizing statistics, vehicle-specific cost
-selection/provenance, raw confirmatory p-values for FDR, and a stressed-cost
-runtime abstention boundary. Runs from older replay epochs remain auditable but
-are quarantined and cannot validate or authorize the trader until replayed under
-epoch 4. Authorization requires exact equality with current epoch 4; future
-epochs are audit-only too. Each current-epoch run seals one immutable verified
-gate proof, and re-derivation appends a new proof rather than rewriting history.
+sessions. Replay epoch 5 retains the epoch-4 point-in-time, executable-row,
+vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries, and additionally
+seals paired synthetic root-control shadow decisions/replays, diagnostic-only
+historical-backfill provenance with exact calendar metadata, durable live-shadow
+FDR allocation binding, chronological paired inference, finite BH input
+validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
+readable for audit but cannot validate, champion, or authorize the trader; they
+must be re-derived under epoch 5. Authorization requires exact equality with
+current epoch 5, while future epochs are audit-only. Each current-epoch run
+seals one immutable verified gate proof, and re-derivation appends a new proof
+rather than rewriting history.
 
 For Docker or an Azure VM, follow [SETUP.md](SETUP.md). For backups,
 reconciliation, session-close checks, and recovery, follow

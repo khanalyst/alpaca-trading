@@ -239,13 +239,17 @@ corpus from Alpaca's historical bars instead:
 python deploy/backfill.py --days 180
 ```
 
-It writes the same normalized rows, the same one-partition-per-session layout,
-and the same sidecar index the recorder writes, so research cannot distinguish
-a backfilled session from a recorded one and no gate is weakened. Only
-*completed* sessions are written, `as_of` is the bar's completed one-minute
-boundary exactly as the recorder records it, and the run is resumable: sessions that already have a
-partition are skipped, so re-running is a no-op and an interrupted run
-continues. `--overwrite` replaces existing partitions, `--quotes` also
+It writes recorder-shaped normalized rows, one partition per session, and the
+same sidecar index, but marks each partition `source_mode: historical_backfill`
+and stores exact Alpaca open/close calendar metadata, including early closes.
+The fetch-time `observed_at` is retained rather than backdated. Only an explicit
+diagnostic replay policy may inspect these rows at provider `as_of`; resulting
+`diagnostic_historical_backfill` evidence is excluded from authorizing statistics
+and cannot authorize a proof. Only *completed* sessions are written, `as_of` is
+the bar's completed one-minute boundary exactly as the recorder records it, and
+the run is resumable: sessions that already have a partition are skipped, so
+re-running is a no-op and an interrupted run continues. `--overwrite` replaces
+existing partitions, `--quotes` also
 backfills quotes (far larger, and rarely needed because replay prices boundary
 fills from bars and charges the modelled half-spread when a quote is absent).
 
@@ -313,13 +317,14 @@ on the dashboard that "Pinned promotions" lists your entry and that "Pinned but
 NOT trading" is absent — a pin that cannot resolve trades nothing rather than
 substituting something else.
 
-**What changes once an edge is pinned.** It is frozen. The rolling-R guard, the
-sequential drift test, and the trial review all still run and still record what
-they find, but they raise a `guard_alert` and leave the edge in place instead of
-demoting it. You are told; nothing acts. Removing a pinned edge is an edit to
-`config.yaml` and a restart — the same route in and out. Runtime risk limits
-(daily loss limit, open risk, position caps) are unaffected: those are safety,
-not lifecycle, and they still stop trading.
+**What changes once an edge is pinned.** The pin records the operator-selected
+identity and promotion context; it does not disable lifecycle stops. The
+rolling-R guard, sequential drift test, and trial review still run, and a
+breach parks or demotes the edge so runtime selection fails closed. The pin
+context remains in the transition/audit record. Removing a pinned edge is an
+edit to `config.yaml` and a restart — the same route in and out. Runtime risk
+limits (daily loss limit, open risk, position caps) are unaffected: those are
+safety, not lifecycle, and they still stop trading.
 
 **Live.** `mode: live` accepts `selection_mode: pinned` with exactly one entry,
 or the older `selection_mode: specific`. Everything in
@@ -451,17 +456,18 @@ backtest/factory evidence, 100 trades plus 30 complete sessions/clusters for
 the sealed qualification window, and 150 trades plus 30 complete sessions for
 the parity-matched live-shadow tail. Retirement then requires the same powered
 floors, a 95% clustered upper-bound rejection of a 0.05R minimum useful edge,
-and at least two negative forward windows for every point. Replay epoch 4
-retains the epoch-3 economics gates and additionally requires latest-of-
-event/as-of/observed-at point-in-time availability, executable-row-only
-authorizing statistics, vehicle-specific cost selection/provenance, raw
-confirmatory p-values for FDR, and a stressed-cost runtime abstention boundary.
-Evidence from older epochs is retained for audit but quarantined until replayed
-under epoch 4. Authorization requires exact epoch equality with current epoch 4;
-future epochs are audit-only too. Each current-epoch run seals one immutable
-verified gate proof, and re-derivation appends a new proof instead of rewriting
-history. A valid bounded LLM replacement is registered first when that lane is
-enabled. Demoted candidates
+and at least two negative forward windows for every point. Replay epoch 5
+retains epoch-4 point-in-time, executable-row, vehicle-cost, raw-confirmatory-p,
+and stressed-cost boundaries, and additionally seals paired synthetic
+root-control shadow decisions/replays, diagnostic historical-backfill provenance
+with exact calendar metadata, durable live-shadow FDR binding, chronological
+paired inference, finite BH input validation, and conservative broker-tick
+equity rounding. Epoch-4 evidence remains readable for audit but is quarantined
+and cannot authorize until re-derived under epoch 5. Authorization requires
+exact epoch equality with current epoch 5; future epochs are audit-only too.
+Each current-epoch run seals one immutable verified gate proof, and re-derivation
+appends a new proof instead of rewriting history. A valid bounded LLM replacement
+is registered first when that lane is enabled. Demoted candidates
 may re-prove on a newer shadow run. Paper
 outcomes are appended for forward monitoring, scoped to their authorizing proof epoch, and may demote a
 deployed edge. Only the broker-free ShadowRunner plus research-side `edge
@@ -499,8 +505,8 @@ The broker-free lane is part of the plain Compose startup: `docker compose up -d
 starts `shadow-init` and `shadow` alongside research. ShadowRunner reads
 recorder events and eligible ledger candidates, evaluates
 each candidate in its own virtual book, and writes only its isolated SQLite WAL.
-For each complete session it records candidate, exact root-baseline, and
-randomized-entry-null replays; mismatch or incomplete rows remain quarantined
+For each complete session it records candidate, paired synthetic root-control,
+and randomized-entry-null replays; mismatch or incomplete rows remain quarantined
 and are not gate input. The service has no broker credentials and cannot mutate
 orders, broker state, runtime state, or the EdgeLedger.
 
@@ -511,11 +517,14 @@ accepts only strictly newer,
 complete, parity-matched rows with prior qualification and matching
 source/config/code/provenance/replay/gate hashes; family and global BH plus
 durable online-FDR are applied before an immutable `lane=shadow` proof and
-live-ingestion marker are appended. The v4 ingester first splits the tail into
+live-ingestion marker are appended. The unchanged `shadow-confirmation-v4`
+ingester first splits the tail into
 older chronological selection sessions and a newer disjoint confirmatory
 window: BH uses selection raw p-values, while only the selected candidate's raw
 confirmatory p-value is sent to LORD. Legacy same-tail v3 rows remain auditable
-but quarantined. The confirmatory p-value resolution scales
+but quarantined. Epoch-5 verification also binds the proof to the durable FDR
+allocation (scope/test id, p-value, alpha, allocation, and decision). The
+confirmatory p-value resolution scales
 to the next allocation; if the bounded simulation cap cannot resolve it, the
 ingester reports `confirmatory_resolution_exhausted` without spending alpha or
 advancing a boundary. A failed/mismatched/incomplete tail likewise leaves the

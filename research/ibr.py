@@ -20,8 +20,9 @@ from .costs import (BAR, QUOTE, CostError, CostModel, ReplayPolicy,
 
 RUNTIME_MAX_MARKET_DATA_AGE_SECONDS = 30.0
 from .market_data import (OptionSnapshot, QuoteSnapshot, UnderlyingBar,
-                          option_has_liquidity, record_available_at,
-                          record_is_available)
+                          historical_backfill_record, option_has_liquidity,
+                          replay_available_at, replay_open_is_available,
+                          replay_record_is_available)
 
 
 class ReplayError(ValueError):
@@ -148,6 +149,9 @@ class IBRTrade:
     # decision boundary separately so runtime/shadow comparisons do not
     # silently pretend the signal was known at bar close.
     decision_timestamp: datetime | None = None
+    # Set only when an explicit diagnostic policy consumed historical
+    # backfill at provider-as-of time.  Authorization rejects this marker.
+    evidence_mode: str = "forward_observed"
 
 
 @dataclass(frozen=True)
@@ -233,9 +237,31 @@ def _session_start(day: date, cfg: IBRConfig, zone: ZoneInfo) -> datetime:
     return datetime.combine(day, cfg.session_open, tzinfo=zone)
 
 
-def _visible(record: object, event_time: datetime) -> bool:
+def _available(record: object, policy: ReplayPolicy) -> datetime | None:
+    return replay_available_at(
+        record,
+        allow_historical_backfill_diagnostics=(
+            policy.allow_historical_backfill_diagnostics),
+    )
+
+
+def _visible(record: object, event_time: datetime,
+             policy: ReplayPolicy) -> bool:
     """A value is usable only when its source was available by that instant."""
-    return record_is_available(record, event_time)
+    return replay_record_is_available(
+        record, event_time,
+        allow_historical_backfill_diagnostics=(
+            policy.allow_historical_backfill_diagnostics),
+    )
+
+
+def _open_visible(record: object, event_time: datetime,
+                  policy: ReplayPolicy) -> bool:
+    return replay_open_is_available(
+        record, event_time,
+        allow_historical_backfill_diagnostics=(
+            policy.allow_historical_backfill_diagnostics),
+    )
 
 
 def _validate_bars(bars: Sequence[UnderlyingBar], cfg: IBRConfig) -> list[UnderlyingBar]:
@@ -340,6 +366,13 @@ def _trade_from_exit(*, vehicle: str, symbol: str, day: date, direction: str,
         decision_timestamp=decision_timestamp,
         underlying_entry=(float(underlying_entry)
                           if underlying_entry is not None else None),
+        evidence_mode=(
+            "diagnostic_historical_backfill"
+            if cfg.policy.allow_historical_backfill_diagnostics and any(
+                historical_backfill_record(item)
+                for item in (signal, entry_bar, exit_bar))
+            else "forward_observed"
+        ),
     )
 
 
@@ -392,7 +425,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     range_bars = [b for b in bars if b.identity.session_date == day
                   and start <= _local(b.timestamp, zone) < range_end
                   and b.end <= range_end
-                  and record_available_at(b) is not None]
+                  and _available(b, cfg.policy) is not None]
     # A complete range is mandatory.  Missing bars must not make an apparent
     # edge by shrinking the range.
     expected = cfg.range_minutes
@@ -440,16 +473,16 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         # boundary.  If the signal was observed later, the causal entry can
         # move to the first complete bar at/after that observation instead of
         # manufacturing a fill from the stale next-bar OHLC.
-        signal_ready_values = [signal.end, *[record_available_at(item)
+        signal_ready_values = [signal.end, *[_available(item, cfg.policy)
                                for item in [*range_bars, signal]
-                               if record_available_at(item) is not None]]
+                               if _available(item, cfg.policy) is not None]]
         signal_ready = max(signal_ready_values, default=None)
         if signal_ready is None or signal_ready <= signal.end:
             return refuse("entry_bar_not_adjacent")
     else:
-        signal_ready_values = [signal.end, *[record_available_at(item)
+        signal_ready_values = [signal.end, *[_available(item, cfg.policy)
                                for item in [*range_bars, signal]
-                               if record_available_at(item) is not None]]
+                               if _available(item, cfg.policy) is not None]]
         signal_ready = max(signal_ready_values, default=None)
         if signal_ready is None:
             return refuse("breakout_not_visible")
@@ -487,7 +520,8 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     # close.  Only a boundary-visible bar may supply its opening print;
     # strict quote-backed execution can instead use the quote as the boundary
     # underlying anchor without consuming delayed OHLC.
-    entry_bar_visible = _visible(entry_bar, entry_bar.timestamp)
+    entry_bar_visible = _open_visible(
+        entry_bar, entry_bar.timestamp, cfg.policy)
     underlying_entry = float(entry_bar.open) if entry_bar_visible else None
     entry_ref = underlying_entry
     entry_source = BAR
@@ -530,7 +564,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         wanted_right = "call" if direction == "long" else "put"
         eligible = [s for s in option_snapshots.values()
                     if s.timestamp <= entry_at
-                    and _visible(s, entry_at)
+                    and _visible(s, entry_at, option_policy)
                     and s.session_date == day and s.ask > 0 and s.bid > 0
                     and entry_at.timestamp() - s.timestamp.timestamp() <=
                         option_policy.max_market_data_age_seconds
@@ -610,7 +644,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
         eligible_exits = [s for s in option_snapshots.values()
                           if selected_contract is not None
                           and s.contract == selected_contract
-                          and s.timestamp <= cutoff and _visible(s, cutoff)
+                          and s.timestamp <= cutoff and _visible(s, cutoff, cfg.policy)
                           and s.session_date == day and s.bid > 0
                           and cutoff.timestamp() - s.timestamp.timestamp() <=
                               cfg.policy.max_market_data_age_seconds
@@ -655,7 +689,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
     for bar in hold:
         if _local(bar.timestamp, zone) >= close_at:
             break
-        if record_available_at(bar) is None:
+        if _available(bar, cfg.policy) is None:
             # A completed post-entry candle may be observed after its market
             # end.  It is still valid resting-order outcome evidence once the
             # full record exists; only the pre-entry bar is excluded above.
@@ -731,7 +765,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
                                     planned_risk_per_unit=distance)
     # Force-flat at the last completed bar before the configured close.
     boundary = next((b for b in hold if _local(b.timestamp, zone) >= close_at
-                     and _visible(b, b.timestamp)), None)
+                     and _open_visible(b, b.timestamp, cfg.policy)), None)
     exit_source = BAR
     if boundary is not None:
         last = boundary
@@ -739,7 +773,7 @@ def _replay_session(bars: Sequence[UnderlyingBar], *, vehicle: str, symbol: str,
             last.open, last.timestamp)
     else:
         candidates = [b for b in hold if b.end <= close_at and
-                      record_available_at(b) is not None]
+                      _available(b, cfg.policy) is not None]
         if not candidates:
             return refuse("no_visible_bar_before_force_flat")
         last = candidates[-1]

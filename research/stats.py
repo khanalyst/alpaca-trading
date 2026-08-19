@@ -769,7 +769,25 @@ def paired_cluster_sign_flip(
 
 def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
     """Control false discoveries across one preregistered candidate family."""
-    ordered = sorted(pvalues.items(), key=lambda item: float(item[1]))
+    try:
+        nominal = float(alpha)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("alpha must be a finite probability in (0,1]") from exc
+    if not math.isfinite(nominal) or not 0.0 < nominal <= 1.0:
+        raise ValueError("alpha must be a finite probability in (0,1]")
+    clean: dict[str, float] = {}
+    for name, raw in pvalues.items():
+        if isinstance(raw, bool):
+            raise ValueError(f"p-value for {name!r} must be a finite probability")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"p-value for {name!r} must be a finite probability") from exc
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"p-value for {name!r} must be in [0,1]")
+        clean[str(name)] = value
+    ordered = sorted(clean.items(), key=lambda item: item[1])
     total = len(ordered)
     if not total:
         return {}
@@ -780,8 +798,8 @@ def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
         running = min(running, min(1.0, float(raw) * total / (index + 1)))
         adjusted[name] = running
     return {
-        name: {"p": float(pvalues[name]), "p_adjusted": adjusted[name],
-               "significant": adjusted[name] <= alpha,
+        name: {"p": clean[str(name)], "p_adjusted": adjusted[str(name)],
+               "significant": adjusted[str(name)] <= nominal,
                "family_size": total}
         for name in pvalues
     }

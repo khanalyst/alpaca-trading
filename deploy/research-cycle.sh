@@ -325,12 +325,14 @@ validated_input="$normalized_input"
 # fields. Production config fails closed on missing/malformed metadata or
 # extended-hours rows.
 set +e
-calendar_view_status="$($python_bin - "$validated_input" "$dataset" "$recorded_root" "$agent_config" "$dataset_from_recorder" <<'PY'
+calendar_view_status="$($python_bin - "$validated_input" "$dataset" "$recorded_root" "$agent_config" "$dataset_from_recorder" "$repo_root" <<'PY'
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
 from zoneinfo import ZoneInfo
+sys.path.insert(0, sys.argv[6])
+from deploy.research_dataset import apply_partition_source
 
 view, source, recorded_root, config_path = map(Path, sys.argv[1:5])
 from_recorder = sys.argv[5] == "1"
@@ -362,12 +364,16 @@ if not sidecar.is_file() and source != Path("-") and from_recorder:
     if candidate.is_file():
         sidecar = candidate
 calendar = None
+partition_sources = None
 if sidecar.is_file():
     try:
         payload = json.loads(sidecar.read_text(encoding="utf-8"))
         calendar = payload.get("session_calendar") if isinstance(payload, dict) else None
         if not isinstance(calendar, dict):
             calendar = None
+        partition_sources = payload.get("partition_sources") if isinstance(payload, dict) else None
+        if not isinstance(partition_sources, dict):
+            partition_sources = None
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         calendar = None
 def boundaries(item, day, number):
@@ -401,6 +407,8 @@ with view.open(encoding="utf-8") as source_file, temporary.open("w", encoding="u
         stamp = parse(item.get("timestamp"))
         if stamp is not None:
             day = stamp.astimezone(ny).date().isoformat()
+            apply_partition_source(
+                item, day, partition_sources, row_number=number)
             opened, closed = boundaries(item, day, number)
             if opened is not None and not opened <= stamp < closed:
                 raise ValueError(f"row {number} is outside exact broker session {day}")

@@ -14,6 +14,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from deploy.backfill import (
@@ -21,9 +22,11 @@ from deploy.backfill import (
     completed_sessions, last_completed_session,
 )
 from deploy.recorder import (
-    _load_index, _scan_corpus, corpus_partitions, iter_corpus_rows,
+    _load_index, _partition_path, _scan_corpus, corpus_partitions,
+    iter_corpus_rows,
 )
 from deploy.recorder_market import FIELDS
+from deploy.research_dataset import apply_partition_source
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -34,12 +37,13 @@ class FakeProvider:
     data_feed = "iex"
 
     def __init__(self, *, bars_per_session=390, holidays=(), quotes=False,
-                 stray_day=False, naive=False):
+                 stray_day=False, naive=False, early_closes=None):
         self.bars_per_session = bars_per_session
         self.holidays = {date.fromisoformat(day) for day in holidays}
         self.serve_quotes = quotes
         self.stray_day = stray_day
         self.naive = naive
+        self.early_closes = dict(early_closes or {})
         self.bar_windows = []
         self.quote_windows = []
         self.calendar_calls = 0
@@ -50,7 +54,9 @@ class FakeProvider:
         while cursor <= end:
             if cursor.weekday() < 5 and cursor not in self.holidays:
                 rows.append({"date": cursor.isoformat(),
-                             "open": "09:30", "close": "16:00"})
+                             "open": "09:30",
+                             "close": self.early_closes.get(
+                                 cursor.isoformat(), "16:00")})
             cursor += timedelta(days=1)
         return rows
 
@@ -107,6 +113,16 @@ class SessionBoundaryTests(unittest.TestCase):
                                       date(2026, 3, 19))
         self.assertEqual(sessions, [date(2026, 3, 13), date(2026, 3, 16),
                                     date(2026, 3, 18), date(2026, 3, 19)])
+
+    def test_malformed_calendar_row_fails_closed(self):
+        class MalformedCalendar(FakeProvider):
+            def calendar(self, start=None, end=None):
+                return [{"date": "not-a-date", "open": "09:30",
+                         "close": "16:00"}]
+
+        with self.assertRaisesRegex(BackfillError, "calendar row 1 is invalid"):
+            completed_sessions(
+                MalformedCalendar(), date(2026, 3, 13), date(2026, 3, 19))
 
     def test_an_unavailable_calendar_refuses_rather_than_guessing(self):
         class NoCalendar:
@@ -179,6 +195,57 @@ class CorpusEquivalenceTests(unittest.TestCase):
                 self.assertEqual(row["event_type"], "bar_1m")
                 self.assertEqual(row["provider"], "alpaca")
                 self.assertEqual(row["feed"], "iex")
+                self.assertEqual(
+                    datetime.fromisoformat(row["observed_at"]), FRIDAY_EVENING)
+
+    def test_exact_calendar_sidecar_preserves_an_early_close(self):
+        provider = FakeProvider(
+            bars_per_session=390,
+            early_closes={"2026-03-19": "13:00"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = _corpus(directory)
+            backfill(provider, ["SPY"], output, days=3,
+                     now=FRIDAY_EVENING)
+            index = _load_index(output)
+            early = index["session_calendar"]["2026-03-19"]
+            self.assertEqual(
+                datetime.fromisoformat(early["close"]).astimezone(NEW_YORK).time(),
+                time(13, 0),
+            )
+            self.assertEqual(early["source"], "alpaca_calendar")
+            partition = _partition_path(output, date(2026, 3, 19))
+            with partition.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 210)
+            self.assertEqual(
+                index["partition_sources"][partition.name]["source_mode"],
+                "historical_backfill",
+            )
+            observed = rows[0]["observed_at"]
+            view = apply_partition_source(
+                dict(rows[0]), "2026-03-19", index["partition_sources"],
+                row_number=1,
+            )
+            self.assertEqual(view["source_mode"], "historical_backfill")
+            self.assertEqual(view["observed_at"], observed)
+
+    def test_partition_provenance_survives_crash_before_index_rewrite(self):
+        provider = FakeProvider(bars_per_session=3)
+        with tempfile.TemporaryDirectory() as directory:
+            output = _corpus(directory)
+            with patch("deploy.backfill._save_index",
+                       side_effect=RuntimeError("simulated index crash")):
+                with self.assertRaisesRegex(RuntimeError, "index crash"):
+                    backfill(provider, ["SPY"], output, days=2,
+                             now=FRIDAY_EVENING)
+            rebuilt = _scan_corpus(output)
+            self.assertTrue(rebuilt["partition_sources"])
+            self.assertEqual(
+                {item["source_mode"]
+                 for item in rebuilt["partition_sources"].values()},
+                {"historical_backfill"},
+            )
 
     def test_research_normalization_accepts_every_backfilled_row(self):
         from research.market_data import normalize_underlying_bar

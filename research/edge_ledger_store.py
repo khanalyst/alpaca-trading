@@ -39,15 +39,17 @@ SCHEMA_VERSION = 3
 # runs.  Runs are stamped at ``append_run``; a run with no stamp is epoch 1.
 # Epoch 3 additionally enforced economics gates (the 30 bps stop floor,
 # recomputable round-trip risk-unit coverage, quote-only proof quality, and
-# adequately powered qualification evidence).  Epoch 4 changes material
+# adequately powered qualification evidence).  Epoch 4 changed material
 # replay semantics again: point-in-time availability is bounded by the latest
 # of event timestamp, source ``as_of``, and ``observed_at``; authorizing
 # statistics exclude non-executable fallback rows; vehicle-specific cost
 # selection/provenance and raw-p FDR accounting are persisted; and runtime
 # assumptions include a stressed-cost abstention boundary.  Existing rows
-# remain readable and are quarantined by eligibility checks until replayed
-# under this generation.
-REPLAY_ENGINE_EPOCH = 4
+# remain readable and are quarantined by eligibility checks until replayed.
+# Epoch 5 additionally seals the real paired-control shadow path, distinguishes
+# historical backfill as non-authorizing diagnostic evidence, binds live-shadow
+# authorization to durable FDR state, and fixes chronological paired inference.
+REPLAY_ENGINE_EPOCH = 5
 PAPER_DEMOTION_MIN_OUTCOMES = 20
 PAPER_DEMOTION_R_FLOOR = -2.0
 
@@ -201,6 +203,21 @@ def init_ledger(path: str | Path = DEFAULT_DB_PATH) -> dict:
             CREATE INDEX IF NOT EXISTS events_candidate ON events(candidate_id, created_at);
             CREATE UNIQUE INDEX IF NOT EXISTS evidence_verified_gate_run
                 ON evidence(run_id) WHERE kind='verified_gate';
+            -- Shadow-ingestion attestations are an authorization boundary and
+            -- must be one-per-run even when two consumers race between their
+            -- read/check and INSERT.  A trigger is used instead of a unique
+            -- index so ledgers that already contain duplicate legacy markers
+            -- remain readable; the authorization verifier can quarantine
+            -- those rows while all new writes are rejected atomically.
+            CREATE TRIGGER IF NOT EXISTS evidence_one_shadow_ingestion_per_run
+                BEFORE INSERT ON evidence
+                WHEN NEW.kind='shadow_ingestion' AND EXISTS(
+                    SELECT 1 FROM evidence
+                    WHERE run_id=NEW.run_id AND kind='shadow_ingestion'
+                )
+            BEGIN
+                SELECT RAISE(ABORT, 'run already has immutable shadow ingestion evidence');
+            END;
             CREATE TRIGGER IF NOT EXISTS candidates_no_update BEFORE UPDATE ON candidates BEGIN
                 SELECT RAISE(ABORT, 'candidates are immutable');
             END;

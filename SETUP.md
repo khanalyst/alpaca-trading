@@ -46,7 +46,7 @@ fed and readable so that silence is informative rather than worrying.
 | Day 1 + first research cycle | Hypotheses seeded, variants tested, most fail. Trader still idle. |
 | Weeks 1–8 | Families are tried, retired, replaced. Reports get interesting. Trader still idle. |
 | First live-shadow-validated edge | Trader begins placing paper trades under risk limits. |
-| Ongoing | Proved edges are frozen; slots keep searching for new ones forever. |
+| Ongoing | Proved rules are not re-tuned; lifecycle and safety guards still monitor them while slots keep searching. |
 
 **Without a historical backfill this takes months** — the recorder only samples
 forward in real time. Step 10 fixes that and is the single biggest thing you
@@ -378,10 +378,14 @@ docker compose run --rm trader python main.py flatten --reason paper-smoke-recov
 This is the step that turns "months before anything happens" into "days".
 
 The recorder only samples forward in real time, so a fresh install has no
-history. Backfill fetches completed sessions from Alpaca and writes them into
-exactly the same corpus format the recorder uses — same fields, same
-per-session partitions, same index — so research cannot tell the difference and
-no evidence gate is weakened.
+history. Backfill fetches completed sessions from Alpaca and writes the
+recorder-shaped fields, partitions, and index, while tagging each partition
+`source_mode: historical_backfill` and recording exact Alpaca open/close
+calendar metadata (including early closes). Its fetch-time `observed_at` is
+retained, not backdated. Backfill is historical diagnostic evidence: only the
+explicit diagnostic replay policy may inspect it, and rows marked
+`diagnostic_historical_backfill` never enter authorizing statistics or authorize
+a live proof.
 
 ```bash
 docker compose run --rm recorder python deploy/backfill.py --days 180
@@ -558,8 +562,10 @@ docker compose run --rm research \
 
 ShadowRunner has no broker credentials or mutation path. It evaluates eligible
 candidates in isolated virtual books from recorder events, writes only its WAL,
-and records candidate/root-baseline/randomized-null exact-session replays.
-Mismatch or incomplete rows are quarantined. Ingestion opens that WAL
+and records candidate, paired synthetic root-control, and randomized-null
+exact-session replays. A tuned rule descendant's synthetic root-control arm
+consumes the same events in its own virtual book and remains outside EdgeLedger
+lifecycle state. Mismatch or incomplete rows are quarantined. Ingestion opens that WAL
 read-only, requires strictly newer sessions, prior qualification, complete
 parity, and matching source/config/code/provenance/replay/gate hashes; family
 and global BH plus durable online FDR must pass before an immutable live marker
@@ -570,9 +576,11 @@ Gate envelopes retain per-arm candidate, baseline, and randomized-null counts,
 fill sources, quote ages, gross/cost/net economics, matched and dropped keys,
 and directional/pair coverage. Quote density can change null/control evidence
 even when the candidate count is unchanged.
-Epoch-4 ingestion uses independent chronological selection and confirmatory
-windows: BH uses selection p-values, only the selected candidate's raw
-confirmatory p reaches LORD, and same-tail v3 scopes remain audit-only.
+The unchanged `shadow-confirmation-v4` ingestion scope uses independent
+chronological selection and confirmatory windows: BH uses selection p-values,
+only the selected candidate's raw confirmatory p reaches LORD, and same-tail v3
+scopes remain audit-only. Epoch-5 verification binds the live proof to the
+durable FDR allocation rather than trusting caller-supplied fields.
 
 Authorizing fill quality is point-in-time and provenance-bound: required records
 become actionable at the maximum of event timestamp, `as_of`, and `observed_at`.
@@ -636,14 +644,15 @@ negative rolling-forward windows. Until then the report says `underpowered` or
 
 Live shadow requires at least 150 trades across 30 complete, parity-matched
 sessions. A separate paper trial is reviewed only after its configured 100
-trades across 30 sessions. Replay epoch 4 retains the epoch-3 economics gates
-and additionally requires latest-of-event/as-of/observed-at point-in-time
-availability, executable-row-only authorizing statistics, vehicle-specific cost
-selection/provenance, raw confirmatory p-values for FDR, and a stressed-cost
-runtime abstention boundary; older-epoch evidence is quarantined until
-replayed. Exact equality with current epoch 4 is required; future epochs are
-audit-only too. Each current-epoch run seals one immutable verified gate proof,
-and re-derivation appends a new proof instead of rewriting history. These defaults make
+trades across 30 sessions. Replay epoch 5 retains epoch-4 boundaries and also
+seals paired synthetic root-control shadow replays, diagnostic historical-
+backfill provenance with exact calendar metadata, durable live-shadow FDR
+binding, chronological paired inference, finite BH input validation, and
+conservative broker-tick equity rounding. Epoch-4 evidence remains audit-readable
+but cannot authorize and must be re-derived under epoch 5. Exact equality with
+current epoch 5 is required; future epochs are audit-only too. Each current-epoch
+run seals one immutable verified gate proof, and re-derivation appends a new
+proof instead of rewriting history. These defaults make
 rejection and deployment decisions span market sessions rather than a handful
 of fills.
 

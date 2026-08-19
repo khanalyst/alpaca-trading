@@ -96,6 +96,10 @@ class ReplayPolicy:
     require_exact_calendar: bool = False
     force_flat_minutes_before_close: int | None = None
     reject_new_entries_minutes_before_close: int | None = None
+    # This flag is intentionally absent from runtime config.  It permits only
+    # labelled historical-backfill records to use their provider ``as_of``
+    # boundary for mechanics diagnostics; resulting rows are non-authorizing.
+    allow_historical_backfill_diagnostics: bool = False
 
     def __post_init__(self) -> None:
         age = float(self.max_market_data_age_seconds)
@@ -122,6 +126,9 @@ class ReplayPolicy:
             raise CostError("strict_market_data must be true or false")
         if not isinstance(self.require_exact_calendar, bool):
             raise CostError("require_exact_calendar must be true or false")
+        if not isinstance(self.allow_historical_backfill_diagnostics, bool):
+            raise CostError(
+                "allow_historical_backfill_diagnostics must be true or false")
         for name in ("force_flat_minutes_before_close",
                      "reject_new_entries_minutes_before_close"):
             value = getattr(self, name)
@@ -149,6 +156,8 @@ class ReplayPolicy:
             "require_exact_calendar": self.require_exact_calendar,
             "force_flat_minutes_before_close": self.force_flat_minutes_before_close,
             "reject_new_entries_minutes_before_close": self.reject_new_entries_minutes_before_close,
+            "allow_historical_backfill_diagnostics": (
+                self.allow_historical_backfill_diagnostics),
         }
 
     @classmethod
@@ -305,7 +314,22 @@ def replay_policy_for_mode(policy: ReplayPolicy, mode: str, *,
     if not isinstance(backtest_bar_fallback, bool):
         raise CostError("backtest_bar_fallback must be true or false")
     strict = lane == "shadow" or not (lane == "backtest" and backtest_bar_fallback)
-    return replace(policy, strict_market_data=strict)
+    return replace(
+        policy, strict_market_data=strict,
+        allow_historical_backfill_diagnostics=False,
+    )
+
+
+def diagnostic_backfill_policy(
+        policy: ReplayPolicy | None = None) -> ReplayPolicy:
+    """Return the explicit bars-capable, non-authorizing backfill policy."""
+    base = ReplayPolicy() if policy is None else policy
+    if not isinstance(base, ReplayPolicy):
+        raise CostError("policy must be a ReplayPolicy")
+    return replace(
+        base, strict_market_data=False,
+        allow_historical_backfill_diagnostics=True,
+    )
 
 
 def _strict_market_data(execution: Mapping) -> bool:
@@ -1148,7 +1172,7 @@ __all__ = [
     "DEFAULT_SPREAD_BPS", "QUOTE",
     "RUNTIME_MAX_SLIPPAGE_BPS", "RUNTIME_MAX_SPREAD_BPS",
     "COST_STRESS_SCENARIOS_BPS", "STRESSED_COST_SCHEMA", "STRESSED_COST_BASIS",
-    "ReplayPolicy",
+    "ReplayPolicy", "diagnostic_backfill_policy",
     "replay_policy_for_mode", "replay_policy_for_session",
     "replay_policy_for_bars", "derive_session_replay_policy",
     "cost_model_for_vehicle", "stressed_cost_usd", "stress_cost_usd",

@@ -285,6 +285,22 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                   control["mean_delta_lcb"] is not None and
                   control["mean_delta_lcb"] > 0),
               "walk_forward_majority_positive": bool(walk["majority_positive"])}
+    fdr_record = None
+    if lane == "shadow":
+        factory = FactoryLedger(ledger.path)
+        test_id = f"{candidate_id}:shadow"
+        state = factory.fdr_state("shadow-confirmation-v4:equity")
+        fdr_record = next((
+            {**item, "tests": index}
+            for index, item in enumerate(state["decisions"], start=1)
+            if item["test_id"] == test_id
+        ), None)
+        if fdr_record is None:
+            fdr_record = (factory.record_fdr_decision(
+                "shadow-confirmation-v4:equity", test_id,
+                control["p_value"], alpha=.05) if record else
+                factory.next_fdr_allocation(
+                    "shadow-confirmation-v4:equity", alpha=.05))
     envelope = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_baseline=fit_baseline, heldout_baseline=baseline,
@@ -319,7 +335,10 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                                        (.02 if passes else 1.0)),
                     "global_q_value": (selection_p_value if lane == "shadow" else
                                        (.02 if passes else 1.0)),
-                    "allocated_alpha": .05,
+                    "allocated_alpha": (fdr_record["allocated_alpha"]
+                                        if fdr_record is not None else .05),
+                    "alpha": .05,
+                    "tests": (fdr_record["tests"] if fdr_record is not None else 1),
                     "decision": passes,
                     "required": True, "tested": True,
                     "p_value_kind": "raw_confirmatory",
@@ -394,6 +413,7 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
                 "rows_digest": edge_ledger.content_hash(heldout),
                 "baseline_rows_digest": edge_ledger.content_hash(baseline),
                 "null_rows_digest": edge_ledger.content_hash(baseline),
+                "test_id": f"{candidate_id}:shadow",
                 "p_value_source": "live_shadow_confirmatory_gate",
                 "raw_p_value": control["p_value"],
             },
@@ -426,13 +446,16 @@ def _persist_gate(ledger: EdgeLedger, candidate_id: str, lane: str, *,
     if record:
         ledger.record_verified_gate(run["run_id"], envelope)
         if live_source is not None:
-            ledger.append_evidence(
-                candidate_id, "shadow_ingestion",
+            ledger.record_shadow_ingestion(
+                candidate_id,
                 {"schema": "shadow-ingest.v1", "candidate_id": candidate_id,
                  "vehicle": "equity", "source": live_source,
                  "replay_digests": [item["replay_digest"]
                                     for item in live_source["sessions"]],
-                 "run_provenance": hashes,
+                 "run_provenance": {**hashes, "candidate_id": candidate_id},
+                 "candidate_proof": {key: candidate.get(key) for key in (
+                     "candidate_id", "dataset_hash", "config_hash", "code_hash",
+                     "provenance_hash")},
                  "gate_hash": envelope["content_hash"]},
                 run_id=run["run_id"])
     return run, envelope

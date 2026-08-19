@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from research import edge_discovery_core, gates
 from research.edge_ledger import EdgeLedger
+from research.edge_ledger_store import content_hash
 from research.live_shadow import ShadowStore
 from research.factory_ledger import FactoryLedger
 from research.live_shadow_ingest import (
@@ -162,6 +163,14 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "shadow_ingestion" for item in evidence))
         self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 8)
 
+    def test_generic_evidence_api_cannot_append_shadow_authorization_marker(self):
+        cid = self.candidate["candidate_id"]
+        run = self.ledger.append_run(cid, lane="shadow", vehicle="equity",
+                                     metrics={})
+        with self.assertRaisesRegex(ValueError, "validated recording path"):
+            self.ledger.append_evidence(cid, "shadow_ingestion", {},
+                                        run_id=run["run_id"])
+
     def test_same_tail_or_tampered_window_digest_cannot_authorize(self):
         cid, run_id = self._seed_live_run()
         run = self.ledger.run(run_id)
@@ -276,6 +285,59 @@ class LiveShadowIngestTests(unittest.TestCase):
         self.assertEqual(online["tests"], 1)
         self.assertEqual(online["test_iterations"], 30_000)
         self.assertTrue(self.ledger.eligibility(cid)["eligible"])
+
+    def test_crash_after_first_trade_resumes_partial_run(self):
+        """A run bound is not consumed until its missing rows/evidence finish."""
+        cid = self.candidate["candidate_id"]
+        self._rows(cid, [2.0] * 8)
+        self._rows(self.baseline["candidate_id"], [0.0] * 8)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 8)
+        config = ShadowIngestConfig(self.edge_path, self.shadow_path,
+                                    min_trades=1, min_sessions=1)
+        original_append_trade = EdgeLedger.append_trade
+        calls = {"count": 0}
+
+        def append_then_crash(ledger, run_id, trade, *, trade_id=None):
+            result = original_append_trade(ledger, run_id, trade, trade_id=trade_id)
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("simulated crash after first trade")
+            return result
+
+        with patch.object(EdgeLedger, "append_trade", new=append_then_crash):
+            with self.assertRaisesRegex(RuntimeError, "after first trade"):
+                ingest_shadow(config)
+        self.assertEqual(len(self.ledger.runs(cid, lane="shadow")), 1)
+        self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 1)
+        result = ingest_shadow(config)
+        self.assertEqual(result["ingested"], 1, result)
+        self.assertEqual(result["candidates"][0]["status"], "ingested")
+        self.assertEqual(len(self.ledger.trades(cid, lane="shadow")), 8)
+        self.assertEqual(self.ledger.candidate(cid)["status"], "validated")
+
+    def test_epoch5_reproof_same_tail_coexists_with_epoch4_run(self):
+        cid = self.candidate["candidate_id"]
+        self._rows(cid, [2.0] * 8)
+        self._rows(self.baseline["candidate_id"], [0.0] * 8)
+        self._rows(f"shadow:null:{cid}", [-1.0] * 8)
+        config = ShadowIngestConfig(self.edge_path, self.shadow_path,
+                                    min_trades=1, min_sessions=1)
+        # Keep the legacy run fully durable under its own verifier epoch, then
+        # prove the exact same tail after the replay engine advances.
+        with patch("research.edge_ledger.REPLAY_ENGINE_EPOCH", 4), \
+                patch("research.edge_ledger_store.REPLAY_ENGINE_EPOCH", 4), \
+                patch("research.live_shadow_ingest.REPLAY_ENGINE_EPOCH", 4):
+            first = ingest_shadow(config)
+        self.assertEqual(first["ingested"], 1, first)
+        first_run = self.ledger.runs(cid, lane="shadow")[0]
+        self.assertEqual(first_run["metrics"]["replay_engine_epoch"], 4)
+
+        second = ingest_shadow(config)
+        self.assertEqual(second["ingested"], 1, second)
+        runs = self.ledger.runs(cid, lane="shadow")
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[-1]["metrics"]["replay_engine_epoch"], 5)
+        self.assertNotEqual(runs[0]["run_id"], runs[1]["run_id"])
 
     def test_online_fdr_records_raw_p_not_selected_global_q(self):
         cid = self.candidate["candidate_id"]
@@ -394,11 +456,53 @@ class LiveShadowIngestTests(unittest.TestCase):
                        (json.dumps(payload, sort_keys=True, separators=(",", ":")), row[0]))
         self.assertFalse(self.ledger.eligibility(cid)["eligible"])
 
+    def test_live_authorization_fails_closed_on_marker_candidate_proof_tamper(self):
+        cid, run_id = self._seed_live_run()
+        with sqlite3.connect(self.edge_path) as db:
+            row = db.execute("""SELECT evidence_id,payload_json FROM evidence
+                WHERE run_id=? AND kind='shadow_ingestion'""", (run_id,)).fetchone()
+            payload = json.loads(row[1])
+            payload["candidate_proof"]["dataset_hash"] = "tampered"
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            db.execute("DROP TRIGGER evidence_no_update")
+            db.execute("UPDATE evidence SET payload_json=?,evidence_hash=? "
+                       "WHERE evidence_id=?", (encoded, content_hash(payload), row[0]))
+        self.assertFalse(self.ledger.eligibility(cid)["eligible"])
+
+    def test_live_authorization_rejects_duplicate_legacy_markers(self):
+        cid, run_id = self._seed_live_run()
+        with sqlite3.connect(self.edge_path) as db:
+            row = db.execute(
+                "SELECT candidate_id,payload_json,evidence_hash FROM evidence "
+                "WHERE run_id=? AND kind='shadow_ingestion'", (run_id,)).fetchone()
+            self.assertIsNotNone(row)
+            # Simulate a pre-trigger ledger containing a duplicate marker.  A
+            # current writer cannot create this state, but authorization must
+            # still quarantine legacy ambiguity rather than selecting one row.
+            db.execute("DROP TRIGGER evidence_one_shadow_ingestion_per_run")
+            db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id,candidate_id,run_id,kind,payload_json,evidence_hash,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("legacy-duplicate-marker", row[0], run_id, "shadow_ingestion",
+                 row[1], row[2], 0.0))
+        self.assertFalse(self.ledger.eligibility(cid)["eligible"])
+
     def test_live_authorization_fails_closed_on_config_digest_tamper(self):
         cid, run_id = self._seed_live_run()
         with sqlite3.connect(self.edge_path) as db:
             db.execute("DROP TRIGGER runs_no_update")
             db.execute("UPDATE runs SET config_hash=? WHERE run_id=?", ("tampered", run_id))
+        self.assertFalse(self.ledger.eligibility(cid)["eligible"])
+
+    def test_live_authorization_fails_closed_when_durable_fdr_is_tampered(self):
+        cid, run_id = self._seed_live_run()
+        with sqlite3.connect(self.edge_path) as db:
+            db.execute("DROP TRIGGER factory_fdr_no_update")
+            db.execute(
+                "UPDATE factory_fdr SET allocated_alpha=? "
+                "WHERE scope=? AND test_id=(SELECT json_extract(metrics_json, '$.gate.verified_gate.online_fdr.test_id') "
+                "FROM runs WHERE run_id=?)", (0.5, "shadow-confirmation-v4:equity", run_id))
         self.assertFalse(self.ledger.eligibility(cid)["eligible"])
 
     def test_manual_offline_promotion_is_rejected_without_live_marker(self):

@@ -19,6 +19,25 @@ from agent.contracts.rule import validate_rule_spec
 
 
 PROOF_SCHEMA = "research-proof.v1"
+
+
+def _contains_diagnostic_backfill(value: Any) -> bool:
+    """Return whether persisted proof input contains diagnostic backfill."""
+    if isinstance(value, Mapping):
+        if (str(value.get("evidence_mode") or "").strip().lower() ==
+                "diagnostic_historical_backfill"):
+            return True
+        reasons = value.get("reasons")
+        if isinstance(reasons, Mapping):
+            count = reasons.get("diagnostic_historical_backfill")
+            if (isinstance(count, (int, float)) and
+                    not isinstance(count, bool) and count > 0):
+                return True
+        return any(_contains_diagnostic_backfill(item)
+                   for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_diagnostic_backfill(item) for item in value)
+    return False
 SESSION_ZONE = "America/New_York"
 _HASH_FIELDS = ("dataset_hash", "config_hash", "code_hash", "provenance_hash")
 _FORBIDDEN = {"source", "code", "raw_response", "response", "html", "api_key",
@@ -437,6 +456,11 @@ def build_proof_payload(ledger: Any, candidate_id: str,
         if not evidence or not any(str(item.get("kind") or "") == "verified_gate"
                                    for item in evidence):
             raise ValueError("proof requires evidence from the authorized verified shadow run")
+        if (_contains_diagnostic_backfill(run.get("metrics")) or
+                _contains_diagnostic_backfill(evidence) or
+                _contains_diagnostic_backfill(trades)):
+            raise ValueError(
+                "diagnostic historical backfill cannot emit an authorized proof")
     evidence_latest = _latest(evidence)
     vehicle = str(context.get("vehicle") or candidate.get("vehicle") or run.get("vehicle") or "")
     if vehicle not in {"equity", "option"}:

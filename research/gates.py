@@ -12,7 +12,7 @@ analysis instead of re-hashing a recorded conclusion.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from statistics import mean
@@ -131,6 +131,9 @@ def _authorization_exclusion_reason(row: Mapping[str, Any], *, vehicle: str,
     ``strict=True``; the first explicit fill field therefore opts a cohort
     into the same strict quality contract as :func:`fill_source_summary`.
     """
+    if (str(row.get("evidence_mode") or "").strip().lower() ==
+            "diagnostic_historical_backfill"):
+        return "diagnostic_historical_backfill"
     if row.get("no_trade") is True:
         return "no_trade"
     if row.get("vehicle", vehicle) != vehicle:
@@ -625,20 +628,36 @@ def matched_pairs(candidate: Iterable[Mapping], baseline: Iterable[Mapping], *,
     """Return the matched candidate-minus-baseline deltas and their clusters."""
     left = _unique_by_match_key(candidate, vehicle)
     right = _unique_by_match_key(baseline, vehicle)
-    keys: list[str] = []
-    deltas: list[float] = []
-    clusters: list[int] = []
-    stamps: list[float] = []
-    for index, key in enumerate(sorted(left)):
+    matched: list[tuple[float | None, str, Mapping, Mapping]] = []
+    for key in sorted(left):
         other = right.get(key)
         if other is None:
             continue
         row = left[key]
         stamp = row.get("entry_timestamp") or row.get("session_date")
         try:
-            timestamp = datetime.fromisoformat(
-                str(stamp).replace("Z", "+00:00")).timestamp()
+            parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            # Legacy diagnostic rows may carry a naive timestamp.  Never let
+            # the host timezone alter cluster order; interpret that legacy
+            # representation deterministically as UTC.  Authorizing market
+            # rows are normalized with explicit offsets before reaching here.
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            timestamp = parsed.timestamp()
         except (TypeError, ValueError):
+            timestamp = None
+        matched.append((timestamp, key, row, other))
+    # Moving-block inference is meaningful only in market chronology.  Match
+    # keys are symbol-major (vehicle:symbol:session) and therefore cannot be
+    # used as the resampling order when a family spans multiple symbols.
+    matched.sort(key=lambda item: (
+        item[0] is None, item[0] if item[0] is not None else 0.0, item[1]))
+    keys: list[str] = []
+    deltas: list[float] = []
+    clusters: list[int] = []
+    stamps: list[float] = []
+    for index, (timestamp, key, row, other) in enumerate(matched):
+        if timestamp is None:
             timestamp = float(index * CLUSTER_SECONDS)
         keys.append(key)
         stamps.append(timestamp)

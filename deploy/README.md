@@ -83,6 +83,13 @@ to make those observations fail closed for explicitly governed feeds. The
 recorder refuses to change equity feeds inside an existing corpus because event
 identity and per-symbol continuity must not cross feed provenance.
 
+On-demand historical backfill uses that exact calendar, including early-close
+open/close bounds, labels written partitions `source_mode: historical_backfill`,
+and retains the truthful fetch-time `observed_at`. It is diagnostic historical
+evidence only: an explicit diagnostic replay policy may inspect provider-
+`as_of` visibility, but `diagnostic_historical_backfill` rows are excluded from
+authorizing statistics and cannot authorize a proof or live deployment.
+
 The plain supported startup includes research: `docker compose up -d` starts
 the scheduled research service in the default startup. `deploy/research-cycle.sh`
 discovers and routes the corpus automatically, concatenating partitions in
@@ -115,16 +122,17 @@ inference uses a deterministic seeded moving-block day/session-cluster
 bootstrap.
 
 Research qualification requires at least 100 trades, 30 complete sessions, and
-30 session-level clusters. Epoch 4 retains the epoch-3 economics gates and
-additionally requires latest-of-event/as-of/observed-at point-in-time
-availability, executable-row-only authorizing statistics, vehicle-specific cost
-selection/provenance, raw confirmatory p-values for FDR, and a stressed-cost
-runtime abstention boundary. Evidence from replay generations older than epoch
-4 is quarantined for audit and cannot validate, champion, or authorize the paper
-trader until it is replayed under epoch 4. Authorization requires exact equality
-with current epoch 4; future generations are audit-only too. A current-epoch
-run seals one immutable verified gate proof, and re-derivation appends a new
-proof instead of rewriting history.
+30 session-level clusters. Epoch 5 retains epoch-4 point-in-time,
+executable-row, vehicle-cost, raw-confirmatory-p, and stressed-cost boundaries,
+and additionally seals paired synthetic root-control shadow decisions/replays,
+diagnostic historical-backfill provenance with exact calendar metadata, durable
+live-shadow FDR binding, chronological paired inference, finite BH input
+validation, and conservative broker-tick equity rounding. Epoch-4 proofs remain
+readable for audit but cannot validate, champion, or authorize the paper trader;
+they must be re-derived under epoch 5. Authorization requires exact equality
+with current epoch 5; future generations are audit-only too. A current-epoch run
+seals one immutable verified gate proof, and re-derivation appends a new proof
+instead of rewriting history.
 
 The plain supported startup also includes the broker-free shadow lane:
 `docker compose up -d` runs the short-lived `shadow-init` service to repair the
@@ -132,7 +140,8 @@ ownership of the persistent WAL directory, then starts ShadowRunner as UID/GID
 10001. It mounts the recorder corpus and EdgeLedger read-only, has no broker
 credentials, and writes only `/app/shadow/shadow.sqlite3` (SQLite WAL). It
 evaluates eligible candidates in isolated virtual books from recorder events,
-creates exact-session candidate/root-baseline/randomized-null replays, and
+creates exact-session candidate, paired synthetic root-control, and
+randomized-null replays, and
 quarantines mismatch/incomplete rows. Virtual opens use the deterministic
 runtime signal/setup/risk path; completed sessions compare semantic shadow
 signatures with factory/IBR replay. The lane cannot submit orders or mutate
@@ -260,10 +269,11 @@ ingest-shadow` opens the shadow WAL read-only, requires strictly newer complete
 parity-matched rows, prior qualification, source/config/code/provenance/replay/
 gate hashes, family/global BH plus durable online FDR, then appends the
 immutable `lane=shadow` proof and live marker. Underpowered, mismatched, or
-incomplete shadow data advances no boundary and is reconsidered. Confirmatory
-v4 ingestion splits each tail into older chronological selection sessions and a
-newer disjoint confirmatory window; BH uses selection raw p-values, while only
-the selected candidate's raw confirmatory p-value reaches LORD. Same-tail v3
+incomplete shadow data advances no boundary and is reconsidered. The unchanged
+`shadow-confirmation-v4` ingestion scope splits each tail into older
+chronological selection sessions and a newer disjoint confirmatory window; BH
+uses selection raw p-values, while only the selected candidate's raw
+confirmatory p-value reaches LORD. Same-tail v3
 rows remain auditable but quarantined. Simulation resolution scales to the next
 online allocation and stops without spending at its bounded cap. Legacy
 validated/champion rows without the marker can be evaluated/migrated but remain

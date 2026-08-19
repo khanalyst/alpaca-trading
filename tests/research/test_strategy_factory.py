@@ -200,6 +200,9 @@ def persist_rule_gate(ledger, candidate_id, lane):
             "selection_raw_p_value": control["p_value"],
             "confirmatory_raw_p_value": control["p_value"],
         })
+    fdr_record = (FactoryLedger(ledger.path).record_fdr_decision(
+        "shadow-confirmation-v4:equity", f"{candidate_id}:shadow",
+        control["p_value"], alpha=.05) if lane == "shadow" else None)
     gate = verified_gate_envelope(
         lane=lane, vehicle="equity", fit=fit, heldout=heldout,
         fit_baseline=fit_baseline, heldout_baseline=baseline,
@@ -230,7 +233,11 @@ def persist_rule_gate(ledger, candidate_id, lane):
                     "selection_raw_p_value": control["p_value"],
                     "confirmatory_raw_p_value": control["p_value"],
                     "family_q_value": control["p_value"], "global_q_value": control["p_value"],
-                    "allocated_alpha": .05, "decision": True,
+                    "allocated_alpha": (fdr_record["allocated_alpha"]
+                                        if fdr_record is not None else .05),
+                    "alpha": .05,
+                    "tests": (fdr_record["tests"] if fdr_record is not None else 1),
+                    "decision": True,
                     "required": True, "tested": True,
                     "p_value_kind": "raw_confirmatory",
                     "p_value_source": "live_shadow_confirmatory_gate",
@@ -319,6 +326,7 @@ def persist_rule_gate(ledger, candidate_id, lane):
                                              "rows_digest": content_hash(heldout),
                                              "baseline_rows_digest": content_hash(baseline),
                                              "null_rows_digest": content_hash(baseline),
+                                             "test_id": f"{candidate_id}:shadow",
                                              "p_value_source": "live_shadow_confirmatory_gate",
                                              "raw_p_value": control["p_value"],
                                          },
@@ -337,12 +345,16 @@ def persist_rule_gate(ledger, candidate_id, lane):
     ledger.record_verified_gate(run["run_id"], gate)
     if lane == "shadow":
         source = ledger.run(run["run_id"])["metrics"]["shadow_source"]
-        ledger.append_evidence(
-            candidate_id, "shadow_ingestion",
+        ledger.record_shadow_ingestion(
+            candidate_id,
             {"schema": "shadow-ingest.v1", "candidate_id": candidate_id,
              "vehicle": "equity", "source": source,
              "replay_digests": [item["replay_digest"] for item in source["sessions"]],
-             "run_provenance": hashes,
+             "run_provenance": {**hashes, "candidate_id": candidate_id},
+             "candidate_proof": {key: ledger.candidate(candidate_id).get(key)
+                                 for key in ("candidate_id", "dataset_hash",
+                                             "config_hash", "code_hash",
+                                             "provenance_hash")},
              "gate_hash": gate["content_hash"]}, run_id=run["run_id"])
 
 
@@ -574,6 +586,16 @@ class StrategyFactoryTests(unittest.TestCase):
         self.assertEqual(len({item.hypothesis_id for item in hypotheses}), 11)
         with self.assertRaisesRegex(FactoryError, "between 1 and 11"):
             initial_hypotheses(12)
+
+    def test_generation_budget_must_be_positive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                    FactoryError, "max_generations must be at least 1"):
+                run_factory(
+                    losing_breakouts(), db_path=Path(directory) / "edge.sqlite3",
+                    strategies=1, variants_per_strategy=2, workers=1,
+                    min_trades=1, min_sessions=1, alpha=1.0,
+                    max_generations=0)
 
     def test_diagnosis_drives_bounded_mutations(self):
         root = initial_hypotheses(1)[0].rule_spec

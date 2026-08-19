@@ -14,7 +14,7 @@ process:
 | Process | Authority | Durable output |
 | --- | --- | --- |
 | Recorder | Read-only Alpaca market-data collection | Mixed bars, quotes, and option snapshots, one partition per session date under `runtime/research/recorded/sessions` |
-| Backfill | Read-only historical bar acquisition, run on demand | The same partitions and sidecar index the recorder writes |
+| Backfill | Read-only historical bar acquisition, run on demand | Recorder-shaped partitions tagged as diagnostic historical evidence, plus exact calendar/source sidecar metadata |
 | Research | Offline simulation, evidence gates, and candidate lifecycle | Edge/factory SQLite ledgers and content-addressed proof artifacts |
 | Trader | Authenticated account reads and order/position mutation | Mode-scoped runtime state, operational journal, events, and heartbeat |
 | Watchdog | Cancel and flatten only, never entries | Its own health status file |
@@ -75,8 +75,10 @@ a substitute for single-owner deployment.
 The optional `shadow` Compose profile mounts the recorder corpus and EdgeLedger
 read-only, has no broker credentials, and writes only its separate WAL database.
 It evaluates eligible candidates in isolated virtual books from recorder events,
-creates exact-session candidate/root-baseline/randomized-null replays, and
-quarantines mismatch/incomplete rows. It uses the same deterministic
+creates exact-session candidate, paired synthetic root-control, and
+randomized-null replays, and quarantines mismatch/incomplete rows. A tuned rule
+descendant's root-control arm consumes the same event stream in its own virtual
+book and remains outside EdgeLedger lifecycle state. It uses the same deterministic
 signal/setup/risk path and compares semantic signatures with factory/IBR replay;
 it has no order, broker, or runtime-state mutation path.
 
@@ -385,18 +387,20 @@ plan.
 ### Corpus acquisition
 
 `deploy/recorder.py` samples forward in real time. `deploy/backfill.py` fills
-the same corpus from Alpaca's historical bars so a new deployment is not months
-away from its first proof. It writes the recorder's exact normalized fields,
-`event_key`, session-partition layout, and sidecar index, and rebuilds that
-index with the recorder's own scan — which is also the validator, so a repeated
-key or malformed row fails at write time rather than downstream. Three
-boundaries keep the result trustworthy: only completed sessions are written, so
-the recorder's continuity check never meets a mid-session hole; `as_of` is the
-bar's completed one-minute boundary, while delayed observations are handled at
-their actionable availability time without backfilling an earlier entry; and options are never
-fabricated, because their quote-age semantics cannot be
-reconstructed from a historical endpoint. Backfill is resumable — a session
-with an existing partition is skipped — so re-running is a no-op.
+the same corpus shape from Alpaca's historical bars so a new deployment is not
+months away from its first diagnostic replay. It writes the recorder's exact
+normalized fields, `event_key`, session-partition layout, and sidecar index, and
+tags each written partition `source_mode: historical_backfill`. The sidecar
+retains exact Alpaca open/close metadata (including early closes), and the
+fetch-time `observed_at` is never backdated. Three boundaries keep the result
+trustworthy: only completed sessions are written, so the recorder's continuity
+check never meets a mid-session hole; diagnostic replay may use provider
+`as_of` visibility only under its explicit non-authorizing policy, without
+backfilling an earlier entry; and options are never fabricated, because their
+quote-age semantics cannot be reconstructed from a historical endpoint.
+Backfill is resumable — a session with an existing partition is skipped — so
+re-running is a no-op. Historical rows are excluded from authorizing statistics
+and cannot authorize a proof.
 
 Corpus length is not the only cold-start constraint. `_simulate_trade` takes at
 most one trade per symbol-session, so the held-out trade floor is a function of
@@ -547,16 +551,20 @@ history. The base allocation is `alpha / (n(n+1))`; each prior discovery starts
 the same telescoping reward stream. This preserves an infinite testing horizon
 without allowing offline candidate churn to exhaust it.
 
-Live-shadow ingestion splits each complete tail into older chronological
-selection sessions and a newer disjoint confirmatory window. BH selection uses
-only the former; the selected candidate is recomputed on the latter and only
-that raw confirmatory p-value is sent to LORD. Same-tail v3 evidence remains
-auditable but is quarantined under replay epoch 4. The current
-`REPLAY_ENGINE_EPOCH` is 4: older runs remain readable for audit, cannot validate
-or authorize runtime, and must be re-derived under epoch 4 to become eligible;
-future epochs are quarantined by the same exact-equality check. A current-epoch
-run seals one immutable verified gate proof; re-derivation appends a new proof
-instead of rewriting the old run.
+The unchanged `shadow-confirmation-v4` scope splits each complete tail into older
+chronological selection sessions and a newer disjoint confirmatory window. BH
+selection uses only the former; the selected candidate is recomputed on the
+latter and only that raw confirmatory p-value is sent to LORD. Same-tail v3
+evidence remains auditable but cannot authorize under epoch 5. The current
+`REPLAY_ENGINE_EPOCH` is 5: epoch 5 also seals paired synthetic root-control
+shadow decisions/replays, diagnostic historical-backfill provenance with exact
+calendar metadata, chronological paired inference, finite BH input validation,
+conservative equity tick rounding, and a live-shadow proof binding to durable
+FDR state. Epoch-4 runs remain readable for audit but cannot validate or
+authorize runtime and must be re-derived under epoch 5; future epochs are
+quarantined by the same exact-equality check. A current-epoch run seals one
+immutable verified gate proof; re-derivation appends a new proof instead of
+rewriting the old run.
 
 `research.edge_ledger_store` owns the SQLite schema and hashing primitives.
 `research.edge_ledger_proof` owns verified-gate persistence and re-verification.
@@ -692,9 +700,11 @@ silently trading nothing. `agent.edge.resolve_pinned_variants` resolves them
 through the same `_eligible` gate every other path uses — pinning selects, it
 never authorizes — and `unresolved_promotions` reports any pin that cannot
 trade, because a promotion that quietly resolves to nothing is the failure
-worth surfacing. A pinned candidate is frozen: `ingest_paper_outcome(frozen=
-True)` evaluates the guards exactly as before and appends a `guard_alert`
-event instead of transitioning, and `review_trials` skips it entirely.
+worth surfacing. A pinned candidate remains subject to hard lifecycle stops:
+`ingest_paper_outcome` evaluates rolling-R and drift guards, and
+`review_trials` still judges the trial. A breach parks or demotes the candidate,
+carrying the operator's promotion fields as audit context; the pin does not
+bypass safety or cause a silent replacement.
 
 The scheduled cycle reviews trials *before* discovery and tuning, so a trial
 that just closed below its floor is already a lesson by the time this cycle

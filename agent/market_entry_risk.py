@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Mapping
 
 from . import state
@@ -21,6 +21,89 @@ from .execution_lifecycle import _plain, _value
 from .instruments import validate_equity_symbol
 
 log = logging.getLogger("engine")
+
+
+def _equity_price_increment(price: Decimal) -> Decimal:
+    """Return Alpaca's equity sub-penny increment for one price."""
+    return Decimal("0.01") if price >= Decimal("1") else Decimal("0.0001")
+
+
+def _quantize_equity_price(value: Any, *, rounding: str) -> Decimal:
+    price = Decimal(str(value))
+    if not price.is_finite() or price <= 0:
+        raise ValueError("equity order price must be finite and positive")
+    rounded = price.quantize(_equity_price_increment(price), rounding=rounding)
+    # A sub-dollar price can cross the $1 boundary when rounded upward.  Its
+    # resulting broker-bound representation must then obey the two-decimal
+    # increment required at or above $1 rather than retaining four decimals.
+    if price < Decimal("1") <= rounded:
+        rounded = rounded.quantize(Decimal("0.01"), rounding=rounding)
+    return rounded
+
+
+def _quantize_equity_bracket(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Move bracket legs toward entry onto broker-valid equity price ticks.
+
+    Rounding toward entry is deliberately conservative: it cannot increase the
+    authored stop risk or overstate the attainable target.  Risk sizing then
+    consumes these exact broker-bound prices rather than a higher-precision
+    geometry the broker would reject or normalize differently.
+    """
+    out = dict(decision)
+    if out.get("stop_price") is None or out.get("target_price") is None:
+        return out
+    direction = str(out.get("direction") or "").lower()
+    try:
+        entry = Decimal(str(out.get("entry_price")))
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise ValueError("equity entry price is unavailable for tick rounding") from exc
+    if not entry.is_finite() or entry <= 0:
+        raise ValueError("equity entry price is unavailable for tick rounding")
+    if direction == "long":
+        stop = _quantize_equity_price(out["stop_price"], rounding=ROUND_CEILING)
+        target = _quantize_equity_price(out["target_price"], rounding=ROUND_FLOOR)
+        valid = stop < entry < target
+    elif direction == "short":
+        stop = _quantize_equity_price(out["stop_price"], rounding=ROUND_FLOOR)
+        target = _quantize_equity_price(out["target_price"], rounding=ROUND_CEILING)
+        valid = target < entry < stop
+    else:
+        raise ValueError("equity direction is unavailable for tick rounding")
+    if not valid:
+        raise ValueError("tick-rounded bracket legs do not straddle entry")
+    distance = abs(entry - stop)
+    out.update(stop_price=float(stop), target_price=float(target),
+               stop_distance=float(distance),
+               stop_loss_pct=float(distance / entry * Decimal("100")),
+               take_profit_pct=float(abs(target - entry) / entry * Decimal("100")))
+    return out
+
+
+def _equity_entry_reference(decision: Mapping[str, Any], row: Mapping[str, Any]) -> float | None:
+    """Return the current executable quote side or the authored fallback.
+
+    Some signal producers author absolute stop/target legs without repeating
+    an entry price.  Risk sizing has always allowed the market snapshot to
+    supply that price; tick rounding must use the same fail-closed runtime
+    evidence instead of rejecting the signal before risk vetting.
+    """
+    quote = row.get("quote") if isinstance(row, Mapping) else None
+    direction = str(decision.get("direction") or "").lower()
+    if isinstance(quote, Mapping) and direction in {"long", "short"}:
+        raw = (quote.get("ask", quote.get("ask_price")) if direction == "long" else
+               quote.get("bid", quote.get("bid_price")))
+        try:
+            rounded = _quantize_equity_price(
+                raw, rounding=(ROUND_CEILING if direction == "long" else ROUND_FLOOR))
+            return float(rounded)
+        except (TypeError, ValueError, ArithmeticError, OverflowError):
+            pass
+    authored = decision.get("entry_price")
+    try:
+        value = float(authored)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value == value and abs(value) != float("inf") and value > 0 else None
 
 
 class MarketEntryRiskMixin:
@@ -374,12 +457,28 @@ class MarketEntryRiskMixin:
             for position in positions))
         decision = dict(signal)
         decision["symbol"] = symbol
+        authored_entry_reference = self._number(decision.get("entry_price"))
+        if ("entry_price" in decision and decision.get("entry_price") is not None and
+                authored_entry_reference is None):
+            self._event("risk_reject", {
+                "symbol": symbol, "reason": "authored entry price is invalid"})
+            return None
         edge_cfg = cfg or self.cfg
         strategy = edge_cfg.get("strategy", {})
         profile = str(decision.get("execution_profile") or
                       strategy.get("execution_profile",
                                    strategy.get("execution_mode", "shares"))).lower()
         decision["execution_profile"] = "options" if profile in {"options", "option"} else "shares"
+        if decision["execution_profile"] == "shares":
+            try:
+                entry_reference = _equity_entry_reference(decision, row)
+                if entry_reference is not None:
+                    decision["entry_price"] = entry_reference
+                decision = _quantize_equity_bracket(decision)
+            except (ValueError, ArithmeticError) as exc:
+                self._event("execution_reject", {
+                    "symbol": symbol, "reason": str(exc)})
+                return None
         asset = self._assets.get(symbol.upper())
         if (decision["execution_profile"] == "shares" and
                 decision.get("direction") == "short" and asset is not None and
@@ -477,7 +576,12 @@ class MarketEntryRiskMixin:
         side = "buy" if signal.get("direction") == "long" else "sell"
         try:
             order_type, tif, limit = self._entry_execution(
-                side, row.get("quote", {}), plan.get("entry_price"))
+                side, row.get("quote", {}),
+                authored_entry_reference if authored_entry_reference is not None
+                else plan.get("entry_price"))
+            if limit is not None:
+                limit = _quantize_equity_price(
+                    limit, rounding=(ROUND_CEILING if side == "buy" else ROUND_FLOOR))
         except ValueError as exc:
             self._event("execution_reject", {"symbol": symbol, "reason": str(exc)})
             return None

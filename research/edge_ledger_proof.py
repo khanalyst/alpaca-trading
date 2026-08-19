@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from contextlib import closing
 import json
+import sqlite3
 from typing import Mapping
 import uuid
 
@@ -713,18 +714,22 @@ class EdgeLedgerProofMixin:
         if not isinstance(replay_digests, list) or replay_digests != expected_replays:
             return False
         with closing(_connect(self.path)) as db:
-            row = db.execute(
+            marker_rows = db.execute(
                 """SELECT payload_json,evidence_hash FROM evidence
                    WHERE candidate_id=? AND run_id=? AND kind='shadow_ingestion'
-                   ORDER BY created_at DESC,evidence_id DESC LIMIT 1""",
-                (run.get("candidate_id"), run.get("run_id"))).fetchone()
+                   ORDER BY created_at DESC,evidence_id DESC""",
+                (run.get("candidate_id"), run.get("run_id"))).fetchall()
             gate_row = db.execute(
                 """SELECT payload_json,evidence_hash FROM evidence
                    WHERE candidate_id=? AND run_id=? AND kind='verified_gate'
                    ORDER BY created_at DESC,evidence_id DESC LIMIT 1""",
                 (run.get("candidate_id"), run.get("run_id"))).fetchone()
-        if row is None or gate_row is None:
+        # The current writer prevents duplicates atomically.  Legacy duplicate
+        # markers are ambiguous authorization claims and remain audit-readable
+        # but cannot authorize.
+        if len(marker_rows) != 1 or gate_row is None:
             return False
+        row = marker_rows[0]
         try:
             payload = json.loads(row["payload_json"])
             gate_payload = json.loads(gate_row["payload_json"])
@@ -734,6 +739,16 @@ class EdgeLedgerProofMixin:
                 row["evidence_hash"] != content_hash(payload) or
                 not isinstance(gate_payload, Mapping) or
                 gate_row["evidence_hash"] != content_hash(gate_payload)):
+            return False
+        candidate = self.candidate(str(run.get("candidate_id") or ""))
+        candidate_proof = payload.get("candidate_proof")
+        expected_candidate_proof = ({key: candidate.get(key) for key in (
+            "candidate_id", "dataset_hash", "config_hash", "code_hash",
+            "provenance_hash")} if isinstance(candidate, Mapping) else None)
+        if (not isinstance(candidate_proof, Mapping) or
+                dict(candidate_proof) != expected_candidate_proof or
+                payload.get("candidate_id") != run.get("candidate_id") or
+                payload.get("vehicle") != run.get("vehicle")):
             return False
         evidence_source = payload.get("source")
         gate_hash = gate_payload.get("gate_hash")
@@ -747,6 +762,43 @@ class EdgeLedgerProofMixin:
                 online.get("decision") is not True or
                 online.get("scope") !=
                     f"shadow-confirmation-v4:{run.get('vehicle')}"):
+            return False
+        # The envelope's online-FDR fields are claims, not authority.  The
+        # ingester must have spent the exact immutable allocation recorded in
+        # the co-located factory ledger before this run can authorize.  This
+        # closes the former convention-only path where a caller could rewrite
+        # ``online_fdr`` and append a marker without consuming LORD state.
+        scope = f"shadow-confirmation-v4:{run.get('vehicle')}"
+        test_id = online.get("test_id")
+        confirmatory_test_id = confirmatory.get("test_id") if isinstance(
+            confirmatory, Mapping) else None
+        if (not isinstance(test_id, str) or not test_id or
+                confirmatory_test_id != test_id):
+            return False
+        try:
+            with closing(_connect(self.path)) as db:
+                fdr_rows = db.execute(
+                    "SELECT * FROM factory_fdr WHERE scope=? "
+                    "ORDER BY created_at,decision_id", (scope,)).fetchall()
+        except sqlite3.Error:
+            # A ledger without a factory-FDR table cannot authorize a live
+            # shadow proof; fail closed rather than leaking a schema error.
+            return False
+        matching = [
+            (index, row) for index, row in enumerate(fdr_rows, start=1)
+            if str(row["test_id"]) == test_id
+        ]
+        if len(matching) != 1:
+            return False
+        test_index, durable_fdr = matching[0]
+        if (online.get("tests") != test_index or
+                str(durable_fdr["scope"]) != scope or
+                str(durable_fdr["test_id"]) != test_id or
+                not _close(online.get("p_value"), durable_fdr["p_value"]) or
+                not _close(online.get("alpha"), durable_fdr["alpha"]) or
+                not _close(online.get("allocated_alpha"),
+                           durable_fdr["allocated_alpha"]) or
+                bool(online.get("decision")) is not bool(durable_fdr["decision"])):
             return False
         # Rebuild the adaptive selection statistic from persisted selection
         # rows.  Session/row digests are checked first, then the exact gate
@@ -892,6 +944,9 @@ class EdgeLedgerProofMixin:
             return False
         run_provenance = payload.get("run_provenance")
         if (not isinstance(run_provenance, Mapping) or
+                run_provenance.get("candidate_proof") != candidate_proof or
+                run_provenance.get("candidate_id") != run.get("candidate_id") or
+                run_provenance.get("vehicle") != run.get("vehicle") or
                 run_provenance.get("independent_confirmatory") is not True or
                 run_provenance.get("disjoint_sessions") is not True or
                 run_provenance.get("session_disjoint") is not True or

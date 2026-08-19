@@ -46,6 +46,43 @@ class FakeLedger:
 
 
 class ProofTests(unittest.TestCase):
+    def test_authorized_proof_refuses_diagnostic_historical_backfill(self):
+        class DiagnosticLedger(FakeLedger):
+            def runs(self, candidate_id):
+                run = super().runs(candidate_id)[0]
+                run["metrics"]["gate"]["authorization_projection"] = {
+                    "heldout": {"reasons": {
+                        "diagnostic_historical_backfill": 1,
+                    }},
+                }
+                return [run]
+
+            def evidence(self, candidate_id):
+                return [{
+                    "evidence_id": "gate-1", "run_id": "run-1",
+                    "kind": "verified_gate", "evidence_hash": "g" * 64,
+                    "payload": {
+                        "run_id": "run-1",
+                        "gate": {"passes": False,
+                                 "authorization_projection": {
+                                     "heldout": {"reasons": {
+                                         "diagnostic_historical_backfill": 1,
+                                     }}}},
+                    },
+                }]
+
+            def trades(self, candidate_id):
+                return [{"run_id": "run-1", "trade_id": "trade-1",
+                         "evidence_mode":
+                             "diagnostic_historical_backfill"}]
+
+        with self.assertRaisesRegex(
+                ValueError, "diagnostic historical backfill"):
+            build_proof_payload(
+                DiagnosticLedger(), "candidate-1",
+                {"authorized_run_id": "run-1"},
+            )
+
     def test_payload_helpers_are_reexported_without_wrappers(self):
         self.assertIs(canonical_json, proof_payload.canonical_json)
         self.assertIs(payload_hash, proof_payload.payload_hash)
