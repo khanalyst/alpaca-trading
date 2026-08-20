@@ -1731,6 +1731,61 @@ class DeployTests(unittest.TestCase):
             self.assertTrue(result["fresh"])
             self.assertEqual(result["series_files"], 0)
 
+    def test_recorder_health_surfaces_a_permanent_sip_entitlement_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "market.csv"
+            csv_path.write_text("event_key\n", encoding="utf-8")
+            index_path = root / ".recorder-index.json"
+            index_path.write_text(json.dumps({"data_feed": "sip"}),
+                                  encoding="utf-8")
+            status_path = root / ".recorder-status.json"
+            status_path.write_text(json.dumps({
+                "schema": "recorder-status.v1",
+                "status": "failed",
+                "updated_ts": 995,
+                "data_feed": "sip",
+                "failure_kind": "sip_entitlement_required",
+                "retryable": False,
+                "error": "subscription does not permit querying recent SIP data",
+            }), encoding="utf-8")
+            os.utime(csv_path, (995, 995))
+            os.utime(index_path, (995, 995))
+
+            result = health.recorder(root, max_age=300, now=1000)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["fresh"])
+            self.assertEqual(result["status"], "sip_entitlement_required")
+            self.assertEqual(result["failure_kind"],
+                             "sip_entitlement_required")
+            self.assertFalse(result["retryable"])
+            self.assertIn("recent SIP", result["last_error"])
+
+    def test_market_data_probe_does_not_mutate_the_corpus(self):
+        fake = _MarketFake()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "market.csv"
+
+            result = recorder.probe_market_data(
+                fake, ["SPY"], config={"universe": {"asset_classes": []}})
+
+            self.assertEqual(result["status"], "probe_ok")
+            self.assertEqual(result["data_feed"], "sip")
+            self.assertEqual(result["event_counts"],
+                             {"bar_1m": 1, "quote": 1})
+            self.assertFalse(output.exists())
+            self.assertFalse((root / "sessions").exists())
+
+    def test_subscription_error_is_classified_as_non_retryable(self):
+        kind, retryable = recorder._market_data_failure(
+            RuntimeError(
+                "subscription does not permit querying recent SIP data"),
+            data_feed="sip", options_feed="opra")
+        self.assertEqual(kind, "sip_entitlement_required")
+        self.assertFalse(retryable)
+
     def test_scheduler_accepts_paper_config_without_secret_loader(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.yaml"

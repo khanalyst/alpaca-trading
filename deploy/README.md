@@ -56,8 +56,19 @@ duplicate check is required:
 
 ```sh
 docker compose run --rm --no-deps recorder \
+  python deploy/recorder.py --out runtime/research/recorded --probe
+
+docker compose run --rm --no-deps recorder \
   python deploy/recorder.py --out runtime/research/recorded --audit
 ```
+
+The probe makes real recent SIP bar/quote requests (and OPRA requests when the
+configured universe records options) without appending corpus rows. A configured
+feed name is not an entitlement check. Deployment now stops before service
+replacement when the probe reports `sip_entitlement_required` or
+`opra_entitlement_required`. The recorder also persists its latest attempt in
+`.recorder-status.json`, so health and the dashboard distinguish a permanent
+subscription failure from an empty or temporarily stale corpus.
 
 Catch-up requests are split into `ALPACA_RECORDER_FETCH_WINDOW_MINUTES`
 windows (15 minutes by default), so a long outage cannot materialize the whole

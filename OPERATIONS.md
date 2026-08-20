@@ -663,7 +663,7 @@ organization controls.
 | --- | --- |
 | mode/endpoint guard failure | Restore the scoped paper or live guard, check the endpoint, and restart only after authenticated `main.py check`; live also needs `pattern_day_trader=true`. |
 | `market closed` or stale calendar | Do not force an entry; refresh the calendar and wait for the next regular session. |
-| Missing bars/quotes | Check the selected Alpaca feed entitlement and recorder health; mark the interval unavailable. |
+| Missing bars/quotes | Run the recorder `--probe`, inspect `failure_kind`/`last_error`, and verify the exact VM credentials have recent SIP (and, when enabled, OPRA) entitlement. `Up` is process liveness, not proof of successful writes; mark the interval unavailable. |
 | Option chain lacks a valid single-leg long contract | Skip the trade. Never substitute a multi-leg, uncovered, or short option. |
 | Position remains after close cutoff or startup cleanup | Stop new entries, cancel orders, flatten manually through the scoped Alpaca account, and keep the trader paused. |
 | Local/broker state differs | Broker state wins; preserve logs and reconcile before resuming. |

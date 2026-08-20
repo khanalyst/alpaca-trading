@@ -104,6 +104,8 @@ def _validate_dataset_row(row: dict) -> tuple[str, str, datetime]:
 NEW_YORK = ZoneInfo("America/New_York")
 INDEX_NAME = ".recorder-index.json"
 INDEX_SCHEMA = "recorder-index.v1"
+STATUS_NAME = ".recorder-status.json"
+STATUS_SCHEMA = "recorder-status.v1"
 PARTITION_DIR = "sessions"
 PARTITION_SOURCE_SCHEMA = "recorder-partition-source.v1"
 # The recorder only ever asks the provider for ``watermark - 1 minute`` onwards,
@@ -121,6 +123,42 @@ MAX_ERROR_BACKOFF_SECONDS = 15 * 60
 # name for callers that imported the old constant, but do not prune calendar
 # entries by age.
 SESSION_CALENDAR_RETENTION_DAYS = 90
+
+
+def _save_status(output: Path, payload: dict) -> dict:
+    """Atomically persist the latest recorder attempt without touching data."""
+    root = _corpus_root(output)
+    root.mkdir(parents=True, exist_ok=True)
+    value = {
+        "schema": STATUS_SCHEMA,
+        "updated_ts": time.time(),
+        **payload,
+    }
+    temporary = root / (STATUS_NAME + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, root / STATUS_NAME)
+    return value
+
+
+def _market_data_failure(exc: Exception, *, data_feed: str,
+                         options_feed: str) -> tuple[str, bool]:
+    """Classify permanent entitlement failures separately from outages."""
+    message = str(exc).strip().lower()
+    entitlement_markers = (
+        "subscription does not permit",
+        "not entitled",
+        "insufficient subscription",
+        "insufficient permission",
+        "forbidden",
+    )
+    if any(marker in message for marker in entitlement_markers):
+        selected = options_feed if any(
+            marker in message for marker in ("option", "opra")) else data_feed
+        return f"{selected}_entitlement_required", False
+    return "market_data_request_failed", True
 
 
 def _canonical_data_feed(value: object) -> str:
@@ -1053,11 +1091,52 @@ def record_once(provider: AlpacaProvider, symbols: list[str], output: Path,
     return total_unique
 
 
+def probe_market_data(provider: AlpacaProvider, symbols: list[str], *,
+                      config: dict | None = None,
+                      include_options: bool | None = None,
+                      now: datetime | None = None) -> dict:
+    """Prove configured recent-feed access without mutating the corpus."""
+    symbols = [validate_equity_symbol(symbol) for symbol in symbols]
+    if not symbols:
+        raise ValueError("at least one US equity symbol is required")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("market-data probe time must be timezone-aware")
+    current = current.astimezone(timezone.utc)
+    if include_options is None:
+        classes = (config or {}).get("universe", {}).get("asset_classes", [])
+        include_options = any(
+            str(value).lower() in {"us_option", "option"}
+            for value in classes)
+    data_feed = _resolved_feed(provider, None, config)
+    options_feed = _options_feed(config) if include_options else None
+    rows = list(_rows(
+        provider, symbols, current, feed=data_feed, config=config,
+        include_options=bool(include_options), option_limit=1,
+        start=current - timedelta(minutes=3), observed_at=current))
+    event_counts: dict[str, int] = {}
+    for row in rows:
+        event = str(row.get("event_type") or "unknown")
+        event_counts[event] = event_counts.get(event, 0) + 1
+    return {
+        "status": "probe_ok",
+        "probe": True,
+        "data_feed": data_feed,
+        "options_feed": options_feed,
+        "symbols": symbols,
+        "rows": len(rows),
+        "event_counts": event_counts,
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="record Alpaca paper market data")
     p.add_argument("--out", default="runtime/research/recorded")
     p.add_argument("--interval", type=float, default=60.0)
     p.add_argument("--once", action="store_true")
+    p.add_argument(
+        "--probe", action="store_true",
+        help="verify recent SIP/OPRA entitlement without writing corpus rows")
     p.add_argument("--audit", action="store_true",
                    help="validate the full corpus and detect duplicate keys")
     p.add_argument("--config", default="config.yaml")
@@ -1095,6 +1174,32 @@ def main(argv=None) -> int:
         os.getenv("ALPACA_RECORDER_OPTION_HOLD_MINUTES", "180"))))
     include_options = any(str(value).lower() in {"us_option", "option"}
                           for value in cfg.get("universe", {}).get("asset_classes", []))
+    data_feed = _resolved_feed(provider, None, cfg)
+    options_feed = _options_feed(cfg) if include_options else None
+    if args.probe:
+        try:
+            payload = probe_market_data(
+                provider, symbols, config=cfg, include_options=include_options)
+        except Exception as exc:
+            failure_kind, retryable = _market_data_failure(
+                exc, data_feed=data_feed,
+                options_feed=options_feed or "opra")
+            payload = _save_status(output, {
+                "status": "failed",
+                "probe": True,
+                "data_feed": data_feed,
+                "options_feed": options_feed,
+                "failure_kind": failure_kind,
+                "retryable": retryable,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
+            print(json.dumps(payload, sort_keys=True), file=sys.stderr,
+                  flush=True)
+            return 2
+        payload = _save_status(output, payload)
+        print(json.dumps(payload, sort_keys=True), flush=True)
+        return 0
     calendar = CalendarCache(provider)
     failure_count = 0
     while True:
@@ -1109,20 +1214,40 @@ def main(argv=None) -> int:
                 MAX_ERROR_BACKOFF_SECONDS,
                 max(args.interval, 1.0) * (2 ** min(failure_count - 1, 4)),
             )
+            failure_kind, retryable = _market_data_failure(
+                exc, data_feed=data_feed,
+                options_feed=options_feed or "opra")
             payload = {
                 "schema": "recorder-error.v1",
                 "status": "failed",
+                "probe": False,
+                "data_feed": data_feed,
+                "options_feed": options_feed,
+                "failure_kind": failure_kind,
+                "retryable": retryable,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "failure_count": failure_count,
                 "retry_seconds": delay,
             }
+            _save_status(output, payload)
             print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
             if args.once:
                 return 1
             time.sleep(delay)
             continue
         failure_count = 0
+        _save_status(output, {
+            "status": "recording",
+            "probe": False,
+            "data_feed": data_feed,
+            "options_feed": options_feed,
+            "rows": count,
+            "failure_kind": None,
+            "retryable": None,
+            "error_type": None,
+            "error": None,
+        })
         print(f"recorded {count} Alpaca rows to {output}", flush=True)
         if args.once:
             return 0

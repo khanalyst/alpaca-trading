@@ -38,6 +38,8 @@ fi
 
 "${compose[@]}" config --quiet
 "${compose[@]}" build trader
+"${compose[@]}" run --rm --no-deps recorder \
+  python deploy/recorder.py --out runtime/research/recorded --probe
 "${compose[@]}" run --rm --no-deps trader python main.py check
 "${compose[@]}" up -d --no-build --remove-orphans
 "${compose[@]}" exec -T trader python main.py check

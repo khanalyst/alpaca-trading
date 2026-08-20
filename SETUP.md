@@ -428,13 +428,19 @@ recorder's first live cycle resumes cleanly from a completed session boundary.
 ## 11. Start recording market data
 
 ```bash
+docker compose run --rm --no-deps recorder \
+  python deploy/recorder.py --out runtime/research/recorded --probe
 docker compose up -d
 docker compose ps
 docker compose logs --tail=100 recorder
 ```
 
-**Expected:** `recorded N Alpaca rows to ...` roughly once a minute during
-market hours, and the recorder's health turning healthy.
+**Expected:** the probe returns `status: probe_ok` for the configured SIP feed
+(and OPRA when options are enabled), followed by `recorded N Alpaca rows to ...`
+roughly once a minute during market hours and healthy recorder status. A
+container can remain `Up` while every acquisition attempt fails; health exposes
+the durable `failure_kind` and `last_error`. Do not interpret process uptime as
+evidence that corpus rows exist.
 
 Outside market hours the recorder is quiet — this is normal. Coverage and
 session cutoffs use the exact Alpaca calendar, so holidays and early closes are

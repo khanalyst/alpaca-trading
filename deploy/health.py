@@ -105,6 +105,8 @@ def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
     index_path = path / ".recorder-index.json"
     index_write = index_path.stat().st_mtime if index_path.is_file() else None
     index = _read_json(index_path)
+    attempt = _read_json(path / ".recorder-status.json")
+    attempt_failed = attempt.get("status") == "failed"
     raw_coverage = index.get("bar_coverage")
     coverage = ({str(symbol): dict(value)
                  for symbol, value in raw_coverage.items()
@@ -133,15 +135,24 @@ def recorder(path: Path, max_age: float, *, now: float | None = None) -> dict:
     latest = max(writes, default=None)
     fresh = _fresh(latest, max_age, now)
     return {
-        "ok": bool(files) and fresh,
+        "ok": bool(files) and fresh and not attempt_failed,
         "component": "recorder",
-        "status": "recording" if files and fresh else "stale_or_empty",
+        "status": (str(attempt.get("failure_kind") or "failed")
+                   if attempt_failed else
+                   "recording" if files and fresh else "stale_or_empty"),
         "fresh": fresh,
         "series_files": len(files),
         "latest_write_ts": latest,
         "latest_csv_write_ts": latest_csv,
         "index_write_ts": index_write,
         "data_feed": index.get("data_feed"),
+        "configured_data_feed": attempt.get("data_feed"),
+        "configured_options_feed": attempt.get("options_feed"),
+        "last_attempt_ts": attempt.get("updated_ts"),
+        "last_error": attempt.get("error"),
+        "failure_kind": attempt.get("failure_kind"),
+        "retryable": attempt.get("retryable"),
+        "probe": attempt.get("probe"),
         "coverage_status": coverage_status,
         "bar_gap_symbols": gap_symbols,
         "bar_unobserved_symbols": unobserved,
